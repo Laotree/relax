@@ -6474,15 +6474,16 @@ impl<'a> Lcx<'a> {
                     self.err(self.pos, "unsizing to `dyn` needs a single-pointer value".to_string());
                     return self.unit();
                 }
-                let addr = match self.u.vtable(src, dy) {
-                    Ok(a) => a,
+                let vt = self.f.vreg(Cls::I);
+                match self.u.vtable_shared(src, dy) {
+                    Ok(Some(addr)) => self.emit(Inst::Addr(vt, self.u.data_sym(addr))),
+                    // a front that goes on to note the body's other values; this lowering is dropped
+                    Ok(None) => self.emit(Inst::Iconst(vt, 1)),
                     Err(m) => {
                         self.err(self.pos, m);
                         return self.unit();
                     }
-                };
-                let vt = self.f.vreg(Cls::I);
-                self.emit(Inst::Addr(vt, self.u.data_sym(addr)));
+                }
                 let _ = target;
                 Val::L(vec![p[0], vt])
             }

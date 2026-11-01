@@ -1,6 +1,7 @@
 //! A hot fn never ends a run below O3 with nothing pending. The one way a body can name what only
-//! the owner may evaluate: its promoted constants (`&CONST-EXPR`), which a background build's front
-//! off the owner got no value for: its O3 build gave up for good (STUCK below O3).
+//! the owner may make: its promoted constants (`&CONST-EXPR`) and a new vtable (each method a slot
+//! nobody made yet), which a background build's front off the owner got no value for: its O3 build
+//! gave up for good (STUCK below O3).
 
 use super::*;
 
@@ -24,6 +25,18 @@ pub fn hot(out: &mut u32) {
 pub fn clamped(out: &mut u32) {
     *out = 2.5f32.clamp(0.0, 1.0).to_bits() ^ 'z'.to_digit(36).unwrap();
 }
+trait Shape { fn a(&self) -> u32; fn b(&self) -> u32; fn c(&self) -> u32; fn d(&self) -> u32; fn e(&self) -> u32; fn f(&self) -> u32; }
+struct Sq(u32);
+impl Shape for Sq {
+    fn a(&self) -> u32 { self.0 } fn b(&self) -> u32 { self.0 + 1 } fn c(&self) -> u32 { self.0 + 2 }
+    fn d(&self) -> u32 { self.0 + 3 } fn e(&self) -> u32 { self.0 + 4 } fn f(&self) -> u32 { self.0 + 5 }
+}
+#[inline(never)]
+fn total(s: &dyn Shape) -> u32 { s.a() ^ s.b() ^ s.c() ^ s.d() ^ s.e() ^ s.f() }
+pub fn dynsum(out: &mut u32) {
+    let q = Sq(*out);
+    *out = total(&q);
+}
 fn main() {}
 "#;
 
@@ -43,7 +56,7 @@ fn hot_fn_with_promoted_constants_reaches_o3() {
         let id = DefId(i as u32);
         (d.krate == krate && prog.name(id) == n).then_some(id)
     }).unwrap();
-    let (hot_d, clamped_d) = (def(&prog, "hot"), def(&prog, "clamped"));
+    let (hot_d, clamped_d, dynsum_d) = (def(&prog, "hot"), def(&prog, "clamped"), def(&prog, "dynsum"));
     let mut tcx = Tcx::new();
     tcx.collect(&prog);
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
@@ -84,6 +97,11 @@ fn hot_fn_with_promoted_constants_reaches_o3() {
             assert!(stuck.iter().any(|s| s.0 == id), "slot {} is below O3 with nothing pending: {:?}", u.fns[id as usize].name, tier_explain(&u, id).0);
         }
     });
+    // a front whose body makes a new vtable, each method a slot nobody made yet (code from the disk
+    // cache made none of them): the owner makes the vtable in its drain, the front is made, once
+    let dynsum = crate::owner::call(crate::owner::Class::Program, || u.fn_id(FnKey::Inst(dynsum_d, Vec::new())));
+    let front = crate::owner::call(crate::owner::Class::Program, || u.front.clone());
+    assert!(prefront_slot(&front, dynsum), "the front of dynsum (a new 6-method vtable) was not made off the owner");
     // their O3 builds, off the owner as a tier worker runs them (rule I-PURE: the owner evaluates
     // the promoted constants between requests, the front lowers the body with their values)
     for &id in &ids {

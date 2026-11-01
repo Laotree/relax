@@ -5018,6 +5018,20 @@ impl Unit {
     }
 
     /// vtable of `src` as `dy` (built once): [drop, size, align, methods...]
+    /// `vtable` from shared lowering. None: a background build's front, which notes it for the
+    /// owner (its entries take the addresses of slots only the owner makes, one per method) and
+    /// lowers on without it (want_in_front).
+    pub fn vtable_shared(&self, src: TyId, dy: TyId) -> Result<Option<u64>, String> {
+        let (src, dy) = (self.tcx.tys.erase_regions(src), self.tcx.tys.erase_regions(dy));
+        if let Some(a) = self.vtables.get(&(src, dy)) {
+            return Ok(Some(a));
+        }
+        if want_in_front(self, None, |_| Wanted::Vtable(src, dy)) {
+            return Ok(None);
+        }
+        self.vtable(src, dy).map(Some)
+    }
+
     pub fn vtable(&self, src: TyId, dy: TyId) -> Result<u64, String> {
         let src = self.tcx.tys.erase_regions(src);
         let dy = self.tcx.tys.erase_regions(dy);
@@ -25091,6 +25105,8 @@ enum Wanted {
     Entry(FnKey),
     /// a value of a body (BodyConst): slot, what, the checked body it is evaluated in
     Body(u32, BodyConst, BodyArc),
+    /// a trait object's vtable (source type, dyn type)
+    Vtable(TyId, TyId),
 }
 
 /// A value the lowering of a body evaluates once: a promoted constant, an inline const block.
@@ -25129,17 +25145,27 @@ impl std::hash::Hash for BodyArc {
 /// ends at lower_checked_body. False: not such a lowering: the caller asks the owner, which ends a
 /// helper's speculative lowering.
 fn want_body_const(u: &Unit, body: &Body, slot: u32, what: BodyConst) -> bool {
+    want_in_front(u, Some(body), |b| Wanted::Body(slot, what, BodyArc(b.unwrap())))
+}
+
+/// In a background build's front (WANT_CONSTS, lowering ahead of its checked body; `body`: the
+/// body the value belongs to must be that one): notes `w` for the owner and marks the lowering as
+/// missing values (thrown away at lower_checked_body, made again after the drain). False: not such
+/// a lowering.
+fn want_in_front(u: &Unit, body: Option<&Body>, w: impl FnOnce(Option<std::sync::Arc<Body>>) -> Wanted) -> bool {
     if !LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false) || !WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
         return false;
     }
     let held = LOWER_AHEAD_IDS.with(|a| {
         let mut a = a.borrow_mut();
-        let b = a.body.as_ref().filter(|b| std::ptr::eq(std::sync::Arc::as_ptr(b), body)).cloned();
+        let b = a.body.as_ref().filter(|b| body.is_none_or(|x| std::ptr::eq(std::sync::Arc::as_ptr(b), x))).cloned();
         a.wanted |= b.is_some();
         b
     });
-    let Some(b) = held else { return false };
-    want(Wanted::Body(slot, what, BodyArc(b)), u.tcx.collect_epoch.load(Ordering::SeqCst));
+    if held.is_none() {
+        return false;
+    }
+    want(w(body.and(held)), u.tcx.collect_epoch.load(Ordering::SeqCst));
     true
 }
 
@@ -25169,6 +25195,13 @@ pub(crate) fn const_drain() {
                 let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.entry(id))).is_ok();
                 if ahead_trace() {
                     eprintln!("const-drain: entry of {} {}", u.fns[id as usize].name, if ok { "taken" } else { "failed" });
+                }
+                continue;
+            }
+            Wanted::Vtable(src, dy) => {
+                let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.vtable(src, dy).is_ok())).unwrap_or(false);
+                if ahead_trace() {
+                    eprintln!("const-drain: a vtable {}", if ok { "made" } else { "failed" });
                 }
                 continue;
             }
