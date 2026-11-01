@@ -759,14 +759,83 @@ fn spacing_free(text: &str) -> String {
     out
 }
 
+/// An expanded trait impl belongs to the ADT that requested it. Follow expansion edges
+/// only as far as that item: following all the way to authored text loses a deriving ADT
+/// that was itself made by a macro. Neither the expansion's offsets nor its header's
+/// tokenization are part of its identity.
+fn derive_owners(pf: &crate::parser::ParsedFile) -> Vec<Option<(usize, String)>> {
+    use crate::ast::{ItemKind, Ty};
+    let ast = &pf.ast;
+    let mut owners = Vec::new();
+    for (i, it) in ast.items.iter().enumerate() {
+        if !matches!(it.kind, ItemKind::Struct(..) | ItemKind::Enum(..) | ItemKind::Union(..)) { continue; }
+        owners.push((it.lo, it.hi, i));
+    }
+    owners.sort_unstable();
+    let mut regions: Vec<_> = pf.exp_map.iter().collect();
+    for part in pf.parts() { regions.extend(part.exp_map.iter()); }
+    regions.sort_unstable();
+    ast.items.iter().map(|it| {
+        let ItemKind::Impl(row) = it.kind else { return None };
+        let imp = ast.row(row);
+        let trait_ = imp.trait_?;
+        let Ty::Path(self_ty) = ast.ty(imp.self_ty) else { return None };
+        let name = pf.text(ast.segs(self_ty.segs).last()?.name);
+        let mut pos = it.lo;
+        loop {
+            let r = regions.partition_point(|r| r.0 <= pos).checked_sub(1)?;
+            let (lo, hi, call) = regions[r];
+            if pos < lo || pos >= hi || call >= pos { return None; }
+            pos = call;
+            let next = owners.partition_point(|o| o.0 <= pos);
+            let owner = next.checked_sub(1).and_then(|k| {
+                let (_, end, owner) = owners[k];
+                (pos < end && pf.text(ast.items[owner].name) == name).then_some(owner)
+            }).or_else(|| {
+                // Hosted derives point at the first `#`, before Item::lo. Read that
+                // attribute prefix from bytes: Attr's token indices may have no stored
+                // tokens in this representation. Only whole outer attributes may intervene.
+                let &(start, _, owner) = owners.get(next)?;
+                if pf.text(ast.items[owner].name) != name { return None; }
+                let mut tokens = Vec::new();
+                crate::lexer::lex(pf.bytes(pos, start), pf.edition, &mut tokens).ok()?;
+                use crate::lexer::T;
+                let mut i = 0;
+                while tokens.get(i).is_some_and(|t| matches!(t.kind, T::Pound | T::DocComment)) {
+                    if tokens[i].kind == T::DocComment { i += 1; continue; }
+                    if tokens.get(i + 1)?.kind != T::OpenBracket { return None; }
+                    i += 2;
+                    let mut depth = 1;
+                    while depth != 0 {
+                        match tokens.get(i)?.kind {
+                            T::OpenBracket => depth += 1,
+                            T::CloseBracket => depth -= 1,
+                            T::Eof => return None,
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                }
+                (i != 0 && tokens.get(i)?.kind == T::Eof).then_some(owner)
+            });
+            if let Some(owner) = owner {
+                let path = ast.segs(trait_.segs).iter().map(|s| pf.text(s.name)).collect::<Vec<_>>().join("::");
+                return Some((owner, path));
+            }
+        }
+    }).collect()
+}
+
 /// An item's identity across versions of a file: its container path, kind and name (impls,
 /// imports and item macros by their header tokens; generated `__relax_*` names with their
 /// position digits dropped), with an occurrence number for repeats. Items in fn bodies are
-/// keyed by their fn.
+/// keyed by their fn. Derive impls are keyed by their deriving item and trait instead of
+/// their rendered header; their methods inherit that identity.
 fn item_keys(pf: &crate::parser::ParsedFile) -> Vec<String> {
     use crate::ast::ItemKind;
     let ast = &pf.ast;
     let mut key: Vec<Option<String>> = vec![None; ast.items.len()];
+    let derives = derive_owners(pf);
     fn name_of(pf: &crate::parser::ParsedFile, it: &crate::ast::Item) -> String {
         let n = String::from_utf8_lossy(&pf.src[it.name.lo as usize..it.name.hi as usize]).into_owned();
         if n.starts_with("__relax_") {
@@ -789,9 +858,12 @@ fn item_keys(pf: &crate::parser::ParsedFile) -> Vec<String> {
             n
         }
     }
-    fn walk(pf: &crate::parser::ParsedFile, items: &[crate::ast::ItemId], prefix: &str, key: &mut Vec<Option<String>>) {
+    fn walk(pf: &crate::parser::ParsedFile, items: &[crate::ast::ItemId], prefix: &str, derives: &[Option<(usize, String)>], key: &mut Vec<Option<String>>) {
         let ast = &pf.ast;
         for &iid in items {
+            // The position-ordered pass below keys the deriving item before its output,
+            // including block-local ADTs that the root item walk does not visit.
+            if derives[iid.0 as usize].is_some() { continue; }
             let it = ast.item(iid);
             let kids = child_items(ast, &it.kind);
             let holes: Vec<(u32, u32)> = kids.iter().map(|c| (ast.items[c.0 as usize].lo, ast.items[c.0 as usize].hi)).collect();
@@ -808,10 +880,10 @@ fn item_keys(pf: &crate::parser::ParsedFile) -> Vec<String> {
             };
             let k = format!("{}/{} {}", prefix, kind_name(&it.kind), head);
             key[iid.0 as usize] = Some(k.clone());
-            walk(pf, &kids, &k, key);
+            walk(pf, &kids, &k, derives, key);
         }
     }
-    walk(pf, &ast.root_items, "", &mut key);
+    walk(pf, &ast.root_items, "", &derives, &mut key);
     trace_count("classify_unreached", key.iter().filter(|k| k.is_none()).count());
     let mut order: Vec<usize> = (0..ast.items.len()).collect();
     order.sort_by_key(|&i| (ast.items[i].lo, std::cmp::Reverse(ast.items[i].hi), i));
@@ -824,8 +896,14 @@ fn item_keys(pf: &crate::parser::ParsedFile) -> Vec<String> {
             holders.pop();
         }
         if key[i].is_none() {
-            let owner = holders.last().and_then(|&top| key[top].clone()).unwrap_or_default();
-            key[i] = Some(format!("{}{{}}/{} {}", owner, kind_name(&it.kind), name_of(pf, it)));
+            if let Some((owner, trait_)) = &derives[i] {
+                let k = format!("{}/derive impl {}", key[*owner].as_ref().expect("deriving item precedes its expansion"), trait_);
+                key[i] = Some(k.clone());
+                walk(pf, &child_items(ast, &it.kind), &k, &derives, &mut key);
+            } else {
+                let owner = holders.last().and_then(|&top| key[top].clone()).unwrap_or_default();
+                key[i] = Some(format!("{}{{}}/{} {}", owner, kind_name(&it.kind), name_of(pf, it)));
+            }
         }
         holders.push(i);
     }
@@ -964,11 +1042,15 @@ fn file_root_module(prog: &crate::program::Program, file: u32) -> Option<u32> {
 /// items only the old version has (removed) and only the new one has (added).
 /// item_keys of a file version, memoized for the next edit: the previous edit's new version is
 /// the next edit's old one (a big file's keys cost tens of ms). Keyed by the version's text and
-/// item spans; parsing a text is deterministic.
+/// item spans, tokens and expansion origins. The same text can also be held as an image or
+/// expansion text, so a representation change must not reuse keys from a different view.
 fn item_keys_memo(pf: &crate::parser::ParsedFile) -> std::rc::Rc<Vec<String>> {
     use std::hash::{Hash, Hasher};
     let mut h = crate::fxhash::FxHasher::default();
     pf.src.hash(&mut h);
+    pf.toks.words().hash(&mut h);
+    for region in pf.exp_map.iter() { region.hash(&mut h); }
+    for part in pf.parts() { for region in part.exp_map.iter() { region.hash(&mut h); } }
     pf.ast.items.len().hash(&mut h);
     for it in &pf.ast.items { (it.lo, it.hi).hash(&mut h); }
     let id = h.finish();
@@ -5129,6 +5211,104 @@ mod round43_tests {
         assert!(removed.is_empty(), "removed: {:?}", removed);
         assert!(added.is_empty(), "added: {:?}", added);
         assert_eq!(pairs.len(), old.ast.items.len());
+    }
+}
+
+#[cfg(test)]
+mod derive_reload_tests {
+    use super::*;
+
+    #[test]
+    fn derive_identity_survives_successive_patches() {
+        isolated_test!(derive_identity_survives_successive_patches);
+        let source = r#"#![no_std]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Record { pub value: u32 }
+mod nested {
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct Record { pub value: u32 }
+}
+macro_rules! record {
+    () => {
+        #[derive(Clone, Debug, Default, PartialEq)]
+        pub struct Expanded { pub value: u32 }
+    };
+}
+record!();
+pub fn revision() -> u32 { 0 }
+"#;
+        let path = std::env::temp_dir().join(format!("relax-derive-reload-{}.rs", std::process::id()));
+        std::fs::write(&path, source).unwrap();
+        let path_text = path.to_str().unwrap();
+        let session = std::sync::Arc::new(crate::Session::default());
+        let cfg = crate::cfg::CfgSet::host(&session, &[]);
+        let mut prog = Program::new(&session);
+        // parse_owned and a standalone load without core do not expand these derives.
+        // Enable the same built-in expander that loading core enables in a live session.
+        std::sync::Arc::make_mut(&mut prog.macros).s2_fmt = true;
+        prog.load_crate("derive_reload", path_text, 2021, cfg.clone(), vec![]).unwrap();
+        let revision = (0..prog.defs.len()).map(|i| DefId(i as u32)).find(|&d| prog.name(d) == "revision").unwrap();
+        let mut file = prog.def(revision).file;
+        let first = source.replace("{ 0 }", "{ 1 }");
+        // Move all expansion regions without editing any deriving item, and use the
+        // installed first patch as the old version (including its expansion reuse).
+        let second = format!("// an unrelated edit above the declarations\n{}", first.replace("{ 1 }", "{ 2 }"));
+        for (patch, source) in [first, second].into_iter().enumerate() {
+            let old = &prog.files[file as usize];
+            let generated: Vec<_> = old.ast.items.iter().filter_map(|it| {
+                let crate::ast::ItemKind::Impl(row) = it.kind else { return None };
+                let trait_ = old.ast.row(row).trait_?;
+                Some(old.text(old.ast.segs(trait_.segs).last()?.name))
+            }).collect();
+            for trait_ in ["Clone", "Debug", "Default", "PartialEq"] {
+                assert_eq!(generated.iter().filter(|&&name| name == trait_).count(), 3, "{trait_} must really expand");
+            }
+            assert!(old.ast.items.iter().any(|it| matches!(it.kind, crate::ast::ItemKind::Struct(..)) && it.lo >= old.src_len),
+                "one deriving type must itself live in an expansion region");
+            let (text, kept) = compose_partial(&prog, file, source.as_bytes()).unwrap();
+            assert_eq!(kept, 0, "patch {patch}: unchanged derives must not retain duplicate authored items");
+            let mut version = prog.parse_version(file, path_text, text).unwrap();
+            let (pairs, removed, added) = pair_items(old, &version.pf);
+            assert!(removed.is_empty(), "patch {patch}: removed {removed:?}");
+            assert!(added.is_empty(), "patch {patch}: added {added:?}");
+            assert_eq!(pairs.len(), old.ast.items.len());
+            // Check the same expanded tree with text-only storage as well. Keep the
+            // full tokens for classification/installation (attributes use token indices).
+            let tokens = std::mem::take(&mut version.pf.toks);
+            let (text_pairs, removed, added) = pair_items(old, &version.pf);
+            assert!(removed.is_empty(), "patch {patch}, text view: removed {removed:?}");
+            assert!(added.is_empty(), "patch {patch}, text view: added {added:?}");
+            assert_eq!(pairs, text_pairs);
+            version.pf.toks = tokens;
+            let plan = classify(&prog, file, &version.pf, path_text)
+                .unwrap_or_else(|why| panic!("patch {patch}: unexpected restart reasons: {why:?}"));
+            assert!(plan.removed.is_empty());
+            assert!(plan.added.is_empty());
+            assert_eq!(plan.changes, vec![Change::Body(revision)]);
+            if patch == 0 {
+                // Restore the first patch's file through the warm front-image reader before
+                // installing it. The second patch must pair against that representation.
+                let prep = crate::program::prepare_file(&mut version.pf, &cfg);
+                let used = crate::macros::MacroScope::new(prog.macros.clone()).finish();
+                let meta = crate::crate_image::file_meta(path_text, "derive_reload", &version.pf, &used, &prep, false);
+                let mut meta = crate::crate_image::decode(&meta).unwrap();
+                let bytes = crate::front::encode(&version.pf);
+                let words = Box::leak(vec![0u64; bytes.len().div_ceil(8)].into_boxed_slice());
+                let image = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, bytes.len()) };
+                image.copy_from_slice(&bytes);
+                version.pf = crate::front::restore(&mut meta, image).unwrap();
+                assert!(version.pf.toks.is_mapped());
+            }
+            file = prog.commit_body_version(version, &plan.pairs).unwrap();
+            assert_eq!(prog.def(revision).file, file);
+        }
+        // A real derive removal must still take the restart path.
+        let old = &prog.files[file as usize];
+        let removed_debug = String::from_utf8(old.src[..old.src_len as usize].to_vec()).unwrap().replace("Clone, Debug, Default", "Clone, Default");
+        let version = prog.parse_version(file, path_text, removed_debug.into_bytes()).unwrap();
+        let why = classify(&prog, file, &version.pf, path_text).err().expect("removing Debug must require a restart");
+        assert!(why.iter().any(|line| line.contains("fn `fmt` removed")), "{why:?}");
+        std::fs::remove_file(path).unwrap();
     }
 }
 
