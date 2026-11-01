@@ -6,6 +6,7 @@
 # frames, 30 resizes, each followed by a frame), hidden on the offscreen backend. Prints the
 # seconds each run took and, of the warm run, the Cx build time of the idle and the resize frames
 # (median / p90 / max, MAKEPAD_HAL_FRAME_LOG). Default package: makepad-app-calculator.
+# FRAMES_PHASES=1 also prints the warm run's boot phases.
 set -u
 export PATH=$HOME/.cargo/bin:$PATH CARGO_INCREMENTAL=0
 pkgs=${*:-makepad-app-calculator}
@@ -23,6 +24,8 @@ for pkg in $pkgs; do
     for mode in jit nocodegen; do
         env=(MAKEPAD_HAL_BACKEND=offscreen MAKEPAD_HIDE_WINDOWS=1 MAKEPAD_MUTE=1 SANDBOX_MUTE=1 MAKEPAD_HAL_FRAME_LOG=1 MAKEPAD_HAL_SCRIPT=$PWD/$here/resize30.hal)
         [ $mode = nocodegen ] && env+=(MAKEPAD_RUN_NO_CODEGEN=1)
+        # FRAMES_PHASES=1: the warm run's boot phases (MAKEPAD_RUN_VERBOSE's timed lines)
+        [ "${FRAMES_PHASES:-}" = 1 ] && env+=(MAKEPAD_RUN_VERBOSE=1)
         d=$work/$pkg.$mode; mkdir -p "$d/home" "$d/tmp"
         for run in cold warm; do
             t0=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
@@ -38,6 +41,7 @@ for pkg in $pkgs; do
         awk 'NR > 11 { print $2 }' "$d/frames" > "$d/resize"
         stats "$mode idle" "$d/idle"
         stats "$mode resize" "$d/resize"
+        [ "${FRAMES_PHASES:-}" = 1 ] && grep -a -E 'makepad-run: .*[0-9.]+ ms|boot-trace|first (frame|present)' "$d/warm.out" | head -40 | cut -c1-200
         [ -s "$d/frames" ] || grep -a -v '^\s*$' "$d/warm.out" | tail -5 | cut -c1-200
     done
 done
