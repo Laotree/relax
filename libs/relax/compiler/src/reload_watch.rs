@@ -8,8 +8,8 @@ mod native {
     unsafe extern "C" {
         fn inotify_init1(flags: i32) -> i32;
         fn inotify_add_watch(fd: i32, path: *const std::ffi::c_char, mask: u32) -> i32;
-        fn read(fd: i32, buf: *mut u8, size: usize) -> isize;
-        fn write(fd: i32, buf: *const u8, size: usize) -> isize;
+        fn read(fd: i32, buf: *mut core::ffi::c_void, size: usize) -> isize;
+        fn write(fd: i32, buf: *const core::ffi::c_void, size: usize) -> isize;
         fn eventfd(initval: u32, flags: i32) -> i32;
         fn poll(fds: *mut PollFd, nfds: std::ffi::c_ulong, timeout: i32) -> i32;
     }
@@ -81,7 +81,7 @@ mod native {
             let mut lost = false;
             let mut buf = [0u8; 65536];
             loop {
-                let n = unsafe { read(self.fd.as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
+                let n = unsafe { read(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
                 if n < 0 {
                     let e = std::io::Error::last_os_error();
                     if e.kind() == std::io::ErrorKind::WouldBlock { break; }
