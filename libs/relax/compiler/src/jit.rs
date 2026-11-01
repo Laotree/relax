@@ -1504,7 +1504,7 @@ static O3_OPT_PANICKED: relax_session::sync::Mutex<std::collections::BTreeSet<u3
 
 /// A caught panic's message, and whether its payload is one of the preemption/bail payloads
 /// (control flow: the build gave way, nothing went wrong).
-fn panic_payload(p: &(dyn std::any::Any + Send)) -> (String, bool) {
+pub(crate) fn panic_payload(p: &(dyn std::any::Any + Send)) -> (String, bool) {
     if let Some(s) = p.downcast_ref::<&str>() {
         return (s.to_string(), false);
     }
@@ -17034,11 +17034,14 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
             eprintln!("O3 done #{} ({}) {}: {}", id, Q_WHY.get(why as usize).copied().unwrap_or("?"), name, match &r { Ok(true) => "installed", Ok(false) => "dropped", Err(_) => "panicked" });
         }
         if let Err(p) = r {
-            crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_PANIC, 0, 0, 0);
-            let msg = panic_payload(&*p).0;
-            let n = TIER1_PANICS.fetch_add(1, Ordering::Relaxed);
-            if n < 3 {
-                eprintln!("makepad: O3 build of slot {} panicked: {} -- O3 dropped for it", id, msg);
+            // a build that gave way (preempted, the owner busy) is control flow, not a panic
+            let (msg, bail) = panic_payload(&*p);
+            if !bail {
+                crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_PANIC, 0, 0, 0);
+                let n = TIER1_PANICS.fetch_add(1, Ordering::Relaxed);
+                if n < 3 {
+                    eprintln!("makepad: O3 build of slot {} panicked: {} -- O3 dropped for it", id, msg);
+                }
             }
         }
     }
