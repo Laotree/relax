@@ -2194,9 +2194,9 @@ unsafe fn tail_enter(d: &CallDesc, fp: *mut u64, cx: *mut Cx) -> *const IFunc {
         Target::Cell(k) => *fp.add(k as usize),
         Target::Addr(a) => a,
     };
-    if d.csig.is_none() && !matches!(d.target, Target::Addr(_)) {
+    if direct_ok(d) {
         let f = resolve(d, word);
-        if !f.is_null() {
+        if !f.is_null() && same_abi(d, &*f) {
             if COUNT {
                 (*cx).n[1] += 1;
             }
@@ -2210,7 +2210,7 @@ unsafe fn tail_enter(d: &CallDesc, fp: *mut u64, cx: *mut Cx) -> *const IFunc {
                     buf[n + 1] = *fp.add(cell as usize + 1);
                     n += 2;
                 } else {
-                    buf[n] = arg_word(fp, cell);
+                    buf[n] = c_scalar(d, n_arg(d, n), arg_word(fp, cell));
                     n += 1;
                 }
             }
@@ -2271,6 +2271,53 @@ unsafe fn arg_word(fp: *mut u64, x: u32) -> u64 {
     }
 }
 
+/// A call that may run its callee on the interpreter stack when the callee is interpreted: a
+/// Relax-ABI call, or a C call whose arguments are all scalars in registers or on the stack with
+/// no aggregate result (each argument is then the callee's parameter as it is: the C body's entry
+/// would read it back from the register it went in). Calls of fixed addresses (the runtime's
+/// entries) are native.
+#[inline(always)]
+fn direct_ok(d: &CallDesc) -> bool {
+    if matches!(d.target, Target::Addr(_)) {
+        return false;
+    }
+    match &d.csig {
+        None => true,
+        Some((sig, plan)) => sig.ret.is_none() && matches!(plan.ret, RetPlan::Scalar) && plan.args.iter().all(|a| matches!(a, ArgPlan::Scalar(..))),
+    }
+}
+
+/// The interpreted callee takes the call's convention: a Relax-ABI body for a Relax call, a C
+/// body for a C call.
+#[inline(always)]
+fn same_abi(d: &CallDesc, f: &IFunc) -> bool {
+    d.csig.is_some() == f.cplan.is_some()
+}
+
+/// Argument `k`'s value as the C body's entry makes it (relax_interp_enter): a narrow scalar
+/// cut to its size, a signed one sign-extended again. Relax-ABI calls pass it as it is.
+#[inline(always)]
+unsafe fn c_scalar(d: &CallDesc, k: usize, v: u64) -> u64 {
+    let Some((sig, plan)) = &d.csig else { return v };
+    match (&plan.args[k], &sig.args[k]) {
+        (ArgPlan::Scalar(_, size), a) if *size < 8 => {
+            let v = v & ((1u64 << (8 * size)) - 1);
+            match a {
+                CArg::Scalar(Mem::Int(b, true)) => ext(v, b * 8, true),
+                _ => v,
+            }
+        }
+        _ => v,
+    }
+}
+
+/// The argument index of word `n` of a call's argument buffer (V128 arguments take two words;
+/// C calls, the only ones c_scalar changes, have none).
+#[inline(always)]
+fn n_arg(d: &CallDesc, n: usize) -> usize {
+    if d.csig.is_some() { n } else { 0 }
+}
+
 /// true: the callee unwound (results undefined)
 #[inline(never)]
 unsafe fn do_call(d: &CallDesc, fp: *mut u64, cx: *mut Cx) -> bool {
@@ -2281,9 +2328,9 @@ unsafe fn do_call(d: &CallDesc, fp: *mut u64, cx: *mut Cx) -> bool {
     };
     let saved_top = (*cx).top;
     let fp2 = fp.add(d.frame_words);
-    if d.csig.is_none() && !matches!(d.target, Target::Addr(_)) {
+    if direct_ok(d) {
         let f = resolve(d, word);
-        if !f.is_null() {
+        if !f.is_null() && same_abi(d, &*f) {
             // interpreted -> interpreted: same stack, arguments cell to cell
             if COUNT {
                 (*cx).n[1] += 1;
@@ -2302,7 +2349,7 @@ unsafe fn do_call(d: &CallDesc, fp: *mut u64, cx: *mut Cx) -> bool {
                     *dst = *src;
                     *dst.add(1) = *src.add(1);
                 } else {
-                    *dst = arg_word(fp, cell);
+                    *dst = c_scalar(d, k, arg_word(fp, cell));
                 }
             }
             run(f, fp2, cx);
