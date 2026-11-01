@@ -239,6 +239,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
             }
         };
         if c != 0 {
+            if c == makepad_remote::hot::JIT_ERROR_EXIT { return c; }
             if plain.is_some() {
                 eprintln!("error: test failed (harness = false target exited with status {c})");
             }

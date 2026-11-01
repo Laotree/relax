@@ -47,6 +47,7 @@ pub mod procs;
 pub mod hello;
 pub mod hosts;
 pub mod hub;
+pub mod hot;
 pub mod lines;
 pub mod pair;
 pub mod program;
