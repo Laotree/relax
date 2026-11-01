@@ -24208,7 +24208,7 @@ fn exec_check_now(when: &str) {
 #[path = "static_glue.rs"]
 mod static_glue;
 /// bytes per precompiled slot thunk / stub (no-codegen mode)
-const NC_STRIDE: usize = 16;
+const NC_STRIDE: usize = 8;
 
 fn present_files() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
