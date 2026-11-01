@@ -45,6 +45,15 @@ static MAIN_START_MS: AtomicU64 = AtomicU64::new(0);
 static ERRORS_SEEN: AtomicU64 = AtomicU64::new(0);
 static QUIET: AtomicBool = AtomicBool::new(false);
 static SILENT: AtomicBool = AtomicBool::new(false);
+/// This run is a live session (watcher and hot reload: a failed build is fixed by an edit).
+static LIVE_SESSION: AtomicBool = AtomicBool::new(false);
+
+/// Whether this run is a live session: one that takes edits while it runs (a run window can wait
+/// for one after a failed build). A run without (`--no-live`, a store's sources, a program a test
+/// spawns through `CARGO_BIN_EXE_*`) ends with its code instead.
+pub fn live_session() -> bool {
+    LIVE_SESSION.load(Ordering::Acquire)
+}
 pub(crate) static VERBOSE: AtomicBool = AtomicBool::new(false);
 static STARTUP_PATH: relax_session::sync::Mutex<String> = relax_session::sync::Mutex::new(String::new());
 static REPORT_PATH: relax_session::sync::Mutex<String> = relax_session::sync::Mutex::new(String::new());
@@ -699,6 +708,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         && (store_live || !crate::vfs::is_virtual(&workspace_dir())) {
         driver_options.live = true;
     }
+    LIVE_SESSION.store(driver_options.live, Ordering::Release);
     // `--cfg <name>` / `--cfg=<name>` among the cargo flags (`makepad run <pkg> --cfg custom`) or
     // before the package: extra cfgs for the program's crates, not cargo flags
     let mut cargo_flags_in: Vec<String> = Vec::new();

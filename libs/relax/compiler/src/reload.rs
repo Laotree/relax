@@ -3410,6 +3410,8 @@ pub(crate) fn domain_loaded(inputs: Option<Inputs>) {
     // the first domain of a process that restarted into a rebuilt makepad gets the state the
     // previous process left (MAKEPAD_RUN_RESTORE, read once)
     static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    // this run loads the sources as they are: no edit waits for a restart any more
+    SOURCES_WAIT.store(false, Ordering::Release);
     let mut restored = DOMAIN_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()).take();
     if FIRST.swap(false, std::sync::atomic::Ordering::AcqRel) && restored.is_none() {
         if let Some(path) = std::env::var_os("MAKEPAD_RUN_RESTORE") {
@@ -3764,8 +3766,15 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
 
 /// An edit the patcher cannot absorb waits for the person: a running app never restarts by itself.
 fn restart_for_edit(what: &str, lines: &[String]) {
+    SOURCES_WAIT.store(true, Ordering::Release);
     offer_restart(&format!("{}: {}", what, lines.first().cloned().unwrap_or_default()));
 }
+
+/// Source edits wait for a restart: the running program has not taken them (a mod added, a type
+/// changed). A later edit is checked against the running program, so what it uses of them is not
+/// there: its errors are no errors of the sources (rustc accepts them), and a restart applies it
+/// with them. Cleared when a run loads the sources again (`domain_loaded`, a relaunch).
+static SOURCES_WAIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// How long a patch's old code may stay on a program thread's stack before the edit counts as
 /// not landed there (a call made before the patch that does not return: a loop).
@@ -4835,6 +4844,12 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         }
         // landed code the patcher refuses is nobody's error here: a restart takes it
         if synced && o.rung == Rung::Refuse { o.rung = Rung::Restart; }
+        // an edit checked against a program that has not taken earlier edits (they wait for a
+        // restart) fails on what it uses of them: the restart applies it with them
+        if o.rung == Rung::Refuse && SOURCES_WAIT.load(Ordering::Acquire) {
+            o.rung = Rung::Restart;
+            o.lines.insert(0, "it builds on edits that wait for the restart (the running program has not taken them); the restart applies them together -- what the check said against the running program:".to_string());
+        }
         let incomplete = o.rung == Rung::Refuse || o.lines.iter().any(|l| l.starts_with("incomplete:"));
         if incomplete {
             for (&k, src) in which.iter().zip(originals) { stalled.insert(k, (Instant::now(), src, if o.rung == Rung::Refuse { o.lines.clone() } else { Vec::new() })); }
