@@ -1379,11 +1379,23 @@ impl Arena {
         let off = (p as usize).wrapping_sub(base);
         base != 0 && off < RESERVE && self.headers[off / CHUNK].old.load(Ordering::Relaxed)
     }
-    /// Every committed chunk is old from now on (`states`' last row; a settle rebuild calls it).
+    /// Every committed chunk is old from now on (`states`' last row; a settle rebuild calls it,
+    /// before it drops the cold state). Old chunks drain: they leave the list of chunks with free
+    /// slots and never join it again, so what is allocated from now on packs into fresh chunks
+    /// instead of filling the holes between the cold state's blocks, and an old chunk is released
+    /// once its last block goes. (Filled holes kept every page of every cold chunk resident: 39 MB
+    /// live held 841 MB on 16 KB pages.) The threads hand their current chunks back at their next
+    /// slow path, so those drain too.
     pub fn mark_old(&self) {
-        for h in self.headers.iter() {
+        for (index, h) in self.headers.iter().enumerate() {
             let s = lock(&h.state);
             h.old.store(s.committed != 0, Ordering::Relaxed);
+            if s.committed != 0 && h.in_part.load(Ordering::Relaxed) {
+                lock(&self.partial).unlink(index, &self.headers);
+            }
+        }
+        if COMPILER && !self.dynamic {
+            HAND_BACK.fetch_add(1, Ordering::Relaxed);
         }
     }
     pub fn states(&self) -> [usize; 28] {
@@ -1482,6 +1494,10 @@ impl Arena {
         bytes
     }
     fn partial_push(&self, i: usize, class: usize) {
+        // an old chunk drains (`mark_old`): its free slots are never handed out again
+        if self.headers[i].old.load(Ordering::Relaxed) {
+            return;
+        }
         let mut p = lock(&self.partial);
         // a chunk that emptied meanwhile is on its way to the pool: never list it
         if p.class[i] != 0 || self.headers[i].live.load(Ordering::Relaxed) == 0 {

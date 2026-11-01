@@ -1348,9 +1348,9 @@ impl Linker {
             return f.clone();
         }
         let files = (0..im.files.len()).map(|ix| self.cache().dec_file(u, &mut D { b: im.files[ix], p: 0 }).unwrap_or(u32::MAX)).collect();
-        // the pc maps of installed slots hold it: identity state, in the kept heap
+        // the pc maps of installed slots hold it: unit-lifetime state in the slot arena
         let files: Vec<u32> = files;
-        let f = crate::zone_alloc::kept_with(|| std::sync::Arc::new(crate::jit::PcFiles { files: files.clone(), keep: Box::new(KeepMapped(im.store.clone())) }));
+        let f = crate::zone_alloc::slots_with(|| std::sync::Arc::new(crate::jit::PcFiles { files: files.clone(), keep: Box::new(KeepMapped(im.store.clone())) }));
         im.pc_files = Some(f.clone());
         f
     }

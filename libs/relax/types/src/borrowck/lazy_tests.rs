@@ -240,6 +240,23 @@ fn verdict_states() {
 }
 
 #[test]
+fn an_idle_worker_does_not_keep_its_source_alive() {
+    if child("an_idle_worker_does_not_keep_its_source_alive") { return; }
+    // the worker starts with the first enqueuer's source; once the queue is empty it waits
+    // without it, so a settle rebuild's replaced front state (and what its memos hold) can go
+    let front = TestFront::new(0);
+    let clean = front.enqueue("clean", false);
+    front.ungate();
+    assert_eq!(wait_verdict(&front, clean), FnVerdict::Clean);
+    let weak = Arc::downgrade(&front);
+    drop(front);
+    while weak.strong_count() > 0 {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    stop();
+}
+
+#[test]
 fn settle_rebuild_keeps_verdicts_and_queued_checks() {
     if child("settle_rebuild_keeps_verdicts_and_queued_checks") { return; }
     // the worker stays gated until the rebuild is done: `clean` is still queued across it
