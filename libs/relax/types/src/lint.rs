@@ -407,11 +407,13 @@ pub fn check_literals(prog: &Program, tcx: &crate::tcx::Tcx, body: &crate::typec
     let pf = &prog.files[body.file as usize];
     let ast = &pf.ast;
     let n = body.expr_ty.len();
-    let mut negated = std::collections::HashSet::new();
+    // (the negated literal -> where the negation starts: rustc reports a negated literal at the
+    // negation, literal.rs lint_int_literal `negated_expr_span`)
+    let mut negated = std::collections::HashMap::new();
     for i in 0..n {
         let e = body.expr_at(i);
         if !body.expr_typed.get(i) { continue; }
-        if let ExprKind::Unary(UnOp::Neg, x) = ast.expr(e).kind { negated.insert(x.0); }
+        if let ExprKind::Unary(UnOp::Neg, x) = ast.expr(e).kind { negated.insert(x.0, ast.expr(e).lo); }
     }
     for i in 0..n {
         let e = body.expr_at(i);
@@ -420,7 +422,8 @@ pub fn check_literals(prog: &Program, tcx: &crate::tcx::Tcx, body: &crate::typec
         let kind = match ex.kind { ExprKind::Lit(k @ (LitKind::Int | LitKind::Float)) => k, _ => continue };
         let t = body.expr_ty[i];
         let text = std::str::from_utf8(pf.bytes(ex.lo, ex.hi)).unwrap_or("");
-        let neg = negated.contains(&e.0);
+        let neg_at = negated.get(&e.0).copied();
+        let neg = neg_at.is_some();
         match (kind, tcx.tys.kind(t)) {
             (LitKind::Int, TyKind::Int(p)) => {
                 let (bytes, signed) = tcx.tys.int_info(*p);
@@ -433,7 +436,7 @@ pub fn check_literals(prog: &Program, tcx: &crate::tcx::Tcx, body: &crate::typec
                     let ty = crate::typeck::ty_to_string(false, prog, tcx, t);
                     let lit = if neg { format!("-{}", text) } else { text.to_string() };
                     let range = if signed { format!("-{}..={}", min_abs, max) } else { format!("0..={}", max) };
-                    emit_in(prog, body.def, &attrs_around_expr(prog, body.def, body.file, e), &OVERFLOWING_LITERALS, body.file, ex.lo,
+                    emit_in(prog, body.def, &attrs_around_expr(prog, body.def, body.file, e), &OVERFLOWING_LITERALS, body.file, neg_at.unwrap_or(ex.lo),
                         &format!("literal out of range for `{}` -- the literal `{}` does not fit into the type `{}` whose range is `{}`", ty, lit, ty, range));
                 }
             }

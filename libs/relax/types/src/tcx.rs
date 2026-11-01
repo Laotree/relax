@@ -2457,8 +2457,9 @@ impl Tcx {
         if expected_ty == self.tys.error { return self.tys.intern_const(ConstKind::Error); }
         // hir_ty_lowering/mod.rs:3083-3118 try_lower_anon_const_lit: a (negated) integer literal
         // whose kind matches the type (ty/consts/lit.rs:50-55 const_lit_matches_ty) is lowered
-        // directly by lit_to_const, truncated to the type (thir/constant.rs:21-33,75-94; rustc's
-        // deny-by-default overflowing_literals lint has no Relax counterpart). Anything else is
+        // directly by lit_to_const, truncated to the type (thir/constant.rs:21-33,75-94; the
+        // deny-by-default overflowing_literals lint runs on the anon const's own typeck: check.rs
+        // body_anon_consts, signature_anon_consts). Anything else is
         // the anon const, whose typeck reports the mismatch (`Foo<3u16>` for a u8 parameter).
         let (literal, neg) = match pf.ast.expr(unwrapped).kind {
             ast::ExprKind::Unary(ast::UnOp::Neg, inner) if matches!(pf.ast.expr(inner).kind, ast::ExprKind::Lit(ast::LitKind::Int)) => (Some(inner), true),
