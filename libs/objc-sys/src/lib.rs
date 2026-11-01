@@ -15,9 +15,6 @@ mod message;
 pub mod rc;
 pub mod runtime;
 
-//#[cfg(test)]
-//mod test_utils;
-
 #[macro_export]
 macro_rules!objc_block {
     (move || $ body: block) => {
