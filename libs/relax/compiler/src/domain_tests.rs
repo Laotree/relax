@@ -152,15 +152,12 @@ fn teardown_fixture_cycles_and_leaked_thread() {
         assert!(matches!(dead.state, DomainState::Exited(0)));
         #[cfg(target_os = "linux")]
         {
-            // Each cycle leaks 2 MB inside its domain; none of it may stay in the system heap.
-            // Measured cycle to cycle: the system heap also holds what the process's runtime
-            // keeps (under the JIT, the loader's own tables grow as it compiles), a few hundred KB
-            // at a time, never a cycle's 2 MB.
             let now = heap_in_use();
-            if cycle > 0 {
-                assert!(now <= baseline + 1024 * 1024, "cycle {cycle}: {now} > previous cycle's {baseline} + 1 MB");
+            if cycle == 0 {
+                baseline = now;
             }
-            baseline = now;
+            // Native allocator thread caches may vary a little; two MB leaked per cycle may not.
+            assert!(now <= baseline + 256 * 1024, "cycle {cycle}: {now} > baseline {baseline}");
         }
         #[cfg(not(target_os = "linux"))]
         let _ = cycle;

@@ -11,8 +11,9 @@
 //! Heap (glibc mallinfo2): a program thread that runs in a domain allocates in that domain's heap
 //! (zone_alloc::domain), which is what the program's memory is and what `makepad inspect` and the
 //! domain teardown account (DomainInfo::arena_in_use / arena_committed); mallinfo2 reports that heap.
-//! A thread on the system heap (a program without domains, which owns the process heap) gets
-//! glibc's own figures.
+//! A thread on the system heap (a program without domains) gets glibc's figures less what the
+//! loader's own allocator holds there (zone_alloc::system_held): the program's allocations, as a
+//! native build of it would see them, without the JIT's tables and runtime state.
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 extern "C" {
@@ -106,8 +107,18 @@ extern "C" {
 pub extern "C" fn mallinfo2() -> Mallinfo2 {
     match crate::zone_alloc::domain::current_stats() {
         Some(stats) => domain_mallinfo2(stats),
-        None => unsafe { libc_mallinfo2() },
+        None => program_mallinfo2(unsafe { libc_mallinfo2() }, crate::zone_alloc::system_held::bytes()),
     }
+}
+
+/// The system heap's figures without the `loader` bytes the loader's own allocator holds in it
+/// (in-use first, then mmapped).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn program_mallinfo2(mut m: Mallinfo2, loader: usize) -> Mallinfo2 {
+    let from_used = loader.min(m.uordblks);
+    m.uordblks -= from_used;
+    m.hblkhd -= (loader - from_used).min(m.hblkhd);
+    m
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -173,6 +184,21 @@ mod tests {
         unsafe { relax_session::win32::GetCurrentThreadStackLimits(&mut lo, &mut hi) };
         // the reservation's base (the guard region at its bottom included)
         Some((lo + crate::stack::PROGRAM_STACK_GUARD, hi))
+    }
+
+    /// Off a domain, mallinfo2 leaves out what the loader's allocator holds in the system heap:
+    /// a loader block allocated meanwhile does not show, as the program did not allocate it.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn mallinfo2_leaves_out_the_loaders_blocks() {
+        let m = super::Mallinfo2 { uordblks: 1000, hblkhd: 500, fordblks: 7, ..Default::default() };
+        let p = super::program_mallinfo2(m, 1200);
+        assert_eq!((p.uordblks, p.hblkhd, p.fordblks), (0, 300, 7));
+        let before = crate::zone_alloc::system_held::bytes();
+        let held: Vec<u8> = std::hint::black_box(vec![1u8; 1 << 20]);
+        assert!(crate::zone_alloc::system_held::bytes() >= before + (1 << 20));
+        drop(held);
+        assert!(crate::zone_alloc::system_held::bytes() < before + (1 << 20));
     }
 
     /// A domain thread's mallinfo2 is its heap's accounting, the figures DomainInfo shows.

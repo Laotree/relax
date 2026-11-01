@@ -445,6 +445,66 @@ pub mod domain;
 
 pub struct RelaxAlloc;
 
+/// glibc: the bytes of the system heap this allocator holds (the loader's own kept blocks, and the
+/// native code's it serves), as malloc counts its chunks. A JIT program's own allocations never
+/// come through here (the program allocator ABI goes to the program's allocator or its domain
+/// heap), so the system heap minus these is the program's (program_os.rs mallinfo2). Sharded by
+/// stack address (one cache line per shard), so threads do not contend; a shard may go negative
+/// (a block freed on another thread's shard), the sum may not.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub mod system_held {
+    use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
+
+    #[repr(align(64))]
+    struct Shard(AtomicIsize);
+    static SHARDS: [Shard; 32] = [const { Shard(AtomicIsize::new(0)) }; 32];
+
+    extern "C" {
+        fn malloc_usable_size(p: *mut u8) -> usize;
+    }
+
+    #[inline]
+    fn shard() -> &'static AtomicIsize {
+        let here = 0u8;
+        &SHARDS[(std::ptr::addr_of!(here) as usize >> 16) % SHARDS.len()].0
+    }
+
+    /// malloc's chunk of `p`: its usable size and the chunk header
+    #[inline]
+    unsafe fn chunk(p: *mut u8) -> isize {
+        (malloc_usable_size(p) + std::mem::size_of::<usize>()) as isize
+    }
+
+    #[inline]
+    pub(super) unsafe fn add(p: *mut u8) {
+        if !p.is_null() {
+            shard().fetch_add(chunk(p), Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(super) unsafe fn sub(p: *mut u8) {
+        shard().fetch_sub(chunk(p), Relaxed);
+    }
+
+    /// A block's chunk before a realloc
+    #[inline]
+    pub(super) unsafe fn chunk_of(p: *mut u8) -> isize {
+        chunk(p)
+    }
+
+    /// A realloc moved (or resized) a block of chunk `old` to `q`
+    #[inline]
+    pub(super) unsafe fn moved(old: isize, q: *mut u8) {
+        shard().fetch_add(chunk(q) - old, Relaxed);
+    }
+
+    /// The bytes held now.
+    pub fn bytes() -> usize {
+        SHARDS.iter().map(|s| s.0.load(Relaxed)).sum::<isize>().max(0) as usize
+    }
+}
+
 /// Set when the program announces a malloc-zone swap (before it happens).
 #[cfg(target_vendor = "apple")]
 static OWN_ZONE: AtomicBool = AtomicBool::new(false);
@@ -571,7 +631,10 @@ unsafe impl GlobalAlloc for RelaxAlloc {
         if OWN_ZONE.load(Ordering::Relaxed) {
             return zone::alloc(l.size(), l.align());
         }
-        System.alloc(l)
+        let p = System.alloc(l);
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        system_held::add(p);
+        p
     }
     #[inline]
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
@@ -595,7 +658,10 @@ unsafe impl GlobalAlloc for RelaxAlloc {
         if OWN_ZONE.load(Ordering::Relaxed) {
             return zone::alloc_zeroed(l.size(), l.align());
         }
-        System.alloc_zeroed(l)
+        let p = System.alloc_zeroed(l);
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        system_held::add(p);
+        p
     }
     #[inline]
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
@@ -616,6 +682,8 @@ unsafe impl GlobalAlloc for RelaxAlloc {
         if OWN_ZONE.load(Ordering::Relaxed) {
             return zone::dealloc(p);
         }
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        system_held::sub(p);
         System.dealloc(p, l)
     }
     #[inline]
@@ -651,6 +719,16 @@ unsafe impl GlobalAlloc for RelaxAlloc {
         if OWN_ZONE.load(Ordering::Relaxed) {
             return zone::realloc(p, l.size(), l.align(), size);
         }
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            let old = system_held::chunk_of(p);
+            let q = System.realloc(p, l, size);
+            if !q.is_null() {
+                system_held::moved(old, q);
+            }
+            q
+        }
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
         System.realloc(p, l, size)
     }
 }
