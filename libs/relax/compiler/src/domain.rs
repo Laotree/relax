@@ -1192,7 +1192,12 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
         Some(r) => r,
         None => match crate::run::resolve_package(&sess, &workspace, &spec.package, &spec.cargo_flags, &spec.units_json, &target_dir, &std_dir, crate::run::ResolveFor::Domain(id), false) {
             Ok(r) => r,
-            Err(e) => return fail(id, vec![e]),
+            Err(crate::run::ResolveError::ProvidedChanged(change)) => {
+                set_state(id, DomainState::Stopped);
+                crate::reload::host::offer_provided(change, Some(id));
+                return Ok(id);
+            }
+            Err(crate::run::ResolveError::Failed(e)) => return fail(id, vec![e]),
         },
     };
     let resolve_ms = t0.elapsed().as_secs_f64() * 1e3;
