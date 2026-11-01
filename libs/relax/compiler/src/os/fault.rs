@@ -469,6 +469,8 @@ mod imp {
     extern "C" {
         fn sigaction(sig: i32, act: *const SigAction, old: *mut SigAction) -> i32;
         fn sigaltstack(ss: *const StackT, old: *mut StackT) -> i32;
+        // macOS only: iOS has no MAP_JIT pages (no executable memory at all)
+        #[cfg(target_os = "macos")]
         fn pthread_jit_write_protect_np(enabled: i32);
     }
 
@@ -628,7 +630,10 @@ mod imp {
             let f = Fault { kind: kind(sig), sig, pc: *reg(SS_PC), sp: *reg(SS_SP), fp: *reg(SS_FP), addr: *(info.add(SI_ADDR) as *const u64), lr: *reg(SS + 240) };
             // the program may fault while it has its own MAP_JIT pages in write mode
             // (pthread_jit_write_protect_np(0)); recovery continues in execute mode
+            #[cfg(target_os = "macos")]
             let prepare = || pthread_jit_write_protect_np(1);
+            #[cfg(not(target_os = "macos"))]
+            let prepare = || {};
             let debug = || fault_regs(uc);
             let chained = CHAINED[sig as usize][0].load(Ordering::SeqCst) > 1;
             match crate::jit::on_fault(&f, &Hooks { prepare: &prepare, chained, debug: &debug }) {
