@@ -467,14 +467,12 @@ pub struct Unit {
     pub(crate) global_asm: std::sync::OnceLock<HashMap<String, u64>>,
     /// tier-up policy (None: O1 only) and its per-slot records / hot glue
     pub tier1: Option<Tier1Cfg>,
-    /// O3 left calls to callees that had never run (ATTR_COLD): callee -> those O3
-    /// functions, built again once the callee first runs (the path became warm)
-    cold_users: HashMap<u32, Vec<u32>>,
-    /// O3 left calls to callees whose RIR was being built on another thread when its snapshot was
-    /// walked: callee -> those O3 functions, built again once the callee's RIR is set (set_rir),
-    /// so what O3 inlines does not depend on which build finished first. Such builds are not
-    /// cached (an incomplete build).
-    body_users: HashMap<u32, Vec<u32>>,
+    /// O3 code that kept a call to a callee it could not or would not inline (never ran yet, its
+    /// body not there or still building): callee -> those O3 functions, built again once the
+    /// callee proves hot itself -- its own O3 build installs (kept_callee_hot). A call the program
+    /// rarely makes stays a call: rebuilding every such caller when the callee's body came or it
+    /// first ran made warm Sandbox runs build ~180 O3 fns again, the big ones several times.
+    kept_users: HashMap<u32, Vec<u32>>,
     /// O3 rebuilds per slot for that reason (bounded)
     retiers: HashMap<u32, u8>,
     frequency_profiles: HashMap<u32, FrequencyProfile>,
@@ -3832,8 +3830,7 @@ impl Unit {
             aux: false,
             nc_window: std::sync::OnceLock::new(),
             code: Default::default(),
-            cold_users: HashMap::new(),
-            body_users: HashMap::new(),
+            kept_users: HashMap::new(),
             retiers: HashMap::new(),
             frequency_profiles: HashMap::new(),
             hot_entry: 0,
@@ -5723,16 +5720,6 @@ impl Unit {
         if let FnKey::Closure(_, _, parent) = self.fns[id as usize].key {
             drop_completed_body(self, parent);
         }
-        // O3 builds that kept a call to it for lack of a body: built again now that it has one
-        if !self.body_users.is_empty() {
-            if let Some(users) = self.body_users.remove(&id) {
-                for t in users {
-                    if t != id {
-                        self.retier(t);
-                    }
-                }
-            }
-        }
     }
 
     fn single_ref(&self, id: u32) -> bool {
@@ -6793,14 +6780,6 @@ impl Unit {
         if TWINS_RAN.load(Ordering::Relaxed) > 0 && code_as_now().is_none_or(|k| k.tier != tier::STUB) {
             self.borrow_callees(relocs.iter().filter_map(|r| match r.target { relax_backend::rir::Reloc::Call(c) => Some(c), _ => None }));
         }
-        // its first run: O3 code that kept a call to it as never-run is built again
-        if first && !self.cold_users.is_empty() {
-            if let Some(users) = self.cold_users.remove(&id) {
-                for t in users {
-                    self.retier(t);
-                }
-            }
-        }
         self.stats.code_bytes += code.len() as u64;
         self.exec_event(id, "install");
         if self.prog.session.runtime.profile {
@@ -7058,13 +7037,6 @@ impl Unit {
         SlotWord::of(&self.slots, id).store(at, Ordering::SeqCst);
         if matches!(self.fns[id as usize].key, FnKey::Plain(_)) {
             self.follow_twin(id);
-        }
-        if !self.cold_users.is_empty() {
-            if let Some(users) = self.cold_users.remove(&id) {
-                for t in users {
-                    self.retier(t);
-                }
-            }
         }
         self.stats.code_bytes += len as u64;
         self.exec_event(id, "install");
@@ -9948,7 +9920,7 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
             // waited for BORROW_QUEUE forever)
             let borrowed = if q.is_empty() { BORROW_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).pop_front() } else { None };
             let base = if q.is_empty() && borrowed.is_none() { O2_BASE.lock().unwrap_or_else(|e| e.into_inner()).pop_front() } else { None };
-            let o1v = if q.is_empty() && borrowed.is_none() && base.is_none() && FIRST_PRESENT.load(Ordering::Acquire) {
+            let o1v = if q.is_empty() && borrowed.is_none() && base.is_none() && past_startup() {
                 O1V_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
             } else { None };
             if !q.is_empty() {
@@ -10030,7 +10002,7 @@ unsafe fn o2_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     let _cost = relax_codegen::fncost::Record::new(id, 0, "O2");
     let t0 = cpu_ns();
     let epoch = PATCH_EPOCH.load(Ordering::SeqCst);
-    let snapshot = !FIRST_PRESENT.load(Ordering::Acquire);
+    let snapshot = !past_startup();
     if !(&*up).refresh_verified(id) {
         await_verdict(id, Await::O2);
         o2_drop(D_VERDICT, up, id);
@@ -15479,7 +15451,7 @@ fn ran_in_twin_code(u: &Unit, c: u32) -> bool {
 /// first O3 tier-ups compiled ~100 such helpers on the UI thread). After the first present only
 /// (startup stays lazy). Called off the owner, between a build and its install.
 unsafe fn prebuild_callees(up: *mut Unit, relocs: &[relax_backend::rir::RelocAt], absent: &[u32]) {
-    if !FIRST_PRESENT.load(Ordering::Acquire) {
+    if !past_startup() {
         return;
     }
     let calls = |relocs: &[relax_backend::rir::RelocAt]| -> Vec<u32> {
@@ -15973,12 +15945,11 @@ pub(crate) fn tier_explain(u: &Unit, id: u32) -> (String, Vec<(String, String)>)
     {
         let key = u as *const Unit as usize;
         let left: Vec<u32> = UNVERIFIED_LEFT.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|x| x.0 == key && x.2 == id).map(|x| x.1).collect();
-        let cold = u.cold_users.values().filter(|v| v.contains(&id)).count();
-        let body = u.body_users.values().filter(|v| v.contains(&id)).count();
+        let kept = u.kept_users.values().filter(|v| v.contains(&id)).count();
         let vstate = |c: u32| match u.verdict_state(c) { Verdict::Clean => "clean", Verdict::Failed(_) => "failed", Verdict::Pending => "pending", Verdict::Unverifiable(_) => "unverifiable" };
-        rows.push(("SPEC-V".into(), format!("flagged unverified {}; verdict {}; waits to be built again for: {} unverified callee(s) [{}], {} never-run, {} building",
+        rows.push(("SPEC-V".into(), format!("flagged unverified {}; verdict {}; waits to be built again for: {} unverified callee(s) [{}], {} kept callee(s) turning hot",
             f.unverified.load(Ordering::Relaxed), match u.verdict_state(id) { Verdict::Unverifiable(w) => format!("unverifiable ({})", w), _ => vstate(id).to_string() }, left.len(),
-            left.iter().take(6).map(|&c| format!("#{} {} {}{}", c, short_name(&u.fns[c as usize].name), vstate(c), if u.fns[c as usize].unverified.load(Ordering::Relaxed) { " flagged" } else { "" })).collect::<Vec<_>>().join(", "), cold, body)));
+            left.iter().take(6).map(|&c| format!("#{} {} {}{}", c, short_name(&u.fns[c as usize].name), vstate(c), if u.fns[c as usize].unverified.load(Ordering::Relaxed) { " flagged" } else { "" })).collect::<Vec<_>>().join(", "), kept)));
     }
     if !allowed || awaiting {
         rows.push(("verdict".into(), format!("O3 {}; {}", if allowed { "allowed" } else { "not allowed" }, match u.verdict_state(id) { Verdict::Clean => "clean".to_string(), Verdict::Failed(e) => format!("failed, {} events", e.len()), Verdict::Pending => "pending".to_string(), Verdict::Unverifiable(w) => format!("unverifiable: {}", w) })));
@@ -16089,13 +16060,13 @@ fn spawn_tier1_threads(runtime: &crate::options::RuntimeOptions, options: &crate
 /// queued builds per burst worker (spawn_tier1_threads)
 const O3_BURST_PER: usize = 8;
 
-/// Burst worker `j` (0 = the first past the level's workers) may build now: the program has
-/// presented its first frame and more than O3_BURST_PER * (j + 1) builds wait.
+/// Burst worker `j` (0 = the first past the level's workers) may build now: the program is past
+/// its startup (past_startup) and more than O3_BURST_PER * (j + 1) builds wait.
 fn tier1_burst_admits(j: usize, queued: usize) -> bool {
     // only while the UI thread has not waited on the JIT for a second: a level load's thousands
     // of lazy compiles (each typed and lowered on the UI thread) never share the cores with the
     // burst (the user's cold Sandbox: 11 burst workers ran through the 'leap' load)
-    FIRST_PRESENT.load(Ordering::Acquire) && queued > O3_BURST_PER * (j + 1) && crate::postframe::ui_idle_ns() >= BURST_UI_QUIET_NS
+    past_startup() && queued > O3_BURST_PER * (j + 1) && crate::postframe::ui_idle_ns() >= BURST_UI_QUIET_NS
 }
 
 /// the UI thread's JIT-idle time burst workers wait for
@@ -16549,10 +16520,13 @@ impl Unit {
         r
     }
 
-    /// Queues O3 slot `id` to be built again (a callee it kept as a never-run call has
-    /// run since); at most RETIERS times per slot.
+    /// Queues O3 slot `id` to be built again (a callee it kept as a call turned hot, a verdict
+    /// or a twin changed what it may inline); at most RETIERS times per slot. MAKEPAD_RUN_O3_TRACE
+    /// names the line that asked.
+    #[track_caller]
     fn retier(&mut self, id: u32) {
         if t1prof_replay(&self.prog.session.options) { return; }
+        if tier1_trace() { eprintln!("O3 retier #{} from line {} (n={})", id, std::panic::Location::caller().line(), self.retiers.get(&id).copied().unwrap_or(0)); }
         const RETIERS: u8 = 4;
         let _k = crate::zone_alloc::kept();
         let n = self.retiers.entry(id).or_insert(0);
@@ -18159,12 +18133,21 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         for p in &preps { so.insert(p.0, 2); }
         for c in &gave { so.insert(*c, 1); }
     }
+    // the fronts this round's builds asked for that no round made yet: the next round makes them
+    // (each slot once), so a candidate that gave back is tried again after them. One level of its
+    // inline candidates per round, as deep as they go: a bound on the tries left the deeper ones
+    // out, the build installed incomplete and was built again when their bodies came (Sandbox
+    // warm: 277 incomplete O3 builds, the big ones built 3-5 times)
+    let progress = needs.iter().any(|s| !fronted.contains(s));
     for c in gave {
         let mut l = left_out.borrow_mut();
         let n = l.entry(c).or_insert(0);
-        *n += 1;
-        // tried once more after the fronts it needed (this round's `needs`), off the owner again:
-        // not built by the snapshot on the owner because its split was tried
+        // (a try that made way for new fronts is not counted: SPLIT_TRIES bounds the tries that did not)
+        if !progress {
+            *n += 1;
+        }
+        // tried again after the fronts it needed, off the owner again: not built by the snapshot on
+        // the owner because its split was tried
         if *n < SPLIT_TRIES {
             fronted.remove(&c);
             split_tried.borrow_mut().remove(&(c, false));
@@ -18516,17 +18499,19 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // it a panic through the frame skipped its cleanups.
                 let recursive = self_call || inlined.contains(&id);
                 // calls kept for lack of a body, by why (the inliner never saw these callees):
-                // never run -> built again at its first run (cold_users), as the snapshot's
-                // never-run candidates are; its RIR being built on another thread at the walk ->
-                // built again when its RIR is set (body_users; at once when it is set already);
-                // unverified -> UNVERIFIED_LEFT. Those make the build incomplete (this run builds
-                // it again when the body comes), yet its code is valid as built: it is stored like
+                // never run, its RIR being built on another thread at the walk or set meanwhile ->
+                // built again once that callee turns hot itself (kept_users: its own O3 build),
+                // not when its body comes; unverified -> UNVERIFIED_LEFT. Those make the build
+                // incomplete, yet its code is valid as built: it is stored like
                 // any other build. A stored O3 entry is valid iff its inputs are unchanged -- the
                 // key (its own body, the codegen identity) and the certificate of the slots it
                 // inlined (record_deps) -- so a warm launch installs it as it is, whatever that
                 // launch has loaded or run yet: a callee kept as a call stays a call.
                 let mut incomplete = !unverified_left.is_empty();
-                let mut body_again = false;
+                let keep_user = |u: &mut Unit, c: u32| crate::zone_alloc::kept_with(|| {
+                    let v = u.kept_users.entry(c).or_default();
+                    if !v.contains(&id) { v.push(id); }
+                });
                 // (inspect why-tier: per kept callee its state and what builds this slot again)
                 let mut notes: Vec<(u32, &'static str)> = Vec::new();
                 {
@@ -18546,25 +18531,15 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                             continue;
                         }
                         if !f.compiled && !f.ran_before.load(Ordering::Relaxed) && f.rir.is_none() {
-                            crate::zone_alloc::kept_with(|| {
-                                let v = u.cold_users.entry(c).or_default();
-                                if !v.contains(&id) { v.push(id); }
-                            });
-                            notes.push((c, "never ran: again at its first run"));
+                            keep_user(u, c);
+                            notes.push((c, "never ran: again once it is hot"));
                             continue;
                         }
-                        if f.rir.is_some() {
-                            // its RIR came while this was built: at once
+                        if f.rir.is_some() || f.building {
+                            let came = f.rir.is_some();
                             incomplete = true;
-                            body_again = true;
-                            notes.push((c, "RIR came meanwhile: again now"));
-                        } else if f.building {
-                            incomplete = true;
-                            crate::zone_alloc::kept_with(|| {
-                                let v = u.body_users.entry(c).or_default();
-                                if !v.contains(&id) { v.push(id); }
-                            });
-                            notes.push((c, "RIR building: again when it is set"));
+                            keep_user(u, c);
+                            notes.push((c, if came { "RIR came meanwhile: again once it is hot" } else { "RIR building: again once it is hot" }));
                         } else {
                             notes.push((c, "compiled, no RIR, not building: NOT built again"));
                         }
@@ -18580,7 +18555,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                             None => agg.push((w, 1, short_name(&u.fns[c as usize].name).to_string())),
                         }
                     }
-                    let txt = format!("at {:.2} s: {}; root {}; {}", wall_ns() as f64 / 1e9, if incomplete { "incomplete (built again when the bodies come)" } else { "complete" },
+                    let txt = format!("at {:.2} s: {}; root {}; {}", wall_ns() as f64 / 1e9, if incomplete { "incomplete (built again once a kept callee turns hot)" } else { "complete" },
                         if root_unverified { "unverified" } else { "verified" },
                         if agg.is_empty() { "no kept callee notes".to_string() } else { agg.iter().map(|(w, n, e)| format!("{} x{} (e.g. {})", w, n, e)).collect::<Vec<_>>().join("; ") });
                     let mut m = O3_BUILD_NOTES.lock().unwrap_or_else(|e| e.into_inner());
@@ -18798,18 +18773,23 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 }
                 o3_owner(4, tn);
                 let tr = cpu_ns();
-                // never-run callees kept as calls: rebuilt when one first runs (or already has)
-                let mut again = body_again;
+                // never-run callees kept as calls (cold at the walk): rebuilt once one turns hot
+                let mut again = false;
                 for c in cold_left {
-                    if u.fns[c as usize].compiled {
-                        again = true;
-                    } else {
-                        crate::zone_alloc::kept_with(|| {
-                            let v = u.cold_users.entry(c).or_default();
-                            if !v.contains(&id) {
-                                v.push(id);
-                            }
-                        });
+                    crate::zone_alloc::kept_with(|| {
+                        let v = u.kept_users.entry(c).or_default();
+                        if !v.contains(&id) {
+                            v.push(id);
+                        }
+                    });
+                }
+                // this build is the proof that `id` is hot: the O3 code that kept calls to it is
+                // built again, now with it to inline
+                if let Some(users) = u.kept_users.remove(&id) {
+                    for t in users {
+                        if t != id {
+                            u.retier(t);
+                        }
                     }
                 }
                 // callees its snapshot left out as unverified that are verified by now (the rest:
@@ -18980,6 +18960,16 @@ static STARTUP_CACHED: relax_session::sync::Mutex<Vec<(usize, Vec<u32>, u8)>> =
     relax_session::sync::Mutex::new(Vec::new());
 pub static FIRST_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FIRST_PRESENT: AtomicBool = AtomicBool::new(false);
+/// A program that never presents a frame (a test harness, a program without makepad-platform: tests,
+/// benches, CLI tools): its startup ends where its main starts (startup_main), and from there on it
+/// tiers as an app does after its first present.
+static HEADLESS: AtomicBool = AtomicBool::new(false);
+
+/// Past startup: the first present, or the main of a headless program. Tier-up (O3 burst workers, O2
+/// full builds, prebuilt callees) and the cheapest-code rule for lazy compiles follow it.
+pub(crate) fn past_startup() -> bool {
+    FIRST_PRESENT.load(Ordering::Acquire) || HEADLESS.load(Ordering::Acquire)
+}
 // Live edits have their own admission gate: disabling speculative startup scheduling
 // must not allow the watcher to mutate a program while it is booting.
 static LIVE_STARTUP_DONE: AtomicBool = AtomicBool::new(false);
@@ -19010,18 +19000,20 @@ fn startup_phase() -> bool {
     STARTUP_PHASE.load(Ordering::Acquire) == 1
 }
 
-/// A build for a program thread (not a speculative or tier-up worker's) after the first present.
+/// A build for a program thread (not a speculative or tier-up worker's) past startup (the first
+/// present, or a headless program's main).
 /// Its lazy compiles are built as the startup's are (baseline code, no inline candidates but Relax
 /// core's tiniest; hot code tiers up as startup code does): the cheapest code that runs, so a
 /// first call -- a cold load's burst, or code a warm launch never ran before -- costs the least
 /// wait (JITLOOP-B: the warm start hides such compiles, it does not chase them to zero).
 fn ahead_foreground() -> bool {
     let class = if owner::is_owner() { owner::serving().0 } else { owner::Class::Program };
-    FIRST_PRESENT.load(Ordering::Acquire) && class == owner::Class::Program && !IS_WORKER.try_with(|w| w.get()).unwrap_or(false)
+    past_startup() && class == owner::Class::Program && !IS_WORKER.try_with(|w| w.get()).unwrap_or(false)
 }
 
+/// O3 waits for the startup's release: a headless program's never does (startup_main).
 fn startup_holds_tier1() -> bool {
-    matches!(STARTUP_PHASE.load(Ordering::Acquire), 1 | 2)
+    matches!(STARTUP_PHASE.load(Ordering::Acquire), 1 | 2) && !HEADLESS.load(Ordering::Acquire)
 }
 
 fn defer_startup_root(up: *mut Unit, id: u32, depth: u8) -> bool {
@@ -19097,11 +19089,17 @@ const RECORD_BATCH: usize = 8;
 /// Releases speculation, O1 inline candidates and O3 at the first present, never on wall
 /// time (Stage needs 40-58 s from main to present; a clock released speculation in the middle
 /// of startup, and main then waited seconds on the unit lock behind speculative builds). A
-/// program that never presents (headless) releases once its demand compiles have been quiet
-/// for STARTUP_QUIET_NS. No unit pointer is retained: an exiting program can retire its unit
-/// while this thread sleeps.
-pub fn startup_main(runtime: &crate::options::RuntimeOptions) {
+/// program that never presents (`presents` false: a test harness, a program without
+/// makepad-platform) tiers up from its main on as an app past its first present (past_startup,
+/// startup_holds_tier1): a busy cold test, bench or CLI tool held O3 for as long as it kept compiling.
+/// Speculation stays lean: it is released, for any program that does not present, once its demand
+/// compiles have been quiet for STARTUP_QUIET_NS. No unit pointer is retained: an exiting program
+/// can retire its unit while this thread sleeps.
+pub fn startup_main(runtime: &crate::options::RuntimeOptions, presents: bool) {
     let main_at = wall_ns();
+    if !presents {
+        HEADLESS.store(true, Ordering::Release);
+    }
     let runtime = crate::zone_alloc::kept_clone(runtime);
     let release = move || {
         lower_worker_priority(&runtime);
@@ -20314,8 +20312,9 @@ unsafe fn o3_assemble_owner(up: *mut Unit, options: &crate::options::Options, a:
 /// O1 builds one take of an O3 snapshot prepares (o3_candidates_begin): a publish's item bound
 const CAND_TAKE: usize = 8;
 
-/// Takes an O3 snapshot gives a candidate whose preparation needed fronts: each round fronts the
-/// level of inline candidates the last one revealed (each round walks the frontier again)
+/// Takes of an O3 snapshot that give a candidate back without asking for a front no round made yet
+/// (each round fronts the level of inline candidates the last one revealed; one that asked for new
+/// fronts is tried again however deep its candidates go): then it is left out of the snapshot
 const SPLIT_TRIES: u8 = 2;
 
 /// O1 builds of `ids` off the owner (their fronts made ahead): prepared in a take (a publish), optimised on

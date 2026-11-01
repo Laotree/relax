@@ -1762,8 +1762,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         crate::reload::start_watcher(up, live_inputs.unwrap_or_default());
     }
     jit::start_completion(up, runtime);
-    jit::live_needs_present(!live_tests && u.prog.crates.iter().any(|c| u.prog.syms.str(c.name) == "makepad_platform"));
-    jit::startup_main(runtime);
+    let platform = u.prog.crates.iter().any(|c| u.prog.syms.str(c.name) == "makepad_platform");
+    jit::live_needs_present(!live_tests && platform);
+    // a test harness never presents, nor does a program without the platform: no startup to wait out
+    jit::startup_main(runtime, platform && !HARNESS_RUN.load(Ordering::Acquire));
     relax_codegen::fncost::mark("boot done, calling main");
     let main_ms = crate::clock::ms_since_start();
     MAIN_START_MS.store(main_ms as u64, Ordering::Relaxed);
