@@ -224,11 +224,6 @@ impl Inputs {
         }).collect::<BTreeSet<_>>().into_iter().collect()
     }
 
-    /// More source files than this in one settled batch is a bulk change.
-    pub(super) const BULK_SOURCES: usize = 16;
-    /// Sources of more packages than this in one settled batch is a bulk change.
-    pub(super) const BULK_PACKAGES: usize = 4;
-
     /// Native bindings and the compile unit's std are shared by every domain. A fresh app
     /// domain cannot replace them; keep the current app and report the host restart instead.
     /// An input of makepad's own process (not a program source a patch can take).
