@@ -3058,7 +3058,7 @@ fn compile_failed_stub(up: usize, slot: u32, p: &(dyn std::any::Any + Send)) -> 
         let message = format!("internal compiler error compiling `{}` (slot {}) on its first call: {}", name, slot, text);
         eprintln!("makepad-run: {}", message);
         crate::inspect::flightrec::event("compile.ice", &message, slot as u64, 0);
-        let (code, relocs) = error_stub(u, slot, &message);
+        let (code, relocs) = error_stub(u, &message);
         u.emit_or_redirect(&code, &relocs, "error stub").unwrap_or_else(|e| panic!("{}; and its error stub was not emitted: {}", message, e))
     })
 }
@@ -3733,7 +3733,7 @@ impl Unit {
             if no_codegen {
                 Box::new(relax_backend::rir::SlotTable::new(NC_STRIDE as u64, NC_STRIDE as u64, 8, TIER_REC as u64))
             } else {
-                Box::new(relax_backend::rir::SlotTable::new(THUNK_SIZE as u64, STUB_SIZE as u64, 8, TIER_REC as u64))
+                Box::new(relax_backend::rir::SlotTable::new(THUNK_SIZE as u64, STUB_SIZE as u64, if crate::harness::live::enabled() { 16 } else { 8 }, TIER_REC as u64))
             }
         });
         // no-codegen: segment 0 is a window of the precompiled thunk and stub pools and the
@@ -3971,6 +3971,7 @@ impl Unit {
             let _ = u.syms.intern(crate::syms::SymKind::Rt(name), addr);
         }
         let _ = u.syms.intern(crate::syms::SymKind::Rt("null"), 0);
+        u.init_tls();
         // MAKEPAD_RUN_PERTURB: shift what code must not depend on (syms.rs reloc_sig)
         let n = crate::syms::perturb(options);
         if n > 0 {
@@ -3984,7 +3985,6 @@ impl Unit {
         }
         // a call of a panic entry inlined into an invoked call's body unwinds into its pad
         relax_codegen::opt::set_unwind_hosts(vec![u.rs.panic_site, u.rs.panic_bounds, u.rs.panic_impl]);
-        u.init_tls();
         // layouts normalize projections in field types (`struct P(<P as Flags>::Internal)`)
         // provided crates' trusted types: Relax's layout must be rustc's, else the type is used
         // through the crate's fns only (opaque) and the mismatch is reported
@@ -4133,7 +4133,7 @@ impl Unit {
         if relax_codegen::interp::blob::is_blob(code) {
             let mut c = code.to_vec();
             relax_backend::rir::link(&mut c, 0, relocs, &|r| self.env.reloc_value(r))?;
-            return relax_codegen::interp::install_linked(&c, self.env.tls_slow, self.env.resume);
+            return relax_codegen::interp::install_linked(&c, self.env.tls_slow, self.env.resume, self.slots.table_stride() - 8);
         }
         match relax_codegen::interp::redirect_target(code) {
             Some(t) if relocs.is_empty() => Ok(t),
@@ -4224,7 +4224,8 @@ impl Unit {
         if !tw.compiled || tw.build_err.is_some() || crate::stale::lookup(tw.code).is_some() {
             return None;
         }
-        let at = tw.code;
+        // A borrowed body must still enter its twin's mark and inline tree.
+        let at = if crate::harness::live::enabled() && !self.aux { self.slots.thunk(t) } else { tw.code };
         self.fns[id as usize].borrowed = true;
         SlotWord::of(&self.slots, id).store(at, Ordering::SeqCst);
         let n = SPECV_BORROWS.fetch_add(1, Ordering::Relaxed);
@@ -4264,7 +4265,9 @@ impl Unit {
         if !bf.borrowed || bf.compiled {
             return;
         }
-        let at = if live { tw.code } else { self.slots.stub(b) };
+        let at = if live {
+            if crate::harness::live::enabled() && !self.aux { self.slots.thunk(t) } else { tw.code }
+        } else { self.slots.stub(b) };
         self.fns[b as usize].borrowed = live;
         SlotWord::of(&self.slots, b).store(at, Ordering::SeqCst);
     }
@@ -5279,6 +5282,35 @@ impl Unit {
         id
     }
 
+    /// The call table names a loader entry in a live session; replacements update its body
+    /// word. Both cached Reloc::Slot calls and the permanent thunk take this same path.
+    unsafe fn init_slot_target(&self, id: u32, target: u64) {
+        let table = self.slots.table(id);
+        let body = self.slots.body(id);
+        *(body as *mut u64) = target;
+        if table != body {
+            *(table as *mut u64) = if !self.aux {
+                self.marked_thunk(id, body)
+            } else {
+                self.emit_code(&x64::thunk(body), "relax::entry")
+            };
+        }
+    }
+
+    fn marked_thunk(&self, id: u32, body: u64) -> u64 {
+        crate::harness::reach::slot(id);
+        let code = x64::entry_thunk(id, crate::harness::reach::TLS_ENTERED, self.env.tls_key, self.env.tls_slow, body);
+        self.emit_code(&code, "relax::entry_mark")
+    }
+
+    /// Interpreted calls can stay on the interpreter stack, bypassing native entry thunks.
+    fn mark_interpreted(&self, id: u32, at: u64) {
+        if crate::harness::live::enabled() && !self.aux && relax_codegen::interp::is_entry(at) {
+            crate::harness::reach::slot(id);
+            relax_codegen::interp::set_entry_mark(at, crate::harness::reach::TLS_ENTERED, id);
+        }
+    }
+
     /// fn_id's new slot `id` for `key` (the caller holds fn_create).
     fn fn_create_locked(&self, key: &FnKey, name: String) -> u32 {
         let id = self.fns.len() as u32;
@@ -5300,7 +5332,7 @@ impl Unit {
                 os::mem::write_code(stub_addr, &stub);
                 os::mem::write_code(self.slots.thunk(id), &thunk);
             }
-            *(slot_addr as *mut u64) = stub_addr;
+            self.init_slot_target(id, stub_addr);
         }
         self.slot_named(id, key);
         self.fns.push(Self::new_entry(entry_key, name, file, stub_addr, stub.len() as u32));
@@ -5454,7 +5486,7 @@ impl Unit {
                 // the 32-bit web target: thunks are what function pointers name, so thunks, stubs,
                 // table words and tier records all live in the program's 4 GB window
                 let code = count * (THUNK_SIZE + STUB_SIZE);
-                let base = crate::web32::reserve_slots(code, count * (8 + TIER_REC));
+                let base = crate::web32::reserve_slots(code, count * (self.slots.table_stride() as usize + TIER_REC));
                 (base, base + (count * THUNK_SIZE) as u64, base + code as u64)
             } else {
                 // the thunks are in the unit's code area, so calls reach them with a direct branch
@@ -5465,10 +5497,10 @@ impl Unit {
                     perf_map(thunk, count * THUNK_SIZE, &format!("relax::thunks (segment {})", seg));
                 }
                 let code = count * STUB_SIZE;
-                let stub = os::mem::reserve(code, count * (8 + TIER_REC));
+                let stub = os::mem::reserve(code, count * (self.slots.table_stride() as usize + TIER_REC));
                 (thunk, stub, stub + code as u64)
             };
-            let tier = table + (count * 8) as u64;
+            let tier = table + count as u64 * self.slots.table_stride();
             self.slots.install(seg, thunk, stub, table, tier);
         }
         let mut id = first as u64;
@@ -5478,7 +5510,7 @@ impl Unit {
             let id32 = id as u32;
             os::mem::commit(self.slots.thunk(id32), (run * THUNK_SIZE as u64) as usize);
             os::mem::commit(self.slots.stub(id32), (run * STUB_SIZE as u64) as usize);
-            os::mem::commit(self.slots.table(id32), (run * 8) as usize);
+            os::mem::commit(self.slots.table(id32), (run * self.slots.table_stride()) as usize);
             os::mem::commit(self.slots.tier(id32), (run * TIER_REC as u64) as usize);
             id += run;
         }
@@ -5522,7 +5554,7 @@ impl Unit {
         for i in 0..n as u32 {
             let id = first + i;
             let stub_addr = self.slots.stub(id);
-            unsafe { *(self.slots.table(id) as *mut u64) = stub_addr };
+            unsafe { self.init_slot_target(id, stub_addr) };
             self.fns.push(Self::new_entry(unnamed.clone(), String::new(), 0, stub_addr, stub_len as u32));
         }
         first
@@ -5609,8 +5641,8 @@ impl Unit {
     }
 
     /// All O1 RIR installations, including sandbox twins, pass through here.
-    fn set_rir(&mut self, id: u32, mut func: relax_backend::rir::Func) {
-        crate::harness::reach::instrument(self, id, &mut func);
+    fn set_rir(&mut self, id: u32, func: relax_backend::rir::Func) {
+        if !self.aux { crate::harness::reach::note(id, func.inl_slots.iter().copied()); }
         if func.cabi.is_some() {
             self.fns[id as usize].entry_ref.store(true, Ordering::Relaxed);
         }
@@ -6005,9 +6037,17 @@ impl Unit {
                 cx.finish();
                 if let Some(err) = cx.errors.first() { return Err(err.clone()); }
                 cx.f.verify()?;
-                crate::harness::reach::instrument(self, parent, &mut cx.f);
                 let code = relax_codegen::native::compile(&self.prog.session.options, &cx.f, &self.env)?;
                 let entry = self.emit_or_redirect(&code.code, &code.relocs, "promoted initializer")?;
+                let entry = if crate::harness::live::enabled() && !self.aux {
+                    // This initializer has no slot of its own: its entry belongs to the parent.
+                    self.mark_interpreted(parent, entry);
+                    if relax_codegen::interp::is_entry(entry) { entry } else {
+                        let body = self.rw_data(8, 8);
+                        unsafe { write_bytes(body, &entry.to_le_bytes()) };
+                        self.marked_thunk(parent, body)
+                    }
+                } else { entry };
                 let buf = self.rw_data(l.size.max(1) as u64, l.align.max(8) as u64);
                 let result = {
                     let _scope = ConstEvalScope::enter(&self.prog, body.def);
@@ -6700,6 +6740,7 @@ impl Unit {
             Some(t) => t,
             None => self.emit_grouped(group, code, relocs)?,
         };
+        self.mark_interpreted(id, at);
         if redirect.is_none() {
             self.index_code(at, code.len() as u32, id, info);
         }
@@ -7564,7 +7605,7 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
             Err(p) if p.is::<crate::preempt::OwnerBusy>() => {
                 BUSY_PENDING.with(|b| b.set(true));
                 let u = &mut *up;
-                let (code, relocs) = error_stub(u, id, "the compiler's owner thread is busy with an earlier request (the request is cancelled)");
+                let (code, relocs) = error_stub(u, "the compiler's owner thread is busy with an earlier request (the request is cancelled)");
                 u.emit_or_redirect(&code, &relocs, "error stub").unwrap_or(0)
             }
             Err(p) => std::panic::resume_unwind(p),
@@ -7942,7 +7983,7 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
         // the call fails with DEFERRED_RETRY and the outer compile retries after the load
         Err(e) if !outer && e.starts_with(DEFERRED_RETRY) => {
             let u = &mut *up;
-            let (code, relocs) = error_stub(u, id, DEFERRED_RETRY);
+            let (code, relocs) = error_stub(u, DEFERRED_RETRY);
             u.emit_or_redirect(&code, &relocs, "error stub").unwrap_or(0)
         }
         Err(e) => install_error(up, id, &e),
@@ -8238,7 +8279,7 @@ unsafe fn install_error(up: *mut Unit, id: u32, e: &str) -> u64 {
             }
             // a body that failed to compile panics when called, with the error's first line
             let msg = format!("compile error in {}: {}", name, e.lines().next().unwrap_or(""));
-            let (code, relocs) = error_stub(u, id, &msg);
+            let (code, relocs) = error_stub(u, &msg);
             let _as = code_as(CodeKind::new(tier::STUB, origin::FRESH));
             u.install_unchecked(id, &code, &relocs, Vec::new(), 0).expect("error stub links")
         }
@@ -8268,10 +8309,9 @@ pub(crate) fn perf_map(addr: u64, len: usize, name: &str) {
     }
 }
 
-fn error_stub(u: &mut Unit, id: u32, msg: &str) -> (Vec<u8>, Vec<relax_backend::rir::RelocAt>) {
+fn error_stub(u: &mut Unit, msg: &str) -> (Vec<u8>, Vec<relax_backend::rir::RelocAt>) {
     let options = &u.prog.session.clone().options;
     let mut f = relax_backend::rir::Func::new("error".to_string(), 0);
-    crate::harness::reach::instrument(u, id, &mut f);
     let b = f.block();
     let addr = u.data(msg.as_bytes(), 1, crate::syms::DataKind::Bytes);
     let addr = u.data_sym(addr);
@@ -8330,8 +8370,7 @@ pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u
     // a sandboxed twin: its base slot's RIR, transformed (sandbox.rs)
     let twin_func = match (&*up).fns[id as usize].key {
         FnKey::Sandbox(base) => {
-            let mut f = crate::sandbox::twin_rir(up, id, base)?;
-            crate::harness::reach::instrument(&*up, id, &mut f);
+            let f = crate::sandbox::twin_rir(up, id, base)?;
             // O3 must start from confined RIR, never from the base slot's host RIR.
             (&mut *up).set_rir(id, f.clone());
             Some(f)
@@ -8425,7 +8464,7 @@ pub(crate) unsafe fn install_instrumented(up: *mut Unit, id: u32, gen: u32, base
         }
     };
     edit(&mut f, u);
-    crate::harness::reach::instrument(u, id, &mut f);
+    if !u.aux { crate::harness::reach::note(id, f.inl_slots.iter().copied()); }
     let cg = tier0_codegen_rir(options, &f, u.opt.fold, u.opt.layout);
     let c = {
         let _arena = crate::zone_alloc::job("instrumented codegen", runtime.burst_arena);
@@ -10919,7 +10958,6 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
         (&mut *up).fns[id as usize].build_err = Some(e.as_str().into());
     }
     let mut func = r?;
-    crate::harness::reach::instrument(&*up, id, &mut func);
     // inside a take its lowering came from lowering ahead (a take runs no front): given back if the
     // take bails after this point (its candidates' fronts, its build budget), so the next round
     // takes it again instead of needing it fronted again
@@ -14347,7 +14385,7 @@ impl Drop for Unit {
                 }
                 if self.slots.has_seg(seg) {
                     let count = relax_backend::rir::SlotTable::seg_slots(seg);
-                    os::mem::release(self.slots.seg_base(1, seg), count * STUB_SIZE, count * (8 + TIER_REC));
+                    os::mem::release(self.slots.seg_base(1, seg), count * STUB_SIZE, count * (self.slots.table_stride() as usize + TIER_REC));
                 }
             }
         }
@@ -14844,10 +14882,11 @@ pub(crate) fn slot_word(u: &Unit, id: u32) -> u64 {
     SlotWord::of(&u.slots, id).load(Ordering::SeqCst)
 }
 
-/// Slot `id`'s table word: what a call of the slot runs. Every write goes through `store` /
+/// Slot `id`'s replaceable body word. Every write goes through `store` /
 /// `compare_exchange`, which bring the slot's thunk head in step (calls.DESIGN.md): calls go
 /// `call thunk` -> `jmp code`, direct both, whatever the word is set to (tier-up, patch,
-/// rollback, count stubs, twins).
+/// rollback, count stubs, twins). Live entries keep the mark wrapper in the call table and
+/// replace only its body word, so neither a patch nor a counter can bypass the mark.
 pub(crate) struct SlotWord<'a> {
     slots: &'a relax_backend::rir::SlotTable,
     id: u32,
@@ -14858,7 +14897,7 @@ impl<'a> SlotWord<'a> {
         SlotWord { slots, id }
     }
     fn word(&self) -> &AtomicU64 {
-        unsafe { &*(self.slots.table(self.id) as *const AtomicU64) }
+        unsafe { &*(self.slots.body(self.id) as *const AtomicU64) }
     }
     pub(crate) fn load(&self, o: Ordering) -> u64 {
         self.word().load(o)
@@ -18255,7 +18294,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         func = optimized;
         let mut inlined = Vec::with_capacity(inline_rules.len());
         for (c, _) in inline_rules { inlined.push(c); }
-        if func.entry_mark.is_some() { crate::harness::reach::note(id, func.inl_slots.iter().copied()); }
+        inlined.extend_from_slice(&func.inl_slots);
+        inlined.sort_unstable();
+        inlined.dedup();
         let nounwind_used = func.nounwind_inputs.clone();
         if let Some(w) = debug_env().0.as_deref() {
             if dump_rir_match(&name, w) {
@@ -18630,6 +18671,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     // (a twin by its base: the base's verdict decides)
                     crate::zone_alloc::kept_with(|| for &c in &unverified_inl { a.push((up as usize, match u.fns[c as usize].key { FnKey::Plain(b) => b, _ => c }, id)); });
                 }
+                if !u.aux { crate::harness::reach::note(id, inlined.iter().copied()); }
                 u.fns[id as usize].o3.store(true, Ordering::Relaxed);
                 if o3_first() {
                     // #[relax(O3, always)]: its first code (no O1/O2 ever), installed as a lazy
@@ -18677,6 +18719,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                         None => u.emit_hot(&code, &relocs),
                     }.expect("O3 code links (checked)")
                 };
+                u.mark_interpreted(id, at);
                 if !blob {
                     code_growth(if sandboxed { GROW_MODULE } else if u.retiers.contains_key(&id) { GROW_REOPT } else { GROW_TIERUP }, code.len());
                 }
