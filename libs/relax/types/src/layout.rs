@@ -643,6 +643,15 @@ impl Layouts {
         self.wide_size(lcx, tcx, t, &mut Default::default()) >= bound
     }
 
+    /// `size_of::<T>()` of a type whose u32 layout saturated (`is_too_big`) but which is no
+    /// SizeOverflow: its exact size (rustc lays it out; only Relax's u32 layout cannot hold it).
+    pub fn saturated_size(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, t: TyId) -> Option<u64> {
+        let t = tcx.tys.erase_regions(t);
+        let _ = self.of(lcx, tcx, t);
+        if !self.is_too_big(t) || self.size_overflows(lcx, tcx, t) { return None; }
+        u64::try_from(self.wide_size(lcx, tcx, t, &mut Default::default())).ok()
+    }
+
     /// The exact size of `t` where its u32 layout saturated, with the same choices the layout made
     /// (variant encoding, field reordering): a reordered struct packs its fields by decreasing
     /// alignment (each size a multiple of its alignment, so without padding), a `repr(C)` one lays
