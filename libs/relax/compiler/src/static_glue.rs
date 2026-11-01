@@ -11,7 +11,7 @@
 // only use x16/x17, the registers AAPCS64 leaves to veneers, as the generated ones do. (16-byte
 // entries with the slot as immediates were 8 MB of the iOS binary's text; these are 4 MB.)
 
-use super::{rt_compile, rt_hot, rt_panic_bounds, rt_panic_impl, rt_panic_site, rt_resume_unwind};
+use super::{rt_compile_global, rt_hot, rt_panic_bounds, rt_panic_impl, rt_panic_site, rt_resume_unwind};
 
 /// Slots the pools cover (segment 0 of the slot table).
 pub(super) const SLOTS: usize = 1 << 18;
@@ -57,7 +57,8 @@ std::arch::global_asm!(
     "  adr x16, .",
     "  b _makepad_run_sg_stub_common",
     ".endr",
-    // ---- lazy entry (x16 = slot): saves the argument registers (q0-q7 whole), x8; rt_compile
+    // ---- lazy entry (x16 = global slot: the window it is in names the unit, jit.rs
+    // nc_window_of): saves the argument registers (q0-q7 whole), x8; rt_compile_global
     // returns the address to continue at
     ".p2align 2",
     ".globl _makepad_run_sg_lazy_entry",
@@ -216,7 +217,7 @@ std::arch::global_asm!(
     "  mov sp, x2",
     "  br x3",
     table = sym MAKEPAD_RUN_SG_TABLE,
-    rt_compile = sym rt_compile,
+    rt_compile = sym rt_compile_global,
     rt_hot = sym rt_hot,
     panic_site = sym rt_panic_site,
     panic_bounds = sym rt_panic_bounds,

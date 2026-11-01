@@ -323,6 +323,9 @@ pub struct Unit {
     /// An auxiliary unit (the proc-macro world): never the runtime's unit while a program's is
     /// (`adopt_runtime_unit`).
     pub aux: bool,
+    /// no-codegen mode: the unit's window of the precompiled slot pools (first global slot,
+    /// slots), taken at its first slot (`nc_window`)
+    nc_window: std::sync::OnceLock<(u32, u32)>,
     /// which slot's code holds a pc, and how its frames unwind (a leaf lock: panics, unwinding
     /// and faults read it on their own thread, without a unit call)
     pub code: std::sync::RwLock<CodeTables>,
@@ -2991,7 +2994,23 @@ fn rt_compile(slot: u64) -> u64 {
     // compiler thread-locals are gone, so the whole build runs on the owner (only the request
     // touches this thread's state, through try_with)
     // the unit whose stub called: this thread's (another thread may be in another unit's code)
-    let up = cur_unit() as usize;
+    rt_compile_in(cur_unit() as usize, slot)
+}
+}
+
+rt_fn! {
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+/// No-codegen mode's lazy entry (static_glue.rs): `g` is the global slot of the precompiled
+/// pools; the window it is in names the unit and the unit's own slot.
+fn rt_compile_global(g: u64) -> u64 {
+    let (up, off) = nc_window_of(g as u32);
+    rt_compile_in(up, g - off as u64)
+}
+}
+
+/// rt_compile for the unit at `up`.
+fn rt_compile_in(up: usize, slot: u64) -> u64 {
+    let _keep = os::proc::KeepLastError::new();
     if in_thread_exit() && !owner::is_owner() {
         return owner::call(owner::Class::Program, || unsafe { compile_slot(up as *mut Unit, slot as u32) });
     }
@@ -3010,10 +3029,9 @@ fn rt_compile(slot: u64) -> u64 {
         match r {
             Ok(a) => return a,
             Err(p) if crate::preempt::is_cancelled(&*p) && cancelled < COMPILE_CANCEL_RETRIES => cancelled += 1,
-            Err(p) => return compile_failed_stub(slot as u32, &*p),
+            Err(p) => return compile_failed_stub(up, slot as u32, &*p),
         }
     }
-}
 }
 
 /// Cancelled compiles of one lazy call (a preemption, the owner busy with an earlier request) are
@@ -3025,9 +3043,8 @@ const COMPILE_CANCEL_RETRIES: u32 = 1000;
 /// the fn's name here, since the owner's panic hook is silent.
 #[cold]
 #[inline(never)]
-fn compile_failed_stub(slot: u32, p: &(dyn std::any::Any + Send)) -> u64 {
+fn compile_failed_stub(up: usize, slot: u32, p: &(dyn std::any::Any + Send)) -> u64 {
     let text = payload_text(p);
-    let up = cur_unit() as usize;
     owner::call(owner::Class::Program, || unsafe {
         let u = &mut *(up as *mut Unit);
         let name = if (slot as usize) < u.fns.len() { u.fns[slot as usize].name.to_string() } else { format!("slot {}", slot) };
@@ -3712,13 +3729,11 @@ impl Unit {
                 Box::new(relax_backend::rir::SlotTable::new(THUNK_SIZE as u64, STUB_SIZE as u64, 8, TIER_REC as u64))
             }
         });
-        // no-codegen: segment 0 is the precompiled thunk and stub pools and the static table
-        // (no further segments)
+        // no-codegen: segment 0 is a window of the precompiled thunk and stub pools and the
+        // static table (no further segments), taken at the unit's first slot (ensure_slots)
         #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
         if no_codegen {
             let g = static_glue::glue();
-            let tier = os::mem::alloc_rw(static_glue::SLOTS * TIER_REC);
-            slots.install(0, g.thunks, g.stubs, g.table, tier);
             relax_codegen::interp::set_static_thunks(g.thunks, NC_STRIDE as u64, static_glue::SLOTS as u64, g.table);
             // tier-up: the interpreter's count stubs call the hot path directly
             relax_codegen::interp::set_hot(rt_hot);
@@ -3808,6 +3823,7 @@ impl Unit {
             retired: false,
             keep_compile_state: false,
             aux: false,
+            nc_window: std::sync::OnceLock::new(),
             code: Default::default(),
             cold_users: HashMap::new(),
             body_users: HashMap::new(),
@@ -5352,6 +5368,27 @@ impl Unit {
         }
     }
 
+    /// No-codegen mode: the unit's window of the precompiled slot pools, (first global slot,
+    /// slots), installed as its segment 0 at the first call (an auxiliary unit -- the proc-macro
+    /// world -- takes NC_AUX_SLOTS, a program's unit the largest free range), so units live at the
+    /// same time (a macro world rebuilt under a running program) never share a slot's word.
+    fn nc_window(&self) -> (u32, u32) {
+        *self.nc_window.get_or_init(|| {
+            #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+            {
+                let (off, len) = nc_window_take(self.aux).unwrap_or_else(|| panic!("makepad run: no-codegen mode: no free window of the precompiled thunk pool for a {} unit", if self.aux { "macro world" } else { "program" }));
+                let g = static_glue::glue();
+                let tier = os::mem::alloc_rw(len as usize * TIER_REC);
+                let at = |base: u64| base + off as u64 * NC_STRIDE as u64;
+                self.slots.install(0, at(g.thunks), at(g.stubs), g.table + off as u64 * 8, tier);
+                nc_window_owner(off, self as *const Unit as usize);
+                (off, len)
+            }
+            #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+            unreachable!("no-codegen mode is arm64 Apple only")
+        })
+    }
+
     /// Makes slots `first..first + n` usable (the caller holds `fn_create`): reserves the
     /// segments that do not exist yet, and commits their entries' memory where the OS commits on
     /// demand (Windows). The ids are u32; the only limit below that is address space.
@@ -5361,10 +5398,11 @@ impl Unit {
             panic!("more than 4 billion function instances");
         }
         let (last_seg, _) = relax_backend::rir::SlotTable::locate(last as u32);
-        // no-codegen: segment 0 is precompiled and static (installed by Unit::new)
+        // no-codegen: segment 0 is the unit's window of the precompiled pools
         if self.prog.session.options.no_codegen {
-            if last_seg > 0 {
-                panic!("makepad run: no-codegen mode: more than {} function slots (the precompiled thunk pool)", relax_backend::rir::SlotTable::seg_slots(0));
+            let (_, len) = self.nc_window();
+            if last_seg > 0 || last >= len as u64 {
+                panic!("makepad run: no-codegen mode: more than {} function slots (this unit's window of the precompiled thunk pool)", len);
             }
             return;
         }
@@ -14216,7 +14254,10 @@ impl Drop for Unit {
                 // no-codegen: segment 0 is the precompiled glue (pools in the binary, the static
                 // table) and the only segment; its tier records alone were mapped for this unit
                 if seg == 0 && self.prog.session.options.no_codegen {
-                    os::mem::free(self.slots.tier(0), relax_backend::rir::SlotTable::seg_slots(0) * TIER_REC);
+                    if let Some(&(off, len)) = self.nc_window.get() {
+                        os::mem::free(self.slots.tier(0), len as usize * TIER_REC);
+                        nc_window_free(off);
+                    }
                     continue;
                 }
                 if self.slots.has_seg(seg) {
@@ -24201,6 +24242,65 @@ fn exec_check_now(when: &str) {
     }
     #[cfg(not(target_vendor = "apple"))]
     let _ = when;
+}
+
+/// No-codegen mode: the windows of the precompiled slot pools the live units hold, (first global
+/// slot, slots, unit), sorted by their first slot. A unit takes one at its first slot
+/// (Unit::nc_window) and gives it back when it is dropped.
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+static NC_WINDOWS: relax_session::sync::Mutex<Vec<(u32, u32, usize)>> = relax_session::sync::Mutex::new(Vec::new());
+/// An auxiliary unit's window (the proc-macro world's slots; Fab's whole program had 46,000)
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+const NC_AUX_SLOTS: u32 = 1 << 16;
+
+/// A free window: NC_AUX_SLOTS for an auxiliary unit (the first free range that holds it), the
+/// largest free range for a program's unit.
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+fn nc_window_take(aux: bool) -> Option<(u32, u32)> {
+    let mut w = NC_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut free = Vec::new();
+    let mut at = 0u32;
+    for &(off, len, _) in w.iter() {
+        if off > at {
+            free.push((at, off - at));
+        }
+        at = off + len;
+    }
+    if (at as usize) < static_glue::SLOTS {
+        free.push((at, static_glue::SLOTS as u32 - at));
+    }
+    let pick = if aux { free.into_iter().find(|f| f.1 >= NC_AUX_SLOTS).map(|f| (f.0, NC_AUX_SLOTS)) } else { free.into_iter().max_by_key(|f| f.1) };
+    let (off, len) = pick?;
+    w.push((off, len, 0));
+    w.sort_unstable();
+    Some((off, len))
+}
+
+/// Names the unit of window `off`.
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+fn nc_window_owner(off: u32, unit: usize) {
+    let mut w = NC_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = w.iter_mut().find(|e| e.0 == off) {
+        e.2 = unit;
+    }
+}
+
+/// Window `off` is free again (its unit is dropped).
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+fn nc_window_free(off: u32) {
+    NC_WINDOWS.lock().unwrap_or_else(|e| e.into_inner()).retain(|e| e.0 != off);
+}
+#[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+fn nc_window_free(_off: u32) {}
+
+/// The unit and the first global slot of the window global slot `g` is in.
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+fn nc_window_of(g: u32) -> (usize, u32) {
+    let w = NC_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    match w.iter().find(|e| g >= e.0 && g < e.0 + e.1 && e.2 != 0) {
+        Some(e) => (e.2, e.0),
+        None => panic!("makepad run: no-codegen mode: slot {} of the precompiled pool belongs to no live unit", g),
+    }
 }
 
 /// no-codegen mode's precompiled runtime glue (MAKEPAD_RUN_NO_CODEGEN)
