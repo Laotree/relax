@@ -45,16 +45,17 @@ mod native {
             let mut names = HashMap::new();
             for (i, path) in paths.iter().enumerate() {
                 let path = Path::new(path);
-                let dir = path.parent()?;
-                let wd = if let Some(&wd) = dirs.get(dir) { wd } else {
+                let parent = path.parent()?;
+                for dir in std::iter::once(parent).chain(path.is_dir().then_some(path)) {
+                    if dirs.contains_key(dir) { continue; }
                     let c = CString::new(dir.as_os_str().as_bytes()).ok()?;
                     // MODIFY, ATTRIB, CLOSE_WRITE, MOVED_FROM/TO, CREATE, DELETE,
                     // DELETE_SELF and MOVE_SELF. Watching directories handles new inodes.
                     let wd = unsafe { inotify_add_watch(fd.as_raw_fd(), c.as_ptr(), 0xfce) };
                     if wd < 0 { return None; }
                     dirs.insert(dir.to_owned(), wd);
-                    wd
-                };
+                }
+                let wd = dirs[parent];
                 names.insert((wd, path.file_name()?.as_bytes().to_vec()), i);
             }
             let directories = paths.iter().enumerate().filter_map(|(i, p)| {
@@ -190,7 +191,9 @@ mod native {
             for (i, path) in paths.enumerate() {
                 let path = Path::new(path);
                 let dir = path.parent()?;
-                if !dirs.contains_key(dir) { dirs.insert(dir, std::fs::canonicalize(dir).ok()?.as_os_str().as_bytes().to_vec()); }
+                for watched in std::iter::once(dir).chain(path.is_dir().then_some(path)) {
+                    if !dirs.contains_key(watched) { dirs.insert(watched, std::fs::canonicalize(watched).ok()?.as_os_str().as_bytes().to_vec()); }
+                }
                 let mut full = dirs[dir].clone();
                 full.push(b'/');
                 full.extend_from_slice(path.file_name()?.as_bytes());
@@ -308,9 +311,10 @@ mod native {
             let paths: Vec<_> = paths.collect();
             for (i, path) in paths.iter().enumerate() {
                 let path = Path::new(path);
-                let dir = path.parent()?;
-                let key = dir.to_string_lossy().to_lowercase();
-                let d = if let Some(&d) = index.get(&key) { d } else {
+                let parent = path.parent()?;
+                for dir in std::iter::once(parent).chain(path.is_dir().then_some(path)) {
+                    let key = dir.to_string_lossy().to_lowercase();
+                    if index.contains_key(&key) { continue; }
                     let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
                     // FILE_LIST_DIRECTORY; share read/write/delete so saves and renames proceed;
                     // OPEN_EXISTING; BACKUP_SEMANTICS (a directory) | OVERLAPPED
@@ -320,8 +324,8 @@ mod native {
                     if !entry.arm() { return None; }
                     dirs.push(entry);
                     index.insert(key, dirs.len() - 1);
-                    dirs.len() - 1
-                };
+                }
+                let d = index[&parent.to_string_lossy().to_lowercase()];
                 dirs[d].names.insert(path.file_name()?.to_string_lossy().to_lowercase(), i);
             }
             for (i, path) in paths.iter().enumerate() {
