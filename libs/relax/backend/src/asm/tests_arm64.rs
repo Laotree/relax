@@ -1464,37 +1464,6 @@ fn global_labels_and_data() {
     assert_eq!(o.fixups[0].kind, FixKind::Abs64);
 }
 
-/// Exploration: `RELAX_A64_PROBE=<file> cargo test probe -- --ignored --nocapture` compares every
-/// line of the file with clang one by one and lists the gaps.
-#[test]
-#[ignore]
-fn probe() {
-    let Ok(path) = std::env::var("RELAX_A64_PROBE") else { return };
-    let src = std::fs::read_to_string(path).unwrap();
-    let lines: Vec<&str> = src.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
-    let theirs = clang_each(&lines);
-    let (mut gaps, mut diffs, mut over, mut same) = (Vec::new(), Vec::new(), Vec::new(), 0);
-    for (l, t) in lines.iter().zip(theirs) {
-        match (ours_bytes(l), t) {
-            (Ok(a), Some(b)) if a == b => same += 1,
-            (Ok(a), Some(b)) => diffs.push(format!("{}: ours {} clang {}", l, hex(&a), hex(&b))),
-            (Err(e), Some(_)) => gaps.push(format!("{}: {}", l, e)),
-            (Ok(_), None) => over.push(l.to_string()),
-            (Err(_), None) => same += 1,
-        }
-    }
-    println!("same {} | gaps {} | diffs {} | accepted-but-invalid {}", same, gaps.len(), diffs.len(), over.len());
-    for g in &gaps {
-        println!("GAP {}", g);
-    }
-    for g in &diffs {
-        println!("DIFF {}", g);
-    }
-    for g in &over {
-        println!("OVER {}", g);
-    }
-}
-
 /// Wrong operands: whatever clang rejects, we must reject too (we may reject more).
 #[test]
 fn oracle_mutations_are_rejected() {
