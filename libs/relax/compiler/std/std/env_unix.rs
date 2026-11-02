@@ -290,11 +290,12 @@ pub fn current_dir() -> io::Result<PathBuf> {
 }
 
 pub fn set_current_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
-    let c = crate::fs::cstr(path.as_ref())?;
-    if unsafe { sys::chdir(c.as_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    crate::fs::run_path_with_cstr(path.as_ref(), &|c| {
+        if unsafe { sys::chdir(c.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })
 }
 
 pub fn current_exe() -> io::Result<PathBuf> {

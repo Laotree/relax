@@ -496,15 +496,12 @@ impl Command {
             return self.spawn_now(default, exec);
         };
         let saved_env = self.env.clone();
-        let virt = crate::fs::vfs::kind(Path::new(&dir));
-        let r = match virt {
+        let r = match crate::fs::vfs::kind(Path::new(&dir)) {
             Some((abs, _)) => {
                 self.cwd = None;
                 self.env("MAKEPAD_RUN_WORKSPACE", abs.as_os_str());
                 self.env("MAKEPAD_RUN_VFS", crate::fs::vfs::mounts());
-                let r = self.spawn_now(default, exec);
-                self.cwd = Some(dir);
-                r
+                self.spawn_now(default, exec)
             }
             None => {
                 if crate::env::var_os("MAKEPAD_RUN_WORKSPACE").is_some() {
@@ -513,6 +510,7 @@ impl Command {
                 self.spawn_now(default, exec)
             }
         };
+        self.cwd = Some(dir);
         self.env = saved_env;
         r
     }
