@@ -116,6 +116,7 @@ pub use relax_types::*;
 // glob above to relax-types' stamp, and the compiler's own source was left out of the identity.
 include!(concat!(env!("OUT_DIR"), "/src_stamp.rs"));
 pub mod run;
+mod first_frame;
 pub mod hot_failure;
 mod harness;
 mod test_pkg;

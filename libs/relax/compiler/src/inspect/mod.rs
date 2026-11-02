@@ -36,6 +36,7 @@ pub mod pstream;
 pub mod reliability;
 pub mod remarks;
 pub mod replay;
+pub mod snapshot;
 pub mod run_view;
 pub mod tierlog;
 pub mod timeline;
@@ -187,6 +188,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("inputs", "[match=<path substring>]", "the live session's reload source files, workspace-relative, one path per line and a count; unloaded sources are excluded"),
     ("session", "relaunch", "apply the edits waiting for a restart: a hosted app relaunches its domain in this process (host window and GPU device kept); a program that restarts itself (std::relax::restart_supported) restarts with its state"),
     ("why-hung", "[probe_ms=200]", "is it stuck and why: verdict (deadlock / blocked / busy / idle), the wait chain or cycle, stacks of the threads in it"),
+    ("capture", "[why=<text>]", "capture the JIT's state and flight recording; answers the likely cause and report path"),
     ("why-slow", "[s=3]", "where the time goes: ranked findings -- the main thread's CPU split (program / compiles / makepad run runtime / system), its hot fns, the owner's service, other busy threads"),
     ("prof", "[s=3] [hz=200] [threads=all|main|owner|program|compiler|<name>] [ev=cpu|cycles|instructions|branch-misses|cache-misses] [view=top|tree|callers|flame] [focus=<fn>] [fn=<fn>] [min=1] [n=15] [save=1]", "sampling profile of JIT and host frames: per-thread CPU, activity split, top fns by self time with their hottest line, inclusive fns; view=tree: the call tree with the JIT's inline levels as frames and each frame's tier (focus= re-roots at a fn, view=callers fn= inverts); save=1 / view=flame writes folded stacks; ev= samples a hardware event (Linux)"),
     ("pf", "<summary|frames|frame F<n>|top cpu|jit|gpu|hitches|timeline F<n>|lanes|why-slow|diff> [s=3] [save=x.mkpf] [base=y.mkpf]", "the profiler for agents: the client records the app's live `prof` stream (lanes, phases, waits, compile jobs, JIT installs with tiers, GPU passes) for s seconds and answers as compact text: finding first, tables, drill-down ids; file=<x.mkpf> pf ... answers on a recording"),
@@ -276,7 +278,17 @@ fn dispatch_command(req: &Req, out: &mut Out) {
                     if state.is_empty() {
                         out.err("no run's view in this process (a direct program or bare relax)")
                     } else {
-                        out.line(&format!("{{{state}}}"))
+                        // Include the compiler's diagnostics; the host publishes only the overlay state.
+                        let up = crate::jit::current_unit();
+                        let errors = if up.is_null() { Some(Vec::new()) } else {
+                            crate::owner::call_within(crate::owner::Class::Job, 300, move || unsafe { (*up).errors.clone() })
+                        };
+                        let crashed = crate::run::app_domain().and_then(crate::domain::state)
+                            .is_some_and(|s| matches!(s, crate::domain::DomainState::Crashed(_)));
+                        let parked = crashed && errors.as_ref().is_some_and(|e| !e.is_empty());
+                        let errors = errors.map(|e| format!("[{}]", e.iter().map(|e| json_str(e)).collect::<Vec<_>>().join(",")))
+                            .unwrap_or_else(|| "null".into());
+                        out.line(&format!("{{{state},\"compile_errors\":{errors},\"compile_error_parked\":{parked}}}"))
                     }
                 }
                 Some(how @ ("open" | "dismiss")) => {
@@ -321,6 +333,10 @@ fn dispatch_command(req: &Req, out: &mut Out) {
         "waits" => cmd_waits(out),
         "owner" => cmd_owner(out),
         "why-hung" | "hang" => hang::why_hung(req, out),
+        "capture" => {
+            let s = snapshot::capture(req.get("why").unwrap_or("inspect capture"));
+            out.line(&format!("{{\"cause\":{},\"path\":{}}}", json_str(&s.cause), json_str(&s.path.display().to_string())));
+        }
         "memory" => mem::cmd_memory(req, out),
         "prof" => prof::cmd_prof(req, out),
         "timeline" => timeline::cmd_timeline(req, out),

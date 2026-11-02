@@ -19465,6 +19465,7 @@ pub extern "C" fn relax_first_present() {
             if let Some(t) = STARTUP_THREAD.get() {
                 t.unpark();
             }
+            if let Some(t) = crate::first_frame::THREAD.get() { t.unpark(); }
             relax_codegen::exec_census::report();
             if profile_path().is_some() { crate::exec_profile::report(true); }
         }
