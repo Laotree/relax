@@ -2595,46 +2595,14 @@ pub(crate) fn const_fuel_tick() {
 
 
 thread_local! { static COV_INTERESTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
-fn covtrace(msg: &str) { covtrace_with(msg, false) }
-fn covtrace_with(msg: &str, only_changed: bool) {
-    if std::env::var_os("MAKEPAD_RUN_COVTRACE").is_some() {
+fn covtrace(msg: &str) {
+    if let Some(path) = std::env::var_os("MAKEPAD_RUN_COVTRACE") {
         use std::io::Write;
-        let path = std::path::Path::new(&std::env::var_os("CARGO_TARGET_DIR").unwrap_or_default()).join("covtrace.log");
-        static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
-        let hits = crate::coverage::debug_hits();
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        let changed = *last != hits;
-        let note = if changed { format!(" HITS{}", hits) } else { String::new() };
-        *last = hits;
-        if only_changed && !changed { return; }
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = writeln!(f, "{} t={} {}{}", std::process::id(), covtrace_ms(), msg, note);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{} {}", std::process::id(), msg);
         }
-        // a sampler: the bits change between scope events too
-        static SAMPLER: std::sync::Once = std::sync::Once::new();
-        SAMPLER.call_once(|| {
-            let path = path.clone();
-            let _ = std::thread::Builder::new().name("covsampler".into()).spawn(move || {
-                let mut last = String::new();
-                loop {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                    let hits = crate::coverage::debug_hits();
-                    if hits != last {
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                            let _ = writeln!(f, "{} t={} SAMPLE{}", std::process::id(), covtrace_ms(), hits);
-                        }
-                        last = hits;
-                    }
-                }
-            });
-        });
     }
 }
-fn covtrace_ms() -> u128 {
-    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    T0.get_or_init(std::time::Instant::now).elapsed().as_millis()
-}
-
 /// One evaluation's own counter: the enclosing evaluation's is saved and comes back.
 struct ConstEvalScope { saved_fuel: (u64, u64), saved_coverage: Option<(*mut u64, u64)> }
 
@@ -2648,7 +2616,7 @@ impl ConstEvalScope {
             let mask = (rt_tls_block() + TLS_COVERAGE_DISABLED as u64) as *mut u64;
             let previous = *mask;
             *mask = u64::MAX;
-            covtrace(&format!("enter {} mask={:x} prev={:x} cur_block={:x}", prog.def_path(d), mask as u64, previous, os::tls::get(tls_key()) as u64));
+            covtrace(&format!("enter {} mask={:x} prev={:x} cur_block={:x}{}", prog.def_path(d), mask as u64, previous, os::tls::get(tls_key()) as u64, if { let p = prog.def_path(d); let i = ["TRACE_TOPICS","APP_BUILD_META","panic::HOOK","ACTION_SENDER","web_allocator"].iter().any(|k| p.contains(k)); COV_INTERESTING.with(|c| c.set(i)); i } { crate::coverage::debug_hits() } else { String::new() }));
             (mask, previous)
         });
         ConstEvalScope { saved_fuel, saved_coverage }
@@ -2657,7 +2625,7 @@ impl ConstEvalScope {
 
 impl Drop for ConstEvalScope {
     fn drop(&mut self) {
-        if let Some((mask, previous)) = self.saved_coverage { unsafe { covtrace(&format!("drop mask={:x} restore={:x} cur_block={:x}", mask as u64, previous, os::tls::get(tls_key()) as u64)); *mask = previous; } }
+        if let Some((mask, previous)) = self.saved_coverage { unsafe { covtrace(&format!("drop mask={:x} restore={:x} cur_block={:x}{}", mask as u64, previous, os::tls::get(tls_key()) as u64, if COV_INTERESTING.with(|c| c.replace(false)) { crate::coverage::debug_hits() } else { String::new() })); *mask = previous; } }
         let _ = CONST_EVAL_DEPTH.try_with(|g| g.set(g.get().saturating_sub(1)));
         let _ = CONST_FUEL.try_with(|c| c.set(self.saved_fuel));
     }
@@ -7277,7 +7245,6 @@ pub unsafe fn call_jit_in(u: *mut Unit, domain: u64, entry: u64, arg: u64) -> Re
     let prev = CUR_UNIT.try_with(|c| c.replace(u)).unwrap_or(std::ptr::null_mut());
     adopt_runtime_unit(u);
     window_tls_block();
-    covtrace_with(&format!("call_jit_in entry={:x}", entry), true);
     let sampled = (&*u).tier1.is_some();
     if sampled {
         sampler_enter((&*u).exec_base, (&*u).exec_size);
