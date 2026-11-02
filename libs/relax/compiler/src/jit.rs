@@ -10060,7 +10060,6 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
         }));
         O2_SLOT.store(u32::MAX, Ordering::Relaxed);
         O2_RUNNING.store(false, Ordering::Relaxed);
-        crate::postframe::background_build_ended();
         if r.is_err() {
             if o1 { crate::cache::warm_count::add(crate::cache::warm_count::O1V_DROPPED, 1) } else { o2_drop(D_PANIC, std::ptr::null_mut(), id); }
         }
@@ -15149,8 +15148,6 @@ impl Drop for TierActive {
         if let Some(i) = active.iter().position(|id| *id == self.0) { active.swap_remove(i); }
         drop(active);
         TIER1_FINISHED.fetch_add(1, Ordering::Relaxed);
-        crate::postframe::O3_BUILDING.fetch_sub(1, Ordering::Relaxed);
-        crate::postframe::background_build_ended();
     }
 }
 
@@ -17422,7 +17419,6 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
                     tier_revalidate(&mut q);
                     if let Some(e) = tier_pop(&mut q) {
                         TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).push(e.0);
-                        crate::postframe::O3_BUILDING.fetch_add(1, Ordering::Relaxed);
                         break e;
                     }
                 }
@@ -18007,7 +18003,6 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     trace_tier1_phase(id, "start");
     // Also pin direct callers (cache verification / embedders), not only queue workers.
     TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).push(id);
-    crate::postframe::O3_BUILDING.fetch_add(1, Ordering::Relaxed);
     let _active = TierActive(id);
     let t0 = cpu_ns();
     let mut measure = tier1_stats_on().then(|| Tier1Measure::new(t0));
@@ -20893,7 +20888,6 @@ fn spec_worker(runtime: &crate::options::RuntimeOptions) {
         crate::postframe::AHEAD_RUNNING.fetch_add(1, Ordering::Relaxed);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { spec_build(up, id) }));
         crate::postframe::AHEAD_RUNNING.fetch_sub(1, Ordering::Relaxed);
-        crate::postframe::background_build_ended();
         // (compiles only: a warm-cache link ahead is not a function built -- the warm-up hint and
         // the ring said "N functions" for a warm start's manifest links)
         if FIRST_PRESENT.load(Ordering::Relaxed) && matches!(r, Ok(true)) && SPEC_BACK_RAN.with(|b| b.get()) {
@@ -21271,8 +21265,6 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"relax_span_begin" => Some(crate::inspect::timeline::relax_span_begin as *const () as usize),
         b"relax_span_end" => Some(crate::inspect::timeline::relax_span_end as *const () as usize),
         b"__relax_wake" => Some(crate::inspect::timeline::relax_wake as *const () as usize),
-        // makepad's task pool: its fan-out helpers pause while the JIT builds hot code (postframe.rs)
-        b"relax_compile_pressure" => Some(crate::postframe::relax_compile_pressure as *const () as usize),
         b"__relax_recording" | b"relax_recording" => Some(&crate::inspect::timeline::MAKEPAD_RUN_RECORDING as *const _ as usize),
         // std::relax::realtime: code a real-time thread runs is compiled ahead
         b"__relax_realtime" => Some(__relax_realtime as *const () as usize),
