@@ -27,6 +27,7 @@ use crate::lang_items::LangItem;
 use crate::jit::{self, FnKey, Unit};
 use crate::program::{DefId, DefKind, Program};
 use crate::types::TyId;
+use relax_types::mir::transform::const_check::is_live_default;
 use std::time::Instant;
 use std::sync::atomic::Ordering;
 #[path = "reload_watch.rs"]
@@ -3021,11 +3022,13 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         .chain(added_defs.iter().map(|&d| u.prog.def(d).file))
         .map(|f| u.prog.file_paths[f as usize].clone()).collect();
     let mut errs: Vec<String> = add_errs.into_iter().filter(|e| !(e.contains(".rs:")) || edited.iter().any(|p| e.starts_with(p.as_str()))).collect();
-    let as_restart = !layout_restart.is_empty();
+    let mut as_restart = !layout_restart.is_empty();
     errs.extend(layout_restart);
     trace_sub("consts_errs");
     trace_stage("commit_collect");
     let mut checked_bodies = Vec::new();
+    // initial values of added fields that only their derive can evaluate (they name its `vm`)
+    let mut default_restart = Vec::new();
     {
         let mut todo: Vec<(DefId, Vec<TyId>)> = Vec::new();
         let added_code: Vec<DefId> = added_defs.iter().copied().filter(|d| matches!(u.prog.def(*d).kind, DefKind::Fn | DefKind::AssocFn | DefKind::Const | DefKind::AssocConst | DefKind::Static)).collect();
@@ -3055,6 +3058,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::checked_body(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, d, &a)));
             match r {
                 Ok(b) => {
+                    if !b.errors.is_empty() && is_live_default(&u.prog, d) {
+                        default_restart.push(format!("{}: the added field's `#[rust(..)]` initial value is its derive's code ({}), running values cannot take it -- restart the app", u.prog.def_path(d), b.errors[0]));
+                        continue;
+                    }
                     for e in &b.errors {
                         if !errs.contains(e) { errs.push(e.clone()); }
                     }
@@ -3082,6 +3089,12 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         for &file in &olds {
             errs.extend(crate::modules::check_orphans(u, u.prog.file_crate[file as usize], &added_defs));
         }
+    }
+    // The running values cannot take such an initial value: a restart, unless the edit also
+    // has real errors (those alone refuse it).
+    if errs.is_empty() && !default_restart.is_empty() {
+        errs = default_restart;
+        as_restart = true;
     }
     trace_stage("typecheck");
     // D3: the gate is synchronous only under `makepad run --check-first`; otherwise the patched
