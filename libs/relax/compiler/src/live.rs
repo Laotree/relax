@@ -159,6 +159,10 @@ pub fn cmd_live(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         for l in &o.lines {
             println!("  {}", l);
         }
+        if !o.stale.is_empty() {
+            for l in &o.stale { println!("  {}", l); }
+            println!("  hot failure: stale_frame (a warm restart applies the edit)");
+        }
         for (k, old) in olds.iter().enumerate() {
             for r in running.iter_mut() {
                 if r.1 == *old {
