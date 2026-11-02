@@ -259,11 +259,10 @@ impl Plan {
             // Shared like Program::macros: snapshots are Arc clones; a write copies
             // the table only while a snapshot still shares it.
             let mut table = Arc::new(crate::macros::MacroTable::default());
-            // Crates expand on shared workers: a crate whose dependencies are all published
-            // starts expanding (against a copy of the table as its publication will see it)
-            // while earlier crates still publish. Publication stays in crate order and
-            // replays every surface against the real table.
-            let newest_dep = (0..crates.len()).map(|ci| dependency_crates[ci].iter().copied().max()).collect::<Vec<_>>();
+            // Crates expand on shared workers once their dependencies are started or published.
+            // The speculative base has their scanned names, but lacks macros and uses added by
+            // their expansions. Publication stays in crate order and replays every surface
+            // against the real table, catching those differences.
             let mut started: Vec<Option<(Arc<OutlineJob>, Vec<Vec<crate::macros::MacroRef>>, Arc<crate::macros::CrateMods>)>> = (0..crates.len()).map(|_| None).collect();
             // (the workers end with the queue, also when publication panics)
             let finish = OutlineFinish(&queue);
@@ -297,16 +296,27 @@ impl Plan {
                     discovered[k] = Some(discovery.wait(k, profile, &crates[k].name));
                 }
                 for j in k + 1..(k + 1 + OUTLINE_AHEAD).min(discovered.len()) {
-                    let ready = newest_dep[j].is_none_or(|d| d < k);
+                    let ready = dependency_crates[j].iter().all(|&d| d < k || started[d].is_some());
                     if started[j].is_some() || !ready || saved.get(j).and_then(Option::as_ref).is_some() { continue; }
                     if discovered[j].is_none() { discovered[j] = discovery.take(j); }
-                    let Some((_, scans, _, _)) = &mut discovered[j] else { continue; };
+                    let (before, after) = discovered.split_at_mut(j);
+                    let Some((_, scans, _, _)) = &mut after[0] else { continue; };
                     let c = &crates[j];
                     let modules = Arc::new(crate_modules(c, scans));
                     let mut base = table.clone();
                     let mut defs = Vec::with_capacity(scans.len());
                     {
                         let t = Arc::make_mut(&mut base);
+                        for i in k..j {
+                            let Some((_, defs, modules)) = &started[i] else { continue; };
+                            let (_, scans, _, _) = before[i].as_ref().expect("started crate discovery");
+                            let c = &crates[i];
+                            for ((_, _, _, scan, _, _), own) in scans.iter().zip(defs) {
+                                let Some(scan) = scan else { continue; };
+                                publish_scan_names(t, &c.name, scan, own);
+                            }
+                            t.add_crate(c.name.clone(), modules.clone());
+                        }
                         for (_, _, _, scan, _, _) in scans.iter_mut() {
                             let Some(scan) = scan else { defs.push(Vec::new()); continue; };
                             let scan = Arc::make_mut(scan);
