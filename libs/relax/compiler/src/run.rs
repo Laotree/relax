@@ -144,6 +144,21 @@ pub fn report_failed(error: &str, code: i32) {
     report("exit", &code.to_string());
 }
 
+/// A failed run discovered off the main thread (the first-frame watchdog): the launcher hears why,
+/// the exit work every exit does runs (exit report, cache write, the session log's tee drained to
+/// the terminal: _exit alone lost the watchdog's last lines in the pipe), then the process ends.
+/// exit() would run the process's static destructors on this thread while main and the GPU
+/// driver's threads still run (a segfault in the driver on node).
+pub(crate) fn failed_run(why: &str) -> ! {
+    use std::io::Write;
+    report("error", why);
+    crate::tui::exit_code(1);
+    finish_run("failed run", Some(1));
+    if !crate::preempt::is_stopped() { crate::tui::finish(false); }
+    let _ = std::io::stdout().flush();
+    crate::os::thread::exit_now(1)
+}
+
 pub(crate) fn reporting() -> bool {
     REPORT_FILE.lock().unwrap().is_some()
 }
@@ -324,10 +339,11 @@ impl From<crate::provided::SourceCheckError> for ResolveError {
 }
 
 /// A boot that cannot bind its provided libraries keeps the run window for the update offer.
-fn offer_boot_update(change: crate::provided::ProvidedChange) -> i32 {
+fn offer_boot_update(package: &str, change: crate::provided::ProvidedChange) -> i32 {
     if let Err(e) = finish_window() {
         report_failed(&e, 1);
         eprintln!("makepad-run: {e}");
+        crate::first_frame::no_window(package, &e);
         return 1;
     }
     crate::reload::host::offer_provided(change, None);
@@ -949,7 +965,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
 
     let Resolved { units, g, order, cfgs, live_inputs } = match resolve_package(sess, &workspace, &package, &cargo_flags, &units_json, &target_dir, &std_dir, ResolveFor::Boot, check) {
         Ok(r) => r,
-        Err(ResolveError::ProvidedChanged(change)) => return offer_boot_update(change),
+        Err(ResolveError::ProvidedChanged(change)) => return offer_boot_update(&package, change),
         Err(ResolveError::Failed(e)) => {
             if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(&e, "resolve")); }
             eprintln!("makepad-run: {e}");
@@ -1600,7 +1616,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     {
         let t = Instant::now();
         match crate::provided::finish_sources() {
-            Err(crate::provided::SourceCheckError::Changed(change)) => return offer_boot_update(change),
+            Err(crate::provided::SourceCheckError::Changed(change)) => return offer_boot_update(&package, change),
             Err(crate::provided::SourceCheckError::Invalid(e)) => {
                 if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(&e, "resolve")); }
                 eprintln!("makepad-run: {e}");
@@ -1748,6 +1764,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     unsafe { RUN_UNIT = up };
     if let Err(e) = finish_window() {
         eprintln!("makepad-run: {e}");
+        crate::first_frame::no_window(&package, &e);
         return 1;
     }
     if !HAL_RUN.load(Ordering::Acquire) { crate::domain::register_boot(&package, u.syms.dom0()); }
@@ -1847,6 +1864,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     jit::live_needs_present(!live_tests && platform);
     // a test harness never presents, nor does a program without the platform: no startup to wait out
     jit::startup_main(runtime, platform && !HARNESS_RUN.load(Ordering::Acquire));
+    if HAL_RUN.load(Ordering::Acquire) && platform && !HARNESS_RUN.load(Ordering::Acquire) && !live_tests {
+        crate::first_frame::arm(&package);
+    }
     relax_codegen::fncost::mark("boot done, calling main");
     let main_ms = crate::clock::ms_since_start();
     MAIN_START_MS.store(main_ms as u64, Ordering::Relaxed);

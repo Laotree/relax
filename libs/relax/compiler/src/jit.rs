@@ -266,6 +266,12 @@ pub struct Site {
     pub file: u32,
     pub pos: u32,
     pub msg: String,
+    /// Leaked once per site: a caught payload can outlive the unit.
+    static_msg: std::sync::OnceLock<&'static str>,
+    /// The site's file (interned once per path, never freed): a panic's Location needs no compiler state.
+    file_bytes_with_nul: &'static [u8],
+    line: u32,
+    col: u32,
 }
 
 const THUNK_SIZE: usize = x64::THUNK_SIZE;
@@ -369,6 +375,8 @@ pub struct Unit {
     /// one site per (file, position, message): every inlined copy of a panic location is one
     /// site and one symbol, whatever the compile order (one constant pool word)
     site_ix: relax_session::sync::Mutex<HashMap<(u32, u32, String), u64>>,
+    /// std's runtime-panic entry, scoped to this unit's program.
+    panic_hook: std::sync::atomic::AtomicUsize,
     pub rt: Rt,
     /// the runtime entries as symbols (what compiled code calls; see syms.rs)
     pub rs: RtSyms,
@@ -2668,15 +2676,7 @@ pub(crate) fn leave_thread(kind: &str, message: String) -> ! {
 rt_fn! {
 #[allow(clippy::too_many_arguments)]
 fn rt_panic_site(site: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, regs: *const u64, _a7: u64) {
-    let mut msg = fmt_take_top();
-    if msg.is_empty() {
-        let u = unsafe { &*cur_unit() };
-        let sites = u.sites.lock().unwrap_or_else(|e| e.into_inner());
-        if (site as usize) < sites.len() {
-            msg = sites[site as usize].msg.clone();
-        }
-    }
-    raise_unwinding("panic", msg, site, regs)
+    raise_runtime_panic(fmt_take_top(), site, true, regs)
 }
 }
 
@@ -2684,8 +2684,59 @@ rt_fn! {
 #[allow(clippy::too_many_arguments)]
 fn rt_panic_bounds(idx: u64, len: u64, site: u64, _a3: u64, _a4: u64, _a5: u64, regs: *const u64, _a7: u64) {
     let msg = format!("index out of bounds: the len is {} but the index is {}", len, idx);
-    raise_unwinding("panic", msg, site, regs)
+    raise_runtime_panic(msg, site, false, regs)
 }
+}
+
+type RuntimePanicHook = extern "C" fn(*const u8, usize, *const u8, usize, u32, u32, bool);
+
+extern "C" fn relax_set_panic_hook(hook: RuntimePanicHook) {
+    unsafe { (*cur_unit()).panic_hook.store(hook as usize, Ordering::Release) };
+}
+
+/// Runtime checks keep their host calls; std records their payload and runs the hook here.
+fn raise_runtime_panic(mut message: String, site: u64, use_site_message: bool, regs: *const u64) -> ! {
+    let (constant, file, line, col) = {
+        let _kept = crate::zone_alloc::kept();
+        let u = unsafe { &*cur_unit() };
+        let sites = u.sites.lock().unwrap_or_else(|e| e.into_inner());
+        match sites.get(site as usize) {
+            Some(s) => {
+                let constant = if use_site_message && !s.msg.is_empty() {
+                    Some(*s.static_msg.get_or_init(|| Box::leak(s.msg.clone().into_boxed_str())))
+                } else {
+                    None
+                };
+                (constant, s.file_bytes_with_nul, s.line, s.col)
+            }
+            None => (None, &b"<unknown>\0"[..], 0, 0),
+        }
+    };
+    if let Some(msg) = constant {
+        message = msg.to_string();
+    }
+    let hook = unsafe { (*cur_unit()).panic_hook.load(Ordering::Acquire) };
+    if hook != 0 && !in_const_eval() {
+        let msg = constant.unwrap_or(&message);
+        let hook: RuntimePanicHook = unsafe { std::mem::transmute(hook) };
+        hook(msg.as_ptr(), msg.len(), file.as_ptr(), file.len(), line, col, constant.is_some());
+    }
+    raise_unwinding("panic", message, site, regs)
+}
+
+/// A panic site's file with its NUL, one copy per path for the process (bounded by the files).
+fn site_file(path: &str) -> &'static [u8] {
+    static FILES: relax_session::sync::Mutex<Option<HashMap<String, &'static [u8]>>> = relax_session::sync::Mutex::new(None);
+    let mut files = FILES.lock().unwrap_or_else(|e| e.into_inner());
+    let files = files.get_or_insert_with(HashMap::new);
+    if let Some(&b) = files.get(path) {
+        return b;
+    }
+    let mut b = path.as_bytes().to_vec();
+    b.push(0);
+    let b: &'static [u8] = Box::leak(b.into_boxed_slice());
+    files.insert(path.to_string(), b);
+    b
 }
 
 rt_fn! {
@@ -3876,6 +3927,7 @@ impl Unit {
             static_spans: Default::default(),
             sites: Default::default(),
             site_ix: Default::default(),
+            panic_hook: std::sync::atomic::AtomicUsize::new(0),
             rs: RtSyms { tls_base: relax_backend::rir::Sym::new(0), coverage_disabled: relax_backend::rir::Sym::new(0), fmt_str: relax_backend::rir::Sym::new(0), fmt_int: relax_backend::rir::Sym::new(0), fmt_float: relax_backend::rir::Sym::new(0), fmt_print: relax_backend::rir::Sym::new(0), panic_site: relax_backend::rir::Sym::new(0), panic_bounds: relax_backend::rir::Sym::new(0), str_eq: relax_backend::rir::Sym::new(0), fmod: relax_backend::rir::Sym::new(0), fmodf: relax_backend::rir::Sym::new(0), panic_impl: relax_backend::rir::Sym::new(0), thread_run: relax_backend::rir::Sym::new(0), catch_panic: relax_backend::rir::Sym::new(0), args: relax_backend::rir::Sym::new(0), memcpy: relax_backend::rir::Sym::new(0), memmove: relax_backend::rir::Sym::new(0), memset: relax_backend::rir::Sym::new(0), fmt_push: relax_backend::rir::Sym::new(0), fmt_pop: relax_backend::rir::Sym::new(0), resume: relax_backend::rir::Sym::new(0), land: relax_backend::rir::Sym::new(0), panicking: relax_backend::rir::Sym::new(0), rethrow: relax_backend::rir::Sym::new(0) },
             syms: crate::syms::Syms::new(syms_base, rw_base),
             cache: None,
@@ -4751,8 +4803,16 @@ impl Unit {
         // identity state (panic sites are read by the program): the strings are the program's
         let _k = crate::zone_alloc::kept();
         let key = key.clone();
+        let (path, line, col) = match (self.prog.file_paths.get(file as usize), self.prog.files.get(file as usize)) {
+            (Some(path), Some(src)) => {
+                let (line, col) = src.line_col(pos);
+                (path.as_str(), line as u32, col as u32)
+            }
+            _ => ("<unknown>", 0, 0),
+        };
+        let file_bytes_with_nul = site_file(path);
         let mut s = self.sites.lock().unwrap_or_else(|e| e.into_inner());
-        s.push(Site { file, pos, msg: msg.to_string() });
+        s.push(Site { file, pos, msg: msg.to_string(), static_msg: std::sync::OnceLock::new(), file_bytes_with_nul, line, col });
         let i = s.len() as u64 - 1;
         ix.insert(key, i);
         i
@@ -19557,6 +19617,7 @@ pub extern "C" fn relax_first_present() {
             if let Some(t) = STARTUP_THREAD.get() {
                 t.unpark();
             }
+            if let Some(t) = crate::first_frame::THREAD.get() { t.unpark(); }
             relax_codegen::exec_census::report();
             if profile_path().is_some() { crate::exec_profile::report(true); }
         }
@@ -21346,6 +21407,7 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         #[cfg(unix)]
         b"__relax_fork_exec_done" => Some(crate::forkexec::relax_fork_exec_done as *const () as usize),
         b"relax_allocator_swap" => Some(relax_allocator_swap as *const () as usize),
+        b"relax_set_panic_hook" => Some(relax_set_panic_hook as *const () as usize),
         b"relax_first_present" => Some(relax_first_present as *const () as usize),
         b"relax_frame_done" => Some(crate::postframe::relax_frame_done as *const () as usize),
         b"relax_quit_requested" => Some(crate::run::relax_quit_requested as *const () as usize),
