@@ -110,6 +110,14 @@ fn collect(s: &mut State, thread: &Thread, clear: bool) {
     }
 }
 
+/// The thread's block moved (jit.rs window_tls_block): its record follows it.
+pub(crate) fn moved(old: u64, new: u64) {
+    if !super::live::enabled() { return; }
+    let _k = crate::zone_alloc::kept();
+    let mut s = state().lock().unwrap();
+    if let Some(thread) = s.threads.remove(&old) { s.threads.insert(new, thread); }
+}
+
 pub(crate) fn exit(block: u64) {
     if !super::live::enabled() { return; }
     let _k = crate::zone_alloc::kept();

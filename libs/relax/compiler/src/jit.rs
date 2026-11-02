@@ -784,6 +784,28 @@ fn tls_dtor(p: *mut u8) {
     for (base, token) in registrations { crate::domain::thread_finished(base, token); }
 }
 
+/// A wasm32 program reads its thread-local block through 32-bit offsets into its window
+/// (web32.rs): a thread whose block was made before the program's unit (its native memory, the
+/// compile's or the macro world's) gets a window copy once the unit exists, before it runs the
+/// program's code -- the unit's own thread (web32::reserve_unit), a `call_jit` into it, a native
+/// caller of its exports through the thread's first block request.
+pub(crate) fn window_tls_block() {
+    if !crate::web32::on() { return; }
+    let _keep = os::proc::KeepLastError::new();
+    let old = os::tls::get(tls_key()) as u64;
+    if old == 0 || crate::web32::in_misc(old) { return; }
+    let new = crate::web32::alloc(TLS_CAP);
+    // the runtime's words (domain base, thread record, coverage, entry marks); the program's
+    // variables start as a new thread's (zero): the old block's are other units' (each unit
+    // places its variables from TLS_FIRST_FREE), the shadow stack words among them
+    unsafe { std::ptr::copy_nonoverlapping(old as *const u8, new as *mut u8, TLS_FIRST_FREE as usize) };
+    // (the runtime's thread record moves with the copy: slot 1 points to it)
+    crate::harness::reach::moved(old, new);
+    set_tls_block(new as *mut u8);
+    // the old block stays mapped (a frame of the compile's code may still hold its address);
+    // only the current one is freed at the thread's exit
+}
+
 /// The OS key holding each thread's block (one per process).
 fn tls_key() -> u64 {
     let k = TLS_KEY.load(Ordering::Acquire);
@@ -1192,6 +1214,7 @@ rt_fn! {
 fn rt_tls_block() -> u64 {
     let _keep = os::proc::KeepLastError::new();
     ensure_altstack();
+    window_tls_block();
     let b = os::tls::get(tls_key());
     if !b.is_null() {
         TLS_BLOCK_COPY.with(|c| c.set(b as u64));
@@ -7195,6 +7218,7 @@ pub unsafe fn call_jit_in(u: *mut Unit, domain: u64, entry: u64, arg: u64) -> Re
     owner::forbid_in_publish("jit", u32::MAX);
     let prev = CUR_UNIT.try_with(|c| c.replace(u)).unwrap_or(std::ptr::null_mut());
     adopt_runtime_unit(u);
+    window_tls_block();
     let sampled = (&*u).tier1.is_some();
     if sampled {
         sampler_enter((&*u).exec_base, (&*u).exec_size);
