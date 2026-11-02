@@ -4609,6 +4609,48 @@ fn gate_note(g: u8) {
     }
 }
 
+/// The native file watch of the live set. A virtual file (a store run with an edits folder) is
+/// watched where its edit lives, when that folder exists; the edits record, which every new edit
+/// replaces, stands for the rest: its event is a whole scan and a new watch (new folders).
+/// Without this a store run fell back to polling every file (5% of a core idle on Fab).
+struct LiveWatch {
+    watch: watch_events::Watch,
+    /// watch index -> watched file index (usize::MAX: the edits record)
+    files: Vec<usize>,
+}
+
+impl LiveWatch {
+    fn new<'a>(paths: impl Iterator<Item = &'a str>) -> Option<Self> {
+        let mut watched: Vec<String> = Vec::new();
+        let mut files = Vec::new();
+        let mut any_virtual = false;
+        for (i, p) in paths.enumerate() {
+            if crate::vfs::is_virtual(p) {
+                any_virtual = true;
+                let Some(at) = crate::vfs::edit_location(p) else { continue };
+                if !at.parent().is_some_and(|d| d.is_dir()) { continue; }
+                watched.push(at.to_string_lossy().into_owned());
+            } else {
+                watched.push(p.to_string());
+            }
+            files.push(i);
+        }
+        if any_virtual {
+            watched.push(crate::vfs::edits_record()?.to_string_lossy().into_owned());
+            files.push(usize::MAX);
+        }
+        Some(Self { watch: watch_events::Watch::new(watched.iter().map(String::as_str))?, files })
+    }
+    fn wait(&mut self, timeout: std::time::Duration) { self.watch.wait(timeout) }
+    /// None: events may have been lost, or a new edit was recorded: stat every file, watch again.
+    fn changed(&mut self) -> Option<Vec<usize>> {
+        let ids = self.watch.changed()?;
+        let files: Vec<usize> = ids.into_iter().map(|k| self.files[k]).collect();
+        if files.contains(&usize::MAX) { return None; }
+        Some(files)
+    }
+}
+
 /// The live watcher's longest sleep on file events (a backstop: every input wakes it).
 const LIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
 /// Stillness, not an overall deadline: a busy checkout can take as long as it needs.
@@ -4701,7 +4743,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     // the post-boot loader adds files after boot; each is watched from its load (an
     // edit made before it is simply what the load read)
     let mut loads_seen = jit::DEFERRED_LOADS.load(std::sync::atomic::Ordering::Relaxed);
-    let mut events = watch_events::Watch::new(files.iter().map(|f| f.0.as_str()));
+    let mut events = LiveWatch::new(files.iter().map(|f| f.0.as_str()));
     let mut repositories = git::Repositories::default();
     repositories.include(files.iter().map(|f| f.0.as_str()));
     if crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) { eprintln!("makepad live: watching {} source files; session log {}", files.len(), live_log_path()); }
@@ -4783,7 +4825,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 if let Some(f) = files.iter_mut().find(|f| f.0 == path) { f.1 = file; }
                 else { let s = stamp(&path); files.push((path, file, s)); }
             }
-            events = watch_events::Watch::new(files.iter().map(|f| f.0.as_str()));
+            events = LiveWatch::new(files.iter().map(|f| f.0.as_str()));
             repositories = git::Repositories::default();
             repositories.include(files.iter().map(|f| f.0.as_str()));
             hot.clear();
@@ -4825,7 +4867,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 if std::env::var_os("MAKEPAD_RUN_DEFERRED_TRACE").is_some() { eprintln!("makepad live: watching {} more file(s) the post-boot loader loaded", added.len()); }
                 for (p, i) in added { let st = stamp(&p); files.push((p, i, st)); }
                 repositories.include(files.iter().map(|f| f.0.as_str()));
-                events = watch_events::Watch::new(files.iter().map(|f| f.0.as_str()));
+                events = LiveWatch::new(files.iter().map(|f| f.0.as_str()));
                 rewatched = true;
             }
         }
@@ -4862,7 +4904,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let notifications = events.as_mut().and_then(|w| w.changed());
         if t_ev.elapsed().as_millis() > 20 && std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() { eprintln!("makepad live: events drain took {:.1} ms", t_ev.elapsed().as_secs_f64() * 1e3); }
         let lost = events.is_some() && notifications.is_none();
-        if lost { events = watch_events::Watch::new(files.iter().map(|f| f.0.as_str())); }
+        if lost { events = LiveWatch::new(files.iter().map(|f| f.0.as_str())); }
         // a sync moved the dock app's checkout: every file is compared with what runs
         let synced = dock.as_mut().is_some_and(DockGate::synced);
         let caught_up = CATCH_UP.swap(false, std::sync::atomic::Ordering::AcqRel);
@@ -4937,7 +4979,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                     if !known.contains(&path) { files.push((path, u32::MAX, None)); }
                 }
                 repositories.include(files.iter().map(|f| f.0.as_str()));
-                events = watch_events::Watch::new(files.iter().map(|f| f.0.as_str()));
+                events = LiveWatch::new(files.iter().map(|f| f.0.as_str()));
             }
             let now: Vec<_> = files.iter().map(|f| stamp(&f.0)).collect();
             scanned += files.len();
