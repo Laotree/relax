@@ -6627,6 +6627,9 @@ mod cold_tests {
         assert_eq!(cold.fps, fps);
         assert_eq!(cold.records, records, "a finished load writes no record twice");
         assert_fingerprints(&cold, &prog);
+        // `again` queued its records on writer threads and was never finished: dropping it joins
+        // them, so no write lands in the folder while it is removed
+        drop(again);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

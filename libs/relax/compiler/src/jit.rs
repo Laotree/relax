@@ -9178,7 +9178,8 @@ fn o2_release_later() {
     let later = std::mem::take(&mut *O2_LATER.lock().unwrap_or_else(|e| e.into_inner()));
     // (also with nothing later: verified O1 rebuilds queued before the present wait for it)
     let mut q = O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    crate::zone_alloc::kept_with(|| q.extend(later));
+    let now = wall_ns();
+    crate::zone_alloc::kept_with(|| q.extend(later.into_iter().map(|(u, id)| (u, id, now))));
     O2_WAKE.notify_one();
 }
 
@@ -9229,7 +9230,10 @@ fn export_full() -> bool {
 }
 
 /// `#[relax(O2)]` slots waiting for their O2 build: (unit, slot)
-static O2_QUEUE: relax_session::sync::Mutex<Vec<(usize, u32)>> = relax_session::sync::Mutex::new(Vec::new());
+/// the slot the O2 worker builds now (u32::MAX: none; makepad inspect `jit queue`)
+static O2_SLOT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+/// (unit, slot, queued at wall_ns or O2_FRONT_AT)
+static O2_QUEUE: relax_session::sync::Mutex<Vec<(usize, u32, u64)>> = relax_session::sync::Mutex::new(Vec::new());
 /// slots ever queued (each is built once; live patches rebuild through the usual paths)
 static O2_SEEN: relax_session::sync::Mutex<Option<std::collections::HashSet<(usize, u32)>>> = relax_session::sync::Mutex::new(None);
 static O2_WAKE: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
@@ -9361,7 +9365,7 @@ unsafe fn o2_enqueue_front(up: *mut Unit, id: u32) {
             return;
         }
     }
-    O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).insert(0, (up as usize, id));
+    O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).insert(0, (up as usize, id, O2_FRONT_AT));
     crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O2_QUEUED, 1, 0, 0);
     O2_WAKE.notify_one();
     o2_start(up);
@@ -9393,7 +9397,7 @@ unsafe fn o2_enqueue(up: *mut Unit, id: u32) {
             return;
         }
     }
-    O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id));
+    O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id, wall_ns()));
     crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O2_QUEUED, 1, 0, 0);
     O2_WAKE.notify_one();
     o2_start(up);
@@ -9417,8 +9421,9 @@ struct BaseSlots {
     hit: Vec<(usize, u32)>,
 }
 static BASE: relax_session::sync::Mutex<BaseSlots> = relax_session::sync::Mutex::new(BaseSlots { released: false, hit: Vec::new() });
-/// baseline slots waiting for their O2 build: served when O2_QUEUE is empty
-static O2_BASE: relax_session::sync::Mutex<std::collections::VecDeque<(usize, u32)>> = relax_session::sync::Mutex::new(std::collections::VecDeque::new());
+/// baseline slots waiting for their O2 build: (unit, slot, queued at wall_ns), served when
+/// O2_QUEUE is empty
+static O2_BASE: relax_session::sync::Mutex<std::collections::VecDeque<(usize, u32, u64)>> = relax_session::sync::Mutex::new(std::collections::VecDeque::new());
 
 /// Slot `id` runs baseline code -- built so the cold start compiles fast, but every launch that
 /// links it from the cache runs it again (unoptimised RIR, no inlining of user fns: a warm
@@ -9804,7 +9809,7 @@ unsafe fn o2_base(up: *mut Unit, id: u32) -> bool {
     {
         // under O2_QUEUE's lock: the worker checks both queues under it before it waits
         let _q = O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-        O2_BASE.lock().unwrap_or_else(|e| e.into_inner()).push_back((up as usize, id));
+        O2_BASE.lock().unwrap_or_else(|e| e.into_inner()).push_back((up as usize, id, wall_ns()));
         O2_WAKE.notify_one();
     }
     o2_start(up);
@@ -9988,12 +9993,13 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
             // lives to the end of the chain (it was held across the wait below, and the owner
             // waited for BORROW_QUEUE forever)
             let borrowed = if q.is_empty() { BORROW_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).pop_front() } else { None };
-            let base = if q.is_empty() && borrowed.is_none() { O2_BASE.lock().unwrap_or_else(|e| e.into_inner()).pop_front() } else { None };
+            let base = if q.is_empty() && borrowed.is_none() { O2_BASE.lock().unwrap_or_else(|e| e.into_inner()).pop_front().map(|e| (e.0, e.1)) } else { None };
             let o1v = if q.is_empty() && borrowed.is_none() && base.is_none() && past_startup() {
                 O1V_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
             } else { None };
             if !q.is_empty() {
-                Some((q.remove(0), false, false))
+                let e = q.remove(0);
+                Some(((e.0, e.1), false, false))
             } else if let Some(x) = borrowed {
                 // (SPEC-V: base slots running their twins' code get their own)
                 Some((x, false, true))
@@ -10014,6 +10020,7 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
         if !o1 {
             O2_TAKEN.fetch_add(1, Ordering::Relaxed);
         }
+        O2_SLOT.store(id, Ordering::Relaxed);
         O2_RUNNING.store(true, Ordering::Relaxed);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let live = || {
@@ -10051,6 +10058,7 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
                 owner::publish(|| o2_finish(up, done));
             }
         }));
+        O2_SLOT.store(u32::MAX, Ordering::Relaxed);
         O2_RUNNING.store(false, Ordering::Relaxed);
         crate::postframe::background_build_ended();
         if r.is_err() {
@@ -10093,7 +10101,7 @@ unsafe fn o2_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     }
     // a lazy compile's back end for the slot started since o2_thread looked: again later
     if (&*up).fns[id as usize].inflight {
-        crate::zone_alloc::kept_with(|| O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id)));
+        crate::zone_alloc::kept_with(|| O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id, wall_ns())));
         o2_noop(N_REQUEUED);
         return None;
     }
@@ -12905,6 +12913,9 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::
     if owner::is_owner() && !FIRST_PRESENT.load(Ordering::Relaxed) {
         // (a body checked ahead: the request's own slot, row 4, or a slot its preparation needs)
         let own = owner_lower_kind == 0 && BUILD_STACK.try_with(|s| s.borrow().first().copied()).ok().flatten() == Some(id);
+        if ahead_trace() {
+            eprintln!("owner-lower row{} #{} {} us {}", if own { 4 } else { owner_lower_kind }, id, (cpu_ns() - t0).saturating_sub(nested_build_ns() - n0) / 1000, u.fns[id as usize].name);
+        }
         let row = &OWNER_LOWERS[if own { 4 } else { owner_lower_kind }];
         row[0].fetch_add(1, Ordering::Relaxed);
         row[1].fetch_add((cpu_ns() - t0).saturating_sub(nested_build_ns() - n0), Ordering::Relaxed);
@@ -14403,6 +14414,7 @@ impl Drop for Unit {
             self.front.alive.store(false, Ordering::SeqCst);
         }
         self.front.wake.notify_all();
+        lowered_end();
         // Only the unit the process-wide O3 machinery (tier threads: TIER_UNIT; sampler:
         // UNIT) can reach is stopped, and its lock is kept: a build that loaded the pointer
         // must never resume on a freed unit. Any other unit (never ran code, never tiered)
@@ -14656,10 +14668,17 @@ fn rt_loop_hot(counter: u64, fp: u64) {
             if now.saturating_sub(last) >= at_threshold || !settle_unfinal(u, id, threshold) {
                 return;
             }
+        } else if st == T_QUEUED {
+            // queued and still looping in its baseline / O1 / O2 code: the cost goes on into the
+            // record, so its heat (slot_heat) stays live while it waits and tier_revalidate keeps it
+            tier_charge(rec, chunk);
+            note_ui_path(rec);
+            return;
         } else if st != T_COUNTING {
             return;
         }
         tier_charge(rec, chunk);
+        note_ui_path(rec);
         let w5 = (*rec.add(5)).load(Ordering::Relaxed);
         if w5 & LOOP_CHARGED != 0 || tier_cost_now(rec, threshold, tier_clock()).0 < threshold {
             return;
@@ -14769,6 +14788,94 @@ const CALL_FAST_NS: u64 = 10_000_000;
 const SMALL_CODE: u64 = 256;
 /// Tier record word 5: a hot loop under the slot already charged its callers (rt_loop_hot)
 const LOOP_CHARGED: u64 = 1 << 62;
+/// Tier record word 5: the program's main (UI) thread ran the slot's counted calls or loops
+/// (rt_hot, rt_loop_hot): read with its heat (HeatNow)
+const UI_PATH: u64 = 1 << 61;
+
+/// Marks the slot of record `rec` as on the UI thread's path when the calling thread is the
+/// program's main thread (atomics only; one load once marked).
+#[inline]
+unsafe fn note_ui_path(rec: *const AtomicU64) {
+    let main = MAIN_TID.load(Ordering::Relaxed);
+    if main != 0 && (*rec.add(5)).load(Ordering::Relaxed) & UI_PATH == 0 && os::thread::current() == main {
+        (*rec.add(5)).fetch_or(UI_PATH, Ordering::Relaxed);
+    }
+}
+
+// ---- execution heat now
+//
+// A slot's heat is the decayed cost of its counted calls and loops (tier_cost_now, the O3
+// threshold's units): live while its count stub counts, and, once queued, from its loop counters
+// (rt_loop_hot) and its counted code's block counts (profiled_heat), which keep charging the record
+// until O3 code without counters replaces it. So a loop that 15 threads run now reads hotter than
+// startup code that was hot once. Read by makepad inspect `jit queue` and tier_revalidate; the
+// compile queues' hot-first order (HotSpot's CompileBroker picks by event rate the same way) keys
+// on it.
+
+/// a queued slot's record is folded (decayed cost stored, budget refilled) at most this often:
+/// the cost it charges since is then spread over a short span (tier_cost_now)
+const HEAT_FOLD_NS: u64 = 250_000_000;
+
+/// Slot `id`'s execution heat now (cost units, the O3 threshold's scale): its record's decayed cost
+/// while it is counted or queued, 0 otherwise (final, not armed). A queued slot's record is folded
+/// here (its cost check, as rt_hot's under the threshold): only its loop counters charge it then, so
+/// the fold races nothing but their budget decrements (an estimate either way).
+unsafe fn slot_heat(u: &Unit, id: u32, threshold: u64, now: u64) -> (u64, bool) {
+    // (`now`: tier_clock, the records' clock)
+    if id as usize >= u.fns.len() {
+        return (0, false);
+    }
+    let rec = tier_rec(&u.slots, id);
+    let ui = (*rec.add(5)).load(Ordering::Relaxed) & UI_PATH != 0;
+    match (*rec.add(3)).load(Ordering::Acquire) {
+        T_COUNTING => (tier_cost_now(rec, threshold, now).0, ui),
+        T_QUEUED => {
+            let (cost, _) = tier_cost_now(rec, threshold, now);
+            if now.saturating_sub((*rec.add(4)).load(Ordering::Relaxed)) >= HEAT_FOLD_NS {
+                (*rec.add(9)).store(cost, Ordering::Relaxed);
+                (*rec.add(4)).store(now, Ordering::Relaxed);
+                (*rec).store(tier_refill(threshold, cost), Ordering::Relaxed);
+            }
+            (cost, ui)
+        }
+        _ => (0, ui),
+    }
+}
+
+/// The live unit and its O3 threshold, for heat reads (None: no tiering unit).
+fn heat_unit() -> Option<(&'static Unit, u64)> {
+    let up = TIER_UNIT.load(Ordering::Acquire);
+    if up.is_null() {
+        return None;
+    }
+    let u = unsafe { &*up };
+    u.tier1.as_ref().map(|t| (u, t.threshold))
+}
+
+/// One scan's clocks: wall_ns (queue ages) and tier_clock (the records' heat).
+#[derive(Clone, Copy)]
+struct HeatNow {
+    hu: Option<(&'static Unit, u64)>,
+    wall: u64,
+    tier: u64,
+}
+
+impl HeatNow {
+    fn take() -> Self {
+        HeatNow { hu: heat_unit(), wall: wall_ns(), tier: tier_clock() }
+    }
+
+    /// Slot `id`'s heat and UI mark (`unit` 0: the tiering unit; another unit's slot: none).
+    fn heat(&self, unit: usize, id: u32) -> (u64, bool) {
+        match self.hu {
+            Some((u, th)) if unit == 0 || unit == u as *const Unit as usize => unsafe { slot_heat(u, id, th, self.tier) },
+            _ => (0, false),
+        }
+    }
+}
+
+/// An O2 queue entry's time for a hot slot's build (o2_enqueue_front: first among the O2 builds)
+const O2_FRONT_AT: u64 = 0;
 
 /// The O3 threshold for MAKEPAD_RUN_O3_CALLS = `calls`: the cost a steady rate of `calls` x
 /// O3_CALL_UNITS per second converges on (COST_HALF_LIFE_NS).
@@ -15897,6 +16004,10 @@ fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) {
             if len & REARMED != 0 || (*rec.add(3)).load(Ordering::Acquire) != T_QUEUED {
                 return true;
             }
+            // still hot now (its loops kept charging the record while it waited): kept
+            if tier_cost_now(rec, threshold, tier_clock()).0 >= threshold {
+                return true;
+            }
             let code = (*rec.add(1)).load(Ordering::Relaxed);
             let stub = (*rec.add(2)).load(Ordering::Relaxed);
             tier_count_fresh(rec, threshold, tier_clock());
@@ -16158,6 +16269,45 @@ fn tier_pop(q: &mut Vec<(u32, u8, u64, u64)>) -> Option<(u32, u8, u64, u64)> {
     Some(q.remove(best))
 }
 static TIER_THREAD: std::sync::Once = std::sync::Once::new();
+
+/// makepad inspect `jit queue [n=10]`: what the JIT builds now and the next `n` of the O3 and O2
+/// queues in the order they are taken (O3: tier_pop's; O2: the O2 queue, then baseline code), one
+/// line each: heat now as a multiple of the O3 threshold (`ui`: on the UI thread's path), why
+/// queued, seconds waited (`hot`: o2_hot's build), the fn. Locks each queue for one scan.
+pub(crate) fn queue_view(n: usize) -> Vec<String> {
+    let now = HeatNow::take();
+    let th = now.hu.map_or(1, |x| x.1).max(1) as f64;
+    let name = |id: u32| slot_name(id).map_or_else(|| format!("S{id}"), |s| crate::postframe::short_fn(&s));
+    let row = |tier: &str, unit: usize, id: u32, at: u64, why: &str| {
+        let (h, ui) = now.heat(unit, id);
+        let waited = if at == O2_FRONT_AT { "hot".to_string() } else { format!("{:.1}s", now.wall.saturating_sub(at) as f64 / 1e9) };
+        format!("{tier} {:.2}x{} {why} {waited} {} (S{id})", h as f64 / th, if ui { " ui" } else { "" }, name(id))
+    };
+    let mut out = Vec::new();
+    let active: Vec<u32> = TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let o2 = O2_SLOT.load(Ordering::Relaxed);
+    let mut now_line = format!("building: O3 {}", active.len());
+    for id in &active {
+        now_line += &format!(" [{}]", name(*id));
+    }
+    now_line += &if o2 != u32::MAX { format!("; O2 [{}]", name(o2)) } else { "; O2 idle".into() };
+    now_line += &format!("; ahead {} queued", ahead_queued());
+    out.push(now_line);
+    let mut o3: Vec<(u32, u8, u64, u64)> = {
+        let q = tier_queue().unwrap_or_else(|e| e.into_inner());
+        let hot = q.iter().filter(|e| now.heat(0, e.0).0 as f64 >= th).count();
+        out.push(format!("O3 queue {} ({} at or over the threshold now), next {}:", q.len(), hot, n.min(q.len())));
+        q.clone()
+    };
+    // (tier_pop's order: the highest rate queued at, then the oldest)
+    o3.sort_by_key(|e| (std::cmp::Reverse(e.3), e.2));
+    out.extend(o3.iter().take(n).map(|e| row("O3", 0, e.0, e.2, Q_WHY.get(e.1 as usize).copied().unwrap_or("?"))));
+    let q = O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let b: Vec<(usize, u32, u64)> = O2_BASE.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
+    out.push(format!("O2 queue {} + baseline {}, next {}:", q.len(), b.len(), n.min(q.len() + b.len())));
+    out.extend(q.iter().map(|e| (e, "o2")).chain(b.iter().map(|e| (e, "base"))).take(n).map(|(e, why)| row("O2", e.0, e.1, e.2, why)));
+    out
+}
 
 /// The level's O3 workers (`o3_threads`) always run. A level with `o3_burst` also starts burst workers
 /// (user, 10-22: every performance core but one, the program's main thread's): after the first present,
@@ -16528,7 +16678,7 @@ impl Unit {
                 at
             };
             (*rec.add(1)).store(code, Ordering::Relaxed);
-            (*rec.add(5)).store(((*rec.add(5)).load(Ordering::Relaxed) & (REARMED | LOOP_CHARGED)) | bytes, Ordering::Relaxed);
+            (*rec.add(5)).store(((*rec.add(5)).load(Ordering::Relaxed) & (REARMED | LOOP_CHARGED | UI_PATH)) | bytes, Ordering::Relaxed);
             (*rec.add(2)).store(at, Ordering::Release);
             SlotWord::of(&self.slots, id).store(at, Ordering::SeqCst);
         }
@@ -16755,8 +16905,9 @@ pub static PGO_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Queues O3 for the counting slots whose window is over (first O3 worker, no lock held).
 fn pgo_poll() {
+    profiled_heat();
     let now = wall_ns();
-    let mut ready: Vec<(u32, u64)> = Vec::new();
+    let mut ready: Vec<(u32, u64, &'static [AtomicU64], &'static [u32])> = Vec::new();
     let mut parked_now: Vec<u32> = Vec::new();
     {
         let mut g = COUNTING.lock().unwrap_or_else(|e| e.into_inner());
@@ -16778,7 +16929,7 @@ fn pgo_poll() {
             };
             if e.lukewarm && e.credited {
                 crate::inspect::tierlog::note(e.id, crate::inspect::tierlog::ev::WINDOW_END, crate::inspect::tierlog::WIN_CREDITED, rate, 0);
-                ready.push((e.id, work_rate()));
+                ready.push((e.id, work_rate(), e.counters, e.weights));
                 return false;
             }
             if e.lukewarm {
@@ -16791,7 +16942,7 @@ fn pgo_poll() {
                 let per_s = ((work - e.mark.0.min(work)) as u128 * 1_000_000_000 / win as u128) as u64;
                 if per_s >= PGO_MIN_WORK {
                     crate::inspect::tierlog::note(e.id, crate::inspect::tierlog::ev::WINDOW_END, crate::inspect::tierlog::WIN_WORK, rate, 0);
-                    ready.push((e.id, per_s));
+                    ready.push((e.id, per_s, e.counters, e.weights));
                     return false;
                 }
                 if win >= PGO_WORK_NS {
@@ -16827,7 +16978,7 @@ fn pgo_poll() {
             }
             if done {
                 crate::inspect::tierlog::note(e.id, crate::inspect::tierlog::ev::WINDOW_END, if entries >= PGO_ENTRIES || sum >= PGO_BLOCKS || sum > 0 { crate::inspect::tierlog::WIN_DONE } else { crate::inspect::tierlog::WIN_IDLE }, rate, 0);
-                ready.push((e.id, work_rate()));
+                ready.push((e.id, work_rate(), e.counters, e.weights));
             }
             !done
         });
@@ -16852,9 +17003,60 @@ fn pgo_poll() {
             }
         });
     }
-    for (id, rate) in ready {
+    for (id, rate, counters, weights) in ready {
+        // its counted code runs on until the O3 build: the work its counts show goes into the
+        // record, the queue's heat (profiled_heat), from a window's worth at the window's rate
+        let total = counters.iter().zip(weights).map(|(c, w)| c.load(Ordering::Relaxed).saturating_mul(*w as u64)).fold(0, u64::saturating_add);
+        let work = total.saturating_sub(rate.saturating_mul(PGO_MS) / 1000);
+        crate::zone_alloc::kept_with(|| PROFILED_HEAT.lock().unwrap_or_else(|e| e.into_inner()).push(ProfiledHeat { id, counters, weights, work }));
         tier_push(id, Q_PROFILED, rate);
     }
+}
+
+/// A slot queued for its O3 build from its counted code (Q_PROFILED), which runs until that build
+/// is installed: its counts so far (work: instructions, as Counting's)
+struct ProfiledHeat {
+    id: u32,
+    counters: &'static [AtomicU64],
+    weights: &'static [u32],
+    work: u64,
+}
+static PROFILED_HEAT: relax_session::sync::Mutex<Vec<ProfiledHeat>> = relax_session::sync::Mutex::new(Vec::new());
+/// RIR instructions of counted work per cost unit (a back edge's; a loop iteration is ~8 instructions)
+const WORK_PER_UNIT: u64 = 8;
+/// how often the counted slots' work is charged to their records
+const PROFILED_HEAT_NS: u64 = 50_000_000;
+
+/// Charges each Q_PROFILED slot's counted work since the last look to its tier record (in cost
+/// units): counted code has block counters but no loop counters, and this keeps its heat live
+/// while it waits for its build. Slots no longer queued (taken, other code installed) leave the
+/// list. O3 workers only (pgo_poll); at most every PROFILED_HEAT_NS.
+fn profiled_heat() {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = wall_ns();
+    if now.saturating_sub(LAST.load(Ordering::Relaxed)) < PROFILED_HEAT_NS {
+        return;
+    }
+    LAST.store(now, Ordering::Relaxed);
+    let Some((u, _)) = heat_unit() else { return };
+    if PROFILED_HEAT.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        return;
+    }
+    let queued: std::collections::HashSet<u32> = tier_queue().unwrap_or_else(|e| e.into_inner()).iter().filter(|e| e.1 == Q_PROFILED).map(|e| e.0).collect();
+    let mut g = PROFILED_HEAT.lock().unwrap_or_else(|e| e.into_inner());
+    g.retain_mut(|e| unsafe {
+        if e.id as usize >= u.fns.len() || !queued.contains(&e.id) {
+            return false;
+        }
+        let rec = tier_rec(&u.slots, e.id);
+        if (*rec.add(3)).load(Ordering::Acquire) != T_QUEUED {
+            return false;
+        }
+        let work = e.counters.iter().zip(e.weights).map(|(c, w)| c.load(Ordering::Relaxed).saturating_mul(*w as u64)).fold(0, u64::saturating_add);
+        tier_charge(rec, work.saturating_sub(e.work) / WORK_PER_UNIT);
+        e.work = work;
+        true
+    });
 }
 
 /// A hot loop ran under a frame of slot `id` (rt_loop_hot, no unit lock): true if `id` is a
@@ -17145,6 +17347,7 @@ fn rt_hot(slot: u64) -> u64 {
             // queued without a lock (rule I-CALL): the rate in the record (published by the push's
             // release), the slot on TIER_INBOX; the workers move it into TIER_QUEUE (tier_drain).
             // A hot loop's cost made it hot: queued for its loops (never lukewarm)
+            note_ui_path(rec);
             let why = if (*rec.add(5)).load(Ordering::Relaxed) & LOOP_CHARGED != 0 { Q_LOOP } else { Q_CALLS };
             crate::inspect::tierlog::note(slot as u32, crate::inspect::tierlog::ev::QUEUE, why, rate, code);
             tier_inbox_push(rec, slot as u32, why, rate);
@@ -18327,6 +18530,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     if !fronted.is_empty() {
         let mut lowered = front.lowered.lock().unwrap_or_else(|e| e.into_inner());
         for c in &fronted { lowered.remove(c); }
+        drop(lowered);
+        lowered_end();
     }
     drop(front);
     let t1 = cpu_ns();
@@ -22014,7 +22219,7 @@ fn prefront_slot_once(front: &FrontShared, id: u32) -> bool {
     };
     prefront_count(t0);
     prefronted(id);
-    let ok = front.lowered.lock().unwrap_or_else(|e| e.into_inner()).get(&id).is_some_and(|x| x.is_some());
+    let ok = matches!(front.lowered.lock().unwrap_or_else(|e| e.into_inner()).get(&id), Some(LoweredState::Ready(_)));
     if !ok {
         let why = if why == AF_OK { AF_OTHER } else { why };
         prefront_fail(why);
@@ -22074,12 +22279,13 @@ fn prefront_closure(front: &FrontShared, id: u32) -> bool {
     {
         let mut pending = front.lowered.lock().unwrap_or_else(|e| e.into_inner());
         if pending.contains_key(&id) {
+            let ready = matches!(pending.get(&id), Some(LoweredState::Ready(_)));
             if ahead_trace() {
-                eprintln!("ahead-lower of closure #{}: already {}", id, if pending.get(&id).is_some_and(|x| x.is_some()) { "lowered" } else { "pending/failed" });
+                eprintln!("ahead-lower of closure #{}: already {}", id, if ready { "lowered" } else { "pending/failed" });
             }
-            return pending.get(&id).is_some_and(|x| x.is_some()) || prefront_fail(AF_PENDING);
+            return ready || prefront_fail(AF_PENDING);
         }
-        pending.insert(id, None);
+        pending.insert(id, LoweredState::Running);
     }
     let t0 = cpu_ns();
     let _preemptible = crate::preempt::Preemptible::on();
@@ -22121,9 +22327,10 @@ fn prefront_closure(front: &FrontShared, id: u32) -> bool {
         if transient_ahead_fail(why) {
             pending.remove(&id);
         } else if let Some(slot) = pending.get_mut(&id) {
-            *slot = ready;
+            *slot = ready.map_or(LoweredState::Failed, LoweredState::Ready);
         }
     }
+    lowered_end();
     if !ok {
         prefront_fail(why);
     }
@@ -22619,9 +22826,9 @@ pub struct FrontShared {
     inprog: relax_session::sync::Mutex<crate::fxhash::HashSet<AheadKey>>,
     /// Instances whose build consumed their body: no new ahead checks.
     built: crate::conc::MemoMap<AheadKey, bool>,
-    /// A one-use handoff from lowering helpers. None reserves a slot; removing it lets the
+    /// A one-use handoff from lowering helpers. Running reserves a slot; removing it lets the
     /// normal build take over without waiting. No slot's build state is owned by a helper.
-    lowered: relax_session::sync::Mutex<HashMap<u32, Option<LoweredAhead>>>,
+    lowered: relax_session::sync::Mutex<HashMap<u32, LoweredState>>,
     /// Constants the owner evaluated, by the key lowering asked for, and statics it initialized (key
     /// (static, no args): a static's DefKind tells the two apart) (rule I-PURE: lowering ahead
     /// reads them here instead of asking the owner). Written by the owner (Unit::const_addr,
@@ -22659,6 +22866,7 @@ impl FrontShared {
     pub(crate) fn retire_memos(&self) {
         self.ahead.clear();
         let lowered = std::mem::take(&mut *self.lowered.lock().unwrap_or_else(|e| e.into_inner()));
+        lowered_end();
         let post = std::mem::take(&mut *self.ahead_post.lock().unwrap_or_else(|e| e.into_inner()));
         drop((lowered, post));
     }
@@ -22909,6 +23117,7 @@ fn ahead_helper(f: std::sync::Arc<FrontShared>, index: u32) {
                     // Unused raw RIR is startup work only. Drop it on a helper, outside the
                     // queue/publication locks; in-flight helpers cannot republish removed slots.
                     let unused = std::mem::take(&mut *f.lowered.lock().unwrap_or_else(|e| e.into_inner()));
+                    lowered_end();
                     drop(unused);
                     return;
                 }
@@ -22947,6 +23156,12 @@ fn ahead_helper(f: std::sync::Arc<FrontShared>, index: u32) {
 fn ahead_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_AHEAD_TRACE").is_some())
+}
+
+enum LoweredState {
+    Running,
+    Failed,
+    Ready(LoweredAhead),
 }
 
 struct LoweredAhead {
@@ -23059,49 +23274,75 @@ fn lower_ahead(f: &FrontShared, id: u32, own: bool) -> u8 {
     // not inside another lowering ahead (a compile its constant evaluation reached): this one's
     // guard would end the outer one's temporary callee identities under it
     if LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(true) { return AF_NESTED; }
-    let r = front_read("lower_ahead");
-    if !f.alive.load(Ordering::SeqCst) || !own && !ahead_phase() { return AF_OTHER; }
-    let Some(FnKey::Inst(d, args)) = f.slot_keys.get(&id) else { return AF_NOT_BODY; };
-    let key = (d, args);
-    if f.is_built(&key) { return AF_BUILT; }
-    let Some((epoch, body)) = f.ahead.get(&key) else { return AF_UNCHECKED; };
-    let u = r.unit_of(f);
-    let fn_key = FnKey::Inst(d, key.1.clone());
-    // fn_map publishes after the slot's fields (including a decoded image identity).
-    // The ahead queue can contain the id before fn_id/name_slot finishes publishing it.
-    if epoch != u.tcx.collect_epoch.load(Ordering::SeqCst) || u.fn_map.get(&fn_key) != Some(id) { return AF_STALE; }
-    if !lowers_ahead(u, d, &body, own) { return AF_REFUSED; }
-    {
-        let mut pending = f.lowered.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        let r = front_read("lower_ahead");
+        if !f.alive.load(Ordering::SeqCst) || !own && !ahead_phase() { return AF_OTHER; }
+        let Some(FnKey::Inst(d, args)) = f.slot_keys.get(&id) else { return AF_NOT_BODY; };
+        let key = (d, args);
         if f.is_built(&key) { return AF_BUILT; }
-        // (lowered already, being lowered on another thread, or an earlier lowering failed)
-        if let Some(x) = pending.get(&id) { return if x.is_some() { AF_OK } else { AF_PENDING }; }
-        pending.insert(id, None);
-    }
-    let r = lower_ahead_as(u, id, id, d, &key.1, epoch, None);
-    let why = r.as_ref().err().copied().unwrap_or(AF_OK);
-    // the callees a baseline build inlines (Relax core's tiniest bodies, base_inline_wanted): their
-    // slots are made now, so the helpers check and lower them ahead (slot_ahead) like any slot.
-    // Made later, by the take of this body's build, they were lowered on the owner inside that
-    // build's front (20k bodies, 1 s of a cold Fab's owner fronts before the present)
-    // (makepad run's lazy compiles only: startup, and a program thread's own builds after it; not
-    // a check's walk, whose order follows slot creation, nor a tier-up worker's speculative front)
-    let small: Vec<FnKey> = match &r {
-        Ok(l) if pipelined() && (startup_phase() || ahead_foreground()) => l.callees.iter().filter(|k| matches!(k, FnKey::Inst(cd, _) if base_inline_source(u, *cd) && u.fn_map.get(*k).is_none())).cloned().collect(),
-        _ => Vec::new(),
-    };
-    {
-        let mut pending = f.lowered.lock().unwrap_or_else(|e| e.into_inner());
-        if f.is_built(&key) || transient_ahead_fail(why) {
-            pending.remove(&id);
-        } else if let Some(slot) = pending.get_mut(&id) {
-            *slot = r.ok();
+        let Some((epoch, body)) = f.ahead.get(&key) else { return AF_UNCHECKED; };
+        let u = r.unit_of(f);
+        let fn_key = FnKey::Inst(d, key.1.clone());
+        // fn_map publishes after the slot's fields (including a decoded image identity).
+        // The ahead queue can contain the id before fn_id/name_slot finishes publishing it.
+        if epoch != u.tcx.collect_epoch.load(Ordering::SeqCst) || u.fn_map.get(&fn_key) != Some(id) { return AF_STALE; }
+        if !lowers_ahead(u, d, &body, own) { return AF_REFUSED; }
+        {
+            let mut pending = f.lowered.lock().unwrap_or_else(|e| e.into_inner());
+            if f.is_built(&key) { return AF_BUILT; }
+            match pending.get(&id) {
+                Some(LoweredState::Ready(_)) => return AF_OK,
+                Some(LoweredState::Running) if own && !owner::is_owner() => {
+                    // the writer may need the front: hold neither lock while the helper finishes
+                    drop(pending);
+                    drop(r);
+                    let _idle = JobIdle::enter();
+                    let _w = AheadWait::begin(4);
+                    let mut g = LOWER_AHEAD_DONE.0.lock().unwrap_or_else(|e| e.into_inner());
+                    while matches!(f.lowered.lock().unwrap_or_else(|e| e.into_inner()).get(&id), Some(LoweredState::Running)) && f.alive.load(Ordering::SeqCst) {
+                        g = LOWER_AHEAD_DONE.1.wait_timeout(g, std::time::Duration::from_millis(5)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0);
+                    }
+                    continue;
+                }
+                Some(_) => return AF_PENDING,
+                None => {}
+            }
+            if own {
+                // note every missing free constant before doing any lowering, outside the map lock
+                drop(pending);
+                if want_missing_body_consts(u, &body) { return AF_NEEDS_UNIT; }
+                pending = f.lowered.lock().unwrap_or_else(|e| e.into_inner());
+                if f.is_built(&key) { return AF_BUILT; }
+                if pending.contains_key(&id) { continue; }
+            }
+            pending.insert(id, LoweredState::Running);
         }
+        let r = lower_ahead_as(u, id, id, d, &key.1, epoch, None);
+        let why = r.as_ref().err().copied().unwrap_or(AF_OK);
+        // the callees a baseline build inlines (Relax core's tiniest bodies, base_inline_wanted): their
+        // slots are made now, so the helpers check and lower them ahead (slot_ahead) like any slot.
+        // Made later, by the take of this body's build, they were lowered on the owner inside that
+        // build's front (20k bodies, 1 s of a cold Fab's owner fronts before the present)
+        // (makepad run's lazy compiles only: startup, and a program thread's own builds after it; not
+        // a check's walk, whose order follows slot creation, nor a tier-up worker's speculative front)
+        let small: Vec<FnKey> = match &r {
+            Ok(l) if pipelined() && (startup_phase() || ahead_foreground()) => l.callees.iter().filter(|k| matches!(k, FnKey::Inst(cd, _) if base_inline_source(u, *cd) && u.fn_map.get(*k).is_none())).cloned().collect(),
+            _ => Vec::new(),
+        };
+        {
+            let mut pending = f.lowered.lock().unwrap_or_else(|e| e.into_inner());
+            if f.is_built(&key) || transient_ahead_fail(why) {
+                pending.remove(&id);
+            } else if let Some(slot) = pending.get_mut(&id) {
+                *slot = r.ok().map_or(LoweredState::Failed, LoweredState::Ready);
+            }
+        }
+        lowered_end();
+        for k in small {
+            u.fn_id(k);
+        }
+        return why;
     }
-    for k in small {
-        u.fn_id(k);
-    }
-    why
 }
 
 /// Whether `d`'s body is one a baseline build inlines by its source (base_inline_wanted's rule for
@@ -23129,7 +23370,7 @@ const AF_REFUSED: u8 = 5;
 const AF_NEEDS_UNIT: u8 = 6;
 const AF_NO_PARENT: u8 = 7;
 const AF_OTHER: u8 = 8;
-/// an earlier lowering ahead of the slot failed (its entry stays None) or is running on another thread
+/// an earlier lowering ahead of the slot failed, or is running on another thread
 const AF_PENDING: u8 = 9;
 /// inside another lowering ahead
 const AF_NESTED: u8 = 10;
@@ -23306,9 +23547,9 @@ fn prefront_twin(front: &FrontShared, twin: u32, base: u32) -> bool {
     {
         let mut pending = front.lowered.lock().unwrap_or_else(|e| e.into_inner());
         if pending.contains_key(&twin) {
-            return pending.get(&twin).is_some_and(|x| x.is_some()) || prefront_fail(AF_PENDING);
+            return matches!(pending.get(&twin), Some(LoweredState::Ready(_))) || prefront_fail(AF_PENDING);
         }
-        pending.insert(twin, None);
+        pending.insert(twin, LoweredState::Running);
     }
     let t0 = cpu_ns();
     let ready = {
@@ -23323,9 +23564,10 @@ fn prefront_twin(front: &FrontShared, twin: u32, base: u32) -> bool {
         if why.is_some_and(transient_ahead_fail) {
             pending.remove(&twin);
         } else if let Some(slot) = pending.get_mut(&twin) {
-            *slot = ready.ok();
+            *slot = ready.ok().map_or(LoweredState::Failed, LoweredState::Ready);
         }
     }
+    lowered_end();
     if let Some(why) = why {
         prefront_fail(why);
     }
@@ -23342,15 +23584,18 @@ fn give_back_lowered(u: &Unit, id: u32, func: relax_backend::rir::Func) {
         _ => None,
     };
     let back = LoweredAhead { epoch, file: u.fns[id as usize].file, func, body, callees: Vec::new(), consts: Vec::new(), tls: Vec::new() };
-    u.front.lowered.lock().unwrap_or_else(|e| e.into_inner()).insert(id, Some(back));
+    u.front.lowered.lock().unwrap_or_else(|e| e.into_inner()).insert(id, LoweredState::Ready(back));
+    lowered_end();
 }
 
 /// Unit lock held. Never wait for lowering: taking an unfinished reservation cancels its
 /// publication, and this build uses the already checked body through the ordinary path.
 fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<relax_backend::rir::Func> {
-    let mut lowered = u.front.lowered.lock().unwrap_or_else(|e| e.into_inner()).remove(&id)??;
+    let lowered = u.front.lowered.lock().unwrap_or_else(|e| e.into_inner()).remove(&id)?;
+    lowered_end();
+    let LoweredState::Ready(mut lowered) = lowered else { return None };
     // (MAKEPAD_RUN_O2_TRACE: why a take could not use a lowering made ahead for it)
-    let name = if o2_trace() && owner::bailing() { Some(u.fns[id as usize].name.to_string()) } else { None };
+    let name = if o2_trace() && owner::bailing() || ahead_trace() && !FIRST_PRESENT.load(Ordering::Relaxed) { Some(u.fns[id as usize].name.to_string()) } else { None };
     let refuse = |why: &str| {
         if let Some(name) = &name {
             eprintln!("makepad-run O2: lowering ahead of #{} {} not taken: {}", id, name, why);
@@ -23563,55 +23808,70 @@ pub unsafe fn typeck_ahead_slot(up: *mut Unit, id: u32) {
         if !owner::is_owner() && f.inprog.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
             // (a wait for another thread: not a running job meanwhile, job_sleep's reason)
             let _idle = JobIdle::enter();
-            let _w = AheadWait::begin();
+            let _w = AheadWait::begin(0);
             let mut g = AHEAD_DONE.0.lock().unwrap_or_else(|e| e.into_inner());
             while f.inprog.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) && f.alive.load(Ordering::SeqCst) {
                 g = AHEAD_DONE.1.wait_timeout(g, std::time::Duration::from_millis(5)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0);
             }
         }
         let w = IS_WORKER.try_with(|w| w.get()).unwrap_or(false);
-        AHEAD_STATS[if w { 4 } else { 3 }].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
+        let mut t1 = cpu_ns();
+        AHEAD_STATS[if w { 4 } else { 3 }].fetch_add(t1 - t0, Ordering::Relaxed);
         // the thread about to build the slot lowers it (off the owner: the owner's front then only
         // takes the RIR), also during the startup, when the helpers have not got to it yet
         if !owner::is_owner() && pipelined() {
-            let t = cpu_ns();
+            let _want = WantConsts::on();
             let why = lower_ahead(&f, id, true);
+            if ahead_trace() && !FIRST_PRESENT.load(Ordering::Relaxed) {
+                let site = NEEDS_UNIT_AT.try_with(|a| a.get()).ok().flatten().map_or(String::new(), |l| format!("{}:{}", l.file().rsplit('/').next().unwrap_or(""), l.line()));
+                eprintln!("own-lower af{} #{} main={} at={} {}", why, id, MAIN_TID.load(Ordering::Relaxed) == me(), site, f.slot_keys.get(&id).map_or(0, |_| 1));
+            }
             if MAIN_TID.load(Ordering::Relaxed) == me() {
-                MAIN_AHEAD_WAIT[2].fetch_add(cpu_ns() - t, Ordering::Relaxed);
+                let t = t1;
+                t1 = cpu_ns();
+                MAIN_AHEAD_WAIT[2].fetch_add(t1 - t, Ordering::Relaxed);
                 if !FIRST_PRESENT.load(Ordering::Relaxed) {
                     MAIN_LOWER_WHY[(why as usize).min(MAIN_LOWER_WHY.len() - 1)].fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
         if MAIN_TID.load(Ordering::Relaxed) == me() {
-            MAIN_AHEAD_WAIT[3].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
+            MAIN_AHEAD_WAIT[3].fetch_add(t1 - t0, Ordering::Relaxed);
         }
     }
 }
 
 /// The main thread's waits for a helper's check of the body it is about to build
 /// (typeck_ahead_slot): [count, wall ns], and its cpu ns lowering its slots ahead, and in all of
-/// typeck_ahead_slot (the first-present line)
-pub(crate) static MAIN_AHEAD_WAIT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// typeck_ahead_slot, then its waits for a helper's lowering [count, wall ns] (first-present line)
+pub(crate) static MAIN_AHEAD_WAIT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// the main thread's lowerings ahead of its own slots before the first present, by result (AF_*)
 pub(crate) static MAIN_LOWER_WHY: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
-struct AheadWait(u64);
+struct AheadWait(u64, usize);
 impl AheadWait {
-    fn begin() -> AheadWait {
-        AheadWait(if MAIN_TID.load(Ordering::Relaxed) == me() { wall_ns().max(1) } else { 0 })
+    fn begin(at: usize) -> AheadWait {
+        AheadWait(if MAIN_TID.load(Ordering::Relaxed) == me() { wall_ns().max(1) } else { 0 }, at)
     }
 }
 impl Drop for AheadWait {
     fn drop(&mut self) {
         if self.0 != 0 {
-            MAIN_AHEAD_WAIT[0].fetch_add(1, Ordering::Relaxed);
-            MAIN_AHEAD_WAIT[1].fetch_add(wall_ns() - self.0, Ordering::Relaxed);
+            MAIN_AHEAD_WAIT[self.1].fetch_add(1, Ordering::Relaxed);
+            MAIN_AHEAD_WAIT[self.1 + 1].fetch_add(wall_ns() - self.0, Ordering::Relaxed);
         }
     }
 }
 
 /// Signalled when a check ahead ends (typeck_ahead_slot waits for a helper's check in flight).
 static AHEAD_DONE: (relax_session::sync::Mutex<()>, relax_session::sync::Condvar) = (relax_session::sync::Mutex::new(()), relax_session::sync::Condvar::new());
+
+/// Signalled after a lowering's entry changes or goes away; notify with the map lock released.
+static LOWER_AHEAD_DONE: (relax_session::sync::Mutex<()>, relax_session::sync::Condvar) = (relax_session::sync::Mutex::new(()), relax_session::sync::Condvar::new());
+
+fn lowered_end() {
+    let _g = LOWER_AHEAD_DONE.0.lock().unwrap_or_else(|e| e.into_inner());
+    LOWER_AHEAD_DONE.1.notify_all();
+}
 
 fn inprog_end(f: &FrontShared, key: &AheadKey) {
     f.inprog.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
@@ -25400,7 +25660,7 @@ pub fn manifest_order(order: Vec<u32>, present: usize) -> (Vec<u32>, usize) {
 }
 
 thread_local! {
-    /// (a background build's front, prefront_slot) a constant its lowering ahead finds unevaluated
+    /// (a build's own front) a constant its lowering ahead finds unevaluated
     /// is noted for the owner (CONSTS_WANTED)
     static WANT_CONSTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -25421,15 +25681,23 @@ fn want_body_consts(u: &Unit, body: &Body) {
     if !LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false) || !WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
         return;
     }
+    want_missing_body_consts(u, body);
+}
+
+/// Notes all missing free constants; true means lowering would need the owner.
+fn want_missing_body_consts(u: &Unit, body: &Body) -> bool {
     let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
     let mut seen: crate::fxhash::HashSet<DefId> = Default::default();
+    let mut missing = false;
     for r in body.res.values().chain(body.pat_res.values()).chain(body.fmt_named.values()) {
         if let Res::Def(d) = r {
             if u.prog.def(*d).kind == DefKind::Const && seen.insert(*d) && u.front.consts.get(&(*d, Vec::new())).is_none() {
                 want(Wanted::Const(*d, Vec::new()), epoch);
+                missing = true;
             }
         }
     }
+    missing
 }
 /// Notes `w` for the owner's const_drain.
 fn want(w: Wanted, epoch: u64) {

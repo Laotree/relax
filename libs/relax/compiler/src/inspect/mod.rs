@@ -236,6 +236,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("vms", "", "every live Splash VM: label, thread, heap objects / strings / arrays and bytes, GC runs and time, errors, evaluations"),
     ("live", "[after=<next>]", "an instant look for live graphs (no window, no sleep), one JSON line: now_ms, frames presented, finished builds so far per kind (lazy, ahead, o2, o3, linked; diff two looks for a rate), queues [ahead,o2,o3], UI ms waited on the JIT; with after=<the last answer's next>: the UI frames since then (the last minute at most) as ft [[ms before now_ms the frame ended, ms it worked], ...]"),
     ("jit", "[ms=250]","live compile activity in one line (what the JIT ring shows): busy or idle, the jobs running now, the queues per tier (ahead, O2, O3), builds finished and their rate over ms, the UI thread's JIT duty"),
+    ("jit queue", "[n=10]","what the JIT builds now, then the next n of the O3 and O2 queues in the order they are built: heat (x the O3 threshold; ui: the UI thread's path), why queued, seconds waited, fn"),
     ("threads", "", "every thread: name, role, state, CPU time, what it waits on; JIT threads: alive/restarting/dead, panics, heartbeat"),
     ("stacks", "[thread=<name|tid|main|owner|all>] [depth=12]", "symbolised stacks (identical stacks folded)"),
     ("waits", "", "the wait registry: who waits for what, held by whom"),
@@ -1111,6 +1112,13 @@ fn cmd_waits(out: &mut Out) {
 /// `jit`: the JIT's compile activity over a short window, one line, answer first.
 fn cmd_jit(req: &Req, out: &mut Out) {
     use crate::postframe::activity;
+    if req.pos.first().map(String::as_str) == Some("queue") {
+        out.measured("JIT compile queues", "jit::queue_view: each queue locked for one scan, heat from the tier records", &[]);
+        for l in crate::jit::queue_view(req.num("n", 10) as usize) {
+            out.line(&l);
+        }
+        return;
+    }
     let ms = req.num("ms", 250).clamp(20, 10_000);
     let t0 = std::time::Instant::now();
     let a = activity();
