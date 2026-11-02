@@ -1723,6 +1723,9 @@ pub struct GraphUnit {
     pub host: bool,
     /// build | run-custom-build
     pub mode: String,
+    /// built with rustc's `--test`: libtest's generated main replaces the crate's own
+    /// (a lib's or bin's unit tests, an integration test without `harness = false`)
+    pub harness: bool,
     pub features: Vec<String>,
     /// (unit index, extern crate name)
     pub deps: Vec<(usize, String)>,
@@ -1759,6 +1762,7 @@ impl Units {
                     edition: s(t.and_then(|t| t.get("edition"))),
                     host: u.get("profile").and_then(|p| p.get("opt_level")).map(|o| o.str() == "0").unwrap_or(false) || matches!(u.get("relax_host"), Some(crate::json::Json::Bool(true))),
                     mode: s(u.get("mode")),
+                    harness: u.get("mode").is_some_and(|m| m.str() == "test"),
                     features: list(u.get("features")),
                     deps: u.get("dependencies").map(|d| d.arr().iter().filter_map(|dep| Some((dep.get("index")?.num() as usize, s(dep.get("extern_crate_name"))))).collect()).unwrap_or_default(),
                 }
@@ -2234,6 +2238,11 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
             edition,
             host,
             mode: mode.to_string(),
+            harness: match u {
+                UKind::LibTest | UKind::BinTest(_) => true,
+                UKind::Test(ti) => m.tests[*ti].harness,
+                _ => false,
+            },
             features: node.features.iter().cloned().collect(),
             deps,
         });
