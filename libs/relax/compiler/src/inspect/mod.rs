@@ -256,8 +256,8 @@ fn dispatch_command(req: &Req, out: &mut Out) {
     match req.cmd.as_str() {
         "session" => match req.pos.first().map(String::as_str) {
             Some("relaunch") => match crate::reload::relaunch_pending() {
+                // the waiting edits stay noted until a run loads them (the app may postpone it)
                 Ok(how) => {
-                    crate::reload::clear_restart_pending();
                     out.line(&format!("{{\"relaunch\":\"queued\",\"as\":\"{}\",\"pid\":{}}}", how, std::process::id()))
                 }
                 Err(e) => out.err(&e),
