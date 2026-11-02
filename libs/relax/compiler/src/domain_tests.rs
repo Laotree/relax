@@ -179,8 +179,9 @@ fn teardown_fixture_cycles_and_retiring_thread() {
                 baseline = now;
             }
             // Native allocator thread caches may vary a little; two MB leaked per cycle may not.
-
-            assert!(now <= baseline + 256 * 1024, "cycle {cycle}: {now} > baseline {baseline}");
+            if cycle >= 1 {
+                assert!(now <= baseline + 256 * 1024, "cycle {cycle}: {now} > baseline {baseline}");
+            }
         }
         #[cfg(not(target_os = "linux"))]
         let _ = cycle;
