@@ -327,18 +327,28 @@ pub fn export_hits(u: &Unit, other: &HashMap<String, HashSet<(usize, usize)>>) -
 }
 
 
-/// TEMP: which of the named functions have their entry bit set (debug trace).
+/// TEMP: which of the named functions have their entry bit set (debug trace); cheap after the first scans.
 pub fn debug_hits() -> String {
+    static SEEN: std::sync::Mutex<(usize, Vec<usize>)> = std::sync::Mutex::new((0, Vec::new()));
     let record = RECORD.lock().unwrap_or_else(|e| e.into_inner());
-    let mut out = String::new();
-    for r in record.ranges.iter() {
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    while seen.0 < record.ranges.len() {
+        let r = &record.ranges[seen.0];
         let u = unsafe { &*(r.unit as *const Unit) };
-        if r.slot as usize >= u.fns.len() { continue; }
-        let key = crate::jit::slot_key(u, r.slot);
-        if key.ends_with("<TopicSet>::empty") || key.ends_with("<Dlmalloc>::new") || key.ends_with("<OsString>::into_string") || key.contains("<RwLock>::new<TopicSet>") {
-            let hit = r.bits[r.bit[0] / 64].load(Ordering::Relaxed) & (1 << (r.bit[0] % 64)) != 0;
-            out.push_str(&format!(" [{}={}]", &key[key.len().saturating_sub(24)..], hit as u8));
+        if (r.slot as usize) < u.fns.len() {
+            let key = crate::jit::slot_key(u, r.slot);
+            if key.ends_with("<TopicSet>::empty") || key.ends_with("<Dlmalloc>::new") || key.ends_with("<OsString>::into_string") || key.contains("<RwLock>::new<TopicSet>") || key.ends_with("<FromUtf8Error>::into_bytes") {
+                let i = seen.0;
+                seen.1.push(i);
+            }
         }
+        seen.0 += 1;
+    }
+    let mut out = String::new();
+    for &i in &seen.1 {
+        let r = &record.ranges[i];
+        let hit = r.bits[r.bit[0] / 64].load(Ordering::Relaxed) & (1 << (r.bit[0] % 64)) != 0;
+        out.push_str(&format!(" {}{}{}", i, if hit { "!" } else { "." }, r.slot));
     }
     out
 }
