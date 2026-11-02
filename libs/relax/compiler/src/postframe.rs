@@ -194,39 +194,6 @@ pub fn ahead_progress() -> (u64, u64) {
     (AHEAD_DONE.load(Relaxed), crate::jit::ahead_queued() + AHEAD_RUNNING.load(Relaxed))
 }
 
-// ------------------------------------------------------------ compile pressure (helpers yield)
-
-/// O3 builds running now (TIER_ACTIVE's length, read without its lock)
-pub(crate) static O3_BUILDING: AtomicU64 = AtomicU64::new(0);
-/// wall ns a background build (O3, O2, ahead) last ended, or was last seen running
-static BUILT_LAST: AtomicU64 = AtomicU64::new(0);
-/// The pressure holds this long past the last background build: the gaps between a worker's
-/// builds (a pop, a counted window's end) do not let every helper start and stop again.
-const PRESSURE_HOLD_NS: u64 = 250_000_000;
-
-/// A background build (O3, O2, ahead) ended.
-pub(crate) fn background_build_ended() {
-    BUILT_LAST.store(wall_ns(), Relaxed);
-}
-
-/// The loader symbol `relax_compile_pressure` (makepad platform's task pool, thread.rs
-/// `compile_pressure`): the JIT builds code the program runs in the background now -- an O3 or O2
-/// build of hot code, a function ahead of its call -- or ended one less than PRESSURE_HOLD_NS ago.
-/// The program's parallel helpers pause meanwhile and their callers work on alone: the builds get
-/// the cores, and hot code its optimised version sooner, instead of many threads running it
-/// unoptimised while the compiler starves (Fab's slicer: 15 helpers at UserInitiated against 3 O3
-/// workers below them). Atomics only.
-pub extern "C" fn relax_compile_pressure() -> bool {
-    use crate::jit::O2_RUNNING;
-    let now = wall_ns();
-    if O3_BUILDING.load(Relaxed) > 0 || O2_RUNNING.load(Relaxed) || AHEAD_RUNNING.load(Relaxed) > 0 {
-        BUILT_LAST.store(now, Relaxed);
-        return true;
-    }
-    let last = BUILT_LAST.load(Relaxed);
-    last != 0 && now.saturating_sub(last) < PRESSURE_HOLD_NS
-}
-
 /// The JIT's work: what is queued and running now, and what it has finished so far (monotonic,
 /// so two looks give the work rate). For the run's JIT ring and makepad inspect `jit`: a look,
 /// not a measurement (two queue locks, each alone; the rest atomics).
@@ -312,7 +279,7 @@ impl Activity {
 
 /// A fn's path for one line: its last two segments without generics (`<T as Tr>::f` -> `T::f`),
 /// a trailing ` [..]` note kept, at most 40 chars.
-fn short_fn(name: &str) -> String {
+pub(crate) fn short_fn(name: &str) -> String {
     let (name, note) = match name.find(" [") {
         Some(i) => (&name[..i], &name[i..]),
         None => (name, ""),
