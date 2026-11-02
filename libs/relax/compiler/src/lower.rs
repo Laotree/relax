@@ -1774,8 +1774,12 @@ impl<'a> Lcx<'a> {
                 // the old captures twice)
                 ExprKind::Call(f, _) if matches!(self.kind_ref(b.ty(*f)), TyKind::Closure(..)) => self.mark_root(*f),
                 // overloaded index / deref take `&self` / `&mut self` of the base
-                ExprKind::Index(x, _) if b.ov_index.contains_key(&e.0) => self.mark_root(*x),
+                ExprKind::Index(x, _) if b.ov_index.contains_key(&e.0) || b.ov_deref(e.0, 0).is_some() => self.mark_root(*x),
                 ExprKind::Unary(UnOp::Deref, x) if b.ov_deref(e.0, 0).is_some() => self.mark_root(*x),
+                // a field reached through an overloaded deref of the base (`w.close = true` with
+                // `W: DerefMut`): the deref takes the base's address, and a register copy of it
+                // would take the write
+                ExprKind::Field(x, _) | ExprKind::TupleField(x, _) if b.ov_deref(e.0, 0).is_some() => self.mark_root(*x),
                 // patterns that bind by reference (`ref`, `ref mut`, match ergonomics) take the
                 // scrutinee place's address in place
                 ExprKind::Let(p, x) if self.pat_binds_by_ref(*p) => self.mark_root(*x),
