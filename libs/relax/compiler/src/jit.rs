@@ -14272,11 +14272,6 @@ fn sampler_thread() {
     // 32 ms), so a loop that turns hot is still promoted after one or two looks, and the
     // first compile, push or install puts it back on SAMPLE_MS. Diagnostic cadences
     // (MAKEPAD_RUN_SAMPLE_MS) are kept as given.
-    const SETTLED_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
-    let settle_on = std::env::var_os("MAKEPAD_RUN_SAMPLE_MS").is_none();
-    let activity = || (COMPILE_LAST.load(Ordering::Relaxed), TIER_PUSHES.load(Ordering::Relaxed), TIER1_INSTALLS.load(Ordering::Relaxed));
-    let mut last_activity = activity();
-    let mut active_at = std::time::Instant::now();
     loop {
         crate::lifeline::beat();
         let period = periods[period_index];
@@ -14285,19 +14280,7 @@ fn sampler_thread() {
         // often enough to avoid overflowing the ring even for long intervals.
         let sleep_ms = if cfg!(target_os = "linux") && periods.len() > 1 { period.min(32) } else { period };
         let sleep_ms = if idle_wakes >= IDLE_WAKES { sleep_ms.max(IDLE_MS) } else { sleep_ms };
-        let now_activity = activity();
-        if now_activity != last_activity {
-            last_activity = now_activity;
-            active_at = std::time::Instant::now();
-        }
-        let settled = settle_on && active_at.elapsed() >= SETTLED_AFTER;
-        if settled != SAMPLER_SETTLED.load(Ordering::Relaxed) {
-            SAMPLER_SETTLED.store(settled, Ordering::Relaxed);
-            let ms = if settled { SETTLED_MS } else { SAMPLE_MS };
-            for (_, _, h) in SAMPLED.lock().unwrap().iter() {
-                os::sample::set_period(h, ms);
-            }
-        }
+        let settled = update_sampler_settled();
         let sleep_ms = if settled { sleep_ms.max(SETTLED_MS) } else { sleep_ms };
         wait.sleep(sleep_ms);
         if TIER_STOP.load(Ordering::SeqCst) { break; }
@@ -15934,6 +15917,54 @@ static TIER_PUSHES: AtomicU64 = AtomicU64::new(0);
 const SETTLED_MS: u64 = 32;
 /// The sampler is settled: sources sample every SETTLED_MS (os::sample::set_period)
 static SAMPLER_SETTLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// Only program runs drive the budget, never check/test or compiler build scripts.
+static BUDGET_RUN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SAMPLER_ACTIVITY: std::sync::Mutex<Option<((u64, u64, u64), std::time::Instant)>> = std::sync::Mutex::new(None);
+
+fn sampler_activity() -> (u64, u64, u64) {
+    (COMPILE_LAST.load(Ordering::Relaxed), TIER_PUSHES.load(Ordering::Relaxed), TIER1_INSTALLS.load(Ordering::Relaxed))
+}
+
+pub(crate) fn start_cpu_budget() {
+    let mut activity = SAMPLER_ACTIVITY.lock().unwrap();
+    *activity = Some((sampler_activity(), std::time::Instant::now()));
+    makepad_cpu_budget::set_warming(true);
+    SAMPLER_SETTLED.store(false, Ordering::Relaxed);
+    BUDGET_RUN.store(true, Ordering::Release);
+}
+
+// Ordinary runs have no PC sampler. Reuse the existing monitor's tick so their budget
+// still settles, without enabling profiling or adding a polling thread.
+pub(crate) fn poll_cpu_budget() {
+    if BUDGET_RUN.load(Ordering::Acquire) && !sampling_on() {
+        update_sampler_settled();
+    }
+}
+
+fn update_sampler_settled() -> bool {
+    const SETTLED_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+    static SETTLE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let settle_on = *SETTLE_ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_SAMPLE_MS").is_none());
+    let mut activity = SAMPLER_ACTIVITY.lock().unwrap();
+    let now = sampler_activity();
+    let (last, active_at) = activity.get_or_insert_with(|| (now, std::time::Instant::now()));
+    if *last != now {
+        *last = now;
+        *active_at = std::time::Instant::now();
+    }
+    let settled = settle_on && active_at.elapsed() >= SETTLED_AFTER;
+    if settled != SAMPLER_SETTLED.load(Ordering::Relaxed) {
+        SAMPLER_SETTLED.store(settled, Ordering::Relaxed);
+        if BUDGET_RUN.load(Ordering::Acquire) {
+            makepad_cpu_budget::set_warming(!settled);
+        }
+        let ms = if settled { SETTLED_MS } else { SAMPLE_MS };
+        for (_, _, h) in SAMPLED.lock().unwrap().iter() {
+            os::sample::set_period(h, ms);
+        }
+    }
+    settled
+}
 
 /// The sampling period a newly opened source starts with at least (ms; Linux: the kernel's period)
 #[cfg(target_os = "linux")]
