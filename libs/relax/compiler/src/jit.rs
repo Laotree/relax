@@ -16186,7 +16186,7 @@ fn sampler_activity() -> (u64, u64, u64) {
 pub(crate) fn start_cpu_budget() {
     let mut activity = SAMPLER_ACTIVITY.lock().unwrap();
     *activity = Some((sampler_activity(), std::time::Instant::now()));
-    makepad_cpu_budget::set_warming(true);
+    makepad_cpu_budget::begin_warmup();
     SAMPLER_SETTLED.store(false, Ordering::Relaxed);
     BUDGET_RUN.store(true, Ordering::Release);
 }
@@ -16213,8 +16213,8 @@ fn update_sampler_settled() -> bool {
     let settled = settle_on && active_at.elapsed() >= SETTLED_AFTER;
     if settled != SAMPLER_SETTLED.load(Ordering::Relaxed) {
         SAMPLER_SETTLED.store(settled, Ordering::Relaxed);
-        if BUDGET_RUN.load(Ordering::Acquire) {
-            makepad_cpu_budget::set_warming(!settled);
+        if settled && BUDGET_RUN.load(Ordering::Acquire) {
+            makepad_cpu_budget::end_warmup();
         }
         let ms = if settled { SETTLED_MS } else { SAMPLE_MS };
         for (_, _, h) in SAMPLED.lock().unwrap().iter() {
