@@ -512,7 +512,7 @@ pub(crate) fn before_present_line(main_ns: u64) -> String {
         format!("; owner's own lowerings: of bodies checked ahead {} ({:.0} ms), by const eval {} ({:.0} ms), checked on the owner {} ({:.0} ms), closures {} ({:.0} ms), requests' own slots checked ahead {} ({:.0} ms); main's lowerings ahead of its slots by result: {}",
             o(0, 0), o(0, 1) as f64 / 1e6, o(1, 0), o(1, 1) as f64 / 1e6, o(2, 0), o(2, 1) as f64 / 1e6, o(3, 0), o(3, 1) as f64 / 1e6, o(4, 0), o(4, 1) as f64 / 1e6,
             crate::jit::MAIN_LOWER_WHY.iter().enumerate().filter(|(_, n)| n.load(Relaxed) > 0).map(|(i, n)| format!("af{} {}", i, n.load(Relaxed))).collect::<Vec<_>>().join(", "))
-    } + &format!("; bodies type-checked {} ({} of them by the app check before main: {} crates, {:.0} ms)",
+    } + &format!("; bodies type-checked {} ({} of them by the app check, before main or beside it: {} crates, {:.0} ms)",
         crate::type_queries::BODIES_CHECKED.load(Relaxed), crate::check::RUN_CHECK[1].load(Relaxed), crate::check::RUN_CHECK[0].load(Relaxed), crate::check::RUN_CHECK[2].load(Relaxed) as f64 / 1e6)
 }
 
