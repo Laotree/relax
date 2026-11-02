@@ -505,8 +505,8 @@ pub(crate) fn before_present_line(main_ns: u64) -> String {
     ) + &{
         let a = |i: usize| crate::jit::AHEAD_STATS[i].load(Relaxed);
         let w = |i: usize| crate::jit::MAIN_AHEAD_WAIT[i].load(Relaxed);
-        format!("; checks ahead: {} bodies ({} taken), cpu callers {:.0} ms, helpers {:.0} ms, main waited for a helper's check {}x {:.0} ms, main waited for a helper's lowering {}x {:.0} ms, main's cpu in them {:.0} ms of which lowering its slots {:.0} ms; lowered ahead {} ({} taken) {:.0} ms",
-            a(0), a(1), a(3) as f64 / 1e6, a(4) as f64 / 1e6, w(0), w(1) as f64 / 1e6, w(4), w(5) as f64 / 1e6, w(3) as f64 / 1e6, w(2) as f64 / 1e6, a(5), a(6), a(7) as f64 / 1e6)
+        format!("; checks ahead: {} bodies ({} taken), cpu callers {:.0} ms, helpers {:.0} ms, main waited for a helper's check {}x {:.0} ms, main waited for a helper's lowering {}x {:.0} ms, main's cpu in them {:.0} ms of which lowering its slots {:.0} ms; lowered ahead {} ({} taken) {:.0} ms; looked ahead {} bodies",
+            a(0), a(1), a(3) as f64 / 1e6, a(4) as f64 / 1e6, w(0), w(1) as f64 / 1e6, w(4), w(5) as f64 / 1e6, w(3) as f64 / 1e6, w(2) as f64 / 1e6, a(5), a(6), a(7) as f64 / 1e6, crate::jit::LOOK_QUEUED.load(Relaxed))
     } + &{
         let o = |r: usize, i: usize| crate::jit::OWNER_LOWERS[r][i].load(Relaxed);
         format!("; owner's own lowerings: of bodies checked ahead {} ({:.0} ms), by const eval {} ({:.0} ms), checked on the owner {} ({:.0} ms), closures {} ({:.0} ms), requests' own slots checked ahead {} ({:.0} ms); main's lowerings ahead of its slots by result: {}",
