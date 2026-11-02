@@ -24582,7 +24582,7 @@ fn closures_named(tcx: &Tcx, t: TyId, files: &[u32], seen: &mut std::collections
 /// version that is no longer current cannot be checked again: reload preserves its closure
 /// owners' bodies before replacing it (preserve_closure_bodies), and its closures are lowered
 /// from those on their first call.
-unsafe fn ensure_parent_body(up: *mut Unit, id: u32, file: u32, depth: u32) -> Result<(), String> {
+pub(crate) unsafe fn ensure_parent_body(up: *mut Unit, id: u32, file: u32, depth: u32) -> Result<(), String> {
     if depth > 32 || (&*up).has_body(id, file) {
         return Ok(());
     }

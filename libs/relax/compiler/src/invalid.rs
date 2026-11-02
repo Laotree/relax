@@ -328,6 +328,123 @@ pub fn stats_line() -> String {
     )
 }
 
+/// Live frames whose inlined copy could not be replaced by a patch. Code addresses are never
+/// reused, so inspect can keep explaining the old body while recovery waits for the app.
+/// (code start, what its frames still run): a few entries per failed patch.
+static STALE_INLINE: relax_session::sync::Mutex<Vec<(u64, String)>> = relax_session::sync::Mutex::new(Vec::new());
+
+pub(crate) fn note_stale_inline(start: u64, text: &str) {
+    let _k = crate::zone_alloc::kept();
+    let mut t = STALE_INLINE.lock().unwrap_or_else(|e| e.into_inner());
+    match t.iter_mut().find(|e| e.0 == start) {
+        Some(e) => e.1 = text.to_string(),
+        None => t.push((start, text.to_string())),
+    }
+}
+
+pub(crate) fn stale_inline(start: u64) -> Option<String> {
+    STALE_INLINE.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|e| e.0 == start).map(|e| e.1.clone())
+}
+
+/// Installing a new entry cannot change a live frame's inline copies. Check the bodies that
+/// existed before the patch against their own inline records, once for all program threads.
+/// A capture error is returned as a note; it is not evidence of a stale frame.
+pub(crate) fn stale_inlined_frames(u: &Unit, gen: u32, copies: &[(u32, u32, u32)]) -> Vec<String> {
+    let caps = match crate::inspect::capture_all(&crate::inspect::instrument::program_thread) {
+        Ok(caps) => caps,
+        Err(e) => return vec![format!("stale: the program's stacks could not be read ({e}): frames in code that inlined the edited fns were not checked")],
+    };
+    let mut affected: crate::fxhash::HashMap<u32, Vec<(u32, u32)>> = Default::default();
+    for &(d, s, root) in copies { affected.entry(d).or_default().push((s, root)); }
+    let mut lines = Vec::new();
+    let mut resolver = crate::inspect::codever::Resolver::new();
+    for c in caps {
+        let mut at: Vec<u64> = c.frames.iter().enumerate().map(|(k, &a)| if k == 0 { a } else { a.wrapping_sub(1) }).collect();
+        // A leaf's caller may only be in lr or at sp. Do not report it twice when the
+        // stack walk already found it; recursive frames in the walk remain distinct.
+        if c.lr != 0 {
+            let a = c.lr.wrapping_sub(1);
+            if !at.contains(&a) { at.push(a); }
+        }
+        #[cfg(target_arch = "x86_64")]
+        if c.sp != 0 && c.err.is_none() {
+            if let Some(w) = crate::inspect::threads::read_mem(c.sp, 8) {
+                let a = u64::from_le_bytes(w[..8].try_into().unwrap()).wrapping_sub(1);
+                if !at.contains(&a) { at.push(a); }
+            }
+        }
+        for a in at {
+            let (start, d, s, root, made, tier) = {
+                let code = u.code.read().unwrap_or_else(|e| e.into_inner());
+                let Some((start, _, d)) = code.entry_at(a) else { continue };
+                let Some(copies) = affected.get(&d) else { continue };
+                let f = &u.fns[d as usize];
+                if start == f.code || crate::stale::lookup(a).is_some() { continue; }
+                // Retired tier-up bodies have no recorded patch generation (codever also
+                // describes them as first-version code); they still hold inline copies.
+                let made = f.history().prev.iter().find(|p| p.0 == start).map_or(0, |p| p.3);
+                if made >= gen { continue; }
+                let tier = code.kind_of(start).tier_name();
+                let recorded: Option<Vec<u32>> = code.inlined_at(start).map(|v| v.to_vec());
+                drop(code);
+                let hit = match recorded {
+                    Some(inlined) => copies.iter().find(|(s, _)| inlined.contains(s)).copied(),
+                    // O1 / baseline code records no inlined slots (body_deps also holds nounwind
+                    // answers, not copies): its pc map's inline stack names what it took in
+                    None => copies.iter().find(|(s, _)| body_inlines(u, d, start, *s)).copied(),
+                };
+                let Some((s, root)) = hit else { continue };
+                (start, d, s, root, made, tier)
+            };
+            // describe_pc reads the code tables itself; release the guard before resolving.
+            let Some(pc) = crate::inspect::codever::describe_pc(u, &mut resolver, a) else { continue };
+            let dn = &u.fns[d as usize].name;
+            let sn = &u.fns[s as usize].name;
+            let edited = if root != s { format!(" (edited: `{}`)", u.fns[root as usize].name) } else { String::new() };
+            let version = if made == 0 { "its first version".to_string() } else { format!("patch gen {}", made) };
+            lines.push(format!("stale: thread {} `{}`: `{}` at {} runs its {} code from {}, which inlined `{}`{}: the patch cannot move this frame (`{}` inlined into `{}`) -- hot failure, the app restarts to apply the edit",
+                c.t.os_id, c.t.name, dn, pc.at, tier, version, sn, edited, sn, dn));
+            note_stale_inline(start, &format!("runs the old copy of `{}` inlined into `{}` (patch gen {} could not move this frame; hot failure)", sn, dn, gen));
+        }
+    }
+    lines
+}
+
+/// Whether the code body of `d` at `start` holds an inlined copy of `s`: an inline context of its
+/// pc map (rir::inline_pc_entries: the call's position, then a position inside the inlined fn)
+/// whose fn position lies in `s`'s source (a closure's: its expression).
+fn body_inlines(u: &Unit, d: u32, start: u64, s: u32) -> bool {
+    let (file, lo, hi) = match u.fns[s as usize].key {
+        FnKey::Closure(f, ce, _) if ce & crate::tcx::ASYNC_FN_BODY == 0 && (f as usize) < u.prog.files.len() => {
+            let e = u.prog.files[f as usize].ast.expr(crate::ast::ExprId(ce));
+            (f, e.lo, e.hi)
+        }
+        FnKey::Inst(def, _) => {
+            let def = u.prog.def(def);
+            let Some(file) = u.prog.files.get(def.file as usize) else { return false };
+            let item = file.ast.item(def.item);
+            (def.file, item.lo, item.hi)
+        }
+        _ => return false,
+    };
+    let bodies = crate::inspect::codever::bodies(u, d);
+    let Some(b) = bodies.iter().find(|b| b.start == start) else { return false };
+    let mut table: Vec<u64> = Vec::new();
+    b.map.each(|o, q| {
+        if o == u32::MAX {
+            table.push(q);
+        }
+        true
+    });
+    table.chunks(2).any(|c| {
+        c.len() == 2 && {
+            let q = c[1];
+            let at = q as u32;
+            crate::inspect::codever::same_file(u, relax_backend::rir::pos_file(q), file) && at >= lo && at < hi
+        }
+    })
+}
+
 /// A layout-changing patch (gen `gen`, `layout`: the types whose fields or variants changed),
 /// with the program threads paused (inspect::instrument::pause_for_patch, before its install;
 /// `paused`: that call paused them) and its code installed: the threads with a frame in the

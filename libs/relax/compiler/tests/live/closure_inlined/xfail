@@ -1,0 +1,1 @@
+M46 step 2: a frame in code that inlined the edited fn cannot move yet (deopt at call return / loop back-edge); the patch is a stale_frame hot failure and the parked frame prints the old copy's sum (21)
