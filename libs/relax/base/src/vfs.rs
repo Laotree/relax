@@ -1113,6 +1113,19 @@ pub fn edited_disk_path(path: &str) -> Option<std::path::PathBuf> {
     (!rel.starts_with(".makepad-run-") && p.exists()).then_some(p)
 }
 
+/// Where an edit of `path` lives on disk (whether or not there is one yet): what a file watcher
+/// watches for a virtual file. None for a disk path or without an edits folder.
+pub fn edit_location(path: &str) -> Option<std::path::PathBuf> {
+    if !is_virtual(path) { return None; }
+    let (p, rel) = edit_path(path)?;
+    (!rel.is_empty() && !rel.starts_with(".makepad-run-")).then_some(p)
+}
+
+/// The edits folder's record file (`.makepad-run-edits`): replaced whenever an edit is added.
+pub fn edits_record() -> Option<std::path::PathBuf> {
+    EDITS.read().unwrap().as_ref().map(|d| d.join(".makepad-run-edits"))
+}
+
 /// A folder made in a virtual folder: made in the edits folder.
 pub fn prepare_edit_dir(path: &str) -> io::Result<std::path::PathBuf> {
     let (disk, rel) = edit_path(path).ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "read-only (no MAKEPAD_RUN_EDITS)"))?;
