@@ -219,6 +219,10 @@ pub fn build(f: &Func, al: &Alloc, fr: &Frame, calls: &[(u32, u32)]) -> Vec<u8> 
         }
         of_entry.push(k as u32);
     }
+    // a function without calls has no site: what follows only locates values at calls
+    if calls.is_empty() {
+        return finish(f, al, Table { vars, sites: Vec::new() });
+    }
     // copies between single-definition values hold the same value everywhere (O1 code is full
     // of them: a local read through a copy into a temporary): a leaf is held by any value of its
     // class
@@ -574,6 +578,11 @@ pub fn build(f: &Func, al: &Alloc, fr: &Frame, calls: &[(u32, u32)]) -> Vec<u8> 
         }
         table.sites.sort_unstable_by_key(|s| s.0);
     }
+    finish(f, al, table)
+}
+
+/// The table as encoded: only what a stop can show.
+fn finish(f: &Func, al: &Alloc, mut table: Table) -> Vec<u8> {
     // only what a stop can show: variables located somewhere (a site, a constant, a frame
     // slot) and the sites that locate something; a variable left out reads as optimised out
     let mut used = vec![false; table.vars.len()];
