@@ -2598,7 +2598,7 @@ fn covtrace(msg: &str) {
     if let Some(path) = std::env::var_os("MAKEPAD_RUN_COVTRACE") {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{:?} {}", std::thread::current().id(), msg);
+            let _ = writeln!(f, "{} {}", std::process::id(), msg);
         }
     }
 }
