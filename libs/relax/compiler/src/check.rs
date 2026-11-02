@@ -214,7 +214,7 @@ fn check_prepared(up: *mut Unit, p: AppCheck, beside: Option<&crate::options::Ru
         let (prog, tcx) = r.as_ref().map_or((&u.prog, &u.tcx), |r| r.of(&front));
         let epoch = tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst);
         let admitted: Vec<u32> = todo.iter().copied().filter(|&k| crate::borrowck::event::admit(prog, k)).collect();
-        let impls = if crate::lint::enabled() || admitted.is_empty() { Vec::new() } else { crate::unsafety::crate_impls(prog, &admitted) };
+        let impls = if crate::lint::enabled() || admitted.is_empty() { Vec::new() } else { crate::unsafety::crate_impls(prog, tcx, &admitted) };
         (epoch, admitted, impls)
     };
     if !impls.is_empty() {
