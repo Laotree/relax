@@ -507,17 +507,19 @@ fn main() {
         // the same bytes through the system disassembler's section dump
         #[cfg(target_os = "linux")]
         if let Ok(o) = Command::new("objdump").args(["-s", &format!("--start-address={}", f.addr), &format!("--stop-address={}", f.addr + f.size), bin.to_str().unwrap()]).output() {
+            // " 401120 f30f1efa 4889f8c3 ...  ....H...": a row holds the bytes from its address
+            // up to 16, or up to the end of the range; exactly that many come from its hex
+            // groups (a short row's ASCII column can look like hex)
+            let (lo, end) = (f.addr, f.addr + f.size);
             let mut hex = Vec::new();
             for l in String::from_utf8_lossy(&o.stdout).lines() {
-                // " 401120 f30f1efa 4889f8 ...  text"
                 let mut it = l.split_whitespace();
-                if it.next().map_or(false, |a| u64::from_str_radix(a, 16).is_ok()) {
-                    for w in it.take(4) {
-                        if w.len() % 2 == 0 && w.bytes().all(|c| c.is_ascii_hexdigit()) {
-                            hex.extend((0..w.len() / 2).map(|i| u8::from_str_radix(&w[2 * i..2 * i + 2], 16).unwrap()));
-                        }
-                    }
-                }
+                let Some(a) = it.next().and_then(|a| u64::from_str_radix(a, 16).ok()) else { continue };
+                if a < lo || a >= end || a != lo + hex.len() as u64 { continue; }
+                let want = (end - a).min(16) as usize;
+                let digits: String = it.take(4).collect::<String>().chars().take(2 * want).collect();
+                if digits.len() != 2 * want || !digits.bytes().all(|c| c.is_ascii_hexdigit()) { continue; }
+                hex.extend((0..want).map(|i| u8::from_str_radix(&digits[2 * i..2 * i + 2], 16).unwrap()));
             }
             assert_eq!(&hex[..], nb.code(f), "code bytes differ from the system dump");
         }
