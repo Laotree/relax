@@ -26081,7 +26081,7 @@ fn want_in_front(u: &Unit, body: Option<&Body>, w: impl FnOnce(Option<std::sync:
 /// Owner, before each request: the constants CONSTS_WANTED names, evaluated into FrontShared::consts
 /// (Unit::const_addr publishes there), and its thread-local statics, placed into FrontShared::tls.
 /// One that fails is not asked for again by this drain; a build that needs it bails as before
-/// (the owner's lowering reports it).
+/// (the owner's lowering reports it). A span of makepad inspect's timeline when it has work.
 pub(crate) fn const_drain() {
     let want = std::mem::take(&mut *CONSTS_WANTED.lock().unwrap_or_else(|e| e.into_inner()));
     if want.is_empty() {
@@ -26091,6 +26091,7 @@ pub(crate) fn const_drain() {
     if up.is_null() {
         return;
     }
+    let _span = crate::inspect::timeline::span("owner const drain");
     let u = unsafe { &mut *up };
     let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
     let mut seen: crate::fxhash::HashSet<Wanted> = Default::default();
@@ -26169,6 +26170,7 @@ pub(crate) fn realtime_drain() {
     if up.is_null() {
         return;
     }
+    let _span = crate::inspect::timeline::span("owner realtime drain");
     let mut roots = std::mem::take(&mut *RT_PENDING_SLOTS.lock().unwrap_or_else(|e| e.into_inner()));
     let slots = roots.len();
     let addrs = if RT_DYNS.load(Ordering::Acquire) { std::mem::take(&mut *RT_PENDING.lock().unwrap_or_else(|e| e.into_inner())) } else { Vec::new() };
