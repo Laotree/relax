@@ -795,6 +795,7 @@ pub(crate) fn window_tls_block() {
     let old = os::tls::get(tls_key()) as u64;
     if old == 0 || crate::web32::in_misc(old) { return; }
     let new = crate::web32::alloc(TLS_CAP);
+    covtrace(&format!("window_tls_block old={:x} new={:x} disabled_in_old={:x}", old, new, unsafe { *((old + TLS_COVERAGE_DISABLED as u64) as *const u64) }));
     // the runtime's words (domain base, thread record, coverage, entry marks); the program's
     // variables start as a new thread's (zero): the old block's are other units' (each unit
     // places its variables from TLS_FIRST_FREE), the shadow stack words among them
@@ -2592,6 +2593,15 @@ pub(crate) fn const_fuel_tick() {
     }
 }
 
+
+fn covtrace(msg: &str) {
+    if let Some(path) = std::env::var_os("MAKEPAD_RUN_COVTRACE") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{:?} {}", std::thread::current().id(), msg);
+        }
+    }
+}
 /// One evaluation's own counter: the enclosing evaluation's is saved and comes back.
 struct ConstEvalScope { saved_fuel: (u64, u64), saved_coverage: Option<(*mut u64, u64)> }
 
@@ -2605,6 +2615,7 @@ impl ConstEvalScope {
             let mask = (rt_tls_block() + TLS_COVERAGE_DISABLED as u64) as *mut u64;
             let previous = *mask;
             *mask = u64::MAX;
+            covtrace(&format!("enter {} mask={:x} prev={:x} cur_block={:x}", prog.def_path(d), mask as u64, previous, os::tls::get(tls_key()) as u64));
             (mask, previous)
         });
         ConstEvalScope { saved_fuel, saved_coverage }
@@ -2613,7 +2624,7 @@ impl ConstEvalScope {
 
 impl Drop for ConstEvalScope {
     fn drop(&mut self) {
-        if let Some((mask, previous)) = self.saved_coverage { unsafe { *mask = previous; } }
+        if let Some((mask, previous)) = self.saved_coverage { unsafe { covtrace(&format!("drop mask={:x} restore={:x} cur_block={:x}", mask as u64, previous, os::tls::get(tls_key()) as u64)); *mask = previous; } }
         let _ = CONST_EVAL_DEPTH.try_with(|g| g.set(g.get().saturating_sub(1)));
         let _ = CONST_FUEL.try_with(|c| c.set(self.saved_fuel));
     }
