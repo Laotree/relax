@@ -609,7 +609,7 @@ pub fn run_crate_impl_errors(prog: &Program, tcx: &Tcx, krate: u32) -> std::sync
     }
     let Some(_active) = ImplChecks::enter() else { return std::sync::Arc::new(Vec::new()) };
     let mut out = Vec::new();
-    for d in crate_impls(prog, &[krate]) {
+    for d in crate_impls(prog, tcx, &[krate]) {
         out.extend(impl_errors_inner(prog, tcx, d.1));
     }
     store_crate_impl_errors(krate, epoch, out)
@@ -635,9 +635,9 @@ impl Drop for ImplChecks {
     fn drop(&mut self) { IMPL_CHECKS.with(|a| a.set(false)); }
 }
 
-/// The impls of `crates` (crate, impl), in definition order.
-pub fn crate_impls(prog: &Program, crates: &[u32]) -> Vec<(u32, DefId)> {
-    (0..prog.defs.len() as u32).map(DefId).filter(|&d| { let def = prog.def(d); def.kind == DefKind::Impl && crates.contains(&def.krate) }).map(|d| (prog.def(d).krate, d)).collect()
+/// The live impls of `crates` (crate, impl), in definition order; a refused edit's impls are excluded.
+pub fn crate_impls(prog: &Program, tcx: &Tcx, crates: &[u32]) -> Vec<(u32, DefId)> {
+    (0..prog.defs.len() as u32).map(DefId).filter(|&d| { let def = prog.def(d); def.kind == DefKind::Impl && crates.contains(&def.krate) && !tcx.refused_impls.contains(&d) }).map(|d| (prog.def(d).krate, d)).collect()
 }
 
 /// Impl `d`'s part of its crate's run_crate_impl_errors (one impl, so a whole crate's can be
