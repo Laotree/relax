@@ -2651,16 +2651,19 @@ impl Cache {
         Some(k)
     }
 
-    /// `makepad run`'s type check of crate `c`'s every body (run.rs up front for the app's crates,
-    /// typeck_bg.rs after the first present for the others): the key of its clean verdict -- the
-    /// Relax build and options (cfg), the crate's fingerprint, which covers its loaded files and
-    /// its dependencies' fingerprints, as the code keys rest on, and `skipped`, the text of its
-    /// files the boot's selection did not load (check.rs skipped_text_hash): every file of it. A
-    /// borrowck-kind entry (record_borrowck).
-    pub fn run_typeck_key(&mut self, c: u32, skipped: u128) -> Option<u128> {
+    /// A whole-crate check's clean verdict for crate `c`: `mode` 0, `makepad run`'s type check of
+    /// its every body (run.rs up front for the app's crates, typeck_bg.rs after the first present
+    /// for the others); 1 and 2, `makepad test`'s up-front check of a test subject (check.rs
+    /// subjects_mode: a plain program, a libtest harness; run.rs check_test_subjects). The key:
+    /// the Relax build and options (cfg), the crate's fingerprint, which covers its loaded files
+    /// and its dependencies' fingerprints, as the code keys rest on, and `skipped`, the text of
+    /// its files the boot's selection did not load (check.rs skipped_text_hash): every file of
+    /// it. A borrowck-kind entry (record_borrowck).
+    pub fn crate_check_key(&mut self, c: u32, skipped: u128, mode: u8) -> Option<u128> {
         let fp = *self.fps.get(c as usize)?;
         let mut h = Sip128::new();
-        h.str("run-typeck-crate");
+        h.str(if mode == 0 { "run-typeck-crate" } else { "test-check-crate" });
+        h.u8(mode);
         h.u32(CHECK_BODY_VERSION);
         h.u128(self.cfg);
         h.u128(fp);

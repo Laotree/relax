@@ -7,7 +7,7 @@
 //! compile. An error is reported at once, as a compile error of code that has not run (stderr, the
 //! launcher's report, the run's diagnostics), whether that code ever runs or not; the program
 //! itself never runs unchecked code (a build checks its body first, jit.rs). A crate whose every
-//! body is clean stores its verdict (cache.rs run_typeck_key), so a later run checks only what
+//! body is clean stores its verdict (cache.rs crate_check_key), so a later run checks only what
 //! changed, as cargo builds a dependency once. Not checked here: the app's own crates (checked
 //! whole before main, run.rs), proc-macro crates (they run in the macro host) and the sysroot
 //! (shipped checked, as rustc ships it). The bodies checked here are not kept
@@ -58,7 +58,7 @@ fn todo_crates(u: &Unit, root: u32, skipped: &[u128]) -> (Vec<bool>, Vec<Option<
         }
         let Some(c) = u.cache.as_ref() else { return (true, None) };
         let c = unsafe { &mut *c.get() };
-        match c.run_typeck_key(k, skipped[k as usize]) {
+        match c.crate_check_key(k, skipped[k as usize], 0) {
             Some(key) if matches!(c.borrowck_stored(key), Some(crate::borrowck::lazy::StoredVerdict::Clean)) => (false, None),
             key => (true, key),
         }

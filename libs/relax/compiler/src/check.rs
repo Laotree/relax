@@ -92,7 +92,7 @@ pub(crate) fn body_owners(prog: &crate::program::Program, crates: &[u32]) -> Vec
 
 /// The files of each crate the boot's file selection skipped (paths, sorted), as the boot left
 /// them -- with a crate's fingerprint, which covers the files the boot loaded, every file of it
-/// (cache.rs run_typeck_key). Taken before main, before the post-boot loader starts (run.rs).
+/// (cache.rs crate_check_key). Taken before main, before the post-boot loader starts (run.rs).
 pub(crate) static BOOT_SKIPPED: std::sync::OnceLock<Vec<Vec<String>>> = std::sync::OnceLock::new();
 
 pub(crate) fn boot_skipped(prog: &crate::program::Program) -> Vec<Vec<String>> {
@@ -129,7 +129,7 @@ pub fn run_check_crates(up: *mut Unit, crates: &[u32]) -> Vec<String> {
     let mut todo = Vec::new();
     for &k in crates {
         let skipped = skipped_text_hash(k);
-        let key = u.cache.as_ref().and_then(|c| unsafe { &mut *c.get() }.run_typeck_key(k, skipped));
+        let key = u.cache.as_ref().and_then(|c| unsafe { &mut *c.get() }.crate_check_key(k, skipped, 0));
         let stored = key.is_some_and(|key| u.cache.as_ref().is_some_and(|c| matches!(unsafe { &*c.get() }.borrowck_stored(key), Some(crate::borrowck::lazy::StoredVerdict::Clean))));
         if !stored {
             todo.push(k);
