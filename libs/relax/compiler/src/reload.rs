@@ -1290,6 +1290,20 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
         text
     }
     let mut attributes_changed = attr_text(old, &oa.root_attrs) != attr_text(new, &na.root_attrs);
+    // A derive's output is a function of its deriving item: while that item compares equal, its
+    // impls and their items are unchanged, whatever form each version holds the expansion in.
+    // Each item of a derived impl (the impl too) names its deriving item; only read on a mismatch.
+    fn derived_from(pf: &crate::parser::ParsedFile) -> Vec<Option<usize>> {
+        let owners = derive_owners(pf);
+        let mut of: Vec<Option<usize>> = owners.iter().map(|o| o.as_ref().map(|o| o.0)).collect();
+        for (x, o) in owners.iter().enumerate() {
+            let Some((owner, _)) = o else { continue };
+            for c in child_items(&pf.ast, &pf.ast.items[x].kind) { of[c.0 as usize] = Some(*owner); }
+        }
+        of
+    }
+    let derived_cell = std::cell::OnceCell::new();
+    let derived = || derived_cell.get_or_init(|| (derived_from(old), derived_from(new), pairs.iter().copied().collect::<std::collections::HashMap<u32, u32>>()));
     for &(i, j) in &pairs {
         let (a, b) = (&oa.items[i as usize], &na.items[j as usize]);
         let name = String::from_utf8_lossy(&new.src[b.name.lo as usize..b.name.hi as usize]).into_owned();
@@ -1312,6 +1326,18 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
         // produces a new provider; schedule its generated bodies without lowering them here.
         if attrs_same && same_toks(old, la, a.hi, &ha, new, lb, b.hi, &hb) {
             continue;
+        }
+        // derive output is expansion text: an authored item is never one
+        if a.lo >= old.src_len && b.lo >= new.src_len {
+            let (od, nd, to_new) = derived();
+            if let (Some(oo), Some(no)) = (od[i as usize], nd[j as usize]) {
+                let (ao, bo) = (&oa.items[oo], &na.items[no]);
+                let (holes_o, holes_n) = (holes(old, &ao.kind), holes(new, &bo.kind));
+                if to_new.get(&(oo as u32)) == Some(&(no as u32)) && (attr_raw(old, ao) == attr_raw(new, bo) || attr_norm(old, ao) == attr_norm(new, bo))
+                    && same_toks(old, ao.lo, ao.hi, &holes_o, new, bo.lo, bo.hi, &holes_n) {
+                    continue;
+                }
+            }
         }
         let def = prog.item_defs.get(&(old_file, i)).copied();
         attributes_changed |= !attrs_same;
@@ -1393,7 +1419,14 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
                 Some(d) => out.push(Change::Layout(d)),
                 None => why.push(format!("{}: struct `{}` has no definition -- restart the app", pos(new, b.lo), name)),
             },
-            (_, k) => why.push(format!("{}: {} `{}` changed: {} -- restart the app", pos(new, b.lo), kind_name(k), name, restart_reason(k))),
+            (_, k) => {
+                if reload_trace() {
+                    let sh = |v: Vec<Vec<u8>>| v.iter().map(|x| String::from_utf8_lossy(x).into_owned()).collect::<Vec<_>>().join(" ");
+                    eprintln!("reload: {} `{}` (attrs same {}; old {}..{} of {}, new {}..{} of {}):\n  old: {}\n  new: {}", kind_name(k), name, attrs_same, la, a.hi, old.src_len, lb, b.hi, new.src_len,
+                        sh(toks_norm(old, la, a.hi, &ha)).chars().take(600).collect::<String>(), sh(toks_norm(new, lb, b.hi, &hb)).chars().take(600).collect::<String>());
+                }
+                why.push(format!("{}: {} `{}` changed: {} -- restart the app", pos(new, b.lo), kind_name(k), name, restart_reason(k)));
+            }
         }
     }
     if why.is_empty() {
