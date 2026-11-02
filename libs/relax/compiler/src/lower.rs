@@ -5785,6 +5785,32 @@ impl<'a> Lcx<'a> {
             ExprKind::Paren(x) => self.promotable(x),
             ExprKind::Unary(UnOp::Neg | UnOp::Not, x) => self.promotable(x) && !self.b.binops.contains_key(&e.0),
             ExprKind::Array(v) | ExprKind::Tuple(v) => ast.list(v).iter().all(|x| self.promotable(*x)),
+            // rustc_mir_transform/src/promote_consts.rs: Validator::validate_rvalue accepts a
+            // primitive BinaryOp of promotable operands (`&[0.0, PSI, -PSI / 4.0]` is a static),
+            // except raw/fn pointer operands and an integer `/` or `%` whose divisor is not a
+            // known non-zero constant (or is -1 with a dividend that may be MIN). `&&` / `||`
+            // are control flow, overloaded operators calls: neither is promoted.
+            ExprKind::Binary(op, a, b) => {
+                if matches!(op, BinOp::And | BinOp::Or) || self.b.binops.contains_key(&e.0) {
+                    return false;
+                }
+                let at = self.body_ty(a);
+                if matches!(self.kind(at), TyKind::Ptr(..) | TyKind::FnPtr(..)) || !self.promotable(a) || !self.promotable(b) {
+                    return false;
+                }
+                if matches!(op, BinOp::Div | BinOp::Rem) && matches!(self.kind(at), TyKind::Int(_)) {
+                    let it = self.int_ty(at);
+                    let Some(d) = self.promoted_int(b) else { return false };
+                    if d == 0 {
+                        return false;
+                    }
+                    if it.signed && d == -1 {
+                        let min = -(1i128 << (it.bits as u32 - 1));
+                        return self.promoted_int(a).is_some_and(|n| n != min);
+                    }
+                }
+                true
+            }
             ExprKind::Path(_) => match self.b.res.get(&e.0) {
                 // rustc_mir_transform/src/promote_consts.rs: Validator::validate_operand
                 // accepts constants, including FnDef operands (`&VTable { f: g::<T> }`).
@@ -5822,6 +5848,20 @@ impl<'a> Lcx<'a> {
         }
     }
 
+
+    /// The value of the promotable integer operand `x` (rustc promote_consts: try_eval_scalar
+    /// of a division's constant operand), sign-extended; None when it cannot be evaluated here.
+    fn promoted_int(&mut self, x: ExprId) -> Option<i128> {
+        let t = self.body_ty(x);
+        let it = self.int_ty(t);
+        let addr = self.u.promoted_addr_shared(self.b, x, t, self.cur_fn).ok()??;
+        let n = (it.bits / 8) as usize;
+        let mut raw = [0u8; 16];
+        raw[..n].copy_from_slice(unsafe { std::slice::from_raw_parts(addr as *const u8, n) });
+        let v = u128::from_le_bytes(raw);
+        let sh = 128 - it.bits as u32;
+        Some(if it.signed { ((v << sh) as i128) >> sh } else { v as i128 })
+    }
 
     /// Constant promotion: the rvalue `x` stored in static memory, its address (None for an
     /// unsized type).
