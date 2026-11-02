@@ -1674,8 +1674,8 @@ fn single_punct(c: char) -> Option<T> {
 }
 
 crate::memo_local! {
-    /// derive expansions computed ahead in parallel (pre_expand_derives): (file, item byte range)
-    static PRE: std::cell::RefCell<crate::fxhash::HashMap<(String, u32, u32), Result<Option<Expansion>, (u32, String)>>>;
+    /// Derive expansions by file, test cfg and item byte range.
+    static PRE: std::cell::RefCell<crate::fxhash::HashMap<(String, bool, u32, u32), Result<Option<Expansion>, (u32, String)>>>;
 }
 
 
@@ -1697,7 +1697,7 @@ fn derive_items_inner(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], lo:
     let item_hi = toks.at(hi.saturating_sub(1)).hi;
     // computed ahead on the worker threads?
     if let Some(c) = p.bctx.as_ref().filter(|_| !crate::macro_reg::declaring()) {
-        if let Some(r) = PRE.with(|m| m.borrow_mut().remove(&(c.path.clone(), item_lo, item_hi))) {
+        if let Some(r) = PRE.with(|m| m.borrow_mut().remove(&(c.path.clone(), c.cfg.holds("test"), item_lo, item_hi))) {
             crate::macro_reg::add_pre(true);
             return r;
         }
@@ -2085,7 +2085,7 @@ pub fn pre_expand_derives(krate: &str, files: &[(&str, &[u8], &[Tok])], cfg: &Cf
                     Ok(ItemOut::Nothing) => Ok(None),
                     Err(e) => Err(e),
                 };
-                m.insert((files[fi].0.to_string(), lo, hi), r);
+                m.insert((files[fi].0.to_string(), cfg.holds("test"), lo, hi), r);
             }
         }
     });

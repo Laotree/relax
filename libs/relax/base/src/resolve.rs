@@ -2068,6 +2068,12 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
         if m.lib.is_some() {
             if k == (root, false) && o.test == Some(TestSel::Lib) {
                 roots.push(add(k, UKind::LibTest, &mut units));
+                // Dependencies link the plain library, not its test harness.
+                if nodes.iter().any(|(other, node)| *other != k && node.edges.iter().any(|(di, target)| {
+                    *target == k && !r.manifests[other.0].deps[*di].build
+                })) {
+                    add(k, UKind::Lib, &mut units);
+                }
             } else {
                 let i = add(k, UKind::Lib, &mut units);
                 if k == (root, false) && o.test.is_none() {

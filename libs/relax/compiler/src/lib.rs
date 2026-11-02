@@ -600,7 +600,9 @@ fn cmd_parse(sess: &std::sync::Arc<crate::Session>, units_path: &str, threads: u
     let t0 = Instant::now();
     let mut cfgs = Vec::new();
     for c in &crates {
-        cfgs.push(cfg::CfgSet::host(sess, &c.features));
+        let mut cs = cfg::CfgSet::host(sess, &c.features);
+        if c.harness { cs.set.push("test".into()); }
+        cfgs.push(cs);
     }
     let (files, missing, errors) = crates::discover(sess, &crates, &cfgs, threads);
     let discover_s = t0.elapsed().as_secs_f64();
@@ -1179,7 +1181,8 @@ fn cmd_resolve(sess: &std::sync::Arc<crate::Session>, units_path: &str) {
             let s = prog.syms.intern(n);
             deps.push((s, crate_of[*i]));
         }
-        let cs = program_cfg(sess, &c.features);
+        let mut cs = program_cfg(sess, &c.features);
+        if c.harness { cs.set.push("test".into()); }
         match prog.load_crate_deferred(&c.name, &c.src_path, c.edition, cs, deps) {
             Ok(k) => {
                 prog.crates[k as usize].proc_macro = c.proc_macro;
