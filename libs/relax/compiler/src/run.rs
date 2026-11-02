@@ -2192,6 +2192,8 @@ fn run_apart(exe: &std::path::Path, base: &[String], sel: &[String], tail: &[Str
 /// test that reaches it (a test whose body did not compile used to fail alone at run time while
 /// the others passed). Prints the errors as `makepad check` does; returns their count.
 pub(crate) fn check_test_subjects(u: &mut Unit, root: u32, subjects: &[u32], harness: bool) -> usize {
+    use crate::borrowck::lazy::StoredVerdict;
+    let t0 = Instant::now();
     u.tcx.check_coherence_of(&u.prog, Some(subjects));
     let mut pre: Vec<String> = Vec::new();
     let derive = crate::macro_reg::derive_failures();
@@ -2200,8 +2202,37 @@ pub(crate) fn check_test_subjects(u: &mut Unit, root: u32, subjects: &[u32], har
         pre.extend(crate::check::own_errors(&u.prog, k, &u.tcx.errors, "typeck"));
         pre.extend(crate::check::own_errors(&u.prog, k, &derive, "macro"));
     }
+    // subjects whose every input -- their every file, their dependencies, the Relax build and its
+    // options -- is a clean check's (cache.rs crate_check_key) are not checked again: a test's run
+    // of its own binary (each child of a test that spawns itself), a run after an edit elsewhere.
+    // Not with a command-line lint level (not in the key). A clean test check prints nothing.
+    let mode = if harness { 2 } else { 1 };
+    let keys: Option<Vec<u128>> = match u.cache.as_ref() {
+        Some(c) if crate::check::BOOT_SKIPPED.get().is_some() && !relax_types::lint::cmdline_set() => {
+            let c = unsafe { &mut *c.get() };
+            subjects.iter().map(|&k| c.crate_check_key(k, crate::check::skipped_text_hash(k), mode)).collect()
+        }
+        _ => None,
+    };
+    let t1 = Instant::now();
+    let files = u.prog.files.len();
     unsafe { jit::load_skipped_of(&mut *u, subjects) };
-    crate::check::check_subjects(u, root, subjects, pre, harness)
+    let t2 = Instant::now();
+    let stored = pre.is_empty() && keys.as_ref().zip(u.cache.as_ref()).is_some_and(|(keys, c)| {
+        let c = unsafe { &*c.get() };
+        keys.iter().all(|&k| matches!(c.borrowck_stored(k), Some(StoredVerdict::Clean)))
+    });
+    let n = if stored { 0 } else { crate::check::check_subjects(u, root, subjects, pre, harness) };
+    verbose!("makepad-run: test check: coherence {:.0} ms, skipped files' load {:.0} ms ({} files), check {:.0} ms{}",
+        (t1 - t0).as_secs_f64() * 1e3, (t2 - t1).as_secs_f64() * 1e3, u.prog.files.len() - files, t2.elapsed().as_secs_f64() * 1e3,
+        if stored { " (its crates' clean verdicts are stored)" } else { "" });
+    if n == 0 && !stored {
+        if let (Some(keys), Some(c)) = (keys, u.cache.as_ref()) {
+            let c = unsafe { &mut *c.get() };
+            for k in keys { c.record_borrowck(k, StoredVerdict::Clean); }
+        }
+    }
+    n
 }
 static HAL_RUN: AtomicBool = AtomicBool::new(false);
 static APP_DOMAIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -3329,6 +3360,20 @@ fn quit_mark() {
         crate::cache::write_trace();
     });
     }
+}
+
+/// `__relax_self_spawn` (Relax std process.rs, before a spawn or an exec that runs this program
+/// again: a test's child, a re-exec): what this process compiled so far is written to the disk
+/// cache, so the new process -- the same program, under the same cache -- starts from it rather
+/// than cold (a self-spawning test's first child type-checked and compiled the whole test crate
+/// again while its parent's code sat unwritten: 20 s of relax-compiler's 37 s first run).
+pub(crate) extern "C" fn relax_self_spawn() {
+    static ONE: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
+    if unsafe { RUN_UNIT }.is_null() || crate::forkexec::exec_child() { return; }
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let t = Instant::now();
+    let r = mid_flush(true, true);
+    verbose!("makepad-run cache: written before a run of this program again: {:?} (entries, front images) in {:.1} ms", r, t.elapsed().as_secs_f64() * 1e3);
 }
 
 /// A write of the disk cache while the program runs (front images, code, borrowck verdicts):
