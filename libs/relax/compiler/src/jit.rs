@@ -4966,7 +4966,7 @@ impl Unit {
     pub fn needs_drop_glue(&self, t: TyId) -> bool {
         let env = crate::tcx::TypingEnv::fully_monomorphized(&self.prog);
         if self.tcx.needs_drop(&self.prog, env, t) { return true; }
-        if !crate::layout::LIVE_SESSION.load(Ordering::Relaxed) { return false; }
+        if !crate::layout::live_layouts() { return false; }
         let mut todo = vec![t];
         let mut seen = crate::fxhash::HashSet::default();
         while let Some(t) = todo.pop() {
