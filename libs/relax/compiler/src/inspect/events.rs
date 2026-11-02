@@ -153,6 +153,12 @@ fn kinds(req: &Req) -> Option<Vec<String>> {
 /// panic parked now always counts), as one line.
 pub fn cmd_watch(req: &Req, out: &mut Out) {
     let on = kinds(req);
+    // A run that does not watch its sources never emits a patch event: say so now, not after
+    // the caller's timeout.
+    if on.as_ref().is_some_and(|v| v.iter().any(|k| k.starts_with("patch"))) && !crate::layout::LIVE_SESSION.load(Relaxed) {
+        out.line("{\"err\":\"not a live session: this run does not watch its sources, so no edit patches in (a run from a store is live with MAKEPAD_RUN_STORE_LIVE=1 and an edits folder)\"}");
+        return;
+    }
     let parked_since = PARKED.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|p| p.seq).min().map_or(u64::MAX, |s| s - 1);
     let since = req.get("since").and_then(|s| s.parse().ok()).unwrap_or_else(|| SEQ.load(SeqCst).min(parked_since));
     let timeout = req.num("timeout_s", 0);
