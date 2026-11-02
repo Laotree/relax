@@ -325,3 +325,20 @@ pub fn export_hits(u: &Unit, other: &HashMap<String, HashSet<(usize, usize)>>) -
     }
     hits
 }
+
+
+/// TEMP: which of the named functions have their entry bit set (debug trace).
+pub fn debug_hits() -> String {
+    let record = RECORD.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = String::new();
+    for r in record.ranges.iter() {
+        let u = unsafe { &*(r.unit as *const Unit) };
+        if r.slot as usize >= u.fns.len() { continue; }
+        let key = crate::jit::slot_key(u, r.slot);
+        if key.ends_with("<TopicSet>::empty") || key.ends_with("<Dlmalloc>::new") || key.ends_with("<OsString>::into_string") || key.contains("<RwLock>::new<TopicSet>") {
+            let hit = r.bits[r.bit[0] / 64].load(Ordering::Relaxed) & (1 << (r.bit[0] % 64)) != 0;
+            out.push_str(&format!(" [{}={}]", &key[key.len().saturating_sub(24)..], hit as u8));
+        }
+    }
+    out
+}

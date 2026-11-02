@@ -2594,6 +2594,7 @@ pub(crate) fn const_fuel_tick() {
 }
 
 
+thread_local! { static COV_INTERESTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 fn covtrace(msg: &str) {
     if let Some(path) = std::env::var_os("MAKEPAD_RUN_COVTRACE") {
         use std::io::Write;
@@ -2615,7 +2616,7 @@ impl ConstEvalScope {
             let mask = (rt_tls_block() + TLS_COVERAGE_DISABLED as u64) as *mut u64;
             let previous = *mask;
             *mask = u64::MAX;
-            covtrace(&format!("enter {} mask={:x} prev={:x} cur_block={:x}", prog.def_path(d), mask as u64, previous, os::tls::get(tls_key()) as u64));
+            covtrace(&format!("enter {} mask={:x} prev={:x} cur_block={:x}{}", prog.def_path(d), mask as u64, previous, os::tls::get(tls_key()) as u64, if { let p = prog.def_path(d); let i = ["TRACE_TOPICS","APP_BUILD_META","panic::HOOK","ACTION_SENDER","web_allocator"].iter().any(|k| p.contains(k)); COV_INTERESTING.with(|c| c.set(i)); i } { crate::coverage::debug_hits() } else { String::new() }));
             (mask, previous)
         });
         ConstEvalScope { saved_fuel, saved_coverage }
@@ -2624,7 +2625,7 @@ impl ConstEvalScope {
 
 impl Drop for ConstEvalScope {
     fn drop(&mut self) {
-        if let Some((mask, previous)) = self.saved_coverage { unsafe { covtrace(&format!("drop mask={:x} restore={:x} cur_block={:x}", mask as u64, previous, os::tls::get(tls_key()) as u64)); *mask = previous; } }
+        if let Some((mask, previous)) = self.saved_coverage { unsafe { covtrace(&format!("drop mask={:x} restore={:x} cur_block={:x}{}", mask as u64, previous, os::tls::get(tls_key()) as u64, if COV_INTERESTING.with(|c| c.replace(false)) { crate::coverage::debug_hits() } else { String::new() })); *mask = previous; } }
         let _ = CONST_EVAL_DEPTH.try_with(|g| g.set(g.get().saturating_sub(1)));
         let _ = CONST_FUEL.try_with(|c| c.set(self.saved_fuel));
     }
