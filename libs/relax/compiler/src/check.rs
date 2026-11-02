@@ -61,6 +61,15 @@ pub fn app_crates(prog: &crate::program::Program, root: u32) -> Vec<u32> {
     (0..prog.crates.len() as u32).filter(|&k| k == root || crate::borrowck::event::app_crate(prog, k)).collect()
 }
 
+/// One selection for declaration validation, diagnostics and body checks.
+pub fn checked_crates(prog: &crate::program::Program, root: u32, root_only: bool, workspace: bool, also: &[u32]) -> Vec<u32> {
+    let mut crates = if root_only { vec![root] } else if workspace { workspace_crates(prog, root) } else { app_crates(prog, root) };
+    for &k in also {
+        if !crates.contains(&k) { crates.push(k); }
+    }
+    crates
+}
+
 /// `f` over `items` on MAKEPAD_RUN_JOBS threads (at most 16), results in `items` order.
 fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let jobs = std::env::var("MAKEPAD_RUN_JOBS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0)
@@ -86,11 +95,9 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
     v.into_iter().map(|(_, r)| r).collect()
 }
 
-/// `selftest`: every workspace crate, then every function compiled (see the module doc); else
-/// the app check of the application's crates.
-pub fn check_crate(u: &mut Unit, root: u32, errors: Vec<String>, root_only: bool, selftest: bool, workspace: bool) -> i32 {
-    let crates = if root_only { vec![root] } else if selftest || workspace { workspace_crates(&u.prog, root) } else { app_crates(&u.prog, root) };
-    check_crate_impl(u, root, &crates, errors, true, selftest).0
+/// Check the selected crates; `selftest` also compiles every function (see the module doc).
+pub fn check_crate(u: &mut Unit, root: u32, crates: &[u32], errors: Vec<String>, selftest: bool) -> i32 {
+    check_crate_impl(u, root, crates, errors, true, selftest).0
 }
 
 /// `makepad test`'s check of the crates under test before they run (run.rs check_test_subjects):
