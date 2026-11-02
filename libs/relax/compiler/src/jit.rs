@@ -2607,10 +2607,32 @@ fn covtrace_with(msg: &str, only_changed: bool) {
         let note = if changed { format!(" HITS{}", hits) } else { String::new() };
         *last = hits;
         if only_changed && !changed { return; }
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{} {}{}", std::process::id(), msg, note);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "{} t={} {}{}", std::process::id(), covtrace_ms(), msg, note);
         }
+        // a sampler: the bits change between scope events too
+        static SAMPLER: std::sync::Once = std::sync::Once::new();
+        SAMPLER.call_once(|| {
+            let path = path.clone();
+            let _ = std::thread::Builder::new().name("covsampler".into()).spawn(move || {
+                let mut last = String::new();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    let hits = crate::coverage::debug_hits();
+                    if hits != last {
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                            let _ = writeln!(f, "{} t={} SAMPLE{}", std::process::id(), covtrace_ms(), hits);
+                        }
+                        last = hits;
+                    }
+                }
+            });
+        });
     }
+}
+fn covtrace_ms() -> u128 {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_millis()
 }
 
 /// One evaluation's own counter: the enclosing evaluation's is saved and comes back.
