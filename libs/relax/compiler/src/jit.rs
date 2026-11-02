@@ -14622,8 +14622,10 @@ pub unsafe fn retire_unit(up: *mut Unit) {
         (&mut *up).retired = true;
         if SPEC_UNIT.load(Ordering::Acquire) == up {
             SPEC_UNIT.store(std::ptr::null_mut(), Ordering::Release);
-            SPEC_Q.lock().unwrap_or_else(|e| e.into_inner()).clear();
         }
+        // its queued ids too when speculation is on another unit: a unit allocated at its
+        // address later must not take them
+        SPEC_Q.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(unit, _)| unit != up as usize);
         if UNIT == up {
             UNIT = std::ptr::null_mut();
         }
@@ -19909,7 +19911,10 @@ fn spec_jobs(options: &crate::options::Options) -> usize {
 }
 
 static SPEC_UNIT: std::sync::atomic::AtomicPtr<Unit> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-static SPEC_Q: relax_session::sync::Mutex<std::collections::VecDeque<u32>> = relax_session::sync::Mutex::new(std::collections::VecDeque::new());
+/// (unit, slot id): a slot id means something only in its own unit, and SPEC_UNIT follows the
+/// unit that compiled last (the proc-macro world's ids indexed the program's table after an
+/// edit: "AppendVec index out of bounds" on run-spec threads)
+static SPEC_Q: relax_session::sync::Mutex<std::collections::VecDeque<(usize, u32)>> = relax_session::sync::Mutex::new(std::collections::VecDeque::new());
 static SPEC_WAKE: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
 static SPEC_START: std::sync::Once = std::sync::Once::new();
 /// calls not speculated because they sit on a cold path
@@ -20162,9 +20167,9 @@ unsafe fn spec_enqueue_calls(up: *mut Unit, id: u32, func: &relax_backend::rir::
     {
         let mut q = SPEC_Q.lock().unwrap_or_else(|e| e.into_inner());
         for c in front.into_iter().rev() {
-            q.push_front(c);
+            q.push_front((up as usize, c));
         }
-        q.extend(back);
+        q.extend(back.into_iter().map(|c| (up as usize, c)));
     }
     if added > 0 {
         SPEC_START.call_once(|| {
@@ -20232,7 +20237,7 @@ pub unsafe fn spec_seed(up: *mut Unit, ids: &[u32]) {
     mark_spec_cached(u, &add);
     SEED_PROBE_NS.fetch_add(cpu_ns() - probe, Ordering::Relaxed);
     SEED_QUEUED.fetch_add(add.len() as u64, Ordering::Relaxed);
-    SPEC_Q.lock().unwrap_or_else(|e| e.into_inner()).extend(add);
+    SPEC_Q.lock().unwrap_or_else(|e| e.into_inner()).extend(add.into_iter().map(|id| (up as usize, id)));
     SPEC_START.call_once(|| {
         for k in 0..spec_jobs(options) {
             let session = session.clone();
@@ -21039,7 +21044,7 @@ fn spec_worker(runtime: &crate::options::RuntimeOptions) {
     lower_worker_priority(runtime);
     set_worker();
     loop {
-        let id = {
+        let (unit, id) = {
             let mut q = SPEC_Q.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 if SPEC_STOP.load(Ordering::SeqCst) {
@@ -21055,8 +21060,9 @@ fn spec_worker(runtime: &crate::options::RuntimeOptions) {
         };
         let _job = compile_job();
         let up = SPEC_UNIT.load(Ordering::Acquire);
-        // the unit the queue was for was retired (retire_unit)
-        if up.is_null() {
+        // the unit the queue was for was retired (retire_unit), or speculation moved to another
+        // unit: this id is not a slot of the current one
+        if up.is_null() || up as usize != unit {
             continue;
         }
         // This also covers disk-manifest and callee speculation, not only explicit hints.
@@ -21079,7 +21085,7 @@ fn spec_worker(runtime: &crate::options::RuntimeOptions) {
         }
         match r {
             // gave way to a program thread: first in line again
-            Ok(false) => SPEC_Q.lock().unwrap_or_else(|e| e.into_inner()).push_front(id),
+            Ok(false) => SPEC_Q.lock().unwrap_or_else(|e| e.into_inner()).push_front((unit, id)),
             Ok(true) => {}
             Err(_) => {
                 SPEC_PANICS.fetch_add(1, Ordering::Relaxed);
@@ -24567,7 +24573,7 @@ unsafe fn spec_enqueue_cached(up: *mut Unit, ids: &[u32], depth: u8) {
     {
         let mut q = SPEC_Q.lock().unwrap_or_else(|e| e.into_inner());
         for id in add.into_iter().rev() {
-            q.push_front(id);
+            q.push_front((up as usize, id));
         }
     }
     SPEC_START.call_once(|| {
