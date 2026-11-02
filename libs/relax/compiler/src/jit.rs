@@ -19580,6 +19580,13 @@ pub(crate) fn solver_work_report_at_exit() {
     }
 }
 
+/// The application is about to submit its first window frame (platform hal event loop): waits
+/// for the app check running beside main (check.rs wait_app_check); an error it finds ends the
+/// run before the frame.
+pub extern "C" fn relax_before_first_frame() {
+    crate::jit::host_boundary("relax_before_first_frame", crate::check::wait_app_check)
+}
+
 /// Notify the loader that the application or its embedder presented a frame.
 pub extern "C" fn relax_first_present() {
     crate::jit::host_boundary("relax_first_present", move || {
@@ -21414,6 +21421,7 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_fork_exec_done" => Some(crate::forkexec::relax_fork_exec_done as *const () as usize),
         b"relax_allocator_swap" => Some(relax_allocator_swap as *const () as usize),
         b"relax_set_panic_hook" => Some(relax_set_panic_hook as *const () as usize),
+        b"relax_before_first_frame" => Some(relax_before_first_frame as *const () as usize),
         b"relax_first_present" => Some(relax_first_present as *const () as usize),
         b"relax_frame_done" => Some(crate::postframe::relax_frame_done as *const () as usize),
         b"relax_quit_requested" => Some(crate::run::relax_quit_requested as *const () as usize),
@@ -23039,6 +23047,9 @@ pub struct FrontShared {
     /// burst ends (ahead_helper), not kept for the rest of the run
     ahead_post: relax_session::sync::Mutex<Vec<AheadKey>>,
     queue: relax_session::sync::Mutex<std::collections::VecDeque<AheadWork>>,
+    /// The startup's look-ahead (look_ahead): taken when `queue` is empty (the slots made go
+    /// first), changed with `queue` locked, cleared with it.
+    looks: relax_session::sync::Mutex<std::collections::VecDeque<AheadWork>>,
     wake: relax_session::sync::Condvar,
 }
 
@@ -23114,6 +23125,7 @@ impl FrontShared {
             live_helpers: std::sync::atomic::AtomicU32::new(0),
             ahead_post: Default::default(),
             queue: Default::default(),
+            looks: Default::default(),
             wake: Default::default(),
         }
     }
@@ -23297,6 +23309,7 @@ fn ahead_helper(f: std::sync::Arc<FrontShared>, index: u32) {
                     }
                     f.live_helpers.fetch_sub(1, Ordering::Relaxed);
                     q.clear();
+                    f.looks.lock().unwrap_or_else(|e| e.into_inner()).clear();
                     drop(q);
                     // Unused raw RIR is startup work only. Drop it on a helper, outside the
                     // queue/publication locks; in-flight helpers cannot republish removed slots.
@@ -23308,6 +23321,11 @@ fn ahead_helper(f: std::sync::Arc<FrontShared>, index: u32) {
                 if let Some(id) = q.pop_front() {
                     break id;
                 }
+                if startup_phase() {
+                    if let Some(w) = f.looks.lock().unwrap_or_else(|e| e.into_inner()).pop_front() {
+                        break w;
+                    }
+                }
                 crate::zone_alloc::compiler_hand_back_idle();
                 q = f.wake.wait_timeout(q, std::time::Duration::from_millis(50)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0);
             }
@@ -23316,22 +23334,26 @@ fn ahead_helper(f: std::sync::Arc<FrontShared>, index: u32) {
         if f.linked_start.load(Ordering::Relaxed) && crate::reload::edited_crates().is_empty() {
             continue;
         }
-        let (d, args, slot, normal) = match id {
+        let (d, args, slot, normal, look) = match id {
             AheadWork::Slot(id) => match f.slot_keys.get(&id) {
-                Some(FnKey::Inst(d, args)) => (d, args, Some(id), false),
+                Some(FnKey::Inst(d, args)) => (d, args, Some(id), false, LOOK_LEVELS),
                 _ => continue,
             },
-            AheadWork::Body((d, args), normal) => (d, args, None, normal),
+            AheadWork::Body((d, args), normal) => (d, args, None, normal, 0),
+            // (checked already, by a build or ahead: looked at already, or its slot was made)
+            AheadWork::Look(key, _) if f.is_built(&key) || f.ahead.contains_key(&key) => continue,
+            AheadWork::Look((d, args), levels) => (d, args, None, false, levels),
         };
         let _job = compile_job();
         let _census_context = relax_codegen::exec_census::Context::new(f.census_id, false);
         let _cost = slot.map(|id| relax_codegen::fncost::Record::new(id, 0, "ahead"));
         let t0 = cpu_ns();
-        typeck_ahead(&f, d, args, 1, true, normal);
+        typeck_ahead(&f, d, args.clone(), 1, true, normal);
         AHEAD_STATS[4].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
         if let Some(id) = slot {
             lower_ahead(&f, id, false);
         }
+        look_ahead(&f, d, &args, look);
     }
 }
 
@@ -23866,6 +23888,63 @@ enum AheadWork {
     Slot(u32),
     /// An inline candidate (normal O1), before lowering creates its slot.
     Body(AheadKey, bool),
+    /// A callee a checked body calls (look_ahead), before lowering creates its slot: checked,
+    /// then its own callees looked at `levels` more calls deep.
+    Look(AheadKey, u8),
+}
+
+/// The startup's look-ahead (look_ahead): calls deep below a slot's body, the callees one body
+/// adds at most, and the bodies the look-ahead adds in all (LOOK_QUEUED), its hard budget: a body
+/// looked at and never built is a check wasted (the first-present line counts them).
+const LOOK_LEVELS: u8 = 2;
+const LOOK_FANOUT: usize = 24;
+/// (a cold Fab's look-ahead ends by itself at ~82k bodies; budgets of 20k, 40k and 80k bought
+/// 0.55, 0.97 and 1.5 s of its first frame)
+const LOOK_BUDGET: u64 = 80_000;
+pub(crate) static LOOK_QUEUED: AtomicU64 = AtomicU64::new(0);
+
+/// A checked body's callees -- the slots its lowering will make -- go to the helpers' queue behind
+/// the slots already made (startup only, within LOOK_BUDGET): the main thread finds them checked
+/// when it gets there instead of waiting on a helper's check in flight or checking them itself.
+fn look_ahead(f: &FrontShared, d: DefId, args: &[TyId], levels: u8) {
+    if levels == 0 || !startup_phase() || LOOK_QUEUED.load(Ordering::Relaxed) >= LOOK_BUDGET {
+        return;
+    }
+    let fr = front_read("look_ahead");
+    if !f.alive.load(Ordering::SeqCst) {
+        return;
+    }
+    let (prog, tcx) = fr.of(f);
+    // the body typeck_ahead checked a moment ago (a query hit): a writer preempting it, an error
+    // or a panic leave its callees to the slots lowering makes
+    let next = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _p = crate::preempt::Preemptible::on();
+        let b = tcx.typeck(prog, d);
+        if !b.errors.is_empty() || !b.deferred_misses.is_empty() {
+            return Vec::new();
+        }
+        let mut next = Vec::new();
+        for (c, cargs) in body_callees(prog, tcx, &b, args, true, None) {
+            if next.len() == LOOK_FANOUT { break; }
+            if !matches!(prog.def(c).kind, DefKind::Fn | DefKind::AssocFn) || is_cold_def(prog, tcx, c) || is_cold_name(&prog.def_path(c)) {
+                continue;
+            }
+            let key = (c, cargs);
+            if !f.is_built(&key) && !f.ahead.contains_key(&key) {
+                next.push(AheadWork::Look(key, levels - 1));
+            }
+        }
+        next
+    })).unwrap_or_default();
+    drop(fr);
+    if next.is_empty() {
+        return;
+    }
+    LOOK_QUEUED.fetch_add(next.len() as u64, Ordering::Relaxed);
+    let q = f.queue.lock().unwrap_or_else(|e| e.into_inner());
+    f.looks.lock().unwrap_or_else(|e| e.into_inner()).extend(next);
+    drop(q);
+    f.wake.notify_all();
 }
 
 fn publish_ahead(f: &FrontShared, key: AheadKey, epoch: u64, body: std::sync::Arc<Body>) {
@@ -24133,7 +24212,7 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
         };
         // Discover only direct inline candidates; publish before checking any of them.
         let callees = if depth > 0 {
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body_callees(prog, tcx, &b, true, Some(core)))) {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body_callees(prog, tcx, &b, &key.1, true, Some(core)))) {
                 Ok(c) => c,
                 Err(_) => Vec::new(),
             }
@@ -24181,10 +24260,12 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
 
 /// The fn instances a checked body calls, as lowering will most likely key them (trait
 /// methods resolved to their impls); open or erroneous instances are left out. A guess: a
-/// miss only means the build checks that body itself. `warm_only`: calls inside a diverging
-/// call's expression (`panic!(..)`'s formatting, `unwrap_failed(..)`) are left out, as
-/// prepare_rir_from leaves the callees of cold blocks out of its inline candidates.
-pub(crate) fn body_callees(prog: &Program, tcx: &Tcx, b: &Body, warm_only: bool, only_krate: Option<u32>) -> Vec<(DefId, Vec<TyId>)> {
+/// miss only means the build checks that body itself. `inst`: the instance's own args (compact),
+/// substituted into the calls' (a generic body's callees are then that instance's); empty: none.
+/// `warm_only`: calls inside a diverging call's expression (`panic!(..)`'s formatting,
+/// `unwrap_failed(..)`) are left out, as prepare_rir_from leaves the callees of cold blocks out of
+/// its inline candidates.
+pub(crate) fn body_callees(prog: &Program, tcx: &Tcx, b: &Body, inst: &[TyId], warm_only: bool, only_krate: Option<u32>) -> Vec<(DefId, Vec<TyId>)> {
     use crate::ast::ExprKind;
     let ast = &prog.files[b.file as usize].ast;
     let cold: Vec<(u32, u32)> = if warm_only {
@@ -24204,6 +24285,12 @@ pub(crate) fn body_callees(prog: &Program, tcx: &Tcx, b: &Body, warm_only: bool,
             cold.iter().any(|&(lo, hi)| lo <= e.lo && e.hi <= hi)
         }
     };
+    // the instance's full args (its lifetimes erased), when they are exactly its generics
+    let indices = tcx.generic_indices_of(prog, b.def);
+    let full = (!inst.is_empty() && inst.len() == indices.types_consts.len()).then(|| {
+        let regions = tcx.tys.intern_region_args(&vec![crate::types::RegionId::ERASED; indices.lifetimes.len()]);
+        tcx.complete_args(prog, b.def, inst, regions)
+    });
     let mut out: Vec<(DefId, Vec<TyId>)> = Vec::new();
     let mut add = |k: u32, d: DefId, args: &[TyId]| {
         // `only_krate`: an instance in that crate is reached through a declaration in it (an impl
@@ -24216,6 +24303,10 @@ pub(crate) fn body_callees(prog: &Program, tcx: &Tcx, b: &Body, warm_only: bool,
         // discovery is a codegen boundary, including non-trait callees.
         let mut erased = Vec::with_capacity(args.len());
         for &ty in args {
+            let ty = match &full {
+                Some(full) if !tcx.tys.is_concrete(ty) => crate::types::fold::EarlyBinder::bind(&tcx.tys, ty).instantiate(&tcx.tys, indices, full),
+                _ => ty,
+            };
             let Ok(ty) = tcx.try_normalize_after_erasing_regions(prog, crate::tcx::TypingEnv::fully_monomorphized(&prog), ty) else { return };
             erased.push(ty);
         }

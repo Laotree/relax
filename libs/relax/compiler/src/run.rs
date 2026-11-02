@@ -297,6 +297,12 @@ pub(crate) enum ResolveFor {
 /// `finish_window`.
 static PENDING_WINDOW: relax_session::sync::Mutex<Option<std::io::Result<std::thread::JoinHandle<Result<(), String>>>>> = relax_session::sync::Mutex::new(None);
 
+/// The run's app will be hosted by the HAL (HAL_RUN, known once finish_window joins): its host
+/// window is opening and the host is not domain zero.
+fn hal_window_pending() -> bool {
+    PENDING_WINDOW.lock().unwrap().is_some() && MAIN_HOST.get().is_some_and(|h| !h.domain_zero)
+}
+
 /// Waits for the host window the resolve started to open (it opens beside the load, which does not
 /// need it), and says whether the run is hosted (HAL_RUN).
 fn finish_window() -> Result<(), String> {
@@ -1687,6 +1693,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // the files the boot's selection skipped, before any check or the post-boot loader loads them
     // (the type checks' verdict keys, check.rs BOOT_SKIPPED)
     let _ = crate::check::BOOT_SKIPPED.set(crate::check::boot_skipped(&u.prog));
+    let mut app_check = None;
     if !test_subjects.is_empty() {
         let t_check = Instant::now();
         // after the cache is open: a body whose stored verdict is clean is not checked again
@@ -1702,6 +1709,26 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // a `harness = false` target is a program: a compile error it reaches ends it (rustc rejects it)
         if plain_test.is_some() {
             jit::COMPILE_ERRORS_FATAL.store(true, Ordering::Relaxed);
+        }
+    } else if !harness && !exports_mode && hal_window_pending() {
+        // an app the HAL hosts: its own crates are type-checked whole beside main (the lookups and
+        // the skipped files' loads here); its first window frame waits for that check and an error
+        // ends the run before it (check.rs start_app_check). Every body is still checked before it
+        // first runs: a lazy compile checks its body, and a compile error ends the run.
+        let t_check = Instant::now();
+        let app = crate::check::app_crates(&u.prog, root);
+        app_check = crate::check::prepare_check(&mut *u, &app);
+        phase("app check lookups", t_check);
+        if app_check.is_some() {
+            // (the cache's: on the owner)
+            let t_graph = Instant::now();
+            let upn: *const Unit = &*u;
+            let upn = upn as usize;
+            crate::owner::call(crate::owner::Class::Program, || {
+                let u = unsafe { &*(upn as *const Unit) };
+                if let Some(c) = u.cache.as_ref() { unsafe { &mut *c.get() }.build_item_graph(u); }
+            });
+            phase("item graph", t_graph);
         }
     } else if !harness {
         // the app's own crates -- the code being worked on -- are type-checked whole before they run
@@ -1866,6 +1893,18 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     jit::startup_main(runtime, platform && !HARNESS_RUN.load(Ordering::Acquire));
     if HAL_RUN.load(Ordering::Acquire) && platform && !HARNESS_RUN.load(Ordering::Acquire) && !live_tests {
         crate::first_frame::arm(&package);
+    }
+    if let Some(p) = app_check.take() {
+        let name = u.prog.syms.str(u.prog.crates[root as usize].name).to_string();
+        crate::check::start_app_check(up, p, crate::zone_alloc::kept_clone(runtime), Box::new(move |errors: &[String]| {
+            for e in errors {
+                if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(e, "typeck")); }
+                report("error", e);
+                eprintln!("{}", e);
+            }
+            eprintln!("error: could not compile `{}` due to {} previous error{}: stopped before its first frame (`makepad run` checks the app's own crates whole beside main, as cargo builds them)",
+                name, errors.len(), if errors.len() == 1 { "" } else { "s" });
+        }));
     }
     relax_codegen::fncost::mark("boot done, calling main");
     let main_ms = crate::clock::ms_since_start();
@@ -3348,6 +3387,9 @@ pub(crate) extern "C" fn relax_quit_started() {
     if crate::domain::current_app_domain().and_then(crate::domain::info).is_some_and(|i| i.parent.is_some()) {
         return;
     }
+    // an app quitting before its first frame still has its app check's verdict: an error it finds
+    // ends the run as a compile error (check.rs start_app_check)
+    crate::check::wait_app_check();
     quit_mark();
 }
 
