@@ -266,7 +266,7 @@ pub struct Lcx<'a> {
     stmt_temps: Vec<(VReg, TyId, Option<VReg>)>,
     /// owner of the place a pattern currently matches (by-value bindings move out of it)
     match_root: Option<MatchRoot>,
-    /// in an FnOnce closure body: the drop flag (env, offset) of each by-value capture
+    /// environment drop flags (env, offset) of by-value captures before body ownership
     capture_flag: HashMap<u32, (VReg, i32)>,
     /// drop flags of evaluated operands not yet consumed (guard_operand): on an exit they drop
     /// before the statement's temporaries (rustc: an operand's drop is scheduled in the scope of
@@ -340,8 +340,6 @@ pub struct Lcx<'a> {
     last_pad: Option<(u64, u32)>,
     /// lowering a coroutine's poll function
     coro: Option<Coro>,
-    /// the coroutine's (expr, captures, state pointer, state field offsets)
-    coro_caps: Option<(u32, Vec<u32>, VReg, Vec<u32>)>,
     tree_cx: Option<TreeCx>,
 
     /// per scope: where the statement temporaries of its block's tail expression start
@@ -554,7 +552,6 @@ impl<'a> Lcx<'a> {
             building_pad: false,
             last_pad: None,
             coro: None,
-            coro_caps: None,
             tree_cx: None,
 
             tail_marks: vec![None],
@@ -2282,33 +2279,8 @@ impl<'a> Lcx<'a> {
                 };
                 self.locals[*li as usize] = Some(LocalSt::Slot(a));
                 self.foreign[*li as usize] = true;
-                // an FnOnce body owns its by-value captures (rustc: the upvars are moved into
-                // the body, which drops what it does not move out at its end): the state's flag
-                // is cleared and the capture becomes a local of this body, so partial moves out
-                // of it (`item.uri.unwrap_or_default()`) are tracked like any local's and only
-                // the rest drops (unwinding included)
                 if once && self.capture_by_value(ce, i, *li) {
-                    if let Some(&(fenv, foff)) = self.capture_flag.get(li) {
-                        let z = self.iconst(0);
-                        self.emit(Inst::Store(Mem::Int(1, false), fenv, foff, z));
-                        self.capture_flag.remove(li);
-                    }
-                    self.foreign[*li as usize] = false;
-                    self.own_local(*li);
-                    // a precise capture owns only its fields: the others are not this
-                    // body's to drop
-                    if let Some(fs) = self.capture_fields(ce, i) {
-                        let lt = self.monomorphize(self.b.locals[*li as usize].ty);
-                        let n = match self.kind(lt) {
-                            TyKind::Adt(d, _, _) => self.u.tcx.adts.get(&d).map_or(0, |a| a.variants.first().map_or(0, |v| v.fields.len())),
-                            _ => 0,
-                        };
-                        for j in 0..n as u32 {
-                            if !fs.contains(&j) {
-                                self.moved_field(*li, &[(0, j)]);
-                            }
-                        }
-                    }
+                    self.own_capture(ce, i, *li);
                 }
             }
         }
@@ -2337,6 +2309,29 @@ impl<'a> Lcx<'a> {
         let v = self.settle_before_temp_drop(v, ret, mark);
         self.drop_stmt_temps_from(mark);
         self.ret_val(v, ret);
+    }
+
+    /// Transfer a by-value capture from its environment to the body's drop scope.
+    fn own_capture(&mut self, ce: u32, i: usize, li: u32) {
+        if let Some((env, off)) = self.capture_flag.remove(&li) {
+            let z = self.iconst(0);
+            self.emit(Inst::Store(Mem::Int(1, false), env, off, z));
+        }
+        self.foreign[li as usize] = false;
+        self.own_local(li);
+        // A precise capture owns only its captured fields.
+        if let Some(fs) = self.capture_fields(ce, i) {
+            let lt = self.monomorphize(self.b.locals[li as usize].ty);
+            let n = match self.kind(lt) {
+                TyKind::Adt(d, _, _) => self.u.tcx.adts.get(&d).map_or(0, |a| a.variants.first().map_or(0, |v| v.fields.len())),
+                _ => 0,
+            };
+            for j in 0..n as u32 {
+                if !fs.contains(&j) {
+                    self.moved_field(li, &[(0, j)]);
+                }
+            }
+        }
     }
 
     /// The coroutine (closure) type of async block / async fn body `ce`.
@@ -2451,7 +2446,25 @@ impl<'a> Lcx<'a> {
         let nfields = storage.fields.len();
         let frame_off = ul.fields[nfields - 1] as i32;
         let tag = Mem::Int(self.layout(storage.fields[nfields - 1]).size as u8, false);
+        // Build dispatcher targets before captures enter the body's drop scopes.
+        let saved = self.cur;
+        let pending_ret = self.f.block();
+        self.switch(pending_ret);
+        let vi_p = self.variant_index(poll_ret, LangItem::PollPending);
+        let pv = self.build_enum(poll_ret, vi_p, Vec::new());
+        self.ret_raw(pv, poll_ret);
+        let cancel_end = self.f.block();
+        self.switch(cancel_end);
+        self.goto(pending_ret);
+        let after_done = self.f.block();
+        self.switch(after_done);
+        self.panic_here("`async fn` resumed after completion");
+        let after_panic = self.f.block();
+        self.switch(after_panic);
+        self.panic_here("`async fn` resumed after panicking");
+        self.switch(saved);
         let once = self.storage_for_closure(ce).drop_flags;
+        // Captures enter the outer scope; async fn parameters are in declaration order.
         for (i, li) in caps.iter().enumerate() {
             let off = ul.fields.get(i).copied().unwrap_or(0) as i32;
             if once && self.capture_by_value(ce, i, *li) {
@@ -2469,59 +2482,21 @@ impl<'a> Lcx<'a> {
             };
             self.locals[*li as usize] = Some(LocalSt::Slot(a));
             self.foreign[*li as usize] = true;
+            if once && self.capture_by_value(ce, i, *li) {
+                self.own_capture(ce, i, *li);
+            }
         }
-        // fixed blocks the state machine needs (coroutine_transform)
-        let saved = self.cur;
-        let pending_ret = self.f.block();
-        self.switch(pending_ret);
-        let vi_p = self.variant_index(poll_ret, LangItem::PollPending);
-        let pv = self.build_enum(poll_ret, vi_p, Vec::new());
-        self.ret_raw(pv, poll_ret);
-        let cancel_end = self.f.block();
-        self.switch(cancel_end);
-        self.goto(pending_ret);
-        let after_done = self.f.block();
-        self.switch(after_done);
-        self.panic_here("`async fn` resumed after completion");
-        let after_panic = self.f.block();
-        self.switch(after_panic);
-        self.panic_here("`async fn` resumed after panicking");
-        self.switch(saved);
         self.coro = Some(Coro { ct, env, cx, frame_off, tag, up_size: ul.size, await_slots: Vec::new(), poll_scratch: Vec::new(), call_private: Default::default(), call_sret: Default::default(), poll_ret, suspends: Vec::new(), cancel_end: Some(cancel_end), pending_ret, after_done, after_panic });
         self.pos = ast.block(body).lo;
         let mark = self.stmt_temps.len();
         let v = self.lower_block(body);
         let v = self.settle_before_temp_drop(v, out, mark);
         self.drop_stmt_temps_from(mark);
-        self.coro_caps = Some((ce, caps, env, ul.fields.clone()));
         self.ret_val(v, out);
     }
 
-    /// The end of a coroutine body (its tail or a `return`): the by-value captures it did not
-    /// move out drop (rustc moves the upvars into the coroutine and drops them at its end),
-    /// then Ready(v) is returned.
+    /// Return Ready(v) after the body's drop scopes have been cleaned up.
     fn coro_complete(&mut self, v: Val, out: TyId) {
-        if let Some((ce, caps, env, fields)) = self.coro_caps.clone() {
-            for (i, li) in caps.iter().enumerate() {
-                if self.capture_by_value(ce, i, *li) {
-                    if let Some(&(fenv, foff)) = self.capture_flag.get(li) {
-                        let lt = self.monomorphize(self.b.locals[*li as usize].ty);
-                        let fl = self.f.vreg(Cls::I);
-                        self.emit(Inst::Load(Mem::Int(1, false), fl, fenv, foff));
-                        let yes = self.f.block();
-                        let join = self.f.block();
-                        self.term(Term::Branch(fl, yes, join));
-                        self.switch(yes);
-                        let a = self.addr_add(env, fields.get(i).copied().unwrap_or(0) as i32);
-                        self.drop_at(a, lt);
-                        let z = self.iconst(0);
-                        self.emit(Inst::Store(Mem::Int(1, false), fenv, foff, z));
-                        self.goto(join);
-                        self.switch(join);
-                    }
-                }
-            }
-        }
         let poll_ret = match &self.coro {
             Some(c) => c.poll_ret,
             None => return,
