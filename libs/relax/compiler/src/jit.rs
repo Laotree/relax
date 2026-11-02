@@ -12905,6 +12905,9 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::
     if owner::is_owner() && !FIRST_PRESENT.load(Ordering::Relaxed) {
         // (a body checked ahead: the request's own slot, row 4, or a slot its preparation needs)
         let own = owner_lower_kind == 0 && BUILD_STACK.try_with(|s| s.borrow().first().copied()).ok().flatten() == Some(id);
+        if ahead_trace() {
+            eprintln!("owner-lower row{} #{} {} us {}", if own { 4 } else { owner_lower_kind }, id, (cpu_ns() - t0).saturating_sub(nested_build_ns() - n0) / 1000, u.fns[id as usize].name);
+        }
         let row = &OWNER_LOWERS[if own { 4 } else { owner_lower_kind }];
         row[0].fetch_add(1, Ordering::Relaxed);
         row[1].fetch_add((cpu_ns() - t0).saturating_sub(nested_build_ns() - n0), Ordering::Relaxed);
@@ -14403,6 +14406,7 @@ impl Drop for Unit {
             self.front.alive.store(false, Ordering::SeqCst);
         }
         self.front.wake.notify_all();
+        lowered_end();
         // Only the unit the process-wide O3 machinery (tier threads: TIER_UNIT; sampler:
         // UNIT) can reach is stopped, and its lock is kept: a build that loaded the pointer
         // must never resume on a freed unit. Any other unit (never ran code, never tiered)
@@ -18327,6 +18331,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     if !fronted.is_empty() {
         let mut lowered = front.lowered.lock().unwrap_or_else(|e| e.into_inner());
         for c in &fronted { lowered.remove(c); }
+        drop(lowered);
+        lowered_end();
     }
     drop(front);
     let t1 = cpu_ns();
@@ -22014,7 +22020,7 @@ fn prefront_slot_once(front: &FrontShared, id: u32) -> bool {
     };
     prefront_count(t0);
     prefronted(id);
-    let ok = front.lowered.lock().unwrap_or_else(|e| e.into_inner()).get(&id).is_some_and(|x| x.is_some());
+    let ok = matches!(front.lowered.lock().unwrap_or_else(|e| e.into_inner()).get(&id), Some(LoweredState::Ready(_)));
     if !ok {
         let why = if why == AF_OK { AF_OTHER } else { why };
         prefront_fail(why);
@@ -22074,12 +22080,13 @@ fn prefront_closure(front: &FrontShared, id: u32) -> bool {
     {
         let mut pending = front.lowered.lock().unwrap_or_else(|e| e.into_inner());
         if pending.contains_key(&id) {
+            let ready = matches!(pending.get(&id), Some(LoweredState::Ready(_)));
             if ahead_trace() {
-                eprintln!("ahead-lower of closure #{}: already {}", id, if pending.get(&id).is_some_and(|x| x.is_some()) { "lowered" } else { "pending/failed" });
+                eprintln!("ahead-lower of closure #{}: already {}", id, if ready { "lowered" } else { "pending/failed" });
             }
-            return pending.get(&id).is_some_and(|x| x.is_some()) || prefront_fail(AF_PENDING);
+            return ready || prefront_fail(AF_PENDING);
         }
-        pending.insert(id, None);
+        pending.insert(id, LoweredState::Running);
     }
     let t0 = cpu_ns();
     let _preemptible = crate::preempt::Preemptible::on();
@@ -22121,9 +22128,10 @@ fn prefront_closure(front: &FrontShared, id: u32) -> bool {
         if transient_ahead_fail(why) {
             pending.remove(&id);
         } else if let Some(slot) = pending.get_mut(&id) {
-            *slot = ready;
+            *slot = ready.map_or(LoweredState::Failed, LoweredState::Ready);
         }
     }
+    lowered_end();
     if !ok {
         prefront_fail(why);
     }
@@ -22619,9 +22627,9 @@ pub struct FrontShared {
     inprog: relax_session::sync::Mutex<crate::fxhash::HashSet<AheadKey>>,
     /// Instances whose build consumed their body: no new ahead checks.
     built: crate::conc::MemoMap<AheadKey, bool>,
-    /// A one-use handoff from lowering helpers. None reserves a slot; removing it lets the
+    /// A one-use handoff from lowering helpers. Running reserves a slot; removing it lets the
     /// normal build take over without waiting. No slot's build state is owned by a helper.
-    lowered: relax_session::sync::Mutex<HashMap<u32, Option<LoweredAhead>>>,
+    lowered: relax_session::sync::Mutex<HashMap<u32, LoweredState>>,
     /// Constants the owner evaluated, by the key lowering asked for, and statics it initialized (key
     /// (static, no args): a static's DefKind tells the two apart) (rule I-PURE: lowering ahead
     /// reads them here instead of asking the owner). Written by the owner (Unit::const_addr,
@@ -22659,6 +22667,7 @@ impl FrontShared {
     pub(crate) fn retire_memos(&self) {
         self.ahead.clear();
         let lowered = std::mem::take(&mut *self.lowered.lock().unwrap_or_else(|e| e.into_inner()));
+        lowered_end();
         let post = std::mem::take(&mut *self.ahead_post.lock().unwrap_or_else(|e| e.into_inner()));
         drop((lowered, post));
     }
@@ -22909,6 +22918,7 @@ fn ahead_helper(f: std::sync::Arc<FrontShared>, index: u32) {
                     // Unused raw RIR is startup work only. Drop it on a helper, outside the
                     // queue/publication locks; in-flight helpers cannot republish removed slots.
                     let unused = std::mem::take(&mut *f.lowered.lock().unwrap_or_else(|e| e.into_inner()));
+                    lowered_end();
                     drop(unused);
                     return;
                 }
@@ -22947,6 +22957,12 @@ fn ahead_helper(f: std::sync::Arc<FrontShared>, index: u32) {
 fn ahead_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_AHEAD_TRACE").is_some())
+}
+
+enum LoweredState {
+    Running,
+    Failed,
+    Ready(LoweredAhead),
 }
 
 struct LoweredAhead {
@@ -23059,49 +23075,75 @@ fn lower_ahead(f: &FrontShared, id: u32, own: bool) -> u8 {
     // not inside another lowering ahead (a compile its constant evaluation reached): this one's
     // guard would end the outer one's temporary callee identities under it
     if LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(true) { return AF_NESTED; }
-    let r = front_read("lower_ahead");
-    if !f.alive.load(Ordering::SeqCst) || !own && !ahead_phase() { return AF_OTHER; }
-    let Some(FnKey::Inst(d, args)) = f.slot_keys.get(&id) else { return AF_NOT_BODY; };
-    let key = (d, args);
-    if f.is_built(&key) { return AF_BUILT; }
-    let Some((epoch, body)) = f.ahead.get(&key) else { return AF_UNCHECKED; };
-    let u = r.unit_of(f);
-    let fn_key = FnKey::Inst(d, key.1.clone());
-    // fn_map publishes after the slot's fields (including a decoded image identity).
-    // The ahead queue can contain the id before fn_id/name_slot finishes publishing it.
-    if epoch != u.tcx.collect_epoch.load(Ordering::SeqCst) || u.fn_map.get(&fn_key) != Some(id) { return AF_STALE; }
-    if !lowers_ahead(u, d, &body, own) { return AF_REFUSED; }
-    {
-        let mut pending = f.lowered.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        let r = front_read("lower_ahead");
+        if !f.alive.load(Ordering::SeqCst) || !own && !ahead_phase() { return AF_OTHER; }
+        let Some(FnKey::Inst(d, args)) = f.slot_keys.get(&id) else { return AF_NOT_BODY; };
+        let key = (d, args);
         if f.is_built(&key) { return AF_BUILT; }
-        // (lowered already, being lowered on another thread, or an earlier lowering failed)
-        if let Some(x) = pending.get(&id) { return if x.is_some() { AF_OK } else { AF_PENDING }; }
-        pending.insert(id, None);
-    }
-    let r = lower_ahead_as(u, id, id, d, &key.1, epoch, None);
-    let why = r.as_ref().err().copied().unwrap_or(AF_OK);
-    // the callees a baseline build inlines (Relax core's tiniest bodies, base_inline_wanted): their
-    // slots are made now, so the helpers check and lower them ahead (slot_ahead) like any slot.
-    // Made later, by the take of this body's build, they were lowered on the owner inside that
-    // build's front (20k bodies, 1 s of a cold Fab's owner fronts before the present)
-    // (makepad run's lazy compiles only: startup, and a program thread's own builds after it; not
-    // a check's walk, whose order follows slot creation, nor a tier-up worker's speculative front)
-    let small: Vec<FnKey> = match &r {
-        Ok(l) if pipelined() && (startup_phase() || ahead_foreground()) => l.callees.iter().filter(|k| matches!(k, FnKey::Inst(cd, _) if base_inline_source(u, *cd) && u.fn_map.get(*k).is_none())).cloned().collect(),
-        _ => Vec::new(),
-    };
-    {
-        let mut pending = f.lowered.lock().unwrap_or_else(|e| e.into_inner());
-        if f.is_built(&key) || transient_ahead_fail(why) {
-            pending.remove(&id);
-        } else if let Some(slot) = pending.get_mut(&id) {
-            *slot = r.ok();
+        let Some((epoch, body)) = f.ahead.get(&key) else { return AF_UNCHECKED; };
+        let u = r.unit_of(f);
+        let fn_key = FnKey::Inst(d, key.1.clone());
+        // fn_map publishes after the slot's fields (including a decoded image identity).
+        // The ahead queue can contain the id before fn_id/name_slot finishes publishing it.
+        if epoch != u.tcx.collect_epoch.load(Ordering::SeqCst) || u.fn_map.get(&fn_key) != Some(id) { return AF_STALE; }
+        if !lowers_ahead(u, d, &body, own) { return AF_REFUSED; }
+        {
+            let mut pending = f.lowered.lock().unwrap_or_else(|e| e.into_inner());
+            if f.is_built(&key) { return AF_BUILT; }
+            match pending.get(&id) {
+                Some(LoweredState::Ready(_)) => return AF_OK,
+                Some(LoweredState::Running) if own && !owner::is_owner() => {
+                    // the writer may need the front: hold neither lock while the helper finishes
+                    drop(pending);
+                    drop(r);
+                    let _idle = JobIdle::enter();
+                    let _w = AheadWait::begin(4);
+                    let mut g = LOWER_AHEAD_DONE.0.lock().unwrap_or_else(|e| e.into_inner());
+                    while matches!(f.lowered.lock().unwrap_or_else(|e| e.into_inner()).get(&id), Some(LoweredState::Running)) && f.alive.load(Ordering::SeqCst) {
+                        g = LOWER_AHEAD_DONE.1.wait_timeout(g, std::time::Duration::from_millis(5)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0);
+                    }
+                    continue;
+                }
+                Some(_) => return AF_PENDING,
+                None => {}
+            }
+            if own {
+                // note every missing free constant before doing any lowering, outside the map lock
+                drop(pending);
+                if want_missing_body_consts(u, &body) { return AF_NEEDS_UNIT; }
+                pending = f.lowered.lock().unwrap_or_else(|e| e.into_inner());
+                if f.is_built(&key) { return AF_BUILT; }
+                if pending.contains_key(&id) { continue; }
+            }
+            pending.insert(id, LoweredState::Running);
         }
+        let r = lower_ahead_as(u, id, id, d, &key.1, epoch, None);
+        let why = r.as_ref().err().copied().unwrap_or(AF_OK);
+        // the callees a baseline build inlines (Relax core's tiniest bodies, base_inline_wanted): their
+        // slots are made now, so the helpers check and lower them ahead (slot_ahead) like any slot.
+        // Made later, by the take of this body's build, they were lowered on the owner inside that
+        // build's front (20k bodies, 1 s of a cold Fab's owner fronts before the present)
+        // (makepad run's lazy compiles only: startup, and a program thread's own builds after it; not
+        // a check's walk, whose order follows slot creation, nor a tier-up worker's speculative front)
+        let small: Vec<FnKey> = match &r {
+            Ok(l) if pipelined() && (startup_phase() || ahead_foreground()) => l.callees.iter().filter(|k| matches!(k, FnKey::Inst(cd, _) if base_inline_source(u, *cd) && u.fn_map.get(*k).is_none())).cloned().collect(),
+            _ => Vec::new(),
+        };
+        {
+            let mut pending = f.lowered.lock().unwrap_or_else(|e| e.into_inner());
+            if f.is_built(&key) || transient_ahead_fail(why) {
+                pending.remove(&id);
+            } else if let Some(slot) = pending.get_mut(&id) {
+                *slot = r.ok().map_or(LoweredState::Failed, LoweredState::Ready);
+            }
+        }
+        lowered_end();
+        for k in small {
+            u.fn_id(k);
+        }
+        return why;
     }
-    for k in small {
-        u.fn_id(k);
-    }
-    why
 }
 
 /// Whether `d`'s body is one a baseline build inlines by its source (base_inline_wanted's rule for
@@ -23129,7 +23171,7 @@ const AF_REFUSED: u8 = 5;
 const AF_NEEDS_UNIT: u8 = 6;
 const AF_NO_PARENT: u8 = 7;
 const AF_OTHER: u8 = 8;
-/// an earlier lowering ahead of the slot failed (its entry stays None) or is running on another thread
+/// an earlier lowering ahead of the slot failed, or is running on another thread
 const AF_PENDING: u8 = 9;
 /// inside another lowering ahead
 const AF_NESTED: u8 = 10;
@@ -23306,9 +23348,9 @@ fn prefront_twin(front: &FrontShared, twin: u32, base: u32) -> bool {
     {
         let mut pending = front.lowered.lock().unwrap_or_else(|e| e.into_inner());
         if pending.contains_key(&twin) {
-            return pending.get(&twin).is_some_and(|x| x.is_some()) || prefront_fail(AF_PENDING);
+            return matches!(pending.get(&twin), Some(LoweredState::Ready(_))) || prefront_fail(AF_PENDING);
         }
-        pending.insert(twin, None);
+        pending.insert(twin, LoweredState::Running);
     }
     let t0 = cpu_ns();
     let ready = {
@@ -23323,9 +23365,10 @@ fn prefront_twin(front: &FrontShared, twin: u32, base: u32) -> bool {
         if why.is_some_and(transient_ahead_fail) {
             pending.remove(&twin);
         } else if let Some(slot) = pending.get_mut(&twin) {
-            *slot = ready.ok();
+            *slot = ready.ok().map_or(LoweredState::Failed, LoweredState::Ready);
         }
     }
+    lowered_end();
     if let Some(why) = why {
         prefront_fail(why);
     }
@@ -23342,15 +23385,18 @@ fn give_back_lowered(u: &Unit, id: u32, func: relax_backend::rir::Func) {
         _ => None,
     };
     let back = LoweredAhead { epoch, file: u.fns[id as usize].file, func, body, callees: Vec::new(), consts: Vec::new(), tls: Vec::new() };
-    u.front.lowered.lock().unwrap_or_else(|e| e.into_inner()).insert(id, Some(back));
+    u.front.lowered.lock().unwrap_or_else(|e| e.into_inner()).insert(id, LoweredState::Ready(back));
+    lowered_end();
 }
 
 /// Unit lock held. Never wait for lowering: taking an unfinished reservation cancels its
 /// publication, and this build uses the already checked body through the ordinary path.
 fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<relax_backend::rir::Func> {
-    let mut lowered = u.front.lowered.lock().unwrap_or_else(|e| e.into_inner()).remove(&id)??;
+    let lowered = u.front.lowered.lock().unwrap_or_else(|e| e.into_inner()).remove(&id)?;
+    lowered_end();
+    let LoweredState::Ready(mut lowered) = lowered else { return None };
     // (MAKEPAD_RUN_O2_TRACE: why a take could not use a lowering made ahead for it)
-    let name = if o2_trace() && owner::bailing() { Some(u.fns[id as usize].name.to_string()) } else { None };
+    let name = if o2_trace() && owner::bailing() || ahead_trace() && !FIRST_PRESENT.load(Ordering::Relaxed) { Some(u.fns[id as usize].name.to_string()) } else { None };
     let refuse = |why: &str| {
         if let Some(name) = &name {
             eprintln!("makepad-run O2: lowering ahead of #{} {} not taken: {}", id, name, why);
@@ -23563,55 +23609,70 @@ pub unsafe fn typeck_ahead_slot(up: *mut Unit, id: u32) {
         if !owner::is_owner() && f.inprog.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
             // (a wait for another thread: not a running job meanwhile, job_sleep's reason)
             let _idle = JobIdle::enter();
-            let _w = AheadWait::begin();
+            let _w = AheadWait::begin(0);
             let mut g = AHEAD_DONE.0.lock().unwrap_or_else(|e| e.into_inner());
             while f.inprog.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) && f.alive.load(Ordering::SeqCst) {
                 g = AHEAD_DONE.1.wait_timeout(g, std::time::Duration::from_millis(5)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0);
             }
         }
         let w = IS_WORKER.try_with(|w| w.get()).unwrap_or(false);
-        AHEAD_STATS[if w { 4 } else { 3 }].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
+        let mut t1 = cpu_ns();
+        AHEAD_STATS[if w { 4 } else { 3 }].fetch_add(t1 - t0, Ordering::Relaxed);
         // the thread about to build the slot lowers it (off the owner: the owner's front then only
         // takes the RIR), also during the startup, when the helpers have not got to it yet
         if !owner::is_owner() && pipelined() {
-            let t = cpu_ns();
+            let _want = WantConsts::on();
             let why = lower_ahead(&f, id, true);
+            if ahead_trace() && !FIRST_PRESENT.load(Ordering::Relaxed) {
+                let site = NEEDS_UNIT_AT.try_with(|a| a.get()).ok().flatten().map_or(String::new(), |l| format!("{}:{}", l.file().rsplit('/').next().unwrap_or(""), l.line()));
+                eprintln!("own-lower af{} #{} main={} at={} {}", why, id, MAIN_TID.load(Ordering::Relaxed) == me(), site, f.slot_keys.get(&id).map_or(0, |_| 1));
+            }
             if MAIN_TID.load(Ordering::Relaxed) == me() {
-                MAIN_AHEAD_WAIT[2].fetch_add(cpu_ns() - t, Ordering::Relaxed);
+                let t = t1;
+                t1 = cpu_ns();
+                MAIN_AHEAD_WAIT[2].fetch_add(t1 - t, Ordering::Relaxed);
                 if !FIRST_PRESENT.load(Ordering::Relaxed) {
                     MAIN_LOWER_WHY[(why as usize).min(MAIN_LOWER_WHY.len() - 1)].fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
         if MAIN_TID.load(Ordering::Relaxed) == me() {
-            MAIN_AHEAD_WAIT[3].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
+            MAIN_AHEAD_WAIT[3].fetch_add(t1 - t0, Ordering::Relaxed);
         }
     }
 }
 
 /// The main thread's waits for a helper's check of the body it is about to build
 /// (typeck_ahead_slot): [count, wall ns], and its cpu ns lowering its slots ahead, and in all of
-/// typeck_ahead_slot (the first-present line)
-pub(crate) static MAIN_AHEAD_WAIT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// typeck_ahead_slot, then its waits for a helper's lowering [count, wall ns] (first-present line)
+pub(crate) static MAIN_AHEAD_WAIT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// the main thread's lowerings ahead of its own slots before the first present, by result (AF_*)
 pub(crate) static MAIN_LOWER_WHY: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
-struct AheadWait(u64);
+struct AheadWait(u64, usize);
 impl AheadWait {
-    fn begin() -> AheadWait {
-        AheadWait(if MAIN_TID.load(Ordering::Relaxed) == me() { wall_ns().max(1) } else { 0 })
+    fn begin(at: usize) -> AheadWait {
+        AheadWait(if MAIN_TID.load(Ordering::Relaxed) == me() { wall_ns().max(1) } else { 0 }, at)
     }
 }
 impl Drop for AheadWait {
     fn drop(&mut self) {
         if self.0 != 0 {
-            MAIN_AHEAD_WAIT[0].fetch_add(1, Ordering::Relaxed);
-            MAIN_AHEAD_WAIT[1].fetch_add(wall_ns() - self.0, Ordering::Relaxed);
+            MAIN_AHEAD_WAIT[self.1].fetch_add(1, Ordering::Relaxed);
+            MAIN_AHEAD_WAIT[self.1 + 1].fetch_add(wall_ns() - self.0, Ordering::Relaxed);
         }
     }
 }
 
 /// Signalled when a check ahead ends (typeck_ahead_slot waits for a helper's check in flight).
 static AHEAD_DONE: (relax_session::sync::Mutex<()>, relax_session::sync::Condvar) = (relax_session::sync::Mutex::new(()), relax_session::sync::Condvar::new());
+
+/// Signalled after a lowering's entry changes or goes away; notify with the map lock released.
+static LOWER_AHEAD_DONE: (relax_session::sync::Mutex<()>, relax_session::sync::Condvar) = (relax_session::sync::Mutex::new(()), relax_session::sync::Condvar::new());
+
+fn lowered_end() {
+    let _g = LOWER_AHEAD_DONE.0.lock().unwrap_or_else(|e| e.into_inner());
+    LOWER_AHEAD_DONE.1.notify_all();
+}
 
 fn inprog_end(f: &FrontShared, key: &AheadKey) {
     f.inprog.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
@@ -25400,7 +25461,7 @@ pub fn manifest_order(order: Vec<u32>, present: usize) -> (Vec<u32>, usize) {
 }
 
 thread_local! {
-    /// (a background build's front, prefront_slot) a constant its lowering ahead finds unevaluated
+    /// (a build's own front) a constant its lowering ahead finds unevaluated
     /// is noted for the owner (CONSTS_WANTED)
     static WANT_CONSTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -25421,15 +25482,23 @@ fn want_body_consts(u: &Unit, body: &Body) {
     if !LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false) || !WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
         return;
     }
+    want_missing_body_consts(u, body);
+}
+
+/// Notes all missing free constants; true means lowering would need the owner.
+fn want_missing_body_consts(u: &Unit, body: &Body) -> bool {
     let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
     let mut seen: crate::fxhash::HashSet<DefId> = Default::default();
+    let mut missing = false;
     for r in body.res.values().chain(body.pat_res.values()).chain(body.fmt_named.values()) {
         if let Res::Def(d) = r {
             if u.prog.def(*d).kind == DefKind::Const && seen.insert(*d) && u.front.consts.get(&(*d, Vec::new())).is_none() {
                 want(Wanted::Const(*d, Vec::new()), epoch);
+                missing = true;
             }
         }
     }
+    missing
 }
 /// Notes `w` for the owner's const_drain.
 fn want(w: Wanted, epoch: u64) {
