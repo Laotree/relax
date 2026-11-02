@@ -10,7 +10,8 @@
 //! query the requester is running is the parent of the ones the request starts, so a real cycle
 //! through a request is the query engine's cycle error. A request served nested inside an
 //! earlier request's wait that reaches something only that earlier request can finish (a query
-//! or a build it has open, a load) is cancelled (`OwnerBusy`) and its requester posts it again.
+//! or a build it has open, a load, a constant it is evaluating) is cancelled (`OwnerBusy`) and
+//! its requester posts it again.
 
 use std::any::Any;
 use std::cell::Cell;
@@ -733,6 +734,11 @@ pub fn serving() -> (Class, u64) {
 /// A request served inside an earlier request's wait (owner only).
 pub fn nested() -> bool {
     DEPTH.with(|d| d.get()) > 1
+}
+
+/// The owner's request depth on this thread, zero off the owner or outside a request.
+pub fn depth() -> u32 {
+    DEPTH.try_with(|d| d.get()).unwrap_or(0)
 }
 
 /// Is the main thread the one this work is for (it runs on main, or the owner serves main)?

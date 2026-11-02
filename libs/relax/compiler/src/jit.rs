@@ -6283,7 +6283,12 @@ impl Unit {
         }
         // a constant whose initializer needs its own value (directly or through other constants):
         // rustc's E0391 (the query cycle of const evaluation), not unbounded recursion
-        if CONST_STACK.try_with(|s| s.borrow().iter().any(|(sd, sa)| *sd == d && *sa == args)).unwrap_or(false) {
+        let depth = crate::owner::depth();
+        if let Some(start_depth) = CONST_STACK.try_with(|s| s.borrow().iter().find(|(sd, sa, _)| *sd == d && *sa == args).map(|(_, _, depth)| *depth)).ok().flatten() {
+            // a nested request needs an earlier request's constant to finish; this is not a cycle
+            if start_depth < depth {
+                std::panic::resume_unwind(Box::new(crate::preempt::OwnerBusy));
+            }
             let def = self.prog.def(d);
             let at = self.pos_str(def.file, self.prog.files[def.file as usize].ast.item(def.item).lo);
             self.note_error(format!("{}: E0391: cycle detected when evaluating the initializer of `{}`", at, self.prog.def_path(d)));
@@ -6293,7 +6298,7 @@ impl Unit {
         // rustc's query depth limit (#![recursion_limit], 128 by default): a constant whose
         // evaluation needs the same item at ever deeper arguments
         let limit = self.prog.crates[self.prog.def(d).krate as usize].recursion_limit as usize;
-        if CONST_STACK.try_with(|s| s.borrow().len()).unwrap_or(0) > limit {
+        if CONST_STACK.try_with(|s| s.borrow().iter().filter(|(_, _, sd)| *sd == depth).count()).unwrap_or(0) > limit {
             let def = self.prog.def(d);
             let at = self.pos_str(def.file, self.prog.files[def.file as usize].ast.item(def.item).lo);
             self.note_error(format!("{}: queries overflow the depth limit! [in {}]", at, self.prog.def_path(d)));
@@ -6303,7 +6308,7 @@ impl Unit {
         // (popped also when the evaluation unwinds: a cancelled request is retried)
         struct Pop;
         impl Drop for Pop { fn drop(&mut self) { let _ = CONST_STACK.try_with(|s| { s.borrow_mut().pop(); }); } }
-        let _ = CONST_STACK.try_with(|s| s.borrow_mut().push((d, args.clone())));
+        let _ = CONST_STACK.try_with(|s| s.borrow_mut().push((d, args.clone(), depth)));
         let cert = CertGuard::begin(FnKey::Inst(d, args.clone()));
         let evaluated = { let _pop = Pop; self.eval_init(d, args.clone(), false) };
         let cert = cert.finish();
@@ -21604,8 +21609,9 @@ pub(crate) fn cert_take_in(cert: &ConstCert) {
 }
 
 thread_local! {
-    /// the constants (and their arguments) whose initializers this thread is evaluating, outermost first
-    static CONST_STACK: std::cell::RefCell<Vec<(DefId, Vec<TyId>)>> = Default::default();
+    /// the constants whose initializers this thread is evaluating, with their arguments and
+    /// owner request depth at the push, outermost first
+    static CONST_STACK: std::cell::RefCell<Vec<(DefId, Vec<TyId>, u32)>> = Default::default();
 }
 thread_local! {
     /// const/static initializers this thread is evaluating (run_init_code)
