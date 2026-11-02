@@ -1673,6 +1673,20 @@ pub(crate) extern "C" fn relax_precompile(addr: u64) -> u64 {
     })
 }
 
+/// Builds every function the code at `addr` can reach, on the calling thread (a test's warm-up:
+/// afterwards no lazy compile of that program's code is left to grow the process heap).
+#[cfg(all(test, unix))]
+pub(crate) fn precompile_reachable(up: *mut Unit, addr: u64) -> u64 {
+    let prev = CUR_UNIT.with(|c| c.replace(up));
+    let root = owner::publish(|| unsafe {
+        let u = &*up;
+        u.find_fn(addr).or_else(|| (0..2).find_map(|k| u.slots.find(k, addr).map(|x| x.0))).filter(|&id| (id as usize) < u.fns.len())
+    });
+    let built = root.map_or(0, precompile_from);
+    CUR_UNIT.with(|c| c.set(prev));
+    built
+}
+
 /// `relax_precompile` from slot `root`.
 #[cfg(unix)]
 pub(crate) fn precompile_from(root: u32) -> u64 {

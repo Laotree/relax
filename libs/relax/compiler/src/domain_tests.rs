@@ -110,6 +110,22 @@ fn heap_in_use() -> u64 {
         .1
 }
 
+/// The heap check counts the whole process, so what grows it besides the fixture is settled first.
+/// Each of these is one-off process state that the cycles would otherwise create in whichever
+/// cycle first needs it, which depends on how the threads interleave (and so on machine load):
+/// lazy compiles of the fixture's code, and the symbol tables of the images a teardown stack
+/// dump names (it runs only when a thread outlives its domain's stop).
+#[cfg(target_os = "linux")]
+fn warm_process_state(u: &mut Unit, entry: u64) {
+    extern "C" {
+        fn getpid() -> i32;
+    }
+    crate::jit::precompile_reachable(u, entry);
+    for pc in [warm_process_state as usize as u64, getpid as usize as u64] {
+        assert!(crate::inspect::symbols::host_symbol(pc).is_some());
+    }
+}
+
 #[test]
 fn teardown_fixture_cycles_and_retiring_thread() {
     isolated_test!(teardown_fixture_cycles_and_retiring_thread);
@@ -118,6 +134,8 @@ fn teardown_fixture_cycles_and_retiring_thread() {
     let mut id = None;
     #[cfg(target_os = "linux")]
     let mut baseline = 0;
+    #[cfg(target_os = "linux")]
+    warm_process_state(&mut u, entry);
     for cycle in 0..20 {
         let flags = [const { AtomicU64::new(0) }; 4];
         let (domain, base, main) = launch(&mut u, entry, id, &flags);
@@ -155,10 +173,13 @@ fn teardown_fixture_cycles_and_retiring_thread() {
         #[cfg(target_os = "linux")]
         {
             let now = heap_in_use();
-            if cycle == 0 {
+            // Cycle 0 launches a new domain; from cycle 1 on the domain is cycled, which is the steady
+            // state a leak shows against.
+            if cycle == 1 {
                 baseline = now;
             }
             // Native allocator thread caches may vary a little; two MB leaked per cycle may not.
+
             assert!(now <= baseline + 256 * 1024, "cycle {cycle}: {now} > baseline {baseline}");
         }
         #[cfg(not(target_os = "linux"))]
