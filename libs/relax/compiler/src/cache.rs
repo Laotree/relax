@@ -2307,6 +2307,13 @@ impl Cache {
         Some((k, crates, e.0))
     }
 
+    /// The item graph now (deps_graph): `makepad run`'s app check beside main has it built before
+    /// main, where the check before main had its first code key build it -- else main's first
+    /// compile does, half a second of a cold Fab boot on its path.
+    pub fn build_item_graph(&mut self, u: &Unit) {
+        self.deps_graph(u);
+    }
+
     /// The item graph (cache/deps.rs), on the first need: the stored one when it was built from
     /// this program's very sources (a warm start maps it), else built over it -- the rows of the
     /// crates whose sources and dependencies are as it was built from are taken over, only the
