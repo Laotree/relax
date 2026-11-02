@@ -2741,6 +2741,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         (def.kind == DefKind::Enum).then(|| (d, u.prog.variants[def.sub as usize].len()))
     }).collect();
     let mut layout_restart: Vec<String> = Vec::new();
+    let mut added_defaults: Vec<(DefId, u32, DefId)> = Vec::new();
     let retry_sources: Vec<_> = if kept.is_some() && retries > 0 {
         versions.iter().map(|(v, _)| (v.old, v.path.clone(), v.pf.src[..v.pf.src_len as usize].to_vec())).collect()
     } else { Vec::new() };
@@ -2929,6 +2930,14 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             match edited {
                 Ok((adt, notes)) => {
                     if let Some(old) = u.tcx.adts.insert(d, adt) {
+                        if !old.is_enum {
+                            for f in &u.tcx.adts[&d].variants[0].fields {
+                                if old.variants[0].fields.iter().any(|o| o.name == f.name) { continue; }
+                                if let Some(c) = u.field_default_const(d, f.name).filter(|&c| is_live_default(&u.prog, c)) {
+                                    added_defaults.push((d, f.name, c));
+                                }
+                            }
+                        }
                         saved_adts.push((d, old));
                     }
                     out.lines.extend(notes);
@@ -3027,8 +3036,6 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     trace_sub("consts_errs");
     trace_stage("commit_collect");
     let mut checked_bodies = Vec::new();
-    // initial values of added fields that only their derive can evaluate (they name its `vm`)
-    let mut default_restart = Vec::new();
     {
         let mut todo: Vec<(DefId, Vec<TyId>)> = Vec::new();
         let added_code: Vec<DefId> = added_defs.iter().copied().filter(|d| matches!(u.prog.def(*d).kind, DefKind::Fn | DefKind::AssocFn | DefKind::Const | DefKind::AssocConst | DefKind::Static)).collect();
@@ -3055,13 +3062,12 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
         trace_count("typecheck_items", uniq.len());
         for (d, a) in uniq {
+            // Derive code, not the program's items; whether running values can take a default
+            // is decided by evaluating it below.
+            if is_live_default(&u.prog, d) { continue; }
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::checked_body(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, d, &a)));
             match r {
                 Ok(b) => {
-                    if !b.errors.is_empty() && is_live_default(&u.prog, d) {
-                        default_restart.push(format!("{}: the added field's `#[rust(..)]` initial value is its derive's code ({}), running values cannot take it -- restart the app", u.prog.def_path(d), b.errors[0]));
-                        continue;
-                    }
                     for e in &b.errors {
                         if !errs.contains(e) { errs.push(e.clone()); }
                     }
@@ -3092,10 +3098,20 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     }
     // The running values cannot take such an initial value: a restart, unless the edit also
     // has real errors (those alone refuse it).
-    if errs.is_empty() && !default_restart.is_empty() {
-        errs = default_restart;
-        as_restart = true;
+    if errs.is_empty() {
+        let mut default_restart = Vec::new();
+        for (d, name, c) in added_defaults {
+            if (&*up).const_addr_shared(c, Vec::new()).is_none() {
+                let u = &*up;
+                default_restart.push(format!("struct `{}`: field `{}` added; its `#[rust(..)]` initial value is its derive's code (it may name the derive's `vm`), running values cannot take it -- restart the app", u.prog.def_path(d), u.prog.syms.str(name)));
+            }
+        }
+        if !default_restart.is_empty() {
+            errs = default_restart;
+            as_restart = true;
+        }
     }
+    let u = &mut *up;
     trace_stage("typecheck");
     // D3: the gate is synchronous only under `makepad run --check-first`; otherwise the patched
     // instances are queued to Gandalf when their new code is installed (jit.rs install, rank 0).

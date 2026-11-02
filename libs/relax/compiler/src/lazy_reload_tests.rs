@@ -769,6 +769,9 @@ fn app_scope_live_layout_edits() {
         assert_eq!(restart.rung, Rung::Restart, "{:?}", restart.lines);
         assert!(restart.lines.iter().any(|l| l.contains("#[rust(..)]") && l.contains("restart the app")), "{:?}", restart.lines);
         let after = after.replace("make(vm)", "make(3)");
+        let patch = unsafe { reload::apply(up, vec![Edit { file: u.prog.def(state).file, path: path.to_string_lossy().into_owned(), src: after.as_bytes().to_vec() }]) };
+        assert_eq!(patch.rung, Rung::Patch, "{:?}", patch.lines);
+        let after = after + "\npub struct Fresh { #[rust(make(vm))] pub n: u64 }\n";
         let patch = unsafe { reload::apply(up, vec![Edit { file: u.prog.def(state).file, path: path.to_string_lossy().into_owned(), src: after.into_bytes() }]) };
         assert_eq!(patch.rung, Rung::Patch, "{:?}", patch.lines);
         std::mem::forget(u);
