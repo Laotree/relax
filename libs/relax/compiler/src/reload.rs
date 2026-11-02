@@ -685,12 +685,11 @@ fn toks<'a>(pf: &'a crate::parser::ParsedFile, lo: u32, hi: u32, holes: &[(u32, 
             break;
         }
         covered = true;
-        // a `>>` / `>=` / `>>=` (`<<`, `<=`) the parser split keeps its second part as the
-        // token (its first char consumed): read the token with that char, as a version that
-        // holds the same text untokenized reads it (an expansion's `Option<X<'a>>` compared
-        // as `..'a>` against `..'a>>`, and Scope's next edit of the file took the restart rung)
-        let split = t.lo > prev_hi && t.lo > 0 && matches!(pf.src.get(t.lo as usize - 1), Some(b'>' | b'<'))
-            && matches!(pf.src.get(t.lo as usize), Some(b'>' | b'=' | b'<'));
+        // every split of break_and_eat keeps only the remaining token: read its consumed
+        // char too, so tokens compare like text (fab-model's `&&r.file` lost its first `&`).
+        let split = t.lo > prev_hi && t.lo > 0 && matches!((pf.src.get(t.lo as usize - 1), pf.src.get(t.lo as usize)),
+            (Some(b'<'), Some(b'<' | b'=' | b'-')) | (Some(b'>'), Some(b'>' | b'='))
+            | (Some(b'&'), Some(b'&' | b'=')) | (Some(b'|'), Some(b'|' | b'=')) | (Some(b'+'), Some(b'=')));
         let start = if split { t.lo - 1 } else { t.lo };
         prev_hi = t.hi;
         if holes.iter().any(|&(a, b)| t.lo >= a && t.hi <= b) {
@@ -1362,7 +1361,20 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
                     continue;
                 }
                 match def {
-                    Some(d) if matches!(prog.def(d).kind, DefKind::Fn | DefKind::AssocFn) => out.push(Change::Body(d)),
+                    Some(d) if matches!(prog.def(d).kind, DefKind::Fn | DefKind::AssocFn) => {
+                        if reload_trace() {
+                            let (a, b) = (toks_norm(old, la, a.hi, &ha).concat(), toks_norm(new, lb, b.hi, &hb).concat());
+                            let k = a.iter().zip(&b).position(|(a, b)| a != b).unwrap_or(a.len().min(b.len()));
+                            let snippet = |bytes: &[u8]| {
+                                let text = String::from_utf8_lossy(bytes);
+                                let mut start = k.saturating_sub(15).min(text.len());
+                                while !text.is_char_boundary(start) { start -= 1; }
+                                text[start..].chars().take(60).collect::<String>()
+                            };
+                            eprintln!("reload: body of `{}` changed at byte {} of its text: old `{}` new `{}`", name, k, snippet(&a), snippet(&b));
+                        }
+                        out.push(Change::Body(d));
+                    }
                     _ => why.push(format!("{}: fn `{}` has no definition to patch -- restart the app", pos(new, b.lo), name)),
                 }
             }
@@ -5524,6 +5536,45 @@ mod round43_tests {
         assert!(removed.is_empty(), "removed: {:?}", removed);
         assert!(added.is_empty(), "added: {:?}", added);
         assert_eq!(pairs.len(), old.ast.items.len());
+    }
+}
+
+#[cfg(test)]
+mod split_operator_tests {
+    #[test]
+    fn split_glued_operators_read_as_written() {
+        isolated_test!(split_glued_operators_read_as_written);
+        let session = std::sync::Arc::new(crate::Session::default());
+        // The outer closure's closing `|` glues to the inner closure's opening `|`.
+        let source = br#"
+            fn a(v: &[&String], s: &String) -> bool { v.contains(&&s) }
+            fn b() { let v: Vec<Vec<u8>> = Vec::new(); }
+            fn c() { let f = |_: bool||| true; }
+            fn d() { let r = &&mut 1; }
+        "#;
+        let old = crate::parser::parse_owned(&session, source.to_vec(), 2021).unwrap();
+        let mut new = crate::parser::parse_owned(&session, source.to_vec(), 2021).unwrap();
+        new.toks = Default::default();
+        let (pairs, removed, added) = super::pair_items(&old, &new);
+        assert!(removed.is_empty(), "removed: {:?}", removed);
+        assert!(added.is_empty(), "added: {:?}", added);
+        assert_eq!(pairs.len(), 4);
+        for (i, j) in pairs {
+            let (a, b) = (&old.ast.items[i as usize], &new.ast.items[j as usize]);
+            let crate::ast::ItemKind::Fn(_, Some(body), _) = &a.kind else { panic!("expected parsed fn body"); };
+            let body = old.ast.block(*body);
+            assert!(old.toks.iter().zip(old.toks.iter().skip(1)).any(|(prev, t)|
+                t.lo >= body.lo && t.hi <= body.hi && t.lo > prev.hi && t.lo > 0
+                && matches!(old.src.get(t.lo as usize - 1), Some(b'<' | b'>' | b'&' | b'|' | b'+'))), "no split in item {}", i);
+            assert!(super::same_toks(&old, a.lo, a.hi, &[], &new, b.lo, b.hi, &[]), "item {} differs", i);
+            let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+            let mut expected = Vec::new();
+            for part in source[a.lo as usize..a.hi as usize].split(u8::is_ascii_whitespace).filter(|p| !p.is_empty()) {
+                if expected.last().copied().is_some_and(word) && word(part[0]) { expected.push(b' '); }
+                expected.extend_from_slice(part);
+            }
+            assert_eq!(super::toks_norm(&old, a.lo, a.hi, &[]), vec![expected], "item {} lost source text", i);
+        }
     }
 }
 
