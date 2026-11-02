@@ -672,7 +672,7 @@ fn gandalf_scope_uses_package_source_and_project_boundaries() {
 fn app_scope_live_layout_edits() {
     const CHILD: &str = "MAKEPAD_RUN_APP_LAYOUT_TEST";
     let Ok(case) = std::env::var(CHILD) else {
-        for case in ["app_lib", "path_crate", "framework", "embedded", "generic_embedded", "pointer", "bound_template", "bound_template_embedded", "derive_default"] {
+        for case in ["app_lib", "path_crate", "framework", "embedded", "generic_embedded", "pointer", "bound_template", "bound_template_embedded", "derive_default", "test_run"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "lazy_reload_tests::app_scope_live_layout_edits", "--nocapture", "--test-threads=1"])
                 .env(CHILD, case).output().unwrap();
@@ -730,6 +730,7 @@ fn app_scope_live_layout_edits() {
     crate::borrowck::event::set_app_scope(roots);
     crate::layout::set_root_crate(bin);
     crate::layout::LIVE_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
+    if case == "test_run" { crate::layout::PLAIN_LAYOUTS.store(true, std::sync::atomic::Ordering::Relaxed); }
     let mut tcx = crate::tcx::Tcx::new();
     tcx.collect(&prog);
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
@@ -760,7 +761,7 @@ fn app_scope_live_layout_edits() {
     let value = entry(&mut u, value);
     let name = entry(&mut u, name);
     let layout = u.layout_of(ty).clone();
-    assert_eq!(layout.ext.is_some(), case != "framework");
+    assert_eq!(layout.ext.is_some(), case != "framework" && case != "test_run");
     if case == "derive_default" {
         let after = before.replace("pub value: u64 }", "pub value: u64, #[rust(make(vm))] pub later: u64 }")
             .replace("State { value: 41 }", "State { value: 41, later: 5 }")
@@ -801,6 +802,13 @@ fn app_scope_live_layout_edits() {
         // removes this helper too; its old body must not be checked against the new names.
         + "\nfn obsolete_style() { let _entry = obsolete_style as fn(); }\n";
     let patch = unsafe { reload::apply(up, vec![Edit { file: u.prog.def(state).file, path: path.to_string_lossy().into_owned(), src: after.into_bytes() }]) };
+    if case == "test_run" {
+        assert_eq!(patch.rung, Rung::Restart, "{:?}", patch.lines);
+        assert!(patch.lines.iter().any(|l| l.contains("a test run keeps plain layouts")), "{:?}", patch.lines);
+        std::mem::forget(u);
+        std::fs::remove_dir_all(dir).unwrap();
+        return;
+    }
     // A struct outside the app scope keeps its layout fixed: restart. One embedded by value in a
     // framework type (`Holder`, like the platform's `Option<App>`) patches: its first layout stays.
     if case == "framework" {

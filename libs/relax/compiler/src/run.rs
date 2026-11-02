@@ -775,6 +775,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if live_tests || !check && !harness && plain_test.is_none() && !no_live && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none() && !SILENT.load(Ordering::Relaxed)
         && (store_live || !crate::vfs::is_virtual(&workspace_dir())) {
         driver_options.live = true;
+        driver_options.plain_layouts = HARNESS_RUN.load(Ordering::Acquire);
     }
     LIVE_SESSION.store(driver_options.live, Ordering::Release);
     // `--cfg <name>` / `--cfg=<name>` among the cargo flags (`makepad run <pkg> --cfg custom`) or
@@ -1589,9 +1590,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let root_crate = root;
     crate::layout::set_root_crate(root_crate);
     // A live session (hot reload of the program's own sources, reload.rs); set
-    // before anything is laid out (app structs take the live layout, layout.rs live_editable)
+    // before anything is laid out (the fingerprinted options keep test runs' layouts plain)
     if options.live {
         crate::layout::LIVE_SESSION.store(true, Ordering::Relaxed);
+        crate::layout::PLAIN_LAYOUTS.store(options.plain_layouts, Ordering::Relaxed);
     }
     // The provided crates bind in Unit::new: their source check has passed before it.
     {
