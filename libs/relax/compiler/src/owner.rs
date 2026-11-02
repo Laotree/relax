@@ -81,6 +81,10 @@ const RELEASED: u8 = 3;
 ///   posted between the owner's check and its wait is either seen by the check or notifies.
 const REQUESTER_SPIN_US: u32 = 60;
 const OWNER_SPIN_US: u32 = 60;
+/// The owner's spin after a request of the main thread: a lazy compile on the UI thread asks again
+/// once its back end has built a fn (a cold Fab's first drag: 60-140 UI round trips in a frame,
+/// each paying the owner's futex wake, 0.15-0.3 ms on a busy box)
+const OWNER_MAIN_SPIN_US: u32 = 1000;
 /// spin iterations per microsecond (0: not measured yet, nobody spins)
 static SPIN_PER_US: AtomicU32 = AtomicU32::new(0);
 
@@ -1022,6 +1026,8 @@ fn push(r: usize, class: Class) {
         MAIN_PUBLISH.fetch_add(1, Ordering::Relaxed);
     }
     QUEUED_N.fetch_add(1, Ordering::SeqCst);
+    // makepad inspect's timeline: this thread ends the owner's idle wait, spinning or asleep (owner_loop)
+    crate::inspect::timeline::relax_wake(&WAKE as *const Condvar as usize);
     if OWNER_ASLEEP.load(Ordering::SeqCst) {
         WAKE.notify_all();
     }
@@ -1276,14 +1282,18 @@ fn serve(r: usize) {
 
 fn owner_loop() -> ! {
     calibrate();
+    let mut main_last = false;
     loop {
-        // idle: a short spin catches the next request of a burst without a sleep and wake
-        for _ in 0..spin_iters(OWNER_SPIN_US) {
+        // idle: a short spin catches the next request of a burst without a sleep and wake (a wait of
+        // makepad inspect's timeline, as the sleep below)
+        let spin = crate::inspect::timeline::wait("idle", &WAKE as *const Condvar as u64);
+        for _ in 0..spin_iters(if main_last { OWNER_MAIN_SPIN_US } else { OWNER_SPIN_US }) {
             if QUEUED_N.load(Ordering::Relaxed) != 0 || FORK.load(Ordering::Relaxed) == 1 {
                 break;
             }
             std::hint::spin_loop();
         }
+        drop(spin);
         let r = {
             let mut q = Q.lock().unwrap_or_else(|e| e.into_inner());
             loop {
@@ -1302,10 +1312,16 @@ fn owner_loop() -> ! {
                 }
                 OWNER_ASLEEP.store(true, Ordering::SeqCst);
                 crate::zone_alloc::compiler_hand_back_idle();
+                // a wait of makepad inspect's timeline, ended by the thread that posts the next
+                // request (push): unrecorded, a frame's critical path counted the owner's idle
+                // time before a UI request as the owner running
+                let _idle = crate::inspect::timeline::wait("idle", &WAKE as *const Condvar as u64);
                 q = WAKE.wait(q).unwrap_or_else(|e| e.into_inner());
+                drop(_idle);
                 OWNER_ASLEEP.store(false, Ordering::SeqCst);
             }
         };
+        main_last = from_main(r);
         serve(r);
         crate::lifeline::beat();
         // between top-level requests: the vtables made for real-time trait-object types

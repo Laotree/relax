@@ -159,6 +159,45 @@ pub fn push(kind: Kind, label: &'static str, a: u64, b: u64) {
     }
 }
 
+/// A span of this thread's timeline until the guard drops (nothing when nothing records).
+pub struct Span(&'static str, bool);
+
+pub fn span(name: &'static str) -> Span {
+    let on = recording();
+    if on {
+        push(Kind::SpanBegin, name, 0, 0);
+    }
+    Span(name, on)
+}
+
+impl Drop for Span {
+    fn drop(&mut self) {
+        if self.1 {
+            push(Kind::SpanEnd, self.0, 0, 0);
+        }
+    }
+}
+
+/// A wait of this thread's timeline on `object` until the guard drops, ended by the latest
+/// `relax_wake(object)` (a wait the wait registry does not hold: the owner idle).
+pub struct Wait(bool);
+
+pub fn wait(what: &'static str, object: u64) -> Wait {
+    let on = recording();
+    if on {
+        push(Kind::WaitBegin, what, object, 0);
+    }
+    Wait(on)
+}
+
+impl Drop for Wait {
+    fn drop(&mut self) {
+        if self.0 {
+            push(Kind::WaitEnd, "", 0, 0);
+        }
+    }
+}
+
 // ------------------------------------------------------------------ marker entries
 
 /// makepad's UI phases (platform thread/ui_hang.rs, found by dlsym): a phase begins / ends;
@@ -976,7 +1015,8 @@ fn busy_in(th: &Thread, t0: u64, t1: u64) -> (u64, u64) {
 fn critical(ths: &[Thread], ui: usize, t0: u64, t1: u64) -> Vec<(usize, u64, u64, String)> {
     let mut path = Vec::new();
     let (mut th, mut t) = (ui, t1);
-    for _ in 0..256 {
+    // (a cold lazy compile's frame is hundreds of UI -> owner -> UI round trips, three pieces each)
+    for _ in 0..16384 {
         if t <= t0 {
             break;
         }
@@ -988,8 +1028,13 @@ fn critical(ths: &[Thread], ui: usize, t0: u64, t1: u64) -> Vec<(usize, u64, u64
                 if end < t {
                     path.push((th, end, t, "run".to_string()));
                 }
+                // the wake explains the wait only where the walk meets the wait's end: met inside
+                // it (this thread's own request woke the owner while it waited), the thread waited
+                // since the wait began. A wake stamped just after the end (another thread's clock
+                // read) counts as just before it, so the walk only goes back in time.
                 match s.woke_by.and_then(|(h, at)| ths.iter().position(|x| x.handle == h).map(|i| (i, at))) {
-                    Some((i, at)) if i != th && at > s.t0 => {
+                    Some((i, at)) if i != th && at > s.t0 && end == s.t1 => {
+                        let at = at.min(end.saturating_sub(1));
                         path.push((th, at.max(s.t0), end, format!("{} (ended by {})", s.what, super::tid_label(ths[i].os_id))));
                         th = i;
                         t = at.max(t0);
@@ -1207,6 +1252,18 @@ fn frame_cmd(req: &Req, out: &mut Out) {
     }
     let st: Vec<String> = steps.iter().take(16).map(|(th, d, w)| format!("{{\"thread\":\"{}\",\"ms\":{:.2},\"what\":{}}}", super::tid_label(ths[*th].os_id), *d as f64 / 1e6, json_str(&short(w, 120)))).collect();
     out.line(&format!("{{\"critical_path_busy_ms\":{:.2},\"steps\":[{}]}}", total as f64 / 1e6, st.join(",")));
+    // the path's time by thread and label, most first (a path of many short round trips)
+    let mut by: Vec<(usize, String, u64, usize)> = Vec::new();
+    for (th, d, w) in &steps {
+        let w = w.split(" (ended by ").next().unwrap_or(w);
+        match by.iter_mut().find(|x| x.0 == *th && x.1 == w) {
+            Some(x) => { x.2 += d; x.3 += 1; }
+            None => by.push((*th, w.to_string(), *d, 1)),
+        }
+    }
+    by.sort_by(|a, b| b.2.cmp(&a.2));
+    let by: Vec<String> = by.iter().take(10).map(|(th, w, d, n)| format!("{{\"thread\":\"{}\",\"what\":{},\"ms\":{:.2},\"pieces\":{}}}", super::tid_label(ths[*th].os_id), json_str(&short(w, 120)), *d as f64 / 1e6, n)).collect();
+    out.line(&format!("{{\"critical_path_by\":[{}]}}", by.join(",")));
     // the UI thread's waits in the frame, longest first, with who ended them
     let mut waits: Vec<(u64, String, Option<u64>)> = Vec::new();
     for s in ths[ui].segs.iter().filter(|s| s.wait && s.t1 > t0 && s.t0 < t1) {
