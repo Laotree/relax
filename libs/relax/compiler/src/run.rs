@@ -1807,6 +1807,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         domain_inputs = if HAL_RUN.load(Ordering::Acquire) { live_inputs.as_ref().map(crate::zone_alloc::kept_clone) } else { None };
         crate::reload::start_watcher(up, live_inputs.unwrap_or_default());
     }
+    if !HARNESS_RUN.load(Ordering::Acquire) && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none() {
+        jit::start_cpu_budget();
+    }
     jit::start_completion(up, runtime);
     let platform = u.prog.crates.iter().any(|c| u.prog.syms.str(c.name) == "makepad_platform");
     jit::live_needs_present(!live_tests && platform);
@@ -2683,6 +2686,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             let now = monitor_activity();
             if now == activity { still = still.saturating_add(1) } else { (activity, still) = (now, 0) }
             crate::lifeline::beat();
+            jit::poll_cpu_budget();
             if let Some(file) = present.as_mut() {
                 use std::io::{Read, Write};
                 let _ = file.read_to_end(&mut present_bytes);
