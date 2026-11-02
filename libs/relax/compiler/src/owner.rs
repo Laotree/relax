@@ -146,6 +146,8 @@ static STARTED: std::sync::Once = std::sync::Once::new();
 static FOREGROUND: AtomicU32 = AtomicU32::new(0);
 /// the main thread's requests queued
 static MAIN_QUEUED: AtomicU32 = AtomicU32::new(0);
+/// the main thread's queued publish requests (its lazy compiles' finishes): served first (pick)
+static MAIN_PUBLISH: AtomicU32 = AtomicU32::new(0);
 /// requests queued (any class): the idle owner spins on it
 static QUEUED_N: AtomicU32 = AtomicU32::new(0);
 /// the owner sleeps on WAKE (a push then notifies it; otherwise it is spinning or busy)
@@ -808,6 +810,10 @@ pub fn start() {
                 crate::waits::register();
                 let _ = OWNER_THREAD.set(std::thread::current());
                 crate::jit::ensure_altstack();
+                // the UI thread waits on this thread for every lazy compile: it runs in the UI's
+                // class (macOS: user-interactive QoS), so a busy machine does not starve the one
+                // thread the UI waits behind
+                crate::os::thread::interactive();
                 let _ = crate::zone_alloc::kept_with(|| tx.send(()));
                 // a panic outside a request (serve catches those) ends the process with a report:
                 // a dead owner would leave every requester waiting forever
@@ -1012,6 +1018,8 @@ fn push(r: usize, class: Class) {
         if from_main(r) {
             MAIN_QUEUED.fetch_add(1, Ordering::Relaxed);
         }
+    } else if class == Class::Publish && from_main(r) {
+        MAIN_PUBLISH.fetch_add(1, Ordering::Relaxed);
     }
     QUEUED_N.fetch_add(1, Ordering::SeqCst);
     if OWNER_ASLEEP.load(Ordering::SeqCst) {
@@ -1026,6 +1034,8 @@ fn dequeued(class: usize, r: usize) {
         if from_main(r) {
             MAIN_QUEUED.fetch_sub(1, Ordering::Relaxed);
         }
+    } else if class == Class::Publish as usize && from_main(r) {
+        MAIN_PUBLISH.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1106,6 +1116,23 @@ fn pick(q: &mut Queue, mode: Mode) -> Option<usize> {
         e => (e, false),
     };
     let helper = EXIT_HELPER.load(Ordering::Acquire);
+    // The UI (main) thread's own requests go first, ahead of every other program thread's and every
+    // background publish: it waits with no frame meanwhile, and its lazy compile's finish is a
+    // publish that queued behind the O2/O3 workers' takes (a cold Fab: seconds of UI waits behind
+    // background work). A pump serves only its publish (Class::keeps_job), as for any requester.
+    if only == 0 && MAIN_QUEUED.load(Ordering::Relaxed) + MAIN_PUBLISH.load(Ordering::Relaxed) > 0 {
+        for c in [Class::Program as usize, Class::Publish as usize] {
+            if mode == Mode::Pump && !CLASS_OF[c].keeps_job() {
+                continue;
+            }
+            let lane = &mut q.lanes[c];
+            if let Some(i) = lane.iter().position(|r| from_main(*r)) {
+                let r = lane.remove(i).unwrap();
+                dequeued(c, r);
+                return Some(r);
+            }
+        }
+    }
     for c in SERVICE_ORDER {
         // a pump serves only what the awaited thread may be waiting for: a job's request, a
         // publish. Never a program thread's request: it opens builds of its own on top of the

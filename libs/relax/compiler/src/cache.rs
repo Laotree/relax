@@ -160,6 +160,12 @@ const KIND_DEPS: u32 = 18;
 const KIND_FRONT_ORDER: u32 = 19;
 const KIND_CONST: u32 = 9;
 const KIND_WARM_OUTCOME: u32 = 10;
+/// a slot's tier verdict: its counted window showed too little work for O3 (jit.rs pgo_poll parks
+/// it). Keyed by the slot's code key xor TIER_VERDICT_SALT (empty payload): a warm launch installs
+/// the slot's entry with its tier decision final (no count stub), so its startup burst does not
+/// count it hot again and build its counted code and O3 code every launch
+const KIND_TIER: u32 = 20;
+const TIER_VERDICT_SALT: u128 = 0x7469_6572_2d76_6572_6469_6374_2d70_6b64;
 /// stores a front image was mapped from: kept for the rest of the process (the arrays point
 /// into their mappings)
 static FRONT_STORES: relax_session::sync::Mutex<Vec<std::sync::Arc<Store>>> = relax_session::sync::Mutex::new(Vec::new());
@@ -2975,6 +2981,26 @@ impl Cache {
         let before = warm_count::get(warm_count::O1V_WRITTEN);
         self.record_entry(u, id, code, relocs, pc_map, None, RecKind::O1Up, None);
         warm_count::get(warm_count::O1V_WRITTEN) != before
+    }
+
+    /// Records that slot `id`'s counted window showed too little work for O3 (KIND_TIER).
+    pub fn record_tier_parked(&mut self, u: &Unit, id: u32) {
+        if self.mode == Mode::ReadOnly || u.fns[id as usize].patch_gen != 0 { return; }
+        let Some(key) = self.slot_key(u, id) else { return };
+        let vk = key ^ TIER_VERDICT_SALT;
+        if self.has_index(&vk) || !self.pending_keys.insert(vk) { return; }
+        let kc = self.key_crate.get(&key).copied().unwrap_or(0);
+        self.push_pending(kc, NewEntry { key: vk, kind: KIND_TIER, payload: Vec::new() });
+    }
+
+    /// Whether code entry `key`'s slot was parked below O3 by an earlier run (record_tier_parked).
+    pub(crate) fn tier_parked_key(&self, key: u128) -> bool {
+        matches!(self.get(key ^ TIER_VERDICT_SALT), Some((KIND_TIER, _)))
+    }
+
+    /// Whether slot `id`, linked from the cache this run, was parked below O3 by an earlier run.
+    pub(crate) fn tier_parked(&self, id: u32) -> bool {
+        self.linked_key.get(&id).is_some_and(|&k| self.tier_parked_key(k))
     }
 
     /// The tier rank (baseline 0, O1 1, O2 2, O3 3) of slot `id`'s newest entry, recorded this run

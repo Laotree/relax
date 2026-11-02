@@ -1447,10 +1447,15 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
             crate::zone_alloc::kept_with(|| u.start_order.reserve(slots.len()));
             let mut arm = Vec::with_capacity(slots.len());
             let up: *mut Unit = u;
+            let parked: Vec<u32> = slots.iter().filter(|s| s.parked).map(|s| s.id).collect();
             for s in slots {
                 install_prelinked_slot(up, s, gandalf, &mut notes, &mut arm);
             }
             (&mut *up).arm_counters(&arm);
+            // slots an earlier run parked below O3 start with their tier decision final
+            for id in parked {
+                settle_final(&*up, id);
+            }
         });
         Some((n, notes))
     });
@@ -8132,6 +8137,10 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                 perf_map(a, code.len(), &format!("{}{}", perf_name(u, id), tier));
             }
             u.arm_counter(id, a);
+            // a slot an earlier run parked below O3 starts with its tier decision final
+            if linked_from_cache && u.cache.as_ref().is_some_and(|c| c.tier_parked(id)) {
+                settle_final(u, id);
+            }
             if base {
                 note_base(up, id);
             }
@@ -10186,6 +10195,11 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done) {
                 // by this install, a hot slot counted again ran O2 for minutes: Sandbox's
                 // reconcile, lane SETTLE)
                 u.rearm_counter(id, a);
+            }
+            // SPEC-V: the base of a twin that reached O3 (twin_base_build) goes on to its own O3
+            // build now that it has code
+            if take_twin_o3_base(up, id) {
+                queue_marked(u, id);
             }
             if perf_map_on() {
                 perf_map(a, len, &format!("{} [{}]", u.fns[id as usize].name, if o1 { "O1" } else { "O2" }));
@@ -15426,7 +15440,22 @@ unsafe fn twin_base_build(up: *mut Unit, t: u32) {
     if specv_trace() {
         eprintln!("specv @{:.3} #{} {}: base of hot twin #{} built in the background", wall_ns() as f64 / 1e9, b, short_name(&u.fns[b as usize].name), t);
     }
+    // the twin proved the body hot, and twins are never cached: the base is built at O3 too (after
+    // its O2 build gives it code), so the next launch links O3 code for it instead of building it
+    crate::zone_alloc::kept_with(|| TWIN_O3_BASES.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, b)));
     o2_base(up, b);
+}
+
+/// SPEC-V: bases of O3 twins waiting for their O2 install, then queued for O3 (twin_base_build)
+static TWIN_O3_BASES: relax_session::sync::Mutex<Vec<(usize, u32)>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// Whether slot `id` of `up` waited for its O2 install to go on to O3 (taken off the list).
+fn take_twin_o3_base(up: *mut Unit, id: u32) -> bool {
+    let mut g = TWIN_O3_BASES.lock().unwrap_or_else(|e| e.into_inner());
+    match g.iter().position(|&x| x == (up as usize, id)) {
+        Some(i) => { g.swap_remove(i); true }
+        None => false,
+    }
 }
 
 /// SPEC-V: whether uncompiled slot `c` ran inside twin code without code of its own: its twin was
@@ -16157,7 +16186,7 @@ pub(crate) fn tier1_stats_report() {
     let s = g.as_ref().unwrap_or(&empty);
     let ms = |ns: u64| ns as f64 / 1e6;
     eprintln!("makepad-run o3-stats: builds={} cpu_ms={:.3} max_threads={} in_flight={} (completed attempts; Windows CPU is cycle-estimated)", s.builds, ms(s.cpu), s.max_active, s.active);
-    eprintln!("makepad-run o3-stats: pgo counted_builds={} counted_cpu_ms={:.3} counted_dropped={} not_counted_no_rir_off_owner={}", PGO_STATS[0].load(Ordering::Relaxed), ms(PGO_STATS[1].load(Ordering::Relaxed)), PGO_STATS[2].load(Ordering::Relaxed), PGO_STATS[3].load(Ordering::Relaxed));
+    eprintln!("makepad-run o3-stats: pgo counted_builds={} parked={} counted_cpu_ms={:.3} counted_dropped={} not_counted_no_rir_off_owner={}", PGO_STATS[0].load(Ordering::Relaxed), PGO_PARKED.load(Ordering::Relaxed), ms(PGO_STATS[1].load(Ordering::Relaxed)), PGO_STATS[2].load(Ordering::Relaxed), PGO_STATS[3].load(Ordering::Relaxed));
     eprintln!("makepad-run o3-stats: phases_cpu_ms snapshot={:.3} backend={:.3} install={:.3}", ms(s.phases[0]), ms(s.phases[1]), ms(s.phases[2]));
     let passes: Vec<String> = relax_backend::stats::PASS_NAMES.iter().enumerate().map(|(i, n)| format!("{}={:.3}", n, ms(s.passes[i]))).collect();
     eprintln!("makepad-run o3-stats: backend_pass_ms {} (pass slots can overlap; MAKEPAD_RUN_PASS_TIMES=wall selects wall time)", passes.join(" "));
@@ -16572,9 +16601,9 @@ fn counted_freqs(func: &mut relax_backend::rir::Func) -> Option<Vec<f32>> {
     relax_backend::profile::freqs(func).or_else(|| Some(inline_structural_freqs(func)))
 }
 
-/// A counted build's window ends (its O3 build is queued) after PGO_ENTRIES entries, or
-/// PGO_BLOCKS block executions in all (a loop), or PGO_MS once it ran at all; PGO_IDLE_MS
-/// without running queues it anyway (it went cold: O3 gets what it has).
+/// A counted build's window ends after PGO_ENTRIES entries, or PGO_BLOCKS block executions in all
+/// (a loop), or PGO_MS once it ran at all, or PGO_IDLE_MS without running; its O3 build is queued
+/// when the window shows PGO_MIN_WORK of work per second, else the slot is parked (pgo_poll).
 const PGO_ENTRIES: u64 = 30;
 const PGO_BLOCKS: u64 = 100_000;
 const PGO_MS: u64 = 250;
@@ -16599,10 +16628,6 @@ struct Counting {
     parked: bool,
     /// a hot loop ran under one of its frames (rt_loop_hot): the work is its callees'
     credited: bool,
-    /// a warm-image slot whose RIR the owner fallback built (counted_build): its O3 build was the
-    /// rule before that fallback, so a window with too little work queues O3 (with the counts so
-    /// far) instead of parking it in counted code every launch (never stored as O3)
-    image: bool,
 }
 /// slots running counted code
 static COUNTING: relax_session::sync::Mutex<Vec<Counting>> = relax_session::sync::Mutex::new(Vec::new());
@@ -16611,6 +16636,8 @@ static COUNTING: relax_session::sync::Mutex<Vec<Counting>> = relax_session::sync
 /// The counted tier's measurement replaces the sampler's CPU samples, which made the same call
 /// ("many calls, little CPU: a O3 build would cost more than it saves").
 const PGO_MIN_WORK: u64 = 1_000_000;
+/// counted windows that ended with too little work (parked instead of an O3 build)
+pub(crate) static PGO_PARKED: AtomicU64 = AtomicU64::new(0);
 const PGO_WORK_NS: u64 = 1_000_000_000;
 /// counted builds installed, their build CPU ns, dropped (not built or not installed), not counted
 /// (their normal RIR could not be built off the owner)
@@ -16657,11 +16684,6 @@ fn pgo_poll() {
                     ready.push((e.id, per_s));
                     return false;
                 }
-                if win >= PGO_WORK_NS && e.image {
-                    crate::inspect::tierlog::note(e.id, crate::inspect::tierlog::ev::WINDOW_END, crate::inspect::tierlog::WIN_DONE, rate, 0);
-                    ready.push((e.id, per_s));
-                    return false;
-                }
                 if win >= PGO_WORK_NS {
                     e.mark = (work, now);
                     if !e.parked {
@@ -16678,6 +16700,21 @@ fn pgo_poll() {
                 if sum >= PGO_BLOCKS { break; }
             }
             let done = !pgo_hold() && (entries >= PGO_ENTRIES || sum >= PGO_BLOCKS || (sum > 0 && el >= PGO_MS * 1_000_000) || el >= PGO_IDLE_MS * 1_000_000);
+            // the window's counts are the evidence: code that did less than PGO_MIN_WORK of its
+            // own work per second over it (a startup burst that is over, a slot that went idle)
+            // is not built at O3; it stays in its counted code, parked as a lukewarm slot (looked
+            // at again every PGO_WORK_NS: real work later still gets its O3 build)
+            let per_s = if done { work_rate() } else { u64::MAX };
+            if per_s < PGO_MIN_WORK {
+                let work: u64 = ctr.iter().zip(e.weights).map(|(c, w)| c.load(Ordering::Relaxed).saturating_mul(*w as u64)).fold(0, u64::saturating_add);
+                e.lukewarm = true;
+                e.mark = (work, now);
+                e.parked = true;
+                parked_now.push(e.id);
+                PGO_PARKED.fetch_add(1, Ordering::Relaxed);
+                crate::inspect::tierlog::note(e.id, crate::inspect::tierlog::ev::PARKED, 0, per_s, 0);
+                return true;
+            }
             if done {
                 crate::inspect::tierlog::note(e.id, crate::inspect::tierlog::ev::WINDOW_END, if entries >= PGO_ENTRIES || sum >= PGO_BLOCKS || sum > 0 { crate::inspect::tierlog::WIN_DONE } else { crate::inspect::tierlog::WIN_IDLE }, rate, 0);
                 ready.push((e.id, work_rate()));
@@ -16689,6 +16726,21 @@ fn pgo_poll() {
         for id in &parked_now {
             eprintln!("O3c @{:.3} #{} parked in counted code (under {} insts/s)", now as f64 / 1e9, id, PGO_MIN_WORK);
         }
+    }
+    // the verdict goes into the cache: the next launch installs these slots with their tier final
+    let up = TIER_UNIT.load(Ordering::Acquire);
+    if !parked_now.is_empty() && !up.is_null() {
+        owner::publish(|| unsafe {
+            let u = &mut *up;
+            if let Some(mut c) = u.cache.take() {
+                for &id in &parked_now {
+                    if (id as usize) < u.fns.len() {
+                        c.record_tier_parked(u, id);
+                    }
+                }
+                u.cache = Some(c);
+            }
+        });
     }
     for (id, rate) in ready {
         tier_push(id, Q_PROFILED, rate);
@@ -16737,7 +16789,6 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
         f.compiled && f.rir.is_none() && f.build_err.is_none() && !f.building
     };
     let (needs, front) = owner::publish(|| refront_settled(up, id, needs_rir(up)));
-    let mut fell_back = false;
     if needs && !owner::is_owner() {
         while !tier1_workers_ready() {
             job_sleep(TIER1_POLL);
@@ -16761,7 +16812,6 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
         // The O3 build that follows finds the RIR built (no second build).
         let missing = |up: *mut Unit| needs_rir(up) || (&*up).fns[id as usize].rir.as_ref().is_some_and(|r| upgradable(r));
         if owner::publish(|| missing(up)) {
-            fell_back = true;
             for _ in 0..PREFRONT_ROUNDS {
                 let Ok((left, needs)) = owner::publish_or_bail(|| {
                     let _ = owner::take_needs();
@@ -16880,7 +16930,7 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
                     u.frequency_profiles.insert(id, profile);
                     let weights: &'static [u32] = Box::leak(rir.blocks.iter().map(|b| b.insts.len() as u32 + 1).collect::<Vec<_>>().into_boxed_slice());
                     let at = wall_ns();
-                    COUNTING.lock().unwrap_or_else(|e| e.into_inner()).push(Counting { id, counters, weights, at, lukewarm, mark: (0, at), parked: false, credited: false, image: fell_back });
+                    COUNTING.lock().unwrap_or_else(|e| e.into_inner()).push(Counting { id, counters, weights, at, lukewarm, mark: (0, at), parked: false, credited: false });
                 });
                 // the counted window starts: an idle first worker goes back to its PGO polls
                 w0_wake();
