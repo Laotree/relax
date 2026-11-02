@@ -714,6 +714,8 @@ pub fn finish(u: &Unit) {
 }
 
 /// One module of the captured set with options `optv` (`-tee,remat,...`), written to `path`.
+/// Every trained function must ship as a body or inline: the gate compares replays against
+/// what shipped, including functions called only by compile-time static initializers.
 fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet<u32>, kept_failed: usize, hits: &HashMap<(u64, u64), bool>, forced: &std::collections::BTreeSet<u32>, optv: &str, path: &str) {
     let options = u.prog.session.options.clone();
     // the web player's profile: panics abort, one thread (TLS keys and waits built in)
@@ -823,7 +825,21 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
     address_taken(u, funcs.values(), &mut seeds, &mut std::collections::HashSet::new());
     seeds.sort_unstable();
     seeds.dedup();
-    let reached = reach(u, funcs, &seeds);
+    let mut reached = reach(u, funcs, &seeds);
+    if !block_profile() && module_inline_on() {
+        let mut carried: std::collections::BTreeSet<u32> = reached.iter().copied().collect();
+        for id in &reached { carried.extend(funcs[id].inl_slots.iter().copied()); }
+        let lost: Vec<u32> = forced.iter().copied().filter(|id| funcs.contains_key(id) && !carried.contains(id)).collect();
+        if !lost.is_empty() {
+            if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
+                eprintln!("wasm export: {} trained functions neither called nor carried inline, shipped as roots", lost.len());
+            }
+            seeds.extend(lost);
+            seeds.sort_unstable();
+            seeds.dedup();
+            reached = reach(u, funcs, &seeds);
+        }
+    }
     if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
         eprintln!("wasm export: {} roots (entry + address-taken), {} of {} captured reached", seeds.len(), reached.len(), funcs.len());
         // the untraced callees (slot, name), for the stub ids `env.u(id)` reports
