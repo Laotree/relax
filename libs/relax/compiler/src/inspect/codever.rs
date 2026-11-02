@@ -571,6 +571,10 @@ pub(crate) fn frame_fields(u: &Unit, c: &PcCode) -> (String, String, String, Str
         module.push_str(" INVALIDATED");
         code.push_str(&format!(",\"invalidated\":{}", json_str(&r.reason)));
     }
+    if let Some(text) = crate::invalid::stale_inline(c.start) {
+        module.push_str(" STALE");
+        code.push_str(&format!(",\"stale_inline\":{}", json_str(&text)));
+    }
     let name = match &c.inlined {
         Some(i) => {
             code.push_str(&format!(",\"inlined_into\":{}", json_str(&short(&slot_name, 140))));
