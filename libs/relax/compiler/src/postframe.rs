@@ -312,7 +312,7 @@ impl Activity {
 
 /// A fn's path for one line: its last two segments without generics (`<T as Tr>::f` -> `T::f`),
 /// a trailing ` [..]` note kept, at most 40 chars.
-fn short_fn(name: &str) -> String {
+pub(crate) fn short_fn(name: &str) -> String {
     let (name, note) = match name.find(" [") {
         Some(i) => (&name[..i], &name[i..]),
         None => (name, ""),

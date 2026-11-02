@@ -9178,7 +9178,8 @@ fn o2_release_later() {
     let later = std::mem::take(&mut *O2_LATER.lock().unwrap_or_else(|e| e.into_inner()));
     // (also with nothing later: verified O1 rebuilds queued before the present wait for it)
     let mut q = O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    crate::zone_alloc::kept_with(|| q.extend(later));
+    let now = wall_ns();
+    crate::zone_alloc::kept_with(|| q.extend(later.into_iter().map(|(u, id)| (u, id, now))));
     O2_WAKE.notify_one();
 }
 
@@ -9229,7 +9230,10 @@ fn export_full() -> bool {
 }
 
 /// `#[relax(O2)]` slots waiting for their O2 build: (unit, slot)
-static O2_QUEUE: relax_session::sync::Mutex<Vec<(usize, u32)>> = relax_session::sync::Mutex::new(Vec::new());
+/// the slot the O2 worker builds now (u32::MAX: none; makepad inspect `jit queue`)
+static O2_SLOT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+/// (unit, slot, queued at wall_ns or O2_FRONT_AT)
+static O2_QUEUE: relax_session::sync::Mutex<Vec<(usize, u32, u64)>> = relax_session::sync::Mutex::new(Vec::new());
 /// slots ever queued (each is built once; live patches rebuild through the usual paths)
 static O2_SEEN: relax_session::sync::Mutex<Option<std::collections::HashSet<(usize, u32)>>> = relax_session::sync::Mutex::new(None);
 static O2_WAKE: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
@@ -9361,7 +9365,7 @@ unsafe fn o2_enqueue_front(up: *mut Unit, id: u32) {
             return;
         }
     }
-    O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).insert(0, (up as usize, id));
+    O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).insert(0, (up as usize, id, O2_FRONT_AT));
     crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O2_QUEUED, 1, 0, 0);
     O2_WAKE.notify_one();
     o2_start(up);
@@ -9393,7 +9397,7 @@ unsafe fn o2_enqueue(up: *mut Unit, id: u32) {
             return;
         }
     }
-    O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id));
+    O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id, wall_ns()));
     crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O2_QUEUED, 1, 0, 0);
     O2_WAKE.notify_one();
     o2_start(up);
@@ -9417,8 +9421,9 @@ struct BaseSlots {
     hit: Vec<(usize, u32)>,
 }
 static BASE: relax_session::sync::Mutex<BaseSlots> = relax_session::sync::Mutex::new(BaseSlots { released: false, hit: Vec::new() });
-/// baseline slots waiting for their O2 build: served when O2_QUEUE is empty
-static O2_BASE: relax_session::sync::Mutex<std::collections::VecDeque<(usize, u32)>> = relax_session::sync::Mutex::new(std::collections::VecDeque::new());
+/// baseline slots waiting for their O2 build: (unit, slot, queued at wall_ns), served when
+/// O2_QUEUE is empty
+static O2_BASE: relax_session::sync::Mutex<std::collections::VecDeque<(usize, u32, u64)>> = relax_session::sync::Mutex::new(std::collections::VecDeque::new());
 
 /// Slot `id` runs baseline code -- built so the cold start compiles fast, but every launch that
 /// links it from the cache runs it again (unoptimised RIR, no inlining of user fns: a warm
@@ -9804,7 +9809,7 @@ unsafe fn o2_base(up: *mut Unit, id: u32) -> bool {
     {
         // under O2_QUEUE's lock: the worker checks both queues under it before it waits
         let _q = O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-        O2_BASE.lock().unwrap_or_else(|e| e.into_inner()).push_back((up as usize, id));
+        O2_BASE.lock().unwrap_or_else(|e| e.into_inner()).push_back((up as usize, id, wall_ns()));
         O2_WAKE.notify_one();
     }
     o2_start(up);
@@ -9988,12 +9993,13 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
             // lives to the end of the chain (it was held across the wait below, and the owner
             // waited for BORROW_QUEUE forever)
             let borrowed = if q.is_empty() { BORROW_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).pop_front() } else { None };
-            let base = if q.is_empty() && borrowed.is_none() { O2_BASE.lock().unwrap_or_else(|e| e.into_inner()).pop_front() } else { None };
+            let base = if q.is_empty() && borrowed.is_none() { O2_BASE.lock().unwrap_or_else(|e| e.into_inner()).pop_front().map(|e| (e.0, e.1)) } else { None };
             let o1v = if q.is_empty() && borrowed.is_none() && base.is_none() && past_startup() {
                 O1V_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
             } else { None };
             if !q.is_empty() {
-                Some((q.remove(0), false, false))
+                let e = q.remove(0);
+                Some(((e.0, e.1), false, false))
             } else if let Some(x) = borrowed {
                 // (SPEC-V: base slots running their twins' code get their own)
                 Some((x, false, true))
@@ -10014,6 +10020,7 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
         if !o1 {
             O2_TAKEN.fetch_add(1, Ordering::Relaxed);
         }
+        O2_SLOT.store(id, Ordering::Relaxed);
         O2_RUNNING.store(true, Ordering::Relaxed);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let live = || {
@@ -10051,6 +10058,7 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
                 owner::publish(|| o2_finish(up, done));
             }
         }));
+        O2_SLOT.store(u32::MAX, Ordering::Relaxed);
         O2_RUNNING.store(false, Ordering::Relaxed);
         crate::postframe::background_build_ended();
         if r.is_err() {
@@ -10093,7 +10101,7 @@ unsafe fn o2_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     }
     // a lazy compile's back end for the slot started since o2_thread looked: again later
     if (&*up).fns[id as usize].inflight {
-        crate::zone_alloc::kept_with(|| O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id)));
+        crate::zone_alloc::kept_with(|| O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id, wall_ns())));
         o2_noop(N_REQUEUED);
         return None;
     }
@@ -14660,10 +14668,17 @@ fn rt_loop_hot(counter: u64, fp: u64) {
             if now.saturating_sub(last) >= at_threshold || !settle_unfinal(u, id, threshold) {
                 return;
             }
+        } else if st == T_QUEUED {
+            // queued and still looping in its baseline / O1 / O2 code: the cost goes on into the
+            // record, so its heat (slot_heat) stays live while it waits and tier_revalidate keeps it
+            tier_charge(rec, chunk);
+            note_ui_path(rec);
+            return;
         } else if st != T_COUNTING {
             return;
         }
         tier_charge(rec, chunk);
+        note_ui_path(rec);
         let w5 = (*rec.add(5)).load(Ordering::Relaxed);
         if w5 & LOOP_CHARGED != 0 || tier_cost_now(rec, threshold, tier_clock()).0 < threshold {
             return;
@@ -14773,6 +14788,94 @@ const CALL_FAST_NS: u64 = 10_000_000;
 const SMALL_CODE: u64 = 256;
 /// Tier record word 5: a hot loop under the slot already charged its callers (rt_loop_hot)
 const LOOP_CHARGED: u64 = 1 << 62;
+/// Tier record word 5: the program's main (UI) thread ran the slot's counted calls or loops
+/// (rt_hot, rt_loop_hot): read with its heat (HeatNow)
+const UI_PATH: u64 = 1 << 61;
+
+/// Marks the slot of record `rec` as on the UI thread's path when the calling thread is the
+/// program's main thread (atomics only; one load once marked).
+#[inline]
+unsafe fn note_ui_path(rec: *const AtomicU64) {
+    let main = MAIN_TID.load(Ordering::Relaxed);
+    if main != 0 && (*rec.add(5)).load(Ordering::Relaxed) & UI_PATH == 0 && os::thread::current() == main {
+        (*rec.add(5)).fetch_or(UI_PATH, Ordering::Relaxed);
+    }
+}
+
+// ---- execution heat now
+//
+// A slot's heat is the decayed cost of its counted calls and loops (tier_cost_now, the O3
+// threshold's units): live while its count stub counts, and, once queued, from its loop counters
+// (rt_loop_hot) and its counted code's block counts (profiled_heat), which keep charging the record
+// until O3 code without counters replaces it. So a loop that 15 threads run now reads hotter than
+// startup code that was hot once. Read by makepad inspect `jit queue` and tier_revalidate; the
+// compile queues' hot-first order (HotSpot's CompileBroker picks by event rate the same way) keys
+// on it.
+
+/// a queued slot's record is folded (decayed cost stored, budget refilled) at most this often:
+/// the cost it charges since is then spread over a short span (tier_cost_now)
+const HEAT_FOLD_NS: u64 = 250_000_000;
+
+/// Slot `id`'s execution heat now (cost units, the O3 threshold's scale): its record's decayed cost
+/// while it is counted or queued, 0 otherwise (final, not armed). A queued slot's record is folded
+/// here (its cost check, as rt_hot's under the threshold): only its loop counters charge it then, so
+/// the fold races nothing but their budget decrements (an estimate either way).
+unsafe fn slot_heat(u: &Unit, id: u32, threshold: u64, now: u64) -> (u64, bool) {
+    // (`now`: tier_clock, the records' clock)
+    if id as usize >= u.fns.len() {
+        return (0, false);
+    }
+    let rec = tier_rec(&u.slots, id);
+    let ui = (*rec.add(5)).load(Ordering::Relaxed) & UI_PATH != 0;
+    match (*rec.add(3)).load(Ordering::Acquire) {
+        T_COUNTING => (tier_cost_now(rec, threshold, now).0, ui),
+        T_QUEUED => {
+            let (cost, _) = tier_cost_now(rec, threshold, now);
+            if now.saturating_sub((*rec.add(4)).load(Ordering::Relaxed)) >= HEAT_FOLD_NS {
+                (*rec.add(9)).store(cost, Ordering::Relaxed);
+                (*rec.add(4)).store(now, Ordering::Relaxed);
+                (*rec).store(tier_refill(threshold, cost), Ordering::Relaxed);
+            }
+            (cost, ui)
+        }
+        _ => (0, ui),
+    }
+}
+
+/// The live unit and its O3 threshold, for heat reads (None: no tiering unit).
+fn heat_unit() -> Option<(&'static Unit, u64)> {
+    let up = TIER_UNIT.load(Ordering::Acquire);
+    if up.is_null() {
+        return None;
+    }
+    let u = unsafe { &*up };
+    u.tier1.as_ref().map(|t| (u, t.threshold))
+}
+
+/// One scan's clocks: wall_ns (queue ages) and tier_clock (the records' heat).
+#[derive(Clone, Copy)]
+struct HeatNow {
+    hu: Option<(&'static Unit, u64)>,
+    wall: u64,
+    tier: u64,
+}
+
+impl HeatNow {
+    fn take() -> Self {
+        HeatNow { hu: heat_unit(), wall: wall_ns(), tier: tier_clock() }
+    }
+
+    /// Slot `id`'s heat and UI mark (`unit` 0: the tiering unit; another unit's slot: none).
+    fn heat(&self, unit: usize, id: u32) -> (u64, bool) {
+        match self.hu {
+            Some((u, th)) if unit == 0 || unit == u as *const Unit as usize => unsafe { slot_heat(u, id, th, self.tier) },
+            _ => (0, false),
+        }
+    }
+}
+
+/// An O2 queue entry's time for a hot slot's build (o2_enqueue_front: first among the O2 builds)
+const O2_FRONT_AT: u64 = 0;
 
 /// The O3 threshold for MAKEPAD_RUN_O3_CALLS = `calls`: the cost a steady rate of `calls` x
 /// O3_CALL_UNITS per second converges on (COST_HALF_LIFE_NS).
@@ -15901,6 +16004,10 @@ fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) {
             if len & REARMED != 0 || (*rec.add(3)).load(Ordering::Acquire) != T_QUEUED {
                 return true;
             }
+            // still hot now (its loops kept charging the record while it waited): kept
+            if tier_cost_now(rec, threshold, tier_clock()).0 >= threshold {
+                return true;
+            }
             let code = (*rec.add(1)).load(Ordering::Relaxed);
             let stub = (*rec.add(2)).load(Ordering::Relaxed);
             tier_count_fresh(rec, threshold, tier_clock());
@@ -16162,6 +16269,45 @@ fn tier_pop(q: &mut Vec<(u32, u8, u64, u64)>) -> Option<(u32, u8, u64, u64)> {
     Some(q.remove(best))
 }
 static TIER_THREAD: std::sync::Once = std::sync::Once::new();
+
+/// makepad inspect `jit queue [n=10]`: what the JIT builds now and the next `n` of the O3 and O2
+/// queues in the order they are taken (O3: tier_pop's; O2: the O2 queue, then baseline code), one
+/// line each: heat now as a multiple of the O3 threshold (`ui`: on the UI thread's path), why
+/// queued, seconds waited (`hot`: o2_hot's build), the fn. Locks each queue for one scan.
+pub(crate) fn queue_view(n: usize) -> Vec<String> {
+    let now = HeatNow::take();
+    let th = now.hu.map_or(1, |x| x.1).max(1) as f64;
+    let name = |id: u32| slot_name(id).map_or_else(|| format!("S{id}"), |s| crate::postframe::short_fn(&s));
+    let row = |tier: &str, unit: usize, id: u32, at: u64, why: &str| {
+        let (h, ui) = now.heat(unit, id);
+        let waited = if at == O2_FRONT_AT { "hot".to_string() } else { format!("{:.1}s", now.wall.saturating_sub(at) as f64 / 1e9) };
+        format!("{tier} {:.2}x{} {why} {waited} {} (S{id})", h as f64 / th, if ui { " ui" } else { "" }, name(id))
+    };
+    let mut out = Vec::new();
+    let active: Vec<u32> = TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let o2 = O2_SLOT.load(Ordering::Relaxed);
+    let mut now_line = format!("building: O3 {}", active.len());
+    for id in &active {
+        now_line += &format!(" [{}]", name(*id));
+    }
+    now_line += &if o2 != u32::MAX { format!("; O2 [{}]", name(o2)) } else { "; O2 idle".into() };
+    now_line += &format!("; ahead {} queued", ahead_queued());
+    out.push(now_line);
+    let mut o3: Vec<(u32, u8, u64, u64)> = {
+        let q = tier_queue().unwrap_or_else(|e| e.into_inner());
+        let hot = q.iter().filter(|e| now.heat(0, e.0).0 as f64 >= th).count();
+        out.push(format!("O3 queue {} ({} at or over the threshold now), next {}:", q.len(), hot, n.min(q.len())));
+        q.clone()
+    };
+    // (tier_pop's order: the highest rate queued at, then the oldest)
+    o3.sort_by_key(|e| (std::cmp::Reverse(e.3), e.2));
+    out.extend(o3.iter().take(n).map(|e| row("O3", 0, e.0, e.2, Q_WHY.get(e.1 as usize).copied().unwrap_or("?"))));
+    let q = O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let b: Vec<(usize, u32, u64)> = O2_BASE.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
+    out.push(format!("O2 queue {} + baseline {}, next {}:", q.len(), b.len(), n.min(q.len() + b.len())));
+    out.extend(q.iter().map(|e| (e, "o2")).chain(b.iter().map(|e| (e, "base"))).take(n).map(|(e, why)| row("O2", e.0, e.1, e.2, why)));
+    out
+}
 
 /// The level's O3 workers (`o3_threads`) always run. A level with `o3_burst` also starts burst workers
 /// (user, 10-22: every performance core but one, the program's main thread's): after the first present,
@@ -16532,7 +16678,7 @@ impl Unit {
                 at
             };
             (*rec.add(1)).store(code, Ordering::Relaxed);
-            (*rec.add(5)).store(((*rec.add(5)).load(Ordering::Relaxed) & (REARMED | LOOP_CHARGED)) | bytes, Ordering::Relaxed);
+            (*rec.add(5)).store(((*rec.add(5)).load(Ordering::Relaxed) & (REARMED | LOOP_CHARGED | UI_PATH)) | bytes, Ordering::Relaxed);
             (*rec.add(2)).store(at, Ordering::Release);
             SlotWord::of(&self.slots, id).store(at, Ordering::SeqCst);
         }
@@ -16759,8 +16905,9 @@ pub static PGO_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Queues O3 for the counting slots whose window is over (first O3 worker, no lock held).
 fn pgo_poll() {
+    profiled_heat();
     let now = wall_ns();
-    let mut ready: Vec<(u32, u64)> = Vec::new();
+    let mut ready: Vec<(u32, u64, &'static [AtomicU64], &'static [u32])> = Vec::new();
     let mut parked_now: Vec<u32> = Vec::new();
     {
         let mut g = COUNTING.lock().unwrap_or_else(|e| e.into_inner());
@@ -16782,7 +16929,7 @@ fn pgo_poll() {
             };
             if e.lukewarm && e.credited {
                 crate::inspect::tierlog::note(e.id, crate::inspect::tierlog::ev::WINDOW_END, crate::inspect::tierlog::WIN_CREDITED, rate, 0);
-                ready.push((e.id, work_rate()));
+                ready.push((e.id, work_rate(), e.counters, e.weights));
                 return false;
             }
             if e.lukewarm {
@@ -16795,7 +16942,7 @@ fn pgo_poll() {
                 let per_s = ((work - e.mark.0.min(work)) as u128 * 1_000_000_000 / win as u128) as u64;
                 if per_s >= PGO_MIN_WORK {
                     crate::inspect::tierlog::note(e.id, crate::inspect::tierlog::ev::WINDOW_END, crate::inspect::tierlog::WIN_WORK, rate, 0);
-                    ready.push((e.id, per_s));
+                    ready.push((e.id, per_s, e.counters, e.weights));
                     return false;
                 }
                 if win >= PGO_WORK_NS {
@@ -16831,7 +16978,7 @@ fn pgo_poll() {
             }
             if done {
                 crate::inspect::tierlog::note(e.id, crate::inspect::tierlog::ev::WINDOW_END, if entries >= PGO_ENTRIES || sum >= PGO_BLOCKS || sum > 0 { crate::inspect::tierlog::WIN_DONE } else { crate::inspect::tierlog::WIN_IDLE }, rate, 0);
-                ready.push((e.id, work_rate()));
+                ready.push((e.id, work_rate(), e.counters, e.weights));
             }
             !done
         });
@@ -16856,9 +17003,60 @@ fn pgo_poll() {
             }
         });
     }
-    for (id, rate) in ready {
+    for (id, rate, counters, weights) in ready {
+        // its counted code runs on until the O3 build: the work its counts show goes into the
+        // record, the queue's heat (profiled_heat), from a window's worth at the window's rate
+        let total = counters.iter().zip(weights).map(|(c, w)| c.load(Ordering::Relaxed).saturating_mul(*w as u64)).fold(0, u64::saturating_add);
+        let work = total.saturating_sub(rate.saturating_mul(PGO_MS) / 1000);
+        crate::zone_alloc::kept_with(|| PROFILED_HEAT.lock().unwrap_or_else(|e| e.into_inner()).push(ProfiledHeat { id, counters, weights, work }));
         tier_push(id, Q_PROFILED, rate);
     }
+}
+
+/// A slot queued for its O3 build from its counted code (Q_PROFILED), which runs until that build
+/// is installed: its counts so far (work: instructions, as Counting's)
+struct ProfiledHeat {
+    id: u32,
+    counters: &'static [AtomicU64],
+    weights: &'static [u32],
+    work: u64,
+}
+static PROFILED_HEAT: relax_session::sync::Mutex<Vec<ProfiledHeat>> = relax_session::sync::Mutex::new(Vec::new());
+/// RIR instructions of counted work per cost unit (a back edge's; a loop iteration is ~8 instructions)
+const WORK_PER_UNIT: u64 = 8;
+/// how often the counted slots' work is charged to their records
+const PROFILED_HEAT_NS: u64 = 50_000_000;
+
+/// Charges each Q_PROFILED slot's counted work since the last look to its tier record (in cost
+/// units): counted code has block counters but no loop counters, and this keeps its heat live
+/// while it waits for its build. Slots no longer queued (taken, other code installed) leave the
+/// list. O3 workers only (pgo_poll); at most every PROFILED_HEAT_NS.
+fn profiled_heat() {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = wall_ns();
+    if now.saturating_sub(LAST.load(Ordering::Relaxed)) < PROFILED_HEAT_NS {
+        return;
+    }
+    LAST.store(now, Ordering::Relaxed);
+    let Some((u, _)) = heat_unit() else { return };
+    if PROFILED_HEAT.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        return;
+    }
+    let queued: std::collections::HashSet<u32> = tier_queue().unwrap_or_else(|e| e.into_inner()).iter().filter(|e| e.1 == Q_PROFILED).map(|e| e.0).collect();
+    let mut g = PROFILED_HEAT.lock().unwrap_or_else(|e| e.into_inner());
+    g.retain_mut(|e| unsafe {
+        if e.id as usize >= u.fns.len() || !queued.contains(&e.id) {
+            return false;
+        }
+        let rec = tier_rec(&u.slots, e.id);
+        if (*rec.add(3)).load(Ordering::Acquire) != T_QUEUED {
+            return false;
+        }
+        let work = e.counters.iter().zip(e.weights).map(|(c, w)| c.load(Ordering::Relaxed).saturating_mul(*w as u64)).fold(0, u64::saturating_add);
+        tier_charge(rec, work.saturating_sub(e.work) / WORK_PER_UNIT);
+        e.work = work;
+        true
+    });
 }
 
 /// A hot loop ran under a frame of slot `id` (rt_loop_hot, no unit lock): true if `id` is a
@@ -17149,6 +17347,7 @@ fn rt_hot(slot: u64) -> u64 {
             // queued without a lock (rule I-CALL): the rate in the record (published by the push's
             // release), the slot on TIER_INBOX; the workers move it into TIER_QUEUE (tier_drain).
             // A hot loop's cost made it hot: queued for its loops (never lukewarm)
+            note_ui_path(rec);
             let why = if (*rec.add(5)).load(Ordering::Relaxed) & LOOP_CHARGED != 0 { Q_LOOP } else { Q_CALLS };
             crate::inspect::tierlog::note(slot as u32, crate::inspect::tierlog::ev::QUEUE, why, rate, code);
             tier_inbox_push(rec, slot as u32, why, rate);
