@@ -4116,12 +4116,13 @@ pub fn relaunch_pending() -> Result<&'static str, String> {
     restart_in_place(if why.is_empty() { "session relaunch".into() } else { why })
 }
 
-/// The edits that wait for a relaunch, oldest first (cleared by a relaunch).
+/// The edits that wait for a relaunch, oldest first (cleared once a run loads the sources).
 pub fn restart_pending() -> Vec<String> {
     RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-pub fn clear_restart_pending() {
+/// A run loaded the sources as they are (`domain_loaded`): no edit waits for a restart any more.
+fn clear_restart_pending() {
     let old = std::mem::take(&mut *RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()));
     drop(old);
 }
