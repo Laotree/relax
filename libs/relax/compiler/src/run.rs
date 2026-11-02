@@ -1369,7 +1369,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         Vec::new()
     };
     if live_tests && test_subjects.len() != 1 {
-        eprintln!("makepad test --live: select exactly one target (--lib or --test <name>)");
+        eprintln!("makepad test --live: select exactly one target (--lib, --bin <name> or --test <name>)");
         return 2;
     }
     // Every test target is a binary of its own (cargo builds and runs each apart), and a process
