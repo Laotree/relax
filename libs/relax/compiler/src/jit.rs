@@ -4618,7 +4618,7 @@ impl Unit {
         };
         let place = TlsPlace { sym: self.syms.intern(crate::syms::SymKind::ThreadLocal(d), value), fixed: fixed.is_some(), init };
         // MAKEPAD_RUN_TLS_TRACE=1: where each `#[thread_local]` static went
-        if std::env::var_os("MAKEPAD_RUN_TLS_TRACE").is_some() {
+        if tls_trace() {
             eprintln!("thread_local {}: {} bytes align {}, {} at {:#x}{}", self.prog.def_path(d), size, align, if place.fixed { "static TLS" } else { "block" }, value, if zero { "" } else { ", copied on first access" });
         }
         crate::zone_alloc::kept_with(|| {
@@ -6364,7 +6364,7 @@ impl Unit {
                 false
             }
             Outcome::Unsupported(why) => {
-                if std::env::var_os("MAKEPAD_RUN_INTERP_TRACE").is_some() { eprintln!("interp: {}: unsupported: {why}", self.prog.def_path(d)); }
+                if interp_trace() { eprintln!("interp: {}: unsupported: {why}", self.prog.def_path(d)); }
                 true
             }
             Outcome::Ok => true,
@@ -6458,7 +6458,7 @@ impl Unit {
     fn run_init_code(&mut self, d: DefId, args: Vec<TyId>, buf: u64) -> Option<u64> {
         self.stats.ctfe_code += 1;
         cert_note_code();
-        if std::env::var_os("MAKEPAD_RUN_CTFE_TRACE").is_some() {
+        if crate::ctfe::trace_on() {
             eprintln!("ctfe: compiled {}", self.prog.def_path(d));
         }
         let id = self.fn_id(FnKey::Inst(d, args));
@@ -8570,6 +8570,16 @@ fn sig_dir() -> Option<std::ffi::OsString> {
     relax_session::phase::env_once(&D, "MAKEPAD_RUN_CODE_SIG_DIR").map(std::ffi::OsString::from)
 }
 
+fn reloc_sig_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_RELOC_SIG").is_some())
+}
+
+fn dump_canon() -> Option<&'static str> {
+    static VALUE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    VALUE.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_DUMP_CANON").ok())).as_deref()
+}
+
 fn code_sig(id: u32, f: &relax_backend::rir::Func, code: &[u8], alloc: u64, o3: bool) {
     static F: std::sync::OnceLock<Option<relax_session::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
     if let Some(m) = F.get_or_init(|| {
@@ -8585,8 +8595,8 @@ fn code_sig(id: u32, f: &relax_backend::rir::Func, code: &[u8], alloc: u64, o3: 
             Some(u) => crate::syms::canon_dump(u, &d),
             None => d,
         };
-        if let Ok(w) = std::env::var("MAKEPAD_RUN_DUMP_CANON") {
-            if f.name.ends_with(w.as_str()) {
+        if let Some(w) = dump_canon() {
+            if f.name.ends_with(w) {
                 eprintln!("== CANON {}\n{}", f.name, d);
             }
         }
@@ -8697,6 +8707,19 @@ fn inline_source_wanted(u: &Unit, id: u32, full: bool) -> bool {
 
 /// Source size of a slot's function in tokens (cheap pre-filter for inlining: comments, doc
 /// text and long names do not count).
+/// src_size of an instance of fn `d` (the size is the definition's).
+fn def_src_size(u: &Unit, d: DefId) -> u32 {
+    let def = u.prog.def(d);
+    if !matches!(def.kind, DefKind::Fn | DefKind::AssocFn) {
+        return u32::MAX;
+    }
+    let it = u.prog.files[def.file as usize].ast.item(def.item);
+    let toks = &u.prog.files[def.file as usize].toks;
+    let a = toks.partition_point(|t| t.lo < it.lo);
+    let b = toks.partition_point(|t| t.lo < it.hi);
+    (b - a) as u32
+}
+
 pub fn src_size(u: &Unit, id: u32) -> u32 {
     let (file, lo, hi) = match &u.fns[id as usize].key {
         FnKey::Inst(d, _) => {
@@ -8978,6 +9001,11 @@ pub fn keep_reachable(u: &Unit, id: u32) -> bool {
     marked(d) || (def.parent.0 != u32::MAX && (def.parent.0 as usize) < u.prog.defs.len() && u.prog.def(def.parent).kind == DefKind::Impl && marked(def.parent))
 }
 
+fn dump_ship() -> Option<&'static str> {
+    static VALUE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    VALUE.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_DUMP_SHIP").ok())).as_deref()
+}
+
 /// The RIR a wasm export emits for slot `id`, built even if tracing never called
 /// it. Shipping uses normal O1; explicit block mode retains its captured tier.
 pub unsafe fn export_rir(up: *mut Unit, id: u32, optimized: bool) -> Result<relax_backend::rir::Func, String> {
@@ -9062,8 +9090,8 @@ pub unsafe fn export_rir(up: *mut Unit, id: u32, optimized: bool) -> Result<rela
         relax_backend::passes::relayout(&mut f);
         f.verify().map_err(|e| format!("shipping RIR: {e}"))?;
         // MAKEPAD_RUN_DUMP_SHIP=<name suffix | ~text>: the shipping RIR (what the module emits)
-        if let Ok(w) = std::env::var("MAKEPAD_RUN_DUMP_SHIP") {
-            if dump_rir_match(&f.name, &w) {
+        if let Some(w) = dump_ship() {
+            if dump_rir_match(&f.name, w) {
                 eprintln!("shipping {}", f.dump());
             }
         }
@@ -11949,12 +11977,17 @@ fn opt_pipeline(options: &crate::options::Options, func: &mut relax_backend::rir
     compile_watch(None);
 }
 
+fn dump_input() -> Option<&'static str> {
+    static VALUE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    VALUE.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_DUMP_INPUT").ok())).as_deref()
+}
+
 fn opt_pipeline_inner(options: &crate::options::Options, func: &mut relax_backend::rir::Func, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, relayout: bool, full: bool, nounwind: &dyn Fn(u32) -> bool) {
     crate::coverage::retire(func);
     verify_pass(func, "input (lowering / inlining)");
     // MAKEPAD_RUN_DUMP_INPUT=<name suffix>: the RIR entering the optimiser
-    if let Ok(w) = std::env::var("MAKEPAD_RUN_DUMP_INPUT") {
-        if func.name.ends_with(w.as_str()) {
+    if let Some(w) = dump_input() {
+        if func.name.ends_with(w) {
             eprintln!("{}", func.dump());
         }
     }
@@ -12238,6 +12271,11 @@ unsafe fn build_rir_inner(up: *mut Unit, id: u32) -> Result<relax_backend::rir::
     r
 }
 
+pub(crate) fn deferred_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_DEFERRED_TRACE").is_some())
+}
+
 /// Post-boot loader: loads the skipped modules failed builds needed (unit lock held, outer
 /// compile: no front-end reader and no program reference on this thread's stack), collects
 /// their items, and lets every failed, uninstalled build run again. False: nothing loaded.
@@ -12261,7 +12299,7 @@ pub unsafe fn load_deferred(up: *mut Unit, id: u32) -> bool {
     let u = &mut *up;
     // only the skipped files whose outline can bind the missed name
     let mut mods: Vec<u32> = Vec::new();
-    let trace = std::env::var_os("MAKEPAD_RUN_DEFERRED_TRACE").is_some();
+    let trace = deferred_trace();
     for (m, name) in &missing {
         let skipped = u.prog.skipped_files.contains_key(m);
         let declares = skipped && u.prog.skipped_declares(*m, name);
@@ -12338,7 +12376,7 @@ unsafe fn load_modules(up: *mut Unit, mods: &[u32], why: &str) {
     DEFERRED_LOADS.fetch_add(loaded as u64, Ordering::Relaxed);
     // the live watcher watches the new files from now on
     crate::reload::watch_kick();
-    if std::env::var_os("MAKEPAD_RUN_DEFERRED_TRACE").is_some() {
+    if deferred_trace() {
         eprintln!("makepad-run deferred: {} loaded {} module(s) ({} defs, {} errored signatures reset) in {:.1} ms on {}{}: {}", why, loaded, defs.len(), resigned,
             (wall_ns() - t) as f64 / 1e6, if MAIN_TID.load(Ordering::Relaxed) == me() { "main" } else { "worker" },
             if FIRST_PRESENT.load(Ordering::Acquire) { " after present" } else { " before present" }, paths.join(", "));
@@ -12745,6 +12783,8 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::
     owner::forbid_in_publish("front", twin.unwrap_or(id));
     let t0 = cpu_ns();
     let n0 = nested_build_ns();
+    // OWNER_LOWERS' row: checked ahead, checked by constant evaluation, checked here, a closure
+    let mut owner_lower_kind = 3usize;
     let body = match &key {
         FnKey::Inst(d, args) => {
             // consts that lengths wait for are evaluated first (CTFE by running them), and a body
@@ -12752,13 +12792,15 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::
             // checked ahead (off the unit lock) when it could be; else here
             let again = (&*up).front.is_built(&(*d, args.clone()));
             let body = match take_ahead(&(&*up).prog, &(&*up).front, &(&*up).tcx, *d, args) {
-                Ok(b) => { ahead_check_diag(&*up, id, "hit", 0); b }
+                Ok(b) => { ahead_check_diag(&*up, id, "hit", 0); owner_lower_kind = 0; b }
                 Err(reason) => {
                     let u = &mut *up;
                     if let Some(b) = ctfe_checked_body(u, *d, args) {
                         ahead_check_diag(u, id, "ctfe", 0);
+                        owner_lower_kind = 1;
                         b
                     } else {
+                        owner_lower_kind = 2;
                         let _o = crate::clock::origin(if again { "build-again" } else { "build" });
                         let start = cpu_ns();
                         let b = crate::typeck::codegen_body(&u.prog, &u.tcx, *d, args);
@@ -12860,6 +12902,13 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::
     u.stats.typeck_ns += (t1 - t0).saturating_sub(n1 - n0);
     let lower_ns = (cpu_ns() - t1).saturating_sub(nested_build_ns() - n1);
     u.stats.lower_ns += lower_ns;
+    if owner::is_owner() && !FIRST_PRESENT.load(Ordering::Relaxed) {
+        // (a body checked ahead: the request's own slot, row 4, or a slot its preparation needs)
+        let own = owner_lower_kind == 0 && BUILD_STACK.try_with(|s| s.borrow().first().copied()).ok().flatten() == Some(id);
+        let row = &OWNER_LOWERS[if own { 4 } else { owner_lower_kind }];
+        row[0].fetch_add(1, Ordering::Relaxed);
+        row[1].fetch_add((cpu_ns() - t0).saturating_sub(nested_build_ns() - n0), Ordering::Relaxed);
+    }
     {
         static SLOW: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let lim = *SLOW.get_or_init(|| std::env::var("MAKEPAD_RUN_SLOW_TYPECK_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
@@ -12880,6 +12929,11 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::
     }
     Ok(func)
 }
+
+/// Bodies the owner type-checked or lowered itself before the first present (no lowering ahead to
+/// take), by row: checked ahead, checked by constant evaluation, checked on the owner, closures:
+/// [count, cpu ns of check + lowering, nested builds excluded] (the first-present line)
+pub(crate) static OWNER_LOWERS: [[AtomicU64; 2]; 5] = [const { [const { AtomicU64::new(0) }; 2] }; 5];
 
 /// The same unoptimised RIR on the locked path and the ahead helpers. Publishing a helper's
 /// result does not optimise it: prepare_rir still applies the caller's normal inline policy.
@@ -13519,7 +13573,7 @@ impl<'a> InlineBodies<'a> {
         let entries: Vec<std::sync::Arc<PrepShared>> = PREP_SHARED.lock().unwrap_or_else(|e| e.into_inner()).get(&c).cloned().unwrap_or_default();
         let shared = entries.iter().find(|e| agrees(e)).cloned();
         if !entries.is_empty() && shared.is_none() { TIER1_PREP[4].fetch_add(1, Ordering::Relaxed); }
-        let verify = shared.is_some() && std::env::var_os("MAKEPAD_RUN_PREP_VERIFY").is_some();
+        let verify = shared.is_some() && prep_verify();
         if let Some(e) = shared.as_ref().filter(|_| !verify) {
             TIER1_PREP[3].fetch_add(1, Ordering::Relaxed);
             for &x in &e.nounwind { nounwind(x); }
@@ -13547,7 +13601,7 @@ impl<'a> InlineBodies<'a> {
         let mut f = o1.clone();
         f.baseline = false;
         let mut raw = (relax_backend::rir::Func::new(String::new(), 0), Vec::new());
-        let mut stats = std::env::var("MAKEPAD_RUN_INLINE_STATS").is_ok_and(|v| v == "prep").then(relax_codegen::opt::InlineStats::default);
+        let mut stats = prep_inline_stats().then(relax_codegen::opt::InlineStats::default);
         // (a counted callee's preparation prices its own sites by its counts)
         let mut structural = |_: usize, f: &relax_backend::rir::Func| (!options.no_block_freq).then(|| {
             if relax_backend::profile::has_counts(f) { relax_backend::profile::inline_freqs(f).unwrap_or_else(|| inline_structural_freqs(f)) } else { inline_structural_freqs(f) }
@@ -15086,6 +15140,21 @@ const Q_MARKED: u8 = 3;
 /// PGO: a counted build's window is over (pgo_poll)
 const Q_PROFILED: u8 = 4;
 const Q_WHY: [&str; 5] = ["calls", "loop", "retier", "marked", "profiled"];
+
+fn prep_verify() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_PREP_VERIFY").is_some())
+}
+
+fn prep_inline_stats() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_INLINE_STATS").is_ok_and(|v| v == "prep"))
+}
+
+fn tier1_install_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_O3_TRACE").is_ok())
+}
 
 fn tier1_trace() -> bool {
     static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -18073,7 +18142,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let ta = cpu_ns();
     for &c in &callees { (&mut *up).sync_entry_ref(c); }
     let u = &*up;
-    if std::env::var_os("MAKEPAD_RUN_O3_TRACE").is_some() {
+    if tier1_trace() {
         eprintln!("O3 snapshot of {}: {} callees", u.fns[id as usize].name, callees.len());
     }
     // the assembly and its owner part: here when the walk ran on the owner, else the assembly off
@@ -18522,7 +18591,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         }
         // the calls O3 left (MAKEPAD_RUN_O3_TRACE): (callee slot, in a cold block)
         let mut left: Vec<(u32, bool, u8)> = Vec::new();
-        if std::env::var_os("MAKEPAD_RUN_O3_TRACE").is_some() {
+        if tier1_trace() {
             for b in &func.blocks {
                 let cold = matches!(b.term, relax_backend::rir::Term::Unreachable | relax_backend::rir::Term::Resume);
                 for i in &b.insts {
@@ -18574,7 +18643,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             } => {
                 // Sign O3 machine bytes and symbolic relocations while the unit is locked.
                 // The ordinary signature path only covers foreground/O1 compilation.
-                if std::env::var_os("MAKEPAD_RUN_RELOC_SIG").is_some() {
+                if reloc_sig_on() {
                     crate::syms::reloc_sig(u, || format!("O3:{}", sig_name(u, id)), &code, &relocs, &map);
                 }
                 // Installed O3 code (marked or hot, including retier) is kept as the slot's ordinary
@@ -18939,7 +19008,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 if tier1_trace() {
                     trace_build(u, id, "installed", t2 - t1);
                 }
-                if std::env::var("MAKEPAD_RUN_O3_TRACE").is_ok() {
+                if tier1_install_trace() {
                     eprintln!("tier1: {} installed ({} bytes, {} callees inlined, {:.1} ms build, {:.1} ms snapshot)", u.fns[id as usize].name, code.len(), n_inl, (t2 - t1) as f64 / 1e6, owner_ns.get() as f64 / 1e6);
                     let mut left = Vec::new();
                     for (c, cold, snap) in &left_calls {
@@ -19139,6 +19208,9 @@ pub extern "C" fn relax_first_present() {
             tier_wake_all();
             for i in 0..8 { AHEAD_AT_PRESENT[i].store(AHEAD_STATS[i].load(Ordering::Relaxed), Ordering::Relaxed); }
             owner::pure_mark_present();
+            if crate::run::VERBOSE.load(Ordering::Relaxed) {
+                eprintln!("{}", crate::postframe::before_present_line(wall_ns().saturating_sub(crate::run::main_start_wall())));
+            }
             crate::solver_work::report();
             relax_types::next_solver::search_graph::goal_hist_report();
             relax_codegen::exec_census::first_present();
@@ -22364,7 +22436,7 @@ pub fn front_write() -> std::sync::RwLockWriteGuard<'static, ()> {
 
 /// MAKEPAD_RUN_FRONT_TRACE=1: the front read holders by site (diagnostics of writer waits): each
 /// hold longer than 50 ms is printed when it ends, with its site and thread.
-fn front_trace() -> bool {
+pub(crate) fn front_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_FRONT_TRACE").is_some())
 }
@@ -22757,7 +22829,11 @@ fn spawn_helpers(f: &std::sync::Arc<FrontShared>, _q: &std::collections::VecDequ
     let n = if startup_phase() { f.helpers } else { f.helpers.min(ahead_policy().post_present_helpers) };
     for i in 0..n {
         let f2 = f.clone();
-        if std::thread::Builder::new().name(format!("run-ahead{}", i)).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); ahead_helper(f2, i) }).is_ok() {
+        // the UI thread waits for a helper's check of the body it is about to build (startup: 3.5k
+        // waits, 1.8 s of a cold Fab's main thread on a busy Mac): the helpers run in the UI's class,
+        // as the owner does, not at a script-started process's inherited low QoS (efficiency cores,
+        // coalesced timers), so a busy machine does not starve the threads the UI waits behind
+        if std::thread::Builder::new().name(format!("run-ahead{}", i)).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); crate::os::thread::interactive(); ahead_helper(f2, i) }).is_ok() {
             f.live_helpers.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -23004,13 +23080,35 @@ fn lower_ahead(f: &FrontShared, id: u32, own: bool) -> u8 {
     }
     let r = lower_ahead_as(u, id, id, d, &key.1, epoch, None);
     let why = r.as_ref().err().copied().unwrap_or(AF_OK);
-    let mut pending = f.lowered.lock().unwrap_or_else(|e| e.into_inner());
-    if f.is_built(&key) || transient_ahead_fail(why) {
-        pending.remove(&id);
-    } else if let Some(slot) = pending.get_mut(&id) {
-        *slot = r.ok();
+    // the callees a baseline build inlines (Relax core's tiniest bodies, base_inline_wanted): their
+    // slots are made now, so the helpers check and lower them ahead (slot_ahead) like any slot.
+    // Made later, by the take of this body's build, they were lowered on the owner inside that
+    // build's front (20k bodies, 1 s of a cold Fab's owner fronts before the present)
+    // (makepad run's lazy compiles only: startup, and a program thread's own builds after it; not
+    // a check's walk, whose order follows slot creation, nor a tier-up worker's speculative front)
+    let small: Vec<FnKey> = match &r {
+        Ok(l) if pipelined() && (startup_phase() || ahead_foreground()) => l.callees.iter().filter(|k| matches!(k, FnKey::Inst(cd, _) if base_inline_source(u, *cd) && u.fn_map.get(*k).is_none())).cloned().collect(),
+        _ => Vec::new(),
+    };
+    {
+        let mut pending = f.lowered.lock().unwrap_or_else(|e| e.into_inner());
+        if f.is_built(&key) || transient_ahead_fail(why) {
+            pending.remove(&id);
+        } else if let Some(slot) = pending.get_mut(&id) {
+            *slot = r.ok();
+        }
+    }
+    for k in small {
+        u.fn_id(k);
     }
     why
+}
+
+/// Whether `d`'s body is one a baseline build inlines by its source (base_inline_wanted's rule for
+/// instances): a fn of Relax core within BASE_INLINE_SRC_TOKS.
+fn base_inline_source(u: &Unit, d: DefId) -> bool {
+    let def = u.prog.def(d);
+    def.krate == u.core_crate && matches!(def.kind, DefKind::Fn | DefKind::AssocFn) && def_src_size(u, d) <= BASE_INLINE_SRC_TOKS
 }
 
 /// A lowering ahead that failed only for what the owner makes between two requests (a constant, a
@@ -23166,7 +23264,7 @@ fn lower_ahead_as(u: &Unit, into: u32, base: u32, d: DefId, args: &[TyId], epoch
             Err(AF_LOWER_ERR)
         }
     };
-    if std::env::var_os("MAKEPAD_RUN_AHEAD_TRACE").is_some() {
+    if ahead_trace() {
         eprintln!("ahead-lower {} {} us: {}", if ready.is_ok() { "ready" } else { "deferred" }, (cpu_ns() - t0) / 1000, u.prog.def_path(d));
     }
     AHEAD_STATS[7].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
@@ -23327,7 +23425,7 @@ fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<relax_backend::rir::Func>
             *callee = resolved(*callee, &ids);
         }
     }
-    if std::env::var_os("MAKEPAD_RUN_AHEAD_TRACE").is_some() {
+    if ahead_trace() {
         eprintln!("ahead-lower taken: {}", u.fns[id as usize].name);
     }
     Some(lowered.func)
@@ -23465,6 +23563,7 @@ pub unsafe fn typeck_ahead_slot(up: *mut Unit, id: u32) {
         if !owner::is_owner() && f.inprog.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
             // (a wait for another thread: not a running job meanwhile, job_sleep's reason)
             let _idle = JobIdle::enter();
+            let _w = AheadWait::begin();
             let mut g = AHEAD_DONE.0.lock().unwrap_or_else(|e| e.into_inner());
             while f.inprog.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) && f.alive.load(Ordering::SeqCst) {
                 g = AHEAD_DONE.1.wait_timeout(g, std::time::Duration::from_millis(5)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0);
@@ -23475,7 +23574,38 @@ pub unsafe fn typeck_ahead_slot(up: *mut Unit, id: u32) {
         // the thread about to build the slot lowers it (off the owner: the owner's front then only
         // takes the RIR), also during the startup, when the helpers have not got to it yet
         if !owner::is_owner() && pipelined() {
-            lower_ahead(&f, id, true);
+            let t = cpu_ns();
+            let why = lower_ahead(&f, id, true);
+            if MAIN_TID.load(Ordering::Relaxed) == me() {
+                MAIN_AHEAD_WAIT[2].fetch_add(cpu_ns() - t, Ordering::Relaxed);
+                if !FIRST_PRESENT.load(Ordering::Relaxed) {
+                    MAIN_LOWER_WHY[(why as usize).min(MAIN_LOWER_WHY.len() - 1)].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        if MAIN_TID.load(Ordering::Relaxed) == me() {
+            MAIN_AHEAD_WAIT[3].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The main thread's waits for a helper's check of the body it is about to build
+/// (typeck_ahead_slot): [count, wall ns], and its cpu ns lowering its slots ahead, and in all of
+/// typeck_ahead_slot (the first-present line)
+pub(crate) static MAIN_AHEAD_WAIT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// the main thread's lowerings ahead of its own slots before the first present, by result (AF_*)
+pub(crate) static MAIN_LOWER_WHY: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+struct AheadWait(u64);
+impl AheadWait {
+    fn begin() -> AheadWait {
+        AheadWait(if MAIN_TID.load(Ordering::Relaxed) == me() { wall_ns().max(1) } else { 0 })
+    }
+}
+impl Drop for AheadWait {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            MAIN_AHEAD_WAIT[0].fetch_add(1, Ordering::Relaxed);
+            MAIN_AHEAD_WAIT[1].fetch_add(wall_ns() - self.0, Ordering::Relaxed);
         }
     }
 }
@@ -23542,7 +23672,7 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
             std::thread::sleep(std::time::Duration::from_millis(5));
             continue;
         }
-        if std::env::var_os("MAKEPAD_RUN_AHEAD_TRACE").is_some() {
+        if ahead_trace() {
             match &r {
                 Err(p) => eprintln!("ahead-panic {} : {}", prog.def_path(key.0), p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default()),
                 Ok(b) if !b.errors.is_empty() => eprintln!("ahead-error {} {:?} : {}", prog.def_path(key.0), key.1, b.errors.join(" | ").chars().take(1500).collect::<String>()),
@@ -24646,7 +24776,17 @@ fn present_files() -> bool {
 // next run's mark. A lazy compile a real-time thread still meets is reported, compiles everything
 // its slot reaches at once and is recorded too.
 
-fn rt_trace() -> bool {
+fn tls_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_TLS_TRACE").is_some())
+}
+
+fn interp_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_INTERP_TRACE").is_some())
+}
+
+pub(crate) fn rt_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_RT_TRACE").is_some())
 }
@@ -25159,7 +25299,7 @@ unsafe fn realtime_top_tier(up: *mut Unit, ids: &[u32]) {
             o2_hot(up, id);
         }
     }
-    if std::env::var_os("MAKEPAD_RUN_RT_TRACE").is_some() {
+    if rt_trace() {
         eprintln!("makepad-run rt: tiers of {} real-time slots: {} baseline, {} O1 (both queued for O2), {} O2, {} O3", ids.len(), base, o1, o2, o3);
     }
 }

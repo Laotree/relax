@@ -34,6 +34,11 @@ struct Ctx<'a> {
     reason: Option<String>,
 }
 
+pub(crate) fn trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_CTFE_TRACE").is_some())
+}
+
 /// Evaluates const/static `d` (instance `args`) into `buf` (its layout's size). Returns false
 /// (nothing reliable written) when the initializer is outside the subset.
 pub fn eval_into(u: &mut Unit, d: crate::program::DefId, args: &[TyId], buf: u64) -> bool {
@@ -54,7 +59,7 @@ pub fn eval_into(u: &mut Unit, d: crate::program::DefId, args: &[TyId], buf: u64
     };
     let epoch = Some(epoch);
     if let Some(f) = u.prog.exec_profile_file(body.file) { f.note(crate::exec_profile::CTFE); }
-    let mut cx = Ctx { u, steps: 0, depth: 0, trace: std::env::var_os("MAKEPAD_RUN_CTFE_TRACE").is_some(), reason: None };
+    let mut cx = Ctx { u, steps: 0, depth: 0, trace: trace_on(), reason: None };
     let mut env: Vec<Option<Vec<u8>>> = Vec::new();
     let v = match cx.eval(&body, &mut env, init) {
         Some(v) => v,

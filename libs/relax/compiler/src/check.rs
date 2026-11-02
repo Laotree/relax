@@ -20,6 +20,16 @@ use relax_types::next_solver::{Goal, ParamEnvId};
 use crate::jit::{self, FnKey, Unit};
 use crate::program::DefKind;
 
+fn check_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_CHECK_TRACE").is_some())
+}
+
+fn borrowck_unchecked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_BORROWCK_UNCHECKED").is_some())
+}
+
 /// Errors of earlier phases (`file:line:col: ..` lines) that belong to the root crate's files.
 pub fn own_errors(prog: &crate::program::Program, root: u32, errs: &[String], phase: &'static str) -> Vec<String> {
     let mut paths: Vec<&str> = Vec::new();
@@ -374,7 +384,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         let uu = unsafe { &*(upn as *const Unit) };
         let (prog, tcx) = (&uu.prog, &uu.tcx);
         let d = owner.owner;
-        if std::env::var_os("MAKEPAD_RUN_CHECK_TRACE").is_some() { stderr_line!("makepad check: body {}", prog.def_path(d)); }
+        if check_trace() { stderr_line!("makepad check: body {}", prog.def_path(d)); }
         let mut out = Outcome { errors: Vec::new(), diags: Vec::new(), seed: None, needs_load: false, preempted: false };
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // the syntax-level lints do not wait for the types (rustc runs them before analysis)
@@ -407,7 +417,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
                 Ok(r) => at_patterns = r.at_patterns,
                 Err(p) if p.is::<crate::preempt::NeedsLoad>() || crate::preempt::is_preempted(&*p) => std::panic::resume_unwind(p),
                 Err(_) => {
-                    if std::env::var_os("MAKEPAD_RUN_CHECK_TRACE").is_some() { stderr_line!("makepad check: pattern analysis failed in {}", prog.def_path(d)); }
+                    if check_trace() { stderr_line!("makepad check: pattern analysis failed in {}", prog.def_path(d)); }
                 }
             }
             if !crate::borrowck::enabled(options) {
@@ -415,7 +425,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
             }
             let v = crate::borrowck::check_body(&crate::tcx::EvalCx::new(prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &crate::tcx::EvalState::new()), prog, tcx, &body);
             crate::borrowck::note_verdict(&v);
-            if std::env::var_os("MAKEPAD_RUN_BORROWCK_UNCHECKED").is_some() {
+            if borrowck_unchecked() {
                 for x in &v.unchecked { eprintln!("makepad check: borrowck unchecked: {}", x); }
             }
             let args: Vec<_> = if owner.kind == crate::borrowck::body::BodyKind::Function && !generic { Vec::new() } else { body.args.to_vec() };

@@ -439,7 +439,7 @@ fn refuse(why: &str, name: &str) {
         }
     };
     // the first functions of each reason, by name (the summary only counts)
-    if n <= 4 && std::env::var_os("MAKEPAD_RUN_INTERP_STATS").is_some() {
+    if n <= 4 && interp_stats() {
         eprintln!("makepad-run interp refused: {}: `{}`", why, name);
     }
 }
@@ -500,13 +500,38 @@ pub fn no_codegen() -> bool {
     *N.get_or_init(|| relax_session::options::no_codegen_env(&|n| std::env::var_os(n)))
 }
 
+fn interp_stats() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_INTERP_STATS").is_some())
+}
+
+fn no_coalesce() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_INTERP_NOCOALESCE").is_some())
+}
+
+fn fold_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_INTERP_NOFOLD").is_none())
+}
+
+fn preload_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_INTERP_NOPRELOAD").is_none())
+}
+
+fn frame_fold_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_INTERP_NOFRAMEFOLD").is_none())
+}
+
 fn selection() -> Option<&'static Sel> {
     static S: std::sync::OnceLock<Option<Sel>> = std::sync::OnceLock::new();
     S.get_or_init(|| {
         let v = if no_codegen() { "all".to_string() } else { std::env::var("MAKEPAD_RUN_INTERP").ok().filter(|v| !v.is_empty() && v != "0")? };
         let split = |s: &str| s.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect::<Vec<_>>();
         let skip = std::env::var("MAKEPAD_RUN_INTERP_SKIP").map(|s| split(&s)).unwrap_or_default();
-        if std::env::var_os("MAKEPAD_RUN_INTERP_STATS").is_some() {
+        if interp_stats() {
             extern "C" {
                 fn atexit(f: extern "C" fn()) -> i32;
             }
@@ -554,7 +579,7 @@ pub fn maybe_compile(options: &relax_session::Options, f: &Func, slots: SlotsPtr
     };
     set_runtime(tls_slow, resume);
     SLOTS.store(slots.0 as usize, Ordering::Relaxed);
-    if N_INTERP.fetch_add(1, Ordering::Relaxed) % 2000 == 1999 && std::env::var_os("MAKEPAD_RUN_INTERP_STATS").is_some() {
+    if N_INTERP.fetch_add(1, Ordering::Relaxed) % 2000 == 1999 && interp_stats() {
         print_stats();
     }
     N_WORDS.fetch_add(ifunc.code.len() as u64, Ordering::Relaxed);
@@ -2739,7 +2764,7 @@ fn coalesce(f: &Func) -> (Vec<u32>, std::collections::HashSet<(u32, u32)>) {
     let n = f.vregs.len();
     let mut alias: Vec<u32> = (0..n as u32).collect();
     let mut skip = std::collections::HashSet::new();
-    if std::env::var_os("MAKEPAD_RUN_INTERP_NOCOALESCE").is_some() {
+    if no_coalesce() {
         return (alias, skip);
     }
     let (mut defs, mut uses) = (vec![0u32; n], vec![0u32; n]);
@@ -2928,7 +2953,7 @@ fn lower(options: &relax_session::Options, f: &Func, slots: SlotsPtr, syms: u64,
     let mut konst: Vec<Option<Option<i64>>> = vec![None; f.vregs.len()];
     // where a constant's value comes from (a symbol or a slot: relocated when cached)
     let mut kprov: Vec<Option<Prov>> = vec![None; f.vregs.len()];
-    if std::env::var_os("MAKEPAD_RUN_INTERP_NOFOLD").is_none() {
+    if fold_on() {
         for p in &f.params {
             konst[p.0 as usize] = Some(None);
         }
@@ -2987,7 +3012,7 @@ fn lower(options: &relax_session::Options, f: &Func, slots: SlotsPtr, syms: u64,
         }
     }
     let mut hoist = vec![false; f.vregs.len()];
-    if std::env::var_os("MAKEPAD_RUN_INTERP_NOPRELOAD").is_none() {
+    if preload_on() {
         for (bi, b) in f.blocks.iter().enumerate() {
             if !in_loop[bi] {
                 continue;
@@ -3005,7 +3030,7 @@ fn lower(options: &relax_session::Options, f: &Func, slots: SlotsPtr, syms: u64,
     // stack slot addresses folded into their uses (see Lw::frame)
     let mut frame_of: Vec<Option<u32>> = vec![None; f.vregs.len()];
     let mut needs_cell = vec![false; f.vregs.len()];
-    if std::env::var_os("MAKEPAD_RUN_INTERP_NOFRAMEFOLD").is_none() {
+    if frame_fold_on() {
         let mut defs = vec![0u32; f.vregs.len()];
         for b in &f.blocks {
             for i in &b.insts {

@@ -113,6 +113,16 @@ pub fn startup() {
     }
 }
 
+fn stats_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some())
+}
+
+fn untraced_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_UNTRACED").is_some())
+}
+
 /// Block shaking: remove native coverage effects from the captured RIR and
 /// optionally trap blocks whose source probes never ran. Required callees and
 /// their predecessor paths retain work's keep-reachable behavior.
@@ -171,7 +181,7 @@ fn shake_blocks(f: &mut Func, hits: &HashMap<(u64, u64), bool>, trap: bool, keep
             if let Some(n) = stub.as_deref_mut() {
                 // the replay gate's build: the trap names the block (`env.u(id)` of an id past
                 // every slot)
-                if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_UNTRACED").is_some() {
+                if untraced_on() {
                     eprintln!("  block stub {} = {} b{}", *n, fname, bi);
                 }
                 b.insts.push(Inst::Call(relax_backend::rir::Callee::Fn(*n), Vec::new(), Vec::new()));
@@ -993,7 +1003,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
             Some(SymKind::Rt("web_memory_base")) => 0,
             _ => {
                 n_unlinked += 1;
-                if std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_STATS").is_some() {
+                if stats_on() {
                     eprintln!("wasm export: unlinked symbol {}: {}", id, crate::syms::describe(u, Sym::new(id)));
                 }
                 u.syms.value(Sym::new(id))
@@ -1664,7 +1674,8 @@ pub(crate) fn o3_policy() -> O3Policy {
 
 /// One profile switch for capture, closure, emission and gate semantics.
 fn block_profile() -> bool {
-    std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_BLOCKS").is_some_and(|v| v != "0")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_WASM_EXPORT_BLOCKS").is_some_and(|v| v != "0"))
 }
 
 /// Apply only semantics shared by every requested emission variant. These are

@@ -34,6 +34,11 @@ static SUMMARY_DONE: AtomicBool = AtomicBool::new(false);
 /// request was queued behind when they ended (ns)
 static SERVED: [AtomicU64; crate::owner::CLASSES] = [const { AtomicU64::new(0) }; crate::owner::CLASSES];
 static SERVED_BLOCKING: [AtomicU64; crate::owner::CLASSES] = [const { AtomicU64::new(0) }; crate::owner::CLASSES];
+/// the main thread's compiles before the first present (the cold start's critical path): [count,
+/// wall, typeck ahead, owner queue, front, back, finish, in-flight wait, cpu front, cpu opt, cpu
+/// codegen] (ns), and per way satisfied (jit::MAIN_HOW_NAMES) the count
+static BEFORE: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+static BEFORE_HOW: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 // ------------------------------------------------------------ readiness (the warm-up veil)
 
@@ -450,7 +455,23 @@ pub(crate) static LOG_KEY: std::sync::Mutex<String> = std::sync::Mutex::new(Stri
 pub(crate) fn main_compile(name: &str, r: &MainCompile) {
     let fp = present_ns();
     let key = if log_on() { std::mem::take(&mut *LOG_KEY.lock().unwrap()) } else { String::new() };
-    if fp == 0 || r.start < fp || crate::jit::QUIT_SEEN.load(Relaxed) {
+    if fp == 0 || r.start < fp {
+        if fp == 0 {
+            BEFORE[0].fetch_add(1, Relaxed);
+            BEFORE[1].fetch_add(r.end.saturating_sub(r.start), Relaxed);
+            for (a, &ns) in r.ns.iter().enumerate() {
+                BEFORE[a + 2].fetch_add(ns, Relaxed);
+            }
+            for (a, &ns) in r.cpu.iter().enumerate() {
+                BEFORE[a + 8].fetch_add(ns, Relaxed);
+            }
+            if let Some(h) = BEFORE_HOW.get(r.how as usize) {
+                h.fetch_add(1, Relaxed);
+            }
+        }
+        return;
+    }
+    if crate::jit::QUIT_SEEN.load(Relaxed) {
         return;
     }
     let dt = r.end.saturating_sub(r.start);
@@ -503,6 +524,30 @@ pub(crate) fn main_compile(name: &str, r: &MainCompile) {
 }
 
 /// A main-thread owner request ended after the present (owner::request): waited `w` ns from `t0`.
+/// The cold start's critical path at the first present (one line): the main thread's compiles
+/// before it, where their wall went, its owner requests and what the owner thread was busy with.
+pub(crate) fn before_present_line(main_ns: u64) -> String {
+    let b = |i: usize| BEFORE[i].load(Relaxed) as f64 / 1e6;
+    let m = |i: usize| crate::owner::MAIN_ACC[i].load(Relaxed);
+    let how: Vec<String> = crate::jit::MAIN_HOW_NAMES.iter().enumerate().filter(|(i, _)| BEFORE_HOW[*i].load(Relaxed) > 0).map(|(i, n)| format!("{} {}", n, BEFORE_HOW[i].load(Relaxed))).collect();
+    let busy = |i: usize| crate::owner::BUSY_NS[i].load(Relaxed) as f64 / 1e6;
+    format!(
+        "makepad-run before the first present: main {:.0} ms after its start, {} main-thread compiles ({}) {:.0} ms wall: typeck ahead {:.0}, owner queue {:.0}, front {:.0}, back {:.0}, finish {:.0}, in-flight {:.0} ms; cpu front {:.0}, opt {:.0}, codegen {:.0} ms; main's owner requests {} waited {:.0} ms (queue {:.0}, wake {:.0}); owner busy: job {:.0}, publish {:.0}, program {:.0} ms",
+        main_ns as f64 / 1e6, BEFORE[0].load(Relaxed), how.join(", "), b(1), b(2), b(3), b(4), b(5), b(6), b(7), b(8), b(9), b(10),
+        m(0), m(1) as f64 / 1e6, m(2) as f64 / 1e6, m(3) as f64 / 1e6, busy(0), busy(1), busy(2)
+    ) + &{
+        let a = |i: usize| crate::jit::AHEAD_STATS[i].load(Relaxed);
+        let w = |i: usize| crate::jit::MAIN_AHEAD_WAIT[i].load(Relaxed);
+        format!("; checks ahead: {} bodies ({} taken), cpu callers {:.0} ms, helpers {:.0} ms, main waited for a helper's check {}x {:.0} ms, main's cpu in them {:.0} ms of which lowering its slots {:.0} ms; lowered ahead {} ({} taken) {:.0} ms",
+            a(0), a(1), a(3) as f64 / 1e6, a(4) as f64 / 1e6, w(0), w(1) as f64 / 1e6, w(3) as f64 / 1e6, w(2) as f64 / 1e6, a(5), a(6), a(7) as f64 / 1e6)
+    } + &{
+        let o = |r: usize, i: usize| crate::jit::OWNER_LOWERS[r][i].load(Relaxed);
+        format!("; owner's own lowerings: of bodies checked ahead {} ({:.0} ms), by const eval {} ({:.0} ms), checked on the owner {} ({:.0} ms), closures {} ({:.0} ms), requests' own slots checked ahead {} ({:.0} ms); main's lowerings ahead of its slots by result: {}",
+            o(0, 0), o(0, 1) as f64 / 1e6, o(1, 0), o(1, 1) as f64 / 1e6, o(2, 0), o(2, 1) as f64 / 1e6, o(3, 0), o(3, 1) as f64 / 1e6, o(4, 0), o(4, 1) as f64 / 1e6,
+            crate::jit::MAIN_LOWER_WHY.iter().enumerate().filter(|(_, n)| n.load(Relaxed) > 0).map(|(i, n)| format!("af{} {}", i, n.load(Relaxed))).collect::<Vec<_>>().join(", "))
+    }
+}
+
 pub(crate) fn main_owner_wait(t0: u64, w: u64) {
     if in_window(t0) {
         OWNER[0].fetch_add(1, Relaxed);

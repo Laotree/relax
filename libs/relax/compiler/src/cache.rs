@@ -2078,7 +2078,7 @@ impl Cache {
                 n += 1;
             }
         }
-        if std::env::var_os("MAKEPAD_RUN_RT_TRACE").is_some() {
+        if crate::jit::rt_trace() {
             eprintln!("makepad-run rt: recorded {} of {} slots", n, ids.len());
         }
         let path = self.rt_set_path(u, root);
