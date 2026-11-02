@@ -266,6 +266,12 @@ pub struct Site {
     pub file: u32,
     pub pos: u32,
     pub msg: String,
+    /// Leaked once per site: a caught payload can outlive the unit.
+    static_msg: std::sync::OnceLock<&'static str>,
+    /// The site's file (interned once per path, never freed): a panic's Location needs no compiler state.
+    file_bytes_with_nul: &'static [u8],
+    line: u32,
+    col: u32,
 }
 
 const THUNK_SIZE: usize = x64::THUNK_SIZE;
@@ -369,6 +375,8 @@ pub struct Unit {
     /// one site per (file, position, message): every inlined copy of a panic location is one
     /// site and one symbol, whatever the compile order (one constant pool word)
     site_ix: relax_session::sync::Mutex<HashMap<(u32, u32, String), u64>>,
+    /// std's runtime-panic entry, scoped to this unit's program.
+    panic_hook: std::sync::atomic::AtomicUsize,
     pub rt: Rt,
     /// the runtime entries as symbols (what compiled code calls; see syms.rs)
     pub rs: RtSyms,
@@ -2668,15 +2676,7 @@ pub(crate) fn leave_thread(kind: &str, message: String) -> ! {
 rt_fn! {
 #[allow(clippy::too_many_arguments)]
 fn rt_panic_site(site: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, regs: *const u64, _a7: u64) {
-    let mut msg = fmt_take_top();
-    if msg.is_empty() {
-        let u = unsafe { &*cur_unit() };
-        let sites = u.sites.lock().unwrap_or_else(|e| e.into_inner());
-        if (site as usize) < sites.len() {
-            msg = sites[site as usize].msg.clone();
-        }
-    }
-    raise_unwinding("panic", msg, site, regs)
+    raise_runtime_panic(fmt_take_top(), site, true, regs)
 }
 }
 
@@ -2684,8 +2684,59 @@ rt_fn! {
 #[allow(clippy::too_many_arguments)]
 fn rt_panic_bounds(idx: u64, len: u64, site: u64, _a3: u64, _a4: u64, _a5: u64, regs: *const u64, _a7: u64) {
     let msg = format!("index out of bounds: the len is {} but the index is {}", len, idx);
-    raise_unwinding("panic", msg, site, regs)
+    raise_runtime_panic(msg, site, false, regs)
 }
+}
+
+type RuntimePanicHook = extern "C" fn(*const u8, usize, *const u8, usize, u32, u32, bool);
+
+extern "C" fn relax_set_panic_hook(hook: RuntimePanicHook) {
+    unsafe { (*cur_unit()).panic_hook.store(hook as usize, Ordering::Release) };
+}
+
+/// Runtime checks keep their host calls; std records their payload and runs the hook here.
+fn raise_runtime_panic(mut message: String, site: u64, use_site_message: bool, regs: *const u64) -> ! {
+    let (constant, file, line, col) = {
+        let _kept = crate::zone_alloc::kept();
+        let u = unsafe { &*cur_unit() };
+        let sites = u.sites.lock().unwrap_or_else(|e| e.into_inner());
+        match sites.get(site as usize) {
+            Some(s) => {
+                let constant = if use_site_message && !s.msg.is_empty() {
+                    Some(*s.static_msg.get_or_init(|| Box::leak(s.msg.clone().into_boxed_str())))
+                } else {
+                    None
+                };
+                (constant, s.file_bytes_with_nul, s.line, s.col)
+            }
+            None => (None, &b"<unknown>\0"[..], 0, 0),
+        }
+    };
+    if let Some(msg) = constant {
+        message = msg.to_string();
+    }
+    let hook = unsafe { (*cur_unit()).panic_hook.load(Ordering::Acquire) };
+    if hook != 0 && !in_const_eval() {
+        let msg = constant.unwrap_or(&message);
+        let hook: RuntimePanicHook = unsafe { std::mem::transmute(hook) };
+        hook(msg.as_ptr(), msg.len(), file.as_ptr(), file.len(), line, col, constant.is_some());
+    }
+    raise_unwinding("panic", message, site, regs)
+}
+
+/// A panic site's file with its NUL, one copy per path for the process (bounded by the files).
+fn site_file(path: &str) -> &'static [u8] {
+    static FILES: relax_session::sync::Mutex<Option<HashMap<String, &'static [u8]>>> = relax_session::sync::Mutex::new(None);
+    let mut files = FILES.lock().unwrap_or_else(|e| e.into_inner());
+    let files = files.get_or_insert_with(HashMap::new);
+    if let Some(&b) = files.get(path) {
+        return b;
+    }
+    let mut b = path.as_bytes().to_vec();
+    b.push(0);
+    let b: &'static [u8] = Box::leak(b.into_boxed_slice());
+    files.insert(path.to_string(), b);
+    b
 }
 
 rt_fn! {
@@ -2959,6 +3010,74 @@ pub static COMPILE_ERRORS_FATAL: std::sync::atomic::AtomicBool = std::sync::atom
 /// Off by default: the run never waits for the checker, which reports in the background.
 pub static CHECK_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// `makepad run` in a live session (run.rs): a call of code that does not compile -- a type error
+/// in a dependency's body is found when that body is first called -- parks the calling thread at
+/// the call (park_compile_error) instead of panicking and ending the run: the error is reported
+/// as a compile error, a live edit that fixes it resumes the call, stopping is the user's choice.
+/// The failed slot gets no error stub (install_error): it stays lazy, so every call of it parks.
+pub static PARK_COMPILE_ERRORS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What a lazy compile hands its call when the slot did not compile and the call parks
+/// (PARK_COMPILE_ERRORS); never a code address.
+const PARK_AT_ERROR: u64 = u64::MAX;
+
+thread_local! {
+    /// (owner thread) the slot a program thread's lazy call is compiling now (u32::MAX: none):
+    /// its failure parks that call (install_error); a failure of any other slot meanwhile (an
+    /// inline candidate, a constant's code) is that slot's error stub as before
+    static PARK_SLOT: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+}
+
+/// `f` with PARK_SLOT = `id` (owner thread; nested requests the owner serves meanwhile set theirs).
+fn park_slot<R>(id: u32, f: impl FnOnce() -> R) -> R {
+    if !PARK_COMPILE_ERRORS.load(std::sync::atomic::Ordering::Relaxed) { return f(); }
+    let prev = PARK_SLOT.with(|s| s.replace(id));
+    struct Restore(u32);
+    impl Drop for Restore { fn drop(&mut self) { let _ = PARK_SLOT.try_with(|s| s.set(self.0)); } }
+    let _r = Restore(prev);
+    f()
+}
+
+/// A program thread's call of slot `slot` whose compile failed (PARK_AT_ERROR): the thread parks
+/// at the call (inspect events.rs park_compile_error) until a live edit makes the slot compile --
+/// then the call goes on into that code, with the arguments it was made with -- or the user
+/// stops the run. Its domain stopping lets it fail as the error's panic (its cleanup runs).
+#[cold]
+#[inline(never)]
+fn park_compile_error(up: usize, slot: u32) -> u64 {
+    let (message, location) = owner::call(owner::Class::Program, || unsafe {
+        let u = &*(up as *mut Unit);
+        let f = &u.fns[slot as usize];
+        let e = f.build_err.as_deref().unwrap_or("its build failed");
+        let location = match &f.key {
+            FnKey::Inst(d, _) => {
+                let def = u.prog.def(*d);
+                u.pos_str(def.file, u.prog.files[def.file as usize].ast.item(def.item).lo)
+            }
+            _ => String::new(),
+        };
+        (format!("compile error in {}: {}", f.name, e.lines().next().unwrap_or("")), location)
+    });
+    let mut frames = [0u64; crate::inspect::heap::DEPTH];
+    let n = crate::inspect::heap::capture_host(&mut frames) as usize;
+    let rebuild = || match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { compile_slot(up as *mut Unit, slot) })) {
+        Ok(a) if a != PARK_AT_ERROR => Some(a),
+        _ => None,
+    };
+    match crate::inspect::events::park_compile_error(&message, &location, &frames[..n], rebuild) {
+        crate::inspect::events::CompileParked::Fixed(a) => a,
+        crate::inspect::events::CompileParked::Stop => {
+            eprintln!("makepad-run: stopped at a call of code that did not compile ({})", message);
+            std::process::exit(101)
+        }
+        crate::inspect::events::CompileParked::Unwind => owner::call(owner::Class::Program, || unsafe {
+            let u = &mut *(up as *mut Unit);
+            let (code, relocs) = error_stub(u, &message);
+            u.emit_or_redirect(&code, &relocs, "error stub").unwrap_or_else(|e| panic!("{}; and its error stub was not emitted: {}", message, e))
+        }),
+    }
+}
+
 fn fatal_compile_error(p: &PanicInfo, report: &str) {
     if COMPILE_ERRORS_FATAL.load(std::sync::atomic::Ordering::Relaxed) && p.message.starts_with("compile error in ") {
         eprintln!("makepad-run: {} -- the program cannot run past it (rustc rejects it)\n  report: {}", p.message, report);
@@ -3070,6 +3189,7 @@ fn rt_compile_in(up: usize, slot: u64) -> u64 {
             compile_slot(up as *mut Unit, slot as u32)
         }));
         match r {
+            Ok(PARK_AT_ERROR) => return park_compile_error(up, slot as u32),
             Ok(a) => return a,
             Err(p) if crate::preempt::is_cancelled(&*p) && cancelled < COMPILE_CANCEL_RETRIES => cancelled += 1,
             Err(p) => return compile_failed_stub(up, slot as u32, &*p),
@@ -3807,6 +3927,7 @@ impl Unit {
             static_spans: Default::default(),
             sites: Default::default(),
             site_ix: Default::default(),
+            panic_hook: std::sync::atomic::AtomicUsize::new(0),
             rs: RtSyms { tls_base: relax_backend::rir::Sym::new(0), coverage_disabled: relax_backend::rir::Sym::new(0), fmt_str: relax_backend::rir::Sym::new(0), fmt_int: relax_backend::rir::Sym::new(0), fmt_float: relax_backend::rir::Sym::new(0), fmt_print: relax_backend::rir::Sym::new(0), panic_site: relax_backend::rir::Sym::new(0), panic_bounds: relax_backend::rir::Sym::new(0), str_eq: relax_backend::rir::Sym::new(0), fmod: relax_backend::rir::Sym::new(0), fmodf: relax_backend::rir::Sym::new(0), panic_impl: relax_backend::rir::Sym::new(0), thread_run: relax_backend::rir::Sym::new(0), catch_panic: relax_backend::rir::Sym::new(0), args: relax_backend::rir::Sym::new(0), memcpy: relax_backend::rir::Sym::new(0), memmove: relax_backend::rir::Sym::new(0), memset: relax_backend::rir::Sym::new(0), fmt_push: relax_backend::rir::Sym::new(0), fmt_pop: relax_backend::rir::Sym::new(0), resume: relax_backend::rir::Sym::new(0), land: relax_backend::rir::Sym::new(0), panicking: relax_backend::rir::Sym::new(0), rethrow: relax_backend::rir::Sym::new(0) },
             syms: crate::syms::Syms::new(syms_base, rw_base),
             cache: None,
@@ -4682,8 +4803,16 @@ impl Unit {
         // identity state (panic sites are read by the program): the strings are the program's
         let _k = crate::zone_alloc::kept();
         let key = key.clone();
+        let (path, line, col) = match (self.prog.file_paths.get(file as usize), self.prog.files.get(file as usize)) {
+            (Some(path), Some(src)) => {
+                let (line, col) = src.line_col(pos);
+                (path.as_str(), line as u32, col as u32)
+            }
+            _ => ("<unknown>", 0, 0),
+        };
+        let file_bytes_with_nul = site_file(path);
         let mut s = self.sites.lock().unwrap_or_else(|e| e.into_inner());
-        s.push(Site { file, pos, msg: msg.to_string() });
+        s.push(Site { file, pos, msg: msg.to_string(), static_msg: std::sync::OnceLock::new(), file_bytes_with_nul, line, col });
         let i = s.len() as u64 - 1;
         ix.insert(key, i);
         i
@@ -7608,7 +7737,8 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
     if owner::is_owner() {
         // (a cancellation must not unwind through the JIT frames above: the call gets a stub that
         // panics, and the Rust frame that ran the code -- run_init_code -- cancels the request)
-        return match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_slot_locked(up, id, false))) {
+        // (no park: a call made on the owner -- a constant's code -- gets the error stub)
+        return match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| park_slot(u32::MAX, || compile_slot_locked(up, id, false)))) {
             Ok(Compiled::Code(a)) => a,
             Ok(Compiled::Back(_)) => unreachable!("a nested compile is never split"),
             Err(p) if p.is::<crate::preempt::OwnerBusy>() => {
@@ -7676,7 +7806,7 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
                     *crate::postframe::LOG_KEY.lock().unwrap() = k;
                 }
             }
-            let r = compile_slot_locked(up, id, true);
+            let r = park_slot(id, || compile_slot_locked(up, id, true));
             if let Compiled::Code(_) = r {
                 compile_note(up, id, w0);
             }
@@ -7694,7 +7824,7 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
             SPLIT_NS[2].fetch_add(t1 - t, Ordering::Relaxed);
             main_rec(|r| r.ns[4] += t1 - t);
             test_compile_panic(up, id);
-            let r = split_finish(up, done);
+            let r = park_slot(id, || split_finish(up, done));
             if let Split::Installed(_) = r {
                 compile_note(up, id, w0);
             }
@@ -8266,6 +8396,10 @@ pub(crate) unsafe fn install_patched(up: *mut Unit, id: u32, code: &[u8], map: V
     Ok(a)
 }
 
+/// The parked calls' errors reported so far (slot, error): a call that parks again on the same
+/// error does not report it again.
+static PARK_NOTED: relax_session::sync::Mutex<Vec<(u32, Box<str>)>> = relax_session::sync::Mutex::new(Vec::new());
+
 /// `makepad check`: every failed build (slot, full error), collected while the check compiles.
 pub static CHECK_FAILURES: relax_session::sync::Mutex<Option<Vec<(u32, String)>>> = relax_session::sync::Mutex::new(None);
 
@@ -8273,6 +8407,24 @@ pub static CHECK_FAILURES: relax_session::sync::Mutex<Option<Vec<(u32, String)>>
 unsafe fn install_error(up: *mut Unit, id: u32, e: &str) -> u64 {
     if let Some(v) = CHECK_FAILURES.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
         v.push((id, e.to_string()));
+    }
+    // a program thread's call of it parks (PARK_COMPILE_ERRORS): no stub, the slot stays lazy with
+    // its failure kept (a live patch clears it), the error reported once
+    if PARK_SLOT.with(|s| s.get()) == id && PARK_COMPILE_ERRORS.load(Ordering::Relaxed) {
+        let u = &mut *up;
+        let f = &mut u.fns[id as usize];
+        if f.build_err.as_deref() != Some(e) {
+            f.build_err = Some(crate::zone_alloc::slots_with(|| Box::from(e)));
+        }
+        let name = f.name.to_string();
+        u.reload_errors.insert(id);
+        let mut noted = PARK_NOTED.lock().unwrap_or_else(|p| p.into_inner());
+        if !noted.iter().any(|(s, t)| *s == id && **t == *e) {
+            crate::zone_alloc::kept_with(|| noted.push((id, Box::from(e))));
+            drop(noted);
+            u.note_error(format!("compile error in {}: {}", name, e));
+        }
+        return PARK_AT_ERROR;
     }
     {
         {
@@ -16577,7 +16729,7 @@ fn w0_activity() -> [u64; 8] {
         (SLOW_BASE.lock().unwrap_or_else(|e| e.into_inner()).len() + TWIN_PENDING.lock().unwrap_or_else(|e| e.into_inner()).len() + COUNTING.lock().unwrap_or_else(|e| e.into_inner()).len()) as u64,
     ]
 }
-fn tier1_workers_ready() -> bool {
+pub(crate) fn tier1_workers_ready() -> bool {
     DEMAND_COMPILES.load(Ordering::SeqCst) == 0
         && wall_ns().saturating_sub(DEMAND_LAST.load(Ordering::SeqCst)) >= TIER1_POLL.as_nanos() as u64
 }
@@ -19465,6 +19617,7 @@ pub extern "C" fn relax_first_present() {
             if let Some(t) = STARTUP_THREAD.get() {
                 t.unpark();
             }
+            if let Some(t) = crate::first_frame::THREAD.get() { t.unpark(); }
             relax_codegen::exec_census::report();
             if profile_path().is_some() { crate::exec_profile::report(true); }
         }
@@ -21254,6 +21407,7 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         #[cfg(unix)]
         b"__relax_fork_exec_done" => Some(crate::forkexec::relax_fork_exec_done as *const () as usize),
         b"relax_allocator_swap" => Some(relax_allocator_swap as *const () as usize),
+        b"relax_set_panic_hook" => Some(relax_set_panic_hook as *const () as usize),
         b"relax_first_present" => Some(relax_first_present as *const () as usize),
         b"relax_frame_done" => Some(crate::postframe::relax_frame_done as *const () as usize),
         b"relax_quit_requested" => Some(crate::run::relax_quit_requested as *const () as usize),
@@ -21273,6 +21427,7 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"relax_pm_parse" => Some(crate::pmhost::relax_pm_parse as *const () as usize),
         b"relax_pm_getenv" => Some(crate::pmhost::relax_pm_getenv as *const () as usize),
         b"__relax_exit" => Some(__relax_exit as *const () as usize),
+        b"__relax_self_spawn" => Some(crate::run::relax_self_spawn as *const () as usize),
         // makepad inspect's timeline: makepad's UI phases (platform thread/ui_hang.rs), Relax std's
         // futex wakes and the recording flag they check
         // makepad inspect's retry boundaries (makepad's event dispatch)

@@ -2651,6 +2651,28 @@ impl Cache {
         Some(k)
     }
 
+    /// A whole-crate check's clean verdict for crate `c`: `mode` 0, `makepad run`'s type check of
+    /// its every body (run.rs up front for the app's crates, typeck_bg.rs after the first present
+    /// for the others); 1 and 2, `makepad test`'s up-front check of a test subject (check.rs
+    /// subjects_mode: a plain program, a libtest harness; run.rs check_test_subjects). The key:
+    /// the Relax build and options (cfg), the crate's fingerprint, which covers its loaded files
+    /// and its dependencies' fingerprints, as the code keys rest on, and `skipped`, the text of
+    /// its files the boot's selection did not load (check.rs skipped_text_hash): every file of
+    /// it. A borrowck-kind entry (record_borrowck).
+    pub fn crate_check_key(&mut self, c: u32, skipped: u128, mode: u8) -> Option<u128> {
+        let fp = *self.fps.get(c as usize)?;
+        let mut h = Sip128::new();
+        h.str(if mode == 0 { "run-typeck-crate" } else { "test-check-crate" });
+        h.u8(mode);
+        h.u32(CHECK_BODY_VERSION);
+        h.u128(self.cfg);
+        h.u128(fp);
+        h.u128(skipped);
+        let k = h.finish128();
+        self.key_crate.insert(k, c);
+        Some(k)
+    }
+
     /// The verdict stored for this key (on disk, or recorded by this run).
     pub fn borrowck_stored(&self, key: u128) -> Option<StoredVerdict> {
         match self.get(key) {
