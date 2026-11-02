@@ -598,6 +598,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mut selftest = false;
     // `makepad check --workspace`: every workspace crate the package reaches, not only its app crates
     let mut workspace_check = false;
+    let mut also: Vec<String> = Vec::new();
+    let mut also_requested = false;
     // `makepad test <package>` (lib.rs): the program is the package's test harness, not its main
     let mut harness = false;
     let mut live_tests = false;
@@ -649,6 +651,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             // `makepad selftest` (lib.rs): the check, then every fn compiled (check.rs)
             "--selftest" => selftest = true,
             "--workspace" => workspace_check = true,
+            a if a.starts_with("--also=") => {
+                also_requested = true;
+                also.extend(a[7..].split(',').filter(|n| !n.is_empty()).map(str::to_string));
+            }
             "--verbose" => driver_options.verbose = true,
             // read into the session (session_from_env)
             "--no-asm" | "--allow-c" => {}
@@ -736,6 +742,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if i >= args.len() {
         return usage();
     }
+    if also_requested && (!check || watch || root_only || selftest || session.is_some()) { return usage(); }
     driver_options.verbose &= !SILENT.load(Ordering::Relaxed);
     VERBOSE.store(driver_options.verbose, Ordering::Relaxed);
     if driver_options.verbose { crate::tui::track_for_verbose(); }
@@ -948,6 +955,22 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             return 1;
         }
     };
+    let mut also_graph = Vec::new();
+    for name in &also {
+        // The original units distinguish target libs from host-only deps, even after substitution.
+        let crates: Vec<usize> = g.crates.iter().enumerate().filter_map(|(ci, c)| {
+            if g.pkg[ci].1 != *name || c.proc_macro || c.bin { return None; }
+            units.units.iter().zip(&g.raw).any(|(u, raw)| {
+                !u.host && u.kind.iter().any(|k| matches!(k.as_str(), "lib" | "rlib"))
+                    && raw.pkg == g.pkg[ci] && raw.name == crate::crates::base_crate_name(&c.name)
+            }).then_some(ci)
+        }).collect();
+        if crates.is_empty() {
+            eprintln!("makepad check: --also {name}: not in {package}'s build");
+            return 2;
+        }
+        also_graph.extend(crates);
+    }
     let mem_g = crate::memstat::tag(crate::memstat::Tag::Load);
     // fn bodies a later parse can do alone are parsed on their first need (a warm run needs
     // few: their code comes from the disk cache); --check reads every body. MAKEPAD_RUN_LAZY_BODIES=0: off
@@ -989,6 +1012,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         let mut roots: Vec<String> = crate::reload::gandalf_app_roots(&units, &crate::unitgraph::manifest_dir_of(&g.crates[g.root].src_path));
         let own_dir = &g.pkg[g.root].0;
         roots.extend((0..g.crates.len()).filter(|&c| g.pkg[c].0 == *own_dir).map(|c| crate::vfs::normalize_path(&g.crates[c].src_path)));
+        // These crates' lints need fresh import and macro uses too.
+        roots.extend(also_graph.iter().map(|&c| crate::vfs::normalize_path(&g.crates[c].src_path)));
         let checked: Vec<(String, String)> = pre.iter().filter(|c| roots.contains(&crate::vfs::normalize_path(&c.root))).map(|c| (c.name.clone(), c.root.clone())).collect();
         if let Some(images) = front_images.as_ref() { images.reload_crates(checked); }
     }
@@ -1280,6 +1305,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         eprintln!("makepad-run: the package root did not load");
         return 1;
     }
+    // Collected-image loading can reorder crates; use the loader's final mapping.
+    let also: Vec<u32> = also_graph.iter().map(|&ci| crate_of[ci]).collect();
 
     drop(mem_g);
     let mem_g = crate::memstat::tag(crate::memstat::Tag::Resolve);
@@ -1318,10 +1345,12 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let t = Instant::now();
     // A check reports validation errors of its crates' impl headers and field types, which
     // declaration collection lowers: the crates are marked before it runs (a run marks none).
+    let checked = if check {
+        crate::check::checked_crates(&prog, root, watch || root_only || session.is_some(), selftest || workspace_check, &also)
+    } else { Vec::new() };
     if check {
-        let checked = if watch || root_only || session.is_some() { vec![root] } else if selftest || workspace_check { crate::check::workspace_crates(&prog, root) } else { crate::check::app_crates(&prog, root) };
         let mut own = vec![false; prog.crates.len()];
-        for k in checked { prog.crates[k as usize].validate = true; own[k as usize] = true; }
+        for &k in &checked { prog.crates[k as usize].validate = true; own[k as usize] = true; }
         // rustc's import resolution replayed over the checked crates: the glob ambiguities it finds
         // answer the name lookups of the declarations collected next
         prog.own_crates = own.clone();
@@ -1408,8 +1437,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         crate::jit::compile_watch(Some(("check: own errors", 0)));
         let mut pre = crate::macro_reg::derive_failures();
         pre.extend(watch_load_errors);
-        // the watch session reports its root crate's; a one-shot check every workspace crate's
-        let checked = if watch || root_only || session.is_some() { vec![root] } else if selftest || workspace_check { crate::check::workspace_crates(&prog, root) } else { crate::check::app_crates(&prog, root) };
         crate::jit::compile_watch(Some(("check: unit", 0)));
         let t = Instant::now();
         let mut u = Unit::new(prog, tcx, core);
@@ -1424,7 +1451,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         if selftest || watch || session.is_some() { u.tcx.check_coherence(&u.prog); }
         else { u.tcx.check_coherence_of(&u.prog, Some(&checked)); }
         phase("coherence", t);
-        for k in checked {
+        for &k in &checked {
             pre.extend(crate::check::own_errors(&u.prog, k, &u.prog.errors, "resolve"));
             pre.extend(crate::check::own_errors(&u.prog, k, &u.tcx.errors, "typeck"));
         }
@@ -1434,8 +1461,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         if selftest || watch || session.is_some() {
             unsafe { jit::load_all_skipped(&mut *u) };
         } else {
-            let crates = if root_only { vec![root] } else if workspace_check { crate::check::workspace_crates(&u.prog, root) } else { crate::check::app_crates(&u.prog, root) };
-            unsafe { jit::load_skipped_of(&mut *u, &crates) };
+            unsafe { jit::load_skipped_of(&mut *u, &checked) };
         }
         phase("load checked files", t);
         crate::jit::compile_watch(Some(("check: crate", 0)));
@@ -1474,7 +1500,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             let mut session = crate::serve::Session::new(u, root, pre);
             return session.watch(deep);
         }
-        let code = crate::check::check_crate(&mut u, root, pre, root_only, selftest, workspace_check);
+        let code = crate::check::check_crate(&mut u, root, &checked, pre, selftest);
         // the parsed files go to the cache's front images as a run's do (one store shared with
         // `makepad run`): the next check (or run) of the package maps them instead of parsing
         // every file again (Stage: 6 s of a warm check was parsing)
