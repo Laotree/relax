@@ -121,9 +121,11 @@ fn warm_process_state(u: &mut Unit, entry: u64) {
         fn getpid() -> i32;
     }
     crate::jit::precompile_reachable(u, entry);
-    for pc in [warm_process_state as usize as u64, getpid as usize as u64] {
-        assert!(crate::inspect::symbols::host_symbol(pc).is_some());
-    }
+    assert!(crate::inspect::symbols::host_symbol(getpid as *const () as usize as u64).is_some());
+    // This test's own code is in a host image only in a rustc build: under the JIT it is JIT
+    // code, which no image's symbol table holds (a stack dump names it from the JIT's tables).
+    #[cfg(not(relax))]
+    assert!(crate::inspect::symbols::host_symbol(warm_process_state as *const () as usize as u64).is_some());
 }
 
 #[test]
