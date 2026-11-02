@@ -777,6 +777,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         driver_options.live = true;
     }
     LIVE_SESSION.store(driver_options.live, Ordering::Release);
+    // a live run parks a call of code that does not compile until a live edit fixes it (jit.rs
+    // PARK_COMPILE_ERRORS); a test, a check and a run nothing can patch keep the error fatal
+    jit::PARK_COMPILE_ERRORS.store(driver_options.live && !live_tests && !check && !harness && plain_test.is_none(), Ordering::Relaxed);
     // `--cfg <name>` / `--cfg=<name>` among the cargo flags (`makepad run <pkg> --cfg custom`) or
     // before the package: extra cfgs for the program's crates, not cargo flags
     let mut cargo_flags_in: Vec<String> = Vec::new();
@@ -1665,6 +1668,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     phase("image", t);
     drop(mem_g);
+    // the files the boot's selection skipped, before any check or the post-boot loader loads them
+    // (the type checks' verdict keys, check.rs BOOT_SKIPPED)
+    let _ = crate::check::BOOT_SKIPPED.set(crate::check::boot_skipped(&u.prog));
     if !test_subjects.is_empty() {
         let t_check = Instant::now();
         // after the cache is open: a body whose stored verdict is clean is not checked again
@@ -1680,6 +1686,30 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // a `harness = false` target is a program: a compile error it reaches ends it (rustc rejects it)
         if plain_test.is_some() {
             jit::COMPILE_ERRORS_FATAL.store(true, Ordering::Relaxed);
+        }
+    } else if !harness {
+        // the app's own crates -- the code being worked on -- are type-checked whole before they run
+        // (a crate whose clean verdict is stored under its fingerprint is not): a type error there
+        // refuses the run, as cargo's build would, and never meets the program at run time. The
+        // dependencies are checked as their bodies are reached, and all of them in the background
+        // after the first frame (typeck_bg.rs).
+        let t_check = Instant::now();
+        let app = crate::check::app_crates(&u.prog, root);
+        let errors = crate::check::run_check_crates(&mut *u, &app);
+        phase("app check", t_check);
+        verbose!("makepad-run: app check: {} of {} app crates checked ({} body owners), {} errors; verdict lookup {:.0} ms, skipped files' load {:.0} ms",
+            crate::check::RUN_CHECK[0].load(Ordering::Relaxed), app.len(), crate::check::RUN_CHECK[1].load(Ordering::Relaxed), errors.len(),
+            crate::check::RUN_CHECK[3].load(Ordering::Relaxed) as f64 / 1e6, crate::check::RUN_CHECK[4].load(Ordering::Relaxed) as f64 / 1e6);
+        if !errors.is_empty() {
+            for e in &errors {
+                if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(e, "typeck")); }
+                report("error", e);
+                eprintln!("{}", e);
+            }
+            eprintln!("error: could not compile `{}` due to {} previous error{}: not started (`makepad run` checks the app's own crates whole before they run, as cargo builds them)",
+                u.prog.syms.str(u.prog.crates[root as usize].name), errors.len(), if errors.len() == 1 { "" } else { "s" });
+            std::mem::forget(u);
+            return 101;
         }
     }
     // after the cache is open: a validated warm start with the program's clean verdict stored skips the check
@@ -1811,6 +1841,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         jit::start_cpu_budget();
     }
     jit::start_completion(up, runtime);
+    // the dependencies' bodies no build asked for are type-checked after the first frame
+    if !harness { crate::typeck_bg::start(up, root, main_def, runtime); }
     let platform = u.prog.crates.iter().any(|c| u.prog.syms.str(c.name) == "makepad_platform");
     jit::live_needs_present(!live_tests && platform);
     // a test harness never presents, nor does a program without the platform: no startup to wait out

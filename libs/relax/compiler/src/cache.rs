@@ -2651,6 +2651,25 @@ impl Cache {
         Some(k)
     }
 
+    /// `makepad run`'s type check of crate `c`'s every body (run.rs up front for the app's crates,
+    /// typeck_bg.rs after the first present for the others): the key of its clean verdict -- the
+    /// Relax build and options (cfg), the crate's fingerprint, which covers its loaded files and
+    /// its dependencies' fingerprints, as the code keys rest on, and `skipped`, the text of its
+    /// files the boot's selection did not load (check.rs skipped_text_hash): every file of it. A
+    /// borrowck-kind entry (record_borrowck).
+    pub fn run_typeck_key(&mut self, c: u32, skipped: u128) -> Option<u128> {
+        let fp = *self.fps.get(c as usize)?;
+        let mut h = Sip128::new();
+        h.str("run-typeck-crate");
+        h.u32(CHECK_BODY_VERSION);
+        h.u128(self.cfg);
+        h.u128(fp);
+        h.u128(skipped);
+        let k = h.finish128();
+        self.key_crate.insert(k, c);
+        Some(k)
+    }
+
     /// The verdict stored for this key (on disk, or recorded by this run).
     pub fn borrowck_stored(&self, key: u128) -> Option<StoredVerdict> {
         match self.get(key) {

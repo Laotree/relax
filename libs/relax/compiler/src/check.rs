@@ -81,6 +81,110 @@ pub fn checked_crates(prog: &crate::program::Program, root: u32, root_only: bool
     crates
 }
 
+/// The body owners of `crates` (fns with bodies, consts and statics with initializers), in
+/// definition order.
+pub(crate) fn body_owners(prog: &crate::program::Program, crates: &[u32]) -> Vec<crate::program::DefId> {
+    let mut own = vec![false; prog.crates.len()];
+    for &k in crates { own[k as usize] = true; }
+    (0..prog.defs.len()).filter(|&i| own[prog.defs[i].krate as usize]).map(|i| crate::program::DefId(i as u32))
+        .filter(|&d| !is_live_default(prog, d)).filter_map(|d| crate::borrowck::body::CheckedBody::item(prog, d)).map(|b| b.owner).collect()
+}
+
+/// The files of each crate the boot's file selection skipped (paths, sorted), as the boot left
+/// them -- with a crate's fingerprint, which covers the files the boot loaded, every file of it
+/// (cache.rs run_typeck_key). Taken before main, before the post-boot loader starts (run.rs).
+pub(crate) static BOOT_SKIPPED: std::sync::OnceLock<Vec<Vec<String>>> = std::sync::OnceLock::new();
+
+pub(crate) fn boot_skipped(prog: &crate::program::Program) -> Vec<Vec<String>> {
+    let mut out = vec![Vec::new(); prog.crates.len()];
+    for (m, f) in &prog.skipped_files {
+        out[prog.mods[*m as usize].krate as usize].push(f.0.clone());
+    }
+    for v in &mut out { v.sort_unstable(); }
+    out
+}
+
+/// The text of crate `c`'s files the boot skipped (BOOT_SKIPPED: path and content; 0: none).
+/// The selection read them already: they are in the OS's file cache.
+pub(crate) fn skipped_text_hash(c: u32) -> u128 {
+    let Some(paths) = BOOT_SKIPPED.get().and_then(|v| v.get(c as usize)).filter(|v| !v.is_empty()) else { return 0 };
+    let mut h = crate::sip::Sip128::new();
+    for p in paths {
+        h.str(p);
+        // (an unreadable file: its absence is the input, its load reports it)
+        h.u128(crate::vfs::read(p).map_or(0, |src| crate::crate_image::file_hash(p, &src)));
+    }
+    h.finish128()
+}
+
+/// `makepad run`'s type check of every body of `crates` (the app's own crates whose clean verdict
+/// is not stored: run.rs, before `main`), on MAKEPAD_RUN_JOBS threads: the checked bodies stay in
+/// the typeck query for the builds that follow. A body that fails while files the lazy selection
+/// skipped remain is checked again with every file loaded (its error may be a name in one).
+/// Returns the errors, rustc's order, follow-ons dropped; a clean crate's verdict is stored.
+pub fn run_check_crates(up: *mut Unit, crates: &[u32]) -> Vec<String> {
+    let u = unsafe { &*up };
+    let t0 = jit::wall_ns();
+    let mut keys = Vec::new();
+    let mut todo = Vec::new();
+    for &k in crates {
+        let skipped = skipped_text_hash(k);
+        let key = u.cache.as_ref().and_then(|c| unsafe { &mut *c.get() }.run_typeck_key(k, skipped));
+        let stored = key.is_some_and(|key| u.cache.as_ref().is_some_and(|c| matches!(unsafe { &*c.get() }.borrowck_stored(key), Some(crate::borrowck::lazy::StoredVerdict::Clean))));
+        if !stored {
+            todo.push(k);
+            keys.extend(key.map(|key| (k, key)));
+        }
+    }
+    RUN_CHECK[0].store(todo.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let t1 = jit::wall_ns();
+    RUN_CHECK[3].store(t1 - t0, std::sync::atomic::Ordering::Relaxed);
+    if todo.is_empty() { RUN_CHECK[2].store(t1 - t0, std::sync::atomic::Ordering::Relaxed); return Vec::new(); }
+    unsafe { jit::load_skipped_of(up, &todo) };
+    RUN_CHECK[4].store(jit::wall_ns() - t1, std::sync::atomic::Ordering::Relaxed);
+    let u = unsafe { &*up };
+    let owners = body_owners(&u.prog, &todo);
+    RUN_CHECK[1].store(owners.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let upn = up as usize;
+    let check = |&d: &crate::program::DefId| -> Option<Vec<String>> {
+        let uu = unsafe { &*(upn as *const Unit) };
+        for _ in 0..100 {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| uu.tcx.typeck(&uu.prog, d))) {
+                Ok(b) => return (!b.errors.is_empty()).then(|| b.errors.to_vec()),
+                // a constant it needed was asked of the compiler's owner thread while an earlier
+                // request held it up, or a front writer waits: checked again
+                Err(p) if crate::preempt::is_preempted(&*p) || p.is::<crate::preempt::NeedsLoad>() || p.is::<crate::preempt::OwnerBusy>() => std::thread::yield_now(),
+                Err(_) => break,
+            }
+        }
+        let def = uu.prog.def(d);
+        let pos = uu.prog.files[def.file as usize].ast.item(def.item).lo;
+        Some(vec![uu.prog.record_error(def.file, pos, "typeck", format!("internal compiler error while checking {} -- makepad run bug, report it{}", uu.prog.def_path(d), jit::take_ice_location()))])
+    };
+    let mut failed: Vec<(crate::program::DefId, Vec<String>)> = owners.iter().zip(par_map(&owners, check)).filter_map(|(d, e)| e.map(|e| (*d, e))).collect();
+    if !failed.is_empty() && unsafe { !(*up).prog.skipped_files.is_empty() } {
+        unsafe { jit::load_all_skipped(up) };
+        let again: Vec<crate::program::DefId> = failed.iter().map(|f| f.0).collect();
+        failed = again.iter().zip(par_map(&again, check)).filter_map(|(d, e)| e.map(|e| (*d, e))).collect();
+    }
+    let u = unsafe { &*up };
+    let dirty: Vec<u32> = failed.iter().map(|f| u.prog.def(f.0).krate).collect();
+    if let Some(c) = u.cache.as_ref() {
+        let c = unsafe { &mut *c.get() };
+        for (k, key) in keys { if !dirty.contains(&k) { c.record_borrowck(key, crate::borrowck::lazy::StoredVerdict::Clean); } }
+    }
+    RUN_CHECK[2].store(jit::wall_ns() - t0, std::sync::atomic::Ordering::Relaxed);
+    let mut errors: Vec<String> = failed.into_iter().flat_map(|f| f.1).collect();
+    errors.sort_by_cached_key(|e| error_position(e));
+    errors.dedup();
+    if errors.iter().any(|e| !is_follow_on(e)) { errors.retain(|e| !is_follow_on(e)); }
+    errors
+}
+
+/// The last run_check_crates: crates checked, their body owners, wall ns, of it the stored verdicts'
+/// lookup and the skipped files' load.
+pub static RUN_CHECK: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
 /// `f` over `items` on MAKEPAD_RUN_JOBS threads (at most 16), results in `items` order.
 fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let jobs = std::env::var("MAKEPAD_RUN_JOBS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0)
