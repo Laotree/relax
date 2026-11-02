@@ -232,10 +232,13 @@ fn teardown_fixture_cycles_and_retiring_thread() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-// Compile the production pool and stop_workers into the JIT fixture, with
-// only their UI/logging/priority adapters replaced. No GPU, package resolver,
+// Compile the production pool, CPU budget and stop_workers into the JIT fixture,
+// with only their UI/logging/priority adapters replaced. No GPU, package resolver,
 // external tools or copied implementation of the pool is involved.
 fn static_pool_fixture() -> String {
+    let budget = include_str!("../../../../platform/cpu_budget/src/lib.rs")
+        .replace("use makepad_relax_api::relax_api;\n", "")
+        .replace("#[relax_api]\n", "");
     let source = include_str!("../../../../platform/src/thread.rs");
     let network = source.split_once("pub use makepad_network::{").unwrap().1
         .split_once("};").unwrap().0;
@@ -298,26 +301,23 @@ fn static_pool_fixture() -> String {
             }
         }
     "#;
-    format!("{adapters}\nmod thread {{\n{runtime}\n}}\nmod restart {{\nstatic STOP_WAKER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);\npub(crate) fn stop_workers({stop}\n}}\n}}\n{STATIC_POOL_APP}")
+    format!("{adapters}\nmod makepad_cpu_budget {{\n{budget}\n}}\nmod thread {{\n{runtime}\nuse crate::makepad_cpu_budget;\npub(crate) fn fixture_pool(spawner: ThreadSpawner) -> TaskPool {{ let pool = TaskPool::create(spawner, 3).unwrap(); while pool.inner.workers.iter().any(|worker| !worker.idle.load(Ordering::Acquire)) {{ std::thread::yield_now(); }} pool }}\n}}\nmod restart {{\nstatic STOP_WAKER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);\npub(crate) fn stop_workers({stop}\n}}\n}}\n{STATIC_POOL_APP}")
 }
 
 const STATIC_POOL_APP: &str = r#"
 use std::sync::{OnceLock, atomic::{AtomicU64, Ordering}};
-use thread::{TaskPool, ThreadSpawner, PoolOptions, Lane};
+use thread::{TaskPool, ThreadSpawner, Class};
 static POOL: OnceLock<TaskPool> = OnceLock::new();
 fn static_pool_app(p: *mut u64) {
     let flags = unsafe { &*(p as *const [AtomicU64; 4]) };
     assert!(POOL.get().is_none(), "relaunch must start from its own static image");
     let spawner = ThreadSpawner::for_current_thread(4);
-    let pool = POOL.get_or_init(|| TaskPool::new(spawner.clone(), PoolOptions {
-        name: "static-pool".into(), ..PoolOptions::with_workers(3, 1)
-    }).unwrap());
-    while pool.idle_workers() != 3 { std::thread::yield_now(); }
+    let pool = POOL.get_or_init(|| thread::fixture_pool(spawner.clone()));
     flags[0].store(1, Ordering::SeqCst);
     while flags[1].load(Ordering::SeqCst) == 0 { std::thread::yield_now(); }
     restart::stop_workers(&spawner);
     assert!(!pool.is_open());
-    assert!(pool.submit(Lane::Light, || ()).is_err());
+    assert!(pool.submit(Class::Visible, || ()).is_err());
     assert!(POOL.get().is_some(), "the pool handle remains in the static");
     flags[2].store(1, Ordering::SeqCst);
 }
@@ -337,7 +337,7 @@ fn static_task_pool_relaunches_in_place_without_live_threads() {
         wait(|| flags[0].load(Ordering::SeqCst) != 0);
         let live = info(domain).unwrap();
         for index in 0..3 {
-            assert!(live.thread_names.contains(&format!("static-pool-{index}")));
+            assert!(live.thread_names.contains(&format!("makepad-pool-{index}")));
         }
         flags[1].store(1, Ordering::SeqCst);
         main.join().unwrap();
