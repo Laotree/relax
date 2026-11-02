@@ -2597,8 +2597,9 @@ pub(crate) fn const_fuel_tick() {
 thread_local! { static COV_INTERESTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 fn covtrace(msg: &str) { covtrace_with(msg, false) }
 fn covtrace_with(msg: &str, only_changed: bool) {
-    if let Some(path) = std::env::var_os("MAKEPAD_RUN_COVTRACE") {
+    if std::env::var_os("MAKEPAD_RUN_COVTRACE").is_some() {
         use std::io::Write;
+        let path = std::path::Path::new(&std::env::var_os("CARGO_TARGET_DIR").unwrap_or_default()).join("covtrace.log");
         static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
         let hits = crate::coverage::debug_hits();
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
