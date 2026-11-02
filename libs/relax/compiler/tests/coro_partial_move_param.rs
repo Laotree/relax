@@ -82,3 +82,26 @@ fn an_early_return_drops_the_whole_parameter() {
     assert_eq!(r, Ok(Vec::new()));
     assert_eq!(take(), "name,l1,l2,field");
 }
+
+#[test]
+fn a_suspended_partial_move_drops_locals_before_parameters() {
+    async fn run(_first: D, request: Req, _last: D) {
+        let _body = D("body".into());
+        let _layers = request.layers.into_iter();
+        Yield(false).await;
+    }
+
+    let waker = unsafe { Waker::from_raw(noop_raw()) };
+    let mut cx = Context::from_waker(&waker);
+    let mut f = Box::pin(run(D("first".into()), req(), D("last".into())));
+    assert!(matches!(f.as_mut().poll(&mut cx), Poll::Pending));
+    assert_eq!(take(), "", "suspension keeps the captures and locals live");
+    drop(f);
+    assert_eq!(take(), "l1,l2,body,last,name,field,first", "cancellation drops only owned fields in scope order");
+
+    block_on(run(D("first".into()), req(), D("last".into())));
+    assert_eq!(take(), "l1,l2,body,last,name,field,first", "completion drops locals before parameters in reverse parameter order");
+
+    drop(run(D("first".into()), req(), D("last".into())));
+    assert_eq!(take(), "first,name,l1,l2,field,last", "an unpolled future still owns whole captures");
+}
