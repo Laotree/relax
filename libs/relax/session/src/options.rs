@@ -232,10 +232,6 @@ pub struct Options {
     /// A live session (hot reload, watcher): `makepad run` of a working tree, `makepad live`; never
     /// from the environment. Default `false`.
     pub live: bool,
-    /// A test harness's live session keeps plain layouts: its tests rerun from scratch after
-    /// the warm restart a layout edit takes, so its code differs from a live app session's.
-    /// Never from the environment. Default `false`.
-    pub plain_layouts: bool,
     /// `MAKEPAD_RUN_MODULES_TRUSTED`; default `false`.
     pub modules_trusted: bool,
     /// `MAKEPAD_RUN_SANDBOX_NOCHECK`; default `false`.
@@ -371,7 +367,6 @@ impl Default for Options {
             unwind: true,
             no_codegen: false,
             live: false,
-            plain_layouts: false,
             modules_trusted: false,
             sandbox_nocheck: false,
             borrowck_only: None,
@@ -482,7 +477,6 @@ impl Options {
             unwind: { let os = get("MAKEPAD_RUN_UNWIND"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             no_codegen: no_codegen_env(get),
             live: false,
-            plain_layouts: false,
             modules_trusted: { let os = get("MAKEPAD_RUN_MODULES_TRUSTED"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() == Some("1") },
             sandbox_nocheck: { let os = get("MAKEPAD_RUN_SANDBOX_NOCHECK"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() == Some("1") },
             borrowck_only: { let os = get("MAKEPAD_RUN_BORROWCK_ONLY"); let v = os.and_then(|v| v.into_string().ok()); v },
@@ -573,7 +567,6 @@ impl Options {
             unwind,
             no_codegen,
             live,
-            plain_layouts,
             modules_trusted,
             sandbox_nocheck,
             borrowck_only,
@@ -697,8 +690,6 @@ impl Options {
         h.u8(*no_codegen as u8);
         h.str("live");
         h.u8(*live as u8);
-        h.str("plain_layouts");
-        h.u8(*plain_layouts as u8);
         h.str("modules_trusted");
         h.u8(*modules_trusted as u8);
         h.str("sandbox_nocheck");
@@ -940,9 +931,6 @@ mod tests {
         let fingerprint = base.fingerprint();
         let mut changed = base.clone();
         changed.live = true;
-        assert_ne!(fingerprint, changed.fingerprint());
-        changed = base.clone();
-        changed.plain_layouts = true;
         assert_ne!(fingerprint, changed.fingerprint());
         changed = base.clone();
         changed.cpu.avx = true;

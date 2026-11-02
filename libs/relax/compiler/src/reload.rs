@@ -1491,9 +1491,6 @@ fn layout_edit(u: &Unit, d: DefId, fresh: &crate::tcx::AdtT, running_discriminan
         u.tcx.tys.intern(crate::types::TyKind::Adt(d, u.tcx.tys.mk_list(&args), crate::types::RegionArgsId::EMPTY))
     };
     if !u.lay.live_editable(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, d, old, t) {
-        if crate::layout::PLAIN_LAYOUTS.load(Ordering::Relaxed) {
-            return Err(format!("struct `{}`: its layout changed; a test run keeps plain layouts (its tests rerun from scratch) -- restart the app", name));
-        }
         return Err(format!("struct `{}` keeps its first layout in a live session only when it is in the app scope, has named fields, Rust's repr and no Copy impl -- restart the app", name));
     }
     trace_sub("layout_edit_live_editable");
@@ -1752,9 +1749,6 @@ fn niche_fields(u: &Unit, d: DefId) -> Vec<usize> {
 fn enum_edit(u: &Unit, d: DefId, old: &crate::tcx::AdtT, fresh: &crate::tcx::AdtT, running_discriminants: &[u128], fresh_discriminants: &[u128]) -> Result<(crate::tcx::AdtT, Vec<String>), String> {
     let name = u.prog.def_path(d);
     if !u.lay.live_editable_enum(&crate::layout::LayoutCx::new(&u.prog), d, old) || !fresh.is_enum || fresh.n_generics != old.n_generics {
-        if crate::layout::PLAIN_LAYOUTS.load(Ordering::Relaxed) {
-            return Err(format!("enum `{}`: its layout changed; a test run keeps plain layouts (its tests rerun from scratch) -- restart the app", name));
-        }
         return Err(format!("enum `{}` keeps its first layout in a live session only when it is the program's own with Rust's repr -- restart the app", name));
     }
     let n = old.variants.len();

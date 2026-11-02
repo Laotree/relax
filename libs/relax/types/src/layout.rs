@@ -597,7 +597,7 @@ impl Layouts {
     /// edits may give fields in place -- named fields, no repr other than Rust's, not Copy (a
     /// bitwise copy would share the extension block).
     pub fn live_editable(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, d: crate::program::DefId, adt: &crate::tcx::AdtT, t: TyId) -> bool {
-        if !live_layouts() {
+        if !LIVE_SESSION.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
         }
         let prog = lcx.prog;
@@ -619,7 +619,7 @@ impl Layouts {
     /// Live sessions (M10): an enum of the program's own crate with Rust's repr, which variants
     /// may be added to in place (tagged layout, no niche).
     pub fn live_editable_enum(&self, lcx: &LayoutCx<'_>, d: crate::program::DefId, adt: &crate::tcx::AdtT) -> bool {
-        if !live_layouts() || !adt.is_enum {
+        if !LIVE_SESSION.load(std::sync::atomic::Ordering::Relaxed) || !adt.is_enum {
             return false;
         }
         let prog = lcx.prog;
@@ -1474,14 +1474,6 @@ fn packed_align(align: u32, packed: u32) -> u32 {
 
 /// A live session (`makepad run` of a working tree watches and patches the program's sources).
 pub static LIVE_SESSION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// A test harness run in a live session keeps plain layouts: its tests rerun from scratch
-/// after the warm restart a layout edit takes, so live layouts would cost every run and save none.
-pub static PLAIN_LAYOUTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub fn live_layouts() -> bool {
-    LIVE_SESSION.load(std::sync::atomic::Ordering::Relaxed) && !PLAIN_LAYOUTS.load(std::sync::atomic::Ordering::Relaxed)
-}
 
 /// The crate of the program's main (the disk cache's startup manifest is per program).
 static ROOT_CRATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
