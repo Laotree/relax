@@ -4911,13 +4911,16 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let retry_due = retry_at.is_some_and(|t| t <= Instant::now());
         let all = lost || rewatched || synced || caught_up || retry_due
             || last_scan.elapsed() >= if events.is_some() { LIVE_IDLE } else { LIVE_QUIET };
+        let backstop_only = all && !(lost || rewatched || synced || caught_up || retry_due);
         let t_round = std::time::Instant::now();
         let mut changed: Vec<usize> = Vec::new();
         let mut scanned = 0;
         if all {
             last_scan = Instant::now();
-            scanned = files.len();
             for (k, f) in files.iter_mut().enumerate() {
+                // Virtual files change only through the edits folder, which the native watch covers.
+                if backstop_only && events.is_some() && crate::vfs::is_virtual(&f.0) { continue; }
+                scanned += 1;
                 if stamp(&f.0) != f.2 {
                     changed.push(k);
                 }
