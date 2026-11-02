@@ -4926,7 +4926,10 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     let mut dock = DockGate::from_env();
     let mut startup_scan = true;
     let mut restart_required = false;
+    let mut restart_message = String::new();
     let mut revision = 0;
+    // the last two path parts say which crate and file
+    let short = |p: &str| -> String { let v: Vec<&str> = p.rsplit('/').take(2).collect(); v.into_iter().rev().collect::<Vec<_>>().join("/") };
     crate::harness::live::wait_initial();
     loop {
         crate::hot_failure::pump();
@@ -4956,6 +4959,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         if DOMAIN_LOADING.load(std::sync::atomic::Ordering::Acquire) { gate_note(1); continue; }
         let latest = DOMAIN_REVISION.load(std::sync::atomic::Ordering::Acquire);
         if latest != revision {
+            let relaunched = revision != 0;
             revision = latest;
             if let Some(next) = DOMAIN_INPUTS.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 inputs = next;
@@ -4964,10 +4968,19 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 *WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(snapshot);
             }
             let loaded = crate::owner::call(crate::owner::Class::Program, || own_files(&*up));
+            let previous: std::collections::HashMap<_, _> = std::mem::take(&mut files).into_iter().map(|(p, _, s)| (p, s)).collect();
             files = inputs.paths.iter().map(|(p, (s, _))| (p.clone(), u32::MAX, *s)).collect();
             for (path, file) in loaded {
                 if let Some(f) = files.iter_mut().find(|f| f.0 == path) { f.1 = file; }
                 else { let s = stamp(&path); files.push((path, file, s)); }
+            }
+            // Report edits the new domain loaded before the watcher could answer them.
+            if relaunched && !crate::harness::live::enabled() {
+                let changed: Vec<_> = files.iter().filter(|f| previous.get(&f.0).is_some_and(|s| s.is_some() && *s != f.2)).collect();
+                if !changed.is_empty() {
+                    let names: Vec<String> = changed.iter().take(3).map(|f| short(&f.0)).collect();
+                    patch_verified_event(&format!("{}{}: loaded by the relaunch", names.join(", "), if changed.len() > 3 { ", ..." } else { "" }), 0, &[]);
+                }
             }
             events = LiveWatch::new(files.iter().map(|f| f.0.as_str()));
             repositories = git::Repositories::default();
@@ -4977,6 +4990,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             retry_at = None;
             undos.clear();
             restart_required = false;
+            restart_message.clear();
             landing.clear();
             startup_scan = true;
         }
@@ -4986,7 +5000,30 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         if !crate::harness::live::enabled() && !jit::live_startup_done() { gate_note(2); continue; }
         // Once the tree no longer matches this session, later saves must not patch a
         // mixture of revisions into the old process. A fresh run restores live editing.
-        if restart_required { gate_note(3); continue; }
+        if restart_required {
+            gate_note(3);
+            if !crate::harness::live::enabled() {
+                let notifications = events.as_mut().and_then(|w| w.changed());
+                let lost = events.is_some() && notifications.is_none();
+                if lost { events = LiveWatch::new(files.iter().map(|f| f.0.as_str())); }
+                let ids = if lost || last_scan.elapsed() >= if events.is_some() { LIVE_IDLE } else { LIVE_QUIET } {
+                    last_scan = Instant::now();
+                    (0..files.len()).collect()
+                } else { notifications.unwrap_or_else(|| hot.clone()) };
+                let changed: Vec<_> = ids.into_iter().filter_map(|k| {
+                    let f = &files[k];
+                    let current = stamp(&f.0);
+                    (current != f.2).then_some((k, current))
+                }).collect();
+                if !changed.is_empty() {
+                    let names: Vec<String> = changed.iter().take(3).map(|&(k, _)| short(&files[k].0)).collect();
+                    let message = format!("{}{}: restart pending ({restart_message}); this edit applies with it", names.join(", "), if changed.len() > 3 { ", ..." } else { "" });
+                    patch_refused_event(&message, false, std::slice::from_ref(&message));
+                    for (k, current) in changed { files[k].2 = current; }
+                }
+            }
+            continue;
+        }
         // the startup's file scan (own_files: an owner request of 10-15 ms on Sandbox) waits until
         // the UI thread's first frames after the present are done: run right at the present, the
         // UI thread's first lazy links queued behind it (36 ms of a first post-present episode)
@@ -5197,6 +5234,13 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             for &k in &unloaded { files[k].2 = settled_stamps[k]; }
             changed = rest;
             if changed.is_empty() {
+                if !crate::harness::live::enabled() {
+                    let unloaded: Vec<_> = unloaded.into_iter().filter(|&k| !std::path::Path::new(&files[k].0).is_dir()).collect();
+                    if !unloaded.is_empty() {
+                        let names: Vec<String> = unloaded.iter().take(3).map(|&k| short(&files[k].0)).collect();
+                        patch_verified_event(&format!("{}{}: not loaded by the app (nothing to patch)", names.join(", "), if unloaded.len() > 3 { ", ..." } else { "" }), 0, &[]);
+                    }
+                }
                 continue;
             }
         }
@@ -5218,12 +5262,11 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             // a change the running process cannot take: makepad rebuilds itself in the background
             // and restarts into the new binary; the app keeps running (and patching) meanwhile
             let what = if changed.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };
-            // the last two path parts say which crate and file
-            let short = |p: &str| -> String { let v: Vec<&str> = p.rsplit('/').take(2).collect(); v.into_iter().rev().collect::<Vec<_>>().join("/") };
             let names: Vec<String> = changed.iter().take(3).map(|&k| short(&files[k].0)).collect();
             let why = format!("{} {what} changed ({}{}): {reason}", changed.len(), names.join(", "), if changed.len() > 3 { ", ..." } else { "" });
-            match host::request(why, inputs.process_paths()) {
+            match host::request(why.clone(), inputs.process_paths()) {
                 Ok(()) => {
+                    if !crate::harness::live::enabled() { patch_refused_event(&why, false, std::slice::from_ref(&why)); }
                     for &k in &changed { files[k].2 = settled_stamps[k]; }
                     continue;
                 }
@@ -5241,6 +5284,11 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             note_restart_pending(&message);
             eprintln!("makepad live: {message}");
             live_log(&format!("{{\"restart_required\":true,\"message\":{}}}", json_str(&message)));
+            if !crate::harness::live::enabled() {
+                patch_refused_event(&message, false, std::slice::from_ref(&message));
+                for &k in &changed { files[k].2 = settled_stamps[k]; }
+            }
+            restart_message = message;
             restart_required = true;
             continue;
         }
@@ -5249,6 +5297,10 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         if let Err(error) = crate::native_macros::reload(&macro_changes, (&(*up).prog.session).runtime.profile) {
             eprintln!("makepad live: {error}");
             live_log(&error);
+            if !synced && !crate::harness::live::enabled() {
+                patch_refused_event(&error, true, std::slice::from_ref(&error));
+                for &k in &changed { files[k].2 = settled_stamps[k]; }
+            }
             continue;
         }
         let saved = changed.iter().filter_map(|&k| stamp(&files[k].0).map(|s| s.0)).max();
