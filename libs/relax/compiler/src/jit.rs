@@ -23492,7 +23492,7 @@ fn lower_ahead(f: &FrontShared, id: u32, own: bool) -> u8 {
         // fn_map publishes after the slot's fields (including a decoded image identity).
         // The ahead queue can contain the id before fn_id/name_slot finishes publishing it.
         if epoch != u.tcx.collect_epoch.load(Ordering::SeqCst) || u.fn_map.get(&fn_key) != Some(id) { return AF_STALE; }
-        if !lowers_ahead(u, d, &body, own) { return AF_REFUSED; }
+        if !lowers_ahead(u, d, &body) { return AF_REFUSED; }
         {
             let mut pending = f.lowered.lock().unwrap_or_else(|e| e.into_inner());
             if f.is_built(&key) { return AF_BUILT; }
@@ -23604,24 +23604,26 @@ fn prefront_fail(why: u8) -> bool {
     false
 }
 
-/// Whether instance `d`'s body (`body`, checked) may be lowered off the unit: not a trait
-/// declaration's (virtual/derived shims), a sandbox wrapper's or a provided crate's fn (the locked
-/// path's bridge selection), and every static it names initialized already (the owner evaluates
-/// them before ordinary lowering, also those on unreachable paths: FrontShared::consts has the
-/// initialized ones). Constants come from FrontShared::consts too (evaluated by the owner
-/// already, else the lowering bails: NeedsUnit); the take checks both.
+/// Whether instance `d`'s body (`body`, checked) may be lowered off the unit: not a sandbox
+/// wrapper's or a provided crate's fn (the locked path's bridge selection), and every static it
+/// names initialized already (the owner evaluates them before ordinary lowering, also those on
+/// unreachable paths: FrontShared::consts has the initialized ones). Constants come from
+/// FrontShared::consts too (evaluated by the owner already, else the lowering bails: NeedsUnit);
+/// the take checks both.
 ///
-/// `own`: the lowering of a build that reached the source-body lowering (its own lazy compile, a
-/// background take's front): the selections above take_lowered_ahead (trait shims) are made
-/// before it is taken, so a trait's provided method lowers ahead too. The helpers' speculative
-/// lowering leaves them out. A provided crate's fn lowers ahead only when the owner's build
-/// lowers its source body too (provided_source_body); its bridge and opaque-type forwards are the
-/// owner's. (A lowering ahead that fails a provided-crate check is deferred, never an error: the
-/// Stage incident, ScriptHeap::resolve_fields failing check_provided_field ahead, predates that.)
-fn lowers_ahead(u: &Unit, d: DefId, body: &Body, own: bool) -> bool {
+/// A trait's provided method lowers ahead too, on the helpers as well as for a build's own front:
+/// its build takes the lowering only where it would lower that same source body (a selection above
+/// take_lowered_ahead -- a shim, a bridge, a provided type's fmt/hash -- leaves it untaken, never
+/// used). (Left to the owner, the provided methods
+/// of a cold Fab -- `Iterator::collect`, `PartialEq::ne`, the script hooks' defaults -- were lowered
+/// in its fronts: 2.2k bodies before the first present.) A provided crate's fn lowers ahead only
+/// when the owner's build lowers its source body too (provided_source_body); its bridge and
+/// opaque-type forwards are the owner's. (A lowering ahead that fails a provided-crate check is
+/// deferred, never an error: the Stage incident, ScriptHeap::resolve_fields failing
+/// check_provided_field ahead, predates that.)
+fn lowers_ahead(u: &Unit, d: DefId, body: &Body) -> bool {
     let def = u.prog.def(d);
     !(!matches!(def.kind, DefKind::Fn | DefKind::AssocFn)
-        || !own && (def.parent != crate::program::NO_DEF && u.prog.def(def.parent).kind == DefKind::Trait)
         || crate::sandbox::is_wrapper_crate(def.krate)
         || !provided_source_body(u, d)
         || !statics_ready(u, body))
@@ -23681,7 +23683,7 @@ fn lower_ahead_as(u: &Unit, into: u32, base: u32, d: DefId, args: &[TyId], epoch
         let _plain = PlainLower::enter(plain.map(|t| (base, t)));
         // an instance that does not normalize is the locked build's to report
         let Some(body) = crate::typeck::try_codegen_body(&u.prog, &u.tcx, d, args) else { return Err("body does not normalize".to_string()) };
-        if plain.is_some() && !lowers_ahead(u, d, &body, true) { return Err("not lowered ahead".to_string()) }
+        if plain.is_some() && !lowers_ahead(u, d, &body) { return Err("not lowered ahead".to_string()) }
         LOWER_AHEAD_IDS.with(|a| a.borrow_mut().body = Some(body.clone()));
         let (func, closures) = lower_checked_body(u, base, &fn_key, &body)?;
         let (callees, consts, tls) = LOWER_AHEAD_IDS.with(|a| { let mut a = a.borrow_mut(); (std::mem::take(&mut a.keys), std::mem::take(&mut a.consts), std::mem::take(&mut a.tls)) });
