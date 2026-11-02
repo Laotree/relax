@@ -891,6 +891,16 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             // session going on, not a re-run: it drops the added flag and stays live
             unsafe { std::env::set_var("MAKEPAD_RUN_SELF_EXEC_SILENT_ADDED", "1") };
         }
+        // the re-run is this workspace's program wherever the spawn puts its working folder
+        // (a test that runs itself in a scratch folder); after the added `--silent`, which an
+        // exec finds at index 2 (std process.rs)
+        if pre.len() > 1 && !pre.iter().any(|a| a == "--workspace-dir") {
+            let ws = workspace_dir();
+            let ws = std::path::absolute(&ws).map(|p| p.display().to_string()).unwrap_or(ws);
+            let at = if pre.get(2).is_some_and(|a| a == "--silent") { 3 } else { 2 };
+            pre.insert(at, ws);
+            pre.insert(at, "--workspace-dir".to_string());
+        }
         for j in 1..pre.len() {
             if pre[j - 1] == "--units" && !std::path::Path::new(&pre[j]).is_absolute() {
                 pre[j] = format!("{}/{}", workspace_dir(), pre[j]);
