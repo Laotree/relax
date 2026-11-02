@@ -1302,16 +1302,18 @@ impl Arena {
             os::huge_pages(address, len, false);
         }
     }
-    /// Domain heaps (Linux with transparent huge pages): a program heap's chunks are reserved
-    /// without huge pages, and only dense ones get them. A thread keeps a current chunk per size
-    /// class, so a program with 37 threads held 1212 chunks with 166 MB carved (Scope); with huge
-    /// pages everywhere, khugepaged turned every one of them into 2 MB resident (2-2.4 GB for 100
-    /// MB in use), while huge pages are worth having on dense heap data (Sandbox race UI-thread
-    /// CPU). Each pass marks for huge pages, and collapses at once: a thread's current chunk carved
-    /// at least half way, another small chunk at least half full of live blocks, a large block of a
-    /// whole 2 MB or more. A marked chunk no thread allocates in that fell under 1/8 live loses its
-    /// mark (the trim's page release then shrinks it). At most `budget` collapses per pass.
-    /// Returns the collapses done.
+    /// Domain heaps, once a second on every platform: the next trim epoch starts (each thread
+    /// settles its current chunks again, `owned_tick`) and the current chunks of threads blocked in
+    /// a wait are settled for them (`settle_for_waiting_owner`). With transparent huge pages
+    /// (Linux), a program heap's chunks are reserved without huge pages, and only dense ones get
+    /// them. A thread keeps a current chunk per size class, so a program with 37 threads held 1212
+    /// chunks with 166 MB carved (Scope); with huge pages everywhere, khugepaged turned every one of
+    /// them into 2 MB resident (2-2.4 GB for 100 MB in use), while huge pages are worth having on
+    /// dense heap data (Sandbox race UI-thread CPU). Each pass marks for huge pages, and collapses
+    /// at once: a thread's current chunk carved at least half way, another small chunk at least
+    /// half full of live blocks, a large block of a whole 2 MB or more. A marked chunk no thread
+    /// allocates in that fell under 1/8 live loses its mark (the trim's page release then shrinks
+    /// it). At most `budget` collapses per pass. Returns the collapses done.
     pub fn densify(&self, budget: usize) -> usize {
         let base = self.base.load(Ordering::Relaxed);
         if !self.dynamic || base == 0 {
@@ -1372,7 +1374,8 @@ impl Arena {
     /// unlisted (full)], columns [chunks, touched bytes, live slot bytes, resident bytes]; then
     /// [large runs, committed, resident]; then [sparse chunks (live slots under 1/8 of touched),
     /// their resident bytes]; then [chunks committed before the last `mark_old`, their live slot
-    /// bytes, their resident bytes] (`memory`'s arena states).
+    /// bytes, their resident bytes]; then the free granules and the requested bytes of attached
+    /// chunks; then the requested bytes of the large blocks (`memory`'s arena states).
     /// Does block `p` (of this arena) lie in a chunk marked old (`mark_old`)?
     pub fn is_old(&self, p: *const u8) -> bool {
         let base = self.base.load(Ordering::Relaxed);
@@ -1398,8 +1401,8 @@ impl Arena {
             HAND_BACK.fetch_add(1, Ordering::Relaxed);
         }
     }
-    pub fn states(&self) -> [usize; 28] {
-        let mut c = [0usize; 28];
+    pub fn states(&self) -> [usize; 29] {
+        let mut c = [0usize; 29];
         let base = self.base.load(Ordering::Relaxed);
         if base == 0 {
             return c;
@@ -1414,6 +1417,10 @@ impl Arena {
                 c[16] += 1;
                 c[17] += s.committed;
                 c[18] += res;
+                // the requested bytes of the live large block (a warm run: none)
+                if !s.released {
+                    c[28] += h.account.load(Ordering::Relaxed).wrapping_sub(h.remote_bytes.load(Ordering::Relaxed)) as isize as usize;
+                }
                 continue;
             }
             let (row, bump, live) = if s.released {
@@ -2668,7 +2675,7 @@ pub fn detail() -> (usize, usize, usize, usize) {
 pub fn census() -> [usize; 11] {
     DEFAULT.census()
 }
-pub fn states() -> [usize; 28] {
+pub fn states() -> [usize; 29] {
     DEFAULT.states()
 }
 pub fn mark_old() {
