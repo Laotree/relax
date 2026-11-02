@@ -19578,6 +19578,13 @@ pub(crate) fn solver_work_report_at_exit() {
     }
 }
 
+/// The application is about to submit its first window frame (platform hal event loop): waits
+/// for the app check running beside main (check.rs wait_app_check); an error it finds ends the
+/// run before the frame.
+pub extern "C" fn relax_before_first_frame() {
+    crate::jit::host_boundary("relax_before_first_frame", crate::check::wait_app_check)
+}
+
 /// Notify the loader that the application or its embedder presented a frame.
 pub extern "C" fn relax_first_present() {
     crate::jit::host_boundary("relax_first_present", move || {
@@ -21408,6 +21415,7 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_fork_exec_done" => Some(crate::forkexec::relax_fork_exec_done as *const () as usize),
         b"relax_allocator_swap" => Some(relax_allocator_swap as *const () as usize),
         b"relax_set_panic_hook" => Some(relax_set_panic_hook as *const () as usize),
+        b"relax_before_first_frame" => Some(relax_before_first_frame as *const () as usize),
         b"relax_first_present" => Some(relax_first_present as *const () as usize),
         b"relax_frame_done" => Some(crate::postframe::relax_frame_done as *const () as usize),
         b"relax_quit_requested" => Some(crate::run::relax_quit_requested as *const () as usize),
