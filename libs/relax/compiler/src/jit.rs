@@ -672,8 +672,9 @@ impl CodeTables {
         }
     }
 
-    /// The slots the O3 body at `start` inlined (None: not recorded: O1 / O2 / baseline code,
-    /// whose inlined slots are the slot's body_deps).
+    /// The slots inlined by the body at `start`: bodies built in this run (from their RIR,
+    /// O3 bodies from their own list), or O3 bodies linked from the cache or startup image.
+    /// None: other linked code, or a body that inlined nothing.
     pub fn inlined_at(&self, start: u64) -> Option<&[u32]> {
         self.inlined.get(&start).map(|b| &b[..])
     }
@@ -6900,6 +6901,18 @@ impl Unit {
         self.mark_interpreted(id, at);
         if redirect.is_none() {
             self.index_code(at, code.len() as u32, id, info);
+            // every non-O3 build uses the slot's RIR; linked code's RIR may be another build's
+            if code_as_now().is_none_or(|k| !matches!(k.origin, origin::CACHE | origin::IMAGE) && !matches!(k.tier, tier::O3 | tier::STUB)) {
+                if let Some(rir) = &self.fns[id as usize].rir {
+                    let mut inl_slots = rir.inl_slots.clone();
+                    inl_slots.sort_unstable();
+                    inl_slots.dedup();
+                    inl_slots.retain(|&s| s != id);
+                    if !inl_slots.is_empty() {
+                        self.code.write().unwrap_or_else(|e| e.into_inner()).note_inlined(at, &inl_slots);
+                    }
+                }
+            }
         }
         if redirect.is_none() {
             code_growth(if twin { GROW_MODULE } else if gen > 0 { GROW_PATCH } else { GROW_FIRST }, code.len());
