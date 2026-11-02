@@ -67,7 +67,7 @@ impl DomainHeap {
         self.inner.arena.detail()
     }
     /// Chunk states with resident bytes (arena.rs `states`).
-    pub fn states(&self) -> [usize; 28] {
+    pub fn states(&self) -> [usize; 29] {
         self.inner.arena.states()
     }
     pub fn range(&self) -> (usize, usize) {
@@ -213,8 +213,9 @@ pub fn trim_all() {
     }
 }
 
-/// Every live domain heap gives its dense chunks huge pages and takes them from sparse ones
-/// (arena.rs `densify`); at most `budget` collapses per heap. Returns the collapses done.
+/// Every live domain heap's once-a-second pass (arena.rs `densify`): its next trim epoch, the
+/// waiting threads' current chunks settled, and (Linux) huge pages for dense chunks, taken from
+/// sparse ones; at most `budget` collapses per heap. Returns the collapses done.
 pub fn densify_all(budget: usize) -> usize {
     lease().iter().flatten().map(|h| h.arena.densify(budget)).sum()
 }
