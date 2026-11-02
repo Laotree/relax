@@ -173,12 +173,10 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
                 return 101;
             }
         };
-        if !h.is_empty() {
-            let mut sel = vec!["--bins".to_string()];
-            if !b.is_empty() {
-                sel.extend(h.iter().flat_map(|n| ["--bin".to_string(), n.clone()]));
-            }
-            runs.push((sel, None));
+        // Each target needs its own process: the harness shares dependency
+        // statics, environment and background threads across a target graph.
+        for n in h {
+            runs.push((vec!["--bins".to_string(), "--bin".to_string(), n], None));
         }
         for (n, path) in p {
             runs.push((vec!["--bins".to_string(), "--bin".to_string(), n], Some(path)));
@@ -192,12 +190,8 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
                 return 101;
             }
         };
-        if !h.is_empty() {
-            if t.is_empty() {
-                runs.push((vec!["--tests".to_string()], None));
-            } else {
-                runs.push((h.iter().flat_map(|n| ["--test".to_string(), n.clone()]).collect(), None));
-            }
+        for n in h {
+            runs.push((vec!["--test".to_string(), n], None));
         }
         for (n, path) in p {
             runs.push((vec!["--test".to_string(), n], Some(path)));
