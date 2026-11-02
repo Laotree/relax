@@ -161,6 +161,33 @@ pub fn run_check_crates(up: *mut Unit, crates: &[u32]) -> Vec<String> {
         let pos = uu.prog.files[def.file as usize].ast.item(def.item).lo;
         Some(vec![uu.prog.record_error(def.file, pos, "typeck", format!("internal compiler error while checking {} -- makepad run bug, report it{}", uu.prog.def_path(d), jit::take_ice_location()))])
     };
+    // the crates' impl soundness checks (unsafety::run_crate_impl_errors, part of every body's
+    // check in run mode) once per crate, impl by impl on these threads, before the bodies: else
+    // each thread reaching a crate's first bodies before the first finished ran all of them
+    let u = unsafe { &*up };
+    let epoch = u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst);
+    let admitted: Vec<u32> = todo.iter().copied().filter(|&k| crate::borrowck::event::admit(&u.prog, k)).collect();
+    if !crate::lint::enabled() && !admitted.is_empty() {
+        let impls = crate::unsafety::crate_impls(&u.prog, &admitted);
+        let parts = par_map(&impls, |&(_, d)| {
+            let uu = unsafe { &*(upn as *const Unit) };
+            for _ in 0..100 {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::unsafety::impl_errors(&uu.prog, &uu.tcx, d))) {
+                    Ok(r) => return r,
+                    Err(p) if crate::preempt::is_preempted(&*p) || p.is::<crate::preempt::NeedsLoad>() || p.is::<crate::preempt::OwnerBusy>() => std::thread::yield_now(),
+                    // (a crate whose checks panic is left to its bodies' checks, which report it)
+                    Err(_) => break,
+                }
+            }
+            None
+        });
+        for &k in &admitted {
+            let mine: Vec<&Option<Vec<String>>> = impls.iter().zip(&parts).filter(|((c, _), _)| *c == k).map(|(_, p)| p).collect();
+            if mine.iter().all(|p| p.is_some()) {
+                crate::unsafety::store_crate_impl_errors(k, epoch, mine.into_iter().flat_map(|p| p.iter().flatten().cloned()).collect());
+            }
+        }
+    }
     let mut failed: Vec<(crate::program::DefId, Vec<String>)> = owners.iter().zip(par_map(&owners, check)).filter_map(|(d, e)| e.map(|e| (*d, e))).collect();
     if !failed.is_empty() && unsafe { !(*up).prog.skipped_files.is_empty() } {
         unsafe { jit::load_all_skipped(up) };
