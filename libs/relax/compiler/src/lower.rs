@@ -13433,10 +13433,25 @@ fn dense_live_check(f: &Func, c: &Coro, nv: usize, seen: &[bool], known: &[Optio
     }
 }
 
+fn coro_transform_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_TRACE").is_ok_and(|v| v.split(',').any(|x| x == "coro")))
+}
+
+fn coro_trace_level() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("MAKEPAD_RUN_CORO_TRACE").as_deref() { Ok("2") => 2, Ok("3") => 3, _ => 0 })
+}
+
+fn coro_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_CORO_TRACE").is_some())
+}
+
 fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32) -> Result<(u32, u32, u64), String> {
     use relax_backend::regalloc::{term_uses, uses_defs};
     // MAKEPAD_RUN_TRACE=coro: the transform's sizes and phase times (coro-transform line)
-    let tr = std::env::var("MAKEPAD_RUN_TRACE").is_ok_and(|v| v.split(',').any(|x| x == "coro"));
+    let tr = coro_transform_trace();
     let t_start = std::time::Instant::now();
     let mut t_ph: Vec<(&str, f64)> = Vec::new();
     let mut mark = |name: &'static str| if tr { t_ph.push((name, t_start.elapsed().as_secs_f64() * 1e3)); };
@@ -13993,7 +14008,7 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32) -> Result<(u32, u
     };
     mark("gen/kill");
     // MAKEPAD_RUN_CORO_TRACE=2: why each slot is saved at each point (3: slots of 1 MB and more)
-    let coro_why = match std::env::var("MAKEPAD_RUN_CORO_TRACE").as_deref() { Ok("2") => 2, Ok("3") => 3, _ => 0 };
+    let coro_why = coro_trace_level();
     for (k, &(pend, resume, cancel)) in c.suspends.iter().enumerate() {
         let mut vs = Vec::new();
         let mut sv = vec![0u64; wd];
@@ -14301,7 +14316,7 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32) -> Result<(u32, u
     }
     let size = end;
     // MAKEPAD_RUN_CORO_TRACE: the saved slots and values of each coroutine
-    if std::env::var_os("MAKEPAD_RUN_CORO_TRACE").is_some() {
+    if coro_trace() {
         for s in 0..ns {
             if !saved_at[s].is_empty() {
                 eprintln!("coro {:?} slot {} size {} saved at {:?} variant {:?} offset {:?}", c.ct, s, f.slots[s].size, saved_at[s], variant_of[s], slot_off[s]);

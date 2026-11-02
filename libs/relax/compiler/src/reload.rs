@@ -58,8 +58,24 @@ static TRACE: TraceCell = TraceCell;
 thread_local! {
     static TRACE_INPUT: std::cell::Cell<(f64, f64, usize)> = const { std::cell::Cell::new((0.0, 0.0, 0)) };
 }
+
+pub(crate) fn reload_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_RELOAD_TRACE").is_some())
+}
+
+fn stream_timing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_STREAM_TIMING").is_some())
+}
+
+fn live_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some())
+}
+
 pub(crate) fn trace_input(watch_ms: f64, read_ms: f64, scanned: usize) {
-    if std::env::var_os("MAKEPAD_RUN_RELOAD_TRACE").is_some() {
+    if reload_trace() {
         TRACE_INPUT.with(|s| s.set((watch_ms, read_ms, scanned)));
     }
 }
@@ -115,7 +131,7 @@ impl ReloadTrace {
 }
 impl TraceTransaction {
     fn begin(files: usize) -> Self {
-        if std::env::var_os("MAKEPAD_RUN_RELOAD_TRACE").is_some() {
+        if reload_trace() {
             let now = Instant::now();
             let (watch, read, scanned) = TRACE_INPUT.with(|s| s.replace((0.0, 0.0, 0)));
             let mut state = ReloadTrace { started: Some(now), last: Some(now), cpu_last: relax_backend::cpu_ns(), ..Default::default() };
@@ -1006,7 +1022,7 @@ fn compose_partial(prog: &Program, old_file: u32, new_src: &[u8]) -> Option<(Vec
         }
     }
     prog.parse_version(old_file, path, text.clone()).ok()?;
-    if std::env::var_os("MAKEPAD_RUN_STREAM_TIMING").is_some() {
+    if stream_timing() {
         eprintln!("makepad-run stream: compose_partial {} bytes {:.3} ms", new_src.len(), ms(started));
     }
     Some((text, kept))
@@ -1308,7 +1324,7 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
                 let raw = |pf: &crate::parser::ParsedFile, lo: u32, hi: u32| -> Vec<u8> { norm_generated(&pf.src[lo as usize..hi as usize]).into_iter().filter(|c| !c.is_ascii_whitespace()).collect() };
                 let sig_same = if gen { raw(old, la, body_a) == raw(new, lb, body_b) } else { same_toks(old, la, body_a, &[], new, lb, body_b, &[]) };
                 if !attrs_same || !sig_same {
-                    if std::env::var_os("MAKEPAD_RUN_RELOAD_TRACE").is_some() {
+                    if reload_trace() {
                         let sh = |v: Vec<Vec<u8>>| v.iter().map(|x| String::from_utf8_lossy(x).into_owned()).collect::<Vec<_>>().join(" ");
                         eprintln!("reload: signature of `{}` (attrs same {}):\n  old: {}\n  new: {}", name, attrs_same, sh(toks_norm(old, la, body_a, &[])), sh(toks_norm(new, lb, body_b, &[])));
                         if !attrs_same {
@@ -1327,7 +1343,7 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
             (ItemKind::Const(_, ea), ItemKind::Const(_, eb)) if ea.is_some() && eb.is_some() => {
                 let (ea, eb) = (oa.expr(ea.get().unwrap()), na.expr(eb.get().unwrap()));
                 if !attrs_same || toks_norm(old, la, ea.lo, &[]) != toks_norm(new, lb, eb.lo, &[]) {
-                    if std::env::var_os("MAKEPAD_RUN_RELOAD_TRACE").is_some() {
+                    if reload_trace() {
                         let sh = |v: Vec<Vec<u8>>| v.iter().map(|x| String::from_utf8_lossy(x).into_owned()).collect::<Vec<_>>().join(" ");
                         eprintln!("reload: type of const `{}` (attrs same {}; old {}..{} of {}, new {}..{} of {}):\n  old: {}\n  new: {}", name, attrs_same, la, ea.lo, old.src_len, lb, eb.lo, new.src_len,
                             sh(toks_norm(old, la, ea.lo, &[])).chars().take(600).collect::<String>(), sh(toks_norm(new, lb, eb.lo, &[])).chars().take(600).collect::<String>());
@@ -1383,7 +1399,7 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
     if why.is_empty() {
         Ok(Plan { pairs, changes: out, added: plan_added, removed: plan_removed, removed_uses, attributes_changed })
     } else {
-        if std::env::var_os("MAKEPAD_RUN_RELOAD_TRACE").is_some() {
+        if reload_trace() {
             // which items paired and which did not, with their keys (a restart that the
             // source does not explain is a difference between the two parses)
             let (ko, kn) = (item_keys(old), item_keys(new));
@@ -2704,7 +2720,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         u.flush_cache_records();
         let wait_from = jit::wall_ns();
         let fw = jit::front_write();
-        if std::env::var_os("MAKEPAD_RUN_FRONT_TRACE").is_some() {
+        if jit::front_trace() {
             let now = jit::wall_ns();
             eprintln!("reload-front-wait: {:.1} ms (t={:.0}..{:.0} ms)", (now - wait_from) as f64 / 1e6, wait_from as f64 / 1e6, now as f64 / 1e6);
         }
@@ -4604,7 +4620,7 @@ pub(crate) fn stamp(path: &str) -> Option<(std::time::SystemTime, u64)> {
 
 fn gate_note(g: u8) {
     static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
-    if LAST.swap(g, Ordering::Relaxed) != g && std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() {
+    if LAST.swap(g, Ordering::Relaxed) != g && live_trace() {
         eprintln!("makepad live: watcher gate {} at t={:.0} ms", ["open", "domain loading", "no first present", "restart required"][g as usize], crate::clock::ms_since_start());
     }
 }
@@ -4713,7 +4729,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     let mut pending: Vec<PendingPatch> = Vec::new();
     // a save is seen within 100 ms (a restart's whole budget is 1 s); one round is a stat per
     // watched file (MAKEPAD_RUN_LIVE_TRACE=1 prints its cost once)
-    let mut traced = std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_none();
+    let mut traced = !live_trace();
     // the hot set: the program's own package (its root crate's directory) and every file saved
     // this session, polled every 5 ms (a few stats); every file is polled every 100 ms
     let mut hot: Vec<usize> = {
@@ -4814,7 +4830,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             loads_seen = loads;
             let t_own = Instant::now();
             let loaded = crate::owner::call(crate::owner::Class::Program, || own_files(&*up));
-            if std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() { eprintln!("makepad live: rewatch (loads {loads}, startup scan {rewatched}): own files in {:.1} ms at t={:.0} ms", t_own.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start()); }
+            if live_trace() { eprintln!("makepad live: rewatch (loads {loads}, startup scan {rewatched}): own files in {:.1} ms at t={:.0} ms", t_own.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start()); }
             let known: std::collections::HashMap<_, _> = files.iter().enumerate().map(|(i, f)| (f.0.clone(), i)).collect();
             let mut added = Vec::new();
             for (path, file) in loaded {
@@ -4822,7 +4838,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 else { added.push((path, file)); }
             }
             if !added.is_empty() {
-                if std::env::var_os("MAKEPAD_RUN_DEFERRED_TRACE").is_some() { eprintln!("makepad live: watching {} more file(s) the post-boot loader loaded", added.len()); }
+                if jit::deferred_trace() { eprintln!("makepad live: watching {} more file(s) the post-boot loader loaded", added.len()); }
                 for (p, i) in added { let st = stamp(&p); files.push((p, i, st)); }
                 repositories.include(files.iter().map(|f| f.0.as_str()));
                 events = watch_events::Watch::new(files.iter().map(|f| f.0.as_str()));
@@ -4831,7 +4847,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         }
         let t_dr = Instant::now();
         drain_streams(up);
-        if std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() && t_dr.elapsed().as_millis() > 20 { eprintln!("makepad live: drain_streams took {:.1} ms at t={:.0} ms", t_dr.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start()); }
+        if live_trace() && t_dr.elapsed().as_millis() > 20 { eprintln!("makepad live: drain_streams took {:.1} ms at t={:.0} ms", t_dr.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start()); }
         if !pending.is_empty() {
             for (o, n) in settle_verdicts(up, &mut pending, &mut undos) {
                 for f in files.iter_mut() {
@@ -4860,7 +4876,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         }
         let t_ev = Instant::now();
         let notifications = events.as_mut().and_then(|w| w.changed());
-        if t_ev.elapsed().as_millis() > 20 && std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() { eprintln!("makepad live: events drain took {:.1} ms", t_ev.elapsed().as_secs_f64() * 1e3); }
+        if t_ev.elapsed().as_millis() > 20 && live_trace() { eprintln!("makepad live: events drain took {:.1} ms", t_ev.elapsed().as_secs_f64() * 1e3); }
         let lost = events.is_some() && notifications.is_none();
         if lost { events = watch_events::Watch::new(files.iter().map(|f| f.0.as_str())); }
         // a sync moved the dock app's checkout: every file is compared with what runs
@@ -4913,7 +4929,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             continue;
         }
         let seen = std::time::Instant::now();
-        if std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() { eprintln!("makepad live: a change seen at t={:.0} ms ({} file(s))", crate::clock::ms_since_start(), changed.len()); }
+        if live_trace() { eprintln!("makepad live: a change seen at t={:.0} ms ({} file(s))", crate::clock::ms_since_start(), changed.len()); }
         // from the save on, the post-boot loader keeps off the unit (the read below
         // compares with the running text on it)
         for &k in &changed {

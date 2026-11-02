@@ -1750,6 +1750,11 @@ fn add_fuel(f: &mut Func, words: VReg, site: Sym, panic_site: Sym, pos0: u64, co
     }
 }
 
+fn sandbox_dump() -> Option<&'static str> {
+    static VALUE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    VALUE.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_SANDBOX_DUMP").ok())).as_deref()
+}
+
 /// The code of a twin (on the owner thread): the base slot's RIR, transformed.
 pub unsafe fn twin_rir(up: *mut Unit, id: u32, base: u32) -> Result<Func, String> {
     if base == u32::MAX {
@@ -1769,8 +1774,8 @@ pub unsafe fn twin_rir(up: *mut Unit, id: u32, base: u32) -> Result<Func, String
     let mut f = jit::sandbox_source_rir(up, base)?;
     transform(up, &mut f, id)?;
     // MAKEPAD_RUN_SANDBOX_DUMP=<substring>: the transformed RIR of matching twins
-    if let Ok(pat) = std::env::var("MAKEPAD_RUN_SANDBOX_DUMP") {
-        if f.name.contains(&pat) {
+    if let Some(pat) = sandbox_dump() {
+        if f.name.contains(pat) {
             eprintln!("sandbox twin {} ({} insts):\n{}", f.name, relax_codegen::opt::inst_count(&f), f.dump());
         }
     }

@@ -7964,6 +7964,14 @@ fn slotcoal_trace() -> bool {
     *T.get_or_init(|| std::env::var_os("MAKEPAD_RUN_SLOTCOAL_TRACE").is_some())
 }
 
+fn slotcoal_dump() -> Option<&'static str> {
+    static VALUE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    VALUE.get_or_init(|| {
+        let _k = relax_session::phase::kept();
+        std::env::var("MAKEPAD_RUN_SLOTCOAL_DUMP").ok()
+    }).as_deref()
+}
+
 /// Slot coalescing along whole copies (O3): `Copy(C <- B)` of one slot's bytes into an equal slot
 /// (or of the whole of the smaller one into, or out of, the start of a larger one: an `Option<T>`
 /// payload or a tuple's first field moved to a slot of its own -- the smaller slot becomes the
@@ -7986,7 +7994,7 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
         if ns < 2 {
             return any;
         }
-        if slotcoal_trace() && std::env::var("MAKEPAD_RUN_SLOTCOAL_DUMP").is_ok_and(|n| f.name.contains(&n)) {
+        if slotcoal_trace() && slotcoal_dump().is_some_and(|n| f.name.contains(n)) {
             eprintln!("slotcoal {}: round {} RIR\n{}", f.name, _round, f.dump());
         }
         let sc = slot_scan(f);

@@ -2152,6 +2152,11 @@ pub fn set_main_host(host: MainHost) {
     let _ = MAIN_HOST.set(host);
 }
 
+fn link_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_LINK_TRACE").is_some())
+}
+
 /// (name, framework) of every `#[link(name = .., kind = ..)]` on an extern block whose items
 /// are active (got definitions), or an empty link-only block without a cfg; files from
 /// `first_file` on.
@@ -2206,7 +2211,7 @@ pub(crate) fn link_attr_libs(prog: &crate::program::Program, first_file: usize) 
                     }
                     k += 1;
                 }
-                if std::env::var_os("MAKEPAD_RUN_LINK_TRACE").is_some() {
+                if link_trace() {
                     let item_attrs: Vec<String> = f.ast.list(it.attrs).iter().map(|x| (x.toks.lo..x.toks.hi).map(|t| f.tok_text(t)).collect::<Vec<_>>().join(" ")).collect();
                     eprintln!("makepad-run link: {} holds={} in {} (item attrs {:?})", name, holds, prog.file_paths[fi], item_attrs);
                 }
@@ -2710,7 +2715,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                     let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
                     let t = Instant::now();
                     let r = mid_flush(quiet, record);
-                    if crate::memstat::enabled() || std::env::var_os("MAKEPAD_RUN_CACHE_TRACE").is_some() {
+                    if crate::memstat::enabled() || crate::cache::trace_on() {
                         verbose!("makepad-run cache: mid-run write at t={:.0} ms: {:?} (entries, front images) in {:.1} ms", crate::clock::ms_since_start(), r, t.elapsed().as_secs_f64() * 1e3);
                     }
                     busy.store(false, Ordering::SeqCst);
@@ -3170,6 +3175,11 @@ static MID_MANIFEST_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 /// Compile totals since boot, the startup list for the aot levels, and the JSON report.
 /// jit::wall_ns() when main was called (MAKEPAD_RUN_MAIN_COMPILE_LOG's time base)
 static MAIN_START_WALL: AtomicU64 = AtomicU64::new(0);
+
+/// Wall ns (jit::wall_ns) the program's main began at (0: not yet).
+pub(crate) fn main_start_wall() -> u64 {
+    MAIN_START_WALL.load(Ordering::Relaxed)
+}
 
 /// Front images, crate records and the collected graph describe the sources the run booted
 /// from. A live session records them too, until its first edit: from then on the Program holds
