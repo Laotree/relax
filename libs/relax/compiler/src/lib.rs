@@ -1184,6 +1184,7 @@ fn cmd_resolve(sess: &std::sync::Arc<crate::Session>, units_path: &str) {
             Ok(k) => {
                 prog.crates[k as usize].proc_macro = c.proc_macro;
                 prog.crates[k as usize].is_bin = c.bin;
+                prog.crates[k as usize].harness = c.harness;
                 crate_of[ci] = k;
             }
             Err(e) => {
