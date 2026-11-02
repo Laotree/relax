@@ -1091,7 +1091,10 @@ impl Resolver {
                 }
             }
         }
-        Err(format!("package `{}` is not a member of the workspace at {}", package, self.ws.root))
+        Err(format!(
+            "package `{}` is not a member of the workspace at {}: no member or path dependency there has that name (check the name; a private repository's package needs that repository checked out under apps/, e.g. apps/commercial)",
+            package, self.ws.root
+        ))
     }
 }
 
