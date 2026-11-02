@@ -19,6 +19,8 @@ pub struct CrateUnit {
     pub proc_macro: bool,
     /// the unit is a binary target (its `main` is checked)
     pub bin: bool,
+    /// built with `--test` (GraphUnit::harness): no entry point of its own
+    pub harness: bool,
     pub build_script: bool,
     /// package version from cargo's pkg_id ("1.15.1")
     pub version: String,
@@ -266,7 +268,7 @@ pub fn load_units(path: &str) -> Result<Vec<CrateUnit>, String> {
             None => String::new(),
         };
         map.push(out.len());
-        out.push(CrateUnit { name, src_path, edition, features, deps, host: None, proc_macro: kind_pm, bin: false, build_script, version, registry: !pkg.starts_with("path+") });
+        out.push(CrateUnit { name, src_path, edition, features, deps, host: None, proc_macro: kind_pm, bin: false, harness: false, build_script, version, registry: !pkg.starts_with("path+") });
     }
     // remap dependency indices to deduplicated crate indices; drop build-script deps
     for c in out.iter_mut() {
