@@ -246,8 +246,10 @@ fn static_pool_fixture() -> String {
         pub mod ui_hang {
             pub struct UiPhase;
             pub struct UiPhaseGuard;
+            pub struct UiIdleGuard;
             pub fn ui_phase() {}
             pub fn ui_event_phase() {}
+            pub fn ui_idle() -> UiIdleGuard { UiIdleGuard }
             pub mod relax_timeline {
                 pub struct Hooks {
                     pub begin: fn(*const u8, usize),
