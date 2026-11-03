@@ -3122,13 +3122,35 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // has real errors (those alone refuse it).
     if errs.is_empty() {
         let mut default_restart = Vec::new();
+        let mut default_errs = Vec::new();
         for (d, name, c) in added_defaults {
-            if (&*up).const_addr_shared(c, Vec::new()).is_none() {
+            // The derive runs the initial value where its `vm` is bound; the const the front makes
+            // of it binds nothing. One that names `vm` is never evaluated here (its build fails), and
+            // any other error in it is the edit's own.
+            let checked = {
                 let u = &*up;
-                default_restart.push(format!("struct `{}`: field `{}` added; its `#[rust(..)]` initial value is its derive's code (it may name the derive's `vm`), running values cannot take it -- restart the app", u.prog.def_path(d), u.prog.syms.str(name)));
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::checked_body(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, c, &[])))
+            };
+            let names_vm = match &checked {
+                Ok(b) if !b.errors.is_empty() && b.errors.iter().all(|e| e.contains("E0425: cannot find value `vm` in this scope")) => true,
+                Ok(b) if !b.errors.is_empty() => {
+                    default_errs.extend(b.errors.iter().cloned());
+                    continue;
+                }
+                Ok(_) => false,
+                Err(p) => {
+                    default_errs.push(format!("internal compiler error type-checking {} ({}) -- makepad run bug, report it", (&*up).prog.def_path(c), crate::lifeline::panic_line(&*p)));
+                    continue;
+                }
+            };
+            if names_vm || (&*up).const_addr_shared(c, Vec::new()).is_none() {
+                let u = &*up;
+                default_restart.push(format!("struct `{}`: field `{}` added; its `#[rust(..)]` initial value is its derive's code ({}), running values cannot take it -- restart the app", u.prog.def_path(d), u.prog.syms.str(name), if names_vm { "it names the derive's `vm`" } else { "not a constant" }));
             }
         }
-        if !default_restart.is_empty() {
+        if !default_errs.is_empty() {
+            errs = default_errs;
+        } else if !default_restart.is_empty() {
             errs = default_restart;
             as_restart = true;
         }
