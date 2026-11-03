@@ -1270,6 +1270,9 @@ mod lazy_reload_tests;
 mod calls_tests;
 
 #[cfg(test)]
+mod reload_async_tests;
+
+#[cfg(test)]
 mod value_tests;
 
 #[cfg(test)]

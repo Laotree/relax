@@ -1197,6 +1197,19 @@ pub(crate) fn include_edits(prog: &crate::program::Program, changed: &[String], 
 /// Ok: the item pairing (old item -> new item) and the changes that apply live.
 /// Err: the restart reasons (one line each).
 pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crate::parser::ParsedFile, path: &str, base: &IncludeBase) -> Result<Plan, Vec<String>> {
+    classify_moving(prog, old_file, new, path, base, &[])
+}
+
+/// Whether `d` is a fn whose signature returns an opaque type (an async fn, or `-> impl Trait`):
+/// the type its callers' code is built for (the coroutine or closure of its body, the
+/// iterator its body builds) is made by its body.
+fn defines_opaque(prog: &crate::program::Program, d: DefId) -> bool {
+    prog.opaque_types_defined_by.get(&d).is_some_and(|defs| !defs.is_empty())
+}
+
+/// `classify`, with the fns `moving` (of the running version) handled as a signature change: the
+/// old fn goes, a new one comes from the new text, and its callers are rebuilt against it.
+fn classify_moving(prog: &crate::program::Program, old_file: u32, new: &crate::parser::ParsedFile, path: &str, base: &IncludeBase, moving: &[DefId]) -> Result<Plan, Vec<String>> {
     let _timing = crate::parse_work::time(6);
     use crate::ast::ItemKind;
     let old = &prog.files[old_file as usize];
@@ -1216,7 +1229,11 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
     trace_sub("classify_pair");
     // a fn whose signature changed (M2/M4): the old fn goes and a new one with the new signature
     // comes (its own slots: frames of the old code in flight keep calling the old one), and every
-    // fn naming it is type-checked and rebuilt against the new signature (apply: set_names)
+    // fn naming it is type-checked and rebuilt against the new signature (apply: set_names).
+    // A fn returning an opaque type whose body changed is one too: its callers' code is built
+    // for the type its body makes (an async fn's coroutine: its poll code and state layout), and
+    // the new body makes another one. So is a fn of `moving` (apply_locked: a rebuilt fn of that
+    // kind whose own text is unchanged).
     {
         let skip_name = |pf: &crate::parser::ParsedFile, it: &crate::ast::Item| -> bool { pf.src[it.name.lo as usize..it.name.hi as usize].starts_with(b"__relax_") };
         let attr_toks = |pf: &crate::parser::ParsedFile, it: &crate::ast::Item| -> Vec<Vec<u8>> {
@@ -1230,10 +1247,12 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
                 // an edited `use`: its old imports go, the new ones resolve (M13)
                 (ItemKind::Use { .. }, ItemKind::Use { .. }) => !same_toks(old, a.lo, a.hi, &[], new, b.lo, b.hi, &[]),
                 (ItemKind::Fn(sa, _, _), ItemKind::Fn(sb, _, _)) if !skip_name(new, b) && attr_toks(old, a) == attr_toks(new, b) => {
+                    let def = prog.item_defs.get(&(old_file, i)).copied();
+                    let opaque = (oa.fn_sig(*sa).asyncness && na.fn_sig(*sb).asyncness) || def.is_some_and(|d| defines_opaque(prog, d));
                     match (body_span(old, &a.kind), body_span(new, &b.kind)) {
                         (Some((alo, ahi)), Some((blo, bhi))) => !same_toks(old, a.lo, alo, &[], new, b.lo, blo, &[])
-                            || (oa.fn_sig(*sa).asyncness && na.fn_sig(*sb).asyncness
-                                && !same_toks(old, alo, ahi, &[], new, blo, bhi, &[])),
+                            || (opaque && !same_toks(old, alo, ahi, &[], new, blo, bhi, &[]))
+                            || def.is_some_and(|d| moving.contains(&d)),
                         _ => false,
                     }
                 }
@@ -1331,6 +1350,7 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
             (true, Some(&d)) => plan_removed.push(d),
             (true, None) if matches!(it.kind, ItemKind::Use { .. }) => removed_uses.push(it.lo),
             (true, None) => {} // never collected (cfg'd out)
+            (false, Some(d)) if moving.contains(d) => why.push(format!("{}: fn `{}` is rebuilt with this edit and returns a future or `impl Trait` its body makes (its callers' code holds it), so it is replaced like a changed signature -- replacing a fn here (a trait impl's) is not applied live yet: restart the app", pos(old, it.lo), name)),
             _ => why.push(format!("{}:1:1: {} `{}` removed -- removing this kind of item is not applied live yet: restart the app", path, kind_name(&it.kind), name)),
         }
     }
@@ -2496,27 +2516,118 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         out.changed += plan.added.len() + plan.removed.len();
     }
     set_names.retain(|n| !n.is_empty());
-    if !set_names.is_empty() {
-        let names: Vec<&[u8]> = set_names.iter().map(|n| n.as_slice()).collect();
-        let std_crates: Vec<u32> = (0..u.prog.crates.len() as u32).filter(|&c| matches!(u.prog.syms.str(u.prog.crates[c as usize].name), "core" | "alloc" | "std" | "proc_macro")).collect();
-        let mut seen: Vec<DefId> = Vec::new();
-        for f in u.fns.iter() {
-            trace_count("slot_visits", 1);
-            if let FnKey::Inst(d, _) = &f.key {
-                if !visible_crates[u.prog.def(*d).krate as usize] { continue; }
-                if (f.compiled || f.rir.is_some()) && !seen.contains(d) && !std_crates.contains(&u.prog.def(*d).krate) && matches!(u.prog.def(*d).kind, DefKind::Fn | DefKind::AssocFn) {
-                    seen.push(*d);
-                    if !body_defs.contains(d) && def_is_bound(&u.prog, *d) && item_mentions(&u.prog, *d, &names) {
-                        body_defs.push(*d);
+    // The fns the edit's names reach are type-checked and rebuilt. What a rebuilt fn's body makes
+    // must then be new too (rustc builds it from the new types; here the running values of the
+    // old ones live on):
+    // - its closures and coroutines (async blocks): their identity is their file version, and
+    //   their code is where the names are used. A rebuilt fn of a file the edit does not touch
+    //   gets a new version of that file (the same text), so its closures and async blocks are new
+    //   types with their own slots, layouts and vtables, built from the new body; values the old
+    //   code made keep their own code (closures of the same shape take the new one, below).
+    // - the type it returns, when that is opaque (an async fn's coroutine: its state holds the
+    //   futures it awaits): the fn is replaced like one whose signature changed, and its callers
+    //   are rebuilt against the new one, to a fixpoint.
+    // (Previously the closures of such a fn kept their compiled code: an async block that awaited
+    // an edited async fn went on calling the replaced fn, and the patch reported success.)
+    let std_crates: Vec<u32> = (0..u.prog.crates.len() as u32).filter(|&c| matches!(u.prog.syms.str(u.prog.crates[c as usize].name), "core" | "alloc" | "std" | "proc_macro")).collect();
+    let mut scanned = 0usize;
+    let mut moving: Vec<DefId> = Vec::new();
+    loop {
+        if set_names.len() > scanned {
+            let names: Vec<&[u8]> = set_names[scanned..].iter().map(|n| n.as_slice()).collect();
+            scanned = set_names.len();
+            let mut seen: std::collections::HashSet<DefId> = std::collections::HashSet::new();
+            for f in u.fns.iter() {
+                trace_count("slot_visits", 1);
+                if let FnKey::Inst(d, _) = &f.key {
+                    if !visible_crates[u.prog.def(*d).krate as usize] { continue; }
+                    // (a fn returning an opaque type with a slot: compiled code built for the type
+                    // it returns calls it, or will)
+                    if (f.compiled || f.rir.is_some() || defines_opaque(&u.prog, *d)) && !std_crates.contains(&u.prog.def(*d).krate) && matches!(u.prog.def(*d).kind, DefKind::Fn | DefKind::AssocFn) && seen.insert(*d) {
+                        if !body_defs.contains(d) && def_is_bound(&u.prog, *d) && item_mentions(&u.prog, *d, &names) {
+                            body_defs.push(*d);
+                        }
                     }
                 }
             }
         }
+        // Removed functions keep their old slots for code in flight. In particular, generated
+        // child styles name their own entry: the dependency scan above must not schedule that
+        // deleted body against the new namespace (or its retired lazy parse) when a child goes.
+        body_defs.retain(|d| !versions.iter().any(|(_, plan)| plan.removed.contains(d)));
+        let versioned: Vec<u32> = versions.iter().map(|(v, _)| v.old).collect();
+        let mut touch: Vec<u32> = Vec::new();
+        let mut moves: Vec<DefId> = Vec::new();
+        for &d in &body_defs {
+            let file = u.prog.def(d).file;
+            if defines_opaque(&u.prog, d) {
+                if moving.contains(&d) { continue; }
+                moves.push(d);
+            } else if versioned.contains(&file) || u.closures_of_slots(u.slots_of_defs([d])).is_empty() {
+                continue;
+            }
+            if !versioned.contains(&file) && !touch.contains(&file) {
+                if !own_source_file(&u.prog, file) {
+                    restart.push(format!("`{}` is rebuilt with this edit, and its closures or async blocks (or the future it returns) need new code, but its file `{}` cannot take a new version live -- restart the app", u.prog.def_path(d), u.prog.file_paths[file as usize]));
+                    continue;
+                }
+                touch.push(file);
+            }
+        }
+        if !restart.is_empty() || (touch.is_empty() && moves.is_empty()) {
+            break;
+        }
+        moving.extend_from_slice(&moves);
+        trace_count("reversioned_files", touch.len());
+        trace_count("moved_dependents", moves.len());
+        for &file in &touch {
+            let path = u.prog.file_paths[file as usize].clone();
+            let src = { let pf = &u.prog.files[file as usize]; pf.src[..pf.src_len as usize].to_vec() };
+            match u.prog.parse_version(file, &path, src) {
+                Ok(v) => match classify_moving(&u.prog, file, &v.pf, &path, base, &moving) {
+                    // (its text is the running one's: no change of its own but an include that moved)
+                    Ok(mut plan) => {
+                        changes.extend(std::mem::take(&mut plan.changes));
+                        for &d in &plan.removed { set_names.push(def_name(&u.prog, d).into_bytes()); }
+                        out.changed += plan.removed.len();
+                        versions.push((v, plan));
+                    }
+                    Err(w) => restart.extend(w),
+                },
+                Err(e) => restart.push(format!("{}: a new version of this file (its closures and async blocks are rebuilt with the edit) did not parse: {} -- restart the app", path, e)),
+            }
+        }
+        // the versions that already were in the transaction, with fns now moving
+        for (v, plan) in versions.iter_mut() {
+            if touch.contains(&v.old) || !moves.iter().any(|&d| u.prog.def(d).file == v.old) { continue; }
+            match classify_moving(&u.prog, v.old, &v.pf, &v.path, base, &moving) {
+                Ok(mut p) => {
+                    // (its changes were taken already; a moving fn's text is unchanged: it had none)
+                    p.changes.clear();
+                    for &d in p.removed.iter().filter(|d| !plan.removed.contains(d)) {
+                        set_names.push(def_name(&u.prog, d).into_bytes());
+                        out.changed += 1;
+                    }
+                    *plan = p;
+                }
+                Err(w) => restart.extend(w),
+            }
+        }
+        if !restart.is_empty() {
+            break;
+        }
     }
-    // Removed functions keep their old slots for code in flight. In particular, generated
-    // child styles name their own entry: the dependency scan above must not schedule that
-    // deleted body against the new namespace (or its retired lazy parse) when a child goes.
-    body_defs.retain(|d| !versions.iter().any(|(_, plan)| plan.removed.contains(d)));
+    if !restart.is_empty() {
+        out.rung = Rung::Restart;
+        out.lines = restart;
+        out.ms[0] = ms(t0);
+        return out;
+    }
+    if !moving.is_empty() {
+        out.test_changes = None;
+    }
+    // (the code of the files given new versions is rebuilt against the edit: never from the disk cache)
+    note_edited_crates(u, &versions.iter().map(|(v, _)| v.old).filter(|f| !olds.contains(f)).collect::<Vec<u32>>());
     let const_defs: Vec<DefId> = changes.iter().filter_map(|c| if let Change::Const(d) = c { Some(*d) } else { None }).collect();
     let static_defs: Vec<DefId> = changes.iter().filter_map(|c| if let Change::StaticInit(d) = c { Some(*d) } else { None }).collect();
     trace_count("changed_consts", const_defs.len());
@@ -5616,9 +5727,15 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         if o.rung == Rung::Patch {
             let loaded = crate::owner::call(crate::owner::Class::Program, || (*up).prog.current_source_files());
             for &k in &which {
-                if let Some(&file) = loaded.get(&files[k].0) {
-                    files[k].1 = file;
+                if loaded.contains_key(&files[k].0) {
                     stalled.remove(&k);
+                }
+            }
+            // every path: a patch also gives files it did not edit new versions (a rebuilt fn's
+            // closures and async blocks are new: apply_locked)
+            for f in files.iter_mut() {
+                if let Some(&file) = loaded.get(&f.0) {
+                    f.1 = file;
                 }
             }
             // Module additions can load files without a post-boot loader turn.
