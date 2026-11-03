@@ -156,6 +156,14 @@ pub fn cause_key(reason: &str) -> String {
 /// test assertion or a successful application run.
 pub const JIT_ERROR_EXIT: i32 = 86;
 
+/// A test run whose filter matched no test: no pass (the JIT harness, and `makepad test` over
+/// all its targets).
+pub const NO_TESTS_EXIT: i32 = 87;
+
+/// `makepad test` tells each target's harness it sums the verdict over the targets: one of
+/// several may match no test.
+pub const TEST_PACKAGE_ENV: &str = "MAKEPAD_TEST_PACKAGE";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Tests { code: i32 },
