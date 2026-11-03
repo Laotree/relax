@@ -10138,16 +10138,21 @@ unsafe fn settle_final(u: &Unit, id: u32) -> bool {
 /// earlier run stored for that code (Cache::tier_verdict), not one made again from this run's
 /// start -- a warm launch's faster code crossed the O3 bar where the run that stored it had not,
 /// and its counted builds parked them again (warm Fab: ~150 slots, the launch never settled).
-/// Parked: final. Queued (and no verdict since): its counted build now (Q_STORED). Neither (it
-/// counted and never turned hot): final. Baseline code without a parked verdict counts on: it
-/// gets its O2 build by running (base_running, the settle sweep), and that install applies the
-/// verdict. Final code still counts again when one of its loops turns hot (rt_loop_hot) or the
-/// settled state re-arms (settle_tier_tick). Unit lock held.
+/// Parked: final, its loops included (STORED_PARKED). Queued (and no verdict since): its counted
+/// build now (Q_STORED). Neither (it counted and never turned hot): final. Baseline code without a
+/// parked verdict counts on: it gets its O2 build by running (base_running, the settle sweep), and
+/// that install applies the verdict. Final code counts again when the settled state re-arms
+/// (settle_tier_tick), and without a parked verdict when one of its loops turns hot (rt_loop_hot).
+/// Unit lock held.
 unsafe fn stored_tier_verdict(u: &Unit, id: u32, v: crate::cache::TierVerdict, base: bool) {
     use crate::cache::TierVerdict;
     match v {
         TierVerdict::Parked => {
-            settle_final(u, id);
+            let w5 = &*tier_rec(&u.slots, id).add(5);
+            w5.fetch_or(STORED_PARKED, Ordering::Relaxed);
+            if !settle_final(u, id) {
+                w5.fetch_and(!STORED_PARKED, Ordering::Relaxed);
+            }
         }
         _ if base => {}
         TierVerdict::Queued(rate) => queue_now(u, id, Q_STORED, rate),
@@ -10166,6 +10171,7 @@ unsafe fn settle_unfinal(u: &Unit, id: u32, threshold: u64) -> bool {
         return false;
     }
     tier_count_fresh(rec, threshold, tier_clock());
+    (*rec.add(5)).fetch_and(!STORED_PARKED, Ordering::Relaxed);
     FINAL_SLOTS.fetch_sub(1, Ordering::Relaxed);
     let code = (*rec.add(1)).load(Ordering::Relaxed);
     let stub = (*rec.add(2)).load(Ordering::Relaxed);
@@ -15218,6 +15224,13 @@ fn rt_loop_hot(counter: u64, fp: u64) {
         (*rec.add(8)).store(chunk, Ordering::Relaxed);
         let st = (*rec.add(3)).load(Ordering::Relaxed);
         if st == T_FINAL {
+            // an earlier run parked the slot's code: its loops do not decide again. (Its O2 code
+            // inlined callees, their loops counted as its own; its counted code, built without
+            // inlining, measured only its own work: two toolpath stages fns were counted again and
+            // parked again on every warm Fab launch, holding the first warm one ~3 s from settling)
+            if (*rec.add(5)).load(Ordering::Relaxed) & STORED_PARKED != 0 {
+                return;
+            }
             // a final slot's loop (SETTLE-TIER): word 4 is its last chunk's time, word 7 (the queue
             // rate, unused while final) the start of its run of chunks at the rate its O3 decision
             // needs (final_loop_chunk). A run that lasts: the loop turned hot, the slot counts again
@@ -15831,49 +15844,46 @@ fn tier_drain(q: &mut Vec<(u32, u8, u64, u64)>) {
     let mut ids = Vec::new();
     crate::lockfree::IdStack::walk(token, |id| unsafe { tier_link(tier_rec(slots, id)).load(Ordering::Relaxed) }, |id| ids.push(id));
     let now = wall_ns();
-    let mut verdicts = QUEUED_VERDICTS.lock().unwrap_or_else(|e| e.into_inner());
     for &id in ids.iter().rev() {
         churn_queued(id);
         let rec = tier_rec(slots, id);
         let rate = unsafe { (*rec.add(7)).load(Ordering::Relaxed) };
         let why = unsafe { tier_why(rec).load(Ordering::Relaxed) } as u8;
         tier_push_locked(q, id, why, rate, now);
-        if matches!(why, Q_CALLS | Q_LOOP) {
-            crate::zone_alloc::kept_with(|| verdicts.push((id, rate)));
-        }
     }
 }
 
-/// Slots tier_drain queued for their calls or loops, with their rates: their verdicts for the
-/// cache (record_queued_verdicts: the unit lock, which a holder of the queue's lock may not take)
-static QUEUED_VERDICTS: relax_session::sync::Mutex<Vec<(u32, u64)>> = relax_session::sync::Mutex::new(Vec::new());
+/// Slot `id`, queued for O3 by its calls or loops at cost rate `rate`, stays queued: a worker took
+/// it for its build, or the run ends with it queued and not gone cold (record_queued_at_exit). Its
+/// queued verdict goes into the cache: a later launch that links its code builds it at once
+/// (stored_tier_verdict), unless a verdict after this one parked it or its O3 code was stored.
+/// Unit lock held.
+unsafe fn record_queued(up: *mut Unit, id: u32, rate: u64) {
+    let u = &mut *up;
+    if let Some(mut c) = u.cache.take() {
+        c.record_tier_queued(u, id, rate);
+        u.cache = Some(c);
+    }
+}
 
-/// The queued verdicts so far go into the cache (O3 workers, no lock held): a later launch that
-/// links the slot's code queues it at once (stored_tier_verdict), unless a verdict after it
-/// parked it or its O3 code was stored.
-fn record_queued_verdicts() {
-    let v = {
-        let mut g = QUEUED_VERDICTS.lock().unwrap_or_else(|e| e.into_inner());
-        if g.is_empty() {
-            return;
-        }
-        std::mem::take(&mut *g)
-    };
-    let up = TIER_UNIT.load(Ordering::Acquire);
-    if up.is_null() {
+/// The run ends (owner, unit lock): the entries still queued for their calls or loops store their
+/// queued verdicts, but not those that went cold waiting (tier_revalidate's rule): a backlog the
+/// workers never reached is mostly startup bursts, which the next launch's counted builds parked.
+pub(crate) fn record_queued_at_exit(u: &mut Unit) {
+    let Some(threshold) = u.tier1.as_ref().map(|t| t.threshold) else { return };
+    if u.cache.is_none() {
         return;
     }
-    owner::publish(|| unsafe {
-        let u = &mut *up;
-        if let Some(mut c) = u.cache.take() {
-            for &(id, rate) in &v {
-                if (id as usize) < u.fns.len() {
-                    c.record_tier_queued(u, id, rate);
-                }
-            }
-            u.cache = Some(c);
-        }
-    });
+    let revalidate = ahead_policy().o3_revalidate;
+    let now = wall_ns();
+    let keep: Vec<(u32, u64)> = tier_queue().unwrap_or_else(|e| e.into_inner()).iter()
+        .filter(|e| matches!(e.1, Q_CALLS | Q_LOOP) && (e.0 as usize) < u.fns.len()
+            && !(revalidate && unsafe { queued_gone_cold(tier_rec(&u.slots, e.0), e.2, now, threshold) }))
+        .map(|e| (e.0, e.3)).collect();
+    let up: *mut Unit = u;
+    for (id, rate) in keep {
+        unsafe { record_queued(up, id, rate) };
+    }
 }
 
 /// A push happened (rt_hot's, or one under TIER_QUEUE): one parked worker looks.
@@ -16625,6 +16635,10 @@ unsafe fn prioritize_verdicts(up: *mut Unit, ids: &[u32]) {
 /// Tier record word 5 (counted code bytes | flags): the slot was counted again once (tier_revalidate) and
 /// queued since: its next build goes ahead whatever its age.
 const REARMED: u64 = 1 << 63;
+/// Tier record word 5: final by a parked verdict an earlier run stored for the slot's code
+/// (stored_tier_verdict): its loops do not count it again (rt_loop_hot), the settled state's
+/// re-arm does (settle_rearm_all)
+const STORED_PARKED: u64 = 1 << 60;
 /// Tier record word 5: the counted code bytes (below the flag bits)
 const CODE_BYTES: u64 = (1 << 48) - 1;
 /// A calls / loop entry older than this is counted again (tier_revalidate).
@@ -16638,6 +16652,17 @@ pub static TIER_REVALIDATED: AtomicU64 = AtomicU64::new(0);
 /// evidence. Hot code is queued again within a second or two and built then (REARMED: whatever its age); startup code
 /// that was busy once (a cold Stage queued 2k slots before its first present) and lukewarm UI code
 /// never builds. The level's policy (o3_revalidate).
+/// A queue entry of slot record `rec` (queued by its calls or loops at wall time `at`) went cold
+/// waiting: queued REVALIDATE_NS ago or more, not counted again once already, and its cost now
+/// under the threshold (its loops charge the record while it waits). tier_revalidate counts it
+/// again; the run's end stores no queued verdict for it.
+unsafe fn queued_gone_cold(rec: *const AtomicU64, at: u64, now: u64, threshold: u64) -> bool {
+    now.saturating_sub(at) >= REVALIDATE_NS
+        && (*rec.add(5)).load(Ordering::Relaxed) & REARMED == 0
+        && (*rec.add(3)).load(Ordering::Acquire) == T_QUEUED
+        && tier_cost_now(rec, threshold, tier_clock()).0 < threshold
+}
+
 fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) {
     if q.is_empty() || !ahead_policy().o3_revalidate {
         return;
@@ -16654,19 +16679,15 @@ fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) {
     let Some(threshold) = u.tier1.as_ref().map(|t| t.threshold) else { return };
     let mut n = 0u64;
     q.retain(|&(id, why, at, _)| {
-        if !matches!(why, Q_CALLS | Q_LOOP) || now.saturating_sub(at) < REVALIDATE_NS {
+        if !matches!(why, Q_CALLS | Q_LOOP) {
             return true;
         }
         unsafe {
             let rec = tier_rec(&u.slots, id);
+            if !queued_gone_cold(rec, at, now, threshold) {
+                return true;
+            }
             let len = (*rec.add(5)).load(Ordering::Relaxed);
-            if len & REARMED != 0 || (*rec.add(3)).load(Ordering::Acquire) != T_QUEUED {
-                return true;
-            }
-            // still hot now (its loops kept charging the record while it waited): kept
-            if tier_cost_now(rec, threshold, tier_clock()).0 >= threshold {
-                return true;
-            }
             let code = (*rec.add(1)).load(Ordering::Relaxed);
             let stub = (*rec.add(2)).load(Ordering::Relaxed);
             tier_count_fresh(rec, threshold, tier_clock());
@@ -18156,7 +18177,6 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
         // build (the first worker's poll alone waited out its own builds: hot slots came out of
         // the window one at a time behind a long O3 build)
         pgo_poll();
-        record_queued_verdicts();
         // SPEC-V: the first worker sweeps the verdicts before each build too, not only when the
         // queue is empty (rate-limited inside: once per TIER1_POLL, and only when verdicts or
         // patches moved). With a long O3 queue the idle-only sweep starved: the race's cold launch
@@ -18214,7 +18234,6 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
                     sweep_verdicts();
                     // PGO: counted slots whose window is over go to the queue
                     pgo_poll();
-                    record_queued_verdicts();
                     // baseline code that keeps running under the O3 threshold: its O2 builds
                     drain_slow_base();
                     // the settled state: lukewarm code optimised, its count stubs out (SETTLE-TIER)
@@ -18236,7 +18255,13 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
         }
         let _job = compile_job();
         if queued_hot(why) {
-            owner::publish(|| unsafe { o2_hot(up, id) });
+            owner::publish(|| unsafe {
+                o2_hot(up, id);
+                // taken for its build: its queued verdict (a stored one's is in the cache)
+                if why != Q_STORED {
+                    record_queued(up, id, rate);
+                }
+            });
             // a threshold's cost that came slower than CALL_FAST_NS into code bigger than SMALL_CODE:
             // lukewarm until its counts show the work (a hot loop under it queues it as Q_LOOP instead;
             // a stored verdict's rate is the one an earlier run queued it at)
