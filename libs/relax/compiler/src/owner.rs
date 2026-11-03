@@ -530,6 +530,9 @@ thread_local! {
     /// owner: the request being served (class, requester) and how many are open on its stack
     static SERVING: Cell<(Class, u64)> = const { Cell::new((Class::Program, 0)) };
     static DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// owner: its own work between two requests runs (the drains, `owner_loop`): a request a wait
+    /// of it serves is nested, as one served inside an earlier request's wait
+    static OWN_WORK: Cell<bool> = const { Cell::new(false) };
     /// leaf locks this thread holds (`Leaf`)
     static LEAVES: Cell<u32> = const { Cell::new(0) };
     /// owner: the request being served is background work (Req::bg)
@@ -828,9 +831,14 @@ pub fn serving() -> (Class, u64) {
     SERVING.with(|s| s.get())
 }
 
-/// A request served inside an earlier request's wait (owner only).
+/// (tests) work the owner runs once between two requests, beside its drains (`owner_loop`)
+#[cfg(test)]
+pub(crate) static OWN_WORK_TEST: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(None);
+
+/// A request served inside an earlier request's wait, or inside a wait of the owner's own work
+/// between requests (owner only).
 pub fn nested() -> bool {
-    DEPTH.with(|d| d.get()) > 1
+    DEPTH.with(|d| d.get()) + OWN_WORK.with(|w| w.get()) as u32 > 1
 }
 
 /// The owner's request depth on this thread, zero off the owner or outside a request.
@@ -1450,8 +1458,11 @@ fn owner_loop() -> ! {
         serve(r);
         crate::lifeline::beat();
         // between top-level requests: the vtables made for real-time trait-object types
-        // (a panic in either is printed by the panic hook: the owner is not serving a request)
+        // (a panic in either is printed by the panic hook: the owner is not serving a request).
+        // Own work: a request one of their waits serves is nested (a build they opened is lower
+        // on the owner's stack: that request is cancelled and posted again, as inside a request)
         let frame = crate::jit::frame_enter(std::ptr::null());
+        OWN_WORK.with(|w| w.set(true));
         if std::panic::catch_unwind(crate::jit::realtime_drain).is_err() {
             eprintln!("makepad-run: the owner's real-time vtable drain panicked ({}); the owner goes on", crate::lifeline::panic_at());
         }
@@ -1459,6 +1470,14 @@ fn owner_loop() -> ! {
         if std::panic::catch_unwind(crate::jit::const_drain).is_err() {
             eprintln!("makepad-run: the owner's constant drain panicked ({}); the owner goes on", crate::lifeline::panic_at());
         }
+        #[cfg(test)]
+        {
+            let work = OWN_WORK_TEST.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(work) = work {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+            }
+        }
+        OWN_WORK.with(|w| w.set(false));
         crate::jit::frame_leave(frame);
     }
 }

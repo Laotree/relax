@@ -216,8 +216,9 @@ const LEDGER_KEY: u128 = 0;
 // N01 types and closure arguments with baseline tiers and closure fingerprints; 26: a writable block
 // symbol names which block of its entry it is (its ordinal), so two relocations to different
 // offsets of one block link to one block. 29: image symbol and closure-parent key spans (image.rs
-// skip_*) follow the encoding again; images written before cut keys short.
-const ENTRY_VERSION: u32 = 29;
+// skip_*) follow the encoding again; images written before cut keys short. 30: a code entry ends
+// with the trait-object types its code calls through (jit.rs realtime reach).
+const ENTRY_VERSION: u32 = 30;
 /// the level of a code entry's code (its tier byte)
 const TIER_O1: u8 = 0;
 const TIER_O3: u8 = 1;
@@ -2053,34 +2054,59 @@ impl Cache {
         }
     }
 
-    /// The key encodings of the slots real-time threads of the program rooted at crate `root`
-    /// reached in earlier runs (jit.rs realtime; resolve them with slot_for_bytes_unit): compiled
-    /// ahead when the program marks its real-time code.
-    pub fn rt_set_keys(&self, u: &Unit, root: u32) -> Vec<Vec<u8>> {
-        let Ok(b) = std::fs::read(self.rt_set_path(u, root)) else { return Vec::new() };
+    /// What real-time threads of the program rooted at crate `root` reached in earlier runs (jit.rs
+    /// realtime), compiled ahead when the program marks its real-time code: the key encodings of
+    /// the slots (resolve them with slot_for_bytes_unit) and the trait-object types their code
+    /// calls through (a type that no longer decodes is left out).
+    pub fn rt_set_load(&mut self, u: &Unit, root: u32) -> (Vec<Vec<u8>>, Vec<TyId>) {
+        let Ok(b) = std::fs::read(self.rt_set_path(u, root)) else { return Default::default() };
         let mut d = D { b: &b, p: 0 };
-        let mut out = Vec::new();
-        while let Some(k) = d.bytes() {
-            out.push(k.to_vec());
+        let (mut keys, mut dyns) = (Vec::new(), Vec::new());
+        if d.u32() != Some(ENTRY_VERSION) {
+            return (keys, dyns);
         }
-        out
+        for _ in 0..d.u32().unwrap_or(0) {
+            let Some(k) = d.bytes() else { break };
+            keys.push(k.to_vec());
+        }
+        for _ in 0..d.u32().unwrap_or(0) {
+            let Some(t) = d.bytes() else { break };
+            dyns.extend(self.dec_ty(u, &mut D { b: t, p: 0 }, 0));
+        }
+        (keys, dyns)
     }
 
-    /// Writes the real-time set (see rt_set_keys).
-    pub fn rt_set_store(&mut self, u: &Unit, root: u32, ids: &[u32]) {
+    /// Writes the real-time set (see rt_set_load): slots `ids`, trait-object types `dyns`.
+    pub fn rt_set_store(&mut self, u: &Unit, root: u32, ids: &[u32], dyns: &[TyId]) {
         if self.mode == Mode::ReadOnly {
             return;
         }
-        let mut e = E::default();
+        let mut keys = E::default();
         let mut n = 0;
         for &id in ids {
             if let Some(b) = self.slot_bytes(u, id) {
-                e.bytes(&b);
+                keys.bytes(&b);
                 n += 1;
             }
         }
+        let mut types = E::default();
+        let mut nd = 0;
+        let mut crates = Vec::new();
+        for &t in dyns {
+            let mut one = E::default();
+            if self.enc_ty(u, t, &mut one, &mut crates, 0).is_some() {
+                types.bytes(&one.0);
+                nd += 1;
+            }
+        }
+        let mut e = E::default();
+        e.u32(ENTRY_VERSION);
+        e.u32(n);
+        e.0.extend_from_slice(&keys.0);
+        e.u32(nd);
+        e.0.extend_from_slice(&types.0);
         if crate::jit::rt_trace() {
-            eprintln!("makepad-run rt: recorded {} of {} slots", n, ids.len());
+            eprintln!("makepad-run rt: recorded {} of {} slots, {} of {} trait-object types", n, ids.len(), nd, dyns.len());
         }
         let path = self.rt_set_path(u, root);
         let tmp = path.with_extension("new");
@@ -2091,7 +2117,7 @@ impl Cache {
 
     fn rt_set_path(&self, u: &Unit, root: u32) -> PathBuf {
         let name = u.prog.crates.get(root as usize).map_or("program", |c| u.prog.syms.str(c.name));
-        self.dir.join(format!("rt-{}.keys", name))
+        self.dir.join(format!("rt-{}.set", name))
     }
 
     /// memory report (MAKEPAD_RUN_MEM_REPORT): the recorder's and linker's tables (capacity based)
@@ -3366,6 +3392,18 @@ impl Cache {
             if self.enc_file(u, f, &mut e).is_none() {
                 e.str("");
                 e.u128(0);
+            }
+        }
+        // the trait-object types its code calls through (Unit::note_dyn_calls): real-time reach
+        // follows their vtables when it walks code linked from here
+        let dyns = u.dyn_calls_of(id);
+        e.u32(dyns.len() as u32);
+        let mut crates = Vec::new();
+        for t in dyns {
+            if self.enc_ty(u, t, &mut e, &mut crates, 0).is_none() {
+                self.stats.unencodable += 1;
+                self.why("dyn call type");
+                return None;
             }
         }
         Some(e.0)
@@ -8346,6 +8384,12 @@ impl Linker {
             files.push(self.cache().dec_file(u, &mut d).unwrap_or(u32::MAX));
         }
         let pc = raw.into_iter().map(|(o, p)| (o, (*files.get(relax_backend::rir::pos_file(p) as usize).unwrap_or(&u32::MAX) as u64) << 32 | (p & 0xffff_ffff) | (p & !relax_backend::rir::pos_plain(u64::MAX)))).collect();
+        let nd = d.u32()? as usize;
+        let mut dyns = Vec::with_capacity(nd.min(16));
+        for _ in 0..nd {
+            dyns.push(self.cache().dec_ty(u, &mut d, 0)?);
+        }
+        u.note_dyn_calls(id, dyns);
         self.cache().last_callees = callees;
         self.cache().last_thunks = thunks;
         self.cache().last_data = data;

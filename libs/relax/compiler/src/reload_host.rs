@@ -222,6 +222,8 @@ fn apply_ready(why: String) -> Result<&'static str, String> {
 
 /// A built binary waiting for the program's safe point: the stamps it was built against.
 struct Handover {
+    /// (live-rebuild handover is unix-only: the restart execs this in place)
+    #[cfg(unix)]
     loader: PathBuf,
     stamps: Vec<super::inputs::Stamp>,
 }
@@ -367,7 +369,7 @@ fn build_loop() {
         let asked = {
             let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
             if st.again { drop(st); continue; }
-            *HANDOVER.lock().unwrap_or_else(|e| e.into_inner()) = Some(Handover { loader, stamps: before });
+            *HANDOVER.lock().unwrap_or_else(|e| e.into_inner()) = Some(Handover { #[cfg(unix)] loader, stamps: before });
             st.phase = Phase::Restarting;
             st.since = Some(Instant::now());
             RESTART_AFTER_BUILD.swap(false, std::sync::atomic::Ordering::SeqCst)
