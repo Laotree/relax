@@ -311,7 +311,7 @@ pub(crate) mod settle_rebuild;
 /// Drop). KEPT (system heap, built and grown under `zone_alloc::kept`): the Unit box, code tables,
 /// fns/fn_map, consts, const_readers, body_deps, statics/static_spans, sites/site_ix, rt/rs,
 /// syms, start_order, vtables, locations, lit_data, provided*, slots, missing_stubs, patch_log,
-/// tier-1 state, stats, errors and the scalars/addresses. COMPILER arena: prog, tcx, lay, bodies,
+/// forwards, tier-1 state, stats, errors and the scalars/addresses. COMPILER arena: prog, tcx, lay, bodies,
 /// old_bodies, coro_*, spec_cached, the unwind/unpin/cycle/core-path memos, const_failed, cache,
 /// front, ctfe_fn_bodies, query_errors, reload_*.
 pub struct Unit {
@@ -468,6 +468,10 @@ pub struct Unit {
     /// file version -> the patch generation that made it (invalid.rs: code built later from a
     /// version's source is that generation's code)
     pub file_gen: crate::fxhash::HashMap<u32, u32>,
+    /// every forwarder ever installed (install_forward), by its code address: (the slot it jumps
+    /// to, whether it is its lineage's cell). A slot forwards while its code is one of them, so a
+    /// rollback that brings an earlier code back brings that code's role back with it.
+    pub(crate) forwards: crate::fxhash::HashMap<u64, (u32, bool)>,
     /// bytes of the per-thread block handed out by `tls_alloc`
     pub tls_next: u32,
     /// panicking stand-ins for foreign fns this host lacks, by symbol
@@ -555,6 +559,8 @@ pub mod tier {
     pub const O1: u8 = 2;
     pub const O2: u8 = 3;
     pub const O3: u8 = 4;
+    /// a live patch's forwarder: a jump to a newer version of the slot's fn (install_forward)
+    pub const FORWARD: u8 = 5;
     /// makepad inspect's instrumented build: O1 code generation of the slot's RIR with probe calls
     pub const INSTRUMENTED: u8 = 6;
     /// a compile error's stub (the call panics)
@@ -562,7 +568,7 @@ pub mod tier {
     /// makepad inspect's instrumented build at O3: the probes are in the fn's RIR before the O3
     /// pipeline (the same tier as the O3 code it replaced)
     pub const INSTRUMENTED_O3: u8 = 8;
-    pub const NAMES: [&str; 9] = ["?", "baseline", "O1", "O2", "O3", "?", "instrumented", "error-stub", "O3-instrumented"];
+    pub const NAMES: [&str; 9] = ["?", "baseline", "O1", "O2", "O3", "forwarder", "instrumented", "error-stub", "O3-instrumented"];
 }
 
 /// Origins (CodeKind::origin).
@@ -4045,6 +4051,7 @@ impl Unit {
             patch_log: Vec::new(),
             patch_gen: 0,
             file_gen: Default::default(),
+            forwards: Default::default(),
             // slot 0 of the block: the thread's domain static block (domain.rs)
             tls_next: TLS_FIRST_FREE,
             missing_stubs: Default::default(),
@@ -6984,6 +6991,16 @@ impl Unit {
     }
 
     fn install_unchecked(&mut self, id: u32, code: &[u8], relocs: &[relax_backend::rir::RelocAt], pc_map: Vec<(u32, u64)>, gen: u32) -> Result<u64, String> {
+        // a forwarder runs its lineage's newest code: a build of the slot's own body is an older
+        // version of it and is dropped (a tier-up, a verdict's rebuild, a probe); only the next
+        // forwarder or a rollback replaces it
+        if self.forward_of(id).is_some() {
+            return Ok(self.fns[id as usize].code);
+        }
+        self.install_code(id, code, relocs, pc_map, gen)
+    }
+
+    fn install_code(&mut self, id: u32, code: &[u8], relocs: &[relax_backend::rir::RelocAt], pc_map: Vec<(u32, u64)>, gen: u32) -> Result<u64, String> {
         let _cost_install = relax_codegen::fncost::phase(6);
         // makepad inspect: new code for an instrumented slot (a live patch, a verdict's rebuild,
         // a lazy recompile) replaces its counters and probes, and the first code of a slot whose
@@ -7279,7 +7296,22 @@ impl Unit {
     /// cached, built again once its verdict is clean (sweep_verdicts). Not while a live patch awaits
     /// its verdict, and never for the code of a patch without a clean verdict: a rejected patch group
     /// is rolled back to the code it replaced, as a whole.
+    /// Slot `id` runs another slot's code through a live patch's forwarder (install_forward): the
+    /// slot it jumps to and whether `id` is its lineage's cell.
+    pub(crate) fn forward_of(&self, id: u32) -> Option<(u32, bool)> {
+        if self.forwards.is_empty() {
+            return None;
+        }
+        let f = &self.fns[id as usize];
+        if !f.compiled {
+            return None;
+        }
+        self.forwards.get(&f.code).copied()
+    }
+
     pub(crate) fn o3_allowed(&self, id: u32) -> bool {
+        // (a forwarder's own body is an older version: it gets no code of its own)
+        if self.forward_of(id).is_some() { return false; }
         if self.refresh_verified(id) { return true; }
         let body = match self.fns[id as usize].key { FnKey::Plain(b) => b, _ => id };
         // a body the borrow checker rejected never reaches O3 (its first-run code included: the
@@ -8549,6 +8581,29 @@ pub(crate) unsafe fn install_patched(up: *mut Unit, id: u32, code: &[u8], map: V
     } else {
         u.arm_counter(id, a);
     }
+    Ok(a)
+}
+
+/// Hot reload (reload.rs: closures and suspended bodies stored by a running version): slot `id`,
+/// an older version of a closure or async body, runs `target`'s code from now on. Its code becomes
+/// a jump to `target`'s thunk (as a foreign fn's veneer), installed in patch group `gen`: a rollback
+/// brings back what it ran. `cell`: `id` is its lineage's cell, jumping to the newest version and
+/// replaced by every patch that pairs it; otherwise `target` is that cell and this code stays. No
+/// code is copied, a stored value of any version reaches the newest code in at most two jumps,
+/// and a patch installs at most two forwarders per lineage however many versions came before.
+pub(crate) unsafe fn install_forward(up: *mut Unit, id: u32, target: u32, cell: bool, gen: u32) -> Result<u64, String> {
+    let u = &mut *up;
+    let code = x64::jump_to(u.slots.thunk(target));
+    let _as = code_as(CodeKind::new(tier::FORWARD, origin::PATCH));
+    // its own RIR is the old version's (nothing is inlined into a jump), and the old version's
+    // verdict does not rebuild it
+    let f = &mut u.fns[id as usize];
+    f.rir = None;
+    f.unverified.store(false, Ordering::Relaxed);
+    let a = u.install_code(id, &code, &[], Vec::new(), gen)?;
+    crate::zone_alloc::kept_with(|| u.forwards.insert(a, (target, cell)));
+    // (real-time code that reached the old version reaches the target: walked as a call)
+    realtime_installed(u, id, &[relax_backend::rir::RelocAt { at: 0, kind: relax_backend::rir::RelocKind::Pool64, target: relax_backend::rir::Reloc::Thunk(target) }]);
     Ok(a)
 }
 
@@ -10421,7 +10476,7 @@ unsafe fn o2_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     }
     let f = &(&*up).fns[id as usize];
     // O3 code installed: an O2 build after the present is still the slot's cache entry
-    if f.build_err.is_some() || matches!(f.key, FnKey::Sandbox(_) | FnKey::Plain(_)) || (snapshot && f.o3.load(Ordering::Relaxed)) {
+    if f.build_err.is_some() || matches!(f.key, FnKey::Sandbox(_) | FnKey::Plain(_)) || (snapshot && f.o3.load(Ordering::Relaxed)) || (&*up).forward_of(id).is_some() {
         o2_drop(D_KEY, up, id);
         return None;
     }
@@ -17364,7 +17419,8 @@ impl Unit {
     fn rearm_counter(&mut self, id: u32, code: u64) {
         let rec = tier_rec(&self.slots, id);
         unsafe {
-            if (*rec.add(3)).load(Ordering::Acquire) != T_COUNTING {
+            // (a forwarder's calls are not counted: it takes no code of its own)
+            if (*rec.add(3)).load(Ordering::Acquire) != T_COUNTING || self.forward_of(id).is_some() {
                 return;
             }
             let bytes = self.fns[id as usize].code_len as u64;
@@ -17397,7 +17453,8 @@ impl Unit {
             Some(t) => t.threshold,
             None => return,
         };
-        if !counted {
+        // (a forwarder's calls are not counted: it takes no code of its own)
+        if !counted || self.forward_of(id).is_some() {
             return;
         }
         let rec = tier_rec(&self.slots, id);
@@ -18371,6 +18428,10 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         None => &session.options,
     };
     let runtime = &session.runtime;
+    // a forwarder gets no code of its own (Unit::forward_of): no verdict changes that
+    if owner::publish(|| (&*up).forward_of(id).is_some()) {
+        return false;
+    }
     // SPEC-V: unverified code gets O3 code too, built as it is (Unit::o3_allowed)
     if !owner::publish(|| (&*up).o3_allowed(id)) {
         crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_REFUSED, crate::inspect::tierlog::REFUSE_VERDICT, 0, 0);

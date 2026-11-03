@@ -3713,7 +3713,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // was rebuilt runs the new version of itself when the new parent has a closure at the same
     // place with the same signature and captures (same environment layout); otherwise it keeps
     // its own code (memory-safe; reported). The new code is built now if the edit's precompile
-    // did not reach it.
+    // did not reach it. An older version that forwards to its lineage's cell (install_forward)
+    // follows the cell and is not looked at again: an edit's work stays the same however many
+    // edits came before.
     let mut rebind: Vec<(u32, u32)> = Vec::new();
     if errs.is_empty() {
         let u = &*up;
@@ -3726,7 +3728,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             let f = &u.fns[id as usize];
             if let FnKey::Closure(file, _, _) = &f.key {
                 if new_files.contains(file) { news_c.push(id); }
-                else if f.compiled { olds_c.push(id); }
+                else if f.compiled && !matches!(u.forward_of(id), Some((_, false))) { olds_c.push(id); }
             }
         }
         // a new closure's identity is read from its parent's checked body, which the parent's
@@ -3789,7 +3791,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             for o in u.closures_of_slots(parents) {
                 let fo = &u.fns[o as usize];
                 trace_count("slot_visits", 1);
-                let (FnKey::Closure(of, oce, op), true) = (&fo.key, is_body(&fo.key) && fo.compiled) else { continue };
+                let (FnKey::Closure(of, oce, op), true) = (&fo.key, is_body(&fo.key) && fo.compiled && !matches!(u.forward_of(o), Some((_, false)))) else { continue };
                 let replaced = matches!(&u.fns[*op as usize].key, FnKey::Inst(d, _) if removed_defs.contains(d));
                 if !(rebuilt.contains(op) || replaced) || new_files.contains(of) {
                     continue;
@@ -3960,13 +3962,29 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let gen = u.begin_patch();
     out.group = gen;
     crate::zone_alloc::kept_with(|| for &(_, n) in &news { u.file_gen.insert(n, gen); });
-    let mut rebind_code: Vec<(u32, Code)> = Vec::new();
-    for (o, n) in &rebind {
-        let c = pre.iter().find(|(id, _)| id == n).and_then(|(_, r)| r.as_ref().ok()).or_else(|| staged.iter().find(|(id, _)| id == n).map(|(_, c)| c));
-        if let Some(c) = c {
-            rebind_code.push((*o, c.clone()));
+    // the rebound older versions run the new ones through forwarders (jit::install_forward): per
+    // new slot, its lineage's cell jumps to it, and every other older version paired with it jumps
+    // to the cell (and is never looked at again). A lineage without a cell yet makes its oldest
+    // version the cell. Cells go first: a version that becomes a forwarder may be what its cell
+    // jumps to until then (no jump cycle at any moment).
+    let forwards: Vec<(u32, u32, bool)> = {
+        let u = &*up;
+        let mut targets: Vec<u32> = rebind.iter().map(|x| x.1).collect();
+        targets.sort_unstable();
+        targets.dedup();
+        let (mut cells, mut rest) = (Vec::new(), Vec::new());
+        for n in targets {
+            let mut olds: Vec<u32> = rebind.iter().filter(|x| x.1 == n).map(|x| x.0).collect();
+            olds.sort_unstable();
+            let cell = olds.iter().copied().find(|&o| u.forward_of(o).is_some()).unwrap_or(olds[0]);
+            for o in olds {
+                if o == cell || u.forward_of(o).is_some() { cells.push((o, n, true)); } else { rest.push((o, cell, false)); }
+            }
         }
-    }
+        cells.extend(rest);
+        cells
+    };
+    trace_count("forwarders", forwards.len());
     // An enum layout edit (variants added): code built before it can meet a variant it does not
     // know (a match falls through), so it never runs again. A struct edit (M10) does not change
     // the running layout -- its first fields stay where they are and added fields live in the
@@ -3996,12 +4014,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             Err(e) => out.lines.push(format!("link error in {}: {}", (&*up).fns[id as usize].name, e)),
         }
     }
-    for (id, c) in rebind_code {
-        match jit::install_patched(up, id, &c.0, c.1, &c.2, gen) {
-            Ok(_) => {
-                out.names.push((&*up).fns[id as usize].name.to_string());
-            }
-            Err(e) => out.lines.push(format!("link error in {}: {}", (&*up).fns[id as usize].name, e)),
+    for (id, target, cell) in forwards {
+        if let Err(e) = jit::install_forward(up, id, target, cell, gen) {
+            out.lines.push(format!("link error in {}: {}", (&*up).fns[id as usize].name, e));
         }
     }
     // the new bodies are installed: the guards of their copies inlined before call them now

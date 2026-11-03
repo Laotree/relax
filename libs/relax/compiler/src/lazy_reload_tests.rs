@@ -1692,3 +1692,117 @@ fn a_live_edit_reaches_both_crates_of_a_lib_test_root() {
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A closure stored by the running version (a boxed handler) runs every later edit of its body,
+/// and an edit's work stays flat however many came before: a patch installs at most two
+/// forwarders per closure (the lineage's cell jumps to the newest version, the previous newest to
+/// the cell) and copies no code into the older versions; every older version reaches the newest in
+/// at most two jumps; a build of an older version's own body never lands in it (a tier-up would
+/// bring back old code); a rolled-back patch brings back the forwarders it replaced.
+#[test]
+fn stored_closure_follows_edits_with_flat_work() {
+    const CHILD: &str = "MAKEPAD_RUN_STORED_CLOSURE_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::stored_closure_follows_edits_with_flat_work", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
+            .output().unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    use crate::jit::{FnKey, Unit};
+    use crate::reload::{apply, Edit, Rung};
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-stored-closure-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    let src = |i: u32| format!(r#"use std::cell::RefCell;
+thread_local! {{ static H: RefCell<Option<Box<dyn Fn(u32) -> u32>>> = RefCell::new(None); }}
+fn make() -> Box<dyn Fn(u32) -> u32> {{
+    let k = 3;
+    Box::new(move |x| x * k + {i})
+}}
+pub fn value(out: &mut u32) {{
+    H.with(|h| {{
+        if h.borrow().is_none() {{ *h.borrow_mut() = Some(make()); }}
+        *out = (h.borrow().as_ref().unwrap())(5);
+    }});
+}}
+"#);
+    std::fs::write(dir.join("app/src/lib.rs"), src(1)).unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "stored_closure_app", false).unwrap();
+    let def = |prog: &Program, name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let (value, make) = (def(&prog, "value"), def(&prog, "make"));
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    let (entry, make_slot) = crate::owner::call(crate::owner::Class::Program, || {
+        let f = u.fn_id(FnKey::Inst(value, vec![]));
+        (u.entry(f), u.fn_id(FnKey::Inst(make, vec![])))
+    });
+    let run = || {
+        let mut result = 0u32;
+        unsafe { crate::jit::call_jit(up, entry, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        result
+    };
+    // the versions of make's closure, oldest first, and where each one's calls end up
+    let versions = |u: &Unit| -> Vec<u32> { (0..u.fns.len() as u32).filter(|&id| matches!(u.fns[id as usize].key, FnKey::Closure(_, _, p) if p == make_slot) && u.fns[id as usize].compiled).collect() };
+    let reaches = |u: &Unit, mut s: u32| -> u32 {
+        for _ in 0..2 {
+            match u.forward_of(s) { Some((t, _)) => s = t, None => return s }
+        }
+        assert!(u.forward_of(s).is_none(), "more than two jumps from an older version to the newest");
+        s
+    };
+    assert_eq!(run(), 16);
+    let first = versions(&u)[0];
+    let mut files = vec![u.prog.def(value).file];
+    let mut undo = None;
+    let mut names_first: Option<Vec<String>> = None;
+    for i in 2..=6u32 {
+        let before = u.forwards.len();
+        let o = unsafe { apply(up, vec![Edit { file: *files.last().unwrap(), path: app.clone(), src: src(i).into_bytes() }]) };
+        assert_eq!(o.rung, Rung::Patch, "edit {i}: {:?}", o.lines);
+        // (make, and value's closure while it inlines make)
+        let first_names = names_first.get_or_insert_with(|| o.names.clone());
+        assert!(o.names.iter().all(|n| first_names.contains(n)), "edit {i}: more fns installed than by the first edit: {:?}", o.names);
+        files.push(o.files[0]);
+        assert_eq!(run(), 15 + i, "edit {i}: the box stored at the first run runs the edited closure");
+        assert_eq!(u.forwards.len() - before, if i == 2 { 1 } else { 2 }, "edit {i}: forwarders installed (the cell, the previous version)");
+        let vs = versions(&u);
+        let newest = *vs.last().unwrap();
+        assert!(vs[..vs.len() - 1].iter().all(|&v| reaches(&u, v) == newest), "edit {i}: every older version reaches the newest");
+        assert_eq!(u.forward_of(first), Some((newest, true)), "edit {i}: the first version is the lineage's cell");
+        undo = o.undo;
+    }
+    // the old version's own body, built and installed as a tier-up would, does not replace its
+    // forwarder; nor does it get an O3 build
+    let at = u.fns[first as usize].code;
+    let (code, map, relocs) = unsafe { crate::jit::compile_fn(up, first) }.unwrap();
+    crate::owner::call(crate::owner::Class::Program, || u.install(first, &code, &relocs, map, 0)).unwrap();
+    assert_eq!(u.fns[first as usize].code, at, "a build of the cell's own body was installed");
+    assert!(!unsafe { crate::jit::compile_tier1(up, first) }, "an O3 build of a forwarder");
+    assert_eq!(run(), 21);
+    // edit 6 rolled back: the cell jumps to edit 5's closure again, which runs its own code
+    let previous = versions(&u)[versions(&u).len() - 2];
+    unsafe { crate::reload::rollback(up, undo.take().unwrap(), "test") };
+    files.pop();
+    assert_eq!(run(), 20, "after the rollback the stored box runs edit 5's closure");
+    assert_eq!(u.forward_of(first), Some((previous, true)));
+    assert_eq!(u.forward_of(previous), None, "edit 5's closure runs its own code again");
+    let o = unsafe { apply(up, vec![Edit { file: *files.last().unwrap(), path: app.clone(), src: src(7).into_bytes() }]) };
+    assert_eq!(o.rung, Rung::Patch, "{:?}", o.lines);
+    assert_eq!(run(), 22, "an edit after the rollback reaches the stored box");
+    assert_eq!(u.forward_of(previous), Some((first, false)), "edit 5's closure forwards to the cell");
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
