@@ -9207,6 +9207,52 @@ mod rotate_tests {
             }
         }
     }
+
+    /// A signed division's overflow check in a loop: `(b == -1) & (a == MIN)` with `b == -1`
+    /// hoisted out (a flag from another block). The branch tests the flag; the block's compare
+    /// moves to a new block reached only when the flag holds. A plain value (not a compare's
+    /// result) in place of the flag is a bitwise `&` and stays.
+    #[test]
+    fn branch_on_flag_and_compare_splits() {
+        for plain in [false, true] {
+            let mut f = Func::new("divcheck".into(), 0);
+            let (a, b) = (f.vreg(Cls::I), f.vreg(Cls::I));
+            f.params.extend([a, b]);
+            f.rets.push(Cls::I);
+            let (x, y, c, r1, r2) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+            for _ in 0..4 {
+                f.block();
+            }
+            f.blocks[0].insts = if plain { vec![Inst::IBinI(IOp::Add, U64T, x, b, 1)] } else { vec![Inst::ICmpI(Cond::Eq, true, x, b, -1)] };
+            f.blocks[0].term = Term::Jump(1);
+            f.blocks[1].insts = vec![Inst::ICmpI(Cond::Eq, true, y, a, i64::MIN), Inst::IBin(IOp::And, U64T, c, x, y)];
+            f.blocks[1].term = Term::Branch(c, 2, 3);
+            f.blocks[2].insts = vec![Inst::Iconst(r1, 1)];
+            f.blocks[2].term = Term::Ret(vec![r1]);
+            f.blocks[3].insts = vec![Inst::Iconst(r2, 2)];
+            f.blocks[3].term = Term::Ret(vec![r2]);
+            for b in &mut f.blocks {
+                b.pos = vec![0; b.insts.len()];
+            }
+            let opts = relax_session::Options::default();
+            let changed = relax_backend::passes::split_branch_conditions(&opts, &mut f);
+            f.verify().unwrap();
+            let b1 = f.blocks.iter().position(|bl| bl.insts.iter().any(|i| matches!(i, Inst::IBin(IOp::And, ..))) || matches!(bl.term, Term::Branch(cv, _, _) if cv == x)).unwrap();
+            if plain {
+                assert!(!changed && matches!(f.blocks[b1].term, Term::Branch(cv, _, _) if cv == c), "a bitwise & of a plain value is not a branch condition pair");
+                continue;
+            }
+            assert!(changed);
+            let ret_of = |b: u32| match &f.blocks[b as usize].term { Term::Ret(v) => v[0], _ => panic!() };
+            // the flag first: false -> r2; true -> the block that compares a with MIN
+            assert!(f.blocks[b1].insts.is_empty(), "the compare left the flag's block: {:?}", f.blocks[b1].insts);
+            let Term::Branch(cx, tx, ex) = f.blocks[b1].term else { panic!() };
+            assert_eq!((cx, ret_of(ex)), (x, r2));
+            assert!(matches!(f.blocks[tx as usize].insts[..], [Inst::ICmpI(Cond::Eq, true, d, s, k)] if d == y && s == a && k == i64::MIN));
+            let Term::Branch(cy, ty, ey) = f.blocks[tx as usize].term else { panic!() };
+            assert_eq!((cy, ret_of(ty), ret_of(ey)), (y, r1, r2));
+        }
+    }
 }
 
 #[cfg(test)]
