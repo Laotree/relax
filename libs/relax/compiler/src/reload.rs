@@ -5303,6 +5303,74 @@ pub(crate) fn stamp(path: &str) -> Option<(std::time::SystemTime, u64)> {
     Some((m.modified().ok()?, m.len()))
 }
 
+/// The watcher's rounds while live tracing: its wakeups, the rounds that looked at files and why,
+/// printed once a minute with more than one wakeup (at rest a native watch wakes for nothing).
+struct WatchCost { since: Instant, wakes: u32, rounds: u32, stats: usize, why: [u32; 5] }
+
+impl WatchCost {
+    const WHY: [&'static str; 5] = ["poll (no native watch)", "events lost", "retry", "rescan", "events"];
+
+    fn new() -> WatchCost {
+        WatchCost { since: Instant::now(), wakes: 0, rounds: 0, stats: 0, why: [0; 5] }
+    }
+
+    /// A round that stats `n` files; `why`: its first reason of WHY.
+    fn round(&mut self, n: usize, why: usize) {
+        self.wakes += 1;
+        if n > 0 {
+            self.rounds += 1;
+            self.stats += n;
+            self.why[why] += 1;
+        }
+        if self.since.elapsed() >= std::time::Duration::from_secs(60) {
+            if self.wakes > 1 {
+                let why: Vec<String> = self.why.iter().zip(Self::WHY).filter(|(n, _)| **n > 0).map(|(n, w)| format!("{w} {n}")).collect();
+                eprintln!("makepad live: watch cost: {} wakeup(s), {} round(s) looked at {} file(s) in {:.0} s ({})", self.wakes, self.rounds, self.stats, self.since.elapsed().as_secs_f64(), why.join(", "));
+            }
+            *self = WatchCost::new();
+        }
+    }
+}
+
+/// Which watched files are a mounted store's, and where an edit of each would sit in the edits
+/// folder: asked once per watch set (each answer normalizes the path and walks the mounts).
+#[derive(Default)]
+struct Virtual {
+    is: Vec<bool>,
+    rels: std::collections::HashMap<String, usize>,
+}
+
+impl Virtual {
+    fn of(files: &[(String, u32, Option<(std::time::SystemTime, u64)>)]) -> Virtual {
+        let is: Vec<bool> = files.iter().map(|f| crate::vfs::is_virtual(&f.0)).collect();
+        let rels = files.iter().enumerate().filter(|&(k, _)| is[k]).filter_map(|(k, f)| Some((crate::vfs::edit_rel(&f.0)?, k))).collect();
+        Virtual { is, rels }
+    }
+}
+
+/// One round's look at the watched files, as `stamp` gives them: a disk file's from its stat; the
+/// virtual files' from one walk of the edits folder at the round's first virtual file, matched to
+/// them by their place there. A round over thousands of virtual files costs the few edits, not a
+/// path lookup and a failing stat each (two looks on every edit took 11-29 ms on Fab's 5,500).
+struct Look(std::cell::OnceCell<std::collections::HashMap<usize, (std::time::SystemTime, u64)>>);
+
+impl Look {
+    fn new() -> Look {
+        Look(std::cell::OnceCell::new())
+    }
+
+    /// Watched file `k` (`path`); one added since `virt` was taken is stat'ed on its own.
+    fn stamp(&self, virt: &Virtual, k: usize, path: &str) -> Option<(std::time::SystemTime, u64)> {
+        if !virt.is.get(k).copied().unwrap_or(false) {
+            return stamp(path);
+        }
+        let edits = self.0.get_or_init(|| {
+            crate::vfs::EditsLook::now().map(|l| l.entries().filter_map(|(rel, s)| Some((*virt.rels.get(rel)?, s))).collect()).unwrap_or_default()
+        });
+        Some(edits.get(&k).copied().unwrap_or((std::time::UNIX_EPOCH, 0)))
+    }
+}
+
 /// Whether every changed path is an edit of a mounted store that the edits ledger committed:
 /// devhub's ship-done (`relaxgit::finish`) renames each file into the edits folder and the ledger
 /// last, so an edit whose file was in place when the ledger was renamed is whole, and a save after
@@ -5561,7 +5629,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     // which files are a mounted store's (asked once per watch set: the lookup normalizes the path
     // and walks the mounts)
     let mut ledger = Ledger::now();
-    let mut virt: Vec<bool> = Vec::new();
+    let mut cost = WatchCost::new();
+    let mut virt = Virtual::default();
     let mut startup_scan = true;
     let mut restart_required = false;
     let mut restart_message = String::new();
@@ -5649,11 +5718,12 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             if lost { events = LiveWatch::new(files.iter().map(|f| f.0.as_str())); }
             let full = lost || (events.is_none() && last_scan.elapsed() >= LIVE_QUIET);
             if full { last_scan = Instant::now(); }
-            if virt.len() != files.len() { virt = files.iter().map(|f| crate::vfs::is_virtual(&f.0)).collect(); }
-            let ids = ledger.round(crate::vfs::edits_ledger_stamp(), full, notifications, &hot, &virt);
+            if virt.is.len() != files.len() { virt = Virtual::of(&files); }
+            let ids = ledger.round(crate::vfs::edits_ledger_stamp(), full, notifications, &hot, &virt.is);
+            let look = Look::new();
             let changed: Vec<_> = ids.into_iter().filter_map(|k| {
                 let f = &files[k];
-                let current = stamp(&f.0);
+                let current = look.stamp(&virt, k, &f.0);
                 (current != f.2).then_some((k, current))
             }).collect();
             if !changed.is_empty() {
@@ -5738,13 +5808,18 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let retry_due = retry_at.is_some_and(|t| t <= Instant::now()) || RETRY_NOW.swap(false, std::sync::atomic::Ordering::AcqRel);
         let all = lost || rewatched || synced || caught_up || retry_due
             || (events.is_none() && last_scan.elapsed() >= LIVE_QUIET);
-        if rewatched || synced || virt.len() != files.len() { virt = files.iter().map(|f| crate::vfs::is_virtual(&f.0)).collect(); }
+        if rewatched || synced || virt.is.len() != files.len() { virt = Virtual::of(&files); }
         let t_round = std::time::Instant::now();
         if all { last_scan = Instant::now(); }
         // a sync moved the checkout: every file, the virtual ones too
-        let ids = if synced { (0..files.len()).collect() } else { ledger.round(crate::vfs::edits_ledger_stamp(), all, notifications, &hot, &virt) };
+        let ids = if synced { (0..files.len()).collect() } else { ledger.round(crate::vfs::edits_ledger_stamp(), all, notifications, &hot, &virt.is) };
         let mut scanned = ids.len();
-        let mut changed: Vec<usize> = ids.into_iter().filter(|&k| stamp(&files[k].0) != files[k].2).collect();
+        if live_trace() {
+            let why = [events.is_none(), lost, retry_due, rewatched || synced || caught_up].iter().position(|&w| w).unwrap_or(4);
+            cost.round(scanned, why);
+        }
+        let look = Look::new();
+        let mut changed: Vec<usize> = ids.into_iter().filter(|&k| look.stamp(&virt, k, &files[k].0) != files[k].2).collect();
         if !traced && all {
             traced = true;
             eprintln!("makepad live: one watch round: {} files in {:.2} ms; hot set {} files", files.len(), t_round.elapsed().as_secs_f64() * 1e3, hot.len());
@@ -5778,7 +5853,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // is a wakeup, not proof that a checkout has finished: index.lock must
         // be gone and HEAD, its ref and every changed file must stay still for
         // a full quiet window. Never give up waiting on a slow writer.
-        let mut last: Vec<_> = files.iter().map(|f| stamp(&f.0)).collect();
+        let look = Look::new();
+        let mut last: Vec<_> = files.iter().enumerate().map(|(k, f)| look.stamp(&virt, k, &f.0)).collect();
         let mut git_state = repositories.snapshot();
         let mut still_since = Instant::now();
         // an overlay edit its ledger committed is whole: one look, no quiet window (100 ms of
@@ -5820,7 +5896,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 repositories.include(files.iter().map(|f| f.0.as_str()));
                 events = LiveWatch::new(files.iter().map(|f| f.0.as_str()));
             }
-            let now: Vec<_> = files.iter().map(|f| stamp(&f.0)).collect();
+            let look = Look::new();
+            let now: Vec<_> = files.iter().enumerate().map(|(k, f)| look.stamp(&virt, k, &f.0)).collect();
             scanned += files.len();
             for (k, f) in files.iter().enumerate() {
                 if now[k] != f.2 { changed.push(k); }
@@ -6054,7 +6131,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let originals: Vec<_> = edits.iter().map(|e| e.src.clone()).collect();
         // A writer may have resumed while we read. Keep these texts pending and
         // collect its next batch before compiling or requesting a recovery.
-        if files.iter().map(|f| stamp(&f.0)).ne(settled_stamps.iter().copied()) || repositories.snapshot() != git_state {
+        let look = Look::new();
+        if files.iter().enumerate().map(|(k, f)| look.stamp(&virt, k, &f.0)).ne(settled_stamps.iter().copied()) || repositories.snapshot() != git_state {
             retry_at = Some(Instant::now());
             continue;
         }
@@ -6085,7 +6163,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             eprintln!("makepad live: {}: NOT applied (errors below); the app runs the previous code", what);
             for l in &o.lines { eprintln!("makepad live:   {}", l); }
             patch_refused_event(&what, true, &o.lines);
-            let unchanged = files.iter().map(|f| stamp(&f.0)).eq(settled_stamps.iter().copied()) && repositories.snapshot() == git_state;
+            let look = Look::new();
+            let unchanged = files.iter().enumerate().map(|(k, f)| look.stamp(&virt, k, &f.0)).eq(settled_stamps.iter().copied()) && repositories.snapshot() == git_state;
             if quiet_retry && unchanged {
                 if let Some(failure) = failure {
                     drop(_reloading);
