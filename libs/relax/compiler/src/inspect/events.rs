@@ -718,13 +718,14 @@ pub fn start() {
             let waits = crate::waits::snapshot();
             let main = crate::jit::MAIN_TID.load(Relaxed);
             let now = crate::clock::wall_ns();
-            // the main thread waiting: on the owner after the first present (a compile stall),
-            // on a lock / condvar / join any time
-            if let Some(w) = waits.iter().find(|w| w.thread == main && main != 0) {
+            // the main thread waiting, in a program whose main runs an event loop (it presented a
+            // frame): on the owner (a compile stall), on a lock / condvar / join. A test or bench
+            // run's main waits on its work by design: its hangs are its verdict's, not the inbox's
+            let judged = crate::jit::FIRST_PRESENT.load(Relaxed) && !super::TEST_RUN.load(Relaxed);
+            if let Some(w) = waits.iter().find(|w| judged && w.thread == main && main != 0) {
                 let ms = now.saturating_sub(w.since_ns) / 1_000_000;
-                let present = crate::jit::FIRST_PRESENT.load(Relaxed);
                 let relevant = match w.kind {
-                    crate::waits::Kind::Owner => present,
+                    crate::waits::Kind::Owner => true,
                     crate::waits::Kind::Futex => w.label != "park" && w.label != "condvar" || ms > hang_ms * 4,
                     crate::waits::Kind::None => false,
                     _ => true,
