@@ -63,23 +63,37 @@ pub fn symbol_at(pc: u64) -> Option<(String, u64, String)> {
     symbol_at_imp(pc)
 }
 
+/// dladdr's answer (`Dl_info`). The process's one declaration of dladdr: the profiler and the
+/// executable-region scan use it too (two declarations with their own structs clash where
+/// `c_char` is unsigned, arm64 Linux and Android).
+#[cfg(unix)]
+#[repr(C)]
+pub(crate) struct DlInfo {
+    pub fname: *const std::ffi::c_char,
+    pub fbase: *mut u8,
+    pub sname: *const std::ffi::c_char,
+    pub saddr: *mut u8,
+}
+
+#[cfg(unix)]
+impl Default for DlInfo {
+    fn default() -> Self {
+        Self { fname: std::ptr::null(), fbase: std::ptr::null_mut(), sname: std::ptr::null(), saddr: std::ptr::null_mut() }
+    }
+}
+
+#[cfg(unix)]
+extern "C" {
+    pub(crate) fn dladdr(addr: *const u8, info: *mut DlInfo) -> i32;
+}
+
 /// From a fault handler (no allocation): the image holding `a` (its file name's last part and
 /// load base) and the nearest symbol dladdr knows (empty when none, with its address). Unix:
 /// dladdr, which the handler calls only on the way to the end of the process. Windows: None.
 pub fn image_at_raw(a: u64) -> Option<(&'static [u8], u64, &'static [u8], u64)> {
     #[cfg(unix)]
     {
-        #[repr(C)]
-        struct DlInfo {
-            fname: *const std::ffi::c_char,
-            fbase: *mut u8,
-            sname: *const std::ffi::c_char,
-            saddr: *mut u8,
-        }
-        extern "C" {
-            fn dladdr(addr: *const u8, info: *mut DlInfo) -> i32;
-        }
-        let mut info = DlInfo { fname: std::ptr::null(), fbase: std::ptr::null_mut(), sname: std::ptr::null(), saddr: std::ptr::null_mut() };
+        let mut info = DlInfo::default();
         if unsafe { dladdr(a as *const u8, &mut info) } == 0 || info.fname.is_null() {
             return None;
         }
@@ -98,17 +112,7 @@ pub fn image_at_raw(a: u64) -> Option<(&'static [u8], u64, &'static [u8], u64)> 
 
 #[cfg(unix)]
 fn symbol_at_imp(pc: u64) -> Option<(String, u64, String)> {
-    #[repr(C)]
-    struct DlInfo {
-        fname: *const std::ffi::c_char,
-        fbase: *mut u8,
-        sname: *const std::ffi::c_char,
-        saddr: *mut u8,
-    }
-    extern "C" {
-        fn dladdr(addr: *const u8, info: *mut DlInfo) -> i32;
-    }
-    let mut info = DlInfo { fname: std::ptr::null(), fbase: std::ptr::null_mut(), sname: std::ptr::null(), saddr: std::ptr::null_mut() };
+    let mut info = DlInfo::default();
     if unsafe { dladdr(pc as *const u8, &mut info) } == 0 || info.sname.is_null() {
         return None;
     }
@@ -179,6 +183,8 @@ mod unix {
         pub fn dlsym(handle: *mut u8, name: *const u8) -> *mut u8;
     }
 
+    // (Android's own `lookup` also asks the host library and the program's libraries)
+    #[cfg(not(target_os = "android"))]
     pub unsafe fn lookup(handle: *mut u8, name: *const u8) -> *mut u8 {
         dlsym(handle, name)
     }

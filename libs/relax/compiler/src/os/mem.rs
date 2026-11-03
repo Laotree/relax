@@ -43,17 +43,10 @@ pub fn anonymous_exec_regions() -> Vec<(u64, u64, i32)> {
         behavior: i32,
         user_wired_count: u16,
     }
-    #[repr(C)]
-    struct DlInfo {
-        fname: *const std::ffi::c_char,
-        fbase: *mut u8,
-        sname: *const std::ffi::c_char,
-        saddr: *mut u8,
-    }
+    use super::proc::{dladdr, DlInfo};
     extern "C" {
         fn mach_task_self() -> u32;
         fn mach_vm_region(task: u32, addr: *mut u64, size: *mut u64, flavor: i32, info: *mut BasicInfo64, count: *mut u32, object: *mut u32) -> i32;
-        fn dladdr(addr: *const u8, info: *mut DlInfo) -> i32;
     }
     const VM_REGION_BASIC_INFO_64: i32 = 9;
     const VM_PROT_EXECUTE: i32 = 4;
@@ -69,7 +62,7 @@ pub fn anonymous_exec_regions() -> Vec<(u64, u64, i32)> {
                 break;
             }
             if info.protection & VM_PROT_EXECUTE != 0 {
-                let mut d = DlInfo { fname: std::ptr::null(), fbase: std::ptr::null_mut(), sname: std::ptr::null(), saddr: std::ptr::null_mut() };
+                let mut d = DlInfo::default();
                 // an image's text (or the shared cache) is backed; anything else is generated
                 if dladdr(addr as *const u8, &mut d) == 0 || d.fname.is_null() {
                     out.push((addr, size, info.protection));

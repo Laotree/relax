@@ -525,6 +525,8 @@ mod imp {
     static HOLDS: [Slot; SLOTS] = [const { Slot { state: AtomicU32::new(0), tid: AtomicI32::new(0), regs: [const { AtomicU64::new(0) }; 9], mode: AtomicU32::new(0) } }; SLOTS];
     pub const HOLD_CAPTURE: u32 = 0;
     pub const HOLD_PAUSE: u32 = 1;
+    // a hold for good: Linux x86_64 only (`hold_for_good`, `keep_held`)
+    #[cfg(target_arch = "x86_64")]
     pub const HOLD_FOREVER: u32 = 2;
     static SIGNAL: AtomicI32 = AtomicI32::new(0);
 
@@ -635,6 +637,7 @@ mod imp {
     }
 
     /// A held thread stays held for good.
+    #[cfg(target_arch = "x86_64")]
     pub fn keep(slot: &Slot) {
         slot.mode.store(HOLD_FOREVER, Relaxed);
     }
