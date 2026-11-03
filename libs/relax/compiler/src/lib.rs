@@ -1271,6 +1271,8 @@ mod calls_tests;
 
 #[cfg(test)]
 mod reload_async_tests;
+#[cfg(test)]
+mod reload_items_tests;
 
 #[cfg(test)]
 mod value_tests;
