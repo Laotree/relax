@@ -16,7 +16,8 @@
 //! Steps (driver: the run monitor, after a settle; retried while preconditions fail):
 //! 1. the entries the cache recorded are written to its stores (off the owner); the collected
 //!    image of the program as it is now, encoded under a front read (compiles go on) and committed
-//!    to the store;
+//!    to the store -- unless the store holds an image of this program already (a warm start's, or
+//!    an earlier rebuild's) and only the interners grew since: step 3 tops those up;
 //! 2. the image restored into a new program and type context, on the monitor thread (it reads
 //!    only the image and the stores);
 //! 3. one owner request under a front write: the counts must be those of the encode (only the
@@ -44,7 +45,24 @@ pub(crate) fn remember_boot(pre: &[crate::preload::PreCrate]) {
     *BOOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::zone_alloc::kept_with(|| pre.to_vec()));
 }
 
+/// The counts of the collected image the store holds for this run's program: the one a warm start
+/// restored whole, then each rebuild's. A rebuild whose program differs from it only in the
+/// interners restores that image as it is (no encode): the replace tops the interners up.
+static STORED: relax_session::sync::Mutex<Option<Counts>> = relax_session::sync::Mutex::new(None);
+
+/// A warm start restored the whole program from the collected image: the store holds it.
+pub(crate) fn remember_restored(prog: &Program, tcx: &Tcx) {
+    *STORED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Counts::of(prog, tcx));
+}
+
 static REBUILDS: AtomicU32 = AtomicU32::new(0);
+static ENCODES: AtomicU32 = AtomicU32::new(0);
+
+/// Rebuilds that encoded and stored a new collected image (the others restored the stored one).
+#[cfg(test)]
+pub(crate) fn encodes() -> u32 {
+    ENCODES.load(Ordering::Relaxed)
+}
 
 /// Settle rebuilds done so far.
 pub(crate) fn rebuilds() -> u32 {
@@ -96,10 +114,14 @@ impl Counts {
             regions: tcx.tys.region_counts(), syms: prog.syms.len(), late_syms: prog.syms.late_len(), lists: tcx.tys.list_const_counts() }
     }
 
+    /// The same definitions, files, crates, modules and symbols (the interners aside).
+    fn same_items(&self, o: &Counts) -> bool {
+        (self.defs, self.files, self.crates, self.mods, self.syms, self.late_syms) == (o.defs, o.files, o.crates, o.mods, o.syms, o.late_syms)
+    }
+
     /// Equal but for the interners, which only grew.
     fn same_program(&self, o: &Counts) -> bool {
-        (self.defs, self.files, self.crates, self.mods, self.syms, self.late_syms) == (o.defs, o.files, o.crates, o.mods, o.syms, o.late_syms)
-            && self.tys <= o.tys && self.regions.0 <= o.regions.0 && self.regions.1 <= o.regions.1 && self.lists.0 <= o.lists.0 && self.lists.1 <= o.lists.1
+        self.same_items(o) && self.tys <= o.tys && self.regions.0 <= o.regions.0 && self.regions.1 <= o.regions.1 && self.lists.0 <= o.lists.0 && self.lists.1 <= o.lists.1
     }
 }
 
@@ -265,30 +287,40 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
             return Outcome::Retry(format!("the cache spill failed: {e}"));
         }
     }
-    // 1. the collected image of the program now, under a front read (compiles go on)
+    // 1. the collected image of the program now, under a front read (compiles go on); none when
+    // the store holds one of this program and only the interners grew since (the replace tops
+    // them up)
     let t = Instant::now();
     let Some(inputs) = owner::publish(|| unsafe { (*up).cache.as_ref().map(|c| c.collected_inputs()) }) else {
         return Outcome::Retry("the cache is not in the unit".into());
     };
-    let (before, encoded) = {
+    let stored = *STORED.lock().unwrap_or_else(|e| e.into_inner());
+    let (before, record) = {
         let _c = crate::zone_alloc::compiler();
         let r = front_read("settle rebuild encode");
         let (prog, tcx) = r.unit(up);
         let before = Counts::of(prog, tcx);
+        trace(&format!("the program {before:?}, the stored image {stored:?}"));
         let stop = || crate::preempt::writer_waiting() || crate::preempt::is_stopped();
-        (before, inputs.encode_now(prog, tcx, &stop))
+        (before, (!stored.is_some_and(|s| s.same_program(&before))).then(|| inputs.encode_now(prog, tcx, &stop)))
     };
-    let (dest, payload) = match encoded {
-        crate::cache::CollectedRecord::Ready(dest, payload) => (dest, payload),
-        crate::cache::CollectedRecord::Current => return Outcome::Retry("the store already holds the image".into()),
-        crate::cache::CollectedRecord::Yielded => return Outcome::Retry("the encode yielded to a front writer".into()),
-        crate::cache::CollectedRecord::Failed => return Outcome::Refused("the program is not recordable".into()),
-    };
-    if crate::cache::Cache::commit_collected(None, dest, payload).is_none() {
-        return Outcome::Retry("the collected image could not be written".into());
+    let encoded = record.is_some();
+    if let Some(record) = record {
+        let (dest, payload) = match record {
+            crate::cache::CollectedRecord::Ready(dest, payload) => (dest, payload),
+            crate::cache::CollectedRecord::Current => return Outcome::Retry("the store already holds the image".into()),
+            crate::cache::CollectedRecord::Yielded => return Outcome::Retry("the encode yielded to a front writer".into()),
+            crate::cache::CollectedRecord::Failed => return Outcome::Refused("the program is not recordable".into()),
+        };
+        if crate::cache::Cache::commit_collected(None, dest, payload).is_none() {
+            return Outcome::Retry("the collected image could not be written".into());
+        }
+        *STORED.lock().unwrap_or_else(|e| e.into_inner()) = Some(before);
+        ENCODES.fetch_add(1, Ordering::Relaxed);
     }
     let encode_ms = ms(t);
-    trace(&format!("encoded and stored in {encode_ms:.1} ms"));
+    let encode = if encoded { format!("encode {encode_ms:.1} ms") } else { "no encode (the store holds the program's image)".to_string() };
+    trace(&encode);
 
     // 2. the restore (the image and the stores only)
     let t = Instant::now();
@@ -311,6 +343,11 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
         }
     };
     crate::program::share_std_end();
+    // (another process of this program may have stored its image since: the next try encodes)
+    if !encoded && !stored.is_some_and(|s| s.same_items(&Counts::of(&fresh.prog, &fresh.tcx))) {
+        *STORED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        return Outcome::Retry("the store's image is not this program's".into());
+    }
     let restore_ms = ms(t);
     trace(&format!("restored in {restore_ms:.1} ms"));
 
@@ -361,8 +398,8 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
     crate::pack::release_resident();
     let rss1 = crate::memstat::resident();
     REBUILDS.fetch_add(1, Ordering::Relaxed);
-    if crate::run::VERBOSE.load(Ordering::Relaxed) || crate::memstat::enabled() { eprintln!("makepad-run settle rebuild at t={:.0} ms: encode {:.1} ms, restore {:.1} ms, replace on the owner {:.1} ms, old state dropped in {:.1} ms; total {:.1} ms; rss {:.0} -> {:.0} MB",
-        crate::clock::ms_since_start(), encode_ms, restore_ms, replace_ms, drop_ms, ms(t_all), rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0); }
+    if crate::run::VERBOSE.load(Ordering::Relaxed) || crate::memstat::enabled() { eprintln!("makepad-run settle rebuild at t={:.0} ms: {}, restore {:.1} ms, replace on the owner {:.1} ms, old state dropped in {:.1} ms; total {:.1} ms; rss {:.0} -> {:.0} MB",
+        crate::clock::ms_since_start(), encode, restore_ms, replace_ms, drop_ms, ms(t_all), rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0); }
     Outcome::Done
 }
 

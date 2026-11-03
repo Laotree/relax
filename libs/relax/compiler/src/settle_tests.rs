@@ -150,6 +150,19 @@ fn settle_rebuild_segregates_slot_lifetimes() {
     eprintln!("slot segregation: old chunks {} -> {}, old live slot bytes {} -> {}", before[21], after[21], before[22], after[22]);
     assert!(after[22] < before[22] / 4, "old live bytes must fall below a quarter: {} -> {} (chunks {} -> {})", before[22], after[22], before[21], after[21]);
     assert!(after[21] < before[21], "empty cold chunks must be released");
+    // the same program again: the store holds its image now, so the rebuild restores that and
+    // encodes nothing (a warm launch's rebuild)
+    let encodes = settle_rebuild::encodes();
+    match settle_rebuild::run(up, false) {
+        settle_rebuild::Outcome::Done => {}
+        settle_rebuild::Outcome::Retry(why) | settle_rebuild::Outcome::Refused(why) => panic!("the second settle rebuild did not replace: {why}"),
+    }
+    assert_eq!(settle_rebuild::encodes(), encodes, "a rebuild of a program the store holds encodes nothing");
+    crate::owner::call(crate::owner::Class::Program, || {
+        let fields = check_slots(&u);
+        assert!(fields[..5].iter().chain(&fields[6..]).all(|p| *p), "slot fields survive a rebuild from the stored image");
+        assert!(u.fns.iter().all(|f| f.rir.is_none()));
+    });
     // The isolated process owns the runtime globals; no workers survive the child.
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
