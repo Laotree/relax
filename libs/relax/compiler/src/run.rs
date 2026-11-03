@@ -3840,6 +3840,7 @@ fn summary_inner(why: &str) {
         // the disk cache: this run's new entries become a pack (on the owner thread: no compiles)
         if why != "stats" {
             let u = unsafe { &mut *up };
+            jit::record_queued_at_exit(u);
             u.flush_cache_records();
             let (order, present) = jit::manifest_order(std::mem::take(&mut u.start_order), jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed));
             let mut cache = u.cache.take();
