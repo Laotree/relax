@@ -416,6 +416,10 @@ pub struct Unit {
     pub unwind_drop_cache: crate::conc::MemoMap<TyId, bool>,
     /// (concrete type, dyn type) -> vtable address
     pub vtables: crate::conc::MemoMap<(TyId, TyId), u64>,
+    /// per slot: the trait-object types its code calls methods of through a vtable, as its lowering
+    /// found them (Lcx::dyn_calls) or its disk cache entry recorded them: real-time reach follows
+    /// every vtable of each, now and as new ones are made (realtime_refs, realtime_vtable)
+    pub dyn_calls: relax_session::sync::Mutex<crate::fxhash::HashMap<u32, Box<[TyId]>>>,
     /// static `Location` data per (file, line, col) (#[track_caller] arguments)
     pub locations: relax_session::sync::Mutex<crate::fxhash::HashMap<(String, u32, u32), u64>>,
     /// constants whose evaluation failed (reported once, not re-run per use)
@@ -3278,6 +3282,8 @@ pub(crate) fn slot_name(id: u32) -> Option<String> {
 
 /// `f` gets slot `id`'s name (nothing when none): no lock, no allocation (a forked child's
 /// report, forkexec.rs).
+/// (unix-only, as forkexec.rs: Windows has no fork)
+#[cfg(unix)]
 pub(crate) fn with_slot_name(id: u32, f: &mut dyn FnMut(&[u8])) {
     unsafe {
         if !cur_unit().is_null() && (id as usize) < (&*cur_unit()).fns.len() {
@@ -3945,6 +3951,7 @@ impl Unit {
             coro_relower: Default::default(),
             unwind_drop_cache: Default::default(),
             vtables: crate::conc::MemoMap::new_kept(16),
+            dyn_calls: Default::default(),
             locations: Default::default(),
             const_failed: std::collections::HashSet::new(),
             core_path_cache: crate::conc::MemoMap::with_bits(8),
@@ -5315,6 +5322,22 @@ impl Unit {
         Ok(a)
     }
 
+    /// Slot `id`'s code calls methods of trait-object types `dyns` through their vtables (its
+    /// lowering's virtual calls, or what its cache entry recorded): the newest code's answer.
+    pub(crate) fn note_dyn_calls(&self, id: u32, dyns: Vec<TyId>) {
+        let mut m = self.dyn_calls.lock().unwrap_or_else(|e| e.into_inner());
+        if dyns.is_empty() {
+            m.remove(&id);
+        } else {
+            crate::zone_alloc::kept_with(|| m.insert(id, dyns.into_boxed_slice()));
+        }
+    }
+
+    /// The trait-object types slot `id`'s code calls through (note_dyn_calls).
+    pub(crate) fn dyn_calls_of(&self, id: u32) -> Vec<TyId> {
+        self.dyn_calls.lock().unwrap_or_else(|e| e.into_inner()).get(&id).map_or_else(Vec::new, |d| d.to_vec())
+    }
+
     /// The reload index, built from the slots made so far on first use.
     fn reload_index(&self) -> relax_session::sync::MutexGuard<'_, Option<ReloadSlots>> {
         // fn_create first (fn_id's order): no slot is made while the index is built, and fn_id
@@ -6274,6 +6297,9 @@ impl Unit {
         }
         // a constant that failed to evaluate is not re-run by every use (u64::MAX marks it)
         if self.const_failed.contains(&(d, args.clone())) {
+            if crate::ctfe::trace_on() {
+                eprintln!("ctfe: {}: failed before", self.prog.def_path(d));
+            }
             return None;
         }
         if let Some(a) = unsafe { crate::cache::const_value(self.self_ptr.0, d, &args) } {
@@ -6327,6 +6353,9 @@ impl Unit {
                 Some(a)
             }
             None => {
+                if crate::ctfe::trace_on() {
+                    eprintln!("ctfe: {}: no value (deferred: {})", self.prog.def_path(d), DEFERRED_ABORT.with(|a| a.get()));
+                }
                 // a module the post-boot loader has still to load: evaluated again later
                 if !DEFERRED_ABORT.with(|a| a.get()) { self.const_failed.insert((d, args)); }
                 None
@@ -6621,12 +6650,20 @@ impl Unit {
             // in a build, or while linking cached code (the link fails, the slot is built, and
             // that build defers): not an error of the program
             Err(p) if p.message.contains(DEFERRED_RETRY) && (BUILD_DEPTH.with(|d| d.get()) > 0 || crate::cache::linking(self)) => {
+                if crate::ctfe::trace_on() {
+                    eprintln!("ctfe: {}: deferred: {}", self.prog.def_path(d), p.message);
+                }
                 DEFERRED_ABORT.with(|a| a.set(true));
                 None
             }
             // the initializer did not compile (its type check failed): that error is reported
             // already, and rustc reports no evaluation error for it
-            Err(p) if p.message.starts_with("compile error in ") => None,
+            Err(p) if p.message.starts_with("compile error in ") => {
+                if crate::ctfe::trace_on() {
+                    eprintln!("ctfe: {}: its code did not compile: {}", self.prog.def_path(d), p.message);
+                }
+                None
+            }
             Err(p) => {
                 // the deny-by-default lint, not an evaluation error: no code
                 let code = if p.kind == LONG_RUNNING_KIND { "" } else { "E0080: " };
@@ -6642,6 +6679,9 @@ impl Unit {
                 }
                 // queries.rs:58-108: evaluation errors return to the caller;
                 // const_eval_resolve turns this into Reported.
+                if crate::ctfe::trace_on() {
+                    eprintln!("ctfe: {}: its code failed: {}", self.prog.def_path(d), m);
+                }
                 self.note_error(m);
                 None
             }
@@ -10600,10 +10640,12 @@ crate::memo_local! {
 static BUILD_GEN: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn end_build(up: *mut Unit, id: u32) {
+    let mut above = Vec::new();
     let open = BUILD_STACK.try_with(|s| {
         let mut s = s.borrow_mut();
         match s.iter().rposition(|x| *x == id) {
             Some(i) => {
+                above = s.split_off(i + 1);
                 s.truncate(i);
                 true
             }
@@ -10612,6 +10654,11 @@ unsafe fn end_build(up: *mut Unit, id: u32) {
     });
     if open.unwrap_or(false) {
         (&mut *up).fns[id as usize].building = false;
+    }
+    // builds opened above it that a caught panic left open: closed with it (left set, the slot
+    // could never be built again -- each later build of it a "recursive build")
+    for x in above {
+        (&mut *up).fns[x as usize].building = false;
     }
     BUILD_GEN.fetch_add(1, Ordering::Release);
 }
@@ -13290,6 +13337,7 @@ fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(re
     if let Err(e) = lcx.f.verify() {
         return Err(format!("RIR verify: {}\n{}", e, lcx.f.dump()));
     }
+    u.note_dyn_calls(id, std::mem::take(&mut lcx.dyn_calls));
     Ok((lcx.f, !lcx.new_closures.is_empty()))
 }
 
@@ -25189,6 +25237,81 @@ mod inspect_tiers_tests;
 mod tier_stuck_tests;
 
 #[cfg(test)]
+mod own_work_tests {
+    use super::*;
+
+    /// floats.rs at O3 (diff_fast, 2026-11-03): the owner's constant drain, between two requests,
+    /// built a const fn (hex_float::parse_hex_exact, for an hf64! constant); a wait in that build
+    /// served a type check's constant (a Job) whose initializer calls the same fn. owner::nested
+    /// counted requests only, so the Job was not nested: its build of the fn was a "recursive
+    /// build", and its constant failed for good (no value, cbrt_round never compiled). Served
+    /// inside a wait of the owner's own work it is nested: cancelled (its requester asks again),
+    /// and nothing is marked failed.
+    #[test]
+    fn a_job_served_inside_the_drains_build_of_its_fn_is_cancelled_not_failed() {
+        isolated_test!(a_job_served_inside_the_drains_build_of_its_fn_is_cancelled_not_failed);
+        static OPEN: AtomicBool = AtomicBool::new(false);
+        static JOB_DONE: AtomicBool = AtomicBool::new(false);
+        static WORK_DONE: AtomicBool = AtomicBool::new(false);
+        static WORK_NESTED: AtomicBool = AtomicBool::new(true);
+        crate::borrowck::lazy::disable_gandalf();
+        let source = "#![no_std]\nconst fn triple(x: u32) -> u32 { x * 3 }\nconst B: u32 = triple(2);\n";
+        let path = std::env::temp_dir().join(format!("relax-own-work-{}.rs", std::process::id()));
+        std::fs::write(&path, source).unwrap();
+        let mut session = crate::Session::default();
+        // the initializer runs as JIT code, which compiles `triple` at its call
+        session.options.ctfe = crate::options::Ctfe::Off;
+        let session = std::sync::Arc::new(session);
+        let mut prog = Program::new(&session);
+        prog.load_crate("own_work", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+        let def = |n: &str| prog.defs.iter().enumerate().find_map(|(i, _)| (prog.name(DefId(i as u32)) == n).then_some(DefId(i as u32))).unwrap();
+        let (b, triple) = (def("B"), def("triple"));
+        let mut tcx = Tcx::new();
+        tcx.collect(&prog);
+        let mut u = Unit::new(prog, tcx, 0);
+        let f = u.fn_id(FnKey::Inst(triple, Vec::new()));
+        let up = &mut *u as *mut Unit as usize;
+        // the drain's build of `triple`, open while it waits (as a front's query latch makes it)
+        *crate::owner::OWN_WORK_TEST.lock().unwrap() = Some(Box::new(move || unsafe {
+            WORK_NESTED.store(crate::owner::nested(), Ordering::SeqCst);
+            begin_build(up as *mut Unit, f).unwrap();
+            OPEN.store(true, Ordering::SeqCst);
+            crate::owner::pump_wait(&|| JOB_DONE.load(Ordering::SeqCst));
+            end_build(up as *mut Unit, f);
+            WORK_DONE.store(true, Ordering::SeqCst);
+        }));
+        // a type check's constant, asked for while the drain's build is open
+        let job = std::thread::spawn(move || {
+            while !OPEN.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            let r = std::panic::catch_unwind(|| crate::owner::call(crate::owner::Class::Job, || unsafe { (&mut *(up as *mut Unit)).const_addr(b, Vec::new()) }));
+            JOB_DONE.store(true, Ordering::SeqCst);
+            match r {
+                Ok(a) => Err(format!("the nested constant was not cancelled: {:?}", a)),
+                Err(p) if crate::preempt::is_preempted(&*p) => Ok(()),
+                Err(p) => Err(format!("the nested constant panicked: {:?}", p.downcast_ref::<String>())),
+            }
+        });
+        // a request: the owner's own work runs after it
+        crate::owner::call(crate::owner::Class::Program, || {});
+        job.join().unwrap().unwrap();
+        while !WORK_DONE.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        assert!(!WORK_NESTED.load(Ordering::SeqCst), "the owner's own work is not nested");
+        assert!(!u.const_failed.contains(&(b, Vec::new())), "the cancelled constant was marked failed");
+        assert!(u.fns[f as usize].build_err.is_none(), "{:?}", u.fns[f as usize].build_err);
+        // asked again, it evaluates
+        let a = crate::owner::call(crate::owner::Class::Job, || unsafe { (&mut *(up as *mut Unit)).const_addr(b, Vec::new()) }).expect("B has a value");
+        assert_eq!(unsafe { *(a as *const u32) }, 6);
+        // (the isolated process owns the runtime globals)
+        std::mem::forget(u);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
 mod allocator_swap_tests {
     use super::*;
 
@@ -25451,16 +25574,18 @@ fn present_files() -> bool {
 // code such a thread runs (std::relax::realtime: the platform's audio seam marks the entry the HAL
 // calls and the app's callback); everything it can reach is then compiled on the owner thread
 // before the first call: direct calls, fn addresses taken, the functions constant data points at
-// (vtables, fn tables), the bodies inlined into it, and the methods of every trait object it calls
-// through -- the vtables that exist now and, as the program makes new ones of those types, those
-// too (after the request that made them). New code installed later for a slot of the set (an O2 or
+// (vtables, fn tables), the bodies inlined into it, and the methods (and drops) of every trait
+// object it calls through, as its lowering found them (Lcx::dyn_calls, kept in its disk cache
+// entry) -- the vtables that exist now and, as the program makes new ones of those types, those
+// too: a vtable made by any code (an unsizing anywhere) is pending the moment it is made, so the
+// strict ready is false until its methods are compiled. New code installed later for a slot of the set (an O2 or
 // O3 build, a verdict's rebuild that calls the verified bodies instead of their SPEC-V twins) has
 // its new callees walked too. The marking thread never waits for this: the reach runs in bounded
 // owner steps between the program's requests, and the mark's ticket says when it is done or has
 // waited long enough (RT_WAIT: the platform hands the HAL its audio entry then; audio never waits
 // longer for its code, what is still missing then compiles on its first call). The
-// slots this reaches are recorded in the disk cache (rt-<crate>.keys) and compiled first at the
-// next run's mark. A lazy compile a real-time thread still meets is reported, compiles everything
+// slots this reaches and the trait-object types it calls through are recorded in the disk cache
+// (rt-<crate>.set) and compiled first at the next run's mark. A lazy compile a real-time thread still meets is reported, compiles everything
 // its slot reaches at once and is recorded too.
 
 fn tls_trace() -> bool {
@@ -25501,8 +25626,10 @@ struct RealTime {
     /// the newest ticket whose roots are in the reach, and the wakes of tickets not done yet
     added: u64,
     wakes: Vec<(u64, Option<crate::domain::Callback>, usize)>,
-    /// this reach's start (set length, slots compiled, owner ns, what started it)
+    /// this reach's start (set length, trait-object types known, slots compiled, owner ns, what
+    /// started it)
     n0: usize,
+    d0: usize,
     compiled: u64,
     ns: u64,
     why: &'static str,
@@ -25594,7 +25721,7 @@ pub(crate) extern "C" fn __relax_realtime_lazy(ticket: u64) -> u32 {
 }
 
 /// std::relax::realtime_misses: lazy compiles real-time threads met so far (each one stalled the thread).
-extern "C" fn __relax_realtime_misses() -> u64 {
+pub(crate) extern "C" fn __relax_realtime_misses() -> u64 {
     RT_LAZY.load(Ordering::Relaxed)
 }
 
@@ -25618,9 +25745,13 @@ static RT_ARMED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::ne
 /// set's slots whose compile failed. The reach is one walk for every mark (a slot two roots reach is
 /// walked once, and a warm run links the earlier runs' set without walking it), so this is the
 /// whole real-time set's answer: never 0 while something on any root's path is lazy.
+///
+/// The queues realtime_drain empties are read first: it adds their work to the reach before it
+/// takes them off, so a read never falls between the two (a vtable made just now is counted in
+/// one or the other).
 fn realtime_pending() -> u64 {
-    let own = with_rt(|rt| (rt.todo.len() + rt.link.len() + rt.new_dyns.len() + rt.failed.len()) as u64 + rt.scheduled as u64);
-    own + RT_PENDING.lock().unwrap_or_else(|e| e.into_inner()).len() as u64 + RT_PENDING_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).len() as u64
+    let queued = RT_PENDING.lock().unwrap_or_else(|e| e.into_inner()).len() as u64 + RT_PENDING_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).len() as u64;
+    queued + with_rt(|rt| (rt.todo.len() + rt.link.len() + rt.new_dyns.len() + rt.failed.len()) as u64 + rt.scheduled as u64)
 }
 
 /// A live patch would replace code of `slots` (compiled ones and lazy ones it rebuilds): while a
@@ -25702,6 +25833,7 @@ pub(crate) unsafe fn realtime_reach_queued(up: *mut Unit, roots: Vec<u32>, why: 
     let post = with_rt(|rt| {
         if rt.todo.is_empty() && rt.link.is_empty() && rt.new_dyns.is_empty() && !rt.scheduled {
             rt.n0 = rt.set.len();
+            rt.d0 = rt.dyns.len();
             rt.compiled = 0;
             rt.ns = 0;
             rt.why = why;
@@ -25727,12 +25859,26 @@ unsafe fn realtime_step(up: *mut Unit) {
     // in the set; an edited slot's key no longer resolves and is walked from what calls it)
     if with_rt(|rt| !std::mem::replace(&mut rt.loaded, true)) {
         let root = crate::layout::root_crate();
-        let keys = (&*up).cache.as_ref().map(|c| c.rt_set_keys(&*up, root)).unwrap_or_default();
+        let (keys, dyns) = {
+            let u = &mut *up;
+            match u.cache.take() {
+                Some(mut c) => {
+                    let r = c.rt_set_load(u, root);
+                    u.cache = Some(c);
+                    r
+                }
+                None => Default::default(),
+            }
+        };
         let earlier: Vec<u32> = keys.iter().filter_map(|k| crate::cache::slot_for_bytes_unit(up, k)).collect();
         if rt_trace() {
-            eprintln!("makepad-run rt: the earlier runs' set: {} keys, {} resolved", keys.len(), earlier.len());
+            eprintln!("makepad-run rt: the earlier runs' set: {} keys, {} resolved, {} trait-object types", keys.len(), earlier.len(), dyns.len());
         }
-        with_rt(|rt| rt.link.extend(earlier.into_iter().rev()));
+        // (linked slots are not walked: the types their code calls through are the set's)
+        with_rt(|rt| {
+            rt.link.extend(earlier.into_iter().rev());
+            rt.new_dyns.extend(dyns.into_iter().map(|d| d.0).filter(|d| !rt.dyns.contains(d)));
+        });
     }
     let mut compiled = 0u64;
     let done = loop {
@@ -25768,9 +25914,11 @@ unsafe fn realtime_step(up: *mut Unit) {
                 }
                 let lazy = (id as usize) < (&*up).fns.len() && !(&*up).fns[id as usize].compiled;
                 let partner = realtime_partner(&*up, id);
+                let dyns = (&*up).dyn_calls_of(id);
                 with_rt(|rt| {
                     if lazy { rt.failed.insert(id); } else { rt.failed.remove(&id); }
                     rt.todo.extend(partner);
+                    rt.new_dyns.extend(dyns.into_iter().map(|d| d.0).filter(|d| !rt.dyns.contains(d)));
                 });
             }
             Next::Walk(id) => {
@@ -25791,20 +25939,26 @@ unsafe fn realtime_step(up: *mut Unit) {
                 if !was && now {
                     compiled += 1;
                 }
+                // the trait objects its code calls through (a method, a drop): their vtables next
+                let dyns = (&*up).dyn_calls_of(id);
                 with_rt(|rt| {
                     if now { rt.failed.remove(&id); } else { rt.failed.insert(id); }
                     rt.todo.extend(slots);
+                    rt.new_dyns.extend(dyns.into_iter().map(|d| d.0).filter(|d| !rt.dyns.contains(d)));
                 });
             }
             // trait-object types newly called through: every vtable of each, now and later
             Next::Dyns(new_dyns) => {
                 let u = &*up;
-                let snapshot = u.vtables.snapshot();
+                // known first, then the vtables made so far: one made meanwhile (on another
+                // thread) is in the snapshot or noted by realtime_vtable
                 with_rt(|rt| {
-                    let fresh = new_dyns.iter().filter(|d| rt.dyns.insert(**d)).count();
-                    if fresh > 0 {
+                    if new_dyns.iter().filter(|d| rt.dyns.insert(**d)).count() > 0 {
                         RT_DYNS.store(true, Ordering::Release);
                     }
+                });
+                let snapshot = u.vtables.snapshot();
+                with_rt(|rt| {
                     let addrs: Vec<(u32, u64, TyId)> = snapshot.into_iter().filter(|((_, dy), a)| rt.dyns.contains(&dy.0) && !rt.vtables.contains(a)).map(|((t, dy), a)| (dy.0, a, t)).collect();
                     if rt_trace() {
                         let mut by: crate::fxhash::HashMap<u32, usize> = Default::default();
@@ -25830,10 +25984,10 @@ unsafe fn realtime_step(up: *mut Unit) {
     let dt = wall_ns() - t0;
     RT_AHEAD[0].fetch_add(compiled, Ordering::Relaxed);
     RT_AHEAD[1].fetch_add(dt, Ordering::Relaxed);
-    let (n0, total_compiled, ns, why) = with_rt(|rt| {
+    let (n0, d0, total_compiled, ns, why) = with_rt(|rt| {
         rt.compiled += compiled;
         rt.ns += dt;
-        (rt.n0, rt.compiled, rt.ns, rt.why)
+        (rt.n0, rt.d0, rt.compiled, rt.ns, rt.why)
     });
     if !done {
         // the program's requests that queued meanwhile go first
@@ -25841,8 +25995,9 @@ unsafe fn realtime_step(up: *mut Unit) {
         owner::post_queued(owner::Class::Program, move || unsafe { realtime_step(upn as *mut Unit) });
         return;
     }
-    let set = with_rt(|rt| rt.set.clone());
-    if set.len() == n0 && total_compiled == 0 {
+    let (set, dyns) = with_rt(|rt| (rt.set.clone(), rt.dyns.iter().map(|&d| TyId(d)).collect::<Vec<TyId>>()));
+    let grew = set.len() > n0 || dyns.len() > d0;
+    if !grew && total_compiled == 0 {
         realtime_done();
         return;
     }
@@ -25852,9 +26007,9 @@ unsafe fn realtime_step(up: *mut Unit) {
     // mark; the O3 tier follows its call counts as anywhere
     realtime_top_tier(up, &set);
     let u = &mut *up;
-    if set.len() > n0 {
+    if grew {
         if let Some(mut c) = u.cache.take() {
-            c.rt_set_store(u, crate::layout::root_crate(), &set);
+            c.rt_set_store(u, crate::layout::root_crate(), &set, &dyns);
             u.cache = Some(c);
         }
     }
@@ -26353,6 +26508,10 @@ pub(crate) fn const_drain() {
                     BodyConst::Block(bl, t) => { u.const_block(&body.0, bl, t, slot); true }
                 })).unwrap_or(false);
                 DEFERRED_ABORT.with(|a| a.set(deferred));
+                // (builds the evaluation opened above the slot that a caught panic left open: closed)
+                for x in BUILD_STACK.with(|s| s.borrow_mut().split_off(depth + 1)) {
+                    u.fns[x as usize].building = false;
+                }
                 BUILD_STACK.with(|s| s.borrow_mut().truncate(depth));
                 if ahead_trace() {
                     eprintln!("const-drain: a value of the body of {} {}", u.fns[slot as usize].name, if ok { "evaluated" } else { "failed" });
@@ -26396,21 +26555,28 @@ pub(crate) fn realtime_drain() {
         return;
     }
     let _span = crate::inspect::timeline::span("owner realtime drain");
-    let mut roots = std::mem::take(&mut *RT_PENDING_SLOTS.lock().unwrap_or_else(|e| e.into_inner()));
+    // read, added to the reach, then taken off the queues (realtime_pending reads the queues
+    // first: never 0 in between); what was queued meanwhile stays for the next drain
+    let mut roots = RT_PENDING_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let slots = roots.len();
-    let addrs = if RT_DYNS.load(Ordering::Acquire) { std::mem::take(&mut *RT_PENDING.lock().unwrap_or_else(|e| e.into_inner())) } else { Vec::new() };
-    if !addrs.is_empty() {
-        let u = unsafe { &*up };
-        with_rt(|rt| {
-            for a in addrs {
-                if rt.vtables.insert(a) {
-                    crate::syms::data_thunks(u, a, &mut roots);
-                }
-            }
-        });
+    let addrs = if RT_DYNS.load(Ordering::Acquire) { RT_PENDING.lock().unwrap_or_else(|e| e.into_inner()).clone() } else { Vec::new() };
+    if slots == 0 && addrs.is_empty() {
+        return;
     }
+    let u = unsafe { &*up };
+    with_rt(|rt| {
+        for &a in &addrs {
+            if rt.vtables.insert(a) {
+                crate::syms::data_thunks(u, a, &mut roots);
+            }
+        }
+    });
     if !roots.is_empty() {
         unsafe { realtime_reach(up, roots, if slots > 0 { "new code" } else { "new vtable" }) };
+    }
+    RT_PENDING_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).drain(..slots);
+    if !addrs.is_empty() {
+        RT_PENDING.lock().unwrap_or_else(|e| e.into_inner()).drain(..addrs.len());
     }
 }
 

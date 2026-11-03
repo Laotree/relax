@@ -1034,3 +1034,97 @@ fn realtime_thread_marks_the_calling_thread() {
     assert_eq!(marked, (false, true));
     assert!(!std::thread::spawn(crate::jit::is_realtime_thread).join().unwrap(), "another thread is not marked");
 }
+
+/// FABARMS3's hole: the marked root calls through `dyn Route` (its value holds no trait object),
+/// and other code makes the first `Box<Ded> -> Box<dyn Route>` after the mark, and a second type's
+/// after the reach is done. The root's lowering names the trait object it calls through, so the
+/// reach follows its vtables: the strict ready is false the moment a new one is made (polled
+/// right after the unsizing code ran), true once its methods are compiled, and the real-time
+/// thread then meets no lazy compile.
+#[test]
+fn realtime_reach_follows_vtables_made_after_the_mark() {
+    const CHILD: &str = "MAKEPAD_RUN_RT_DYN_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::realtime_reach_follows_vtables_made_after_the_mark", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
+            .output().unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-rt-dyn-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    std::fs::write(dir.join("app/src/lib.rs"), "pub trait Route { fn next(&mut self) -> u32; }\n\
+        pub struct Ded(pub u32);\n\
+        impl Route for Ded { fn next(&mut self) -> u32 { self.0 += 3; self.0 } }\n\
+        pub struct Arc2(pub u32);\n\
+        impl Route for Arc2 { fn next(&mut self) -> u32 { self.0 * 7 } }\n\
+        #[repr(C)]\n\
+        pub struct Cell { pub route: Option<Box<dyn Route>>, pub out: u32 }\n\
+        pub fn run(c: &mut Cell) { if let Some(r) = c.route.as_mut() { c.out = r.next(); } }\n\
+        pub fn start(c: &mut Cell) { c.route = Some(Box::new(Ded(1))); }\n\
+        pub fn switch(c: &mut Cell) { c.route = Some(Box::new(Arc2(6))); }\n").unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "rt_dyn_app", false).unwrap();
+    let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let (run_d, start_d, switch_d) = (def("run"), def("start"), def("switch"));
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let upn = up as usize;
+    let (root, [run_e, start_e, switch_e]) = crate::owner::call(crate::owner::Class::Program, || {
+        let ids = [run_d, start_d, switch_d].map(|d| u.fn_id(crate::jit::FnKey::Inst(d, vec![])));
+        (ids[0], ids.map(|id| u.entry(id)))
+    });
+    // the Cell (#[repr(C)]: the Option<Box<dyn Route>> as data and vtable words, then `out`), None
+    let mut cell = [0u64; 3];
+    let cp = cell.as_mut_ptr() as u64;
+    let call = |entry: u64| unsafe { crate::jit::call_jit(upn as *mut crate::jit::Unit, entry, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+    // `run` on a real-time thread: its result and the lazy compiles it met
+    let run_rt = move |cp: u64| std::thread::spawn(move || {
+        crate::jit::__relax_realtime_thread();
+        let before = crate::jit::__relax_realtime_misses();
+        unsafe { crate::jit::call_jit(upn as *mut crate::jit::Unit, run_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        (unsafe { *((cp + 16) as *const u32) }, crate::jit::__relax_realtime_misses() - before)
+    }).join().unwrap();
+    // the method `next` of the vtable the cell holds now (its second word): compiled?
+    let next_built = || crate::owner::call(crate::owner::Class::Program, || {
+        let vtable = unsafe { *((cp + 8) as *const u64) };
+        let id = u.thunk_slot(unsafe { *((vtable + 24) as *const u64) });
+        id.is_some_and(|id| u.fns[id as usize].compiled)
+    });
+    let compiled = |t| crate::jit::__relax_realtime_compiled(t);
+    let wait = |t| {
+        for _ in 0..5000 {
+            if compiled(t) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("the real-time reach was not compiled in 10 s");
+    };
+    // the mark, then at once the first unsizing (FABARMS3's order), polled right after it ran
+    let ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![root]) });
+    call(start_e);
+    assert!(!compiled(ticket) || next_built(), "compiled right after the first `Box<Ded> -> Box<dyn Route>`, with `<Ded as Route>::next` lazy");
+    wait(ticket);
+    assert!(next_built(), "compiled, with `<Ded as Route>::next` lazy");
+    assert_eq!(run_rt(cp), (4, 0), "the real-time thread met a lazy compile");
+    // a second type's vtable, made after the reach is done: false at once, until it is compiled
+    call(switch_e);
+    assert!(!compiled(ticket) || next_built(), "compiled right after the first `Box<Arc2> -> Box<dyn Route>`, with `<Arc2 as Route>::next` lazy");
+    wait(ticket);
+    assert_eq!(run_rt(cp), (42, 0), "the real-time thread met a lazy compile");
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}

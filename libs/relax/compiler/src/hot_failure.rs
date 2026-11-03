@@ -245,6 +245,8 @@ pub fn verdict(code: i32) -> Verdict {
 
 /// An existing process restart carries the recovery identity and changed units
 /// alongside the app's snapshot. It does not manufacture another hot load.
+/// (unix-only: the restart is an exec in place, reload.rs exec_restart)
+#[cfg(unix)]
 pub(crate) fn prepare_exec(cmd: &mut std::process::Command) -> Result<(), String> {
     let _kept = crate::zone_alloc::kept();
     let recovery = state().recovery.as_ref().map(|r| (r.attempt.clone(), r.failure.clone()));

@@ -275,6 +275,8 @@ pub struct Lcx<'a> {
     match_scrut: Option<ExprId>,
     /// the pattern being bound is under a `&` pattern: its by-value bindings move out of a borrow
     pat_through_ref: bool,
+    /// the trait-object types this body calls methods of through a vtable (Unit::note_dyn_calls)
+    pub dyn_calls: Vec<TyId>,
     /// a `let` initializer (parens peeled) read whole only to match its pattern against: no move
     /// out of it but its pattern's by-value bindings (checked at the `let`)
     scrut_read: Option<ExprId>,
@@ -547,6 +549,7 @@ impl<'a> Lcx<'a> {
             match_scrut: None,
             pat_through_ref: false,
             scrut_read: None,
+            dyn_calls: Vec::new(),
             guard_flags: HashMap::default(),
             cond_rescope: None,
             indirect_tracked: false,
@@ -4962,6 +4965,15 @@ impl<'a> Lcx<'a> {
         Some(res)
     }
 
+    /// The code calls through a vtable of trait-object type `dy` (a method, a drop): real-time
+    /// reach follows every vtable of it, now and as new ones are made (Unit::note_dyn_calls).
+    fn note_dyn(&mut self, dy: TyId) {
+        let dy = self.u.tcx.tys.erase_regions(dy);
+        if matches!(self.kind(dy), TyKind::Dyn(..)) && !self.dyn_calls.contains(&dy) {
+            self.dyn_calls.push(dy);
+        }
+    }
+
     /// Drops the unsized value at `p` with metadata `len`: a slice's elements, or a struct's
     /// fields with a slice tail.
     fn drop_unsized(&mut self, p: VReg, len: VReg, t: TyId) {
@@ -5036,6 +5048,7 @@ impl<'a> Lcx<'a> {
             }
             TyKind::Dyn(..) => {
                 // a `dyn` tail: through the vtable's drop entry (0 when nothing to drop)
+                self.note_dyn(t);
                 let fp = self.f.vreg(Cls::I);
                 let pm = self.pmem();
                 self.emit(Inst::Load(pm, fp, len, (VT_DROP * self.pb()) as i32));
@@ -10317,6 +10330,10 @@ impl<'a> Lcx<'a> {
         let args = instance.compact_args(&self.u.tcx);
         match instance.def {
             InstanceKind::Virtual(d, index) => {
+                // the trait object called through (the instance's `Self`)
+                if let Some(&dy) = args.first() {
+                    self.note_dyn(dy);
+                }
                 let receiver = self.to_leaves(vals[0].0.clone(), vals[0].1);
                 assert_eq!(receiver.len(), 2, "virtual receiver metadata");
                 let ptr = self.f.vreg(Cls::I);
@@ -10854,6 +10871,7 @@ impl<'a> Lcx<'a> {
                 if let Some(g) = g0 {
                     if let TyKind::Dyn(..) = self.kind(g) {
                         // through the vtable's drop entry (0 when the type has no drop)
+                        self.note_dyn(g);
                         let fp = self.f.vreg(Cls::I);
                         let pm = self.pmem();
                         self.emit(Inst::Load(pm, fp, p[1], (VT_DROP * self.pb()) as i32));
@@ -12685,7 +12703,10 @@ pub fn glue_func(u: &mut Unit, kind: u8, t: TyId) -> Func {
         l.term(Term::Ret(Vec::new()));
         l.finish();
         assert!(l.errors.is_empty(), "unsized drop glue: {:?}", l.errors);
-        return l.f;
+        let dyns = std::mem::take(&mut l.dyn_calls);
+        let f = l.f;
+        u.note_dyn_calls(id, dyns);
+        return f;
     }
     let name = fn_name(u, &FnKey::Glue(kind, t));
     let mut f = Func::new(name, 0);

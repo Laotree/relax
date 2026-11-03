@@ -4188,6 +4188,8 @@ pub fn set_before_exec(prepare: fn() -> Vec<(String, String)>, undo: fn()) {
 }
 
 /// Readies the host's handover for `cmd`, which execs next (its environment is added).
+/// (live-rebuild handover is unix-only: the restart is an exec in place)
+#[cfg(unix)]
 pub(crate) fn hand_over(cmd: &mut std::process::Command) {
     let f = *BEFORE_EXEC.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((prepare, _)) = f {
@@ -4198,6 +4200,7 @@ pub(crate) fn hand_over(cmd: &mut std::process::Command) {
 }
 
 /// The exec after [`hand_over`] failed: the host takes its handover back.
+#[cfg(unix)]
 pub(crate) fn hand_back() {
     let f = *BEFORE_EXEC.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, undo)) = f {
