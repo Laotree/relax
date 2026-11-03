@@ -5240,6 +5240,32 @@ pub(crate) fn stamp(path: &str) -> Option<(std::time::SystemTime, u64)> {
     Some((m.modified().ok()?, m.len()))
 }
 
+/// Whether every changed path is an edit of a mounted store that the edits ledger committed:
+/// devhub's ship-done (`relaxgit::finish`) renames each file into the edits folder and the ledger
+/// last, so an edit whose file was in place when the ledger was renamed is whole, and a save after
+/// it is not settled by it (its file came later). Told by the files' and the ledger's change times,
+/// set by this machine's clock at each rename (a modified time is the saver's, set to its save).
+fn committed_by_ledger<'a>(mut paths: impl Iterator<Item = &'a str>) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let changed_at = |m: &std::fs::Metadata| (m.ctime(), m.ctime_nsec());
+        let Some(ledger) = crate::vfs::edits_record().and_then(|p| std::fs::metadata(p).ok()) else { return false };
+        let mut any = false;
+        let whole = paths.all(|p| {
+            any = true;
+            // an edit taken back has no file: the ledger's rewrite removed it
+            crate::vfs::is_virtual(p) && crate::vfs::edited_disk_path(p).is_none_or(|d| std::fs::metadata(d).is_ok_and(|m| changed_at(&m) <= changed_at(&ledger)))
+        });
+        any && whole
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = paths.next();
+        false
+    }
+}
+
 fn gate_note(g: u8) {
     static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
     if LAST.swap(g, Ordering::Relaxed) != g && live_trace() {
@@ -5692,8 +5718,11 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let mut last: Vec<_> = files.iter().map(|f| stamp(&f.0)).collect();
         let mut git_state = repositories.snapshot();
         let mut still_since = Instant::now();
+        // an overlay edit its ledger committed is whole: one look, no quiet window (100 ms of
+        // every overlay edit's save -> frame)
+        let mut committed = committed_by_ledger(changed.iter().map(|&k| files[k].0.as_str()));
         loop {
-            std::thread::sleep(LIVE_QUIET);
+            if !committed { std::thread::sleep(LIVE_QUIET); }
             let additions = inputs.discover_sources(files.iter().map(|f| f.0.as_str()));
             if !additions.is_empty() {
                 let known: std::collections::HashSet<_> = files.iter().map(|f| f.0.clone()).collect();
@@ -5717,9 +5746,10 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             if moving {
                 quiet_retry = false;
                 still_since = Instant::now();
-            } else if still_since.elapsed() >= LIVE_QUIET {
+            } else if committed || still_since.elapsed() >= LIVE_QUIET {
                 break;
             }
+            committed = false;
         }
         let settled_stamps = last;
         // A moved lockfile or manifest (any landing moves the checkout's) is this app's only when
@@ -6692,5 +6722,46 @@ mod ledger_tests {
         assert_eq!(ledger.round(at(2), false, None, &hot, &virt), [0], "no native events: the hot set's disk files");
         assert_eq!(ledger.round(at(3), false, None, &hot, &virt), [0, 1, 3], "no native events, the ledger moved: and every virtual file");
         assert_eq!(ledger.round(at(3), false, Some(vec![3]), &hot, &virt), [3], "a virtual file the watch named (an in-app edit leaves the ledger)");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod commit_tests {
+    use crate::value_tests::vfs_store;
+
+    /// An overlay edit devhub's ship-done committed (its file, then the ledger renamed) is taken
+    /// at one look; a file written after the ledger (an app's own write, or the next ship's
+    /// before its ledger) still settles first.
+    #[test]
+    fn an_overlay_edit_is_whole_once_the_ledger_after_it_moved() {
+        isolated_test!(an_overlay_edit_is_whole_once_the_ledger_after_it_moved);
+        let fixture = vfs_store::Fixture::new(&[("app/a.rs", b"a"), ("app/b.rs", b"b")]);
+        let root = "/relax-live-commit/vfs/m";
+        crate::vfs::mount(root, fixture.store.clone(), &fixture.commit).unwrap();
+        let edits = std::env::temp_dir().join(format!("relax-live-commit-{}", std::process::id()));
+        std::fs::create_dir_all(edits.join("app")).unwrap();
+        crate::vfs::set_edits(Some(edits.clone()));
+        let (a, b) = (format!("{root}/app/a.rs"), format!("{root}/app/b.rs"));
+        let put = |rel: &str, text: &str| {
+            let tmp = edits.join(format!("{rel}.part"));
+            std::fs::write(&tmp, text).unwrap();
+            std::fs::rename(&tmp, edits.join(rel)).unwrap();
+        };
+        // ctimes are the clock's coarse ticks: a write meant to come later waits one out
+        let tick = || std::thread::sleep(std::time::Duration::from_millis(20));
+        put("app/a.rs", "a2");
+        put(".makepad-run-edits", "app/a.rs\tnew\n");
+        let whole = |paths: &[&str]| super::committed_by_ledger(paths.iter().copied());
+        assert!(whole(&[a.as_str()]), "a shipped edit is whole once its ledger moved");
+        tick();
+        put("app/b.rs", "b2");
+        assert!(!whole(&[a.as_str(), b.as_str()]), "a file written after the ledger settles first");
+        tick();
+        put(".makepad-run-edits", "app/a.rs\tnew\napp/b.rs\tnew\n");
+        assert!(whole(&[a.as_str(), b.as_str()]), "its own ledger commits it");
+        assert!(!whole(&[a.as_str(), "/tmp/not-in-a-store.rs"]), "a disk file settles as any save does");
+        assert!(!whole(&[]), "nothing changed is nothing committed");
+        crate::vfs::set_edits(None);
+        let _ = std::fs::remove_dir_all(&edits);
     }
 }
