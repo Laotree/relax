@@ -4,10 +4,10 @@
 //! the resolved paths, method calls, field reads, patterns, types it mentions); the signatures'
 //! and fields' references are read from the syntax (`TypeWalker`). `finish` then runs rustc's
 //! worklist: seeds are `main`, the effectively public items (`#[allow(dead_code)]` items,
-//! `#[no_mangle]` / `#[used]` / lang items, `const _`), and whatever a live item mentions is
-//! live; trait impls and their items are live when the trait (item) and the implementing type
-//! are. What stays dead is reported per module as rustc's `check_mod_deathness` does, grouped
-//! by parent and lint level.
+//! `#[no_mangle]` / `#[used]` / lang items, `const _`, a test build's `#[test]` fns), and
+//! whatever a live item mentions is live; trait impls and their items are live when the trait
+//! (item) and the implementing type are. What stays dead is reported per module as rustc's
+//! `check_mod_deathness` does, grouped by parent and lint level.
 //!
 //! Check-only (reports through the lint sink); `makepad run` never calls this.
 
@@ -988,7 +988,10 @@ impl<'a> Dead<'a> {
             });
         // rustc_builtin_macros global_allocator.rs: the expansion's allocator shims read the static
         let allocator = def.kind == DefKind::Static && lint::has_attr(self.prog, def.file, attrs, "global_allocator");
-        if used_like || allocator || lint::has_attr(self.prog, def.file, attrs, "lang") { Some(false) } else { None }
+        // rustc_builtin_macros test_harness.rs: a test build's generated `main` names every `#[test]`
+        // fn (outside a test build the front end has removed them)
+        let test = def.kind == DefKind::Fn && lint::has_attr(self.prog, def.file, attrs, "test");
+        if used_like || allocator || test || lint::has_attr(self.prog, def.file, attrs, "lang") { Some(false) } else { None }
     }
 
     fn own_allow(&self, d: DefId) -> bool {

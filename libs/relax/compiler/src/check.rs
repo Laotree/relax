@@ -480,9 +480,9 @@ pub fn check_crate(u: &mut Unit, root: u32, crates: &[u32], errors: Vec<String>,
 
 /// `makepad test`'s check of the crates under test before they run (run.rs check_test_subjects):
 /// the app check of `crates`, errors printed; the number of errors (borrow errors included).
-/// Quiet otherwise: no statistics and no warnings (the lints do not know that the harness uses
-/// the `#[test]` fns). `harness`: the root is built with `--test` (libtest's generated main
-/// replaces the crate's own, rustc_builtin_macros test_harness.rs), so it has no entry point to check.
+/// Quiet otherwise: no statistics and no warnings. `harness`: the root is built with `--test`
+/// (libtest's generated main replaces the crate's own, rustc_builtin_macros test_harness.rs), so
+/// it has no entry point to check.
 pub fn check_subjects(u: &mut Unit, root: u32, crates: &[u32], errors: Vec<String>, harness: bool) -> usize {
     SUBJECTS.store(if harness { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
     let n = check_crate_impl(u, root, crates, errors, true, false).1.len();
