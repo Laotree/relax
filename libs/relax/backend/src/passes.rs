@@ -4623,6 +4623,76 @@ pub fn sink_consts(f: &mut Func) {
             }
         }
     }
+    // used in several blocks, all on cold paths: a copy in each, under a vreg of its own (the
+    // panic location two bounds checks of a cell walk share: its address was loaded, and held
+    // in a register, in each step of the loop). (constant, its block, its index there)
+    let mut several: Vec<(VReg, usize, usize)> = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (j, i) in b.insts.iter().enumerate() {
+            if let Inst::Fconst(d, _, _) | Inst::Iconst(d, _) | Inst::Addr(d, _) = i {
+                if ndef[d.0 as usize] == 1 && use_block[d.0 as usize] == u32::MAX - 1 {
+                    several.push((*d, bi, j));
+                }
+            }
+        }
+    }
+    if !several.is_empty() {
+        let mut at = vec![u32::MAX; nv];
+        for (k, (d, _, _)) in several.iter().enumerate() {
+            at[d.0 as usize] = k as u32;
+        }
+        // per candidate: its use blocks (None once one is hot)
+        let mut ubs: Vec<Option<Vec<u32>>> = vec![Some(Vec::new()); several.len()];
+        for (bi, b) in f.blocks.iter().enumerate() {
+            let mut note = |u: VReg| {
+                let k = at[u.0 as usize];
+                if k != u32::MAX {
+                    let e = &mut ubs[k as usize];
+                    match e {
+                        Some(v) if cold[bi] => {
+                            if v.last() != Some(&(bi as u32)) {
+                                v.push(bi as u32);
+                            }
+                        }
+                        _ => *e = None,
+                    }
+                }
+            };
+            for i in &b.insts {
+                for_uses(i, &mut note);
+            }
+            term_uses(&b.term, &mut uses);
+            for u in &uses {
+                note(*u);
+            }
+        }
+        // last first: removing a definition leaves the indices of the earlier ones as they are;
+        // no copy goes into a block holding a candidate (nor into the constant's own block)
+        let mut holds = vec![false; nb];
+        for &(_, bi, _) in &several {
+            holds[bi] = true;
+        }
+        for (k, &(d, bi, j)) in several.iter().enumerate().rev() {
+            let Some(blocks) = ubs[k].take() else { continue };
+            if blocks.len() > 8 || blocks.iter().any(|&ub| holds[ub as usize]) {
+                continue;
+            }
+            let i = f.blocks[bi].insts.remove(j);
+            let p = f.blocks[bi].pos.remove(j);
+            for ub in blocks {
+                let nd = f.vreg(f.vregs[d.0 as usize]);
+                let mut c = i.clone();
+                c.vregs_mut(|v| *v = nd);
+                let b = &mut f.blocks[ub as usize];
+                for x in b.insts.iter_mut() {
+                    x.vregs_mut(|v| if *v == d { *v = nd });
+                }
+                crate::regalloc::term_vregs_mut(&mut b.term, |v| if *v == d { *v = nd });
+                b.insts.insert(0, c);
+                b.pos.insert(0, p);
+            }
+        }
+    }
     // a stack slot's address used in other blocks is computed again where it is used (a
     // frame-pointer add): one long-lived register per escaping slot from the entry block
     // (SROA's write-back addresses, lowering's slots) spilled and reloaded otherwise
@@ -6965,7 +7035,9 @@ pub fn mem_size(m: Mem) -> i32 {
 /// Loop-invariant code motion: pure, non-trapping, single-definition instructions inside a
 /// natural loop whose operands come from outside it (or from other hoisted instructions)
 /// move to the end of the loop's preheader (its single outside predecessor ending in a
-/// jump to the header). Loads stay (stores/calls in the loop), integer div/rem stay (trap).
+/// jump to the header). Loads stay (stores/calls in the loop) unless nothing in the loop can
+/// write what they read (noalias params' memory, stack slots no pointer to which is kept: see
+/// `licm`), integer div/rem stay (trap).
 /// No edge goes to the same or an earlier block: the CFG has no cycle, so no loop.
 pub fn forward_only(f: &Func) -> bool {
     f.blocks.iter().enumerate().all(|(bi, b)| b.term.succs().all(|t| t as usize > bi))
@@ -7161,11 +7233,15 @@ pub fn licm(options: &relax_session::Options, f: &mut Func) -> bool {
     // handed it: rustc's `noalias`, with local_cse's roots. Params withheld until the borrow
     // check's verdict are not in `f.noalias`, so they hoist nothing.
     let mut na = if f.noalias.is_empty() || no_noalias(options) { None } else { Some(noalias_roots(f, &ndef)) };
+    // whether a call keeps no copy of its pointer argument k and does not return it: O3's
+    // param_nocapture oracle over the inline snapshot, or the build's facts for the callees
+    // it keeps calls to (`Func::nocapture`, LLVM's `nocapture` from FunctionAttrs)
+    let facts = f.nocapture.clone();
+    let keeps_none = |c: &Callee, k: usize| sroa_nocapture(c, k) || facts.iter().any(|x| x.0 == *c && x.1 as usize == k && !x.2);
     // a param handed to a call anywhere in the function may be kept by it (then reached later through a
     // loaded pointer, which the roots take as not derived from the param): captured for the hoist,
-    // unless the callee provably keeps no pointer it gets there (O3's param_nocapture oracle, as
-    // LLVM's `nocapture`: `f1.decode(&mut r, &self.setup.codebooks, y)` left every `self.spectra`
-    // load in decode_spectra's loops)
+    // unless the callee provably keeps no pointer it gets there (`f1.decode(&mut r,
+    // &self.setup.codebooks, y)` left every `self.spectra` load in decode_spectra's loops)
     if let Some((_, cap, taint)) = na.as_mut() {
         for b in &f.blocks {
             for i in &b.insts {
@@ -7176,7 +7252,7 @@ pub fn licm(options: &relax_session::Options, f: &mut Func) -> bool {
                     };
                     for (k, a) in args.iter().copied().enumerate() {
                         let t = taint[a.0 as usize];
-                        if t != u32::MAX && !cap.contains(&t) && !(sroa_nocapture(c, k) && !opt_off(options, "-licmnocap")) {
+                        if t != u32::MAX && !cap.contains(&t) && !(keeps_none(c, k) && !opt_off(options, "-licmnocap")) {
                             cap.push(t);
                         }
                     }
@@ -7190,6 +7266,24 @@ pub fn licm(options: &relax_session::Options, f: &mut Func) -> bool {
             }
         }
     }
+    // stack slots no pointer to which is kept: the address is only a load / store / copy base,
+    // moved or offset by constants, or passed to calls that provably keep no copy and do not
+    // return it (`keeps_none`) -- never stored, returned, an indirect callee or another operand.
+    // Only pointers derived from the slot's address reach its memory, so a loop that writes
+    // none through them and hands none to a call reads the same value every iteration (LLVM's
+    // LICM, an alloca's capture tracking: nearest_with inlined into nearest_region read a
+    // local SegGrid's `nx` and cell vectors' pointers and lengths from the frame in each step
+    // of its cell walk). (per vreg: slot and offset of the address it holds; per slot: kept by
+    // no one; slot sizes)
+    let slot_kept: Option<(Vec<(u32, i64)>, Vec<bool>, Vec<u32>)> = if f.slots.is_empty() || loops.is_empty() || opt_off(options, "-licmslot") {
+        None
+    } else {
+        let sc = slot_scan(f);
+        let free: Vec<bool> = (0..f.slots.len())
+            .map(|s| !sc.esc_other[s] && sc.call_args[s].iter().all(|&(b, i, k)| matches!(&f.blocks[b].insts[i], Inst::Call(c, ..) if keeps_none(c, k as usize))))
+            .collect();
+        free.iter().any(|&x| x).then(|| (sc.vs, free, f.slots.iter().map(|s| s.size).collect()))
+    };
     for (h, body) in &loops {
         let outside: Vec<u32> = preds[*h as usize].iter().copied().filter(|p| !body[*p as usize]).collect();
         if outside.len() != 1 {
@@ -7242,6 +7336,52 @@ pub fn licm(options: &relax_session::Options, f: &mut Func) -> bool {
         // a loop that writes no memory and calls nothing: loads from dereferenceable params
         // read the same value on every iteration and may run before it
         let read_only = (0..n).all(|bi| !body[bi] || (f.blocks[bi].insts.iter().all(|i| !is_mem_effect(i)) && matches!(f.blocks[bi].term, Term::Jump(_) | Term::Branch(..) | Term::Ret(_) | Term::Unreachable)));
+        // the slots kept by no one that this loop only reads: their addresses in it are load
+        // and copy-source bases (and address arithmetic), nothing else
+        let slot_rd: Vec<bool> = match &slot_kept {
+            None => Vec::new(),
+            Some((vs, free, _)) => {
+                let mut r = free.clone();
+                for bi in 0..n {
+                    if !body[bi] {
+                        continue;
+                    }
+                    for i in &f.blocks[bi].insts {
+                        let rd = match i {
+                            Inst::Load(_, _, b, _) | Inst::VLoad(_, b, _) | Inst::LoadX(_, _, b, ..) | Inst::VLoadX(_, b, ..) | Inst::Copy(_, b, _) => Some(*b),
+                            Inst::Mov(..) | Inst::IBinI(IOp::Add, ..) => continue,
+                            _ => None,
+                        };
+                        for_uses(i, |u| {
+                            let s = vs[u.0 as usize].0;
+                            if s != u32::MAX && Some(u) != rd {
+                                r[s as usize] = false;
+                            }
+                        });
+                    }
+                    term_uses(&f.blocks[bi].term, &mut uses);
+                    for u in &uses {
+                        let s = vs[u.0 as usize].0;
+                        if s != u32::MAX {
+                            r[s as usize] = false;
+                        }
+                    }
+                }
+                r
+            }
+        };
+        // a load inside such a slot: the same value every iteration; frame memory, so safe
+        // to run before the loop
+        let slot_load = |i: &Inst| -> bool {
+            match (i, &slot_kept) {
+                (Inst::Load(m, _, base, off), Some((vs, _, size))) => {
+                    let (s, o) = vs[base.0 as usize];
+                    let at = o + *off as i64;
+                    s != u32::MAX && slot_rd[s as usize] && at >= 0 && at + mem_size(*m) as i64 <= size[s as usize] as i64
+                }
+                _ => false,
+            }
+        };
         // vregs with a definition inside the loop (multi-def ones never become invariant
         // through hoisting: only single-def instructions move)
         let mut def_in_loop = vec![false; nv];
@@ -7264,7 +7404,7 @@ pub fn licm(options: &relax_session::Options, f: &mut Func) -> bool {
                     continue;
                 }
                 for i2 in &f.blocks[b2].insts {
-                    if matches!(i2, Inst::Load(..) | Inst::Store(..) | Inst::Call(..) | Inst::Copy(..) | Inst::Mov(..)) {
+                    if matches!(i2, Inst::Load(..) | Inst::Store(..) | Inst::Call(..) | Inst::Copy(..) | Inst::Mov(..)) && !slot_load(i2) {
                         continue;
                     }
                     uses_defs(i2, &mut uses, &mut defs);
@@ -7298,6 +7438,7 @@ pub fn licm(options: &relax_session::Options, f: &mut Func) -> bool {
                     let pure = match i {
                         Inst::IBin(IOp::Div | IOp::Rem, ..) | Inst::IBinI(IOp::Div | IOp::Rem, ..) => false,
                         Inst::Load(m, _, base, off) if read_only && *off >= 0 && ndef[base.0 as usize] == 1 && f.deref.iter().any(|(p, sz)| p == base && (*off as i64 + mem_size(*m) as i64) <= *sz as i64) => true,
+                        i if slot_load(i) => true,
                         // a load of an uncaptured noalias param's own dereferenceable memory that
                         // the loop never writes: same value every iteration, and safe to run
                         // before the loop (the param is dereferenceable for the whole call)
