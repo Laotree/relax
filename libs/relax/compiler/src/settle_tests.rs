@@ -981,22 +981,32 @@ fn round50_opaque_body_invalidates_solver_answer() {
     std::fs::write(&path, source).unwrap();
     let session = std::sync::Arc::new(crate::Session::default());
     let mut prog = Program::new(&session);
-    prog.load_crate("reload_opaque", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+    let krate = prog.load_crate("reload_opaque", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
     let owner = prog.defs.iter().enumerate().find_map(|(i, _)| (prog.name(DefId(i as u32)) == "owner").then_some(DefId(i as u32))).unwrap();
     let opaque = prog.opaque_types_defined_by[&owner][0];
+    let (module, name) = (prog.crates[krate as usize].root_mod, prog.def(owner).name);
     let mut tcx = Tcx::new(); tcx.collect(&prog);
     let mut u = Unit::new(prog, tcx, 0);
     let up = &mut *u as *mut Unit;
-    let hidden = |u: &Unit| {
+    let hidden = |u: &Unit, opaque: DefId| {
         let alias = u.tcx.alias_ty_with_args(crate::types::AliasTyKind::Opaque { def_id: opaque }, &[]);
         u.tcx.try_normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), alias).unwrap()
     };
-    assert_eq!(hidden(&u), u.tcx.tys.u8_);
+    // the opaque type of the `owner` the program names now
+    let current = |u: &Unit| u.prog.opaque_types_defined_by[&u.prog.mods[module as usize].values[&name]][0];
+    assert_eq!(hidden(&u, opaque), u.tcx.tys.u8_);
     let outcome = unsafe { crate::reload::apply(up, vec![crate::reload::Edit { file: u.prog.def(owner).file, path: path.to_string_lossy().into_owned(), src: source.replace("1u8", "2u32").into_bytes() }]) };
     assert_eq!(outcome.rung, crate::reload::Rung::Patch, "{:?}", outcome.lines);
-    assert_eq!(hidden(&u), u.tcx.tys.u32_);
+    // a fn returning an opaque type is replaced when its body changes (its callers' code is built
+    // for the type the body makes): the new one's opaque reveals the new body's type, the old
+    // one's (the code built before the edit) its own
+    let replaced = current(&u);
+    assert_ne!(replaced, opaque);
+    assert_eq!(hidden(&u, replaced), u.tcx.tys.u32_);
+    assert_eq!(hidden(&u, opaque), u.tcx.tys.u8_);
     unsafe { crate::reload::rollback(up, outcome.undo.unwrap(), "test"); }
-    assert_eq!(hidden(&u), u.tcx.tys.u8_);
+    assert_eq!(current(&u), opaque);
+    assert_eq!(hidden(&u, opaque), u.tcx.tys.u8_);
     std::fs::remove_file(path).unwrap();
 }
 

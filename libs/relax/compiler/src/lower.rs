@@ -144,6 +144,8 @@ struct Coro {
     /// the slots of awaited futures (address vreg, suspension point): live only across their
     /// own suspension point
     await_slots: Vec<(VReg, usize)>,
+    /// the type of each awaited future, by its slot's address vreg (the state's shape: M5)
+    await_tys: Vec<(VReg, TyId)>,
     /// slots made by an await's poll (its result): dead at its suspension point (rustc: the
     /// poll's result is dead before the yield)
     poll_scratch: Vec<(u32, u32, usize)>,
@@ -1916,34 +1918,7 @@ impl<'a> Lcx<'a> {
         if self.coro.is_some() || !relax_backend::dbgloc::on() {
             return;
         }
-        // single definitions of address vregs: SlotAddr and slot + constant
-        let mut slot_of: std::collections::HashMap<u32, (u32, i32)> = std::collections::HashMap::new();
-        let mut consts: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
-        for b in &self.f.blocks {
-            for i in &b.insts {
-                let (d, a, off) = match i {
-                    Inst::SlotAddr(d, s) => {
-                        slot_of.insert(d.0, (*s, 0));
-                        continue;
-                    }
-                    Inst::Iconst(d, k) => {
-                        consts.insert(d.0, *k);
-                        continue;
-                    }
-                    Inst::IBinI(IOp::Add, _, d, a, off) => (d, a, *off),
-                    Inst::IBin(IOp::Add, _, d, a, k) => match consts.get(&k.0) {
-                        Some(off) => (d, a, *off),
-                        None => continue,
-                    },
-                    _ => continue,
-                };
-                if let Some(&(s, o)) = slot_of.get(&a.0) {
-                    if let Ok(off) = i32::try_from(o as i64 + off) {
-                        slot_of.insert(d.0, (s, off));
-                    }
-                }
-            }
-        }
+        let slot_of = slot_addrs(&self.f);
         for (li, st) in self.locals.iter().enumerate() {
             let Some(st) = st else { continue };
             let n = self.u.prog.syms.str(self.b.locals[li].name);
@@ -1963,6 +1938,30 @@ impl<'a> Lcx<'a> {
         }
     }
 
+    /// A coroutine body's locals and awaited futures by where they live: the types held in each
+    /// slot, and in each register. M5 (reload.rs) resumes a suspended state in new poll code only when what it
+    /// saved has the same types, not just the same places and sizes: a future of another
+    /// coroutine (an async fn a live edit replaced) or a closure of another version has the
+    /// size of the old one and other code.
+    fn coro_local_tys(&self, c: &Coro) -> (std::collections::HashMap<u32, Vec<TyId>>, std::collections::HashMap<u32, TyId>) {
+        let slot_of = slot_addrs(&self.f);
+        let mut slots: std::collections::HashMap<u32, Vec<TyId>> = std::collections::HashMap::new();
+        let mut regs: std::collections::HashMap<u32, TyId> = std::collections::HashMap::new();
+        for (li, st) in self.locals.iter().enumerate() {
+            let Some(st) = st else { continue };
+            let t = self.u.tcx.tys.erase_regions(self.monomorphize(self.b.locals[li].ty));
+            match st {
+                LocalSt::Slot(a) => if let Some(&(s, _)) = slot_of.get(&a.0) { slots.entry(s).or_default().push(t); },
+                LocalSt::Regs(r) => for v in r { regs.insert(v.0, t); },
+            }
+        }
+        // the awaited futures (each in a slot of its own: rustc's `__awaitee`)
+        for &(a, t) in &c.await_tys {
+            if let Some(&(s, _)) = slot_of.get(&a.0) { slots.entry(s).or_default().push(t); }
+        }
+        (slots, regs)
+    }
+
     pub fn finish(&mut self) {
         self.record_dbg();
         let inits = std::mem::take(&mut self.entry_inits);
@@ -1979,12 +1978,14 @@ impl<'a> Lcx<'a> {
         }
         elaborate_drop_flags(&mut self.f, &flags);
         if let Some(c) = self.coro.take() {
+            // (only a live session resumes states in new code)
+            let tys = if self.u.prog.session.options.live { self.coro_local_tys(&c) } else { Default::default() };
             // the transform moves the body's slots around the suspension points
             for s in self.f.slots.iter_mut() {
                 s.born = false;
             }
             let ptr_bytes = self.pb();
-            match coroutine_transform(&mut self.f, &c, ptr_bytes) {
+            match coroutine_transform(&mut self.f, &c, ptr_bytes, &tys) {
                 Ok((sz, al, shape)) => {
                     let area = (sz, al);
                     if self.errors.is_empty() {
@@ -2514,7 +2515,7 @@ impl<'a> Lcx<'a> {
                 self.own_capture(ce, i, *li);
             }
         }
-        self.coro = Some(Coro { ct, env, cx, frame_off, tag, up_size: ul.size, await_slots: Vec::new(), poll_scratch: Vec::new(), call_private: Default::default(), call_sret: Default::default(), poll_ret, suspends: Vec::new(), cancel_end: Some(cancel_end), pending_ret, after_done, after_panic });
+        self.coro = Some(Coro { ct, env, cx, frame_off, tag, up_size: ul.size, await_slots: Vec::new(), await_tys: Vec::new(), poll_scratch: Vec::new(), call_private: Default::default(), call_sret: Default::default(), poll_ret, suspends: Vec::new(), cancel_end: Some(cancel_end), pending_ret, after_done, after_panic });
         self.pos = ast.block(body).lo;
         let mark = self.stmt_temps.len();
         let v = self.lower_block(body);
@@ -2623,6 +2624,7 @@ impl<'a> Lcx<'a> {
         if let Some(c) = self.coro.as_mut() {
             let k = c.suspends.len();
             c.await_slots.push((slot, k));
+            c.await_tys.push((slot, fut_t));
         }
         self.store_val(slot, 0, fut_t, fut);
         // no drop flag: the future is a temporary only between here and its drop after Ready
@@ -13649,7 +13651,41 @@ fn coro_trace() -> bool {
     *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_CORO_TRACE").is_some())
 }
 
-fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32) -> Result<(u32, u32, u64), String> {
+/// Single definitions of a body's address vregs: a slot's address and slot + constant, by vreg
+/// (slot, offset).
+fn slot_addrs(f: &Func) -> std::collections::HashMap<u32, (u32, i32)> {
+    let mut slot_of: std::collections::HashMap<u32, (u32, i32)> = std::collections::HashMap::new();
+    let mut consts: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            let (d, a, off) = match i {
+                Inst::SlotAddr(d, s) => {
+                    slot_of.insert(d.0, (*s, 0));
+                    continue;
+                }
+                Inst::Iconst(d, k) => {
+                    consts.insert(d.0, *k);
+                    continue;
+                }
+                Inst::IBinI(IOp::Add, _, d, a, off) => (d, a, *off),
+                Inst::IBin(IOp::Add, _, d, a, k) => match consts.get(&k.0) {
+                    Some(off) => (d, a, *off),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            if let Some(&(s, o)) = slot_of.get(&a.0) {
+                if let Ok(off) = i32::try_from(o as i64 + off) {
+                    slot_of.insert(d.0, (s, off));
+                }
+            }
+        }
+    }
+    slot_of
+}
+
+/// `tys`: the types of the body's locals by slot and by register (coro_local_tys), for the state's shape.
+fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::collections::HashMap<u32, Vec<TyId>>, std::collections::HashMap<u32, TyId>)) -> Result<(u32, u32, u64), String> {
     use relax_backend::regalloc::{term_uses, uses_defs};
     // MAKEPAD_RUN_TRACE=coro: the transform's sizes and phase times (coro-transform line)
     let tr = coro_transform_trace();
@@ -14680,19 +14716,19 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32) -> Result<(u32, u
             b.pos.push(pos0);
         }
     }
-    // the state's shape (M5): what each suspension point saves where
+    // the state's shape (M5): what each suspension point saves where, and the types it saves
     let shape = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         (nk, size, align).hash(&mut h);
         for s in 0..ns {
             if !saved_at[s].is_empty() {
-                (&saved_at[s], f.slots[s].size, slot_off[s]).hash(&mut h);
+                (&saved_at[s], f.slots[s].size, slot_off[s], tys.0.get(&(s as u32))).hash(&mut h);
             }
         }
         for k in 0..nk {
-            for (_, o) in &cell[k] {
-                (k, *o).hash(&mut h);
+            for (v, o) in &cell[k] {
+                (k, *o, tys.1.get(&v.0)).hash(&mut h);
             }
         }
         h.finish()
