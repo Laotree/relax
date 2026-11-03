@@ -1,7 +1,81 @@
 //! Live edits of async code: after a patch every new call runs the new code -- an edited async
 //! fn awaited from an async block or an async fn of a file the edit does not touch, an edited
 //! async block, and an edit that also retypes a field of a struct the coroutine holds.
+//! (`live_app` and `in_child` are the live-session harness of reload_items_tests too.)
 use std::sync::Arc;
+
+/// Runs each case of test `test` (its path in this crate) in a child process (process-global
+/// runtime state); in the child, `body(case)`.
+pub(crate) fn in_child(test: &str, cases: &[&str], body: impl FnOnce(&str)) {
+    const CHILD: &str = "MAKEPAD_RUN_RELOAD_LIVE_CASE";
+    let Ok(case) = std::env::var(CHILD) else {
+        for case in cases {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .env(CHILD, case).env("MAKEPAD_RUN_GANDALF_ALL", "0")
+                .output().unwrap();
+            assert!(output.status.success(), "{case}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
+        return;
+    };
+    body(&case)
+}
+
+/// A live session (M10 layouts, an app-scope crate) over crate `app` of `files` (paths under
+/// src/ with their text; lib.rs first), then `run(call, edit)`: `call(name)` runs the crate's
+/// fn `name(out: &mut u64)` (one of `names`, found at load) and returns `*out`; `edit(file,
+/// subs)` applies text substitutions to that file live and returns the outcome.
+pub(crate) fn live_app(tag: &str, files: &[(&str, &str)], names: &[&str], run: impl FnOnce(&dyn Fn(&str) -> u64, &mut dyn FnMut(&str, &[(&str, &str)]) -> crate::reload::Outcome)) {
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    crate::layout::LIVE_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-reload-{}-{}", tag, std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    let path = |f: &str| dir.join("app/src").join(f).to_string_lossy().into_owned();
+    for (f, text) in files {
+        std::fs::write(path(f), text).unwrap();
+    }
+    let lib = path("lib.rs");
+    let mut session = crate::Session::default();
+    session.options.live = true;
+    let session = Arc::new(session);
+    let (prog, core, app_crate) = crate::load_with_std(&session, &lib, "live_app", false).unwrap();
+    crate::borrowck::event::set_app_scope(vec![lib.clone()]);
+    let entries_of: Vec<_> = names.iter().map(|name| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == *name).then_some(id)
+    }).unwrap_or_else(|| panic!("no fn `{name}`"))).collect();
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let entries: Vec<u64> = crate::owner::call(crate::owner::Class::Program, || {
+        entries_of.iter().map(|&d| { let id = u.fn_id(crate::jit::FnKey::Inst(d, vec![])); u.entry(id) }).collect()
+    });
+    let call = |name: &str| -> u64 {
+        let entry = entries[names.iter().position(|n| *n == name).unwrap()];
+        let mut x = 0u64;
+        unsafe { crate::jit::call_jit(up, entry, &mut x as *mut u64 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        x
+    };
+    let mut texts: Vec<(String, String)> = files.iter().map(|(f, t)| (f.to_string(), t.to_string())).collect();
+    let mut edit = |file: &str, subs: &[(&str, &str)]| {
+        let text = &mut texts.iter_mut().find(|(f, _)| f == file).unwrap().1;
+        for (from, to) in subs {
+            assert!(text.contains(from), "{file}: {from}");
+            *text = text.replace(from, to);
+        }
+        let p = path(file);
+        let index = unsafe { (*up).prog.current_source_files()[&p] };
+        unsafe { crate::reload::apply(up, vec![crate::reload::Edit { file: index, path: p, src: text.clone().into_bytes() }]) }
+    };
+    run(&call, &mut edit);
+    // Like settle_tests: process exit owns the runtime worker/executable-memory teardown.
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
 
 const LIB: &str = r#"mod driver;
 pub use driver::*;
@@ -108,101 +182,48 @@ pub fn drive_job(out: &mut u64) {
 }
 "#;
 
-/// Each case in its own child process (process-global runtime state): "patch", the edits that
-/// apply live; "restart", an edit whose dependents cannot take it live.
+/// "patch": the edits that apply live; "restart": an edit whose dependents cannot take it live.
 #[test]
 fn edited_async_code_runs_on_the_next_call() {
-    const CHILD: &str = "MAKEPAD_RUN_RELOAD_ASYNC_TEST";
-    let Ok(case) = std::env::var(CHILD) else {
-        for case in ["patch", "restart"] {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "reload_async_tests::edited_async_code_runs_on_the_next_call", "--nocapture", "--test-threads=1"])
-                .env(CHILD, case).env("MAKEPAD_RUN_GANDALF_ALL", "0")
-                .output().unwrap();
-            assert!(output.status.success(), "{case}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-        }
-        return;
-    };
-    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
-    // a live session: the app's structs keep their first layout across field edits (M10)
-    crate::layout::LIVE_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
-    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
-    let dir = std::env::temp_dir().join(format!("relax-reload-async-{}-{}", case, std::process::id()));
-    std::fs::create_dir_all(dir.join("app/src")).unwrap();
-    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
-    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
-    std::fs::write(dir.join("app/src/lib.rs"), LIB).unwrap();
-    std::fs::write(dir.join("app/src/driver.rs"), if case == "restart" { format!("{DRIVER}{JOB}") } else { DRIVER.to_string() }).unwrap();
-    let lib = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
-    let mut session = crate::Session::default();
-    session.options.live = true;
-    let session = Arc::new(session);
-    let (prog, core, app_crate) = crate::load_with_std(&session, &lib, "async_app", false).unwrap();
-    crate::borrowck::event::set_app_scope(vec![lib.clone()]);
-    let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
-        let id = crate::program::DefId(i as u32);
-        (d.krate == app_crate && prog.name(id) == name).then_some(id)
-    }).unwrap();
-    let names: &[&str] = if case == "restart" { &["drive", "drive_job"] } else { &["drive", "drive_outer", "drive_block", "hold", "resume"] };
-    let defs: Vec<_> = names.iter().map(|n| def(n)).collect();
-    let d_run = def("run");
-    let mut tcx = crate::tcx::Tcx::new();
-    tcx.collect(&prog);
-    let mut u = crate::jit::Unit::new(prog, tcx, core);
-    let up = &mut *u as *mut crate::jit::Unit;
-    let entries: Vec<u64> = crate::owner::call(crate::owner::Class::Program, || {
-        defs.iter().map(|&d| { let id = u.fn_id(crate::jit::FnKey::Inst(d, vec![])); u.entry(id) }).collect()
+    in_child("reload_async_tests::edited_async_code_runs_on_the_next_call", &["patch", "restart"], |case| {
+        let driver = if case == "restart" { format!("{DRIVER}{JOB}") } else { DRIVER.to_string() };
+        let names: &[&str] = if case == "restart" { &["drive", "drive_job"] } else { &["drive", "drive_outer", "drive_block", "hold", "resume"] };
+        live_app(&format!("async-{case}"), &[("lib.rs", LIB), ("driver.rs", &driver)], names, |call, edit| {
+            assert_eq!(call("drive"), 101);
+            if case == "restart" {
+                // `J::go` (an async fn of a trait impl) awaits `run`: its future holds `run`'s, so
+                // it is replaced with it, and a trait impl's fn is not replaced live yet -- the
+                // edit restarts (before, the impl's coroutine kept calling the replaced `run` and
+                // the patch "applied")
+                assert_eq!(call("drive_job"), 101);
+                let outcome = edit("lib.rs", &[("t.n + 100;", "t.n + 200;")]);
+                assert_eq!(outcome.rung, crate::reload::Rung::Restart, "{:?}", outcome.lines);
+                assert_eq!((call("drive"), call("drive_job")), (101, 101), "nothing of the edit installed");
+                return;
+            }
+            let mut patch = |subs: &[(&str, &str)]| {
+                let outcome = edit("lib.rs", subs);
+                assert_eq!(outcome.rung, crate::reload::Rung::Patch, "{subs:?}: {:?}", outcome.lines);
+            };
+            assert_eq!((call("drive_outer"), call("drive_block"), call("hold")), (1101, 7, 1), "(hold: a future suspended inside run)");
+            // the edited async fn's new body runs when it is awaited from an async block (behind a
+            // boxed dyn future) and from an async fn, both in a file the edit does not touch; the
+            // suspended future finishes on the code it started in (its code before the await changed)
+            patch(&[("Trace { from: Some(1), n: 0 };", "Trace { from: Some(1), n: 4 };"), ("t.n + 100;", "t.n + 200;")]);
+            assert_eq!(call("drive"), 205, "an async block of an untouched file awaits the edited async fn");
+            assert_eq!(call("drive_outer"), 1205, "an async fn of an untouched file awaits the edited async fn");
+            assert_eq!(call("resume"), 1101, "the suspended future finishes on its old code, all of it");
+            // an async block edited in its fn
+            patch(&[("*out = 7;", "*out = 8;")]);
+            assert_eq!(call("drive_block"), 8, "the edited async block runs");
+            // a field of a struct the coroutine holds across its await retyped, with the async fn's body
+            patch(&[
+                ("pub from: Option<u64>,", "pub from: Option<(u64, u64)>,"),
+                ("Trace { from: Some(1), n: 4 };", "Trace { from: Some((1, 2)), n: 0 };"),
+                ("t.from.unwrap_or(0) + t.n + 200;", "t.from.map_or(0, |(a, b)| a + b) + t.n + 300;"),
+            ]);
+            assert_eq!(call("drive"), 303, "the async fn's body over the retyped field");
+            assert_eq!(call("drive_outer"), 1303, "the same through the async fn awaiting it");
+        });
     });
-    let call = |name: &str| -> u64 {
-        let entry = entries[names.iter().position(|n| *n == name).unwrap()];
-        let mut x = 0u64;
-        unsafe { crate::jit::call_jit(up, entry, &mut x as *mut u64 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
-        x
-    };
-    assert_eq!(call("drive"), 101);
-    let mut text = LIB.to_string();
-    let mut edit = |subs: &[(&str, &str)]| {
-        for (from, to) in subs {
-            assert!(text.contains(from), "{from}");
-            text = text.replace(from, to);
-        }
-        let file = u.prog.def(d_run).file;
-        unsafe { crate::reload::apply(up, vec![crate::reload::Edit { file, path: lib.clone(), src: text.clone().into_bytes() }]) }
-    };
-    if case == "restart" {
-        // `J::go` (an async fn of a trait impl) awaits `run`: its future holds `run`'s, so it is
-        // replaced with it, and a trait impl's fn is not replaced live yet -- the edit restarts
-        // (before, the impl's coroutine kept calling the replaced `run` and the patch "applied")
-        assert_eq!(call("drive_job"), 101);
-        let outcome = edit(&[("t.n + 100;", "t.n + 200;")]);
-        assert_eq!(outcome.rung, crate::reload::Rung::Restart, "{:?}", outcome.lines);
-        assert_eq!((call("drive"), call("drive_job")), (101, 101), "nothing of the edit installed");
-    } else {
-        let mut patch = |subs: &[(&str, &str)]| {
-            let outcome = edit(subs);
-            assert_eq!(outcome.rung, crate::reload::Rung::Patch, "{subs:?}: {:?}", outcome.lines);
-        };
-        assert_eq!((call("drive_outer"), call("drive_block"), call("hold")), (1101, 7, 1), "(hold: a future suspended inside run)");
-        // the edited async fn's new body runs when it is awaited from an async block (behind a
-        // boxed dyn future) and from an async fn, both in a file the edit does not touch; the
-        // suspended future finishes on the code it started in (its code before the await changed)
-        patch(&[("Trace { from: Some(1), n: 0 };", "Trace { from: Some(1), n: 4 };"), ("t.n + 100;", "t.n + 200;")]);
-        assert_eq!(call("drive"), 205, "an async block of an untouched file awaits the edited async fn");
-        assert_eq!(call("drive_outer"), 1205, "an async fn of an untouched file awaits the edited async fn");
-        assert_eq!(call("resume"), 1101, "the suspended future finishes on its old code, all of it");
-        // an async block edited in its fn
-        patch(&[("*out = 7;", "*out = 8;")]);
-        assert_eq!(call("drive_block"), 8, "the edited async block runs");
-        // a field of a struct the coroutine holds across its await retyped, with the async fn's body
-        patch(&[
-            ("pub from: Option<u64>,", "pub from: Option<(u64, u64)>,"),
-            ("Trace { from: Some(1), n: 4 };", "Trace { from: Some((1, 2)), n: 0 };"),
-            ("t.from.unwrap_or(0) + t.n + 200;", "t.from.map_or(0, |(a, b)| a + b) + t.n + 300;"),
-        ]);
-        assert_eq!(call("drive"), 303, "the async fn's body over the retyped field");
-        assert_eq!(call("drive_outer"), 1303, "the same through the async fn awaiting it");
-    }
-    // Like settle_tests: process exit owns the runtime worker/executable-memory teardown.
-    std::mem::forget(u);
-    std::fs::remove_dir_all(dir).unwrap();
 }
