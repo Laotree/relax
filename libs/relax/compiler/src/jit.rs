@@ -7808,10 +7808,14 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
         // (a cancellation must not unwind through the JIT frames above: the call gets a stub that
         // panics, and the Rust frame that ran the code -- run_init_code -- cancels the request)
         // (no park: a call made on the owner -- a constant's code -- gets the error stub)
+        let depth0 = BUILD_STACK.with(|s| s.borrow().len());
         return match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| park_slot(u32::MAX, || compile_slot_locked(up, id, false)))) {
             Ok(Compiled::Code(a)) => a,
             Ok(Compiled::Back(_)) => unreachable!("a nested compile is never split"),
             Err(p) if p.is::<crate::preempt::OwnerBusy>() => {
+                // the builds the cancellation unwound out of: closed (the JIT code runs on with
+                // the stub; a caller that catches the cancellation may build them again)
+                close_builds_above(up, depth0);
                 BUSY_PENDING.with(|b| b.set(true));
                 let u = &mut *up;
                 let (code, relocs) = error_stub(u, "the compiler's owner thread is busy with an earlier request (the request is cancelled)");
@@ -10639,26 +10643,30 @@ crate::memo_local! {
 /// Bumped whenever a build ends (reclaim_generation).
 static BUILD_GEN: AtomicU64 = AtomicU64::new(0);
 
-unsafe fn end_build(up: *mut Unit, id: u32) {
-    let mut above = Vec::new();
-    let open = BUILD_STACK.try_with(|s| {
-        let mut s = s.borrow_mut();
-        match s.iter().rposition(|x| *x == id) {
-            Some(i) => {
-                above = s.split_off(i + 1);
-                s.truncate(i);
-                true
-            }
-            None => false,
-        }
-    });
-    if open.unwrap_or(false) {
-        (&mut *up).fns[id as usize].building = false;
-    }
-    // builds opened above it that a caught panic left open: closed with it (left set, the slot
-    // could never be built again -- each later build of it a "recursive build")
-    for x in above {
+/// Builds open on this frame's stack above `depth` that a caught panic left open (no end_build
+/// ran): closed. Left `building`, the slot could never be built again in this frame -- each later
+/// build of it a "recursive build", a compile error.
+unsafe fn close_builds_above(up: *mut Unit, depth: usize) {
+    for x in BUILD_STACK.with(|s| { let mut s = s.borrow_mut(); let d = depth.min(s.len()); s.split_off(d) }) {
         (&mut *up).fns[x as usize].building = false;
+    }
+}
+
+/// close_builds_above at its drop (a step that catches its panics, such as const_drain's).
+struct CloseBuildsAbove(*mut Unit, usize);
+impl Drop for CloseBuildsAbove {
+    fn drop(&mut self) {
+        unsafe { close_builds_above(self.0, self.1) };
+    }
+}
+
+unsafe fn end_build(up: *mut Unit, id: u32) {
+    let at = BUILD_STACK.try_with(|s| s.borrow().iter().rposition(|x| *x == id)).ok().flatten();
+    if let Some(i) = at {
+        // builds opened above it that a caught panic left open: closed with it
+        close_builds_above(up, i + 1);
+        BUILD_STACK.with(|s| s.borrow_mut().truncate(i));
+        (&mut *up).fns[id as usize].building = false;
     }
     BUILD_GEN.fetch_add(1, Ordering::Release);
 }
@@ -26479,6 +26487,9 @@ pub(crate) fn const_drain() {
         if e != epoch || !seen.insert(w.clone()) {
             continue;
         }
+        // each item's builds a caught panic left open are closed after it: the next item's
+        // evaluation may build the same fn (the hf64! constants all call parse_hex_exact)
+        let _close = CloseBuildsAbove(up, BUILD_STACK.with(|s| s.borrow().len()));
         let (d, ok) = match w {
             Wanted::Entry(key) => {
                 let id = u.fn_id(key);
@@ -26508,10 +26519,7 @@ pub(crate) fn const_drain() {
                     BodyConst::Block(bl, t) => { u.const_block(&body.0, bl, t, slot); true }
                 })).unwrap_or(false);
                 DEFERRED_ABORT.with(|a| a.set(deferred));
-                // (builds the evaluation opened above the slot that a caught panic left open: closed)
-                for x in BUILD_STACK.with(|s| s.borrow_mut().split_off(depth + 1)) {
-                    u.fns[x as usize].building = false;
-                }
+                unsafe { close_builds_above(up, depth + 1) };
                 BUILD_STACK.with(|s| s.borrow_mut().truncate(depth));
                 if ahead_trace() {
                     eprintln!("const-drain: a value of the body of {} {}", u.fns[slot as usize].name, if ok { "evaluated" } else { "failed" });
