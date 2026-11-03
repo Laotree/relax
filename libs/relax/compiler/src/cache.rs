@@ -2662,7 +2662,8 @@ impl Cache {
     /// A whole-crate check's clean verdict for crate `c`: `mode` 0, `makepad run`'s type check of
     /// its every body (run.rs up front for the app's crates, typeck_bg.rs after the first present
     /// for the others); 1 and 2, `makepad test`'s up-front check of a test subject (check.rs
-    /// subjects_mode: a plain program, a libtest harness; run.rs check_test_subjects). The key:
+    /// subjects_mode: a plain program, a libtest harness; run.rs check_test_subjects); 3, the test
+    /// dependency check: every body type- and borrow-checked, errors only. The key:
     /// the Relax build and options (cfg), the crate's fingerprint, which covers its loaded files
     /// and its dependencies' fingerprints, as the code keys rest on, and `skipped`, the text of
     /// its files the boot's selection did not load (check.rs skipped_text_hash): every file of

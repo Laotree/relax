@@ -21398,6 +21398,7 @@ pub fn set_exit_hook(f: extern "C" fn()) {
 /// exited after its window closed).
 pub extern "C" fn __relax_exit(code: i32) {
     crate::domain::exit_current(code);
+    let code = crate::check::finish_test_deps(code);
     crate::tui::exit_code(code);
     let h = EXIT_HOOK.load(Ordering::SeqCst);
     if h != 0 {
@@ -21411,6 +21412,7 @@ pub extern "C" fn __relax_exit(code: i32) {
 extern "C" fn recorded_exit(code: i32) -> ! {
     // an app domain's exit ends that domain only (domain.rs)
     crate::domain::exit_current(code);
+    let code = crate::check::finish_test_deps(code);
     crate::tui::exit_code(code);
     os::proc::exit(code)
 }

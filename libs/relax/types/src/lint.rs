@@ -349,7 +349,20 @@ static SINK: Mutex<Vec<(Level, String)>> = Mutex::new(Vec::new());
 
 /// `makepad check` collects lints (nothing else does).
 pub fn enable() { ENABLED.store(true, Ordering::Relaxed); }
-pub fn enabled() -> bool { ENABLED.load(Ordering::Relaxed) }
+pub fn enabled() -> bool { ENABLED.load(Ordering::Relaxed) && !SUPPRESSED.with(|s| s.get()) }
+
+thread_local! {
+    static SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Errors-only checks leave other threads' lint collection alone.
+pub struct Suppress(bool);
+impl Suppress {
+    pub fn new() -> Self { Self(SUPPRESSED.with(|s| s.replace(true))) }
+}
+impl Drop for Suppress {
+    fn drop(&mut self) { SUPPRESSED.with(|s| s.set(self.0)); }
+}
 
 /// Reports `lint` at `pos` of `file` in `def`'s scope: "path:line:col: error|warning: msg".
 pub fn emit(prog: &Program, def: DefId, lint: &Lint, file: u32, pos: u32, msg: &str) {
