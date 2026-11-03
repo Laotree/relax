@@ -136,6 +136,9 @@ pub struct FnEntry {
     pub ran_before: AtomicBool,
     /// SPEC-V: its unverified-mode twin got code (a body whose callers ran unverified code)
     pub twin_ran: AtomicBool,
+    /// A live patch replaced its body (`set_patched`): its patch flag is set, so the copies inlined
+    /// before call the slot, and it is never inlined again (callee_attrs).
+    pub patched: AtomicBool,
     /// SPEC-V: a body with no code of its own whose slot word holds its twin's code until its own
     /// build (background) is installed (`Unit::borrow_twin`). Owner thread.
     pub borrowed: bool,
@@ -5578,6 +5581,20 @@ impl Unit {
         }
     }
 
+    /// A live session can patch slot `id`'s body: its source is a file the session watches (an
+    /// own type's drop glue: the type's file).
+    fn patchable(&self, id: u32) -> bool {
+        let file = match &self.fns[id as usize].key {
+            FnKey::Glue(_, t) => match self.tcx.tys.kind(*t) {
+                TyKind::Adt(d, _, _) => self.prog.def(*d).file,
+                _ => return false,
+            },
+            FnKey::Shim(_) => return false,
+            k => self.key_file(k),
+        };
+        crate::reload::own_source_file(&self.prog, file)
+    }
+
     /// A new slot's entry: no code yet (its table word points at its lazy stub `stub_addr`).
     fn new_entry(key: &FnKey, name: &str, file: u32, stub_addr: u64, stub_len: u32) -> FnEntry {
         // Generated glue and sandbox entries are conservatively not local-linkage. A
@@ -5587,7 +5604,7 @@ impl Unit {
         // Copy explicitly: converting an existing String can keep its old allocation.
         // Clone also copies both Inst's and Shim's owned type arguments.
         let (key, name) = crate::zone_alloc::slots_with(|| (key.clone(), Box::<str>::from(name)));
-        FnEntry { key, name, code: stub_addr, code_len: stub_len, pc_map: PcMap::default(), file, history: None, compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, build_ns: 0, cg_ns: 0, version: 0, inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), unverified: AtomicBool::new(false), d3_lowered: AtomicBool::new(false), ran_before: AtomicBool::new(false), twin_ran: AtomicBool::new(false), borrowed: false, calls: Box::default() }
+        FnEntry { key, name, code: stub_addr, code_len: stub_len, pc_map: PcMap::default(), file, history: None, compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, build_ns: 0, cg_ns: 0, version: 0, inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), unverified: AtomicBool::new(false), d3_lowered: AtomicBool::new(false), ran_before: AtomicBool::new(false), twin_ran: AtomicBool::new(false), patched: AtomicBool::new(false), borrowed: false, calls: Box::default() }
     }
 
     /// Slot `id` has its key: the front's slot keys and its ahead check (before the slot is
@@ -5843,7 +5860,8 @@ impl Unit {
     }
 
     /// All O1 RIR installations, including sandbox twins, pass through here.
-    fn set_rir(&mut self, id: u32, func: relax_backend::rir::Func) {
+    fn set_rir(&mut self, id: u32, mut func: relax_backend::rir::Func) {
+        func.patch_flag = patch_flag(self, id);
         if !self.aux { crate::harness::reach::note(id, func.inl_slots.iter().copied()); }
         if func.cabi.is_some() {
             self.fns[id as usize].entry_ref.store(true, Ordering::Relaxed);
@@ -9014,6 +9032,10 @@ fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &cra
     if crate::inspect::patches::no_inline(c) {
         return None;
     }
+    // a live patch replaced it: a copy would always take its guard's slot call (set_patched)
+    if fns[c as usize].patched.load(Ordering::Relaxed) {
+        return None;
+    }
     Some(match &fns[c as usize].key {
         FnKey::Inst(d, args) => {
             let core = prog.def(*d).krate == core_crate;
@@ -11687,6 +11709,8 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
         TakenBack::note(up, id, f);
     }
     let u = &*up;
+    // (an inline candidate's preparation: the back end inlines it guarded, as its RIR would be)
+    func.patch_flag = patch_flag(u, id);
     Ok((Prep { func, cfg, callees: snap, ro: u.ro_reader(), relayout, name, deferred, facts }, prep_ns))
 }
 
@@ -14912,6 +14936,24 @@ pub(crate) fn loop_counter_sym(u: &Unit, id: u32) -> relax_backend::rir::Sym {
     u.syms.intern(crate::syms::SymKind::TierRec(id), u.slots.tier(id) + TIER_LOOP)
 }
 
+/// A live session's patchable slot (`Unit::patchable`): its patch flag, the tier record word the
+/// guards of its inlined copies read (`Func::patch_flag`). None: its copies are not guarded.
+pub(crate) fn patch_flag(u: &Unit, id: u32) -> Option<relax_backend::rir::Sym> {
+    let options = &u.prog.session.options;
+    if !options.live || relax_backend::stats::opt_off(options, "-guard") || !u.patchable(id) {
+        return None;
+    }
+    let s = loop_counter_sym(u, id);
+    Some(relax_backend::rir::Sym { id: s.id, off: s.off + PATCH_FLAG_OFF })
+}
+
+/// A live patch replaced slot `id`'s body (installed first): its inlined copies call the slot from
+/// now on, and it is never inlined again.
+pub(crate) fn set_patched(u: &Unit, id: u32) {
+    u.fns[id as usize].patched.store(true, Ordering::Relaxed);
+    unsafe { (*tier_rec(&u.slots, id).add((TIER_PATCH / 8) as usize)).store(1, Ordering::Release) };
+}
+
 /// The loop counter and rt_loop_hot symbols for the baseline / O1 / O2 code of slot `id` (unit
 /// lock held): every slot whose calls the count stub counts, when O3 is on. None: its code counts
 /// no loops (O3 off, a shim / glue / foreign fn, a naked fn).
@@ -15088,15 +15130,20 @@ fn rt_loop_hot(counter: u64, fp: u64) {
 /// Per-slot record at `SlotTable::tier(slot)`: [cost budget, counted code, count stub, state,
 /// last cost check (wall_ns), counted code bytes | flags, TIER_INBOX link (low 32 bits) | queue
 /// reason Q_* (high 32 bits), cost rate at queueing, loop counter, decayed cost at the last check]
-/// (read by JIT code, rt_hot and rt_loop_hot without the lock). The budget (signed) is what the
+/// (read by JIT code, rt_hot and rt_loop_hot without the lock), patch flag (a live session: 1 once a
+/// patch replaced the slot's body; the guards of its inlined copies read it). The budget (signed) is what the
 /// count stub takes each call's weight from (call_weight) and rt_loop_hot each LOOP_CHUNK back
 /// edges' cost from; at or below 0 the next call goes to rt_hot, which decays the cost seen so far,
 /// adds what was spent since and either queues the slot (tier_check) or refills the budget. The
 /// loop counter is the word the slot's own baseline / O1 / O2 code decrements per loop iteration
 /// (profile::loop_counters).
-const TIER_REC: usize = 80;
+const TIER_REC: usize = 88;
 /// the loop counter's offset in the tier record (word 8)
 const TIER_LOOP: u64 = 64;
+/// the patch flag's offset in the tier record (word 10)
+const TIER_PATCH: u64 = 80;
+/// a patch flag symbol's offset from its slot's loop counter symbol (both `SymKind::TierRec`)
+pub(crate) const PATCH_FLAG_OFF: i64 = (TIER_PATCH - TIER_LOOP) as i64;
 /// Cost units: a back edge is 1, a call CALL_COST plus its code's size (call_weight). The O3
 /// threshold is MAKEPAD_RUN_O3_CALLS (default 2000) x O3_CALL_UNITS = 40000 units, which a loop
 /// reaches in 40000 back edges (HotSpot's C2 Tier4BackEdgeThreshold, as before) and a tiny fn in
@@ -21554,7 +21601,7 @@ fn resume_compile_jobs(_trace: bool) {
     BG_CV.notify_all();
     // requests other threads queued during the pause: the owner sleeps until woken (it served
     // only the pauser meanwhile), so a pause that ended without waking it left them queued until
-    // some later request came (a domain thread and a test hung node with the owner idle)
+    // some later request came (a domain thread and a test hung on a node with the owner idle)
     owner::resume();
     end_pause_turn();
 }

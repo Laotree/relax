@@ -171,6 +171,64 @@ pub(crate) fn offer_provided(change: crate::provided::ProvidedChange, domain: Op
     crate::run_state::emit(crate::run_state::Event::UpdateReady { domain, message });
 }
 
+/// The pid of a process that became the rebuilt makepad at boot (`apply_at_boot`): a process
+/// started by the program has another pid, and rebuilds for its own boot.
+const REBUILT_ENV: &str = "MAKEPAD_RUN_BOOT_REBUILT";
+
+/// A boot whose provided crates changed, with nobody to take the offer: no run window, a hidden
+/// one, or a run that is no live session (a command-line program, a test's child). The update is
+/// applied before the program runs: makepad builds again in the foreground (cargo's output shows)
+/// and the process becomes the rebuilt makepad with the same command line. Returns only when that
+/// cannot happen, having said why, with the run's exit code (1: the program did not run), so a
+/// stale makepad never ends a run with 0 and nothing done.
+pub(crate) fn apply_at_boot(change: &crate::provided::ProvidedChange) -> i32 {
+    let _k = crate::zone_alloc::kept();
+    let mut what = format!("The JIT itself changed ({}: {}", change.crate_name, change.files.iter().take(3).map(String::as_str).collect::<Vec<_>>().join(", "));
+    if change.files.len() > 3 { what.push_str(&format!(" and {} more", change.files.len() - 3)); }
+    what.push(')');
+    let failed = |e: String| -> i32 {
+        let message = format!("{what}: {e}; the program did not run");
+        eprintln!("makepad-run: {message}");
+        crate::run::report_failed(&message, 1);
+        1
+    };
+    // this process is that rebuild already (the exec below keeps the pid): makepad is built from
+    // other sources than the program's copy of the crate, and building again cannot change that
+    if std::env::var(REBUILT_ENV).ok().and_then(|v| v.parse::<u32>().ok()) == Some(std::process::id()) {
+        return failed("the rebuilt makepad differs from the program's copy too (makepad is built from other sources than the program uses)".into());
+    }
+    let (mut cmd, shown) = match command() {
+        Ok(c) => c,
+        Err(e) => return failed(format!("this makepad cannot rebuild itself ({e}): build it again, then run")),
+    };
+    eprintln!("makepad-run: {what}: makepad builds again first (`{shown}`), then runs this");
+    let t0 = Instant::now();
+    match cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::inherit()).status() {
+        Ok(s) if s.success() => {}
+        Ok(s) => return failed(format!("rebuilding makepad FAILED ({s})")),
+        Err(e) => return failed(format!("cannot start `{shown}`: {e}")),
+    }
+    let Some(exe) = loader() else { return failed("the makepad binary's path is unknown".into()) };
+    // cargo left the binary this process runs: running it again would find the same change
+    if LOADED.get().copied().flatten().is_some_and(|id| identity(&exe) == Some(id)) {
+        return failed("rebuilding makepad changed nothing (cargo builds it from other sources than the program uses)".into());
+    }
+    eprintln!("makepad-run: makepad rebuilt in {:.0} s; the program runs on it", t0.elapsed().as_secs_f64());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(std::env::args_os().skip(1)).env(REBUILT_ENV, std::process::id().to_string());
+        // fd 2 back to the terminal before the exec (the transcript tee is a thread of this process)
+        crate::tui::exit_code(0);
+        crate::tui::finish(false);
+        let e = cmd.exec();
+        failed(format!("cannot start the rebuilt makepad: {e}"))
+    }
+    #[cfg(not(unix))]
+    failed("this platform cannot start the rebuilt makepad in place".into())
+}
+
 /// Cached text only: no manifest scan or git process on the UI thread.
 pub fn update_message() -> Option<std::sync::Arc<str>> {
     STATE.lock().unwrap_or_else(|e| e.into_inner()).update_message.clone()

@@ -1224,7 +1224,7 @@ impl Arena {
                 // every arena. A domain heap (the program's heap, as its malloc would be) gets
                 // them back per chunk once a chunk is dense (`densify`): huge pages everywhere cost
                 // Scope 2-2.4 GB resident for 100 MB in use, none at all cost Sandbox race warm
-                // frames +4% UI-thread CPU and cold start +5 s node (JITMEM.REPORT.md)
+                // frames +4% UI-thread CPU and cold start +5 s on a node (JITMEM.REPORT.md)
                 if base != 0 {
                     unsafe { os::no_huge_pages(base, RESERVE) };
                 }

@@ -787,7 +787,7 @@ mod tests {
     #[test]
     fn credential_text_round_trip() {
         let root = Root::generate().unwrap();
-        let mac = machine(&root, "my-mac", Role::Device, Some("192.0.2.14".parse().unwrap()));
+        let mac = machine(&root, "my-mac", Role::Device, Some("10.77.0.91".parse().unwrap()));
         let text = mac.cred.text();
         assert_eq!(Credential::parse(&text), Some(mac.cred.clone()));
         assert!(text.starts_with("mkid1.my-mac.device.4000000000.0a4d00de."));
@@ -802,7 +802,7 @@ mod tests {
     fn proofs_bind_to_the_certificate_time_and_fleet() {
         let root = Root::generate().unwrap();
         let fleet = Fleet::new(root.point(), ["stolen".to_string()].into_iter().collect());
-        let mac_ip: IpAddr = "192.0.2.14".parse().unwrap();
+        let mac_ip: IpAddr = "10.77.0.91".parse().unwrap();
         let mac = machine(&root, "my-mac", Role::Device, Some(mac_ip));
         let fp = [7u8; 32];
         let now = now_secs();
@@ -815,7 +815,7 @@ mod tests {
         assert!(!elsewhere.admin() && elsewhere.machine());
         assert!(require(&elsewhere, Need::Admin).unwrap_err().contains("not its bound address"));
         // IPv4-mapped IPv6 is the same address.
-        let mapped = fleet.check_proof(&mac.authorization(&fp), &fp, "::ffff:192.0.2.14".parse().unwrap(), now).unwrap();
+        let mapped = fleet.check_proof(&mac.authorization(&fp), &fp, "::ffff:10.77.0.91".parse().unwrap(), now).unwrap();
         assert!(mapped.admin());
         // Another certificate, time, fleet, revocation, tampering.
         assert_eq!(fleet.check_proof(&mac.authorization(&fp), &[8; 32], mac_ip, now), Err(Rejection::BadProof));
@@ -828,7 +828,7 @@ mod tests {
         let node = machine(&root, "n5", Role::Node, None);
         let promoted = node.authorization(&fp).replace(".node.", ".device.");
         assert_eq!(fleet.check_proof(&promoted, &fp, mac_ip, now), Err(Rejection::NotFleet));
-        let peer = fleet.check_proof(&node.authorization(&fp), &fp, "192.0.2.13".parse().unwrap(), now).unwrap();
+        let peer = fleet.check_proof(&node.authorization(&fp), &fp, "10.77.0.89".parse().unwrap(), now).unwrap();
         assert!(peer.node() && !peer.admin() && require(&peer, Need::Admin).is_err() && require(&peer, Need::Node).is_ok());
         // A node credential bound to the admin address is still no admin.
         let sneaky = machine(&root, "n2", Role::Node, Some(mac_ip));
@@ -848,7 +848,7 @@ mod tests {
         let now = now_secs();
         let n3 = machine(&root, "n3", Role::Node, None);
         let verifier = Verifier::new(fleet.clone(), fp, &n3.cred);
-        let ip: IpAddr = "192.0.2.11".parse().unwrap();
+        let ip: IpAddr = "10.77.0.76".parse().unwrap();
         // The hub's own WM: the same credential, from any address.
         let wm = verifier.check(&n3.authorization(&fp), ip, now).unwrap();
         assert!(wm.this_machine() && require(&wm, Need::ThisMachine).is_ok() && !wm.admin());
@@ -860,7 +860,7 @@ mod tests {
         let twin = machine(&root, "n3", Role::Node, None);
         assert!(!verifier.check(&twin.authorization(&fp), ip, now).unwrap().this_machine());
         // The admin Mac is admin, not this machine.
-        let mac_ip: IpAddr = "192.0.2.14".parse().unwrap();
+        let mac_ip: IpAddr = "10.77.0.91".parse().unwrap();
         let mac = machine(&root, "my-mac", Role::Device, Some(mac_ip));
         let admin = verifier.check(&mac.authorization(&fp), mac_ip, now).unwrap();
         assert!(admin.admin() && !admin.this_machine());
@@ -874,7 +874,7 @@ mod tests {
         let fleet = Fleet::new(root.point(), HashSet::new());
         let node = machine(&root, "n1", Role::Node, None);
         let identity = node.tls_identity("makepad fleet n1").unwrap();
-        let addr: IpAddr = "192.0.2.12".parse().unwrap();
+        let addr: IpAddr = "10.77.0.38".parse().unwrap();
         let peer = fleet.check_server(&identity.cert_der, addr, now_secs()).unwrap();
         assert_eq!(peer.name, "n1");
         // A certificate of another key carrying a stolen (public) credential.
@@ -892,7 +892,7 @@ mod tests {
         let root = Root::generate().unwrap();
         let fleet = Fleet::new(root.point(), HashSet::new());
         let node = machine(&root, "n5", Role::Node, None);
-        let addr: IpAddr = "192.0.2.13".parse().unwrap();
+        let addr: IpAddr = "10.77.0.89".parse().unwrap();
         let bytes = node.announce("ai-hub", b"{\"port\":8124}").unwrap();
         assert!(is_announcement(&bytes) && bytes.len() < 1200);
         let (peer, service, payload) = fleet.check_announcement(&bytes, addr, now_secs()).unwrap();

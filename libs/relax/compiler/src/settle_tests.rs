@@ -458,7 +458,7 @@ fn main() {}
 #[test]
 fn prebuild_link_needing_initializer_bails() {
     isolated_test!(prebuild_link_needing_initializer_bails);
-    // Rule I-PUB (remote-XR Sandbox node: "O3 build of slot N panicked: initializer inside a
+    // Rule I-PUB (remote-XR Sandbox on a node: "O3 build of slot N panicked: initializer inside a
     // publish"): an O3 replacement's prebuild_callees linked a callee's stored entry inside a
     // publish; the entry names a static whose value the cache does not hold, so the link ran its
     // initializer there. The link is a take now: it bails, and the program's own link (or a

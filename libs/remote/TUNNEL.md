@@ -72,10 +72,10 @@ Server:
 ## Common tasks
 
 ```sh
-makepad-remote 192.0.2.17 shell 'echo hi'          # port 8384 by default
-cargo makepad tunnel 192.0.2.17:8384 --no-sync run script.ps1
-makepad-remote 192.0.2.17 admin node-restart
-makepad-remote rotate 192.0.2.17                   # new key; no lock-out window
+makepad-remote 192.0.2.87 shell 'echo hi'          # port 8384 by default
+cargo makepad tunnel 192.0.2.87:8384 --no-sync run script.ps1
+makepad-remote 192.0.2.87 admin node-restart
+makepad-remote rotate 192.0.2.87                   # new key; no lock-out window
 ```
 
 `rotate` works without a window in which either side could lock the other

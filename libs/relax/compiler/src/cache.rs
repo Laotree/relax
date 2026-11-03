@@ -2692,8 +2692,8 @@ impl Cache {
     /// A whole-crate check's clean verdict for crate `c`: `mode` 0, `makepad run`'s type check of
     /// its every body (run.rs up front for the app's crates, typeck_bg.rs after the first present
     /// for the others); 1 and 2, `makepad test`'s up-front check of a test subject (check.rs
-    /// subjects_mode: a plain program, a libtest harness; run.rs check_test_subjects); 3, the test
-    /// dependency check: every body type- and borrow-checked, errors only. The key:
+    /// subjects_mode: a plain program, a libtest harness; run.rs check_test_subjects). The test
+    /// dependency check keys by its dependencies' interfaces instead (`dep_check_key`). The key:
     /// the Relax build and options (cfg), the crate's fingerprint, which covers its loaded files
     /// and its dependencies' fingerprints, as the code keys rest on, and `skipped`, the text of
     /// its files the boot's selection did not load (check.rs skipped_text_hash): every file of
@@ -2707,6 +2707,33 @@ impl Cache {
         h.u128(self.cfg);
         h.u128(fp);
         h.u128(skipped);
+        let k = h.finish128();
+        self.key_crate.insert(k, c);
+        Some(k)
+    }
+
+    /// The test dependency check's clean verdict for crate `c` (every body type- and
+    /// borrow-checked, errors only: check.rs start_test_deps). What its bodies' verdicts rest on:
+    /// the Relax build and options (cfg), the crate's own text (`own`: as rustc is invoked on it
+    /// and the files the boot loaded, check.rs own_text_hashes; `skipped`: the files the boot
+    /// skipped) and, of each crate of its dependency `closure` (crate, its skipped files' text),
+    /// the interface (items.rs: its items outside the fn bodies that are holes -- a const fn's,
+    /// an `impl Trait` return's or an async fn's body is interface, a proc-macro crate's whole
+    /// text is) and the text of the files the boot skipped (they have no digest without a parse).
+    /// So a body edit in a dependency checks that dependency again, not every crate above it
+    /// (M51). Not covered: an include_str!/include_bytes! input of a dependency read by a const
+    /// that a type names. A borrowck-kind entry (record_borrowck). None: an interface unknown.
+    pub fn dep_check_key(&mut self, c: u32, own: u128, skipped: u128, closure: impl Iterator<Item = (u32, u128)>) -> Option<u128> {
+        let mut h = Sip128::new();
+        h.str("test-deps-check-crate");
+        h.u32(CHECK_BODY_VERSION);
+        h.u128(self.cfg);
+        h.u128(own);
+        h.u128(skipped);
+        for (d, text) in closure {
+            h.u128(*self.iface.get(d as usize)?);
+            h.u128(text);
+        }
         let k = h.finish128();
         self.key_crate.insert(k, c);
         Some(k)

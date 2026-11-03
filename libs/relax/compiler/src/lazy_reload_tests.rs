@@ -856,7 +856,7 @@ fn gandalf_carry_keeps_only_crates_that_cannot_see_the_edit() {
     assert!(gandalf_keeps(&p, &visible, def("h")), "a crate that cannot see the edit keeps its verdicts");
     let plan_of = |src: &str| {
         let v = p.parse_snapshot(file, &a_path).parse(src.as_bytes().to_vec()).unwrap();
-        classify(&p, file, &v.pf, &a_path)
+        classify(&p, file, &v.pf, &a_path, &Default::default())
     };
     let body = plan_of(&a_src.replace("{ 1 }", "{ 7 }")).unwrap();
     assert!(gandalf_carries(&body.changes, [&body].into_iter()), "a body edit carries");
@@ -1289,7 +1289,7 @@ fn realtime_reach_skips_trait_objects_it_only_makes_itself() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// FABARMS3's misses on node (W1207: 24 lazy compiles on the real-time thread, drop glue of generic
+/// FABARMS3's misses on a node (W1207: 24 lazy compiles on the real-time thread, drop glue of generic
 /// containers and core::fmt's float path): code ran before the mark (the planner's simulation), so
 /// the reach found slots compiled already whose RIR was dropped after their install. A drop glue's
 /// references were never read again (only fns' RIR was rebuilt), and with a disk cache a lookup
@@ -1368,7 +1368,7 @@ fn realtime_reach_walks_code_that_ran_before_the_mark() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// What FABARMS3's misses on node (W1207) were, on a cold store: the marked root formats floats
+/// What FABARMS3's misses on a node (W1207) were, on a cold store: the marked root formats floats
 /// (core::fmt's float path is reached through the formatter fn pointer an `Argument` holds, data the
 /// reach reads) and drops containers (`Vec`, `vec::IntoIter`, `array::IntoIter`, `Weak`: drop glue
 /// of generic types). Nothing else ran before the mark: the reach alone compiles them, and the
@@ -1445,7 +1445,7 @@ fn realtime_reach_covers_float_formatting_and_container_drops() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// Fab's live edit on node (ICEs "key in collected table", "variance declaration"): a new module
+/// Fab's live edit on a node (ICEs "key in collected table", "variance declaration"): a new module
 /// file whose structs (a `#[cfg(relax)]` field of a std type among them) an existing struct holds
 /// in `Option` fields, filled through `get_or_insert_with`. The edit patches, the new code runs.
 #[test]
@@ -1553,6 +1553,142 @@ impl RtPath {
     let o = unsafe { apply(up, vec![Edit { file, path: app.clone(), src: v2.as_bytes().to_vec() }]) };
     assert_eq!(o.rung, Rung::Patch, "{:?}", o.lines);
     assert_eq!(run(), 21);
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A live edit that renames a struct field finds the fns using it from the field uses typeck
+/// resolved. A generic fn whose body names the old field's name (`window`'s local `plans`, fab
+/// slice's `FieldPlans::window`) is read as typeck left it: instantiating it at its own
+/// parameters for codegen has no answer (`<impl IntoIterator as IntoIterator>::IntoIter`), and
+/// the edit failed as an internal compiler error (NoSolution).
+#[test]
+fn a_renamed_field_reads_generic_fns_as_typeck_left_them() {
+    const CHILD: &str = "MAKEPAD_RUN_RENAMED_FIELD_EDIT_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::a_renamed_field_reads_generic_fns_as_typeck_left_them", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
+            .output().unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    use crate::reload::{apply, Edit, Rung};
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-renamed-field-edit-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    let v1 = r#"pub struct Boundary { pub plans: bool }
+pub fn window(layers: impl IntoIterator<Item = u32>) -> u32 {
+    let mut plans = 0;
+    for l in layers { plans += l; }
+    plans
+}
+pub fn value(out: &mut u32) {
+    let b = Boundary { plans: true };
+    *out = if b.plans { window([1u32, 2, 3]) } else { 0 };
+}
+"#;
+    let v2 = v1.replace("pub plans: bool", "pub ready: bool").replace("Boundary { plans: true }", "Boundary { ready: true }")
+        .replace("if b.plans { window([1u32, 2, 3]) }", "if b.ready { window([1u32, 2, 3]) + 10 }");
+    std::fs::write(dir.join("app/src/lib.rs"), v1).unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "renamed_field_edit_app", false).unwrap();
+    crate::borrowck::event::set_app_scope(vec![app.clone()]);
+    crate::layout::set_root_crate(app_crate);
+    crate::layout::LIVE_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
+    let value = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == "value").then_some(id)
+    }).unwrap();
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let entry = crate::owner::call(crate::owner::Class::Program, || { let f = u.fn_id(crate::jit::FnKey::Inst(value, vec![])); u.entry(f) });
+    let run = || {
+        let mut result = 0u32;
+        unsafe { crate::jit::call_jit(up, entry, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        result
+    };
+    assert_eq!(run(), 6);
+    let file = u.prog.def(value).file;
+    let o = unsafe { apply(up, vec![Edit { file, path: app.clone(), src: v2.into_bytes() }]) };
+    assert!(o.failure.is_none() && o.rung == Rung::Patch, "{:?}", o.lines);
+    assert_eq!(run(), 16);
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// `--lib` tests of a package whose dev-dependency depends back on it (M50): the harness crate
+/// and the plain library the dependency links are two crates of one file. A live edit of that
+/// file patches both, so a call through the dependency runs the new body too.
+#[test]
+fn a_live_edit_reaches_both_crates_of_a_lib_test_root() {
+    const CHILD: &str = "MAKEPAD_RUN_TWIN_CRATE_EDIT_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::a_live_edit_reaches_both_crates_of_a_lib_test_root", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
+            .output().unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    use crate::reload::{apply, Edit, Rung};
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-twin-crate-edit-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("twinlib/src")).unwrap();
+    std::fs::create_dir_all(dir.join("twinuser/src")).unwrap();
+    let v1 = "pub fn f() -> u32 { 1 }\n#[cfg(test)]\npub fn value(out: &mut u32) { *out = f() * 100 + twinuser::through(); }\n";
+    std::fs::write(dir.join("twinlib/src/lib.rs"), v1).unwrap();
+    std::fs::write(dir.join("twinuser/src/lib.rs"), "pub fn through() -> u32 { twinlib::f() }\n").unwrap();
+    let lib = dir.join("twinlib/src/lib.rs").to_string_lossy().into_owned();
+    let user = dir.join("twinuser/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    crate::pmhost::install();
+    let mut prog = Program::new(&session);
+    let (core, std_deps) = crate::load_std_crates(&session, &mut prog).unwrap();
+    let plain = prog.load_crate_deferred("twinlib", &lib, 2021, crate::program_cfg(&session, &[]), std_deps.clone()).unwrap();
+    let mut deps = std_deps.clone();
+    deps.push((prog.syms.intern("twinlib"), plain));
+    let through = prog.load_crate_deferred("twinuser", &user, 2021, crate::program_cfg(&session, &[]), deps).unwrap();
+    let mut cfg = crate::program_cfg(&session, &[]);
+    cfg.set.push("test".to_string());
+    let mut deps = std_deps;
+    deps.push((prog.syms.intern("twinuser"), through));
+    let harness = prog.load_crate_deferred("twinlib", &lib, 2021, cfg, deps).unwrap();
+    prog.prelude_crate = Some(core);
+    prog.resolve_imports();
+    assert!(prog.errors.is_empty(), "{:?}", prog.errors);
+    crate::borrowck::event::set_app_scope(vec![lib.clone(), user.clone()]);
+    crate::layout::set_root_crate(harness);
+    crate::layout::LIVE_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
+    let value = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == harness && prog.name(id) == "value").then_some(id)
+    }).unwrap();
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let entry = crate::owner::call(crate::owner::Class::Program, || { let f = u.fn_id(crate::jit::FnKey::Inst(value, vec![])); u.entry(f) });
+    let run = || {
+        let mut result = 0u32;
+        unsafe { crate::jit::call_jit(up, entry, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        result
+    };
+    assert_eq!(run(), 101);
+    let file = u.prog.def(value).file;
+    let o = unsafe { apply(up, vec![Edit { file, path: lib.clone(), src: v1.replace("{ 1 }", "{ 2 }").into_bytes() }]) };
+    assert!(o.failure.is_none() && o.rung == Rung::Patch, "{:?}", o.lines);
+    // the harness copy's f and the plain copy's f (reached through twinuser) both changed
+    assert_eq!(run(), 202);
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
