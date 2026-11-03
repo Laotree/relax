@@ -224,6 +224,8 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
     };
     let pkg_dir = crate::resolve::package_dir(&sess, &crate::run::workspace_dir(), &package).unwrap_or_default();
     let mut code = 0;
+    // a filter no target matched is no pass (a target exits NO_TESTS_EXIT when it matched none)
+    let (mut matched, mut unmatched) = (false, false);
     for (sel, plain) in runs {
         let mut a: Vec<String> = vec!["run".to_string()];
         match &plain {
@@ -241,7 +243,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         a.extend(sel);
         a.push("--".to_string());
         a.extend(prog.iter().cloned());
-        let status = std::process::Command::new(&exe).args(&a).status();
+        let status = std::process::Command::new(&exe).args(&a).env(makepad_remote::hot::TEST_PACKAGE_ENV, "1").status();
         let c = match status {
             Ok(s) => s.code().unwrap_or(101),
             Err(e) => {
@@ -249,6 +251,11 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
                 101
             }
         };
+        if c == makepad_remote::hot::NO_TESTS_EXIT {
+            unmatched = true;
+            continue;
+        }
+        matched = true;
         if c != 0 {
             if c == makepad_remote::hot::JIT_ERROR_EXIT { return c; }
             if plain.is_some() {
@@ -256,6 +263,10 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
             }
             code = 101;
         }
+    }
+    if unmatched && !matched {
+        eprintln!("error: no test matched {}", prog.join(" "));
+        return makepad_remote::hot::NO_TESTS_EXIT;
     }
     // cargo test's default selection also runs the lib's doc tests; makepad test does not: say
     // how many there are, so the counts compare honestly
