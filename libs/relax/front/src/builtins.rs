@@ -812,6 +812,34 @@ impl Expansion {
     }
 }
 
+/// The file an include macro of source file `current` names by `rel`.
+pub fn include_path(current: Option<&str>, rel: &str) -> String {
+    let path = if std::path::Path::new(rel).is_absolute() {
+        rel.to_string()
+    } else if let Some(path) = current {
+        format!("{}/{}", crate::program::dir_of(path), rel)
+    } else { rel.to_string() };
+    crate::vfs::normalize_path(&path)
+}
+
+/// The paths (as written) of the `include_str!("..")` / `include_bytes!("..")` calls among token
+/// texts: a plain or raw string literal argument (a computed one, `concat!(..)`, is not seen).
+pub fn include_literals<'a>(texts: &[&'a [u8]]) -> Vec<String> {
+    let mut out = Vec::new();
+    for w in texts.windows(5) {
+        if !matches!(w[0], b"include_str" | b"include_bytes") || w[1] != b"!" || w[2] != b"(" || w[4] != b")" { continue; }
+        let lit = w[3];
+        let body = if let Some(raw) = lit.strip_prefix(b"r") {
+            let hashes = raw.iter().take_while(|&&c| c == b'#').count();
+            raw.get(hashes + 1..raw.len().saturating_sub(hashes + 1))
+        } else if lit.first() == Some(&b'"') && !lit.contains(&b'\\') {
+            lit.get(1..lit.len().saturating_sub(1))
+        } else { None };
+        if let Some(body) = body.and_then(|b| std::str::from_utf8(b).ok()) { out.push(body.to_string()); }
+    }
+    out
+}
+
 /// Resolve nested includes relative to the file that authored the invocation.
 fn include_input(p: &crate::parser::Parser, lo: usize, hi: usize, call_lo: u32) -> Result<(String, Vec<u8>), String> {
     let args = lit_args(p, lo, hi)?;
@@ -821,12 +849,7 @@ fn include_input(p: &crate::parser::Parser, lo: usize, hi: usize, call_lo: u32) 
         Some(p.sources.as_ref().ok_or("include! requires a source registry")?.get(source.file)?)
     } else { None };
     let current = authored.as_ref().map(|s| s.path.as_str()).or_else(|| p.bctx.as_ref().map(|c| c.path.as_str()));
-    let path = if std::path::Path::new(rel).is_absolute() {
-        rel.clone()
-    } else if let Some(path) = current {
-        format!("{}/{}", crate::program::dir_of(path), rel)
-    } else { rel.clone() };
-    let path = crate::vfs::normalize_path(&path);
+    let path = include_path(current, rel);
     let data = crate::vfs::read(&path).map_err(|e| format!("couldn't read `{}`: {}", path, e))?;
     crate::sip::note_late_input(p.bctx.as_ref().map_or("", |c| c.krate.as_str()), crate::sip::LATE_FILE, &path, Some(&data));
     Ok((path, data))
