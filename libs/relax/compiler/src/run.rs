@@ -624,6 +624,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mut also_requested = false;
     // `makepad test <package>` (lib.rs): the program is the package's test harness, not its main
     let mut harness = false;
+    let mut self_exec = false;
     let mut live_tests = false;
     let mut test_restart = None;
     let mut plain_test: Option<String> = None;
@@ -654,6 +655,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 // a test whose code Relax cannot compile fails as that test; the others still run
                 jit::COMPILE_ERRORS_FATAL.store(false, Ordering::Relaxed);
             }
+            "--self-exec" => self_exec = true,
             "--live" => live_tests = true,
             "--harness-restart" if i + 1 < args.len() => {
                 i += 1;
@@ -937,6 +939,11 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             if pre[j - 1] == "--units" && !std::path::Path::new(&pre[j]).is_absolute() {
                 pre[j] = format!("{}/{}", workspace_dir(), pre[j]);
             }
+        }
+        // Re-runs made by std::process share the parent's dependency check.
+        if (harness || plain_test.is_some()) && !pre.iter().any(|a| a == "--self-exec") {
+            let at = if pre.get(2).is_some_and(|a| a == "--silent") { 3 } else { 2 };
+            pre.insert(at, "--self-exec".to_string());
         }
         pre.push("--".to_string());
         unsafe { std::env::set_var("MAKEPAD_RUN_SELF_EXEC", pre.join("\u{1f}")) };
@@ -1707,6 +1714,26 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             std::mem::forget(u);
             return 101;
         }
+        if !self_exec {
+            let candidates: Vec<u32> = g.crates.iter().enumerate().filter(|(ci, c)| !c.registry && crate_of[*ci] != u32::MAX).map(|(ci, _)| crate_of[ci]).collect();
+            let names = g.crates.iter().enumerate().filter(|(ci, c)| !c.registry && crate_of[*ci] != u32::MAX).map(|(ci, _)| (crate_of[ci], g.pkg[ci].1.clone())).collect();
+            let subjects = test_subjects.clone();
+            crate::check::start_test_deps(&mut *u, move |prog| {
+                fn canon(p: &str) -> String {
+                    std::fs::canonicalize(p).map(|c| c.display().to_string()).unwrap_or_else(|_| p.to_string())
+                }
+                let std_dir = format!("{}/", canon(&crate::std_dir()).trim_end_matches('/'));
+                let mut crates: Vec<u32> = candidates.into_iter().filter(|k| {
+                    let c = &prog.crates[*k as usize];
+                    !subjects.contains(k) && !c.proc_macro
+                        && !matches!(prog.syms.str(c.name), "core" | "alloc" | "std" | "proc_macro")
+                        && !canon(c.root_path()).starts_with(&std_dir)
+                }).collect();
+                crates.sort_unstable();
+                crates.dedup();
+                crates
+            }, names, runtime);
+        }
         // a `harness = false` target is a program: a compile error it reaches ends it (rustc rejects it)
         if plain_test.is_some() {
             jit::COMPILE_ERRORS_FATAL.store(true, Ordering::Relaxed);
@@ -1757,24 +1784,27 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
     }
     // after the cache is open: a validated warm start with the program's clean verdict stored skips the check
-    jit::start_background_coherence(&u);
+    crate::owner::call(crate::owner::Class::Program, || jit::start_background_coherence(&u));
     *STARTUP_PATH.lock().unwrap() = crate::zone_alloc::kept_with(|| format!("{}/startup/{}.startup", target_dir, package));
     if let Ok(p) = crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_REPORT")) {
         *REPORT_PATH.lock().unwrap() = p;
     }
     if crate::why::enabled() {
-        for (i, d) in u.prog.defs.iter().enumerate() {
-            if u.prog.files.get(d.file as usize).and_then(|f| f.ast.items.get(d.item.0 as usize)).is_some() {
-                let c = u.prog.why_def(crate::program::DefId(i as u32), "declaration");
+        let front = u.front.clone();
+        let r = jit::front_read("boot declarations");
+        let prog = r.of(&front).0;
+        for (i, d) in prog.defs.iter().enumerate() {
+            if prog.files.get(d.file as usize).and_then(|f| f.ast.items.get(d.item.0 as usize)).is_some() {
+                let c = prog.why_def(crate::program::DefId(i as u32), "declaration");
                 crate::why::event("item-decl", &c.file, c.line, &c.symbol, None);
             }
             if matches!(d.kind, crate::program::DefKind::Fn | crate::program::DefKind::AssocFn) {
-                let c = u.prog.why_def(crate::program::DefId(i as u32), "declaration");
+                let c = prog.why_def(crate::program::DefId(i as u32), "declaration");
                 crate::why::event("fn-decl", &c.file, c.line, &c.symbol, None);
             }
         }
     }
-    let entry = match main_def {
+    let entry = crate::owner::call(crate::owner::Class::Program, || match main_def {
         Some(main_def) => {
             let id = {
                 let _why = crate::why::enabled().then(|| {
@@ -1787,13 +1817,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             u.entry(id)
         }
         None => 0,
-    };
+    });
     let up: *mut Unit = &mut *u;
     unsafe { RUN_UNIT = up };
     if let Err(e) = finish_window() {
         eprintln!("makepad-run: {e}");
         crate::first_frame::no_window(&package, &e);
-        return 1;
+        return crate::check::finish_test_deps(1);
     }
     if !HAL_RUN.load(Ordering::Acquire) { crate::domain::register_boot(&package, u.syms.dom0()); }
     start_exit_summary();
@@ -1887,7 +1917,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     jit::start_completion(up, runtime);
     // the dependencies' bodies no build asked for are type-checked after the first frame
-    if !harness { crate::typeck_bg::start(up, root, main_def, runtime); }
+    if !harness && plain_test.is_none() { crate::typeck_bg::start(up, root, main_def, runtime); }
     let platform = u.prog.crates.iter().any(|c| u.prog.syms.str(c.name) == "makepad_platform");
     jit::live_needs_present(!live_tests && platform);
     // a test harness never presents, nor does a program without the platform: no startup to wait out
@@ -2025,6 +2055,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
         groups.sort();
         let code = crate::harness::run(&mut u, up, &groups);
+        let code = crate::check::finish_test_deps(code);
         flush_errors(true);
         std::mem::forget(u);
         return code;
@@ -2052,7 +2083,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             // Workers already hold this unit's pointer. Its Drop waits
             // for the front end and O3; process shutdown owns it now.
             std::mem::forget(u);
-            return 1;
+            return crate::check::finish_test_deps(1);
         }
     };
     let code = match r {
@@ -2066,6 +2097,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             101
         }
     };
+    let code = crate::check::finish_test_deps(code);
     // threads the program spawned may still run (and compile) until the process exits, as
     // under rustc where returning from main exits with detached threads still running: the
     // unit must outlive cmd_run (dropping it here freed it under them)
@@ -3149,6 +3181,9 @@ const EXIT_QUIESCE_MS: u64 = 200;
 /// a link called exit): its compile is half done, the exit worker can never intervene, and
 /// waiting for it would only delay the exit.
 static EXIT_CALLER_HOLDS: AtomicBool = AtomicBool::new(false);
+pub(crate) fn exit_caller_holds_owner() -> bool {
+    EXIT_CALLER_HOLDS.load(Ordering::SeqCst) || crate::owner::is_owner() || crate::owner::serving_request()
+}
 fn exit_quiesce_ms() -> u64 {
     if EXIT_CALLER_HOLDS.load(Ordering::SeqCst) { 0 } else { EXIT_QUIESCE_MS }
 }

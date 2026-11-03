@@ -33,7 +33,7 @@ impl Cx<'_> {
         self.mk_at(e, span, ExprKind::NonHirLiteral { lit, user_ty: None }, self.bool_ty())
     }
 
-    /// `ty` with its projections normalized (the result type of a trait method).
+    /// `ty` with its projections normalized (a field type).
     fn normalize(&self, ty: TyId) -> TyId {
         self.tcx().try_normalize_erasing_regions(self.prog(), self.root.cx.env, ty).unwrap_or(ty)
     }
@@ -42,7 +42,9 @@ impl Cx<'_> {
     fn method_output(&self, def: DefId, args: &[TyId], span: Span) -> BuildResult<TyId> {
         let tcx = self.tcx();
         let Some(sig) = tcx.fn_sig(self.prog(), def) else { return self.unresolved(span, "method signature") };
-        Ok(tcx.tys.erase_regions(self.normalize(tcx.tys.subst(sig.ret, args))))
+        // (the signature's late-bound regions are erased first: the normalizer takes no escaping bound vars)
+        let ret = tcx.tys.subst(sig.ret, args);
+        Ok(tcx.try_normalize_erasing_late_bound_regions(self.prog(), self.root.cx.env, ret).unwrap_or_else(|_| tcx.tys.erase_regions(ret)))
     }
 
     /// The index of an enum's variant that is the lang item `item`.

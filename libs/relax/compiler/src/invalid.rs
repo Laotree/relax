@@ -389,8 +389,8 @@ pub(crate) fn stale_inlined_frames(u: &Unit, gen: u32, copies: &[(u32, u32, u32)
                 drop(code);
                 let hit = match recorded {
                     Some(inlined) => copies.iter().find(|(s, _)| inlined.contains(s)).copied(),
-                    // O1 / baseline code records no inlined slots (body_deps also holds nounwind
-                    // answers, not copies): its pc map's inline stack names what it took in
+                    // Bodies linked from the cache below O3 have no recorded slots (body_deps also
+                    // holds nounwind answers, not copies): their pc map's inline stack names what they took in
                     None => copies.iter().find(|(s, _)| body_inlines(u, d, start, *s)).copied(),
                 };
                 let Some((s, root)) = hit else { continue };

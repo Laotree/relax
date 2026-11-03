@@ -646,7 +646,7 @@ pub struct Program {
     /// `macro_rules!` definitions seen so far (files parse in load order)
     pub macros: crate::collected::Deferred<std::sync::Arc<crate::macros::MacroTable>>,
     /// per crate root: what the preload found (macro definitions, files; preload.rs)
-    ahead: HashMap<(String, String), u32>,
+    ahead: HashMap<crate::preload::CrateKey, u32>,
     /// the preload's parse workers and the files submitted to them not yet loaded
     pool: Option<std::sync::Arc<crate::preload::Pool>>,
     pool_workers: Vec<std::thread::JoinHandle<()>>,
@@ -1261,7 +1261,7 @@ impl Program {
         self.defs[root_def.0 as usize].scope = root_mod;
         self.crates.push(CrateInfo { name: cname, root_mod, edition, recursion_limit: 128, deps, cfg, proc_macro: false, is_bin: false, harness: false, validate: false, relaxed: Default::default(), features: Default::default(), impl_view: Default::default(), root_path: root.to_string(), context: crate::source_context::Context::new(root, self.sources.clone(), &self.session) });
         let kname = self.syms.str(cname).to_string();
-        let akey = (kname.clone(), root.to_string());
+        let akey = crate::preload::crate_key(&kname, root, &self.crates[krate as usize].cfg);
         if !self.ahead.contains_key(&akey) {
             if crate::preload::trace() {
                 eprintln!("boot-trace: {} ({}) was not preloaded", kname, root);
@@ -1409,13 +1409,13 @@ impl Program {
         for h in std::mem::take(&mut self.pool_workers) {
             let _ = h.join();
         }
-        self.ahead = crates.iter().enumerate().map(|(i, c)| ((c.name.clone(), c.root.clone()), i as u32)).collect();
+        self.ahead = crates.iter().enumerate().map(|(i, c)| (c.key(), i as u32)).collect();
         if let Some(plan) = &plan {
             // A suffix retains the full recipe and dependency indices used by
             // the plan that certified its collected prefix.
             self.load_recipe = plan.crates().to_vec();
         } else { for c in &crates {
-            if let Some(saved) = self.load_recipe.iter_mut().find(|old| old.name == c.name && old.root == c.root) { *saved = c.clone(); }
+            if let Some(saved) = self.load_recipe.iter_mut().find(|old| old.name == c.name && old.root == c.root && old.cfg.holds("test") == c.cfg.holds("test")) { *saved = c.clone(); }
             else { self.load_recipe.push(c.clone()); }
         } }
         let (pool, workers) = crate::preload::start_with_plan(sess, crates, &self.macros, images, bounded, self.sources.clone(), plan);
@@ -1445,7 +1445,7 @@ impl Program {
         let mut next = Program::new(&session);
         next.sources = sources;
         next.load_recipe = recipe.clone();
-        next.ahead = recipe.iter().enumerate().map(|(i, c)| ((c.name.clone(), c.root.clone()), i as u32)).collect();
+        next.ahead = recipe.iter().enumerate().map(|(i, c)| (c.key(), i as u32)).collect();
         let (pool, workers) = crate::preload::start_with_contexts(&session, recipe, &next.macros, None, false, next.sources.clone(), contexts);
         next.demand_plan = pool.demand_plan.clone();
         next.pool = Some(pool);
@@ -2863,7 +2863,7 @@ impl Program {
                                             break;
                                         }
                                     }
-                                    if self.demand_plan.as_ref().is_some_and(|p| p.skips(self.crates[krate as usize].root_path(), c)) {
+                                    if self.demand_plan.as_ref().is_some_and(|p| p.skips(self.crates[krate as usize].root_path(), self.crates[krate as usize].cfg.holds("test"), c)) {
                                         let is_mod_rs = child_mod_rs || c.ends_with("/mod.rs");
                                         let cdir = if is_mod_rs { dir_of(c).to_string() } else { format!("{}/{}", dir_of(c), stem_of(c)) };
                                         self.skipped_files.insert(m, (c.clone(), cdir, is_mod_rs));

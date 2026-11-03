@@ -155,7 +155,7 @@ const KIND_EXP_NAMES: u32 = 17;
 /// the program's item graph (cache/deps.rs Deps::encode), one per program (its root crate's code
 /// store, under a key of the program's view: replaced when the program changes)
 const KIND_DEPS: u32 = 18;
-/// a program's last load order (cache.rs load_order): its crates (name, root), in order, keyed by
+/// a program's last load order (cache.rs load_order): its crates (name, root, test), keyed by
 /// the graph's crate set (GraphRecipe::set)
 const KIND_FRONT_ORDER: u32 = 19;
 const KIND_CONST: u32 = 9;
@@ -868,6 +868,7 @@ impl Cache {
             h.str(prog.syms.str(prog.crates[c].name));
             let root_file = prog.mods.get(prog.crates[c].root_mod as usize).map(|m| m.file);
             h.str(root_file.and_then(|f| prog.file_paths.get(f as usize)).map_or("", |p| p.as_str()));
+            h.u8(prog.crates[c].cfg.holds("test") as u8);
             let id = h.finish128();
             crate_ident.push(id);
             crate_by_ident.insert(id, c as u32);
@@ -2661,7 +2662,8 @@ impl Cache {
     /// A whole-crate check's clean verdict for crate `c`: `mode` 0, `makepad run`'s type check of
     /// its every body (run.rs up front for the app's crates, typeck_bg.rs after the first present
     /// for the others); 1 and 2, `makepad test`'s up-front check of a test subject (check.rs
-    /// subjects_mode: a plain program, a libtest harness; run.rs check_test_subjects). The key:
+    /// subjects_mode: a plain program, a libtest harness; run.rs check_test_subjects); 3, the test
+    /// dependency check: every body type- and borrow-checked, errors only. The key:
     /// the Relax build and options (cfg), the crate's fingerprint, which covers its loaded files
     /// and its dependencies' fingerprints, as the code keys rest on, and `skipped`, the text of
     /// its files the boot's selection did not load (check.rs skipped_text_hash): every file of
@@ -4036,7 +4038,7 @@ pub fn app_store_files(dir: &std::path::Path, krate: &str) -> Vec<PathBuf> {
             if kind != KIND_FRONT_GRAPH { continue; }
             let Some((_, bytes)) = st.get_at(i, key) else { continue };
             let Some(graph) = crate::crate_image::decode::<crate::crate_image::GraphImage>(bytes) else { continue };
-            if graph.crates.iter().any(|((name, _), _)| name == krate) {
+            if graph.crates.iter().any(|((name, _, _), _)| name == krate) {
                 bases.push(g.clone());
                 bases.push(collected::path(dir, graph.identity));
             }
@@ -4782,7 +4784,7 @@ fn front_order_path(dir: &std::path::Path, set: u128) -> PathBuf {
     dir.join(format!("front_order-{:016x}.rcs", front_order_key(set) as u64))
 }
 /// The load order the last collected image of a program with these crates was recorded in.
-fn read_front_order(dir: &std::path::Path, set: u128) -> Option<Vec<(String, String)>> {
+fn read_front_order(dir: &std::path::Path, set: u128) -> Option<Vec<crate::preload::CrateKey>> {
     let store = Store::open(&front_order_path(dir, set))?;
     let (kind, bytes) = store.get(front_order_key(set))?;
     if kind != KIND_FRONT_ORDER { return None; }
@@ -4840,7 +4842,7 @@ impl FrontGraphWrite {
     fn capture(prog: &crate::program::Program, dir: &std::path::Path, fps: &[Option<u128>]) -> Option<Self> {
         let recipe = prog.front_graph.as_ref()?;
         if recipe.crates.len() != prog.crates.len() || recipe.crates.iter().zip(&prog.crates)
-            .any(|(key, c)| prog.syms.str(c.name) != key.0 || c.root_path() != key.1) { return None; }
+            .any(|(key, c)| crate::preload::crate_key(prog.syms.str(c.name), c.root_path(), &c.cfg) != *key) { return None; }
         Some(Self { dir: dir.to_owned(), options: prog.session.options.clone(), recipe: recipe.clone(),
             fps: fps.to_vec(), demand: prog.demand_plan.clone(), profile: prog.session.runtime.profile })
     }
@@ -5042,7 +5044,7 @@ pub struct FrontImages {
     /// inputs whose contents this handle read and hashed to validate (an unchanged warm start: 0)
     content_hashes: std::sync::atomic::AtomicU64,
     probes: relax_session::sync::Mutex<Option<HashMap<String, bool>>>,
-    stores: relax_session::sync::Mutex<HashMap<(String, String), PathBuf>>,
+    stores: relax_session::sync::Mutex<HashMap<crate::preload::CrateKey, PathBuf>>,
     certificate: relax_session::sync::Mutex<Option<std::sync::Arc<crate::crate_image::GraphImage>>>,
     /// the begun load's graph as read from its store (begin_load), certified or not: the restore and
     /// the demand plan's lookups read it once
@@ -5404,7 +5406,7 @@ impl FrontImages {
     fn selected_image(&self, c: &crate::preload::PreCrate, deps: &[u128], selection: Option<(u128, &[String])>) -> Option<crate::crate_image::CrateImage> {
         let deps = &self.full_deps(c, deps)?;
         let options = &c.cfg.session.options;
-        let certified = self.stores.lock().unwrap().get(&(c.name.clone(), c.root.clone())).cloned();
+        let certified = self.stores.lock().unwrap().get(&c.key()).cloned();
         if let Some(path) = certified {
             if let Some(image) = self.candidate(options, c, deps, &path, &std::cell::Cell::new(""), selection) { return Some(image); }
         }
@@ -5570,7 +5572,7 @@ impl crate::crate_image::CrateImages for FrontImages {
         let Some(saved) = self.front_graph(identity) else { return None; };
         if saved.identity != identity || saved.crates.len() != crates.len() { return None; }
         // this load's crate k is the stored graph's crate from[k]
-        let at: HashMap<&(String, String), usize> = saved.crates.iter().enumerate().map(|(j, (key, _))| (key, j)).collect();
+        let at: HashMap<_, usize> = saved.crates.iter().enumerate().map(|(j, (key, _))| (key, j)).collect();
         let from: Vec<usize> = recipe.crates.iter().map(|key| at.get(key).copied()).collect::<Option<_>>()?;
         if !reordered && from.iter().enumerate().any(|(k, &j)| k != j) { return None; }
         let Some(image) = saved.demand_image.clone().filter(|image| image.graph == graph && image.parts.len() == crates.len()) else { return None; };
@@ -8601,7 +8603,7 @@ mod prune_tests {
             p
         };
         let graph = |identity: u128, app: &str| crate::crate_image::encode(&crate::crate_image::GraphImage {
-            identity, crates: vec![(("core".into(), "/s/core/lib.rs".into()), 1), ((app.into(), format!("/w/{app}/main.rs")), 2)], inputs: Vec::new(), stamps: Vec::new(), probes: Vec::new(), demand_image: None,
+            identity, crates: vec![(("core".into(), "/s/core/lib.rs".into(), false), 1), ((app.into(), format!("/w/{app}/main.rs"), false), 2)], inputs: Vec::new(), stamps: Vec::new(), probes: Vec::new(), demand_image: None,
         });
         let own = put("calc_app-0000000000000001.rcs", KIND_DATA, vec![1]);
         let own_gen = crate::store::gen_path(&own, 1);
