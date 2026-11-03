@@ -561,6 +561,46 @@ fn main() {}
 }
 
 #[test]
+fn prebuild_builds_callees_that_ran_before() {
+    isolated_test!(prebuild_builds_callees_that_ran_before);
+    // A warm session's startup image links baseline code that inlined tiny drop glue and core fns
+    // (no inlining records below O3); an O2 build over that code (the SETTLE-TIER sweep) calls
+    // them. Those that ran in the image's session are built before the replacement's install, not
+    // on the program's threads at its first call; a callee with no sign of having run stays lazy.
+    crate::borrowck::lazy::disable_gandalf();
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-prebuild-ran-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("input.rs"), "pub fn ran(x: u32) -> u32 { x + 1 }\npub fn never(x: u32) -> u32 { x + 2 }\nfn main() {}\n").unwrap();
+    let session = std::sync::Arc::new(crate::Session::default());
+    let (prog, core, krate) = crate::load_with_std(&session, dir.join("input.rs").to_str().unwrap(), "prebuild_ran", false).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| (d.krate == krate && prog.name(DefId(i as u32)) == name).then_some(DefId(i as u32))).unwrap();
+    let (ran, never) = (def("ran"), def("never"));
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    let (ran, never) = crate::owner::call(crate::owner::Class::Program, || {
+        let ran = u.fn_id(FnKey::Inst(ran, Vec::new()));
+        // (as the startup image's prelink marks the callees its code inlined)
+        u.fns[ran as usize].ran_before.store(true, Ordering::Relaxed);
+        (ran, u.fn_id(FnKey::Inst(never, Vec::new())))
+    });
+    FIRST_PRESENT.store(true, Ordering::Release);
+    {
+        let _job = compile_job();
+        let call = |c| relax_backend::rir::RelocAt { at: 0, kind: relax_backend::rir::RelocKind::Pool64, target: relax_backend::rir::Reloc::Call(c) };
+        unsafe { prebuild_callees(up, &[call(ran), call(never)], &[]) };
+    }
+    let (ran, never) = crate::owner::call(crate::owner::Class::Program, || (u.fns[ran as usize].compiled, u.fns[never as usize].compiled));
+    assert!(ran, "a callee that ran in the image's session is built before the install");
+    assert!(!never, "a callee with no sign of having run stays lazy");
+    std::mem::forget(u);
+}
+
+#[test]
 fn settle_rebuild_pins_tier1_and_closure_history() {
     isolated_test!(settle_rebuild_pins_tier1_and_closure_history);
     // Unit installs process-global runtime state. Cache fixtures in the same harness can
