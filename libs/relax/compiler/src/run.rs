@@ -2846,7 +2846,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             let now = monitor_activity();
             if now == activity { still = still.saturating_add(1) } else { (activity, still) = (now, 0) }
             crate::lifeline::beat();
-            jit::poll_cpu_budget();
+            jit::poll_settled();
             if let Some(file) = present.as_mut() {
                 use std::io::{Read, Write};
                 let _ = file.read_to_end(&mut present_bytes);
@@ -4038,6 +4038,24 @@ fn summary_inner(why: &str) {
             let stuck = jit::tier_stuck(u);
             let why: Vec<String> = jit::tier_stuck_reasons(&stuck).iter().take(4).map(|(w, ids)| format!("{} x {} (e.g. {})", ids.len(), w, u.fns[ids[0] as usize].name)).collect();
             verbose!("makepad-run: O3 stuck: {} hot fns below O3 with nothing pending{}{}", stuck.len(), if why.is_empty() { "" } else { ": " }, why.join("; "));
+        }
+        if VERBOSE.load(Ordering::Relaxed) {
+            verbose!("{}", jit::busy::report());
+            // the late tier-up that keeps a warm run from settling: slots first queued after 5 s
+            let late = crate::inspect::tierlog::queued_after(5000);
+            if !late.is_empty() {
+                let mut on: std::collections::BTreeMap<String, u32> = Default::default();
+                let mut how: std::collections::BTreeMap<&str, u32> = Default::default();
+                for (_, h) in &late {
+                    let code = crate::inspect::tierlog::queued_on(h).map_or_else(|| "?".to_string(), |c| crate::inspect::codever::label(crate::inspect::codever::kind_at(u, c)));
+                    *on.entry(code).or_default() += 1;
+                    *how.entry(crate::inspect::tierlog::outcome(h)).or_default() += 1;
+                }
+                let join = |m: Vec<(String, u32)>| m.into_iter().map(|(k, n)| format!("{k} {n}")).collect::<Vec<_>>().join(", ");
+                let eg: Vec<String> = late.iter().take(6).map(|(id, h)| format!("{} at {:.1} s ({})", crate::inspect::short(&u.fns[*id as usize].name, 70), h.first_ms[crate::inspect::tierlog::ev::QUEUE as usize] as f64 / 1e3, crate::inspect::tierlog::outcome(h))).collect();
+                verbose!("makepad-run: first queued for O3 after 5 s: {} slots; on code: {}; became: {}; first: {}", late.len(),
+                    join(on.into_iter().collect()), join(how.into_iter().map(|(k, n)| (k.to_string(), n)).collect()), eg.join("; "));
+            }
         }
         let q = jit::TIER_QUEUED.load(Ordering::Relaxed);
         if q > 0 {

@@ -7945,6 +7945,7 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
             main_rec(|r| r.ns[1] += wall_ns() - t);
             let w0 = wall_ns();
             COMPILE_LAST.store(w0, Ordering::Relaxed);
+            busy::note(busy::LAZY);
             if crate::postframe::log_on() && FIRST_PRESENT.load(Ordering::Relaxed) {
                 let mut mine = false;
                 main_rec(|_| mine = true);
@@ -15114,6 +15115,7 @@ fn rt_loop_hot(counter: u64, fp: u64) {
             if now.saturating_sub(last) >= final_chunk_gap(chunk) || !settle_unfinal(u, id, threshold) {
                 return;
             }
+            PGO_LOOP_UNFINALS.fetch_add(1, Ordering::Relaxed);
         } else if st == T_QUEUED {
             // queued and still looping in its baseline / O1 / O2 code: the cost goes on into the
             // record, so its heat (slot_heat) stays live while it waits and tier_revalidate keeps it
@@ -16500,7 +16502,7 @@ fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) {
 }
 
 
-/// O3 queue pushes so far (any reason): the sampler's settled test (sampler_thread)
+/// O3 queue pushes so far (any reason)
 static TIER_PUSHES: AtomicU64 = AtomicU64::new(0);
 /// The settled sampler's period (sampler_thread)
 const SETTLED_MS: u64 = 32;
@@ -16509,6 +16511,63 @@ static SAMPLER_SETTLED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 // Only program runs drive the budget, never check/test or compiler build scripts.
 static BUDGET_RUN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static SAMPLER_ACTIVITY: std::sync::Mutex<Option<((u64, u64, u64), std::time::Instant)>> = std::sync::Mutex::new(None);
+
+/// What fed the settled latch (update_sampler_settled: a compile, an O3 queue push or an O3 install
+/// restarts its 3 s of quiet; its first settle ends the CPU budget's warm-up), per second of the run
+/// and by kind. The verbose exit line says when the JIT first settled, or what held it open:
+/// `makepad-run: the JIT settled ...`.
+pub(crate) mod busy {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    /// a lazy compile (a thread called a slot without code)
+    pub const LAZY: usize = 0;
+    /// a speculative job that ran a back end
+    pub const SPEC_BUILT: usize = 1;
+    /// a speculative job that built nothing (code already there, or a stored entry linked)
+    pub const SPEC_IDLE: usize = 2;
+    /// an O3 queue push: + its reason (Q_*)
+    pub const PUSH: usize = 3;
+    /// O3 code installed
+    pub const O3: usize = 8;
+    const KINDS: usize = 9;
+    const NAMES: [&str; KINDS] = ["lazy", "spec built", "spec idle", "push calls", "push loop", "push retier", "push marked", "push profiled", "O3 installed"];
+    const SECS: usize = 128;
+    static AT: [[AtomicU32; KINDS]; SECS] = [const { [const { AtomicU32::new(0) }; KINDS] }; SECS];
+    /// the first settle (ms since start; 0: not yet), the longest quiet stretch before it (ms) and
+    /// where that stretch ended (ms since start)
+    pub(super) static SETTLED_AT: AtomicU64 = AtomicU64::new(0);
+    pub(super) static QUIET_MS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static QUIET_AT: AtomicU64 = AtomicU64::new(0);
+
+    pub fn note(kind: usize) {
+        let s = (crate::clock::ms_since_start() / 1000.0) as usize;
+        AT[s.min(SECS - 1)][kind].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One line: when the JIT first settled (or that it did not, with its longest quiet stretch), then per
+    /// 5 s of the run the latch's events by kind.
+    pub fn report() -> String {
+        let settled = SETTLED_AT.load(Ordering::Relaxed);
+        let head = if settled > 0 {
+            format!("settled at t={settled} ms")
+        } else {
+            format!("not settled at t={:.0} ms: longest quiet {} ms (ended t={} ms; 3000 settle)", crate::clock::ms_since_start(), QUIET_MS.load(Ordering::Relaxed), QUIET_AT.load(Ordering::Relaxed))
+        };
+        let mut windows = Vec::new();
+        for w in 0..SECS.div_ceil(5) {
+            let mut n = [0u64; KINDS];
+            for s in w * 5..(w * 5 + 5).min(SECS) {
+                for (k, c) in AT[s].iter().enumerate() {
+                    n[k] += c.load(Ordering::Relaxed) as u64;
+                }
+            }
+            if n.iter().any(|&c| c > 0) {
+                let parts: Vec<String> = n.iter().enumerate().filter(|(_, &c)| c > 0).map(|(k, c)| format!("{} {c}", NAMES[k])).collect();
+                windows.push(format!("{}-{} s: {}", w * 5, w * 5 + 5, parts.join(", ")));
+            }
+        }
+        format!("makepad-run: the JIT {head}; what restarted its quiet, per 5 s: {}", windows.join("; "))
+    }
+}
 
 fn sampler_activity() -> (u64, u64, u64) {
     (COMPILE_LAST.load(Ordering::Relaxed), TIER_PUSHES.load(Ordering::Relaxed), TIER1_INSTALLS.load(Ordering::Relaxed))
@@ -16522,10 +16581,11 @@ pub(crate) fn start_cpu_budget() {
     BUDGET_RUN.store(true, Ordering::Release);
 }
 
-// Ordinary runs have no PC sampler. Reuse the existing monitor's tick so their budget
-// still settles, without enabling profiling or adding a polling thread.
-pub(crate) fn poll_cpu_budget() {
-    if BUDGET_RUN.load(Ordering::Acquire) && !sampling_on() {
+// Ordinary runs have no PC sampler. Reuse the existing monitor's tick so they still settle (the
+// budget's warm-up ends; a test harness, which drives no budget, still reports when it settled),
+// without enabling profiling or adding a polling thread.
+pub(crate) fn poll_settled() {
+    if !sampling_on() {
         update_sampler_settled();
     }
 }
@@ -16541,13 +16601,19 @@ fn update_sampler_settled() -> bool {
         *last = now;
         *active_at = std::time::Instant::now();
     }
-    let settled = settle_on && active_at.elapsed() >= SETTLED_AFTER;
+    let quiet = active_at.elapsed();
+    let first = busy::SETTLED_AT.load(Ordering::Relaxed) == 0;
+    if first && quiet.as_millis() as u64 > busy::QUIET_MS.load(Ordering::Relaxed) {
+        busy::QUIET_MS.store(quiet.as_millis() as u64, Ordering::Relaxed);
+        busy::QUIET_AT.store(crate::clock::ms_since_start() as u64, Ordering::Relaxed);
+    }
+    let settled = settle_on && quiet >= SETTLED_AFTER;
     if settled != SAMPLER_SETTLED.load(Ordering::Relaxed) {
         SAMPLER_SETTLED.store(settled, Ordering::Relaxed);
+        if settled && first {
+            busy::SETTLED_AT.store((crate::clock::ms_since_start() as u64).max(1), Ordering::Relaxed);
+        }
         if settled && BUDGET_RUN.load(Ordering::Acquire) {
-            if makepad_cpu_budget::warming() && crate::run::VERBOSE.load(Ordering::Relaxed) {
-                eprintln!("makepad-run: the JIT settled: warm-up over at t={:.0} ms (3 s without a compile, an O3 push or an install)", crate::clock::ms_since_start());
-            }
             makepad_cpu_budget::end_warmup();
         }
         let ms = if settled { SETTLED_MS } else { SAMPLE_MS };
@@ -16770,6 +16836,7 @@ fn tier_push(id: u32, why: u8, rate: u64) {
 
 fn tier_push_locked(q: &mut Vec<(u32, u8, u64, u64)>, id: u32, why: u8, rate: u64, now: u64) {
     TIER_PUSHES.fetch_add(1, Ordering::Relaxed);
+    busy::note(busy::PUSH + (why as usize).min(Q_WHY.len() - 1));
     q.push((id, why, now, rate));
     if tier1_trace() {
         // no unit lock here (rt_hot): the slot, not its name
@@ -16962,7 +17029,7 @@ pub(crate) fn tier1_stats_report() {
     let s = g.as_ref().unwrap_or(&empty);
     let ms = |ns: u64| ns as f64 / 1e6;
     eprintln!("makepad-run o3-stats: builds={} cpu_ms={:.3} max_threads={} in_flight={} (completed attempts; Windows CPU is cycle-estimated)", s.builds, ms(s.cpu), s.max_active, s.active);
-    eprintln!("makepad-run o3-stats: pgo counted_builds={} parked={} counted_cpu_ms={:.3} counted_dropped={} not_counted_no_rir_off_owner={}", PGO_STATS[0].load(Ordering::Relaxed), PGO_PARKED.load(Ordering::Relaxed), ms(PGO_STATS[1].load(Ordering::Relaxed)), PGO_STATS[2].load(Ordering::Relaxed), PGO_STATS[3].load(Ordering::Relaxed));
+    eprintln!("makepad-run o3-stats: pgo counted_builds={} parked={} counted_cpu_ms={:.3} counted_dropped={} not_counted_no_rir_off_owner={} final_loop_unfinals={}", PGO_STATS[0].load(Ordering::Relaxed), PGO_PARKED.load(Ordering::Relaxed), ms(PGO_STATS[1].load(Ordering::Relaxed)), PGO_STATS[2].load(Ordering::Relaxed), PGO_STATS[3].load(Ordering::Relaxed), PGO_LOOP_UNFINALS.load(Ordering::Relaxed));
     eprintln!("makepad-run o3-stats: phases_cpu_ms snapshot={:.3} backend={:.3} install={:.3}", ms(s.phases[0]), ms(s.phases[1]), ms(s.phases[2]));
     let passes: Vec<String> = relax_backend::stats::PASS_NAMES.iter().enumerate().map(|(i, n)| format!("{}={:.3}", n, ms(s.passes[i]))).collect();
     eprintln!("makepad-run o3-stats: backend_pass_ms {} (pass slots can overlap; MAKEPAD_RUN_PASS_TIMES=wall selects wall time)", passes.join(" "));
@@ -17443,6 +17510,8 @@ const PGO_WORK_NS: u64 = 1_000_000_000;
 /// counted builds installed, their build CPU ns, dropped (not built or not installed), not counted
 /// (their normal RIR could not be built off the owner)
 pub static PGO_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// final slots (a stored verdict, or settled this run) whose loop turned hot: they count again
+static PGO_LOOP_UNFINALS: AtomicU64 = AtomicU64::new(0);
 
 /// Queues O3 for the counting slots whose window is over (first O3 worker, no lock held).
 fn pgo_poll() {
@@ -19563,6 +19632,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     }
                     u.stats.tier1_installed += 1;
                     TIER1_INSTALLS.fetch_add(1, Ordering::Relaxed);
+                    busy::note(busy::O3);
                     crate::boot_stats::o3_installed(boot_arm(u, id), id);
                     // (what it inlined is what its code took in: its group follows their
                     // generation, invalid::group_of)
@@ -19733,6 +19803,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 u.stats.tier1_code_bytes += code.len() as u64;
                 u.stats.tier1_installed += 1;
                 TIER1_INSTALLS.fetch_add(1, Ordering::Relaxed);
+                busy::note(busy::O3);
                 crate::boot_stats::o3_installed(boot_arm(u, id), id);
                 crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_INSTALLED, 0, t2 - t1, at);
                 // deterministic O3, replay: installed (a build whose install was refused is retried
@@ -21440,6 +21511,7 @@ fn spec_worker(runtime: &crate::options::RuntimeOptions) {
         crate::postframe::AHEAD_RUNNING.fetch_add(1, Ordering::Relaxed);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { spec_build(up, id) }));
         crate::postframe::AHEAD_RUNNING.fetch_sub(1, Ordering::Relaxed);
+        busy::note(if matches!(r, Ok(true)) && SPEC_BACK_RAN.with(|b| b.get()) { busy::SPEC_BUILT } else { busy::SPEC_IDLE });
         // (compiles only: a warm-cache link ahead is not a function built -- the warm-up hint and
         // the ring said "N functions" for a warm start's manifest links)
         if FIRST_PRESENT.load(Ordering::Relaxed) && matches!(r, Ok(true)) && SPEC_BACK_RAN.with(|b| b.get()) {
