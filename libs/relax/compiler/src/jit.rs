@@ -1428,7 +1428,7 @@ pub unsafe fn spec_seed_manifest(up: *mut Unit) {
 
 /// Installs one slot of the startup image (on the owner thread): as install_compiled does for code
 /// from the disk cache, with the borrowck note collected in `notes` (sent after the start).
-unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, gandalf: bool, notes: &mut Vec<u32>, arm: &mut Vec<(u32, u64)>) {
+unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, gandalf: bool, notes: &mut Vec<u32>, arm: &mut Vec<(u32, u64)>, verdicts: &mut Vec<(u32, crate::cache::TierVerdict, bool)>) {
     let u = &mut *up;
     if u.fns[s.id as usize].compiled {
         return;
@@ -1471,6 +1471,10 @@ unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, 
     // run's unverified callers ran their twins' baseline code for the whole session, MICKEYGAP.)
     if matches!(s.kind, 0 | 1 | 4) {
         arm.push((s.id, s.at));
+        // (its tier starts from its stored verdict once armed: stored_tier_verdict)
+        if !tier1 {
+            verdicts.push((s.id, s.verdict, s.base));
+        }
     } else {
         u.frequency_profiles.remove(&s.id);
     }
@@ -1504,14 +1508,13 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
             crate::zone_alloc::kept_with(|| u.start_order.reserve(slots.len()));
             let mut arm = Vec::with_capacity(slots.len());
             let up: *mut Unit = u;
-            let parked: Vec<u32> = slots.iter().filter(|s| s.parked).map(|s| s.id).collect();
+            let mut verdicts = Vec::new();
             for s in slots {
-                install_prelinked_slot(up, s, gandalf, &mut notes, &mut arm);
+                install_prelinked_slot(up, s, gandalf, &mut notes, &mut arm, &mut verdicts);
             }
             (&mut *up).arm_counters(&arm);
-            // slots an earlier run parked below O3 start with their tier decision final
-            for id in parked {
-                settle_final(&*up, id);
+            for (id, v, base) in verdicts {
+                stored_tier_verdict(&*up, id, v, base);
             }
         });
         Some((n, notes))
@@ -8459,9 +8462,10 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                 perf_map(a, code.len(), &format!("{}{}", perf_name(u, id), tier));
             }
             u.arm_counter(id, a);
-            // a slot an earlier run parked below O3 starts with its tier decision final
-            if linked_from_cache && u.cache.as_ref().is_some_and(|c| c.tier_parked(id)) {
-                settle_final(u, id);
+            if linked_from_cache {
+                if let Some(v) = u.cache.as_ref().and_then(|c| c.tier_verdict(id)) {
+                    stored_tier_verdict(u, id, v, base);
+                }
             }
             if base {
                 note_base(up, id);
@@ -8471,7 +8475,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                 // #[relax(O3)]: its O3 build queued now, at the lowest priority (no samples, no
                 // call rate); the O3 threads start after the first present
                 if relax_level(u, id) >= 3 && u.tier1.is_some() {
-                    queue_marked(u, id);
+                    queue_now(u, id, Q_MARKED, 0);
                 }
             }
             note_entered(&*up, id);
@@ -9690,7 +9694,7 @@ fn o2_hottest_queued(offered: &std::collections::HashSet<(usize, u32)>) -> Optio
     }
     // (the queue's lock is not held while O2_SEEN is taken)
     let mut hot: Vec<(u64, u32)> = tier_queue().unwrap_or_else(|e| e.into_inner()).iter()
-        .filter(|e| matches!(e.1, Q_CALLS | Q_LOOP) && !offered.contains(&(up as usize, e.0))).map(|e| (e.3, e.0)).collect();
+        .filter(|e| queued_hot(e.1) && !offered.contains(&(up as usize, e.0))).map(|e| (e.3, e.0)).collect();
     hot.sort_unstable_by(|a, b| b.cmp(a));
     let seen = O2_SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let id = hot.into_iter().map(|(_, id)| id).find(|id| !seen.as_ref().is_some_and(|m| m.contains(&(up as usize, *id))))?;
@@ -10041,6 +10045,29 @@ unsafe fn settle_final(u: &Unit, id: u32) -> bool {
     let _ = SlotWord::of(&u.slots, id).compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
     FINAL_SLOTS.fetch_add(1, Ordering::Relaxed);
     true
+}
+
+/// Slot `id` (counting) runs code linked from the cache: its tier starts from the decision an
+/// earlier run stored for that code (Cache::tier_verdict), not one made again from this run's
+/// start -- a warm launch's faster code crossed the O3 bar where the run that stored it had not,
+/// and its counted builds parked them again (warm Fab: ~150 slots, the launch never settled).
+/// Parked: final. Queued (and no verdict since): its counted build now (Q_STORED). Neither (it
+/// counted and never turned hot): final. Baseline code without a parked verdict counts on: it
+/// gets its O2 build by running (base_running, the settle sweep), and that install applies the
+/// verdict. Final code still counts again when one of its loops turns hot (rt_loop_hot) or the
+/// settled state re-arms (settle_tier_tick). Unit lock held.
+unsafe fn stored_tier_verdict(u: &Unit, id: u32, v: crate::cache::TierVerdict, base: bool) {
+    use crate::cache::TierVerdict;
+    match v {
+        TierVerdict::Parked => {
+            settle_final(u, id);
+        }
+        _ if base => {}
+        TierVerdict::Queued(rate) => queue_now(u, id, Q_STORED, rate),
+        TierVerdict::None => {
+            settle_final(u, id);
+        }
+    }
 }
 
 /// A final slot counts again from nothing (no lock: atomics only, rt_loop_hot too). False: it was
@@ -10577,11 +10604,16 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done) {
                 // by this install, a hot slot counted again ran O2 for minutes: Sandbox's
                 // reconcile, lane SETTLE)
                 u.rearm_counter(id, a);
+                // code linked from the cache that counted on (baseline: stored_tier_verdict) until
+                // this build replaced it: now the verdict stored for the slot's code
+                if let Some(v) = u.cache.as_ref().and_then(|c| c.tier_verdict(id)) {
+                    stored_tier_verdict(u, id, v, false);
+                }
             }
             // SPEC-V: the base of a twin that reached O3 (twin_base_build) goes on to its own O3
             // build now that it has code
             if take_twin_o3_base(up, id) {
-                queue_marked(u, id);
+                queue_now(u, id, Q_MARKED, 0);
             }
             if perf_map_on() {
                 perf_map(a, len, &format!("{} [{}]", u.fns[id as usize].name, if o1 { "O1" } else { "O2" }));
@@ -14957,8 +14989,9 @@ pub(crate) static TIER1_ENABLED: std::sync::atomic::AtomicBool = std::sync::atom
 
 static TIER_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Queues `#[relax(O3)]` slot `id` for its O3 build ahead of hotness (if it is still counting).
-unsafe fn queue_marked(u: &Unit, id: u32) {
+/// Queues slot `id` for its O3 build now, ahead of its counts (if it is still counting): marked
+/// `#[relax(O3)]` (Q_MARKED, rate 0) or by its stored verdict (Q_STORED, the rate it was queued at).
+unsafe fn queue_now(u: &Unit, id: u32, why: u8, rate: u64) {
     let rec = tier_rec(&u.slots, id);
     let code = (*rec.add(1)).load(Ordering::Relaxed);
     let stub = (*rec.add(2)).load(Ordering::Relaxed);
@@ -14966,7 +14999,7 @@ unsafe fn queue_marked(u: &Unit, id: u32) {
         let s = SlotWord::of(&u.slots, id);
         let _ = s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
         TIER_QUEUED.fetch_add(1, Ordering::Relaxed);
-        tier_push(id, Q_MARKED, 0);
+        tier_push(id, why, rate);
         TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime));
     }
 }
@@ -15711,13 +15744,49 @@ fn tier_drain(q: &mut Vec<(u32, u8, u64, u64)>) {
     let mut ids = Vec::new();
     crate::lockfree::IdStack::walk(token, |id| unsafe { tier_link(tier_rec(slots, id)).load(Ordering::Relaxed) }, |id| ids.push(id));
     let now = wall_ns();
+    let mut verdicts = QUEUED_VERDICTS.lock().unwrap_or_else(|e| e.into_inner());
     for &id in ids.iter().rev() {
         churn_queued(id);
         let rec = tier_rec(slots, id);
         let rate = unsafe { (*rec.add(7)).load(Ordering::Relaxed) };
         let why = unsafe { tier_why(rec).load(Ordering::Relaxed) } as u8;
         tier_push_locked(q, id, why, rate, now);
+        if matches!(why, Q_CALLS | Q_LOOP) {
+            crate::zone_alloc::kept_with(|| verdicts.push((id, rate)));
+        }
     }
+}
+
+/// Slots tier_drain queued for their calls or loops, with their rates: their verdicts for the
+/// cache (record_queued_verdicts: the unit lock, which a holder of the queue's lock may not take)
+static QUEUED_VERDICTS: relax_session::sync::Mutex<Vec<(u32, u64)>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// The queued verdicts so far go into the cache (O3 workers, no lock held): a later launch that
+/// links the slot's code queues it at once (stored_tier_verdict), unless a verdict after it
+/// parked it or its O3 code was stored.
+fn record_queued_verdicts() {
+    let v = {
+        let mut g = QUEUED_VERDICTS.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *g)
+    };
+    let up = TIER_UNIT.load(Ordering::Acquire);
+    if up.is_null() {
+        return;
+    }
+    owner::publish(|| unsafe {
+        let u = &mut *up;
+        if let Some(mut c) = u.cache.take() {
+            for &(id, rate) in &v {
+                if (id as usize) < u.fns.len() {
+                    c.record_tier_queued(u, id, rate);
+                }
+            }
+            u.cache = Some(c);
+        }
+    });
 }
 
 /// A push happened (rt_hot's, or one under TIER_QUEUE): one parked worker looks.
@@ -15740,7 +15809,16 @@ const Q_RETIER: u8 = 2;
 const Q_MARKED: u8 = 3;
 /// PGO: a counted build's window is over (pgo_poll)
 const Q_PROFILED: u8 = 4;
-const Q_WHY: [&str; 5] = ["calls", "loop", "retier", "marked", "profiled"];
+/// an earlier run queued the code linked from the cache and stored no verdict after (Cache::
+/// tier_verdict): its counted build at once, as Q_CALLS's, never counted again (tier_revalidate)
+const Q_STORED: u8 = 5;
+const Q_WHY: [&str; 6] = ["calls", "loop", "retier", "marked", "profiled", "stored"];
+
+/// Queued by how the slot runs (rt_hot: its calls, its loops) or by its stored verdict: its O2
+/// build (o2_hot), then its counted build
+fn queued_hot(why: u8) -> bool {
+    matches!(why, Q_CALLS | Q_LOOP | Q_STORED)
+}
 
 fn prep_verify() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -16554,11 +16632,11 @@ pub(crate) mod busy {
     /// an O3 queue push: + its reason (Q_*)
     pub const PUSH: usize = 2;
     /// O3 code installed
-    pub const O3: usize = 7;
+    pub const O3: usize = 8;
     /// an O2 or verified-O1 build finished (background: counted, but it does not restart the quiet)
-    pub const O2: usize = 8;
-    const KINDS: usize = 9;
-    const NAMES: [&str; KINDS] = ["lazy", "spec", "push calls", "push loop", "push retier", "push marked", "push profiled", "O3 installed", "O2 built (no restart)"];
+    pub const O2: usize = 9;
+    const KINDS: usize = 10;
+    const NAMES: [&str; KINDS] = ["lazy", "spec", "push calls", "push loop", "push retier", "push marked", "push profiled", "push stored", "O3 installed", "O2 built (no restart)"];
     const SECS: usize = 128;
     static AT: [[AtomicU32; KINDS]; SECS] = [const { [const { AtomicU32::new(0) }; KINDS] }; SECS];
     /// every event so far that restarts the quiet (the latch compares it tick to tick)
@@ -17989,6 +18067,7 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
         // build (the first worker's poll alone waited out its own builds: hot slots came out of
         // the window one at a time behind a long O3 build)
         pgo_poll();
+        record_queued_verdicts();
         // SPEC-V: the first worker sweeps the verdicts before each build too, not only when the
         // queue is empty (rate-limited inside: once per TIER1_POLL, and only when verdicts or
         // patches moved). With a long O3 queue the idle-only sweep starved: the race's cold launch
@@ -18046,6 +18125,7 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
                     sweep_verdicts();
                     // PGO: counted slots whose window is over go to the queue
                     pgo_poll();
+                    record_queued_verdicts();
                     // baseline code that keeps running under the O3 threshold: its O2 builds
                     drain_slow_base();
                     // the settled state: lukewarm code optimised, its count stubs out (SETTLE-TIER)
@@ -18066,11 +18146,12 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
             continue;
         }
         let _job = compile_job();
-        if why == Q_CALLS || why == Q_LOOP {
+        if queued_hot(why) {
             owner::publish(|| unsafe { o2_hot(up, id) });
             // a threshold's cost that came slower than CALL_FAST_NS into code bigger than SMALL_CODE:
-            // lukewarm until its counts show the work (a hot loop under it queues it as Q_LOOP instead)
-            let lukewarm = why == Q_CALLS && unsafe {
+            // lukewarm until its counts show the work (a hot loop under it queues it as Q_LOOP instead;
+            // a stored verdict's rate is the one an earlier run queued it at)
+            let lukewarm = why != Q_LOOP && unsafe {
                 let u = &*up;
                 let threshold = u.tier1.as_ref().map_or(0, |t| t.threshold);
                 (rate as u128) * (CALL_FAST_NS as u128) < (threshold as u128) * 1_000_000_000
