@@ -117,6 +117,45 @@ pub(crate) fn skipped_text_hash(c: u32) -> u128 {
     h.finish128()
 }
 
+/// The test dependency check's own text of each crate of `crates` (cache.rs dep_check_key): the
+/// crate as rustc is invoked on it and the text of the files the boot loaded (as its fingerprint
+/// hashes them, without its dependencies'; skipped_text_hash has the others).
+fn own_text_hashes(prog: &crate::program::Program, crates: &[u32]) -> Vec<u128> {
+    let mut per: Vec<Option<crate::sip::Sip128>> = vec![None; prog.crates.len()];
+    for &c in crates {
+        let ci = &prog.crates[c as usize];
+        let mut h = crate::crate_image::fingerprint_head(prog.syms.str(ci.name), ci.root_path(), ci.edition, ci.proc_macro, &ci.cfg.set);
+        h.str("own-text");
+        h.u128(ci.context.fingerprint());
+        per[c as usize] = Some(h);
+    }
+    for f in 0..prog.boot_files.min(prog.files.len()) {
+        if prog.front_macro_fragments.contains(&f) { continue; }
+        let Some(h) = prog.file_crate.get(f).and_then(|&c| per.get_mut(c as usize)).and_then(Option::as_mut) else { continue };
+        let pf = &prog.files[f];
+        let path = prog.file_paths.get(f).map_or("", |p| p.as_str());
+        h.u128(crate::crate_image::file_hash(path, &pf.src[..(pf.src_len as usize).min(pf.src.len())]));
+    }
+    crates.iter().map(|&c| per[c as usize].as_ref().map_or(0, |h| h.finish128())).collect()
+}
+
+/// The crates crate `c` depends on, directly or not (itself not).
+fn dependency_closure(prog: &crate::program::Program, c: u32) -> Vec<u32> {
+    let mut seen = vec![false; prog.crates.len()];
+    let mut stack = vec![c];
+    let mut out = Vec::new();
+    while let Some(k) = stack.pop() {
+        for &(_, d) in &prog.crates[k as usize].deps {
+            if d != c && !std::mem::replace(&mut seen[d as usize], true) {
+                out.push(d);
+                stack.push(d);
+            }
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
 /// `makepad run`'s type check of every body of `crates` (the app's own crates whose clean verdict
 /// is not stored: run.rs, before `main`), on MAKEPAD_RUN_JOBS threads: the checked bodies stay in
 /// the typeck query for the builds that follow. A body that fails while files the lazy selection
@@ -318,17 +357,27 @@ pub fn start_test_deps(up: *mut Unit, select: impl FnOnce(&crate::program::Progr
         let (t0, cpu0) = (jit::wall_ns(), relax_backend::cpu_ns());
         let up = upn as *mut Unit;
         let front = unsafe { (*up).front.clone() };
-        let crates = { let r = jit::front_read("test dependency crates"); select(r.of(&front).0) };
+        // per crate: its own text (the boot's files) and its dependency closure
+        let (crates, own, closures) = {
+            let r = jit::front_read("test dependency crates");
+            let prog = r.of(&front).0;
+            let crates = select(prog);
+            let own = own_text_hashes(prog, &crates);
+            let closures: Vec<Vec<u32>> = crates.iter().map(|&k| dependency_closure(prog, k)).collect();
+            (crates, own, closures)
+        };
         names.retain(|(k, _)| crates.contains(k));
         names.sort_unstable_by_key(|(k, _)| *k);
         names.dedup_by_key(|(k, _)| *k);
-        let skipped: Vec<_> = crates.iter().map(|&k| skipped_text_hash(k)).collect();
+        // the text of the files the boot skipped, of every crate a key names (read here, off the owner)
+        let mut skipped = std::collections::HashMap::new();
+        for &k in crates.iter().chain(closures.iter().flatten()) { skipped.entry(k).or_insert_with(|| skipped_text_hash(k)); }
         let (todo, keys) = crate::owner::call(crate::owner::Class::Publish, || {
             let u = unsafe { &*up };
             let mut todo = Vec::new();
             let mut keys = Vec::new();
-            for (&k, skipped) in crates.iter().zip(skipped) {
-                let key = u.cache.as_ref().and_then(|c| unsafe { &mut *c.get() }.crate_check_key(k, skipped, 3));
+            for ((&k, &own), closure) in crates.iter().zip(&own).zip(&closures) {
+                let key = u.cache.as_ref().and_then(|c| unsafe { &mut *c.get() }.dep_check_key(k, own, skipped[&k], closure.iter().map(|d| (*d, skipped[d]))));
                 let stored = key.is_some_and(|key| u.cache.as_ref().is_some_and(|c| matches!(unsafe { &*c.get() }.borrowck_stored(key), Some(crate::borrowck::lazy::StoredVerdict::Clean))));
                 if !stored {
                     todo.push(k);
