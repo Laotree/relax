@@ -23,7 +23,7 @@ use relax_backend::x64;
 use crate::os;
 use crate::owner;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum FnKey {
@@ -758,6 +758,25 @@ const TLS_CAP: usize = 1 << 20;
 const TLS_COVERAGE_DISABLED: u32 = 16;
 const TLS_FIRST_FREE: u32 = 32;
 static TLS_KEY: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Bytes of a thread-local block any unit placed variables in (`Unit::tls_alloc`; the most of
+/// every unit's): no thread writes a block beyond it.
+static TLS_USED: AtomicU32 = AtomicU32::new(TLS_FIRST_FREE);
+/// Thread-local blocks no thread uses (zeroed), for the next thread's `rt_tls_block`.
+static SPARE_TLS_BLOCKS: crate::stack::Spares<u64> = crate::stack::Spares::new();
+
+/// A new thread's thread-local block, all zeros: one a finished thread left, else a new one.
+fn tls_block_new() -> u64 {
+    SPARE_TLS_BLOCKS.take().unwrap_or_else(|| os::mem::alloc_rw(TLS_CAP))
+}
+
+/// A thread is done with block `p`: zeroed as far as a thread can have written it, it is kept
+/// for the next thread, or unmapped when enough are kept.
+fn tls_block_done(p: u64) {
+    unsafe { std::ptr::write_bytes(p as *mut u8, 0, TLS_USED.load(Ordering::Acquire) as usize) };
+    if let Some(p) = SPARE_TLS_BLOCKS.keep(p) {
+        os::mem::free(p, TLS_CAP);
+    }
+}
 
 thread_local! {
     /// This thread exits: the program's thread-local destructors run (tls_exit). (const, no
@@ -794,7 +813,7 @@ fn tls_dtor(p: *mut u8) {
         crate::web32::thread_exit(p as u64);
         crate::web32::free(p as u64, TLS_CAP);
     } else {
-        os::mem::free(p as u64, TLS_CAP);
+        tls_block_done(p as u64);
     }
     for (base, token) in registrations { crate::domain::thread_finished(base, token); }
 }
@@ -1236,7 +1255,7 @@ fn rt_tls_block() -> u64 {
         return b as u64;
     }
     // the wasm32 program's thread-local blocks are in its window (`&THREAD_LOCAL` is an offset)
-    let b = if crate::web32::on() { crate::web32::alloc(TLS_CAP) } else { os::mem::alloc_rw(TLS_CAP) };
+    let b = if crate::web32::on() { crate::web32::alloc(TLS_CAP) } else { tls_block_new() };
     // a thread nothing assigned a domain to (one native code started, or the first use of a
     // thread JIT code started before its start put it in its parent's domain): the default
     unsafe { *(b as *mut u64) = crate::domain::default_base() };
@@ -4768,6 +4787,7 @@ impl Unit {
             panic!("thread-local block full");
         }
         self.tls_next = at + size;
+        TLS_USED.fetch_max(self.tls_next, Ordering::Release);
         at
     }
 
