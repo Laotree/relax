@@ -160,12 +160,15 @@ const KIND_DEPS: u32 = 18;
 const KIND_FRONT_ORDER: u32 = 19;
 const KIND_CONST: u32 = 9;
 const KIND_WARM_OUTCOME: u32 = 10;
-/// a slot's tier verdict: its counted window showed too little work for O3 (jit.rs pgo_poll parks
-/// it). Keyed by the slot's code key xor TIER_VERDICT_SALT (empty payload): a warm launch installs
-/// the slot's entry with its tier decision final (no count stub), so its startup burst does not
-/// count it hot again and build its counted code and O3 code every launch
+/// a slot's tier verdict, keyed by the slot's code key xor a salt: parked (TIER_PARKED_SALT, empty
+/// payload: its counted window showed too little work for O3, jit.rs pgo_poll) or queued for O3
+/// (TIER_QUEUED_SALT, payload: the cost rate it was queued at, 8 bytes LE: jit.rs tier_drain). A
+/// launch that links the entry starts from that decision (jit.rs stored_tier_verdict) instead of
+/// making it again from its own start: parked -> final, queued -> its counted build at once, no
+/// verdict (it counted and never turned hot) -> final
 const KIND_TIER: u32 = 20;
-const TIER_VERDICT_SALT: u128 = 0x7469_6572_2d76_6572_6469_6374_2d70_6b64;
+const TIER_PARKED_SALT: u128 = 0x7469_6572_2d76_6572_6469_6374_2d70_6b64;
+const TIER_QUEUED_SALT: u128 = 0x7469_6572_2d71_7565_7565_642d_7261_7465;
 /// stores a front image was mapped from: kept for the rest of the process (the arrays point
 /// into their mappings)
 static FRONT_STORES: relax_session::sync::Mutex<Vec<std::sync::Arc<Store>>> = relax_session::sync::Mutex::new(Vec::new());
@@ -228,6 +231,17 @@ const TIER_O2: u8 = 2;
 /// a run that links it builds it again at O2 after its first present (jit.rs note_base), and
 /// that code replaces the entry
 const TIER_BASE: u8 = 3;
+
+/// What an earlier run decided for a slot's code below O3 (KIND_TIER; jit.rs stored_tier_verdict).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum TierVerdict {
+    /// counted, never queued for O3
+    None,
+    /// queued for O3 at this cost rate (units/s), no parked verdict since
+    Queued(u64),
+    /// its counted window showed too little work for O3
+    Parked,
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
@@ -3073,22 +3087,38 @@ impl Cache {
 
     /// Records that slot `id`'s counted window showed too little work for O3 (KIND_TIER).
     pub fn record_tier_parked(&mut self, u: &Unit, id: u32) {
+        self.record_tier(u, id, TIER_PARKED_SALT, Vec::new());
+    }
+
+    /// Records that slot `id` was queued for O3 by its calls or loops at cost rate `rate` (KIND_TIER).
+    pub fn record_tier_queued(&mut self, u: &Unit, id: u32, rate: u64) {
+        self.record_tier(u, id, TIER_QUEUED_SALT, rate.to_le_bytes().to_vec());
+    }
+
+    fn record_tier(&mut self, u: &Unit, id: u32, salt: u128, payload: Vec<u8>) {
         if self.mode == Mode::ReadOnly || u.fns[id as usize].patch_gen != 0 { return; }
         let Some(key) = self.slot_key(u, id) else { return };
-        let vk = key ^ TIER_VERDICT_SALT;
+        let vk = key ^ salt;
         if self.has_index(&vk) || !self.pending_keys.insert(vk) { return; }
         let kc = self.key_crate.get(&key).copied().unwrap_or(0);
-        self.push_pending(kc, NewEntry { key: vk, kind: KIND_TIER, payload: Vec::new() });
+        self.push_pending(kc, NewEntry { key: vk, kind: KIND_TIER, payload });
     }
 
-    /// Whether code entry `key`'s slot was parked below O3 by an earlier run (record_tier_parked).
-    pub(crate) fn tier_parked_key(&self, key: u128) -> bool {
-        matches!(self.get(key ^ TIER_VERDICT_SALT), Some((KIND_TIER, _)))
+    /// The tier verdict an earlier run stored for code entry `key` (record_tier_parked / _queued).
+    pub(crate) fn tier_verdict_key(&self, key: u128) -> TierVerdict {
+        if matches!(self.get(key ^ TIER_PARKED_SALT), Some((KIND_TIER, _))) {
+            return TierVerdict::Parked;
+        }
+        match self.get(key ^ TIER_QUEUED_SALT) {
+            Some((KIND_TIER, p)) => TierVerdict::Queued(p.get(..8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()))),
+            _ => TierVerdict::None,
+        }
     }
 
-    /// Whether slot `id`, linked from the cache this run, was parked below O3 by an earlier run.
-    pub(crate) fn tier_parked(&self, id: u32) -> bool {
-        self.linked_key.get(&id).is_some_and(|&k| self.tier_parked_key(k))
+    /// The tier verdict stored for the entry slot `id` was linked from this run; None: its code
+    /// was not linked from the cache.
+    pub(crate) fn tier_verdict(&self, id: u32) -> Option<TierVerdict> {
+        self.linked_key.get(&id).map(|&k| self.tier_verdict_key(k))
     }
 
     /// The tier rank (baseline 0, O1 1, O2 2, O3 3) of slot `id`'s newest entry, recorded this run
