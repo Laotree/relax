@@ -344,13 +344,20 @@ impl From<crate::provided::SourceCheckError> for ResolveError {
     }
 }
 
-/// A boot that cannot bind its provided libraries keeps the run window for the update offer.
+/// A boot that cannot bind its provided libraries keeps the run window for the update offer,
+/// when someone can take it there: a visible window of a live session (the run window waits on
+/// the offer). Else the update is applied before the program runs (`apply_at_boot`): a run that
+/// ran nothing never ends with 0.
 fn offer_boot_update(package: &str, change: crate::provided::ProvidedChange) -> i32 {
     if let Err(e) = finish_window() {
         report_failed(&e, 1);
         eprintln!("makepad-run: {e}");
         crate::first_frame::no_window(package, &e);
         return 1;
+    }
+    let seen = HAL_RUN.load(Ordering::Acquire) && live_session() && std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_none();
+    if !seen {
+        return crate::reload::host::apply_at_boot(&change);
     }
     crate::reload::host::offer_provided(change, None);
     0
