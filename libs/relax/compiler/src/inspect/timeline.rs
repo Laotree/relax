@@ -1029,26 +1029,39 @@ fn busy_in(th: &Thread, t0: u64, t1: u64) -> (u64, u64) {
 
 /// The critical path of [t0, t1) ending on thread `ui`: walking back from t1, the UI thread's
 /// own busy time counts; a wait ended by another thread's wake moves the walk to that thread at
-/// the wake. Returns the path as (thread index, from, to, what) pieces, newest first.
+/// the wake, for the time the wait lasted only: before the wait began the waiting thread ran
+/// itself, and the walk returns to it there (the waker's earlier history is not this path's).
 fn critical(ths: &[Thread], ui: usize, t0: u64, t1: u64) -> Vec<(usize, u64, u64, String)> {
     let mut path = Vec::new();
     let (mut th, mut t) = (ui, t1);
     // the thread whose wait moved the walk here: the next wait met is explained by its wake if it
     // has one (the owner woke for the UI's own request, not for a post just after it)
     let mut from: Option<usize> = None;
+    // the threads the walk left at a wake: (thread, the start of its wait = where it resumes)
+    let mut back: Vec<(usize, u64)> = Vec::new();
     // (a cold lazy compile's frame is hundreds of UI -> owner -> UI round trips, three pieces each)
     for _ in 0..16384 {
-        if t <= t0 {
-            break;
+        let floor = back.last().map_or(t0, |b| b.1);
+        if t <= floor {
+            match back.pop() {
+                Some((b, at)) => {
+                    th = b;
+                    t = at;
+                    from = None;
+                    continue;
+                }
+                None => break,
+            }
         }
-        // the latest wait on this thread that overlaps (.., t)
-        let w = ths[th].segs.iter().filter(|s| s.wait && s.t0 < t && s.t1 > t0).filter(|s| s.t0 < t).max_by_key(|s| s.t1.min(t));
+        // the latest wait on this thread that overlaps [floor, t)
+        let w = ths[th].segs.iter().filter(|s| s.wait && s.t0 < t && s.t1 > floor).max_by_key(|s| s.t1.min(t));
         match w {
-            Some(s) if s.t1 >= t.min(s.t1) => {
+            Some(s) => {
                 let end = s.t1.min(t);
                 if end < t {
                     path.push((th, end, t, "run".to_string()));
                 }
+                let start = s.t0.max(floor);
                 // the wake explains the wait only where the walk meets the wait's end: met inside
                 // it (this thread's own request woke the owner while it waited), the thread waited
                 // since the wait began. A wake stamped just after the end (another thread's clock
@@ -1056,21 +1069,22 @@ fn critical(ths: &[Thread], ui: usize, t0: u64, t1: u64) -> Vec<(usize, u64, u64
                 let came = from.take().and_then(|f| ths[f].wakes.iter().filter(|w| w.1 == s.key && w.0 > s.t0 && w.0 <= s.t1 + 50_000).min_by_key(|w| w.0).map(|w| (f, w.0)));
                 match came.or_else(|| s.woke_by.and_then(|(h, at)| ths.iter().position(|x| x.handle == h).map(|i| (i, at)))) {
                     Some((i, at)) if i != th && at > s.t0 && end == s.t1 => {
-                        let at = at.min(end.saturating_sub(1));
-                        path.push((th, at.max(s.t0), end, format!("{} (ended by {})", s.what, super::tid_label(ths[i].os_id))));
+                        let at = at.max(start).min(end.saturating_sub(1).max(start));
+                        path.push((th, at, end, format!("{} (ended by {})", s.what, super::tid_label(ths[i].os_id))));
+                        back.push((th, start));
                         from = Some(th);
                         th = i;
-                        t = at.max(t0);
+                        t = at;
                     }
                     _ => {
-                        path.push((th, s.t0.max(t0), end, s.what.clone()));
-                        t = s.t0;
+                        path.push((th, start, end, s.what.clone()));
+                        t = start;
                     }
                 }
             }
-            _ => {
-                path.push((th, t0, t, "run".to_string()));
-                break;
+            None => {
+                path.push((th, floor, t, "run".to_string()));
+                t = floor;
             }
         }
     }
@@ -1457,6 +1471,26 @@ mod tests {
         assert_eq!(w.woke_by, Some((22, 109_990_000)));
         let cp = super::critical(&ths, 0, 0, 120_000_000);
         assert!(cp.iter().any(|p| p.0 == 1 && p.3 == "run" && p.2 - p.1 > 50_000_000), "{:?}", cp.iter().map(|p| (p.0, p.1, p.2, p.3.clone())).collect::<Vec<_>>());
+    }
+
+    /// A waker's history before the wait it ended began is not on the path: the UI posts while
+    /// the owner serves another thread's request (woken by that thread's post), and the walk
+    /// returns to the UI at its wait's start instead of following the other thread back.
+    #[test]
+    fn the_walk_returns_to_the_waiter_at_its_wait_start() {
+        use super::Kind::*;
+        const W: u64 = 0x3000;
+        let owner = vec![rec(0, WaitBegin, "idle", W, ""), rec(12_000, WaitEnd, "", 0, ""), rec(12_000, SpanBegin, "serve publish", 0, ""), rec(15_000, Served, "", 22, ""), rec(15_000, SpanEnd, "serve publish", 0, ""),
+            rec(15_000, SpanBegin, "serve program", 0, ""), rec(19_000, Served, "", 11, ""), rec(19_000, SpanEnd, "serve program", 0, ""), rec(19_100, WaitBegin, "idle", W, "")];
+        let ui = vec![rec(0, SpanBegin, "Actions", 0, ""), rec(13_000, Wake, "", W, ""), rec(13_100, WaitBegin, "owner", 0, "program"), rec(19_500, WaitEnd, "", 0, ""), rec(20_000, SpanEnd, "Actions", 0, "")];
+        let other = vec![rec(0, SpanBegin, "work", 0, ""), rec(11_900, Wake, "", W, ""), rec(11_950, SpanEnd, "work", 0, ""), rec(11_950, WaitBegin, "owner", 0, "publish"), rec(15_200, WaitEnd, "", 0, "")];
+        let ths = super::build(vec![(3, 33, owner), (1, 11, ui), (2, 22, other)], 20_000);
+        let cp = super::critical(&ths, 1, 0, 20_000);
+        let steps: Vec<_> = cp.iter().map(|p| (p.0, p.1, p.2, p.3.clone())).collect();
+        assert!(!cp.iter().any(|p| p.0 == 2), "{steps:?}");
+        // the owner's service from the UI's request back to its wait start, then the UI's own time
+        assert!(cp.iter().any(|p| p.0 == 0 && p.1 == 13_100), "{steps:?}");
+        assert!(cp.iter().any(|p| p.0 == 1 && p.1 == 0 && p.2 == 13_100), "{steps:?}");
     }
 
     /// The owner idle is ended by the request of the thread the walk came from (or the first post
