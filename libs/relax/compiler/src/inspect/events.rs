@@ -676,6 +676,11 @@ pub fn cmd_resume(req: &Req, out: &mut Out) {
         }
         Some(p) => {
             if decision == 3 && p.domain.is_some() && p.domain == crate::run::app_domain() {
+                // a unit an edit left half-made: a fresh process, never a relaunch on that unit
+                if let Some(why) = crate::reload::unit_suspect() {
+                    if let Err(e) = crate::reload::restart_process(&why) { out.err(&e); }
+                    return;
+                }
                 match crate::run::relaunch() {
                     Ok(()) => {
                         p.decision.store(1, SeqCst);

@@ -2095,9 +2095,16 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, sources: &[Edit], partial:
     let edits: Vec<_> = edits.into_iter().filter(|e| !crate::native_macros::owns_path(&e.path)).collect();
     if edits.is_empty() { return idle_outcome(None, "no loaded source items changed"); }
     let sources: Vec<_> = sources.iter().map(|source| (source.path.as_str(), std::sync::Arc::<[u8]>::from(source.src.as_slice()))).collect();
-    // an internal compiler panic in the transaction refuses the edit with its message (the app
-    // keeps running the code it had; a half-applied state is not installed)
     let files: Vec<u32> = edits.iter().map(|e| e.file).collect();
+    // an earlier transaction panicked: the program's tables may be half-way through it, and no
+    // edit applies to them again -- the process restart that recovery asks for applies this one
+    if let Some(why) = unit_suspect() {
+        return Outcome { failure: Some(makepad_remote::hot::Outcome::Panic), kept: 0, pending: false, rung: Rung::Restart, files, lines: vec![format!("not applied to a program an earlier edit left half-made ({why}): a process restart applies it")], stale: Vec::new(), names: Vec::new(), changed: 0, test_changes: None, group: 0, ms: [0.0; 4], undo: None, work: [0; 5] };
+    }
+    // an internal compiler panic in the transaction refuses the edit with its message. Nothing
+    // undoes what the transaction had changed of the program by then (its file versions, defs,
+    // query inputs), so the unit is marked suspect: the recovery is a fresh process
+    // (mark_unit_suspect), never a relaunch on this unit.
     let r = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // takes the parse snapshots of the edits (under the unit call)
         let snap = |edits: &[Edit]| {
@@ -2178,7 +2185,8 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, sources: &[Edit], partial:
         Err(p) => {
             // the message and where the compiler panicked: the report names the spot
             let msg = crate::lifeline::panic_line(&*p);
-            Outcome { failure: Some(makepad_remote::hot::Outcome::Panic), kept: 0, pending: false, rung: Rung::Restart, files, lines: vec![format!("internal compiler error applying the edit: {} -- makepad run bug, report it; restart the app", msg)], stale: Vec::new(), names: Vec::new(), changed: 0, test_changes: None, group: 0, ms: [0.0; 4], undo: None, work: [0; 5] }
+            mark_unit_suspect(&format!("internal compiler error applying an edit: {msg}"));
+            Outcome { failure: Some(makepad_remote::hot::Outcome::Panic), kept: 0, pending: false, rung: Rung::Restart, files, lines: vec![format!("internal compiler error applying the edit: {} -- makepad run bug, report it; the app restarts (a fresh process)", msg)], stale: Vec::new(), names: Vec::new(), changed: 0, test_changes: None, group: 0, ms: [0.0; 4], undo: None, work: [0; 5] }
         }
     };
     crate::owner::call(crate::owner::Class::Program, || {
@@ -3665,6 +3673,21 @@ fn ms(t0: Instant) -> f64 {
 
 /// The program announced it can restart with its state (std::relax::restart_supported).
 static RESTART_SUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Why this process's unit cannot be trusted (None: it can): a compiler panic inside an edit's
+/// transaction, or an internal compiler error at a call after edits. Every restart from then on
+/// is a fresh process (exec_restart: the same sources, the warm cache, the app's state when it
+/// left one), never a domain relaunch, which keeps the unit.
+static UNIT_SUSPECT: relax_session::sync::Mutex<Option<String>> = relax_session::sync::Mutex::new(None);
+
+pub(crate) fn mark_unit_suspect(why: &str) {
+    let _k = crate::zone_alloc::kept();
+    let mut s = UNIT_SUSPECT.lock().unwrap_or_else(|e| e.into_inner());
+    if s.is_none() { *s = Some(why.lines().next().unwrap_or("").to_string()); }
+}
+
+pub(crate) fn unit_suspect() -> Option<String> {
+    UNIT_SUSPECT.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
 /// A restart is due (an edit needs one); the program polls this at its safe point.
 static RESTART_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The app is pinned: the live watch stands still and a rebuilt makepad waits.
@@ -3935,6 +3958,14 @@ pub extern "C" fn __relax_restart_now(state: *const u8, len: usize) {
         let st = unsafe { if state.is_null() { &[][..] } else { std::slice::from_raw_parts(state, len) } };
         // a rebuilt makepad waits: the process restarts into it (or this returns, said why)
         if host::restart_now(st) { return; }
+        if unit_suspect().is_some() {
+            RESTART_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+            if let Err(e) = exec_restart(Some(st)) {
+                crate::hot_failure::restart_failed(&e);
+                eprintln!("makepad live: {e}");
+            }
+            return;
+        }
         if crate::domain::current_app_domain().is_some() && crate::domain::current_app_domain() == crate::run::app_domain() {
             *DOMAIN_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(String::from_utf8_lossy(st).into_owned());
             RESTART_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -4146,7 +4177,7 @@ fn restart_in_place(why: String) -> Result<&'static str, String> {
         wake_program();
         return Ok("restart with the program's state");
     }
-    if crate::run::app_domain().is_some() {
+    if crate::run::app_domain().is_some() && unit_suspect().is_none() {
         crate::run::relaunch()?;
         return Ok("domain relaunch");
     }
@@ -4173,6 +4204,26 @@ pub fn recover_hot_failure(kind: makepad_remote::hot::Outcome, lines: &[String],
         crate::hot_failure::pump();
         if crate::harness::live::enabled() && crate::hot_failure::has_error() {
             std::process::exit(crate::hot_failure::verdict(101).code());
+        }
+    }
+}
+
+/// An internal compiler error at a program thread's call (jit.rs compile_ice): after live edits
+/// it is a failed hot load like any other -- recorded, the unit suspect, a fresh process asked
+/// for at the app's next event (`on_main`: not asked; that thread is in the call, the caller
+/// restarts the process itself). False: no recovery started (no edit ran in this process, or a
+/// recovery runs already) or asking for the restart failed.
+pub(crate) fn recover_compile_ice(message: &str, on_main: bool) -> bool {
+    if !crate::hot_failure::failed(makepad_remote::hot::Outcome::Panic, &[message.to_string()], None) { return false; }
+    mark_unit_suspect(message);
+    note_restart_pending(message);
+    if on_main { return true; }
+    match restart_in_place(message.to_string()) {
+        Ok(_) => true,
+        Err(e) => {
+            crate::hot_failure::restart_failed(&e);
+            crate::hot_failure::pump();
+            false
         }
     }
 }

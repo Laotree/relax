@@ -3046,19 +3046,22 @@ fn park_slot<R>(id: u32, f: impl FnOnce() -> R) -> R {
 #[cold]
 #[inline(never)]
 fn park_compile_error(up: usize, slot: u32) -> u64 {
-    let (message, location) = owner::call(owner::Class::Program, || unsafe {
+    let (message, location, ice) = owner::call(owner::Class::Program, || unsafe {
         let u = &*(up as *mut Unit);
         let f = &u.fns[slot as usize];
         let e = f.build_err.as_deref().unwrap_or("its build failed");
+        // (an internal error's position may need the very tables that failed)
+        let ice = e.starts_with("internal compiler error");
         let location = match &f.key {
-            FnKey::Inst(d, _) => {
+            FnKey::Inst(d, _) if !ice => {
                 let def = u.prog.def(*d);
                 u.pos_str(def.file, u.prog.files[def.file as usize].ast.item(def.item).lo)
             }
             _ => String::new(),
         };
-        (format!("compile error in {}: {}", f.name, e.lines().next().unwrap_or("")), location)
+        (format!("compile error in {}: {}", f.name, e.lines().next().unwrap_or("")), location, ice)
     });
+    if ice { return compile_ice(up, &message); }
     let mut frames = [0u64; crate::inspect::heap::DEPTH];
     let n = crate::inspect::heap::capture_host(&mut frames) as usize;
     let rebuild = || match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { compile_slot(up as *mut Unit, slot) })) {
@@ -3077,6 +3080,40 @@ fn park_compile_error(up: usize, slot: u32) -> u64 {
             u.emit_or_redirect(&code, &relocs, "error stub").unwrap_or_else(|e| panic!("{}; and its error stub was not emitted: {}", message, e))
         }),
     }
+}
+
+/// A program thread's call of a slot whose compile hit an internal compiler error: no error of
+/// the program, so no edit of it resumes the call, and it never parks (zero hot failures). After
+/// live edits it is a failed hot load (reload.rs recover_compile_ice): recorded, and a fresh
+/// process replaces this one -- now when this is the app's main thread, else at the app's next
+/// event, with its state, while this call waits for it. Otherwise (no edit ran, a recovery
+/// failed or runs already: the replacement's own error) the call fails as the error's panic.
+#[cold]
+#[inline(never)]
+fn compile_ice(up: usize, message: &str) -> u64 {
+    eprintln!("makepad-run: {message} -- makepad run bug, report it");
+    let on_main = os::thread::current() == MAIN_TID.load(Ordering::Relaxed);
+    // (a recovery this process asked for already: its restart is this call's end too)
+    let restarting = crate::reload::recover_compile_ice(message, on_main) || crate::reload::unit_suspect().is_some() && crate::hot_failure::recovering();
+    if restarting {
+        // the app's main thread cannot take the restart at its next event from inside this call:
+        // the process restarts now, with the state the app last left, if any
+        if on_main {
+            if let Err(e) = crate::reload::restart_process(message) { crate::hot_failure::restart_failed(&e); }
+        }
+        // the call ends with this process (or, the restart failed, fails as the error's panic)
+        while crate::hot_failure::recovering() {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    } else if crate::hot_failure::recovering() {
+        // the warm restart's own process failed the same way: the JIT error devhub reports
+        crate::hot_failure::restart_failed(message);
+    }
+    owner::call(owner::Class::Program, || unsafe {
+        let u = &mut *(up as *mut Unit);
+        let (code, relocs) = error_stub(u, message);
+        u.emit_or_redirect(&code, &relocs, "error stub").unwrap_or_else(|e| panic!("{}; and its error stub was not emitted: {}", message, e))
+    })
 }
 
 fn fatal_compile_error(p: &PanicInfo, report: &str) {
