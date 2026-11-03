@@ -25562,7 +25562,8 @@ unsafe fn realtime_mark(up: *mut Unit, root: u64, data: u64, meta: u64, ticket: 
 }
 
 /// Marks slots `roots` as real-time code (what std::relax::realtime does for the slots of a value);
-/// returns the mark's ticket. Owner only.
+/// returns the mark's ticket. Owner only. (The unit tests' mark: std's goes through a value.)
+#[cfg(test)]
 pub(crate) unsafe fn realtime_mark_slots(up: *mut Unit, roots: Vec<u32>) -> u64 {
     let ticket = RT_TICKET.fetch_add(1, Ordering::AcqRel) + 1;
     realtime_reach_queued(up, roots, "mark");
