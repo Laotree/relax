@@ -216,9 +216,10 @@ const LEDGER_KEY: u128 = 0;
 // N01 types and closure arguments with baseline tiers and closure fingerprints; 26: a writable block
 // symbol names which block of its entry it is (its ordinal), so two relocations to different
 // offsets of one block link to one block. 29: image symbol and closure-parent key spans (image.rs
-// skip_*) follow the encoding again; images written before cut keys short. 30: a code entry ends
-// with the trait-object types its code calls through (jit.rs realtime reach).
-const ENTRY_VERSION: u32 = 30;
+// skip_*) follow the encoding again; images written before cut keys short. 30: a code entry ended
+// with the trait-object types its code calls through; 31: it no longer does (jit.rs realtime reach
+// follows the trait objects its roots are passed, not every one its code calls through).
+const ENTRY_VERSION: u32 = 31;
 /// the level of a code entry's code (its tier byte)
 const TIER_O1: u8 = 0;
 const TIER_O3: u8 = 1;
@@ -2056,8 +2057,8 @@ impl Cache {
 
     /// What real-time threads of the program rooted at crate `root` reached in earlier runs (jit.rs
     /// realtime), compiled ahead when the program marks its real-time code: the key encodings of
-    /// the slots (resolve them with slot_for_bytes_unit) and the trait-object types their code
-    /// calls through (a type that no longer decodes is left out).
+    /// the slots (resolve them with slot_for_bytes_unit) and the trait-object types whose vtables
+    /// it followed (a type that no longer decodes is left out).
     pub fn rt_set_load(&mut self, u: &Unit, root: u32) -> (Vec<Vec<u8>>, Vec<TyId>) {
         let Ok(b) = std::fs::read(self.rt_set_path(u, root)) else { return Default::default() };
         let mut d = D { b: &b, p: 0 };
@@ -3392,18 +3393,6 @@ impl Cache {
             if self.enc_file(u, f, &mut e).is_none() {
                 e.str("");
                 e.u128(0);
-            }
-        }
-        // the trait-object types its code calls through (Unit::note_dyn_calls): real-time reach
-        // follows their vtables when it walks code linked from here
-        let dyns = u.dyn_calls_of(id);
-        e.u32(dyns.len() as u32);
-        let mut crates = Vec::new();
-        for t in dyns {
-            if self.enc_ty(u, t, &mut e, &mut crates, 0).is_none() {
-                self.stats.unencodable += 1;
-                self.why("dyn call type");
-                return None;
             }
         }
         Some(e.0)
@@ -8384,12 +8373,6 @@ impl Linker {
             files.push(self.cache().dec_file(u, &mut d).unwrap_or(u32::MAX));
         }
         let pc = raw.into_iter().map(|(o, p)| (o, (*files.get(relax_backend::rir::pos_file(p) as usize).unwrap_or(&u32::MAX) as u64) << 32 | (p & 0xffff_ffff) | (p & !relax_backend::rir::pos_plain(u64::MAX)))).collect();
-        let nd = d.u32()? as usize;
-        let mut dyns = Vec::with_capacity(nd.min(16));
-        for _ in 0..nd {
-            dyns.push(self.cache().dec_ty(u, &mut d, 0)?);
-        }
-        u.note_dyn_calls(id, dyns);
         self.cache().last_callees = callees;
         self.cache().last_thunks = thunks;
         self.cache().last_data = data;

@@ -2914,6 +2914,15 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             carry_gandalf(u, from, &visible_crates, if full_inputs { None } else { Some(&files) });
         }
         trace_sub("publish_collected");
+        // the added items' signatures, types and impl tables: before the layout edits, whose
+        // checks of an added field's type (its Default, its drop) ask about the items the edit
+        // adds (a field of a struct a new module declares: its ADT was not collected yet, an ICE)
+        trace_count("added_defs", added_defs.len());
+        if !added_defs.is_empty() {
+            let e = u.tcx.collect_added_in(&u.prog, &added_defs, false, scope.as_deref());
+            add_errs.extend(e);
+        }
+        trace_sub("collect_added");
         // struct field-list edits (M10): reconciled with the running layout, or the restart rung
 
         for &d in &layout_defs {
@@ -2981,13 +2990,6 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             }
         }
         trace_sub("layout");
-        // the added items' signatures, types and impl tables
-        trace_count("added_defs", added_defs.len());
-        if !added_defs.is_empty() {
-            let e = u.tcx.collect_added_in(&u.prog, &added_defs, false, scope.as_deref());
-            add_errs.extend(e);
-        }
-        trace_sub("collect_added");
         unsafe {
             u.prog.reclaim_caches();
         }
