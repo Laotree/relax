@@ -2392,7 +2392,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                         continue;
                     }
                     named += 1;
-                    let uses = crate::borrowck::identity_args(&u.tcx, &u.prog, *fd).map(|a| crate::typeck::instantiate_body(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, *fd, &a).field_uses).unwrap_or_default();
+                    // typeck resolves a field use (rustc: no field is reached through a generic);
+                    // its body as typeck left it, never instantiated: a generic fn at its own
+                    // parameters has no codegen answer (`<impl IntoIterator>::IntoIter`: NoSolution)
+                    let uses = u.tcx.typeck(&u.prog, *fd).field_uses.clone();
                     if uses.iter().any(|(ud, k)| *ud == d && gone.contains(k)) {
                         body_defs.push(*fd);
                         field_deps += 1;

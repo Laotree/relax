@@ -357,3 +357,32 @@ fn guards_bound_out_of_tuples_drop_where_rustc_drops_them() {
     assert_eq!(&first[..n], rustc, "first tier");
     assert_eq!(&o3[..m], rustc, "O3");
 }
+
+#[path = "../../base/tests/support/vfs_store.rs"]
+mod vfs_store;
+
+/// Sandbox game_store (asset client cache.rs fsync_dir: `File::open(dir)?.sync_all()`): a folder
+/// opens for reading as it does on the disk (open(2) of a directory O_RDONLY succeeds; its reads
+/// fail EISDIR), so a virtual one (an overlay run's sources) is fsync'd, not refused EISDIR.
+#[test]
+fn a_virtual_folder_opens_for_reading_as_a_disk_folder_does() {
+    isolated_test!(a_virtual_folder_opens_for_reading_as_a_disk_folder_does);
+    let fixture = vfs_store::Fixture::new(&[("app/cache/a.bin", b"a")]);
+    let root = "/relax-values-vfs-dir/vfs/m";
+    crate::vfs::mount(root, fixture.store.clone(), &fixture.commit).unwrap();
+    let src = format!(r#"
+pub fn values(out: &mut [usize; 5]) {{
+    let dir = std::fs::File::open("{root}/app/cache");
+    out[0] = dir.is_ok() as usize;
+    if let Ok(mut d) = dir {{
+        out[1] = d.sync_all().is_ok() as usize;
+        out[2] = d.metadata().map_or(0, |m| m.is_dir() as usize);
+        let mut buf = [0u8; 4];
+        out[3] = matches!(std::io::Read::read(&mut d, &mut buf), Err(e) if e.kind() == std::io::ErrorKind::IsADirectory) as usize;
+    }}
+    // a write still needs the edits folder
+    out[4] = std::fs::OpenOptions::new().write(true).open("{root}/app/cache").is_err() as usize;
+}}
+"#);
+    assert_eq!(values::<5>(&src, "vfs_dir"), [1, 1, 1, 1, 1]);
+}
