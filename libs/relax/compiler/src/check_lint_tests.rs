@@ -38,6 +38,12 @@ fn check_package(lib: &str, bins: &[&str]) {
 
 /// `check_package`'s check, returning its exit code.
 fn check_package_code(lib: &str, bins: &[&str]) -> i32 {
+    check_code(lib, bins, false)
+}
+
+/// The check of `lib` and `bins`; `harness`: the library is built with `--test` (cfg(test),
+/// libtest's generated main), as `makepad check --test <name>` builds a test target.
+fn check_code(lib: &str, bins: &[&str], harness: bool) -> i32 {
     crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
     std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     // `makepad check`'s session (run.rs): constants go through the check-mode interpreter first
@@ -55,7 +61,10 @@ fn check_package_code(lib: &str, bins: &[&str]) -> i32 {
     let (core, std_deps) = crate::load_std_crates(&sess, &mut prog).unwrap();
     let mut files = vec![dir.join("lib.rs")];
     std::fs::write(&files[0], lib).unwrap();
-    let root = prog.load_crate_deferred("pkg", files[0].to_str().unwrap(), 2021, crate::program_cfg(&sess, &[]), std_deps.clone()).unwrap();
+    let mut cfg = crate::program_cfg(&sess, &[]);
+    if harness { cfg.set.push("test".to_string()); }
+    let root = prog.load_crate_deferred("pkg", files[0].to_str().unwrap(), 2021, cfg, std_deps.clone()).unwrap();
+    prog.crates[root as usize].harness = harness;
     let mut crates = vec![root];
     for (i, src) in bins.iter().enumerate() {
         let path = dir.join(format!("bin{i}.rs"));
@@ -79,6 +88,26 @@ fn check_package_code(lib: &str, bins: &[&str]) -> i32 {
     }
     std::fs::remove_dir(&dir).unwrap();
     code
+}
+
+/// `makepad check --test <name>` had reported every test of a test target and every helper they
+/// call as never used: libtest's generated main names each `#[test]` fn (rustc_builtin_macros
+/// test_harness.rs), so they are live; a helper no test reaches still is dead.
+#[test]
+fn a_test_targets_test_fns_are_used() {
+    let Some(warnings) = warnings_in_child("check_lint_tests::a_test_targets_test_fns_are_used") else {
+        return assert_eq!(check_code(r#"
+            fn helper() -> u32 { 2 }
+            fn unused() {}
+            #[test]
+            fn adds() { assert_eq!(helper(), 2); }
+            mod nested {
+                #[test]
+                fn runs() {}
+            }
+        "#, &[], true), 0);
+    };
+    assert_eq!(warnings, ["function `unused` is never used [dead_code]"]);
 }
 
 /// WARNZERO class 6 (994 warnings in 24 packages: apps/flow's makepad-flow-server.rs:96, ai-llm's
