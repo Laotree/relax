@@ -8322,6 +8322,10 @@ pub fn set_sroa_nocapture(q: Option<Box<dyn Fn(&Callee, usize) -> bool>>) {
 /// (`setbe; movzx; setbe; movzx; and; test; je`, `cset; cset; and; cbz`). The compares have no
 /// effects, so evaluating `y` only when `x` does not decide is the same branch. Version guards
 /// (`lo <= hi & hi <= len`) and selects folded into `&` of conditions take this shape.
+/// One of the two may be a flag computed elsewhere (a compare's result, defined once: a signed
+/// division's `b == -1`, hoisted out of a loop, `&` the `a == MIN` of its block): the branch
+/// tests the flag first and the block's compare moves to the new block, which runs only when
+/// the flag does not decide (`test; jne` instead of `cmp; sete; movzx; and; test; jne`).
 /// MAKEPAD_RUN_OPT=-splitbr off. Returns whether anything changed.
 pub fn split_branch_conditions(options: &relax_session::Options, f: &mut Func) -> bool {
     if crate::stats::opt_off(options, "-splitbr") {
@@ -8346,6 +8350,15 @@ pub fn split_branch_conditions(options: &relax_session::Options, f: &mut Func) -
     }
     let once = |v: VReg| nuse[v.0 as usize] == 1 && ndef[v.0 as usize] == 1;
     let is_cmp = |i: &Inst, v: VReg| matches!(*i, Inst::ICmp(_, _, d, _, _) | Inst::ICmpI(_, _, d, _, _) | Inst::FCmp(_, _, d, _, _) if d == v);
+    // a flag: the result of a compare, its only definition (0 or 1 wherever it is read)
+    let mut flag = vec![false; nv];
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::ICmp(_, _, d, _, _) | Inst::ICmpI(_, _, d, _, _) | Inst::FCmp(_, _, d, _, _) = *i {
+                flag[d.0 as usize] = ndef[d.0 as usize] == 1;
+            }
+        }
+    }
     let mut changed = false;
     for bi in 0..f.blocks.len() {
         let Term::Branch(c, t, e) = f.blocks[bi].term else { continue };
@@ -8359,10 +8372,40 @@ pub fn split_branch_conditions(options: &relax_session::Options, f: &mut Func) -
             Inst::IBin(IOp::Or, _, _, x, y) => (true, x, y),
             _ => continue,
         };
-        if x == y || !once(x) || !once(y) {
+        if x == y {
             continue;
         }
-        let (Some(px), Some(py)) = (b.insts[..k].iter().position(|i| is_cmp(i, x)), b.insts[..k].iter().position(|i| is_cmp(i, y))) else { continue };
+        let (px, py) = (b.insts[..k].iter().position(|i| is_cmp(i, x)), b.insts[..k].iter().position(|i| is_cmp(i, y)));
+        // one compare of this block read only here, the other operand a flag from elsewhere (or
+        // read elsewhere too): the flag is tested as it is, the compare moves to the new block
+        let lone = match (px.filter(|_| once(x)), py.filter(|_| once(y))) {
+            (Some(_), Some(_)) => None,
+            (None, Some(q)) if flag[x.0 as usize] => Some((x, y, q)),
+            (Some(q), None) if flag[y.0 as usize] => Some((y, x, q)),
+            _ => continue,
+        };
+        if let Some((fl, y, py)) = lone {
+            let mut ops: Vec<VReg> = Vec::new();
+            for_uses(&b.insts[py], |u| ops.push(u));
+            if b.insts[py + 1..].iter().any(|i| { let mut w = false; for_defs(i, |d| w |= ops.contains(&d)); w }) {
+                continue;
+            }
+            let ycmp = b.insts[py].clone();
+            let ypos = b.pos[py];
+            let (term_pos, count) = (b.term_pos, b.count);
+            let nb = f.blocks.len() as u32;
+            let b = &mut f.blocks[bi];
+            b.insts.remove(k);
+            b.pos.remove(k);
+            b.insts.remove(py);
+            b.pos.remove(py);
+            // `fl & y`: fl false decides (e); `fl | y`: fl true decides (t)
+            b.term = if or { Term::Branch(fl, t, nb) } else { Term::Branch(fl, nb, e) };
+            f.blocks.push(Block { insts: vec![ycmp], pos: vec![ypos], term: Term::Branch(y, t, e), term_pos, count });
+            changed = true;
+            continue;
+        }
+        let (Some(px), Some(py)) = (px, py) else { continue };
         // y's compare moves to the new block: its operands must keep their values from py to
         // the end of the block (and x's compare must not read y)
         let mut ops: Vec<VReg> = Vec::new();
