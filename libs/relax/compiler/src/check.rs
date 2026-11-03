@@ -950,7 +950,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     if compile { unsafe {
         let _job = jit::compile_job();
         let mut d = crate::owner::call(crate::owner::Class::Program, || jit::settle_drop(up));
-        d.release_rir();
+        d.release();
     } crate::memstat::trim(); }
     if crate::memstat::enabled() {
         crate::memstat::print("check: type/borrow checked", &crate::memreport::unit_sizes(unsafe { &*up }));
@@ -1160,7 +1160,7 @@ unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u3
                         && crate::memstat::resident() as u64 > settled_rss.load(Ordering::Relaxed) + SETTLE_GROWTH {
                         let _job = jit::compile_job();
                         let mut d = crate::owner::call(crate::owner::Class::Program, || jit::settle_drop(up));
-                        d.release_rir();
+                        d.release();
                         crate::memstat::trim();
                         settled_rss.store(crate::memstat::resident() as u64, Ordering::Relaxed);
                     }

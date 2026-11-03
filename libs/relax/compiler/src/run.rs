@@ -2955,15 +2955,19 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 // subsequent startup callers rebuild them. After present, retry shared
                 // reclamation as compilation progresses, without a global quiet gate.
                 // at most every SETTLE_DROP_EVERY_NS (a request goes at once): each pass scans every
-                // slot on the owner, and an O3 tail bumped the generation with every install
+                // slot, and an O3 tail bumped the generation with every install. The pass runs in
+                // steps, each its own owner request (jit::SettleSweep): the owner serves a waiting
+                // main-thread request between two of them
                 let now_ns = jit::wall_ns();
                 let settled_d = if (FIRST_PRESENT_WALL.load(Ordering::Acquire) != 0 || reclaim_requested)
                     && (reclaimed != Some(n) && now_ns.saturating_sub(last_drop_ns) >= SETTLE_DROP_EVERY_NS || reclaim_requested) {
                     last_drop_ns = now_ns;
-                    Some(crate::owner::publish(|| unsafe { jit::settle_drop(RUN_UNIT) }))
+                    let mut sweep = jit::SettleSweep::default();
+                    while !crate::owner::call(crate::owner::Class::Program, || unsafe { sweep.step(RUN_UNIT, jit::SETTLE_STEP) }) {}
+                    Some(sweep.drops)
                 } else { None };
                 if let Some(mut d) = settled_d {
-                    d.release_rir();
+                    d.release();
                     drops.fns += d.fns;
                     drops.rir += d.rir;
                     drops.typeck += d.typeck;

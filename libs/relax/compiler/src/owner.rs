@@ -131,6 +131,9 @@ struct Req {
     /// main-thread request accounting (0: not a main-thread request): wall ns at the push, and at
     /// the owner's completion
     t_push: u64,
+    /// a main-thread program or publish request after the first present: wall ns at the push (0:
+    /// another): what it queued behind is charged to that request's site (`owner` answer)
+    t_main: u64,
     t_serve: AtomicU64,
     t_done: AtomicU64,
     /// the requester sleeps on these until Done (no thread handle: a thread's TLS destructors
@@ -203,12 +206,12 @@ pub struct SiteAcc {
     site: std::sync::atomic::AtomicPtr<std::panic::Location<'static>>,
     class: AtomicU8,
     /// [requests, owner ns, O1 optimisation ns on the owner, main's queue ns behind it, main waits behind it,
-    /// services of 1 ms or more, the longest service ns]
-    pub acc: [AtomicU64; 7],
+    /// services of 1 ms or more, the longest service ns, then the services by length (HOLD_EDGES_US)]
+    pub acc: [AtomicU64; SITE_FIELDS],
 }
 
 const SITES_N: usize = 96;
-pub static SITES: [SiteAcc; SITES_N] = [const { SiteAcc { site: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), class: AtomicU8::new(0), acc: [const { AtomicU64::new(0) }; 7] } }; SITES_N];
+pub static SITES: [SiteAcc; SITES_N] = [const { SiteAcc { site: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), class: AtomicU8::new(0), acc: [const { AtomicU64::new(0) }; SITE_FIELDS] } }; SITES_N];
 pub const SITE_REQS: usize = 0;
 pub const SITE_NS: usize = 1;
 pub const SITE_OPT_NS: usize = 2;
@@ -216,6 +219,35 @@ pub const SITE_BEHIND_NS: usize = 3;
 pub const SITE_BEHIND_N: usize = 4;
 pub const SITE_LONG_N: usize = 5;
 pub const SITE_MAX_NS: usize = 6;
+/// The hold histogram's bucket bounds (µs; the last bucket is open): how long one service of a site
+/// held the owner (`makepad inspect <pid> owner`)
+pub const HOLD_EDGES_US: [u64; 8] = [100, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000];
+pub const HOLD_BUCKETS: usize = HOLD_EDGES_US.len() + 1;
+/// the first of the hold histogram's fields
+pub const SITE_HIST: usize = 7;
+const SITE_FIELDS: usize = SITE_HIST + HOLD_BUCKETS;
+
+/// The hold histogram's bucket of a service of `ns`.
+pub fn hold_bucket(ns: u64) -> usize {
+    HOLD_EDGES_US.iter().position(|&us| ns < us * 1000).unwrap_or(HOLD_EDGES_US.len())
+}
+
+/// The site table as (site, class, counters) rows, for the `owner` answer (atomics only).
+pub fn site_rows() -> Vec<(*const std::panic::Location<'static>, u8, [u64; SITE_FIELDS])> {
+    let mut out = Vec::new();
+    for row in SITES.iter() {
+        let n = row.acc[SITE_REQS].load(Ordering::Relaxed);
+        if n == 0 {
+            continue;
+        }
+        let mut a = [0u64; SITE_FIELDS];
+        for (i, v) in row.acc.iter().enumerate() {
+            a[i] = v.load(Ordering::Relaxed);
+        }
+        out.push((row.site.load(Ordering::Acquire) as *const _, row.class.load(Ordering::Relaxed), a));
+    }
+    out
+}
 /// main's queue delay (after the first present) by what the owner served when it asked: per class,
 /// and the owner idle (last row): [waits, ns]
 pub static MAIN_BEHIND: [[AtomicU64; 2]; CLASSES + 1] = [const { [const { AtomicU64::new(0) }; 2] }; CLASSES + 1];
@@ -747,9 +779,10 @@ pub fn for_main() -> bool {
     main != 0 && if is_owner() { serving().1 == main } else { me() == main }
 }
 
-/// The main thread waits for a request now.
+/// The main thread waits for a request now: a program request, or the publish that finishes its
+/// lazy compile (long work on the owner stops for either).
 pub fn main_waiting() -> bool {
-    MAIN_QUEUED.load(Ordering::Relaxed) > 0
+    MAIN_QUEUED.load(Ordering::Relaxed) + MAIN_PUBLISH.load(Ordering::Relaxed) > 0
 }
 
 /// What the owner serves now (diagnostics): "idle", or the class and its requester's name.
@@ -873,7 +906,8 @@ fn request<R>(site: &'static std::panic::Location<'static>, class: Class, deadli
     // closure only between this push and the Done store
     let run: *mut (dyn FnMut() + 'static) = unsafe { std::mem::transmute(run) };
     let on_main = crate::jit::MAIN_TID.load(Ordering::Relaxed) == me();
-    let main_wait = on_main && class == Class::Program && crate::jit::FIRST_PRESENT.load(Ordering::Acquire) && !crate::jit::QUIT_SEEN.load(Ordering::Relaxed);
+    let main_after = on_main && matches!(class, Class::Program | Class::Publish) && crate::jit::FIRST_PRESENT.load(Ordering::Acquire) && !crate::jit::QUIT_SEEN.load(Ordering::Relaxed);
+    let main_wait = main_after && class == Class::Program;
     // a thread waiting for its work on the owner is not a compile job meanwhile (an allocator
     // swap or fork waits for the jobs running; its work runs on the owner, which serves the
     // pauser): pure jobs (Job class) are, they hold front guards and queries
@@ -890,6 +924,7 @@ fn request<R>(site: &'static std::panic::Location<'static>, class: Class, deadli
         panic: Cell::new(None),
         waited: true,
         t_push: if class == Class::Program && on_main { crate::jit::wall_ns().max(1) } else { 0 },
+        t_main: if main_after { crate::jit::wall_ns().max(1) } else { 0 },
         t_serve: AtomicU64::new(0),
         t_done: AtomicU64::new(0),
         done: Mutex::new(false),
@@ -926,18 +961,22 @@ fn request<R>(site: &'static std::panic::Location<'static>, class: Class, deadli
         if served != 0 {
             let q = served.saturating_sub(req.t_push);
             crate::jit::main_rec_behind(q, behind, behind_from, behind_site);
-            if main_wait {
-                let c = if behind == u8::MAX { CLASSES } else { (behind as usize).min(CLASSES - 1) };
-                MAIN_BEHIND[c][0].fetch_add(1, Ordering::Relaxed);
-                MAIN_BEHIND[c][1].fetch_add(q, Ordering::Relaxed);
-                if let Some(site) = behind_site {
-                    let row = site_acc(site, CLASS_OF[c.min(CLASSES - 1)]);
-                    row.acc[SITE_BEHIND_N].fetch_add(1, Ordering::Relaxed);
-                    row.acc[SITE_BEHIND_NS].fetch_add(q, Ordering::Relaxed);
-                }
-            }
         }
         crate::postframe::main_owner_wait(req.t_push, w);
+    }
+    // what main's program or publish request queued behind after the present: the class, and the
+    // site of the request the owner was serving when it asked
+    let served = req.t_serve.load(Ordering::Relaxed);
+    if req.t_main != 0 && served != 0 {
+        let q = served.saturating_sub(req.t_main);
+        let c = if behind == u8::MAX { CLASSES } else { (behind as usize).min(CLASSES - 1) };
+        MAIN_BEHIND[c][0].fetch_add(1, Ordering::Relaxed);
+        MAIN_BEHIND[c][1].fetch_add(q, Ordering::Relaxed);
+        if let Some(site) = behind_site {
+            let row = site_acc(site, CLASS_OF[c.min(CLASSES - 1)]);
+            row.acc[SITE_BEHIND_N].fetch_add(1, Ordering::Relaxed);
+            row.acc[SITE_BEHIND_NS].fetch_add(q, Ordering::Relaxed);
+        }
     }
     // makepad inspect: a real-time thread (an audio callback) that waited for the compiler
     if crate::inspect::events::watched() {
@@ -1011,6 +1050,7 @@ pub fn post_queued(class: Class, f: impl FnOnce() + Send + 'static) {
         panic: Cell::new(None),
         waited: false,
         t_push: 0,
+        t_main: 0,
         t_serve: AtomicU64::new(0),
         t_done: AtomicU64::new(0),
         done: Mutex::new(false),
@@ -1188,6 +1228,8 @@ fn serve(r: usize) {
     let t0 = crate::jit::wall_ns();
     if req.t_push != 0 {
         MAIN_ACC[2].fetch_add(t0.saturating_sub(req.t_push), Ordering::Relaxed);
+    }
+    if req.t_push != 0 || req.t_main != 0 {
         req.t_serve.store(t0.max(1), Ordering::Relaxed);
     }
     let prev_ctx = unsafe { crate::query::swap_context(req.ctx) };
@@ -1245,6 +1287,7 @@ fn serve(r: usize) {
         row.acc[SITE_LONG_N].fetch_add(1, Ordering::Relaxed);
     }
     row.acc[SITE_MAX_NS].fetch_max(t1.saturating_sub(t0), Ordering::Relaxed);
+    row.acc[SITE_HIST + hold_bucket(t1.saturating_sub(t0))].fetch_add(1, Ordering::Relaxed);
     note_served(req.class, req.from, req.site, t0, t1);
     crate::postframe::owner_served(req.class as usize, req.site, req.from, t0, t1, FOREGROUND.load(Ordering::Relaxed));
     // the process is ending on another thread: this request is never answered (its requester
