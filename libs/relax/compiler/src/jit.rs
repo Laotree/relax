@@ -16177,8 +16177,12 @@ fn ran_in_twin_code(u: &Unit, c: u32) -> bool {
 
 /// A background replacement (O3 build, O2 worker build) about to be installed calls, through
 /// `relocs`, slots that have no code yet but ran inside the code it replaces (inlined there, or in
-/// twin code), or that an O3 build kept as calls because their bodies were not there yet
-/// (`absent`: inline candidates of a warm session, whose code came from the disk cache). SPEC-V
+/// twin code), or in the session that made the startup image (`ran_before`: the image's baseline
+/// code inlined tiny drop glue and core fns, and its installs link no inlining records below O3 --
+/// the SETTLE-TIER sweep's ~1300 O2 builds over running baseline slots of a warm Fab plate made
+/// ~200 lazy compiles of them on the program's threads, each restarting the JIT's quiet), or that
+/// an O3 build kept as calls because their bodies were not there yet (`absent`: inline candidates
+/// of a warm session, whose code came from the disk cache). SPEC-V
 /// bases whose twins have code borrow it (borrow_twin); the others link their stored entry, or get
 /// an O2 build here, on this worker, before the swap -- and so do theirs, up to PREBUILD_MAX -- so
 /// the program's first calls into the new code never compile on its threads (a warm session's
@@ -16205,9 +16209,10 @@ unsafe fn prebuild_callees(up: *mut Unit, relocs: &[relax_backend::rir::RelocAt]
                 (c as usize) < u.fns.len() && !u.fns[c as usize].compiled && u.fns[c as usize].build_err.is_none()
                     && matches!(u.fns[c as usize].key, FnKey::Inst(..) | FnKey::Closure(..) | FnKey::Glue(..))
                     && (!u.fns[c as usize].twin_ran.load(Ordering::Relaxed) || u.borrow_twin(c).is_none())
-                    // ran inside other code (inlined there, or in twin code), so the replacement's
-                    // first calls reach it: its stored entry is linked now, else it is built below
-                    && (ran_in_twin_code(u, c) || !u.fns[c as usize].history().inlined_into.is_empty() || absent.contains(&c))
+                    // ran inside other code (inlined there, in twin code, or in the startup
+                    // image's session), so the replacement's first calls reach it: its stored
+                    // entry is linked now, else it is built below
+                    && (u.fns[c as usize].ran_before.load(Ordering::Relaxed) || ran_in_twin_code(u, c) || !u.fns[c as usize].history().inlined_into.is_empty() || absent.contains(&c))
             }).collect()
         });
         // the stored entry's link, one take per slot (rule I-PUB): a link may need what a publish
