@@ -526,6 +526,9 @@ struct State {
     /// A large block handed out from the warm large list: its pages hold old bytes, so
     /// `alloc_zeroed` writes the zeros the pool's decommitted runs would have given.
     dirty: bool,
+    /// The live blocks this chunk had when, detached, it last gave its whole free granules back
+    /// (`trim_detached`; usize::MAX: not since it was last handed back).
+    trim_live: usize,
 }
 
 // A buddy free-chunk list supports both single chunks and contiguous large mappings.
@@ -1014,6 +1017,7 @@ impl Arena {
         s.bump = o.bump.load(Ordering::Relaxed);
         h.live.store(o.live.load(Ordering::Relaxed), Ordering::Relaxed);
         s.attached = false;
+        s.trim_live = usize::MAX;
         if o.live.load(Ordering::Relaxed) == 0 {
             self.release_empty(index, s);
         } else if s.free != 0 || s.bump + s.stride <= CHUNK {
@@ -1086,6 +1090,22 @@ impl Arena {
         let chunk = self.base.load(Ordering::Relaxed) + index * CHUNK;
         if let Some(head) = self.drop_free_granules(index, chunk, o.stride, bump, o.free) {
             o.free = head;
+        }
+    }
+    /// A detached chunk `index` of a program heap (its lock held, `live` blocks) that a free left
+    /// sparse, its live blocks filling under a quarter of what it carved, gives its whole free
+    /// granules back at once, and again each time its live blocks halve: a chunk emptied by a
+    /// burst of frees is walked a few times, not at every free. They went back only on a trim,
+    /// which a program at rest gets only when something compiles (Fab kept them through hours of
+    /// edits).
+    unsafe fn trim_detached(&self, index: usize, s: &mut State, live: usize) {
+        if s.stride == 0 || s.committed != CHUNK || s.bump < OWNED_TRIM_MIN || live * s.stride * 4 >= s.bump || live * 2 > s.trim_live {
+            return;
+        }
+        s.trim_live = live;
+        let chunk = self.base.load(Ordering::Relaxed) + index * CHUNK;
+        if let Some(head) = self.drop_free_granules(index, chunk, s.stride, s.bump, s.free) {
+            s.free = head;
         }
     }
     /// The monitor (`densify`, chunk `index` attached, its lock held) settles a current chunk whose
@@ -1937,8 +1957,16 @@ impl Arena {
             }
             { self.alloc_failed(5, l); return null_mut(); }
         }
-        // a warm large run keeps what it had committed beyond this block (resize_in_place trims it)
-        let committed = committed.max(kept);
+        // A warm large run gives back what it had committed beyond this block. Kept, it stayed
+        // with a block that is never resized (an `Arc<[T]>` made from a Vec) for the block's whole
+        // life: Fab's program heap held 5.1 GB committed for 4.3 GB of large blocks.
+        let committed = if kept > committed && os::decommit((address + committed) as *mut u8, kept - committed, COMPILER) {
+            self.committed.fetch_sub(kept - committed, Ordering::Relaxed);
+            self.chunks.fetch_sub((kept + CHUNK - 1) / CHUNK - (committed + CHUNK - 1) / CHUNK, Ordering::Relaxed);
+            committed
+        } else {
+            committed.max(kept)
+        };
         let h = &self.headers[index];
         let generation;
         {
@@ -1957,6 +1985,7 @@ impl Arena {
                 order,
                 bytes: 0,
                 dirty: warm_large.is_some(),
+                trim_live: usize::MAX,
             };
             h.live.store(1, Ordering::Relaxed);
             h.old.store(false, Ordering::Relaxed);
@@ -2156,7 +2185,8 @@ impl Arena {
         } else {
             s.bytes -= l.size();
         }
-        if h.live.fetch_sub(1, Ordering::Relaxed) != 1 {
+        let live = h.live.fetch_sub(1, Ordering::Relaxed) - 1;
+        if live != 0 {
             *(p as *mut usize) = s.free;
             s.free = p as usize;
             if COMPILER
@@ -2165,6 +2195,9 @@ impl Arena {
                 && !h.in_part.load(Ordering::Relaxed)
             {
                 self.partial_push(index, s.class);
+            }
+            if COMPILER && self.dynamic && !s.attached {
+                self.trim_detached(index, &mut s, live);
             }
             return;
         }
