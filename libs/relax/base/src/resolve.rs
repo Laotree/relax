@@ -376,7 +376,7 @@ pub struct Resolver {
 
 fn read_toml(path: &str) -> Result<TomlTable, String> {
     let text = crate::vfs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?;
-    parse_toml(&text).map(|d| d.root).map_err(|e| format!("{}: {}", path, e))
+    parse_toml(&text).map(|d| d.root).map_err(|e| e.in_file(path))
 }
 
 impl Workspace {
@@ -1059,17 +1059,22 @@ impl Resolver {
     }
 
     /// The workspace member named `package` (members, and path dependencies under the root).
+    /// A manifest that does not load is passed over while another may be the package; when none
+    /// is, its error is the answer (a duplicate key in the package's own manifest read as "not a
+    /// member"), the ones whose text names the package first.
     fn find_member(&mut self, package: &str) -> Result<usize, String> {
         let mut queue: Vec<String> = self.ws.member_dirs();
+        // manifests that did not load: (names the package, error), in the order met
+        let mut broken: Vec<(bool, String)> = Vec::new();
         // fast path: a member whose manifest names the package (parsed only when the text matches)
         let needle = format!("\"{}\"", package);
         for d in &queue {
             let path = format!("{}/Cargo.toml", d);
             if crate::vfs::read_to_string(&path).is_ok_and(|t| t.contains(&needle)) {
-                if let Ok(i) = self.load(d, Source::Path) {
-                    if self.manifests[i].name == package {
-                        return Ok(i);
-                    }
+                match self.load(d, Source::Path) {
+                    Ok(i) if self.manifests[i].name == package => return Ok(i),
+                    Ok(_) => {}
+                    Err(e) => broken.push((true, e)),
                 }
             }
         }
@@ -1079,7 +1084,15 @@ impl Resolver {
             if !seen.insert(d.clone()) || !crate::vfs::is_file(format!("{}/Cargo.toml", d)) {
                 continue;
             }
-            let Ok(i) = self.load(&d, Source::Path) else { continue };
+            let i = match self.load(&d, Source::Path) {
+                Ok(i) => i,
+                Err(e) => {
+                    if !broken.iter().any(|b| b.1 == e) {
+                        broken.push((false, e));
+                    }
+                    continue;
+                }
+            };
             if self.manifests[i].name == package {
                 return Ok(i);
             }
@@ -1090,6 +1103,21 @@ impl Resolver {
                     }
                 }
             }
+        }
+        if !broken.is_empty() {
+            broken.sort_by_key(|b| !b.0);
+            let errs: Vec<&str> = broken.iter().map(|b| b.1.as_str()).collect();
+            return Err(format!(
+                "{}\n(package `{}` was not found in the workspace at {}: {} see above)",
+                errs.join("\n"),
+                package,
+                self.ws.root,
+                if errs.len() == 1 {
+                    "a member's manifest does not load,".to_string()
+                } else {
+                    format!("{} members' manifests do not load,", errs.len())
+                }
+            ));
         }
         Err(format!(
             "package `{}` is not a member of the workspace at {}: no member or path dependency there has that name (check the name; a private repository's package needs that repository checked out under apps/, e.g. apps/commercial)",
@@ -2433,6 +2461,28 @@ required-features = ["b", "manual"]
         let _ = std::fs::write(format!("{root}/vendor/shares/Cargo.toml"), "[package]\nname = \"shares\"\nversion = \"6.0.1\"\nedition = \"2021\"\n[features]\ndefault = [\"nope/alloc\"]\n");
         let e = unit_graph(sess, &root, "app", &[]).err().unwrap();
         assert!(e.contains("names no dependency"), "{e}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A member manifest that does not parse is the answer when no member is the package: its
+    /// file, line, column and message, not "not a member of the workspace". Another broken member
+    /// does not hide a package that loads.
+    #[test]
+    fn a_member_manifest_that_does_not_parse_is_reported() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let root = tree("broken-member", &[
+            ("Cargo.toml", "[workspace]\nmembers = [\"slice\", \"other\"]\n"),
+            ("slice/Cargo.toml", "[package]\nname = \"fab-slice\"\nversion = \"0.1.0\"\n\n[dev-dependencies]\nsdf = { path = \"../other\" }\nsdf = { path = \"../other\" }\n"),
+            ("slice/src/lib.rs", ""),
+            ("other/Cargo.toml", "[package]\nname = \"other\"\nversion = \"0.1.0\"\n"),
+            ("other/src/lib.rs", ""),
+        ]);
+        let mut r = Resolver::new(sess, &root).unwrap();
+        let e = r.find_member("fab-slice").err().unwrap();
+        let path = format!("{}/slice/Cargo.toml", normalize(&root));
+        assert!(e.starts_with(&format!("{path}:7:1: duplicate key `sdf`\n")), "{e}");
+        assert!(!e.contains("not a member"), "{e}");
+        assert!(r.find_member("other").is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
 
