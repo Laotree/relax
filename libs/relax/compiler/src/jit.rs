@@ -280,6 +280,35 @@ pub struct Site {
 const THUNK_SIZE: usize = x64::THUNK_SIZE;
 const STUB_SIZE: usize = x64::STUB_SIZE;
 
+/// The owner fns of the interned closure types (an async fn's coroutine is one), by the closure's
+/// file version. It takes in the types interned since its last look, as the type interner only
+/// appends. Owners stay listed once seen, also across a settle rebuild's new interner.
+#[derive(Default)]
+pub(crate) struct ClosureOwners {
+    by_file: HashMap<u32, std::collections::HashSet<DefId>>,
+    seen: usize,
+}
+impl ClosureOwners {
+    /// The owners of the closure types of `files` that exist now.
+    fn of_files(&mut self, tcx: &Tcx, prog: &Program, files: &[u32]) -> Vec<DefId> {
+        let end = tcx.tys.len();
+        for i in self.seen..end {
+            let TyKind::Closure(file, _, a) = tcx.tys.kind(TyId(i as u32)) else { continue };
+            let TyKind::FnDef(d, ..) = tcx.tys.kind(a.parent_args) else { continue };
+            let mut d = *d;
+            while prog.def(d).kind == DefKind::Closure { d = prog.def(d).parent; }
+            self.by_file.entry(*file).or_default().insert(d);
+        }
+        self.seen = end;
+        files.iter().flat_map(|f| self.by_file.get(f).into_iter().flatten().copied()).collect()
+    }
+
+    /// The unit's type interner was replaced (settle rebuild): its types are looked at from the first.
+    pub(crate) fn interner_replaced(&mut self) {
+        self.seen = 0;
+    }
+}
+
 /// Reverse slot identities, maintained at slot creation (including lazy/background slots).
 /// Keys never change when their installed code changes; old closure versions stay indexed.
 #[derive(Default)]
@@ -313,7 +342,7 @@ pub(crate) mod settle_rebuild;
 /// syms, start_order, vtables, locations, lit_data, provided*, slots, missing_stubs, patch_log,
 /// forwards, tier-1 state, stats, errors and the scalars/addresses. COMPILER arena: prog, tcx, lay, bodies,
 /// old_bodies, coro_*, spec_cached, the unwind/unpin/cycle/core-path memos, const_failed, cache,
-/// front, ctfe_fn_bodies, query_errors, reload_*.
+/// front, ctfe_fn_bodies, query_errors, reload_*, closure_owners.
 pub struct Unit {
     /// the run's session: never replaced (a settle rebuild replaces `prog`), so any thread reads it
     /// without a front read (`unit_session`)
@@ -472,6 +501,8 @@ pub struct Unit {
     /// to, whether it is its lineage's cell). A slot forwards while its code is one of them, so a
     /// rollback that brings an earlier code back brings that code's role back with it.
     pub(crate) forwards: crate::fxhash::HashMap<u64, (u32, bool)>,
+    /// the owners of the interned closure types (preserve_closure_bodies)
+    pub(crate) closure_owners: ClosureOwners,
     /// bytes of the per-thread block handed out by `tls_alloc`
     pub tls_next: u32,
     /// panicking stand-ins for foreign fns this host lacks, by symbol
@@ -4052,6 +4083,7 @@ impl Unit {
             patch_gen: 0,
             file_gen: Default::default(),
             forwards: Default::default(),
+            closure_owners: Default::default(),
             // slot 0 of the block: the thread's domain static block (domain.rs)
             tls_next: TLS_FIRST_FREE,
             missing_stubs: Default::default(),
@@ -24491,44 +24523,42 @@ pub(crate) unsafe fn preserve_closure_bodies(up: *mut Unit, files: &[u32]) -> Re
     owners.dedup();
     let n_slotted = owners.len();
     let mut done: std::collections::HashSet<(u32, u32)> = owners.iter().copied().collect();
-    // Fns of these files that hold closures and have a slot, with no closure slot yet: code from the
-    // disk cache names their closures in callees not built yet (`spawn<closure, ()>`), which may be
-    // built first after the edit. The file's def index finds them without checking the other fns.
+    // Fns of these files whose closures have a type, with no closure slot yet: code from the disk
+    // cache names their closures in callees not built yet (`spawn<closure, ()>`), which may be built
+    // first after the edit. A version's closure (or async fn coroutine) is named only once its type
+    // exists: a check of its owner's body made it, or linked code that names it. The other fns of
+    // the file have nothing of this version to keep.
     {
-        let u = &*up;
-        let mut holders: std::collections::HashMap<DefId, u32> = Default::default();
-        for &file in files {
-            for &d in u.prog.defs_in_file(file) {
-                let mut d = DefId(d);
-                // an async fn's body is a closure of its own (its coroutine)
-                if u.tcx.async_fns.contains_key(&d) { holders.insert(d, file); }
-                if u.prog.def(d).kind != DefKind::Closure { continue; }
-                while u.prog.def(d).kind == DefKind::Closure { d = u.prog.def(d).parent; }
-                holders.insert(d, file);
-            }
-        }
-        if !holders.is_empty() {
-            for (id, slot) in u.fns.iter().enumerate() {
-                if let FnKey::Inst(d, _) = &slot.key {
-                    if let Some(&file) = holders.get(d) {
-                        if done.insert((id as u32, file)) { owners.push((id as u32, file)); }
-                    }
-                }
+        let u = &mut *up;
+        crate::reload::trace_count("preserve_types", u.tcx.tys.len().saturating_sub(u.closure_owners.seen));
+        let holders = u.closure_owners.of_files(&u.tcx, &u.prog, files);
+        crate::reload::trace_count("preserve_holders", holders.len());
+        for id in u.slots_of_defs(holders.iter().copied()) {
+            if let FnKey::Inst(d, _) = &u.fns[id as usize].key {
+                let file = u.prog.def(*d).file;
+                if files.contains(&file) && done.insert((id, file)) { owners.push((id, file)); }
             }
         }
     }
     let mut seen_tys: std::collections::HashSet<TyId> = Default::default();
+    crate::reload::trace_sub("preserve_scan");
+    crate::reload::trace_count("preserve_slotted", n_slotted);
     let mut i = 0;
     while i < owners.len() {
         let (parent, file) = owners[i];
         i += 1;
+        crate::reload::trace_count("preserve_owners", 1);
         // owners found through a type (below) are preserved as well as they can be: one that cannot
         // be checked again leaves only its closures unbuildable, never the edit refused
+        if !(&*up).has_body(parent, file) {
+            crate::reload::trace_count("preserve_checked", 1);
+        }
         match ensure_parent_body(up, parent, file, 0) {
             Ok(()) => {}
             Err(e) if i <= n_slotted => return Err(e),
             Err(_) => continue,
         }
+        crate::reload::trace_sub("preserve_check");
         let u = &mut *up;
         let Some(body) = u.body_of(parent, file).cloned() else { continue };
         // Freeze shared identity tables before their definitions are replaced.
@@ -24538,10 +24568,12 @@ pub(crate) unsafe fn preserve_closure_bodies(up: *mut Unit, files: &[u32]) -> Re
             let cx = crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &state);
             let frozen = std::sync::Arc::new(crate::typeck::instantiate_body(&cx, &u.prog, &u.tcx, body.def, &body.args));
             u.put_body(parent, frozen.clone());
+            crate::reload::trace_count("preserve_frozen", 1);
             frozen
         } else {
             body
         };
+        crate::reload::trace_sub("preserve_freeze");
         // The environments this version gives its closures, recorded now while it is current: a
         // closure of it may be laid out first after the edit, also when no body of this version
         // was lowered in this run (code from the disk cache, or an owner that never ran). An async
@@ -24569,6 +24601,7 @@ pub(crate) unsafe fn preserve_closure_bodies(up: *mut Unit, files: &[u32]) -> Re
                 owners.push((owner, file));
             }
         }
+        crate::reload::trace_sub("preserve_named");
     }
     Ok(())
 }

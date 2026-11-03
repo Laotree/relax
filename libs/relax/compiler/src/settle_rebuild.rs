@@ -507,6 +507,8 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
         _query_errors: std::mem::replace(&mut u.query_errors, query_errors),
         _rir: rir,
     };
+    // (a new type interner: the closure types are looked at again in it)
+    u.closure_owners.interner_replaced();
     // what Unit::new does with a restored program, again for the new one
     u.tcx.const_eval_provider = Some(relax_types::const_eval::ConstEvalProvider {
         context: u.self_ptr.0 as usize, evaluate: const_eval_to_valtree,

@@ -57,7 +57,7 @@ impl TraceCell {
 }
 static TRACE: TraceCell = TraceCell;
 thread_local! {
-    static TRACE_INPUT: std::cell::Cell<(f64, f64, usize)> = const { std::cell::Cell::new((0.0, 0.0, 0)) };
+    static TRACE_INPUT: std::cell::Cell<(f64, f64, f64, usize)> = const { std::cell::Cell::new((0.0, 0.0, 0.0, 0)) };
 }
 
 pub(crate) fn reload_trace() -> bool {
@@ -75,9 +75,11 @@ fn live_trace() -> bool {
     *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some())
 }
 
-pub(crate) fn trace_input(watch_ms: f64, read_ms: f64, scanned: usize) {
+/// The watcher's part of an edit: `watch_ms` from the save to the read, `look_ms` of it from the
+/// change seen to the read (the settle looks), `read_ms` reading the files.
+pub(crate) fn trace_input(watch_ms: f64, look_ms: f64, read_ms: f64, scanned: usize) {
     if reload_trace() {
-        TRACE_INPUT.with(|s| s.set((watch_ms, read_ms, scanned)));
+        TRACE_INPUT.with(|s| s.set((watch_ms, look_ms, read_ms, scanned)));
     }
 }
 fn trace_stage(name: &'static str) {
@@ -95,7 +97,7 @@ fn trace_stage(name: &'static str) {
     });
 }
 /// A finer split of the running stage: wall time since the stage began or the previous sub mark.
-fn trace_sub(name: &'static str) {
+pub(crate) fn trace_sub(name: &'static str) {
     TRACE.with(|s| {
         if let Some(prev) = s.sub_last.or(s.last) {
             let now = Instant::now();
@@ -118,7 +120,7 @@ fn call_traced<R>(at: &'static str, f: impl FnOnce() -> R) -> R {
         f()
     })
 }
-fn trace_count(name: &'static str, n: usize) {
+pub(crate) fn trace_count(name: &'static str, n: usize) {
     TRACE.with(|s| {
         if s.started.is_some() { *s.counts.entry(name).or_default() += n; }
     });
@@ -134,9 +136,10 @@ impl TraceTransaction {
     fn begin(files: usize) -> Self {
         if reload_trace() {
             let now = Instant::now();
-            let (watch, read, scanned) = TRACE_INPUT.with(|s| s.replace((0.0, 0.0, 0)));
+            let (watch, look, read, scanned) = TRACE_INPUT.with(|s| s.replace((0.0, 0.0, 0.0, 0)));
             let mut state = ReloadTrace { started: Some(now), last: Some(now), cpu_last: relax_backend::cpu_ns(), ..Default::default() };
             state.stages.insert("watch", watch);
+            state.subs.insert("look", look);
             state.stages.insert("read", read);
             state.counts.insert("watch_files", scanned);
             state.counts.insert("edit_files", files);
@@ -2916,6 +2919,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // source version is replaced, including owners of already compiled closures: O3
     // and closure matching may need those old bodies long after this edit.
     let old_files: Vec<u32> = versions.iter().map(|(v, _)| v.old).collect();
+    trace_sub("realtime_frozen");
     if let Err(e) = jit::preserve_closure_bodies(up, &old_files) {
         out.rung = Rung::Refuse;
         out.lines.push(e);
@@ -6054,7 +6058,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             retry_at = Some(Instant::now());
             continue;
         }
-        trace_input(watch_ms, ms(read_started), scanned);
+        trace_input(watch_ms, (read_started - seen).as_secs_f64() * 1000., ms(read_started), scanned);
         let mut o = apply_update(up, edits);
         let only_previous_errors = !o.lines.is_empty() && o.lines.iter().all(|l| l.ends_with("type checking failed due to previous errors"));
         let mut failure = o.failure.or_else(|| (o.rung == Rung::Refuse && internal_failure(&o.lines)).then_some(makepad_remote::hot::Outcome::Refused));
