@@ -626,6 +626,44 @@ fn loopback_carrier_requires_its_token_and_end_lines_carry_host_fields() {
 }
 
 #[test]
+fn an_ask_given_up_closes_its_request_at_the_far_end() {
+    // a routed request that answers only `quick` at once and holds anything else open, as a `watch` does
+    let ep = Endpoint::new("ask-while-test");
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
+    let closed_tx = Arc::new(Mutex::new(closed_tx));
+    ep.register("route", 1, Arc::new(move |_, open| {
+        let closed = closed_tx.clone();
+        std::thread::spawn(move || {
+            while let Some(ev) = open.channel.recv() {
+                match ev {
+                    Event::Data(d) if d == b"quick" => {
+                        let _ = open.channel.send(b"{\"fast\":1}\n{\"end\":1}\n".to_vec());
+                    }
+                    Event::Closed(..) => break,
+                    _ => {}
+                }
+            }
+            let _ = closed.lock().unwrap().send(());
+        });
+        Ok(())
+    }));
+    let token = crate::carrier::loopback::new_token().unwrap();
+    let addr = crate::carrier::loopback::serve(&ep, &token).unwrap().to_string();
+    let client = Client::new(Target::Loopback(addr, token), "t");
+    let mut lines = Vec::new();
+    let answered = crate::hub::ask_while(&client, "box:1", "cmd", "", "quick", &mut |l| { lines.push(l.to_string()); true }, &|| true);
+    assert_eq!(answered, Ok(Some(false)));
+    assert_eq!(lines, ["{\"fast\":1}"]);
+    closed_rx.recv_timeout(WAIT).expect("the answered request closed");
+    // the far end holds this one: once `keep` says no the ask ends and the far end sees its close
+    let t = std::time::Instant::now();
+    let answered = crate::hub::ask_while(&client, "box:1", "cmd", "", "watch", &mut |_| true, &|| t.elapsed() < Duration::from_millis(100));
+    assert_eq!(answered, Ok(None));
+    assert!(t.elapsed() < Duration::from_secs(2), "gave up after {:?}", t.elapsed());
+    closed_rx.recv_timeout(WAIT).expect("the given-up request closed at the far end");
+}
+
+#[test]
 fn a_request_past_its_timeout_is_closed_and_the_connection_goes_on() {
     let ep = Endpoint::new("timeout-test");
     ep.register_cmd(|req, out| match req.cmd.as_str() {

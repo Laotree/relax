@@ -4127,6 +4127,21 @@ static DOMAIN_LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 static DOMAIN_INPUTS: relax_session::sync::Mutex<Option<Inputs>> = relax_session::sync::Mutex::new(None);
 /// The watcher's reload inputs, also readable while it waits for a live test verdict.
 static WATCH_INPUTS: relax_session::sync::Mutex<Option<std::sync::Arc<Inputs>>> = relax_session::sync::Mutex::new(None);
+/// Told when the watcher's inputs are set, or when it ends without them ([`WATCH_GONE`]).
+static WATCH_READY: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
+/// The live session's watcher could not start, or ended: nothing waits for its inputs.
+static WATCH_GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn set_watch_inputs(snapshot: std::sync::Arc<Inputs>) {
+    *WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(snapshot);
+    WATCH_READY.notify_all();
+}
+
+fn watch_gone() {
+    let _g = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner());
+    WATCH_GONE.store(true, std::sync::atomic::Ordering::Release);
+    WATCH_READY.notify_all();
+}
 static DOMAIN_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// End native callbacks into the outgoing domain before its static block can be reclaimed.
@@ -5148,7 +5163,7 @@ pub fn start_watcher(up: *mut Unit, inputs: Inputs) {
     struct P(*mut Unit);
     unsafe impl Send for P {}
     let p = P(up);
-    let _ = std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("run-live".to_string())
         .spawn(move || { let _z = crate::zone_alloc::compiler_thread();
             let runtime = &session.runtime;
@@ -5174,13 +5189,24 @@ pub fn start_watcher(up: *mut Unit, inputs: Inputs) {
                     break;
                 }
             }
+            watch_gone();
         });
+    if spawned.is_err() {
+        watch_gone();
+    }
 }
 
 /// Inspect takes the loaded paths on the owner: tests can load more files while the watcher
 /// waits for their verdict. No inputs lock survives that request or the path formatting.
 pub(crate) fn input_paths() -> Result<Vec<String>, String> {
-    let inputs = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or("the live watcher has not started")?;
+    // a live session's request that comes before its watcher started (a patch sent right after
+    // the launch) waits for it: it was refused "not started" (11-03)
+    let mut g = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner());
+    while g.is_none() && crate::layout::LIVE_SESSION.load(std::sync::atomic::Ordering::Acquire) && !WATCH_GONE.load(std::sync::atomic::Ordering::Acquire) {
+        g = WATCH_READY.wait(g).unwrap_or_else(|e| e.into_inner());
+    }
+    let inputs = g.clone().ok_or("this run watches no sources (not a live session, or its watcher ended)")?;
+    drop(g);
     let up = crate::run::running_unit();
     if up.is_null() { return Err("no running program".into()); }
     let std_dir = std::env::var("MAKEPAD_RUN_STD").unwrap_or_default();
@@ -5364,7 +5390,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     crate::sip::on_late_new(watch_events::kick);
     inputs.add_runner();
     let snapshot = crate::zone_alloc::kept_with(|| std::sync::Arc::new(inputs.clone()));
-    *WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(snapshot);
+    set_watch_inputs(snapshot);
     let std_dir = std::env::var("MAKEPAD_RUN_STD").unwrap_or_default();
     // (path, running file index, last stamp)
     // the program's own source files (not std, registry or git dependencies), loaded so far
@@ -5492,7 +5518,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 inputs = next;
                 inputs.add_runner();
                 let snapshot = crate::zone_alloc::kept_with(|| std::sync::Arc::new(inputs.clone()));
-                *WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(snapshot);
+                set_watch_inputs(snapshot);
             }
             let loaded = crate::owner::call(crate::owner::Class::Program, || own_files(&*up));
             files = inputs.paths.iter().map(|(p, (s, _))| (p.clone(), u32::MAX, *s)).collect();
