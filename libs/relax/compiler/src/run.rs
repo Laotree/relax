@@ -584,10 +584,11 @@ pub(crate) fn resolve_package(
 }
 
 /// The warm front end: the program and type context restored from this launch's collected
-/// image, and the proof the cache opens with. None: no usable image (the caller loads the sources).
+/// image, and the proof the cache opens with. None: no usable image (the caller loads the sources;
+/// restore_collected's trace names the check that refused it).
 fn warm_front(images: &crate::cache::FrontImages, sess: &std::sync::Arc<crate::Session>, pre: &[crate::preload::PreCrate])
     -> Option<(crate::program::Program, crate::tcx::Tcx, Option<crate::cache::CollectedCache>)> {
-    images.restore_collected(sess, pre)
+    images.restore_collected(sess, pre).ok()
 }
 
 

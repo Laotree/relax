@@ -248,11 +248,15 @@ impl FrontImages {
         Some((self.front_graph(base.identity)?, Some((base.pre.clone(), base.common))))
     }
 
-    pub fn restore_collected(&self, session: &Arc<crate::Session>, pre: &[crate::preload::PreCrate]) -> Option<(Program, Tcx, Option<CollectedCache>)> {
+    /// The program and type context restored from the collected image of `pre`'s graph. Err:
+    /// which check refused it (the settle rebuild's deferral line and the boot's trace name it).
+    pub fn restore_collected(&self, session: &Arc<crate::Session>, pre: &[crate::preload::PreCrate]) -> Result<(Program, Tcx, Option<CollectedCache>), String> {
         let _profile = crate::load_profile::span(session.runtime.profile, "front-collected-restore", "main");
         // This handoff is scoped to one immutable load, never a later edit.
         self.pending_plan.lock().unwrap().take();
-        let mut why = "disabled";
+        let mut why = "symbol perturbation on";
+        // (the crate or file the refusing check was about)
+        let mut detail = String::new();
         let started = std::time::Instant::now();
         let phase = |name: &str| if crate::preload::trace() {
             eprintln!("makepad-run collected: {} at {:.1} ms", name, started.elapsed().as_secs_f64() * 1e3);
@@ -260,7 +264,7 @@ impl FrontImages {
         let restored = (|| {
         if crate::syms::perturb(&session.options) != 0 { return None; }
         self.begin_load(pre);
-        why = "certificate";
+        why = "certificate lock poisoned";
         let cert = self.certificate.lock().ok()?;
         let stale;
         // a reordered load's base graph: its crates in its order, of which `common` lead `pre` too
@@ -272,6 +276,7 @@ impl FrontImages {
         let (graph, mut prefix) = match cert.as_ref().filter(|_| !self.reloading()) {
             Some(graph) => (graph, pre.len()),
             None => {
+                why = "no stored graph of this crate set";
                 let (graph, b) = self.graph_for(pre)?;
                 stale = graph;
                 base = b;
@@ -290,6 +295,7 @@ impl FrontImages {
                         let release = release_after.clone();
                         // (detached: the restore takes its prefix as soon as the plan's early
                         // selection covers it, and the load goes on while the plan completes)
+                        why = "demand worker not started";
                         std::thread::Builder::new().name("run-demand".into()).spawn(move || {
                             crate::macro_reg::set_in_world(in_world);
                             worker.complete();
@@ -300,6 +306,7 @@ impl FrontImages {
                     }
                 }
                 let prefix = if plan.is_some() { 0 } else {
+                    why = "the graph's crate records";
                     let (rpre, common) = base.as_ref().map_or((pre, pre.len()), |(p, n): &(Vec<_>, usize)| (p.as_slice(), *n));
                     Self::collected_prefix(rpre, &self.records_for(&stale, rpre, common, None)?, &|_| Some((0, Vec::new())))?.0
                 };
@@ -308,22 +315,30 @@ impl FrontImages {
         };
         let (rpre, common) = base.as_ref().map_or((pre, pre.len()), |(p, n)| (p.as_slice(), *n));
         phase("validated");
-        why = "store";
+        why = "collected store missing or unreadable";
         let st = Arc::new(Store::open(&path(&self.dir, graph.identity))?);
         // Like a front image: structure only here (bounds; the image reader checks every
         // section), the checksum in the background (verify_front_images), so the boot reads
         // only the pages of the tables it uses, not the whole image.
+        why = "no collected entry in its store";
         let at = st.index.binary_search_by(|e| { let k = e.key; k.cmp(&key(graph.identity)) }).ok()?;
+        why = "collected entry unreadable";
         let (kind, bytes) = st.get_at(at, key(graph.identity))?;
+        why = "collected entry of another kind";
         if kind != KIND_COLLECTED { return None; }
         pin_front(&st, Some(at));
         // The checked, immutable mapping is pinned for the Program's mapped definition arena.
         let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
+        why = "collected image header";
         let image = crate::image::Reader::new(bytes)?;
-        why = "certificate identity";
-        if image.len() != 6 || image.bytes(0, 0)? != certificate(graph).to_le_bytes() { return None; }
+        why = "collected image sections (format)";
+        if image.len() != 6 { return None; }
+        why = "certificate mismatch (the crate graph changed since the image)";
+        if image.bytes(0, 0)? != certificate(graph).to_le_bytes() { return None; }
+        why = "interface count differs from the graph's crates";
         let ifaces: &[MappedKey] = image.slice(5, 5)?;
         if ifaces.len() != graph.crates.len() { return None; }
+        why = "collected image sections (format)";
         let program = image.bytes(1, 1)?;
         let types = image.bytes(2, 2)?;
         let definitions = image.bytes(3, 3)?;
@@ -338,15 +353,20 @@ impl FrontImages {
         let mut stores = Vec::new();
         let mut late = HashMap::new();
         let present = graph.crates.iter().map(|((name, _, _), _)| name.clone()).collect();
-        why = "crate stores / late inputs";
         for (i, store_path) in store_paths.iter().enumerate() {
+            detail = graph.crates[i].0 .0.clone();
+            why = "crate store missing or unreadable";
             let store = indexes.as_ref().and_then(|ix| ix.stores.get(i)).cloned()
                 .or_else(|| Store::open(store_path).map(Arc::new))?;
+            why = "late inputs changed (crate ledger)";
             if i < prefix && !ledger_current(&store, &present, &mut late) { return None; }
             stores.push(store);
         }
+        detail.clear();
         phase("crate stores");
         why = "Program";
+        // (the first file whose front image did not restore)
+        let mut failed_file: Option<String> = None;
         let mut file_times = [std::time::Duration::ZERO; 3];
         let timed = crate::preload::trace();
         let mut lap = |slot: usize, at: &mut Option<std::time::Instant>| if let Some(t) = at {
@@ -354,7 +374,7 @@ impl FrontImages {
             file_times[slot] += now - *t;
             *t = now;
         };
-        let mut prog = Program::restore_collected(session, program, rpre, |f, k, cfg, meta| {
+        let prog = Program::restore_collected(session, program, rpre, |f, k, cfg, meta| {
             let restored = (|| {
             let mut at = timed.then(std::time::Instant::now);
             let store = stores.get(k as usize)?;
@@ -382,19 +402,34 @@ impl FrontImages {
             lap(2, &mut at);
             Some(pf)
             })();
-            if restored.is_none() && crate::preload::trace() { eprintln!("makepad-run collected: file not restored: {}", meta.path); }
+            if restored.is_none() {
+                if crate::preload::trace() { eprintln!("makepad-run collected: file not restored: {}", meta.path); }
+                failed_file.get_or_insert_with(|| meta.path.to_string());
+            }
             restored
-        })?;
+        });
+        let Some(mut prog) = prog else {
+            if let Some(f) = failed_file {
+                why = "a file's front image did not restore";
+                detail = f;
+            }
+            return None;
+        };
         if crate::preload::trace() {
             eprintln!("makepad-run collected: files lookup {:.1}, restore {:.1}, parts {:.1} ms",
                 file_times[0].as_secs_f64() * 1e3, file_times[1].as_secs_f64() * 1e3, file_times[2].as_secs_f64() * 1e3);
         }
         phase("Program");
         prog.front_sink = self.sink();
-        why = "crate identities";
-        if prog.crates.len() != graph.crates.len() || prog.crates.iter().zip(&graph.crates)
-            .any(|(c, (key, _))| crate::preload::crate_key(prog.syms.str(c.name), c.root_path(), &c.cfg) != *key) { return None; }
-        why = "Tcx";
+        why = "crate count differs from the graph's";
+        if prog.crates.len() != graph.crates.len() { return None; }
+        why = "crate identity differs from the graph's";
+        if let Some(c) = prog.crates.iter().zip(&graph.crates)
+            .find(|(c, (key, _))| crate::preload::crate_key(prog.syms.str(c.name), c.root_path(), &c.cfg) != *key) {
+            detail = prog.syms.str(c.0.name).to_string();
+            return None;
+        }
+        why = "type context (Tcx)";
         let mut tcx = Tcx::restore_collected(types, prog.files.len(), prog.crates.len())?;
         phase("Tcx");
         if let Some(plan) = plan.as_deref() {
@@ -414,14 +449,20 @@ impl FrontImages {
                 plan.wait_progress(seen);
             };
             phase("prefix chosen");
-            why = "demand selection: ledger";
-            for store in stores.iter().take(prefix) {
+            why = "late inputs changed (crate ledger, demand selection)";
+            for (i, store) in stores.iter().take(prefix).enumerate() {
+                detail = graph.crates[i].0 .0.clone();
                 if !ledger_current(store, &present, &mut late) { return None; }
             }
+            detail.clear();
             phase("selection validated");
         }
-        why = "ledger replay";
-        for store in stores.iter().take(prefix) { replay_front_ledger(store)?; }
+        why = "front ledger replay";
+        for (i, store) in stores.iter().take(prefix).enumerate() {
+            detail = graph.crates[i].0 .0.clone();
+            replay_front_ledger(store)?;
+        }
+        detail.clear();
         phase("ledger replayed");
         prog.front_graph = Some(GraphRecipe { base: base.is_some().then_some(graph.identity), ..GraphRecipe::new(pre) });
         let image_defs = prog.defs.len();
@@ -466,10 +507,13 @@ impl FrontImages {
         }
         Some((prog, tcx, cache))
         })();
-        if restored.is_none() && (crate::preload::trace() || session.runtime.profile) {
-            eprintln!("makepad-run collected: not restored: {}; demand plan retained={}", why, self.pending_plan.lock().unwrap().is_some());
-        }
-        restored
+        restored.ok_or_else(|| {
+            let why = if detail.is_empty() { why.to_string() } else { format!("{why} ({detail})") };
+            if crate::preload::trace() || session.runtime.profile {
+                eprintln!("makepad-run collected: not restored: {}; demand plan retained={}", why, self.pending_plan.lock().unwrap().is_some());
+            }
+            why
+        })
     }
 
 }

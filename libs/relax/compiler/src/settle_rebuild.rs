@@ -332,13 +332,13 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
         // the new state in fresh chunks: compact, not in the old state's partly free ones
         let _f = crate::zone_alloc::compiler_fresh();
         let restored = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let images = crate::cache::FrontImages::open(&sess.options)?;
+            let images = crate::cache::FrontImages::open(&sess.options).ok_or_else(|| "the front image stores did not open".to_string())?;
             images.restore_collected(&sess, &pre)
         }));
         match restored {
-            Ok(Some((prog, tcx, Some(collected)))) => Fresh { prog, tcx, collected, cache: None },
-            Ok(Some(_)) => return Outcome::Retry("only a prefix of the program was restored".into()),
-            Ok(None) => return Outcome::Retry("the collected image was not restored".into()),
+            Ok(Ok((prog, tcx, Some(collected)))) => Fresh { prog, tcx, collected, cache: None },
+            Ok(Ok(_)) => return Outcome::Retry("only a prefix of the program was restored".into()),
+            Ok(Err(why)) => return Outcome::Retry(format!("the collected image was not restored: {why}")),
             Err(_) => return Outcome::Retry("the restore panicked".into()),
         }
     };
