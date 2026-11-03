@@ -8022,6 +8022,7 @@ unsafe fn compile_note(up: *mut Unit, id: u32, w0: u64) {
     if (&*up).prog.session.runtime.profile && crate::exec_profile::is_call(up as usize, id) && (&*up).fns[id as usize].compiled && (&*up).fns[id as usize].build_err.is_none() {
         (&*up).exec_note(id, crate::exec_profile::CALL);
     }
+    busy::touch();
     compile_wall_add(up, w0);
 }
 
@@ -10040,8 +10041,11 @@ unsafe fn settle_final(u: &Unit, id: u32) -> bool {
     if (*rec.add(3)).compare_exchange(T_COUNTING, T_FINAL, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         return false;
     }
-    // (word 4 is the time of the last loop chunk while final: rt_loop_hot)
-    (*rec.add(4)).store(tier_clock(), Ordering::Relaxed);
+    // (word 4 is the time of the last loop chunk while final, word 7 the start of its run of close
+    // chunks: rt_loop_hot)
+    let now = tier_clock();
+    (*rec.add(4)).store(now, Ordering::Relaxed);
+    (*rec.add(7)).store(now, Ordering::Relaxed);
     let code = (*rec.add(1)).load(Ordering::Relaxed);
     let stub = (*rec.add(2)).load(Ordering::Relaxed);
     let _ = SlotWord::of(&u.slots, id).compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
@@ -10537,6 +10541,7 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done) {
             return;
         }
     };
+    busy::count(busy::O2);
     let u = &mut *up;
     if o1 {
         wc::add(wc::O1V_BUILT, 1);
@@ -15107,12 +15112,18 @@ fn rt_loop_hot(counter: u64, fp: u64) {
         (*rec.add(8)).store(chunk, Ordering::Relaxed);
         let st = (*rec.add(3)).load(Ordering::Relaxed);
         if st == T_FINAL {
-            // a final slot's loop (SETTLE-TIER): word 4 is its last chunk's time. Two chunks closer
-            // than a chunk takes at the rate its O3 decision needs (final_chunk_gap): the loop turned
-            // hot, the slot counts again (this chunk charged below); slower, it stays final
+            // a final slot's loop (SETTLE-TIER): word 4 is its last chunk's time, word 7 (the queue
+            // rate, unused while final) the start of its run of chunks at the rate its O3 decision
+            // needs (final_loop_chunk). A run that lasts: the loop turned hot, the slot counts again
+            // (this chunk charged below); slower, or a burst, it stays final
             let now = tier_clock();
             let last = (*rec.add(4)).swap(now, Ordering::Relaxed);
-            if now.saturating_sub(last) >= final_chunk_gap(chunk) || !settle_unfinal(u, id, threshold) {
+            let start = (*rec.add(7)).load(Ordering::Relaxed);
+            let (hot, run) = final_loop_chunk(last, start, now, chunk, PGO_DECIDES.load(Ordering::Relaxed));
+            if run != start {
+                (*rec.add(7)).store(run, Ordering::Relaxed);
+            }
+            if !hot || !settle_unfinal(u, id, threshold) {
                 return;
             }
             PGO_LOOP_UNFINALS.fetch_add(1, Ordering::Relaxed);
@@ -15441,6 +15452,38 @@ mod tier_cost_tests {
         assert!((insts_per_s / PGO_MIN_WORK as f64 - 1.0).abs() < 0.01, "a chunk per gap is the PGO bar: {insts_per_s} insts/s");
         assert!(at_threshold / 2 > gap, "a loop at twice the threshold's rate stays final under PGO (gap {gap} ns)");
         assert!(at_threshold / 4 < gap, "one at four times it counts again (gap {gap} ns)");
+    }
+
+    /// Under PGO a final slot counts again only for a run of close chunks that lasts PGO_WORK_NS (a
+    /// burst ends before its counted build installs, and would be parked again); without PGO two
+    /// close chunks do. A slow chunk starts the run again.
+    #[test]
+    fn a_final_loop_counts_again_after_a_lasting_run() {
+        let chunk = tier_threshold(2000) / LOOP_CHUNK_DIV;
+        let gap = final_chunk_gap_of(chunk, true);
+        let step = gap / 2;
+        // a run of chunks at twice the bar from t0
+        let t0 = 10_000_000_000u64;
+        let (mut last, mut start) = (t0, t0);
+        let mut t = t0;
+        let mut counted_at = None;
+        while t < t0 + 2 * PGO_WORK_NS {
+            t += step;
+            let (hot, run) = final_loop_chunk(last, start, t, chunk, true);
+            (last, start) = (t, run);
+            if hot {
+                counted_at = Some(t);
+                break;
+            }
+        }
+        let at = counted_at.expect("a lasting run counts again");
+        assert!(at - t0 >= PGO_WORK_NS && at - t0 < PGO_WORK_NS + gap, "it counts again once the run lasted PGO_WORK_NS ({} ns)", at - t0);
+        // a burst: the run restarts at a slow chunk
+        let (hot, run) = final_loop_chunk(t0 + PGO_WORK_NS / 2, t0, t0 + PGO_WORK_NS / 2 + gap, chunk, true);
+        assert!(!hot && run == t0 + PGO_WORK_NS / 2 + gap, "a slow chunk starts the run again");
+        // no PGO: two close chunks
+        let (hot, _) = final_loop_chunk(t0, t0, t0 + final_chunk_gap_of(chunk, false) / 2, chunk, false);
+        assert!(hot, "without PGO two close chunks count again");
     }
 
     /// The threshold is a rate: a steady rate over threshold x ln 2 / half-life tiers up, one under it
@@ -16510,37 +16553,60 @@ const SETTLED_MS: u64 = 32;
 static SAMPLER_SETTLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 // Only program runs drive the budget, never check/test or compiler build scripts.
 static BUDGET_RUN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static SAMPLER_ACTIVITY: std::sync::Mutex<Option<((u64, u64, u64), std::time::Instant)>> = std::sync::Mutex::new(None);
+static SAMPLER_ACTIVITY: std::sync::Mutex<Option<(u64, std::time::Instant)>> = std::sync::Mutex::new(None);
 
-/// What fed the settled latch (update_sampler_settled: a compile, an O3 queue push or an O3 install
-/// restarts its 3 s of quiet; its first settle ends the CPU budget's warm-up), per second of the run
-/// and by kind. The verbose exit line says when the JIT first settled, or what held it open:
-/// `makepad-run: the JIT settled ...`.
+/// The settled latch's sources (update_sampler_settled: a compile, an O3 queue push or an O3 install
+/// restarts its 3 s of quiet; its first settle ends the CPU budget's warm-up), counted per second
+/// of the run and by kind. A speculative job that builds nothing (the slot has code, or its stored
+/// entry links) is no compile, and neither is a first call that links its stored code: they do not
+/// restart the quiet (a warm run reaching new code links it in microseconds). The verbose exit
+/// line says when the JIT first settled, or what held it open: `makepad-run: the JIT settled ...`.
 pub(crate) mod busy {
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-    /// a lazy compile (a thread called a slot without code)
+    /// a lazy compile began (a thread called a slot without code)
     pub const LAZY: usize = 0;
-    /// a speculative job that ran a back end
-    pub const SPEC_BUILT: usize = 1;
-    /// a speculative job that built nothing (code already there, or a stored entry linked)
-    pub const SPEC_IDLE: usize = 2;
+    /// a speculative build's back end began
+    pub const SPEC: usize = 1;
     /// an O3 queue push: + its reason (Q_*)
-    pub const PUSH: usize = 3;
+    pub const PUSH: usize = 2;
     /// O3 code installed
-    pub const O3: usize = 8;
+    pub const O3: usize = 7;
+    /// an O2 or verified-O1 build finished (background: counted, but it does not restart the quiet)
+    pub const O2: usize = 8;
     const KINDS: usize = 9;
-    const NAMES: [&str; KINDS] = ["lazy", "spec built", "spec idle", "push calls", "push loop", "push retier", "push marked", "push profiled", "O3 installed"];
+    const NAMES: [&str; KINDS] = ["lazy", "spec", "push calls", "push loop", "push retier", "push marked", "push profiled", "O3 installed", "O2 built (no restart)"];
     const SECS: usize = 128;
     static AT: [[AtomicU32; KINDS]; SECS] = [const { [const { AtomicU32::new(0) }; KINDS] }; SECS];
+    /// every event so far that restarts the quiet (the latch compares it tick to tick)
+    static ACTIVITY: AtomicU64 = AtomicU64::new(0);
     /// the first settle (ms since start; 0: not yet), the longest quiet stretch before it (ms) and
     /// where that stretch ended (ms since start)
     pub(super) static SETTLED_AT: AtomicU64 = AtomicU64::new(0);
     pub(super) static QUIET_MS: AtomicU64 = AtomicU64::new(0);
     pub(super) static QUIET_AT: AtomicU64 = AtomicU64::new(0);
+    /// the last event that restarted the quiet (ms since start): a run that ends before 3 s of
+    /// quiet would have settled 3 s after it
+    static LAST_AT: AtomicU64 = AtomicU64::new(0);
 
     pub fn note(kind: usize) {
+        count(kind);
+        touch();
+    }
+
+    /// Counted for the report only: the quiet goes on.
+    pub fn count(kind: usize) {
         let s = (crate::clock::ms_since_start() / 1000.0) as usize;
         AT[s.min(SECS - 1)][kind].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The end of a compile noted at its start: the quiet restarts, nothing new is counted.
+    pub fn touch() {
+        ACTIVITY.fetch_add(1, Ordering::Relaxed);
+        LAST_AT.store(crate::clock::ms_since_start() as u64, Ordering::Relaxed);
+    }
+
+    pub fn activity() -> u64 {
+        ACTIVITY.load(Ordering::Relaxed)
     }
 
     /// One line: when the JIT first settled (or that it did not, with its longest quiet stretch), then per
@@ -16552,6 +16618,7 @@ pub(crate) mod busy {
         } else {
             format!("not settled at t={:.0} ms: longest quiet {} ms (ended t={} ms; 3000 settle)", crate::clock::ms_since_start(), QUIET_MS.load(Ordering::Relaxed), QUIET_AT.load(Ordering::Relaxed))
         };
+        let head = format!("{head}, last restart at t={} ms", LAST_AT.load(Ordering::Relaxed));
         let mut windows = Vec::new();
         for w in 0..SECS.div_ceil(5) {
             let mut n = [0u64; KINDS];
@@ -16569,8 +16636,8 @@ pub(crate) mod busy {
     }
 }
 
-fn sampler_activity() -> (u64, u64, u64) {
-    (COMPILE_LAST.load(Ordering::Relaxed), TIER_PUSHES.load(Ordering::Relaxed), TIER1_INSTALLS.load(Ordering::Relaxed))
+fn sampler_activity() -> u64 {
+    busy::activity()
 }
 
 pub(crate) fn start_cpu_budget() {
@@ -17482,8 +17549,21 @@ static COUNTING: relax_session::sync::Mutex<Vec<Counting>> = relax_session::sync
 /// ("many calls, little CPU: a O3 build would cost more than it saves").
 const PGO_MIN_WORK: u64 = 1_000_000;
 /// PGO decides O3 in this process (pgo_on of the tiering unit's options, set as it starts tiering):
-/// a final slot's loop is measured against PGO_MIN_WORK too (final_chunk_gap)
+/// a final slot's loop is measured against PGO_MIN_WORK too (final_loop_chunk)
 static PGO_DECIDES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A final slot's loop chunk at `now` after one at `last`, its run of close chunks (each within
+/// final_chunk_gap_of the one before) begun at `start`: (it counts again, the run's start now).
+/// Without PGO two close chunks are enough. Under PGO the run must last PGO_WORK_NS, the window a
+/// parked slot's work is measured over: a shorter burst is over before its counted build installs,
+/// and the window then parks it again. (Warm Fab launches after the bar fix: 133 of 208 counted
+/// builds were final slots counted again, most parked again.)
+fn final_loop_chunk(last: u64, start: u64, now: u64, chunk: u64, pgo: bool) -> (bool, u64) {
+    if now.saturating_sub(last) >= final_chunk_gap_of(chunk, pgo) {
+        return (false, now);
+    }
+    (!pgo || now.saturating_sub(start) >= PGO_WORK_NS, start)
+}
 
 /// The longest gap between two loop chunks (`chunk` back edges each) of a final slot that makes it
 /// count again (rt_loop_hot): the time a chunk takes at the rate its O3 decision needs. That is the
@@ -17492,10 +17572,6 @@ static PGO_DECIDES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// parked again in its counted code, after a counted build. With the threshold's rate alone (~3x
 /// under the PGO bar) a warm Fab launch counted again ~170 slots an earlier run had parked (their
 /// verdicts stored and linked final), 2-4 CPU-s of counted builds, each one parked again.
-fn final_chunk_gap(chunk: u64) -> u64 {
-    final_chunk_gap_of(chunk, PGO_DECIDES.load(Ordering::Relaxed))
-}
-
 fn final_chunk_gap_of(chunk: u64, pgo: bool) -> u64 {
     let at_threshold = (COST_HALF_LIFE_NS / std::f64::consts::LN_2 / LOOP_CHUNK_DIV as f64) as u64;
     if !pgo {
@@ -21511,7 +21587,6 @@ fn spec_worker(runtime: &crate::options::RuntimeOptions) {
         crate::postframe::AHEAD_RUNNING.fetch_add(1, Ordering::Relaxed);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { spec_build(up, id) }));
         crate::postframe::AHEAD_RUNNING.fetch_sub(1, Ordering::Relaxed);
-        busy::note(if matches!(r, Ok(true)) && SPEC_BACK_RAN.with(|b| b.get()) { busy::SPEC_BUILT } else { busy::SPEC_IDLE });
         // (compiles only: a warm-cache link ahead is not a function built -- the warm-up hint and
         // the ring said "N functions" for a warm start's manifest links)
         if FIRST_PRESENT.load(Ordering::Relaxed) && matches!(r, Ok(true)) && SPEC_BACK_RAN.with(|b| b.get()) {
@@ -22759,9 +22834,11 @@ unsafe fn spec_build(up: *mut Unit, id: u32) -> bool {
     drop(front);
     match b {
         Some(Begin::Back(w)) => {
+            busy::note(busy::SPEC);
             let d = w.run();
             owner::publish(|| split_finish(up, d));
             COMPILE_LAST.store(wall_ns(), Ordering::Relaxed);
+            busy::touch();
             SPEC_BACK_RAN.with(|b| b.set(true));
             true
         }
