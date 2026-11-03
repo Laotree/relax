@@ -74,8 +74,15 @@ pub(crate) fn target_dir(exe: &Path) -> Option<PathBuf> {
     layout(exe).map(|l| l.0)
 }
 
-/// The cargo command that rebuilds the loader in place, or why there is none.
-fn command() -> Result<(std::process::Command, String), String> {
+/// The cargo command that rebuilds the loader in place, or why there is none. `background`: the
+/// app keeps running while it builds (a live edit, a landing that changed makepad). On macOS that
+/// build runs at background QoS (efficiency cores, throttled I/O; cargo's rustc inherit it), never
+/// at full width beside the app the person works in: three running apps' rebuilds after a landing
+/// took rustc to ~1080% of a core on the person's Mac while they tweaked Fab (11-03). Elsewhere,
+/// and for a boot that waits for its build, nice 10. Apps that start their rebuilds at once build
+/// once: cargo's lock on the profile's build directory keeps the others waiting for that build,
+/// and their cargo then finds makepad current.
+fn command(background: bool) -> Result<(std::process::Command, String), String> {
     if !cfg!(unix) {
         return Err("this platform cannot replace a running makepad binary".into());
     }
@@ -87,7 +94,7 @@ fn command() -> Result<(std::process::Command, String), String> {
     }
     let bin = exe.file_stem().ok_or("no binary name")?.to_string_lossy().into_owned();
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let mut args: Vec<String> = vec!["-n".into(), "10".into(), cargo, "build".into(), "--manifest-path".into(), manifest.into(), "-p".into(), package.into(), "--bin".into(), bin];
+    let mut args: Vec<String> = vec![cargo, "build".into(), "--manifest-path".into(), manifest.into(), "-p".into(), package.into(), "--bin".into(), bin];
     match profile.as_str() {
         "debug" => {}
         "release" => args.push("--release".into()),
@@ -96,9 +103,10 @@ fn command() -> Result<(std::process::Command, String), String> {
     args.push("--target-dir".into());
     args.push(target.to_string_lossy().into_owned());
     if let Some(t) = triple { args.push("--target".into()); args.push(t); }
-    let shown = args[2..].join(" ");
-    let mut cmd = std::process::Command::new("nice");
-    cmd.args(&args).env_remove("MAKEPAD_RUN_RESTORE").env_remove("MAKEPAD_RUN_RESTART_T0").stdin(std::process::Stdio::null());
+    let shown = args.join(" ");
+    let low: &[&str] = if background && cfg!(target_os = "macos") { &["/usr/sbin/taskpolicy", "-c", "background"] } else { &["nice", "-n", "10"] };
+    let mut cmd = std::process::Command::new(low[0]);
+    cmd.args(&low[1..]).args(&args).env_remove("MAKEPAD_RUN_RESTORE").env_remove("MAKEPAD_RUN_RESTART_T0").stdin(std::process::Stdio::null());
     Ok((cmd, shown))
 }
 
@@ -197,7 +205,7 @@ pub(crate) fn apply_at_boot(change: &crate::provided::ProvidedChange) -> i32 {
     if std::env::var(REBUILT_ENV).ok().and_then(|v| v.parse::<u32>().ok()) == Some(std::process::id()) {
         return failed("the rebuilt makepad differs from the program's copy too (makepad is built from other sources than the program uses)".into());
     }
-    let (mut cmd, shown) = match command() {
+    let (mut cmd, shown) = match command(false) {
         Ok(c) => c,
         Err(e) => return failed(format!("this makepad cannot rebuild itself ({e}): build it again, then run")),
     };
@@ -317,7 +325,7 @@ fn stamps(paths: &[String]) -> Vec<super::inputs::Stamp> {
 /// the running one). Err: this run cannot rebuild itself (the caller says how to restart).
 pub(super) fn request(why: String, paths: Vec<String>) -> Result<(), String> {
     let _k = crate::zone_alloc::kept();
-    command()?;
+    command(true)?;
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     st.why = why;
     st.paths = paths;
@@ -377,7 +385,7 @@ fn build_loop() {
             (st.why.clone(), st.paths.clone())
         };
         let before = stamps(&paths);
-        let (mut cmd, shown) = match command() {
+        let (mut cmd, shown) = match command(true) {
             Ok(c) => c,
             Err(e) => return fail(format!("{why}; cannot rebuild makepad: {e}; the app runs the previous code -- restart it by hand")),
         };
