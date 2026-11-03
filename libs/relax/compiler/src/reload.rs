@@ -5721,8 +5721,33 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // an overlay edit its ledger committed is whole: one look, no quiet window (100 ms of
         // every overlay edit's save -> frame)
         let mut committed = committed_by_ledger(changed.iter().map(|&k| files[k].0.as_str()));
+        let mut waited = false;
         loop {
-            if !committed { std::thread::sleep(LIVE_QUIET); }
+            if !committed {
+                // the rest of the quiet window, or for an overlay edit until the watch hears a file
+                // or the ledger: one seen between its file's rename and ship-done's last write, the
+                // ledger's, goes on at that rename (a third of overlay edits waited out the whole
+                // window, 11-03). Every file is looked at below, so an event is only a wakeup; a
+                // disk save waits out the window without a look per event (a checkout's files).
+                let left = LIVE_QUIET.saturating_sub(still_since.elapsed());
+                let overlay = cfg!(unix) && changed.iter().all(|&k| crate::vfs::is_virtual(&files[k].0));
+                let rewatch = match events.as_mut().filter(|_| overlay) {
+                    Some(w) => {
+                        waited = true;
+                        // whole milliseconds, rounded up: a wait that ends short of the window
+                        // would look again at once
+                        w.wait(Some(std::time::Duration::from_millis(left.as_micros().div_ceil(1000) as u64)));
+                        w.changed().is_none()
+                    }
+                    None => {
+                        std::thread::sleep(left);
+                        false
+                    }
+                };
+                // events lost, or a new edit recorded (it may have made a folder): watched anew
+                if rewatch { events = LiveWatch::new(files.iter().map(|f| f.0.as_str())); }
+                committed = committed_by_ledger(changed.iter().map(|&k| files[k].0.as_str()));
+            }
             let additions = inputs.discover_sources(files.iter().map(|f| f.0.as_str()));
             if !additions.is_empty() {
                 let known: std::collections::HashSet<_> = files.iter().map(|f| f.0.clone()).collect();
@@ -5751,6 +5776,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             }
             committed = false;
         }
+        // a wait above may have taken a wakeup meant for the loop's own (a streamed edit, a
+        // retry, a domain's inputs): one more round sees what it was for
+        if waited { watch_events::kick(); }
         let settled_stamps = last;
         // A moved lockfile or manifest (any landing moves the checkout's) is this app's only when
         // its own resolved graph moved; else there is nothing to rebuild or restart.
@@ -6761,6 +6789,47 @@ mod commit_tests {
         assert!(whole(&[a.as_str(), b.as_str()]), "its own ledger commits it");
         assert!(!whole(&[a.as_str(), "/tmp/not-in-a-store.rs"]), "a disk file settles as any save does");
         assert!(!whole(&[]), "nothing changed is nothing committed");
+        crate::vfs::set_edits(None);
+        let _ = std::fs::remove_dir_all(&edits);
+    }
+
+    /// An overlay edit seen between its file's rename and its ledger's goes on when the watch
+    /// hears the ledger, not a quiet window later: the settle waits on the live watch.
+    #[test]
+    fn the_watch_wakes_at_the_ledger_that_commits_an_overlay_edit() {
+        isolated_test!(the_watch_wakes_at_the_ledger_that_commits_an_overlay_edit);
+        let fixture = vfs_store::Fixture::new(&[("app/a.rs", b"a")]);
+        let root = "/relax-live-wake/vfs/m";
+        crate::vfs::mount(root, fixture.store.clone(), &fixture.commit).unwrap();
+        let edits = std::env::temp_dir().join(format!("relax-live-wake-{}", std::process::id()));
+        std::fs::create_dir_all(edits.join("app")).unwrap();
+        crate::vfs::set_edits(Some(edits.clone()));
+        let a = format!("{root}/app/a.rs");
+        let put = |rel: &str, text: &str| {
+            let tmp = edits.join(format!("{rel}.part"));
+            std::fs::write(&tmp, text).unwrap();
+            std::fs::rename(&tmp, edits.join(rel)).unwrap();
+        };
+        let tick = || std::thread::sleep(std::time::Duration::from_millis(20));
+        put(".makepad-run-edits", "");
+        let mut watch = super::LiveWatch::new(std::iter::once(a.as_str())).expect("a native watch");
+        tick();
+        put("app/a.rs", "a2");
+        let whole = || super::committed_by_ledger(std::iter::once(a.as_str()));
+        assert!(!whole(), "its ledger has not moved yet");
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                tick();
+                put(".makepad-run-edits", "app/a.rs\tnew\n");
+            });
+            // the file's own event may come first: each wakeup looks again
+            while !whole() {
+                watch.wait(Some(std::time::Duration::from_secs(30)));
+                let _ = watch.changed();
+            }
+        });
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "woken by the ledger's rename, not a timeout ({:?})", start.elapsed());
         crate::vfs::set_edits(None);
         let _ = std::fs::remove_dir_all(&edits);
     }
