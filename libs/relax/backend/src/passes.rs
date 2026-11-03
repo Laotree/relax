@@ -2076,6 +2076,10 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
     if f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::IBin(IOp::Or, ..)))) && combine_rotates(f) {
         dce(f);
     }
+    // the high word of `a as i128 * b as i128`: one signed high multiply (imul / smulh)
+    if !opt_off(options, "-smulh") && f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::IBin(IOp::MulHi, IntTy { signed: false, .. }, ..)))) && signed_mulhi(f) {
+        dce(f);
+    }
     // x / 2^k: x * 2^-k (adds vregs, so after the rounds)
     if recip_pow2_div(f) {
         dce(f);
@@ -2378,6 +2382,101 @@ pub fn combine_rotates(f: &mut Func) -> bool {
             }
             f.blocks[bi].insts[k] = Inst::IBinI(IOp::Rotl, IntTy { bits: w as u8, signed: false }, d, l.2, l.3);
             changed = true;
+        }
+    }
+    changed
+}
+
+/// The high word of a product of two sign-extended 64-bit values (`a as i128 * b as i128`) as one
+/// signed high multiply. lower.rs (wide_arith) builds a 128-bit product's high word as
+/// `umulh(x, y) + x * hi(y) + hi(x) * y`; when each high word is its low word's sign (`v >> 63`,
+/// arithmetic) that sum is `smulh(x, y)` (mod 2^64), which LLVM selects as one `imul` (x64) /
+/// `smulh` (arm64). Geometry's i128 cross products, orientations and sort keys (the slicer's clip:
+/// `cross`, `dot`, `orient`) paid two shifts, three multiplies and two adds per product, and the
+/// registers they hold. The chain must be one block's (as lowering emits it) and every vreg in it
+/// defined once, so each reads the values the high multiply reads. Returns whether anything changed.
+pub fn signed_mulhi(f: &mut Func) -> bool {
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    let mut def_at: Vec<(u32, u32)> = vec![(u32::MAX, 0); nv];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (k, i) in b.insts.iter().enumerate() {
+            for_defs(i, |d| {
+                ndef[d.0 as usize] += 1;
+                def_at[d.0 as usize] = (bi as u32, k as u32);
+            });
+        }
+    }
+    // v's only definition, when it is in block `bi`
+    let def_in = |f: &Func, v: VReg, bi: usize| -> Option<Inst> {
+        if ndef[v.0 as usize] != 1 || def_at[v.0 as usize].0 as usize != bi {
+            return None;
+        }
+        Some(f.blocks[bi].insts[def_at[v.0 as usize].1 as usize].clone())
+    };
+    // v = x >> 63 (arithmetic, 64 bits): x's sign word
+    let sign_of = |f: &Func, v: VReg| -> Option<VReg> {
+        if ndef[v.0 as usize] != 1 {
+            return None;
+        }
+        let (bi, k) = def_at[v.0 as usize];
+        if bi == u32::MAX {
+            return None;
+        }
+        let x = match f.blocks[bi as usize].insts[k as usize] {
+            Inst::IBinI(IOp::Shr, IntTy { bits: 64, signed: true }, _, x, 63) => x,
+            // (before immediates are folded in) the count a constant 63
+            Inst::IBin(IOp::Shr, IntTy { bits: 64, signed: true }, _, x, c) if ndef[c.0 as usize] == 1 && def_at[c.0 as usize].0 != u32::MAX => {
+                let (cb, ck) = def_at[c.0 as usize];
+                match f.blocks[cb as usize].insts[ck as usize] {
+                    Inst::Iconst(_, 63) => x,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        (ndef[x.0 as usize] == 1).then_some(x)
+    };
+    let mut changed = false;
+    for bi in 0..f.blocks.len() {
+        for k in 0..f.blocks[bi].insts.len() {
+            let (d, p, q) = match f.blocks[bi].insts[k] {
+                Inst::IBin(IOp::Add, IntTy { bits: 64, .. }, d, p, q) => (d, p, q),
+                _ => continue,
+            };
+            // the three addends: one operand is itself an add of two
+            let terms = [(p, q), (q, p)].into_iter().find_map(|(inner, outer)| match def_in(f, inner, bi) {
+                Some(Inst::IBin(IOp::Add, IntTy { bits: 64, .. }, _, t1, t2)) => Some([t1, t2, outer]),
+                _ => None,
+            });
+            let Some(terms) = terms else { continue };
+            let found = (0..3).find_map(|h| {
+                let Some(Inst::IBin(IOp::MulHi, IntTy { bits: 64, signed: false }, _, x, y)) = def_in(f, terms[h], bi) else { return None };
+                if ndef[x.0 as usize] != 1 || ndef[y.0 as usize] != 1 {
+                    return None;
+                }
+                // the other two: x * sign(y) and sign(x) * y, either operand order
+                let (mut xs, mut sy) = (false, false);
+                for t in (0..3).filter(|&t| t != h) {
+                    let Some(Inst::IBin(IOp::Mul, IntTy { bits: 64, .. }, _, a, b)) = def_in(f, terms[t], bi) else { return None };
+                    let is = |v: VReg, s: VReg, of: VReg| v == of && sign_of(f, s) == Some(if of == x { y } else { x });
+                    if !xs && (is(a, b, x) || is(b, a, x)) {
+                        xs = true;
+                    } else if !sy && (is(a, b, y) || is(b, a, y)) {
+                        sy = true;
+                    } else {
+                        return None;
+                    }
+                }
+                (xs && sy).then_some((x, y))
+            });
+            if let Some((x, y)) = found {
+                f.blocks[bi].insts[k] = Inst::IBin(IOp::MulHi, I64, d, x, y);
+                changed = true;
+            }
         }
     }
     changed
@@ -8309,4 +8408,55 @@ pub fn split_branch_conditions(options: &relax_session::Options, f: &mut Func) -
         relayout(f);
     }
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// lower.rs's high word of `x as i128 * y as i128`: umulh(x, y) + x * (y >> 63) + (x >> 63) * y
+    fn wide_mul_high(signed_shift: bool) -> (Func, VReg, VReg, VReg) {
+        let mut f = Func::new("wide_mul_high".into(), 0);
+        let v: Vec<VReg> = (0..8).map(|_| f.vreg(Cls::I)).collect();
+        let (x, y, sx, sy, h0, c1, c2, h1) = (v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+        let hi = f.vreg(Cls::I);
+        f.params = vec![x, y];
+        f.rets = vec![Cls::I];
+        f.block();
+        let sh = IntTy { bits: 64, signed: signed_shift };
+        f.blocks[0].insts = vec![
+            Inst::IBinI(IOp::Shr, sh, sx, x, 63),
+            Inst::IBinI(IOp::Shr, sh, sy, y, 63),
+            Inst::IBin(IOp::MulHi, U64, h0, x, y),
+            Inst::IBin(IOp::Mul, U64, c1, x, sy),
+            Inst::IBin(IOp::Mul, U64, c2, sx, y),
+            Inst::IBin(IOp::Add, U64, h1, h0, c1),
+            Inst::IBin(IOp::Add, U64, hi, h1, c2),
+        ];
+        f.blocks[0].term = Term::Ret(vec![hi]);
+        f.blocks[0].pos = vec![0; f.blocks[0].insts.len()];
+        (f, x, y, hi)
+    }
+
+    #[test]
+    fn the_high_word_of_a_sign_extended_product_is_one_signed_mulhi() {
+        let (mut f, x, y, hi) = wide_mul_high(true);
+        assert!(signed_mulhi(&mut f));
+        assert_eq!(f.blocks[0].insts[6], Inst::IBin(IOp::MulHi, I64, hi, x, y));
+        f.verify().unwrap();
+        // the identity it rests on (mod 2^64), signs and extremes included
+        let vals = [0i64, 1, -1, 2, -2, 0x1234_5678_9abc, -0x7777_0000_1111, i64::MAX, i64::MIN, i64::MIN + 1];
+        for &a in &vals {
+            for &b in &vals {
+                let u = fold_ibin(IOp::MulHi, U64, a, b).unwrap();
+                let sum = u.wrapping_add(a.wrapping_mul(b >> 63)).wrapping_add((a >> 63).wrapping_mul(b));
+                assert_eq!(sum, fold_ibin(IOp::MulHi, I64, a, b).unwrap(), "{a} {b}");
+            }
+        }
+        // zero-extended high words (u64 as u128) are not signs: left alone
+        let (mut g, ..) = wide_mul_high(false);
+        let before = g.blocks[0].insts.clone();
+        assert!(!signed_mulhi(&mut g));
+        assert_eq!(g.blocks[0].insts, before);
+    }
 }
