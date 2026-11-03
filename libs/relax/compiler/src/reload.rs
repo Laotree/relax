@@ -2560,6 +2560,13 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     }
     trace_count("selected_slots", slots.len() + fresh.len());
     trace_stage("dependencies");
+    // an armed real-time root's code is not replaced under it: the edit waits for the disarm
+    // (realtime_disarmed retries it), nothing of it is installed now
+    if let Some(line) = jit::realtime_frozen(u, &slots.iter().chain(fresh.iter()).copied().collect::<Vec<u32>>()) {
+        out.rung = Rung::Refuse;
+        out.lines.push(line);
+        return out;
+    }
     // Settle can evict a current closure owner's typeck result. Restore it before its
     // source version is replaced, including owners of already compiled closures: O3
     // and closure matching may need those old bodies long after this edit.
@@ -3662,6 +3669,14 @@ static RESTART_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 static PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Unpinned: the watch's next round looks at every file.
 static CATCH_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The last armed real-time root was disarmed: the watch retries the edits it held now.
+static RETRY_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// std::relax::Realtime::arm's last guard went: edits refused as frozen apply now.
+pub(crate) fn realtime_disarmed() {
+    RETRY_NOW.store(true, std::sync::atomic::Ordering::Release);
+    watch_events::kick();
+}
 
 /// `inspect pin on|off`: while on, no edit or landing reaches the running app and it does not
 /// restart; off, it catches up (patches, or the rebuilt makepad that waited). Returns the state.
@@ -5088,7 +5103,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // a sync moved the dock app's checkout: every file is compared with what runs
         let synced = dock.as_mut().is_some_and(DockGate::synced);
         let caught_up = CATCH_UP.swap(false, std::sync::atomic::Ordering::AcqRel);
-        let retry_due = retry_at.is_some_and(|t| t <= Instant::now());
+        let retry_due = retry_at.is_some_and(|t| t <= Instant::now()) || RETRY_NOW.swap(false, std::sync::atomic::Ordering::AcqRel);
         let all = lost || rewatched || synced || caught_up || retry_due
             || last_scan.elapsed() >= if events.is_some() { LIVE_IDLE } else { LIVE_QUIET };
         let backstop_only = all && !(lost || rewatched || synced || caught_up || retry_due);

@@ -35,6 +35,10 @@ extern "C" {
 extern "C" {
     fn __relax_realtime(root: usize, data: usize, meta: usize, wake: usize) -> u64;
     fn __relax_realtime_ready(ticket: u64) -> bool;
+    fn __relax_realtime_compiled(ticket: u64) -> bool;
+    fn __relax_realtime_lazy(ticket: u64) -> u32;
+    fn __relax_realtime_misses() -> u64;
+    fn __relax_realtime_arm(on: bool);
 }
 
 /// The type whose code `realtime` names (its address is the root's identity, not a call).
@@ -51,6 +55,45 @@ impl Realtime {
     pub fn ready(&self) -> bool {
         self.0 == 0 || unsafe { __relax_realtime_ready(self.0) }
     }
+
+    /// The strict `ready`: everything the mark reaches is compiled and nothing real-time code can
+    /// reach still compiles on its first call. Never true because a wait ran out: what gates arming
+    /// a machine. It turns false again while new code (a live patch, a new trait object of a type
+    /// the code calls through) has callees the compiler has not reached yet.
+    pub fn compiled(&self) -> bool {
+        self.0 == 0 || unsafe { __relax_realtime_compiled(self.0) }
+    }
+
+    /// How many fns real-time code can reach that would compile on their first call (0: none;
+    /// at least 1 until this mark's reach is done). The reach is shared by every mark, so this
+    /// counts what any real-time root still waits for.
+    pub fn lazy(&self) -> u32 {
+        if self.0 == 0 { 0 } else { unsafe { __relax_realtime_lazy(self.0) } }
+    }
+
+    /// Freezes live edits of real-time code while the guard lives: a patch that would replace
+    /// code real-time code can reach is held (the edit is answered "frozen") and applies once the
+    /// last guard is dropped. Edits of other code patch as usual.
+    pub fn arm(&self) -> RealtimeArmed {
+        unsafe { __relax_realtime_arm(true) };
+        RealtimeArmed(())
+    }
+}
+
+/// `Realtime::arm`'s guard: live edits of real-time code wait until it (and every other) is dropped.
+#[derive(Debug)]
+pub struct RealtimeArmed(());
+
+impl Drop for RealtimeArmed {
+    fn drop(&mut self) {
+        unsafe { __relax_realtime_arm(false) };
+    }
+}
+
+/// How many lazy compiles real-time threads met so far (each stalled its thread for the
+/// compile): 0 is the goal; a rise names a hole in what `realtime` reached.
+pub fn realtime_misses() -> u64 {
+    unsafe { __relax_realtime_misses() }
 }
 
 /// The code reachable from `x` runs on a real-time thread (an audio device's callback, a

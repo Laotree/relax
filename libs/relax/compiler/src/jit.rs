@@ -21489,6 +21489,10 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         // std::relax::realtime: code a real-time thread runs is compiled ahead
         b"__relax_realtime" => Some(__relax_realtime as *const () as usize),
         b"__relax_realtime_ready" => Some(__relax_realtime_ready as *const () as usize),
+        b"__relax_realtime_compiled" => Some(__relax_realtime_compiled as *const () as usize),
+        b"__relax_realtime_lazy" => Some(__relax_realtime_lazy as *const () as usize),
+        b"__relax_realtime_misses" => Some(__relax_realtime_misses as *const () as usize),
+        b"__relax_realtime_arm" => Some(__relax_realtime_arm as *const () as usize),
         // makepad inspect's wait registry: program lock / condvar / park waits (Relax's std sync/raw.rs)
         b"__relax_wait_enter" => Some(crate::inspect::relax_wait_enter as *const () as usize),
         b"__relax_wait_leave" => Some(crate::inspect::relax_wait_leave as *const () as usize),
@@ -25360,6 +25364,8 @@ struct RealTime {
     vtables: crate::fxhash::HashSet<u64>,
     /// the earlier runs' set was taken (into `link`)
     loaded: bool,
+    /// slots of the set whose compile failed: a call still compiles them (Realtime::lazy counts them)
+    failed: crate::fxhash::HashSet<u32>,
     /// the reach in progress: the earlier runs' slots still to link (compiled, not walked), the
     /// slots still to walk, the trait-object types newly called through
     link: Vec<u32>,
@@ -25446,6 +25452,62 @@ extern "C" fn __relax_realtime_ready(ticket: u64) -> bool {
     })
 }
 
+/// std::relax::Realtime::compiled: the strict ready. Everything the mark reaches is compiled and
+/// nothing real-time code can reach waits for a compile: never true because a wait ran out.
+pub(crate) extern "C" fn __relax_realtime_compiled(ticket: u64) -> bool {
+    crate::jit::host_boundary("__relax_realtime_compiled", move || RT_DONE.load(Ordering::Acquire) >= ticket && realtime_pending() == 0)
+}
+
+/// std::relax::Realtime::lazy: how many fns real-time code can reach that would still compile on
+/// their first call (0: none), at least 1 while the mark's own reach is not done.
+pub(crate) extern "C" fn __relax_realtime_lazy(ticket: u64) -> u32 {
+    crate::jit::host_boundary("__relax_realtime_lazy", move || {
+        let n = realtime_pending();
+        let n = if RT_DONE.load(Ordering::Acquire) < ticket { n.max(1) } else { n };
+        n.min(u32::MAX as u64) as u32
+    })
+}
+
+/// std::relax::realtime_misses: lazy compiles real-time threads met so far (each one stalled the thread).
+extern "C" fn __relax_realtime_misses() -> u64 {
+    RT_LAZY.load(Ordering::Relaxed)
+}
+
+/// std::relax::Realtime::arm (on) and the drop of its guard (off): while any root is armed, a live
+/// patch that would replace real-time code is held (refused, then applied at the last disarm).
+pub(crate) extern "C" fn __relax_realtime_arm(on: bool) {
+    crate::jit::host_boundary("__relax_realtime_arm", move || {
+        if on {
+            RT_ARMED.fetch_add(1, Ordering::AcqRel);
+        } else if RT_ARMED.fetch_sub(1, Ordering::AcqRel) == 1 {
+            crate::reload::realtime_disarmed();
+        }
+    })
+}
+
+/// Armed real-time roots (std::relax::Realtime::arm guards alive).
+static RT_ARMED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// What real-time code can reach that a call would still compile: the reach's work left (slots to
+/// link or walk, trait-object types and vtables to follow, the new callees of new code) and the
+/// set's slots whose compile failed. The reach is one walk for every mark (a slot two roots reach is
+/// walked once, and a warm run links the earlier runs' set without walking it), so this is the
+/// whole real-time set's answer: never 0 while something on any root's path is lazy.
+fn realtime_pending() -> u64 {
+    let own = with_rt(|rt| (rt.todo.len() + rt.link.len() + rt.new_dyns.len() + rt.failed.len()) as u64 + rt.scheduled as u64);
+    own + RT_PENDING.lock().unwrap_or_else(|e| e.into_inner()).len() as u64 + RT_PENDING_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).len() as u64
+}
+
+/// A live patch would replace code of `slots` (compiled ones and lazy ones it rebuilds): while a
+/// real-time root is armed, the first of them in the real-time set holds the patch (the line says why).
+pub(crate) fn realtime_frozen(u: &Unit, slots: &[u32]) -> Option<String> {
+    if RT_ARMED.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let hit = with_rt(|rt| slots.iter().copied().find(|s| rt.seen.contains(s)))?;
+    Some(format!("frozen: `{}` is real-time code and a real-time root is armed (std::relax::Realtime::arm): the edit applies when it is disarmed", short_name(&u.fns[hit as usize].name)))
+}
+
 /// How long a real-time callback waits for its code at most (MAKEPAD_RUN_RT_WAIT_MS, default 300).
 fn rt_wait_ns() -> u64 {
     static NS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -25497,6 +25559,15 @@ unsafe fn realtime_mark(up: *mut Unit, root: u64, data: u64, meta: u64, ticket: 
             rt.wakes.push((ticket, scope, wake));
         }
     });
+}
+
+/// Marks slots `roots` as real-time code (what std::relax::realtime does for the slots of a value);
+/// returns the mark's ticket. Owner only.
+pub(crate) unsafe fn realtime_mark_slots(up: *mut Unit, roots: Vec<u32>) -> u64 {
+    let ticket = RT_TICKET.fetch_add(1, Ordering::AcqRel) + 1;
+    realtime_reach_queued(up, roots, "mark");
+    with_rt(|rt| rt.added = rt.added.max(ticket));
+    ticket
 }
 
 /// Adds `roots` to the reach and schedules its next owner step.
@@ -25569,9 +25640,12 @@ unsafe fn realtime_step(up: *mut Unit) {
                     let _ = compile_slot_locked(up, id, false);
                     compiled += 1;
                 }
-                if let Some(p) = realtime_partner(&*up, id) {
-                    with_rt(|rt| rt.todo.push(p));
-                }
+                let lazy = (id as usize) < (&*up).fns.len() && !(&*up).fns[id as usize].compiled;
+                let partner = realtime_partner(&*up, id);
+                with_rt(|rt| {
+                    if lazy { rt.failed.insert(id); } else { rt.failed.remove(&id); }
+                    rt.todo.extend(partner);
+                });
             }
             Next::Walk(id) => {
                 // a diverging fn (a panic, an abort) ends the callback's normal path: it stays lazy
@@ -25587,10 +25661,14 @@ unsafe fn realtime_step(up: *mut Unit) {
                 let was = (&*up).fns[id as usize].compiled;
                 let mut slots = realtime_refs(up, id);
                 slots.extend(realtime_partner(&*up, id));
-                if !was && (&*up).fns[id as usize].compiled {
+                let now = (&*up).fns[id as usize].compiled;
+                if !was && now {
                     compiled += 1;
                 }
-                with_rt(|rt| rt.todo.extend(slots));
+                with_rt(|rt| {
+                    if now { rt.failed.remove(&id); } else { rt.failed.insert(id); }
+                    rt.todo.extend(slots);
+                });
             }
             // trait-object types newly called through: every vtable of each, now and later
             Next::Dyns(new_dyns) => {

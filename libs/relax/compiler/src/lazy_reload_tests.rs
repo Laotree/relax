@@ -945,3 +945,79 @@ fn restored_images_take_live_edits() {
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// std::relax::realtime for arming a machine (FABARMS): `compiled` is the strict ready (the whole
+/// reach compiled, never "the wait ran out"), `lazy` counts what would still compile on a call, and
+/// an armed root freezes live edits of real-time code (refused "frozen", applied at the disarm)
+/// while edits of other code patch as usual.
+#[test]
+fn realtime_strict_ready_lazy_and_patch_freeze() {
+    const CHILD: &str = "MAKEPAD_RUN_RT_FREEZE_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::realtime_strict_ready_lazy_and_patch_freeze", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
+            .output().unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    use crate::reload::{apply, Edit, Rung};
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-rt-freeze-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    let src = |gain: u32, other: u32| format!("pub fn value(out: &mut u32) {{ *out = gain(); }}\n#[inline(never)]\npub fn gain() -> u32 {{ {gain} }}\npub fn other(out: &mut u32) {{ *out = {other}; }}\n");
+    std::fs::write(dir.join("app/src/lib.rs"), src(11, 5)).unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "rt_freeze_app", false).unwrap();
+    let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let (value, other) = (def("value"), def("other"));
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let (root, value_entry, other_entry) = crate::owner::call(crate::owner::Class::Program, || {
+        let root = u.fn_id(crate::jit::FnKey::Inst(value, vec![]));
+        let o = u.fn_id(crate::jit::FnKey::Inst(other, vec![]));
+        (root, u.entry(root), u.entry(o))
+    });
+    let run = |entry| {
+        let mut result = 0u32;
+        unsafe { crate::jit::call_jit(up, entry, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        result
+    };
+    // the strict ready: false (lazy > 0) until the reach is compiled, then true with nothing lazy
+    let ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![root]) });
+    while !crate::jit::__relax_realtime_compiled(ticket) {
+        assert!(crate::jit::__relax_realtime_lazy(ticket) > 0, "not compiled, yet nothing lazy");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(crate::jit::__relax_realtime_lazy(ticket), 0, "compiled with lazy fns left");
+    assert_eq!(run(value_entry), 11);
+    let file = u.prog.def(value).file;
+    let edit = |text: String| unsafe { apply(up, vec![Edit { file, path: app.clone(), src: text.into_bytes() }]) };
+    // armed: an edit of real-time code (`gain`, which `value` calls) is held, nothing installs
+    crate::jit::__relax_realtime_arm(true);
+    let o = edit(src(12, 5));
+    assert_eq!(o.rung, Rung::Refuse, "an armed root's code was patched: {:?}", o.lines);
+    assert!(o.lines.iter().any(|l| l.starts_with("frozen:") && l.contains("gain")), "{:?}", o.lines);
+    assert_eq!(run(value_entry), 11, "the frozen edit changed real-time code");
+    // ... an edit of other code patches as usual
+    let o = edit(src(11, 6));
+    assert_eq!(o.rung, Rung::Patch, "an edit of non-real-time code was held: {:?}", o.lines);
+    assert_eq!(run(other_entry), 6);
+    // disarmed: the held edit applies
+    crate::jit::__relax_realtime_arm(false);
+    let o = edit(src(12, 6));
+    assert_eq!(o.rung, Rung::Patch, "{:?}", o.lines);
+    assert_eq!(run(value_entry), 12);
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
