@@ -10710,15 +10710,21 @@ pub struct SettleDrops {
     pub typeck: u64,
     pub lower: u64,
     pub spec: u64,
+    /// the longest step of the sweep on the owner (ns)
     pub max_sweep_ns: u64,
     pub front_pending: bool,
     retired_rir: Vec<std::sync::Arc<relax_backend::rir::Func>>,
+    retired_bodies: Vec<std::sync::Arc<Body>>,
+    retired_ctfe: crate::fxhash::HashMap<(DefId, Vec<TyId>), (u64, std::sync::Arc<Body>)>,
+    retired_memos: Vec<crate::conc::Detached<TyId, bool>>,
+    retired_spec: ExpiredSpec,
 }
 
 impl SettleDrops {
-    /// Slots have relinquished ownership under the unit lock. Destroy their potentially
-    /// large instruction graphs after unlocking, so a frame's lazy call need not wait.
-    pub fn release_rir(&mut self) {
+    /// What the slots and the unit let go of on the owner is destroyed here, by the requester
+    /// after its request: freeing thousands of checked bodies and instruction graphs held the owner
+    /// (and a frame's lazy call behind it) for tens of ms.
+    pub fn release(&mut self) {
         let before = crate::memstat::live_total();
         if !crate::memstat::enabled() {
             self.rir += self.retired_rir.iter().filter(|r| std::sync::Arc::strong_count(r) == 1)
@@ -10726,7 +10732,24 @@ impl SettleDrops {
         }
         self.retired_rir.clear();
         if crate::memstat::enabled() { self.rir += freed_since(before); }
+        let before = crate::memstat::live_total();
+        self.retired_bodies.clear();
+        self.retired_ctfe = Default::default();
+        self.typeck += freed_since(before);
+        let before = crate::memstat::live_total();
+        self.retired_memos.clear();
+        self.lower += freed_since(before);
+        let before = crate::memstat::live_total();
+        self.retired_spec = Default::default();
+        self.spec += freed_since(before);
     }
+}
+
+/// Speculative code the TTL sweep took from its slots (`expire_spec_now`), destroyed off the owner.
+#[derive(Default)]
+pub(crate) struct ExpiredSpec {
+    code: Vec<Box<SpecCode>>,
+    rir: Vec<std::sync::Arc<relax_backend::rir::Func>>,
 }
 
 static DONE_RIR_FNS: AtomicU64 = AtomicU64::new(0);
@@ -10795,121 +10818,214 @@ pub unsafe fn retire_type_side(up: *mut Unit) -> Option<(usize, usize)> {
     Some((*up).tcx.retire_settled())
 }
 
-/// Reclaim rebuildable compile state. Caller holds the unit lock, outside any compilation.
-/// FRONT_RW excludes off-lock typeck before memo nodes can be freed. Suspended fronts pin
-/// their own inputs, not the entire unit. MemoMap::get returns owned clones; no node borrow
-/// crosses a front's unit-lock yield.
+/// Slots one step of the settle sweep looks at: each step is one owner request, so a frame's
+/// request waits for at most one step.
+pub const SETTLE_STEP: usize = 4096;
+
+/// Reclaim rebuildable compile state, in one request (a check's settle, tests): every step of
+/// `SettleSweep` at once. On the owner, outside any compilation.
 pub unsafe fn settle_drop(up: *mut Unit) -> SettleDrops {
-    let session = unsafe { crate::jit::unit_session(up) };
-    let options = &session.options;
-    let u = &mut *up;
-    let started = wall_ns();
-    let mut drops = take_completed_drops();
-    // Freeze the pending/active sets together; the worker moves queue -> active under q.
-    let queue = tier_queue().unwrap_or_else(|e| e.into_inner());
-    let active = TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let mut pinned: std::collections::HashSet<u32> = queue.iter().map(|x| x.0).chain(active.iter().copied()).collect();
-    // the running set keeps its RIR, its callees too (below): code that turned hot (queued, counted,
-    // built at O3) and code whose decayed cost is an eighth of the threshold or more -- it is what tiers up
-    // next: O3, retier, its callers' inline snapshots. Dropped, every O3 build of the running set
-    // rebuilt that RIR on the owner (lane SETTLE: Sandbox's O3 tail, the owner 38% in settle_drop
-    // and its rebuilds while the workers waited)
-    if let Some(threshold) = u.tier1.as_ref().map(|t| t.threshold) {
-        let now = tier_clock();
-        for id in 0..u.fns.len() as u32 {
-            let rec = tier_rec(&u.slots, id);
-            let st = (*rec.add(3)).load(Ordering::Relaxed);
-            if st == T_QUEUED || st == T_COUNTING && tier_cost_now(rec, threshold, now).0 >= threshold / REFILL_DIV {
-                pinned.insert(id);
+    let mut s = SettleSweep::default();
+    while !s.step(up, usize::MAX) {}
+    s.drops
+}
+
+/// The settle sweep: what an installed slot no longer needs (its RIR, its checked body) and the
+/// unit's rebuildable memos go, in steps of at most `SETTLE_STEP` slots, each step one owner request
+/// (the run monitor's: `step` returns false until the sweep is over). A main-thread request waits for
+/// one step, not for a sweep of every slot (a cold Fab: one request held the owner 10-50 ms every
+/// 2 s while the UI dragged), and nothing is freed on the owner: what the steps take goes to the
+/// requester (`SettleDrops::release`).
+///
+/// The steps run as Program requests, which no pump serves: no front is open on the owner's stack
+/// then (`frame_leave` closes a request's builds), so the only slots building are those of a
+/// one-request sweep served inside a front (a check's settle). Between steps compiles go on and each
+/// step decides from the slot states as they are then. The pins (the running set and its inputs) are
+/// taken in the first steps: a slot queued for O3 after them keeps its own RIR (each RIR step reads
+/// the queues again); its callees are rebuilt when its build needs them, as for a slot queued just
+/// after a sweep.
+#[derive(Default)]
+pub struct SettleSweep {
+    phase: u8,
+    at: usize,
+    /// the slots when the sweep began (slots made since wait for the next sweep)
+    n: usize,
+    pinned: std::collections::HashSet<u32>,
+    walk: Vec<u32>,
+    bodies: Vec<u32>,
+    pub drops: SettleDrops,
+}
+
+const SWEEP_PINS: u8 = 0;
+const SWEEP_SCAN: u8 = 1;
+const SWEEP_CALLEES: u8 = 2;
+const SWEEP_PARENTS: u8 = 3;
+const SWEEP_RIR: u8 = 4;
+const SWEEP_BODIES: u8 = 5;
+const SWEEP_MEMOS: u8 = 6;
+const SWEEP_DONE: u8 = 7;
+
+impl SettleSweep {
+    /// One step on the owner, `budget` slots at most; true once the sweep is over.
+    pub unsafe fn step(&mut self, up: *mut Unit, budget: usize) -> bool {
+        let started = wall_ns();
+        let done = self.step_inner(up, budget);
+        self.drops.max_sweep_ns = self.drops.max_sweep_ns.max(wall_ns().saturating_sub(started));
+        done
+    }
+
+    unsafe fn step_inner(&mut self, up: *mut Unit, mut budget: usize) -> bool {
+        let u = &mut *up;
+        loop {
+            match self.phase {
+                SWEEP_PINS => {
+                    self.drops = take_completed_drops();
+                    self.n = u.fns.len();
+                    // the O3 queue and the builds running: they and their known RIR inputs keep
+                    // their RIR (each queued caller would check the shared callees again)
+                    self.pinned = tier_queue().unwrap_or_else(|e| e.into_inner()).iter().map(|x| x.0)
+                        .chain(TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).iter().copied()).collect();
+                    // aot: the slots whose callees are speculated after the burst keep their RIR until then
+                    self.pinned.extend(AOT_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|x| x.0 == up as usize).map(|x| x.1));
+                    self.phase = SWEEP_SCAN;
+                }
+                SWEEP_SCAN => {
+                    // the running set keeps its RIR, its callees too (below): code that turned hot
+                    // (queued, counted, built at O3) and code whose decayed cost is an eighth of the
+                    // threshold or more -- it is what tiers up next: O3, retier, its callers' inline
+                    // snapshots. Dropped, every O3 build of the running set rebuilt that RIR on the
+                    // owner (lane SETTLE: Sandbox's O3 tail, the owner 38% in settle_drop and its
+                    // rebuilds while the workers waited)
+                    let end = self.n.min(self.at.saturating_add(budget));
+                    let tier = u.tier1.as_ref().map(|t| (t.threshold, tier_clock()));
+                    for id in self.at as u32..end as u32 {
+                        if let Some((threshold, now)) = tier {
+                            let rec = tier_rec(&u.slots, id);
+                            let st = (*rec.add(3)).load(Ordering::Relaxed);
+                            if st == T_QUEUED || st == T_COUNTING && tier_cost_now(rec, threshold, now).0 >= threshold / REFILL_DIV {
+                                self.pinned.insert(id);
+                            }
+                        }
+                        let f = &u.fns[id as usize];
+                        if f.building {
+                            self.pinned.insert(id);
+                            // prepare_rir records its callees before yielding between their builds,
+                            // and snapshots their RIR only after that loop. Keep those
+                            // not-yet-snapshotted inputs.
+                            self.pinned.extend(f.calls.iter().copied());
+                        }
+                    }
+                    budget -= end - self.at;
+                    self.at = end;
+                    if self.at < self.n {
+                        return false;
+                    }
+                    // Queued jobs have not enumerated their inline snapshots yet. Their known RIR
+                    // dependency graph is still pending input too; dropping it would make each
+                    // queued caller recheck shared callees. The edges survive slot RIR eviction
+                    // (warm rebuilds).
+                    self.walk = self.pinned.iter().copied().collect();
+                    self.phase = SWEEP_CALLEES;
+                }
+                SWEEP_CALLEES => {
+                    while let Some(id) = self.walk.pop() {
+                        for &callee in &u.fns[id as usize].rir_refs {
+                            if self.pinned.insert(callee) { self.walk.push(callee); }
+                        }
+                        budget = budget.saturating_sub(1);
+                        if budget == 0 && !self.walk.is_empty() {
+                            return false;
+                        }
+                    }
+                    // a pinned closure's parents keep their bodies (it is lowered from them)
+                    self.walk = self.pinned.iter().copied().collect();
+                    self.phase = SWEEP_PARENTS;
+                }
+                SWEEP_PARENTS => {
+                    while let Some(mut id) = self.walk.pop() {
+                        while let FnKey::Closure(_, _, parent) = u.fns[id as usize].key {
+                            if parent == u32::MAX { break; }
+                            self.pinned.insert(parent);
+                            id = parent;
+                        }
+                        budget = budget.saturating_sub(1);
+                        if budget == 0 && !self.walk.is_empty() {
+                            return false;
+                        }
+                    }
+                    self.at = 0;
+                    self.phase = SWEEP_RIR;
+                }
+                SWEEP_RIR => {
+                    // what is queued or building at O3 now keeps its RIR as well
+                    self.pinned.extend(tier_queue().unwrap_or_else(|e| e.into_inner()).iter().map(|x| x.0));
+                    self.pinned.extend(TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).iter().copied());
+                    let end = self.n.min(self.at.saturating_add(budget));
+                    for id in self.at..end {
+                        let f = &mut u.fns[id];
+                        if f.compiled && !f.inflight && !f.building && !self.pinned.contains(&(id as u32)) {
+                            // Arc snapshots remain valid even after the slot drops its ownership.
+                            if let Some(r) = f.rir.take() {
+                                self.drops.fns += 1;
+                                self.drops.retired_rir.push(r);
+                            }
+                        }
+                    }
+                    budget -= end - self.at;
+                    self.at = end;
+                    if self.at < self.n {
+                        return false;
+                    }
+                    self.bodies = u.bodies.keys().copied().collect();
+                    self.phase = SWEEP_BODIES;
+                }
+                SWEEP_BODIES => {
+                    // Current bodies can be checked again. Old file versions cannot: closures still
+                    // refer to their original expression IDs, so keep old_bodies and any old-version
+                    // current body.
+                    while let Some(id) = self.bodies.pop() {
+                        let f = &u.fns[id as usize];
+                        let drop = f.compiled && !f.inflight && !f.building && f.rir.is_none() && !self.pinned.contains(&id)
+                            && u.bodies.get(&id).is_some_and(|b| u.prog.def(b.def).file == b.file);
+                        if drop {
+                            if let Some(b) = u.bodies.remove(&id) { self.drops.retired_bodies.push(b); }
+                        }
+                        budget = budget.saturating_sub(1);
+                        if budget == 0 && !self.bodies.is_empty() {
+                            return false;
+                        }
+                    }
+                    if u.bodies.capacity() > 2 * u.bodies.len() + 1024 { u.bodies.shrink_to_fit(); }
+                    self.drops.retired_ctfe = std::mem::take(&mut *u.ctfe_fn_bodies.lock().unwrap_or_else(|e| e.into_inner()));
+                    self.phase = SWEEP_MEMOS;
+                }
+                SWEEP_MEMOS => {
+                    // RIR and checked body ownership belong to the unit, not the off-lock front.
+                    // A busy checker only postpones shared memo-node reclamation.
+                    if let Some(_front) = front_try_write() {
+                        let (fns, pinned) = (&u.fns, &self.pinned);
+                        let eligible = |id: u32| {
+                            let f = &fns[id as usize];
+                            f.compiled && !f.inflight && f.rir.is_none() && !pinned.contains(&id)
+                        };
+                        // Lcx itself is stack-scoped and already gone. These are its retained memo results.
+                        u.coro_rir.retain_exclusive(|id, _| !eligible(*id));
+                        self.drops.retired_memos.push(u.unwind_drop_cache.detach());
+                        self.drops.retired_memos.push(u.unpin_cache.detach());
+                    } else {
+                        self.drops.front_pending = true;
+                    }
+                    // Force the existing TTL sweep now; never evict young speculative code or
+                    // change what MAKEPAD_RUN_SPEC_TTL_MS=0 means.
+                    if let Some((now, ttl)) = spec_expiry_due(&unit_session(up).options) {
+                        self.drops.retired_spec = expire_spec_now(now, ttl);
+                    }
+                    self.phase = SWEEP_DONE;
+                }
+                _ => return true,
             }
         }
     }
-    // aot: the slots whose callees are speculated after the burst keep their RIR until then
-    pinned.extend(AOT_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|x| x.0 == up as usize).map(|x| x.1));
-    // Queued jobs have not enumerated their inline snapshots yet. Their known RIR
-    // dependency graph is still pending input too; dropping it would make each queued
-    // caller recheck shared callees. The edges survive slot RIR eviction (warm rebuilds).
-    let mut pending: Vec<u32> = pinned.iter().copied().collect();
-    while let Some(id) = pending.pop() {
-        for &callee in &u.fns[id as usize].rir_refs {
-            if pinned.insert(callee) { pending.push(callee); }
-        }
-    }
-    for (id, f) in u.fns.iter().enumerate() {
-        if f.building {
-            pinned.insert(id as u32);
-            // prepare_rir records its callees before yielding between their builds, and
-            // snapshots their RIR only after that loop. Keep those not-yet-snapshotted inputs.
-            pinned.extend(f.calls.iter().copied());
-        }
-    }
-    for mut id in pinned.iter().copied().collect::<Vec<_>>() {
-        while let FnKey::Closure(_, _, parent) = u.fns[id as usize].key {
-            if parent == u32::MAX { break; }
-            pinned.insert(parent);
-            id = parent;
-        }
-    }
-    for (id, f) in u.fns.iter_mut().enumerate() {
-        if f.compiled && !f.inflight && !pinned.contains(&(id as u32)) {
-            // Arc snapshots remain valid even after the slot drops its ownership.
-            if let Some(r) = f.rir.take() {
-                drops.fns += 1;
-                drops.retired_rir.push(r);
-            }
-        }
-    }
-    let fns = &u.fns;
-    let eligible = |id: u32| {
-        let f = &fns[id as usize];
-        f.compiled && !f.inflight && f.rir.is_none() && !pinned.contains(&id)
-    };
-    let mut defs = crate::fxhash::HashSet::default();
-    for (id, f) in u.fns.iter().enumerate() {
-        if eligible(id as u32) {
-            if let FnKey::Inst(d, _) = &f.key { defs.insert(*d); }
-        }
-    }
-    // A polymorphic body is shared by all instances: keep it if any instance is pinned.
-    for (id, f) in u.fns.iter().enumerate() {
-        if !eligible(id as u32) {
-            if let FnKey::Inst(d, _) = &f.key { defs.remove(d); }
-        }
-    }
-    let before = crate::memstat::live_total();
-    // Current bodies can be checked again. Old file versions cannot: closures still refer to
-    // their original expression IDs, so keep old_bodies and any old-version current body.
-    let fns = &u.fns;
-    let prog = &u.prog;
-    u.bodies.retain(|id, b| {
-        let f = &fns[*id as usize];
-        !(f.compiled && !f.inflight && f.rir.is_none() && !pinned.contains(id) && prog.def(b.def).file == b.file)
-    });
-    u.bodies.shrink_to_fit();
-    *u.ctfe_fn_bodies.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
-    drops.typeck += freed_since(before);
-    // RIR and checked body ownership belong to the unit, not the off-lock front.
-    // A busy checker only postpones shared memo-node reclamation.
-    let Some(_front) = front_try_write() else {
-        drops.front_pending = true;
-        drops.max_sweep_ns = wall_ns().saturating_sub(started);
-        return drops;
-    };
-    let before = crate::memstat::live_total();
-    // Lcx itself is stack-scoped and already gone. These are its retained memo results.
-    u.coro_rir.retain_exclusive(|id, _| !eligible(*id));
-    u.unwind_drop_cache.retain_exclusive(|_, _| false);
-    u.unpin_cache.retain_exclusive(|_, _| false);
-    drops.lower = freed_since(before);
-    drop(active);
-    drop(queue);
-    // Force the existing TTL sweep now, under our reentrant unit lock; never evict young
-    // speculative code or change what MAKEPAD_RUN_SPEC_TTL_MS=0 means.
-    let before = crate::memstat::live_total();
-    expire_spec_in_publish(options);
-    drops.spec = freed_since(before);
-    drops.max_sweep_ns = wall_ns().saturating_sub(started);
-    drops
 }
 
 /// Type-checks, lowers and optimises a slot's function into `fns[id].rir`. An internal
@@ -21008,16 +21124,8 @@ pub fn spec_ttl_ns(options: &crate::options::Options) -> u64 {
 /// and compiles on its first call. Only when the unit lock is free right now (never waits).
 pub fn expire_spec(options: &crate::options::Options) {
     if let Some((now, ttl)) = spec_expiry_due(options) {
-        owner::publish(|| expire_spec_now(now, ttl));
-    }
-}
-
-/// `expire_spec` for a caller already on the owner inside a publish (settle_drop): the sweep
-/// runs in place. (A nested publish there broke rule I-PUB: the panic ended the run monitor, and
-/// with it every later settle, zone swap and trim -- Scope cold, 10 s after the present.)
-fn expire_spec_in_publish(options: &crate::options::Options) {
-    if let Some((now, ttl)) = spec_expiry_due(options) {
-        expire_spec_now(now, ttl);
+        // what it took is freed here, off the owner
+        drop(owner::publish(|| expire_spec_now(now, ttl)));
     }
 }
 
@@ -21040,11 +21148,13 @@ fn spec_expiry_due(options: &crate::options::Options) -> Option<(u64, u64)> {
     Some((now, ttl))
 }
 
-/// The sweep (on the owner): speculative code older than the TTL and never called goes.
-fn expire_spec_now(now: u64, ttl: u64) {
+/// The sweep (on the owner): speculative code older than the TTL and never called goes. What it
+/// takes from the slots comes back, to be freed off the owner.
+fn expire_spec_now(now: u64, ttl: u64) -> ExpiredSpec {
+    let mut out = ExpiredSpec::default();
     let up = SPEC_UNIT.load(Ordering::Acquire);
     if up.is_null() {
-        return;
+        return out;
     }
     let u = unsafe { &mut *up };
     let mut g = SPEC_BUILT.lock().unwrap();
@@ -21059,14 +21169,15 @@ fn expire_spec_now(now: u64, ttl: u64) {
             continue;
         }
         if let Some(spec) = f.spec.take() {
-            let SpecCode { code, map, relocs, .. } = *spec;
             u.reload_specs.remove(&id);
-            bytes += (std::mem::size_of::<SpecCode>() + code.capacity() + map.capacity() * 16 + relocs.capacity() * std::mem::size_of::<relax_backend::rir::RelocAt>()) as u64;
+            bytes += (std::mem::size_of::<SpecCode>() + spec.code.capacity() + spec.map.capacity() * 16 + spec.relocs.capacity() * std::mem::size_of::<relax_backend::rir::RelocAt>()) as u64;
+            out.code.push(spec);
             f.spec_state = 3;
             n += 1;
             if f.history().inlined_into.is_empty() {
                 if let Some(r) = f.rir.take() {
                     bytes += relax_codegen::opt::inst_count(&r) as u64 * 80;
+                    out.rir.push(r);
                 }
             }
         }
@@ -21074,6 +21185,7 @@ fn expire_spec_now(now: u64, ttl: u64) {
     g.drain(..cut);
     SPEC_EXPIRED[0].fetch_add(n, Ordering::Relaxed);
     SPEC_EXPIRED[1].fetch_add(bytes, Ordering::Relaxed);
+    out
 }
 
 fn spec_worker(runtime: &crate::options::RuntimeOptions) {
