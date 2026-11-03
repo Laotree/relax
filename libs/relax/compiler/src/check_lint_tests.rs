@@ -7,7 +7,8 @@
 const CHILD: &str = "RELAX_CHECK_LINT_CHILD";
 
 /// In the parent: runs the test `name` alone in a child and returns the warnings it printed, as
-/// "message [lint]" (no position). In the child: None (the caller checks the package).
+/// "message [lint]" (no position), and its errors, as "error: message [lint]". In the child: None
+/// (the caller checks the package).
 fn warnings_in_child(name: &str) -> Option<Vec<String>> {
     if std::env::var_os(CHILD).is_some() {
         return None;
@@ -20,7 +21,11 @@ fn warnings_in_child(name: &str) -> Option<Vec<String>> {
         .unwrap();
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}\n{stderr}");
-    let mut v: Vec<String> = stderr.lines().filter_map(|l| l.split_once(": warning: ").map(|(_, w)| w.to_string())).collect();
+    // (warnings go to stderr, errors to stdout)
+    let mut v: Vec<String> = stderr.lines().chain(stdout.lines()).filter_map(|l| match l.split_once(": warning: ") {
+        Some((_, w)) => Some(w.to_string()),
+        None => l.split_once(": error: ").map(|(_, e)| format!("error: {e}")),
+    }).collect();
     v.sort();
     Some(v)
 }
@@ -28,6 +33,11 @@ fn warnings_in_child(name: &str) -> Option<Vec<String>> {
 /// Checks the package of `lib` and the binary targets `bins` (crate `pkg` and `bin0`, `bin1`, ..),
 /// the library at the root, as `makepad check <package>` does; the check must pass.
 fn check_package(lib: &str, bins: &[&str]) {
+    assert_eq!(check_package_code(lib, bins), 0, "the check failed");
+}
+
+/// `check_package`'s check, returning its exit code.
+fn check_package_code(lib: &str, bins: &[&str]) -> i32 {
     crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
     std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     // `makepad check`'s session (run.rs): constants go through the check-mode interpreter first
@@ -68,7 +78,7 @@ fn check_package(lib: &str, bins: &[&str]) {
         std::fs::remove_file(f).unwrap();
     }
     std::fs::remove_dir(&dir).unwrap();
-    assert_eq!(code, 0, "the check failed");
+    code
 }
 
 /// WARNZERO class 6 (994 warnings in 24 packages: apps/flow's makepad-flow-server.rs:96, ai-llm's
@@ -229,4 +239,123 @@ fn a_macro_import_is_used_through_globs_paths_and_uses() {
     };
     let imports: Vec<&String> = warnings.iter().filter(|w| w.ends_with("[unused_imports]")).collect();
     assert_eq!(imports, ["unused import: `never` [unused_imports]"], "{warnings:?}");
+}
+
+/// WARNZERO (relax-compiler lower.rs, relax-types structural_traits.rs): a by-reference binding
+/// of a guarded arm (`ref x`, or `x` under a reference default binding mode) is bound before the
+/// guard, whose own local is a reference to it (rustc_mir_build bind_matched_candidate_for_guard),
+/// so it is read even when nothing names it; a by-value one, or one of an unguarded arm, is not.
+#[test]
+fn a_by_ref_binding_of_a_guarded_arm_is_read() {
+    let Some(warnings) = warnings_in_child("check_lint_tests::a_by_ref_binding_of_a_guarded_arm_is_read") else {
+        return check_package(r#"
+            pub enum Inst { Mov(u32, u32), Add(u32, u32, u32) }
+            pub struct S { pub a: u32, pub b: u32 }
+            pub fn by_ref(v: &[Inst], s: &S, t: &(String, u32), c: u32) -> u32 {
+                let mut n = 0;
+                for i in v {
+                    match i {
+                        Inst::Mov(d, x) if *x == c => {}
+                        Inst::Add(d, x, y) if *x == c => n += *y,
+                        _ => n += 1,
+                    }
+                }
+                n += match s { S { a: owner, b } if *b > 1 => 1, _ => 0 };
+                n + matches!(t, (name, x) if *x > 0) as u32
+            }
+            pub fn explicit_ref(t: (String, u32)) -> u32 { match t { (ref s, x) if x > 0 => 1, _ => 0 } }
+            pub fn by_value(t: (u32, u32), o: Option<String>) -> u32 {
+                let a = match t { (d, x) if x > 0 => 0, _ => 1 };
+                let b = match o { Some(s) if a > 0 => 1, _ => 0 };
+                a + b + matches!(t, (e, x) if x > 1) as u32
+            }
+            pub fn unguarded(v: &[Inst]) -> u32 { let mut n = 0; for i in v { if let Inst::Add(a, b, _) = i { n += *a; } } n }
+        "#, &[]);
+    };
+    assert_eq!(warnings, [
+        "unused variable: `b` [unused_variables]",
+        "unused variable: `d` [unused_variables]",
+        "unused variable: `e` [unused_variables]",
+        "unused variable: `s` [unused_variables]",
+    ]);
+}
+
+/// WARNZERO (csg_brep local_solve_nd.rs): a plain `let x = init;` is written where `init` makes
+/// its value, at each tail that does not diverge (rustc_mir_build expr_into_dest), so a dead
+/// initial value made inside an external macro (`vec![..]`) is no `unused_assignments`; one made
+/// by a call, or in a local macro, is.
+#[test]
+fn a_dead_initial_value_from_an_external_macro_is_not_reported() {
+    let Some(warnings) = warnings_in_child("check_lint_tests::a_dead_initial_value_from_an_external_macro_is_not_reported") else {
+        return check_package(r#"
+            macro_rules! fresh { () => { Vec::new() } }
+            pub fn external(n: usize, r: &[Result<Vec<f64>, u32>]) -> f64 {
+                let mut step = vec![0.0; n];
+                let mut acc = 0.0;
+                for e in r {
+                    match e { Ok(s) => step = s.clone(), Err(_) => break }
+                    acc += step[0];
+                }
+                acc
+            }
+            pub fn external_tails(c: bool, f: fn() -> Vec<u32>) -> usize { let mut v = if c { vec![1] } else { vec![] }; v = f(); v.len() }
+            pub fn mixed_tails(c: bool, f: fn() -> Vec<u32>) -> usize { let mut w = if c { vec![1] } else { Vec::new() }; w = f(); w.len() }
+            pub fn local_macro(f: fn() -> Vec<u32>) -> usize { let mut l: Vec<u32> = fresh!(); l = f(); l.len() }
+            pub fn plain(f: fn() -> String) -> usize { let mut s = String::new(); s = f(); s.len() }
+        "#, &[]);
+    };
+    assert_eq!(warnings, [
+        "value assigned to `l` is never read [unused_assignments]",
+        "value assigned to `s` is never read [unused_assignments]",
+        "value assigned to `w` is never read [unused_assignments]",
+    ]);
+}
+
+/// WARNZERO (midi_library vgm.rs): the bounds check of an array index reads the array
+/// (rustc_mir_build len_of_slice_or_array: FakeRead ForIndex), so a written array element makes
+/// the array used, and the write is dead only when nothing reads the array after it; a field
+/// write reads nothing.
+#[test]
+fn writing_an_array_element_reads_the_array() {
+    let Some(warnings) = warnings_in_child("check_lint_tests::writing_an_array_element_reads_the_array") else {
+        return check_package(r#"
+            pub fn in_loop(w: &[(u8, u8, u8)]) -> u32 {
+                let mut regs = [[0u8; 256]; 2];
+                let mut n = 0;
+                for &(p, r, v) in w { regs[p as usize][r as usize] = v; n += 1; }
+                n
+            }
+            pub fn last_write(i: usize) { let mut a = [0u32; 4]; a[i] = 5; }
+            pub fn last_add(i: usize) { let mut b = [0u32; 4]; b[i] += 1; }
+            pub fn field_write() { let mut t = (1u32, 2u32); t.0 = 5; }
+        "#, &[]);
+    };
+    assert_eq!(warnings, [
+        "value assigned to `a` is never read [unused_assignments]",
+        "value assigned to `b` is never read [unused_assignments]",
+        "value assigned to `t` is never read [unused_assignments]",
+        "variable `t` is assigned to, but never used [unused_variables]",
+    ]);
+}
+
+/// `let_underscore_lock` is deny-by-default (rustc_lint let_underscore.rs): a `_` anywhere in a
+/// `let` pattern, or in a destructuring assignment, that drops a guard (or a `Result` of one) at
+/// once fails the check; a named guard does not.
+#[test]
+fn a_lock_dropped_by_a_wildcard_fails_the_check() {
+    let Some(warnings) = warnings_in_child("check_lint_tests::a_lock_dropped_by_a_wildcard_fails_the_check") else {
+        return assert_eq!(check_package_code(r#"
+            use std::sync::{Mutex, RwLock};
+            pub fn locks(m: &Mutex<u32>, r: &RwLock<u32>) -> u32 {
+                let _ = m.lock().unwrap();
+                let _ = r.write();
+                let (_, x) = (m.lock().unwrap(), 7);
+                let y;
+                (_, y) = (r.read().unwrap(), 8);
+                let _held = m.lock().unwrap();
+                x + y
+            }
+        "#, &[]), 1);
+    };
+    assert_eq!(warnings, ["error: non-binding let on a synchronization lock [let_underscore_lock]"; 4]);
 }
