@@ -1746,6 +1746,36 @@ mod tests {
         assert!(APP_RAN.load(Ordering::SeqCst));
     }
 
+    /// M55 (makepad-sdf-engine's thin-wall tests on the Vulkan HAL, 2026-11-03): the owner,
+    /// computing the layout of `OnceLock<Result<Arc<Program>, String>>` for one request, waited in
+    /// a query and served a Job there that needed the same layout. The type layer's cycle guard is
+    /// per thread: the Job met the layout in progress, reported E0391 and got a zero-size one. A
+    /// served request has its own computations in progress (its frame); the request below keeps
+    /// its own.
+    #[test]
+    fn a_request_served_inside_a_wait_has_its_own_cycle_guards() {
+        isolated_test!(a_request_served_inside_a_wait_has_its_own_cycle_guards);
+        use relax_types::cycle::{enter, Kind};
+        // 0: not served yet, 1: the layout was free for it, 2: it was refused as a cycle
+        static JOB: AtomicU8 = AtomicU8::new(0);
+        call(Class::Program, || {
+            let _layout = enter(Kind::Layout, 7, 2).expect("nothing in progress yet");
+            let job = std::thread::spawn(|| {
+                while !OWNER_ASLEEP.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                call(Class::Job, || JOB.store(if enter(Kind::Layout, 7, 2).is_ok() { 1 } else { 2 }, Ordering::SeqCst));
+            });
+            pump_wait(&|| JOB.load(Ordering::SeqCst) != 0);
+            job.join().unwrap();
+            // this request's own re-entry is still a cycle
+            assert!(enter(Kind::Layout, 7, 2).is_err());
+        });
+        assert_eq!(JOB.load(Ordering::SeqCst), 1, "the served Job was refused the layout the request below was computing");
+        // and every guard ended with its request
+        assert!(call(Class::Program, || enter(Kind::Layout, 7, 2).is_ok()));
+    }
+
     /// makepad-fab-slice's tests with the dependency check beside them (2026-11-03): an ahead
     /// checker's constant (a Job) pumped on the owner, which served a dependency check's constant
     /// (a Job) inside it; that one waited for a query the ahead checker ran -- whose runner waited for
