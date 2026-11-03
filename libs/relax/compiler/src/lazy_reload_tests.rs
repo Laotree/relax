@@ -1623,3 +1623,72 @@ pub fn value(out: &mut u32) {
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// `--lib` tests of a package whose dev-dependency depends back on it (M50): the harness crate
+/// and the plain library the dependency links are two crates of one file. A live edit of that
+/// file patches both, so a call through the dependency runs the new body too.
+#[test]
+fn a_live_edit_reaches_both_crates_of_a_lib_test_root() {
+    const CHILD: &str = "MAKEPAD_RUN_TWIN_CRATE_EDIT_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::a_live_edit_reaches_both_crates_of_a_lib_test_root", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
+            .output().unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    use crate::reload::{apply, Edit, Rung};
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-twin-crate-edit-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("twinlib/src")).unwrap();
+    std::fs::create_dir_all(dir.join("twinuser/src")).unwrap();
+    let v1 = "pub fn f() -> u32 { 1 }\n#[cfg(test)]\npub fn value(out: &mut u32) { *out = f() * 100 + twinuser::through(); }\n";
+    std::fs::write(dir.join("twinlib/src/lib.rs"), v1).unwrap();
+    std::fs::write(dir.join("twinuser/src/lib.rs"), "pub fn through() -> u32 { twinlib::f() }\n").unwrap();
+    let lib = dir.join("twinlib/src/lib.rs").to_string_lossy().into_owned();
+    let user = dir.join("twinuser/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    crate::pmhost::install();
+    let mut prog = Program::new(&session);
+    let (core, std_deps) = crate::load_std_crates(&session, &mut prog).unwrap();
+    let plain = prog.load_crate_deferred("twinlib", &lib, 2021, crate::program_cfg(&session, &[]), std_deps.clone()).unwrap();
+    let mut deps = std_deps.clone();
+    deps.push((prog.syms.intern("twinlib"), plain));
+    let through = prog.load_crate_deferred("twinuser", &user, 2021, crate::program_cfg(&session, &[]), deps).unwrap();
+    let mut cfg = crate::program_cfg(&session, &[]);
+    cfg.set.push("test".to_string());
+    let mut deps = std_deps;
+    deps.push((prog.syms.intern("twinuser"), through));
+    let harness = prog.load_crate_deferred("twinlib", &lib, 2021, cfg, deps).unwrap();
+    prog.prelude_crate = Some(core);
+    prog.resolve_imports();
+    assert!(prog.errors.is_empty(), "{:?}", prog.errors);
+    crate::borrowck::event::set_app_scope(vec![lib.clone(), user.clone()]);
+    crate::layout::set_root_crate(harness);
+    crate::layout::LIVE_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
+    let value = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == harness && prog.name(id) == "value").then_some(id)
+    }).unwrap();
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let entry = crate::owner::call(crate::owner::Class::Program, || { let f = u.fn_id(crate::jit::FnKey::Inst(value, vec![])); u.entry(f) });
+    let run = || {
+        let mut result = 0u32;
+        unsafe { crate::jit::call_jit(up, entry, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        result
+    };
+    assert_eq!(run(), 101);
+    let file = u.prog.def(value).file;
+    let o = unsafe { apply(up, vec![Edit { file, path: lib.clone(), src: v1.replace("{ 1 }", "{ 2 }").into_bytes() }]) };
+    assert!(o.failure.is_none() && o.rung == Rung::Patch, "{:?}", o.lines);
+    // the harness copy's f and the plain copy's f (reached through twinuser) both changed
+    assert_eq!(run(), 202);
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}

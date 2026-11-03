@@ -1212,7 +1212,14 @@ impl Program {
 
     /// Current module versions, one per authored path (excluding deferred macro fragments).
     pub fn current_source_files(&self) -> std::collections::BTreeMap<String, u32> {
-        let mut files = std::collections::BTreeMap::new();
+        self.current_source_file_sets().into_iter().filter_map(|(path, files)| Some((path, *files.last()?))).collect()
+    }
+
+    /// `current_source_files` with every crate's file of a path, one per crate: a `--lib` test
+    /// root's harness crate and the plain library its dev-dependencies link are two crates of one
+    /// path (M50). The last is the one `current_source_files` names.
+    pub fn current_source_file_sets(&self) -> std::collections::BTreeMap<String, Vec<u32>> {
+        let mut files: std::collections::BTreeMap<String, Vec<u32>> = std::collections::BTreeMap::new();
         let mut bound = Vec::with_capacity(self.mods.len());
         for module in &self.mods {
             // Refused module additions keep their definitions for old compiler
@@ -1224,7 +1231,11 @@ impl Program {
             bound.push(live);
             if !live { continue; }
             if let Some(path) = self.file_paths.get(module.file as usize) {
-                files.insert(path.clone(), module.file);
+                // the last module of a path names its crate's file and orders it
+                let krate = self.file_crate.get(module.file as usize);
+                let of = files.entry(path.clone()).or_default();
+                of.retain(|&f| self.file_crate.get(f as usize) != krate);
+                of.push(module.file);
             }
         }
         files
