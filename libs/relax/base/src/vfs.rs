@@ -1121,6 +1121,51 @@ pub fn edited_disk_path(path: &str) -> Option<std::path::PathBuf> {
     (!rel.starts_with(".makepad-run-") && p.exists()).then_some(p)
 }
 
+/// The edits folder as one look found it: each file and folder in it (the run's own
+/// `.makepad-run-*` files left out) with its (modified time, length). A watcher's round that
+/// looks at every virtual file takes their stamps from it: one walk of the edits instead of a
+/// failing stat per unedited file (5,500 of them on a big app's every edit).
+pub struct EditsLook(BTreeMap<String, (std::time::SystemTime, u64)>);
+
+impl EditsLook {
+    /// The edits folder now; None without one.
+    pub fn now() -> Option<EditsLook> {
+        let dir = EDITS.read().unwrap().clone()?;
+        let mut found = BTreeMap::new();
+        let mut todo = vec![(dir, String::new())];
+        while let Some((at, rel)) = todo.pop() {
+            let Ok(entries) = std::fs::read_dir(&at) else { continue };
+            for e in entries.flatten() {
+                let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
+                if rel.is_empty() && name.starts_with(".makepad-run-") {
+                    continue;
+                }
+                let rel = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+                let Ok(m) = std::fs::metadata(e.path()) else { continue };
+                let Ok(modified) = m.modified() else { continue };
+                if m.is_dir() {
+                    todo.push((e.path(), rel.clone()));
+                }
+                found.insert(rel, (modified, m.len()));
+            }
+        }
+        Some(EditsLook(found))
+    }
+
+    /// Each edit in the folder: its place there (`edit_rel`) and its (modified time, length).
+    pub fn entries(&self) -> impl Iterator<Item = (&str, (std::time::SystemTime, u64))> {
+        self.0.iter().map(|(rel, stamp)| (rel.as_str(), *stamp))
+    }
+}
+
+/// Where an edit of virtual `path` sits in the edits folder (relative to it), as `EditsLook`
+/// lists it; None when it can have none there (a disk or frozen path, no edits folder, the run's
+/// own files).
+pub fn edit_rel(path: &str) -> Option<String> {
+    let (_, rel) = edit_path(path)?;
+    (!rel.is_empty() && !rel.starts_with(".makepad-run-")).then_some(rel)
+}
+
 /// Where an edit of `path` lives on disk (whether or not there is one yet): what a file watcher
 /// watches for a virtual file. None for a disk path or without an edits folder.
 pub fn edit_location(path: &str) -> Option<std::path::PathBuf> {
@@ -1332,6 +1377,33 @@ mod tests {
         assert_eq!(conflicts.len(), 1, "{conflicts:?}");
         assert!(conflicts[0].starts_with("app/b.rs"));
         assert_eq!(load_seeded(&edits).len(), 4);
+        set_edits(None);
+        MOUNTS.write().unwrap().retain(|m| m.root != normalize_path(root));
+        let _ = std::fs::remove_dir_all(&edits);
+    }
+
+    /// A watcher's look at the edits folder gives each virtual file the stamp a stat of its edit
+    /// gives (an edited file, an edited file in a new folder), and none to an unedited file or
+    /// to the run's own ledger.
+    #[test]
+    fn an_edits_look_stamps_each_virtual_file_as_its_stat_does() {
+        let _one = EDITS_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = test_store::Fixture::new(&[("app/a.rs", b"a"), ("app/b.rs", b"b")]);
+        let root = "/edits-look-test/vfs/m";
+        let edits = fixture.store.path.with_extension("look-edits");
+        mount(root, fixture.store.clone(), &fixture.commit).unwrap();
+        set_edits(Some(edits.clone()));
+        std::fs::write(prepare_edit(&format!("{root}/app/a.rs"), false).unwrap(), b"a2").unwrap();
+        std::fs::write(prepare_edit(&format!("{root}/app/new/c.rs"), false).unwrap(), b"c").unwrap();
+        let look = EditsLook::now().unwrap();
+        let found: BTreeMap<&str, _> = look.entries().collect();
+        let stat = |p: &str| edited_disk_path(p).and_then(|d| std::fs::metadata(d).ok()).map(|m| (m.modified().unwrap(), m.len()));
+        for p in ["app/a.rs", "app/new/c.rs", "app/b.rs", "app/none.rs", ".makepad-run-edits"] {
+            let p = format!("{root}/{p}");
+            assert_eq!(edit_rel(&p).and_then(|rel| found.get(rel.as_str()).copied()), stat(&p), "{p}");
+        }
+        assert!(stat(&format!("{root}/app/a.rs")).is_some() && stat(&format!("{root}/app/new/c.rs")).is_some());
+        assert!(stat(&format!("{root}/app/b.rs")).is_none());
         set_edits(None);
         MOUNTS.write().unwrap().retain(|m| m.root != normalize_path(root));
         let _ = std::fs::remove_dir_all(&edits);
