@@ -15087,12 +15087,11 @@ fn rt_loop_hot(counter: u64, fp: u64) {
         let st = (*rec.add(3)).load(Ordering::Relaxed);
         if st == T_FINAL {
             // a final slot's loop (SETTLE-TIER): word 4 is its last chunk's time. Two chunks closer
-            // than a chunk takes at the O3 threshold's rate: the loop turned hot, the slot counts
-            // again (this chunk charged below); slower, it stays final
+            // than a chunk takes at the rate its O3 decision needs (final_chunk_gap): the loop turned
+            // hot, the slot counts again (this chunk charged below); slower, it stays final
             let now = tier_clock();
             let last = (*rec.add(4)).swap(now, Ordering::Relaxed);
-            let at_threshold = (COST_HALF_LIFE_NS / std::f64::consts::LN_2 / LOOP_CHUNK_DIV as f64) as u64;
-            if now.saturating_sub(last) >= at_threshold || !settle_unfinal(u, id, threshold) {
+            if now.saturating_sub(last) >= final_chunk_gap(chunk) || !settle_unfinal(u, id, threshold) {
                 return;
             }
         } else if st == T_QUEUED {
@@ -15404,6 +15403,22 @@ mod tier_cost_tests {
             }
         }
         None
+    }
+
+    /// A final slot counts again for its loop only at the rate its O3 decision needs: without PGO
+    /// the threshold's rate, under PGO the counted window's bar (PGO_MIN_WORK RIR insts/s at
+    /// WORK_PER_UNIT per back edge), ~3x over it. A loop between the two used to count again and be
+    /// parked again after a counted build, on every warm launch.
+    #[test]
+    fn a_final_loop_counts_again_at_the_o3_bar() {
+        let chunk = tier_threshold(2000) / LOOP_CHUNK_DIV;
+        let at_threshold = (COST_HALF_LIFE_NS / std::f64::consts::LN_2 / LOOP_CHUNK_DIV as f64) as u64;
+        assert_eq!(final_chunk_gap_of(chunk, false), at_threshold);
+        let gap = final_chunk_gap_of(chunk, true);
+        let insts_per_s = chunk as f64 * WORK_PER_UNIT as f64 * 1e9 / gap as f64;
+        assert!((insts_per_s / PGO_MIN_WORK as f64 - 1.0).abs() < 0.01, "a chunk per gap is the PGO bar: {insts_per_s} insts/s");
+        assert!(at_threshold / 2 > gap, "a loop at twice the threshold's rate stays final under PGO (gap {gap} ns)");
+        assert!(at_threshold / 4 < gap, "one at four times it counts again (gap {gap} ns)");
     }
 
     /// The threshold is a rate: a steady rate over threshold x ln 2 / half-life tiers up, one under it
@@ -16510,6 +16525,9 @@ fn update_sampler_settled() -> bool {
     if settled != SAMPLER_SETTLED.load(Ordering::Relaxed) {
         SAMPLER_SETTLED.store(settled, Ordering::Relaxed);
         if settled && BUDGET_RUN.load(Ordering::Acquire) {
+            if makepad_cpu_budget::warming() && crate::run::VERBOSE.load(Ordering::Relaxed) {
+                eprintln!("makepad-run: the JIT settled: warm-up over at t={:.0} ms (3 s without a compile, an O3 push or an install)", crate::clock::ms_since_start());
+            }
             makepad_cpu_budget::end_warmup();
         }
         let ms = if settled { SETTLED_MS } else { SAMPLE_MS };
@@ -17131,6 +17149,7 @@ impl Unit {
                 panic!("makepad: a second unit with O3 in this process (tier-up state is per process): give every other unit `tier1 = None`");
             }
         }
+        PGO_DECIDES.store(pgo_on(&unsafe { unit_session(me) }.options), Ordering::Relaxed);
     }
 
     /// A counting slot (T_COUNTING) whose code `code` replaced the code its count stub jumps to: a
@@ -17254,6 +17273,7 @@ impl Unit {
                 panic!("makepad: a second unit with O3 in this process (tier-up state is per process): give every other unit `tier1 = None`");
             }
         }
+        PGO_DECIDES.store(pgo_on(&unsafe { unit_session(me) }.options), Ordering::Relaxed);
     }
 }
 
@@ -17374,6 +17394,29 @@ static COUNTING: relax_session::sync::Mutex<Vec<Counting>> = relax_session::sync
 /// The counted tier's measurement replaces the sampler's CPU samples, which made the same call
 /// ("many calls, little CPU: a O3 build would cost more than it saves").
 const PGO_MIN_WORK: u64 = 1_000_000;
+/// PGO decides O3 in this process (pgo_on of the tiering unit's options, set as it starts tiering):
+/// a final slot's loop is measured against PGO_MIN_WORK too (final_chunk_gap)
+static PGO_DECIDES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The longest gap between two loop chunks (`chunk` back edges each) of a final slot that makes it
+/// count again (rt_loop_hot): the time a chunk takes at the rate its O3 decision needs. That is the
+/// O3 threshold's rate, and under PGO the counted window's bar as well (PGO_MIN_WORK insts/s of its
+/// own work, WORK_PER_UNIT per back edge, as profiled_heat charges it): a loop under it would only be
+/// parked again in its counted code, after a counted build. With the threshold's rate alone (~3x
+/// under the PGO bar) a warm Fab launch counted again ~170 slots an earlier run had parked (their
+/// verdicts stored and linked final), 2-4 CPU-s of counted builds, each one parked again.
+fn final_chunk_gap(chunk: u64) -> u64 {
+    final_chunk_gap_of(chunk, PGO_DECIDES.load(Ordering::Relaxed))
+}
+
+fn final_chunk_gap_of(chunk: u64, pgo: bool) -> u64 {
+    let at_threshold = (COST_HALF_LIFE_NS / std::f64::consts::LN_2 / LOOP_CHUNK_DIV as f64) as u64;
+    if !pgo {
+        return at_threshold;
+    }
+    let at_pgo_bar = (chunk as u128 * WORK_PER_UNIT as u128 * 1_000_000_000 / PGO_MIN_WORK as u128).min(u64::MAX as u128) as u64;
+    at_threshold.min(at_pgo_bar)
+}
 /// counted windows that ended with too little work (parked instead of an O3 build)
 pub(crate) static PGO_PARKED: AtomicU64 = AtomicU64::new(0);
 const PGO_WORK_NS: u64 = 1_000_000_000;
