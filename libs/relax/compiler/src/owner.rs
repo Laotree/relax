@@ -897,7 +897,9 @@ pub fn queued_detail() -> String {
 pub fn main_wait_behind() -> String {
     match MAIN_WAIT_BEHIND.load(Ordering::Relaxed) {
         u64::MAX => "-".to_string(),
-        c => CLASS_NAMES[c as usize & 7].to_string(),
+        // (u8::MAX: the owner was idle when main's request was queued)
+        0xff => "idle".to_string(),
+        c => CLASS_NAMES[c as usize].to_string(),
     }
 }
 
