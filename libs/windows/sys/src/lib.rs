@@ -7481,6 +7481,7 @@ impl ::core::ops::BitAnd for DXGI_MEMORY_SEGMENT_GROUP { type Output = Self; fn 
 impl ::core::ops::BitXor for DXGI_MEMORY_SEGMENT_GROUP { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for DXGI_MEMORY_SEGMENT_GROUP { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 pub const DXGI_MEMORY_SEGMENT_GROUP_LOCAL: crate::Win32::Graphics::Dxgi::DXGI_MEMORY_SEGMENT_GROUP = crate::Win32::Graphics::Dxgi::DXGI_MEMORY_SEGMENT_GROUP(0i64 as _);
+pub const DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL: crate::Win32::Graphics::Dxgi::DXGI_MEMORY_SEGMENT_GROUP = crate::Win32::Graphics::Dxgi::DXGI_MEMORY_SEGMENT_GROUP(1i64 as _);
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DXGI_MODE_DESC1 {
