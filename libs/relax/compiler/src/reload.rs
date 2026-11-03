@@ -3473,6 +3473,19 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             carry_gandalf(u, from, &visible_crates, if full_inputs { None } else { Some(&files) });
         }
         unsafe { u.prog.reclaim_caches(); }
+        // the running enum variants and struct layouts come back with the versions, under the
+        // same write: a background type check reads them (and the declarations they publish)
+        for (d, n) in saved_variants {
+            u.prog.truncate_variants(d, n);
+        }
+        if !saved_adts.is_empty() {
+            for (d, a) in saved_adts {
+                u.tcx.adts.insert(d, a);
+            }
+            u.tcx.publish_collected();
+            u.lay.clear();
+            out.lines.retain(|l| !l.starts_with("field `"));
+        }
         drop(fw);
         jit::bump_patch_epoch();
         let mut invalidated = u.reload_rir.take().unwrap_or_default();
@@ -3503,17 +3516,6 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
         for k in saved_failed {
             u.const_failed.insert(k);
-        }
-        for (d, n) in saved_variants {
-            u.prog.truncate_variants(d, n);
-        }
-        if !saved_adts.is_empty() {
-            for (d, a) in saved_adts {
-                u.tcx.adts.insert(d, a);
-            }
-            u.tcx.publish_collected();
-            u.lay.clear();
-            out.lines.retain(|l| !l.starts_with("field `"));
         }
         out.rung = if as_restart { Rung::Restart } else { Rung::Refuse };
         out.lines.extend(errs);
