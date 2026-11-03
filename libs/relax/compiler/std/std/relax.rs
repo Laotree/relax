@@ -158,6 +158,7 @@ extern "C" {
     fn __relax_patched_files(since: u64, buf: *mut u8, cap: usize) -> usize;
     fn __relax_restored_state(buf: *mut u8, cap: usize) -> usize;
     fn __relax_restart_now(state: *const u8, len: usize);
+    fn __relax_hot_load_failed(why: *const u8, len: usize);
     fn __relax_live_stream(path: *const u8, plen: usize, text: *const u8, len: usize) -> u32;
     fn __relax_live_log(line: *const u8, len: usize);
     fn relax_store_file(u: *const u8, un: usize, c: *const u8, cn: usize, p: *const u8, pn: usize, out: *mut *const u8, out_len: *mut usize) -> u64;
@@ -371,6 +372,13 @@ pub fn patched_files(seen: &mut u64) -> crate::vec::Vec<String> {
 /// a directly running program replaces its process and returns only on failure.
 pub fn restart_now(state: &str) {
     unsafe { __relax_restart_now(state.as_ptr(), state.len()) }
+}
+
+/// Part of a live edit did not reach the running program: a value it built from the old code
+/// cannot take the new one. The edit counts as a failed hot load (recorded) and the app restarts
+/// with its state to apply it.
+pub fn hot_load_failed(why: &str) {
+    unsafe { __relax_hot_load_failed(why.as_ptr(), why.len()) }
 }
 
 /// The state the previous run passed to `restart_now`, if this run is such a restart.

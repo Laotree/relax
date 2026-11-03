@@ -3960,6 +3960,17 @@ pub extern "C" fn __relax_restored_state(buf: *mut u8, cap: usize) -> usize {
     })
 }
 
+/// The program found that part of a live edit did not reach it (std::relax::hot_load_failed: a
+/// value it built from the old code cannot take the new one). A failed hot load like a stale
+/// patch: recorded, and the restart with the app's state applies it.
+pub extern "C" fn __relax_hot_load_failed(why: *const u8, len: usize) {
+    crate::jit::host_boundary("__relax_hot_load_failed", move || {
+        let why = unsafe { if why.is_null() { String::new() } else { String::from_utf8_lossy(std::slice::from_raw_parts(why, len)).into_owned() } };
+        eprintln!("makepad live:   {why}");
+        recover_hot_failure(makepad_remote::hot::Outcome::StaleFrame, &[why], None);
+    })
+}
+
 /// A hosted app queues a fresh domain with this state and returns for cooperative shutdown.
 /// A directly running program writes MAKEPAD_RUN_RESTORE and replaces its process as before.
 pub extern "C" fn __relax_restart_now(state: *const u8, len: usize) {
@@ -4559,6 +4570,7 @@ pub fn restart_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_restart_reason" => __relax_restart_reason as *const () as usize,
         b"__relax_restored_state" => __relax_restored_state as *const () as usize,
         b"__relax_restart_now" => __relax_restart_now as *const () as usize,
+        b"__relax_hot_load_failed" => __relax_hot_load_failed as *const () as usize,
         b"__relax_live_stream" => __relax_live_stream as *const () as usize,
         b"__relax_live_log" => __relax_live_log as *const () as usize,
         _ => return crate::inspect::engine_req::symbol(name),
