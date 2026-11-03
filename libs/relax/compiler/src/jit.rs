@@ -416,10 +416,6 @@ pub struct Unit {
     pub unwind_drop_cache: crate::conc::MemoMap<TyId, bool>,
     /// (concrete type, dyn type) -> vtable address
     pub vtables: crate::conc::MemoMap<(TyId, TyId), u64>,
-    /// per slot: the trait-object types its code calls methods of through a vtable, as its lowering
-    /// found them (Lcx::dyn_calls) or its disk cache entry recorded them: real-time reach follows
-    /// every vtable of each, now and as new ones are made (realtime_refs, realtime_vtable)
-    pub dyn_calls: relax_session::sync::Mutex<crate::fxhash::HashMap<u32, Box<[TyId]>>>,
     /// static `Location` data per (file, line, col) (#[track_caller] arguments)
     pub locations: relax_session::sync::Mutex<crate::fxhash::HashMap<(String, u32, u32), u64>>,
     /// constants whose evaluation failed (reported once, not re-run per use)
@@ -3951,7 +3947,6 @@ impl Unit {
             coro_relower: Default::default(),
             unwind_drop_cache: Default::default(),
             vtables: crate::conc::MemoMap::new_kept(16),
-            dyn_calls: Default::default(),
             locations: Default::default(),
             const_failed: std::collections::HashSet::new(),
             core_path_cache: crate::conc::MemoMap::with_bits(8),
@@ -5320,22 +5315,6 @@ impl Unit {
         // compiled after the current request (realtime_drain)
         realtime_vtable(dy, a);
         Ok(a)
-    }
-
-    /// Slot `id`'s code calls methods of trait-object types `dyns` through their vtables (its
-    /// lowering's virtual calls, or what its cache entry recorded): the newest code's answer.
-    pub(crate) fn note_dyn_calls(&self, id: u32, dyns: Vec<TyId>) {
-        let mut m = self.dyn_calls.lock().unwrap_or_else(|e| e.into_inner());
-        if dyns.is_empty() {
-            m.remove(&id);
-        } else {
-            crate::zone_alloc::kept_with(|| m.insert(id, dyns.into_boxed_slice()));
-        }
-    }
-
-    /// The trait-object types slot `id`'s code calls through (note_dyn_calls).
-    pub(crate) fn dyn_calls_of(&self, id: u32) -> Vec<TyId> {
-        self.dyn_calls.lock().unwrap_or_else(|e| e.into_inner()).get(&id).map_or_else(Vec::new, |d| d.to_vec())
     }
 
     /// The reload index, built from the slots made so far on first use.
@@ -13345,7 +13324,6 @@ fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(re
     if let Err(e) = lcx.f.verify() {
         return Err(format!("RIR verify: {}\n{}", e, lcx.f.dump()));
     }
-    u.note_dyn_calls(id, std::mem::take(&mut lcx.dyn_calls));
     Ok((lcx.f, !lcx.new_closures.is_empty()))
 }
 
@@ -25582,17 +25560,21 @@ fn present_files() -> bool {
 // code such a thread runs (std::relax::realtime: the platform's audio seam marks the entry the HAL
 // calls and the app's callback); everything it can reach is then compiled on the owner thread
 // before the first call: direct calls, fn addresses taken, the functions constant data points at
-// (vtables, fn tables), the bodies inlined into it, and the methods (and drops) of every trait
-// object it calls through, as its lowering found them (Lcx::dyn_calls, kept in its disk cache
-// entry) -- the vtables that exist now and, as the program makes new ones of those types, those
-// too: a vtable made by any code (an unsizing anywhere) is pending the moment it is made, so the
-// strict ready is false until its methods are compiled. New code installed later for a slot of the set (an O2 or
+// (vtables, fn tables: also those of the trait objects it makes itself), the bodies inlined into
+// it, and the methods (and drops) of the trait objects it is handed: those its roots' values and
+// parameters hold (a field, a box, a vector's element, behind a pointer) -- every vtable of those
+// types that exists now and, as the program makes new ones, those too: a vtable made by any code
+// (an unsizing anywhere) is pending the moment it is made, so the strict ready is false until its
+// methods are compiled. A trait object real-time code only makes and passes itself (a formatter's
+// `dyn Write`, a `Once`'s `dyn FnMut`, a table's hasher) is not one of those: its vtables are the
+// ones its code names, never every vtable of its type (that is the whole program: every lazy
+// static's initializer, every thread's main). New code installed later for a slot of the set (an O2 or
 // O3 build, a verdict's rebuild that calls the verified bodies instead of their SPEC-V twins) has
 // its new callees walked too. The marking thread never waits for this: the reach runs in bounded
 // owner steps between the program's requests, and the mark's ticket says when it is done or has
 // waited long enough (RT_WAIT: the platform hands the HAL its audio entry then; audio never waits
 // longer for its code, what is still missing then compiles on its first call). The
-// slots this reaches and the trait-object types it calls through are recorded in the disk cache
+// slots this reaches and the trait-object types whose vtables it follows are recorded in the disk cache
 // (rt-<crate>.set) and compiled first at the next run's mark. A lazy compile a real-time thread still meets is reported, compiles everything
 // its slot reaches at once and is recorded too.
 
@@ -25617,7 +25599,7 @@ struct RealTime {
     /// slots reached, in order (what the disk cache records)
     set: Vec<u32>,
     seen: crate::fxhash::HashSet<u32>,
-    /// trait-object types real-time code calls through (TyId), and the vtables already followed
+    /// trait-object types real-time code is handed (TyId), and the vtables already followed
     dyns: crate::fxhash::HashSet<u32>,
     vtables: crate::fxhash::HashSet<u64>,
     /// the earlier runs' set was taken (into `link`)
@@ -25809,6 +25791,10 @@ unsafe fn realtime_mark(up: *mut Unit, root: u64, data: u64, meta: u64, ticket: 
         crate::syms::data_thunks(u, meta, &mut roots);
         values.extend(u.vtables.snapshot().into_iter().filter(|(_, a)| *a == meta).map(|((t, _), _)| t));
     }
+    // what the roots' callers pass them (FABARMS3's `run_until(&mut self, link: &mut dyn
+    // CellLink, ..)`: the planner's `Box<dyn Route>`, the link)
+    let params = realtime_root_params(u, &roots, &values);
+    values.extend(params);
     // the trait objects those values hold (fields, boxes, vectors, closures' captures): every
     // vtable of those types, now and as the program makes more, is real-time code too. Trait
     // objects the code only makes itself are followed through the vtables its code names.
@@ -25830,9 +25816,19 @@ unsafe fn realtime_mark(up: *mut Unit, root: u64, data: u64, meta: u64, ticket: 
 #[cfg(test)]
 pub(crate) unsafe fn realtime_mark_slots(up: *mut Unit, roots: Vec<u32>) -> u64 {
     let ticket = RT_TICKET.fetch_add(1, Ordering::AcqRel) + 1;
+    let dyns = realtime_value_dyns(&*up, &realtime_root_params(&*up, &roots, &[]));
     realtime_reach_queued(up, roots, "mark");
-    with_rt(|rt| rt.added = rt.added.max(ticket));
+    with_rt(|rt| {
+        rt.new_dyns.extend(dyns);
+        rt.added = rt.added.max(ticket);
+    });
     ticket
+}
+
+/// Whether the reach took slot `id` into the real-time set. (Unit tests.)
+#[cfg(test)]
+pub(crate) fn realtime_reached(id: u32) -> bool {
+    with_rt(|rt| rt.seen.contains(&id))
 }
 
 /// Adds `roots` to the reach and schedules its next owner step.
@@ -25882,7 +25878,7 @@ unsafe fn realtime_step(up: *mut Unit) {
         if rt_trace() {
             eprintln!("makepad-run rt: the earlier runs' set: {} keys, {} resolved, {} trait-object types", keys.len(), earlier.len(), dyns.len());
         }
-        // (linked slots are not walked: the types their code calls through are the set's)
+        // (linked slots are not walked: the trait-object types the reach followed are the set's)
         with_rt(|rt| {
             rt.link.extend(earlier.into_iter().rev());
             rt.new_dyns.extend(dyns.into_iter().map(|d| d.0).filter(|d| !rt.dyns.contains(d)));
@@ -25922,11 +25918,9 @@ unsafe fn realtime_step(up: *mut Unit) {
                 }
                 let lazy = (id as usize) < (&*up).fns.len() && !(&*up).fns[id as usize].compiled;
                 let partner = realtime_partner(&*up, id);
-                let dyns = (&*up).dyn_calls_of(id);
                 with_rt(|rt| {
                     if lazy { rt.failed.insert(id); } else { rt.failed.remove(&id); }
                     rt.todo.extend(partner);
-                    rt.new_dyns.extend(dyns.into_iter().map(|d| d.0).filter(|d| !rt.dyns.contains(d)));
                 });
             }
             Next::Walk(id) => {
@@ -25947,15 +25941,12 @@ unsafe fn realtime_step(up: *mut Unit) {
                 if !was && now {
                     compiled += 1;
                 }
-                // the trait objects its code calls through (a method, a drop): their vtables next
-                let dyns = (&*up).dyn_calls_of(id);
                 with_rt(|rt| {
                     if now { rt.failed.remove(&id); } else { rt.failed.insert(id); }
                     rt.todo.extend(slots);
-                    rt.new_dyns.extend(dyns.into_iter().map(|d| d.0).filter(|d| !rt.dyns.contains(d)));
                 });
             }
-            // trait-object types newly called through: every vtable of each, now and later
+            // trait-object types newly handed to real-time code: every vtable of each, now and later
             Next::Dyns(new_dyns) => {
                 let u = &*up;
                 // known first, then the vtables made so far: one made meanwhile (on another
@@ -25974,7 +25965,7 @@ unsafe fn realtime_step(up: *mut Unit) {
                             *by.entry(*d).or_default() += 1;
                         }
                         for (d, n) in by {
-                            eprintln!("makepad-run rt: trait objects `{}` called through: {} vtables followed", crate::typeck::ty_to_string(false, &u.prog, &u.tcx, TyId(d)), n);
+                            eprintln!("makepad-run rt: trait objects `{}` handed to real-time code: {} vtables followed", crate::typeck::ty_to_string(false, &u.prog, &u.tcx, TyId(d)), n);
                         }
                     }
                     // the values behind those vtables hold trait objects of their own
@@ -26091,6 +26082,34 @@ unsafe fn realtime_miss_caller(up: *mut Unit, id: u32, frames: &[u64]) {
         None => ("no JIT frame (called by host code)".to_string(), false),
     };
     eprintln!("makepad-run rt: miss `{}` called by {} (caller in the real-time set: {})", short_name(&u.fns[id as usize].name), who, if inset { "yes" } else { "no" });
+}
+
+/// The parameter types of the real-time roots: fn items' and methods' (slots `roots`), closures'
+/// and fn pointers' (values of `types`). Their callers are not real-time code: what they pass in is
+/// made elsewhere, and so are the trait objects it holds.
+fn realtime_root_params(u: &Unit, roots: &[u32], types: &[TyId]) -> Vec<TyId> {
+    let mut out = Vec::new();
+    for &id in roots {
+        if (id as usize) >= u.fns.len() {
+            continue;
+        }
+        if let FnKey::Inst(d, args) = &u.fns[id as usize].key {
+            if let Some(sig) = u.tcx.fn_sig(&u.prog, *d) {
+                out.extend(sig.params.iter().map(|p| u.tcx.tys.subst_erasing_regions(*p, args)));
+            }
+        }
+    }
+    for &t in types {
+        let sig = match u.tcx.tys.kind(t) {
+            TyKind::Closure(_, _, a) => a.closure_sig_as_fn_ptr_ty,
+            TyKind::FnPtr(..) => t,
+            _ => continue,
+        };
+        if let TyKind::FnPtr(ps, ..) = u.tcx.tys.kind(sig) {
+            out.extend_from_slice(u.tcx.tys.list(*ps));
+        }
+    }
+    out
 }
 
 /// The trait-object types values of `types` can hold: through struct, enum, tuple, array and slice
