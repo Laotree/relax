@@ -340,6 +340,9 @@ pub struct Unit {
     pub provided: Vec<(u32, crate::provided::ProvidedCrate)>,
     /// their opaque types: drop shim address (0: no drop)
     pub provided_types: HashMap<DefId, u64>,
+    /// their handle structs' field offsets as rustc lays them out, in declaration order (the
+    /// `#[relax_api(handle)]` entry): the fields JIT code may reach there (provided_handle_field)
+    pub provided_offsets: HashMap<DefId, &'static [u64]>,
     /// types whose values cross the provided-crate boundary (provided::crossing_types): worked out
     /// on the first query (`provided_shared`), which only a provided-crate misuse makes
     provided_shared: std::sync::OnceLock<std::collections::HashSet<TyId>>,
@@ -3928,6 +3931,7 @@ impl Unit {
         let provided = crate::zone_alloc::kept_with(|| crate::provided::take_for(&prog));
         let (provided_types, opaque_layouts, check_layouts, handles) = provided_type_tables(&prog, &provided);
         let provided_types = crate::zone_alloc::kept_clone(&provided_types);
+        let provided_offsets = crate::zone_alloc::kept_with(|| handles.iter().map(|(d, _, _, offs)| (*d, *offs)).collect::<HashMap<DefId, &'static [u64]>>());
         let slots = crate::zone_alloc::kept_with(|| {
             if no_codegen {
                 Box::new(relax_backend::rir::SlotTable::new(NC_STRIDE as u64, NC_STRIDE as u64, 8, TIER_REC as u64))
@@ -3953,6 +3957,7 @@ impl Unit {
             provided_shared: std::sync::OnceLock::new(),
             provided,
             provided_types,
+            provided_offsets,
             lay: { let mut l = crate::layout::Layouts::new(); l.opaque = opaque_layouts; l },
             fns: crate::conc::AppendVec::new_slots(u32::MAX as usize + 1),
             reload_slots: Default::default(),
@@ -4259,6 +4264,20 @@ impl Unit {
     /// are the same bytes on both sides.
     pub(crate) fn provided_rustc_layout(&self, d: DefId) -> bool {
         self.provided_types.contains_key(&d) && !self.lay.opaque.contains_key(&d)
+    }
+
+    /// Field `fi` (of type `ft`) of a provided crate's opaque handle struct `d`, as JIT-compiled
+    /// code may reach it (lower.rs project): rustc's offset of the field (the handle's entry),
+    /// when the field is the same bytes on both sides (provided::trusted: plain data, pointers to
+    /// the crate's values) or is itself a provided handle (a place: what JIT code does with it
+    /// goes through the crate's fns, or through this rule again). None: the field's bytes are
+    /// rustc's alone (its std's HashMap, Vec, ..): only the crate's fns read it. (A handle is
+    /// opaque as a whole when any field differs; compute_program's driver sets two bool fields
+    /// of ScriptVmBase, whose HashMap/Vec fields keep it opaque.)
+    pub(crate) fn provided_handle_field(&self, d: DefId, fi: u32, ft: TyId) -> Option<u32> {
+        let off = *self.provided_offsets.get(&d)?.get(fi as usize)?;
+        let handle = matches!(self.tcx.tys.kind(ft), TyKind::Adt(fd, a, _) if a.is_empty() && self.provided_types.contains_key(fd));
+        (handle || crate::provided::trusted(&self.prog, &self.tcx, self.prog.def(d).krate, ft, 0)).then_some(off as u32)
     }
 
         /// Does a value of type `t` cross the provided-crate boundary? Worked out for every provided
@@ -26757,6 +26776,7 @@ impl Unit {
         crate::zone_alloc::kept_with(|| {
             self.provided.extend(added.iter().cloned());
             self.provided_types.extend(types);
+            self.provided_offsets.extend(handles.iter().map(|(d, _, _, offs)| (*d, *offs)));
         });
         self.lay.opaque.extend(opaque);
         // rustc's layout must be Relax's for a plain type, else it is used through the crate's fns only

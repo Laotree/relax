@@ -574,10 +574,14 @@ impl<'a> Lcx<'a> {
 
     /// A field of a provided crate's type is read only when its layout is the same on both
     /// sides (provided.rs `trusted`, or a handle laid out as rustc does: Unit::provided_rustc_layout);
-    /// otherwise rustc's fields are the crate's business.
+    /// otherwise rustc's fields are the crate's business. An opaque handle's fields are decided
+    /// one by one where they are projected (`project`: Unit::provided_handle_field).
     fn check_provided_field(&mut self, t: TyId) {
         if let TyKind::Adt(d, _, _) = self.u.tcx.tys.kind(t) {
             let krate = self.u.prog.def(*d).krate;
+            if self.u.provided_types.contains_key(d) {
+                return;
+            }
             if self.u.provided.iter().any(|(k, _)| *k == krate) && !crate::provided::trusted(&self.u.prog, &self.u.tcx, krate, t, 0) && !self.u.provided_rustc_layout(*d) && !self.relax_only_instance(t) {
                 let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
                 self.provided_err(krate, format!("a field of `{}` is read from JIT-compiled code, but `{}` lives in a provided crate (built by rustc into the loader) and its layout is not C-shaped: call a method of the crate instead", ts, ts));
@@ -1613,20 +1617,29 @@ impl<'a> Lcx<'a> {
                 (storage.fields[fi as usize], l.fields[fi as usize], storage.fields.len())
             }
             TyKind::Tuple(v) if (fi as usize) < u.tcx.tys.list(*v).len() => (u.tcx.tys.list(*v)[fi as usize], l.fields.get(fi as usize).copied().unwrap_or(0), u.tcx.tys.list(*v).len()),
-            TyKind::Adt(d, args, _) => {
-                // an opaque type of a provided crate (rustc's layout, size only): every way of
-                // reaching a field -- `x.f`, a struct pattern, a derived or written impl body --
-                // ends here, so this is where it is refused (provided.rs)
-                if self.u.provided_types.contains_key(d) && !self.u.provided_rustc_layout(*d) {
-                    let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
-                    let krate = self.u.prog.def(*d).krate;
-                    self.provided_err(krate, format!("a field of `{}` is reached from JIT-compiled code (a field access, a pattern or a trait impl's body), but `{}` lives in a provided crate (built by rustc into the loader) and its layout is rustc's alone: call a fn of the crate, or route the impl to rustc's (jit.rs provided_fmt_hash)", ts, ts));
-                    // the fn fails with the error above; lowering goes on over a scratch place of
-                    // the field's type so nothing after it trips over a shapeless one
-                    let ft = self.u.tcx.adts.get(d).and_then(|a| a.variants.get(vi as usize)).and_then(|v| v.fields.get(fi as usize)).map(|_| self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), *d, vi, fi, self.u.tcx.tys.list(*args))).unwrap_or(self.u.tcx.tys.unit);
-                    let a = self.new_slot_for(ft);
-                    return (Place::Mem(a, 0), ft);
+            // an opaque type of a provided crate (rustc's layout, size only): every way of reaching
+            // a field -- `x.f`, a struct pattern, a derived or written impl body -- ends here. A
+            // handle struct's field that is the same bytes on both sides (or is itself a handle)
+            // is reached at rustc's offset (Unit::provided_handle_field); any other is refused
+            // here (provided.rs)
+            TyKind::Adt(d, args, _) if self.u.provided_types.contains_key(d) && !self.u.provided_rustc_layout(*d) => {
+                let fdef = self.u.tcx.adts.get(d).and_then(|a| a.variants.get(vi as usize)).and_then(|v| v.fields.get(fi as usize).map(|f| (f.name, v.fields.len())));
+                let ft = fdef.map(|_| self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), *d, vi, fi, self.u.tcx.tys.list(*args))).unwrap_or(self.u.tcx.tys.unit);
+                match (fdef, if vi == 0 { self.u.provided_handle_field(*d, fi, ft) } else { None }) {
+                    (Some((_, n)), Some(off)) => (ft, off, n),
+                    _ => {
+                        let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
+                        let fs = fdef.map_or(String::new(), |(name, _)| format!(" (`{}: {}`)", self.u.prog.syms.str(name), crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, ft)));
+                        let krate = self.u.prog.def(*d).krate;
+                        self.provided_err(krate, format!("a field of `{}`{} is reached from JIT-compiled code (a field access, a pattern or a trait impl's body), but `{}` lives in a provided crate (built by rustc into the loader) and that field's bytes are rustc's alone (only plain data, pointers and the crate's handles are reached at rustc's offsets): call a fn of the crate, or route the impl to rustc's (jit.rs provided_fmt_hash)", ts, fs, ts));
+                        // the fn fails with the error above; lowering goes on over a scratch place of
+                        // the field's type so nothing after it trips over a shapeless one
+                        let a = self.new_slot_for(ft);
+                        return (Place::Mem(a, 0), ft);
+                    }
                 }
+            }
+            TyKind::Adt(d, _, _) => {
                 let adt = self.u.tcx.adts.get(d).unwrap();
                 let var = &adt.variants[vi as usize];
                 let ft = var.fields.get(fi as usize).map(|_| field_ty(fi as usize));
