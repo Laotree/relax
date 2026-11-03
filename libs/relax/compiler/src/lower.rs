@@ -13708,7 +13708,7 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32) -> Result<(u32, u
         for i in &b.insts {
             match i {
                 Inst::Iconst(..) | Inst::Fconst(..) => {}
-                Inst::Mov(d, x) if *x == c.cx => {}
+                Inst::Mov(_, x) if *x == c.cx => {}
                 _ => {
                     uses_defs(i, &mut us, &mut ds);
                     for d in &ds {
