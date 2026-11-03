@@ -1289,7 +1289,7 @@ fn realtime_reach_skips_trait_objects_it_only_makes_itself() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// FABARMS3's misses on node (W1207: 24 lazy compiles on the real-time thread, drop glue of generic
+/// FABARMS3's misses on a node (W1207: 24 lazy compiles on the real-time thread, drop glue of generic
 /// containers and core::fmt's float path): code ran before the mark (the planner's simulation), so
 /// the reach found slots compiled already whose RIR was dropped after their install. A drop glue's
 /// references were never read again (only fns' RIR was rebuilt), and with a disk cache a lookup
@@ -1368,7 +1368,7 @@ fn realtime_reach_walks_code_that_ran_before_the_mark() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// What FABARMS3's misses on node (W1207) were, on a cold store: the marked root formats floats
+/// What FABARMS3's misses on a node (W1207) were, on a cold store: the marked root formats floats
 /// (core::fmt's float path is reached through the formatter fn pointer an `Argument` holds, data the
 /// reach reads) and drops containers (`Vec`, `vec::IntoIter`, `array::IntoIter`, `Weak`: drop glue
 /// of generic types). Nothing else ran before the mark: the reach alone compiles them, and the
@@ -1445,7 +1445,7 @@ fn realtime_reach_covers_float_formatting_and_container_drops() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// Fab's live edit on node (ICEs "key in collected table", "variance declaration"): a new module
+/// Fab's live edit on a node (ICEs "key in collected table", "variance declaration"): a new module
 /// file whose structs (a `#[cfg(relax)]` field of a std type among them) an existing struct holds
 /// in `Option` fields, filled through `get_or_insert_with`. The edit patches, the new code runs.
 #[test]

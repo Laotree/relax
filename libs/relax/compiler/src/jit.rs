@@ -21554,7 +21554,7 @@ fn resume_compile_jobs(_trace: bool) {
     BG_CV.notify_all();
     // requests other threads queued during the pause: the owner sleeps until woken (it served
     // only the pauser meanwhile), so a pause that ended without waking it left them queued until
-    // some later request came (a domain thread and a test hung node with the owner idle)
+    // some later request came (a domain thread and a test hung on a node with the owner idle)
     owner::resume();
     end_pause_turn();
 }

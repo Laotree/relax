@@ -148,7 +148,7 @@ pub fn report_failed(error: &str, code: i32) {
 /// the exit work every exit does runs (exit report, cache write, the session log's tee drained to
 /// the terminal: _exit alone lost the watchdog's last lines in the pipe), then the process ends.
 /// exit() would run the process's static destructors on this thread while main and the GPU
-/// driver's threads still run (a segfault in the driver on node).
+/// driver's threads still run (a segfault in the driver on a node).
 pub(crate) fn failed_run(why: &str) -> ! {
     use std::io::Write;
     report("error", why);
