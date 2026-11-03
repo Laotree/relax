@@ -1144,6 +1144,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mut watch_load_errors = Vec::new();
     let core;
     if let Some((restored_prog, restored_tcx, definitions)) = restored {
+        if collected_restored { jit::settle_rebuild::remember_restored(&restored_prog, &restored_tcx); }
         prog = restored_prog;
         for &ci in &order { if pre_index[ci] < restored_crates { crate_of[ci] = pre_index[ci] as u32; } }
         collected_tcx = Some(restored_tcx);
