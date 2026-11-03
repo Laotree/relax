@@ -4942,6 +4942,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     let mut startup_scan = true;
     let mut restart_required = false;
     let mut restart_message = String::new();
+    // the files of the edit a rebuild of makepad is for (a live test session's restart names them)
+    let mut host_edit: Vec<String> = Vec::new();
     let mut revision = 0;
     // the last two path parts say which crate and file
     let short = |p: &str| -> String { let v: Vec<&str> = p.rsplit('/').take(2).collect(); v.into_iter().rev().collect::<Vec<_>>().join("/") };
@@ -5013,6 +5015,13 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // finishes. In particular, do not acquire Reloading or drain streamed edits:
         // either can compete with the cold compiler before the first frame.
         if !crate::harness::live::enabled() && !jit::live_startup_done() { gate_note(2); continue; }
+        // a live test session's rebuilt makepad: the tests restart into it now, between runs
+        if let Some(why) = host::take_harness_restart() {
+            let group = crate::owner::call(crate::owner::Class::Program, || (*up).begin_patch());
+            crate::harness::live::restart(crate::harness::live::Edit {
+                paths: std::mem::take(&mut host_edit), group, compile_ms: None, restarted: true, changed: None,
+            }, &why);
+        }
         // Once the tree no longer matches this session, later saves must not patch a
         // mixture of revisions into the old process. A fresh run restores live editing.
         if restart_required {
@@ -5284,7 +5293,10 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             let why = format!("{} {what} changed ({}{}): {reason}", changed.len(), names.join(", "), if changed.len() > 3 { ", ..." } else { "" });
             match host::request(why.clone(), inputs.process_paths()) {
                 Ok(()) => {
-                    if !crate::harness::live::enabled() { patch_refused_event(&why, false, std::slice::from_ref(&why)); }
+                    // answered at once (a restart follows the build); the build's end answers
+                    // again: refused with its errors, no change, or the restart into it
+                    patch_refused_event(&why, false, std::slice::from_ref(&why));
+                    host_edit = changed.iter().map(|&k| files[k].0.clone()).collect();
                     for &k in &changed { files[k].2 = settled_stamps[k]; }
                     continue;
                 }

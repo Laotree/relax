@@ -228,6 +228,14 @@ struct Handover {
 
 static HANDOVER: Mutex<Option<Handover>> = Mutex::new(None);
 
+/// A live test session's rebuilt makepad (the reason): the watcher restarts the tests into it
+/// between runs, as for any edit that needs a restart (`take_harness_restart`).
+static HARNESS_RESTART: Mutex<Option<String>> = Mutex::new(None);
+
+pub(super) fn take_harness_restart() -> Option<String> {
+    HARNESS_RESTART.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
 /// The person asked for the restart, and its binary had to be built again first (sources changed
 /// before it): the restart follows the build without asking again.
 static RESTART_AFTER_BUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -283,7 +291,11 @@ fn fail(message: String) {
     st.since = Some(Instant::now());
     st.failed = message.clone();
     let update = st.provided.is_some();
+    let why = st.why.clone();
     drop(st);
+    // the edit's last verdict: refused, saying what failed (a build's first error lines)
+    let lines: Vec<String> = message.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    super::patch_refused_event(&why, true, &lines);
     // A boot waiting for this update has no running app's ring yet. Show a genuine rebuild
     // failure in its run view too, retaining the update button so the person can retry.
     if update {
@@ -339,7 +351,10 @@ fn build_loop() {
         if STATE.lock().unwrap_or_else(|e| e.into_inner()).provided.is_none()
             && LOADED.get().copied().flatten().is_some_and(|id| identity(&loader).is_some_and(|now| now == id)) {
             eprintln!("makepad live: {why}: makepad is unchanged (built in {secs:.0} s); no restart");
-            super::patch_verified_event(&why, 0, &[]);
+            let what = "rebuild produced no change: cargo left the makepad this process runs as it was (the edit is not in what makepad is built from, or was undone)".to_string();
+            // a live test session's tests already ran on this binary: no run answers it but this
+            if crate::harness::live::enabled() { super::patch_refused_event(&why, true, std::slice::from_ref(&what)); }
+            else { super::patch_verified_event(&format!("{why}: {what}"), 0, &[]); }
             super::live_log(&format!("{{\"event\":\"host_rebuild\",\"ok\":true,\"s\":{secs:.1},\"unchanged\":true}}"));
             let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
             if st.again { drop(st); continue; }
@@ -358,6 +373,13 @@ fn build_loop() {
             RESTART_AFTER_BUILD.swap(false, std::sync::atomic::Ordering::SeqCst)
         };
         let reason = format!("makepad was rebuilt ({why})");
+        // a live test session restarts its tests into it at once (its verdict: the restarted run)
+        if crate::harness::live::enabled() {
+            eprintln!("makepad live: makepad rebuilt in {secs:.0} s; the tests restart into it");
+            *HARNESS_RESTART.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
+            super::watch_events::kick();
+            return;
+        }
         if !asked {
             // a running app restarts into it when the person says so (`session relaunch`)
             *super::RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()) = reason.clone();
