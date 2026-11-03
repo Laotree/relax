@@ -1556,3 +1556,70 @@ impl RtPath {
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A live edit that renames a struct field finds the fns using it from the field uses typeck
+/// resolved. A generic fn whose body names the old field's name (`window`'s local `plans`, fab
+/// slice's `FieldPlans::window`) is read as typeck left it: instantiating it at its own
+/// parameters for codegen has no answer (`<impl IntoIterator as IntoIterator>::IntoIter`), and
+/// the edit failed as an internal compiler error (NoSolution).
+#[test]
+fn a_renamed_field_reads_generic_fns_as_typeck_left_them() {
+    const CHILD: &str = "MAKEPAD_RUN_RENAMED_FIELD_EDIT_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::a_renamed_field_reads_generic_fns_as_typeck_left_them", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
+            .output().unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    use crate::reload::{apply, Edit, Rung};
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-renamed-field-edit-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    let v1 = r#"pub struct Boundary { pub plans: bool }
+pub fn window(layers: impl IntoIterator<Item = u32>) -> u32 {
+    let mut plans = 0;
+    for l in layers { plans += l; }
+    plans
+}
+pub fn value(out: &mut u32) {
+    let b = Boundary { plans: true };
+    *out = if b.plans { window([1u32, 2, 3]) } else { 0 };
+}
+"#;
+    let v2 = v1.replace("pub plans: bool", "pub ready: bool").replace("Boundary { plans: true }", "Boundary { ready: true }")
+        .replace("if b.plans { window([1u32, 2, 3]) }", "if b.ready { window([1u32, 2, 3]) + 10 }");
+    std::fs::write(dir.join("app/src/lib.rs"), v1).unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "renamed_field_edit_app", false).unwrap();
+    crate::borrowck::event::set_app_scope(vec![app.clone()]);
+    crate::layout::set_root_crate(app_crate);
+    crate::layout::LIVE_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
+    let value = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == "value").then_some(id)
+    }).unwrap();
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let entry = crate::owner::call(crate::owner::Class::Program, || { let f = u.fn_id(crate::jit::FnKey::Inst(value, vec![])); u.entry(f) });
+    let run = || {
+        let mut result = 0u32;
+        unsafe { crate::jit::call_jit(up, entry, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        result
+    };
+    assert_eq!(run(), 6);
+    let file = u.prog.def(value).file;
+    let o = unsafe { apply(up, vec![Edit { file, path: app.clone(), src: v2.into_bytes() }]) };
+    assert!(o.failure.is_none() && o.rung == Rung::Patch, "{:?}", o.lines);
+    assert_eq!(run(), 16);
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}

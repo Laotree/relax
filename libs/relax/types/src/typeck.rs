@@ -555,7 +555,14 @@ pub struct Fcx<'a> {
 /// as rustc_codegen_ssa::mir::FunctionCx::monomorphize does. Analysis consumers
 /// requesting fully normalized tables use instantiate_body instead.
 pub fn codegen_body(prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> std::sync::Arc<Body> {
-    try_codegen_body(prog, tcx, def, args).expect("failed to normalize body for codegen")
+    try_codegen_body(prog, tcx, def, args).unwrap_or_else(|| no_codegen_body(prog, tcx, def, args))
+}
+
+/// The instance names itself: an ICE (a live edit's above all) says which body did not normalize.
+#[cold]
+fn no_codegen_body(prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> ! {
+    let args: Vec<String> = args.iter().map(|&t| type_name(prog, tcx, t)).collect();
+    panic!("failed to normalize body for codegen: NoSolution: {} [{}]", prog.def_path(def), args.join(", "))
 }
 
 /// codegen_body for a caller that has a fallback: an instance whose types do not normalize
@@ -583,7 +590,7 @@ pub fn checked_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def:
 }
 
 pub fn instantiate_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Body {
-    try_instantiate_body(cx, prog, tcx, def, args).expect("failed to normalize body for codegen")
+    try_instantiate_body(cx, prog, tcx, def, args).unwrap_or_else(|_| no_codegen_body(prog, tcx, def, args))
 }
 
 /// rustc_middle/src/ty/normalize_erasing_regions.rs:172-186: normalization failure
