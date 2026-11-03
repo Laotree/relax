@@ -174,6 +174,8 @@ mod native {
         fn FSEventStreamStop(stream: Stream);
         fn FSEventStreamInvalidate(stream: Stream);
         fn FSEventStreamRelease(stream: Stream);
+        #[cfg(test)]
+        fn FSEventStreamFlushSync(stream: Stream);
     }
     // libdispatch is part of libSystem
     unsafe extern "C" {
@@ -295,6 +297,12 @@ mod native {
             };
             *g = false;
         }
+        /// Every event of the file operations made so far delivered (FSEvents reports them a
+        /// moment later): what a test asserts on is the state after them, not a wait.
+        #[cfg(test)]
+        pub fn flush(&mut self) {
+            unsafe { FSEventStreamFlushSync(self.stream) }
+        }
         /// None means events may have been lost: stat every source this round.
         pub fn changed(&mut self) -> Option<Vec<usize>> {
             let shared = unsafe { &*self.shared };
@@ -344,28 +352,48 @@ mod native {
         own_index: Option<usize>,
         /// lowercase names of missing folders on the way to watched files (`nearest_existing`)
         appears: std::collections::HashSet<String>,
+        /// a read was issued (one that failed to issue has no packet to come)
+        armed: bool,
     }
     impl Dir {
         fn arm(&mut self) -> bool {
             self.overlapped = Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event: 0 };
             let len = std::mem::size_of_val(&self.buf) as u32;
-            unsafe { ReadDirectoryChangesW(self.handle, self.buf.as_mut_ptr().cast(), len, 0, FILTER, std::ptr::null_mut(), &mut self.overlapped, std::ptr::null_mut()) != 0 }
+            self.armed = unsafe { ReadDirectoryChangesW(self.handle, self.buf.as_mut_ptr().cast(), len, 0, FILTER, std::ptr::null_mut(), &mut self.overlapped, std::ptr::null_mut()) != 0 };
+            self.armed
         }
     }
     impl Drop for Dir {
         fn drop(&mut self) {
             unsafe {
-                let mut bytes = 0;
-                // wait for the cancelled read so the kernel no longer writes into the box
-                if CancelIoEx(self.handle, &mut self.overlapped) != 0 { GetOverlappedResult(self.handle, &mut self.overlapped, &mut bytes, 1); }
+                // A read on a handle of the port completes -- its status and its notifications
+                // written into this box -- only when a thread takes its packet from the port, so
+                // nothing signals the handle meanwhile (waiting on it hung a watch's drop for
+                // good). An outstanding read is cancelled and its packet taken here before the
+                // box goes. One watcher thread waits on the port, so no other thread takes it;
+                // the other packets taken meanwhile only wake: one kick passes them on.
+                if self.armed && std::ptr::read_volatile(&self.overlapped.internal) == STATUS_PENDING {
+                    CancelIoEx(self.handle, &mut self.overlapped);
+                    let own: *const Overlapped = &self.overlapped;
+                    let mut entries: [OverlappedEntry; 64] = std::mem::zeroed();
+                    let mut removed = 0u32;
+                    let mut others = false;
+                    while std::ptr::read_volatile(&self.overlapped.internal) == STATUS_PENDING
+                        && GetQueuedCompletionStatusEx(port(), entries.as_mut_ptr(), entries.len() as u32, &mut removed, u32::MAX, 0) != 0
+                    {
+                        others |= entries[..removed as usize].iter().any(|e| e.overlapped.cast_const() != own);
+                    }
+                    if others { kick(); }
+                }
                 CloseHandle(self.handle);
             }
         }
     }
     pub struct Watch { dirs: Vec<Box<Dir>> }
     /// The process's completion port (0: none could be made; `wait` then polls every 5 ms). Its
-    /// packets only wake `wait`: what completed is read from each directory's OVERLAPPED, so the
-    /// cancelled reads of a watch that was replaced are harmless wakes.
+    /// packets only wake `wait`: what completed is read from each directory's OVERLAPPED once its
+    /// packet was taken. One thread waits on it (the live watcher's), which a dropped directory
+    /// relies on to take its own cancelled read's packet.
     fn port() -> HANDLE {
         static PORT: std::sync::OnceLock<HANDLE> = std::sync::OnceLock::new();
         // INVALID_HANDLE_VALUE: a new port, one concurrent thread
@@ -396,7 +424,7 @@ mod native {
                     unsafe { CloseHandle(handle) };
                     return Ok(None);
                 }
-                let mut entry = Box::new(Dir { handle, overlapped: Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event: 0 }, buf: [0; 16384], names: HashMap::new(), own_index: None, appears: Default::default() });
+                let mut entry = Box::new(Dir { handle, overlapped: Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event: 0 }, buf: [0; 16384], names: HashMap::new(), own_index: None, appears: Default::default(), armed: false });
                 Ok(entry.arm().then_some(entry))
             };
             // a missing directory's key maps to usize::MAX
@@ -450,6 +478,23 @@ mod native {
                 ms = 0;
             }
         }
+        /// What the file operations made so far reported, every read they completed taken: a
+        /// read completes during the operation, a re-armed one at once with what came meanwhile,
+        /// so the port then holds no packet. For tests: the state after the operations, no wait.
+        #[cfg(test)]
+        pub fn settled(&mut self) -> Option<Vec<usize>> {
+            let mut seen = Vec::new();
+            loop {
+                let mut entries: [OverlappedEntry; 64] = unsafe { std::mem::zeroed() };
+                let mut removed = 0u32;
+                let took = unsafe { GetQueuedCompletionStatusEx(port(), entries.as_mut_ptr(), entries.len() as u32, &mut removed, 0, 0) } != 0;
+                seen.extend(self.changed()?);
+                if !took { break; }
+            }
+            seen.sort_unstable();
+            seen.dedup();
+            Some(seen)
+        }
         /// None means events may have been lost: stat every source this round.
         pub fn changed(&mut self) -> Option<Vec<usize>> {
             let mut changed = Vec::new();
@@ -501,44 +546,51 @@ pub use native::Watch;
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 mod tests {
-    /// On Windows a read's completion reaches its OVERLAPPED only once `wait` dequeues its
-    /// packet, as the live loop's `wait` does before `changed` (here without sleeping).
-    fn drain(watch: &mut super::Watch) -> Option<Vec<usize>> {
-        if cfg!(windows) { watch.wait(Some(std::time::Duration::ZERO)); }
-        watch.changed()
+    /// On Windows the tests share the process's completion port, on macOS the wake flag: one
+    /// watcher at a time, as in the live loop (a dropped Windows watch takes its own packets).
+    fn one_watcher() -> std::sync::MutexGuard<'static, ()> {
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ONE.lock().unwrap_or_else(|e| e.into_inner())
     }
-    /// inotify is read synchronously; FSEvents and ReadDirectoryChangesW deliver a moment later.
+    /// What the watch reports for the file operations made so far (None: events lost). inotify
+    /// and ReadDirectoryChangesW report an operation before it returns (on Windows a read's
+    /// completion reaches it once its packet is taken: `settled`); FSEvents a moment later, all
+    /// of it once flushed. An empty answer is the state "no event after the write", not a wait.
     fn next(watch: &mut super::Watch) -> Option<Vec<usize>> {
-        let start = std::time::Instant::now();
-        let mut seen = Vec::new();
-        loop {
-            seen.extend(drain(watch)?);
-            if !seen.is_empty() || cfg!(target_os = "linux") || start.elapsed().as_secs() >= 2 {
-                // events of one save may span drains
-                std::thread::sleep(std::time::Duration::from_millis(if cfg!(target_os = "linux") { 0 } else { 50 }));
-                seen.extend(drain(watch)?);
-                seen.sort_unstable();
-                seen.dedup();
-                return Some(seen);
+        #[cfg(windows)]
+        return watch.settled();
+        #[cfg(not(windows))]
+        {
+            #[cfg(target_os = "macos")]
+            watch.flush();
+            let mut seen = Vec::new();
+            loop {
+                let got = watch.changed()?;
+                if got.is_empty() { break; }
+                seen.extend(got);
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            seen.sort_unstable();
+            seen.dedup();
+            Some(seen)
         }
     }
     #[test]
     fn directory_inputs_observe_new_sources() {
+        let _one = one_watcher();
         let dir = std::env::temp_dir().join(format!("relax-notify-add-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let source = dir.join("existing.rs");
         let added = dir.join("added.rs");
         std::fs::write(&source, "old").unwrap();
         let mut watch = super::Watch::new([dir.to_str().unwrap(), source.to_str().unwrap()].into_iter()).unwrap();
-        if !cfg!(target_os = "linux") {
+        if cfg!(target_os = "macos") {
             std::thread::sleep(std::time::Duration::from_millis(300));
-            drain(&mut watch);
+            next(&mut watch);
         }
         std::fs::write(&added, "new").unwrap();
         // A lost-event rescan is also sufficient: the directory's stamp changed.
-        assert!(next(&mut watch).is_none_or(|ids| ids.contains(&0)));
+        let seen = next(&mut watch);
+        assert!(seen.as_ref().is_none_or(|ids| ids.contains(&0)), "no event for the directory after a file was added: {seen:?}");
         drop(watch);
         std::fs::remove_file(source).unwrap();
         std::fs::remove_file(added).unwrap();
@@ -547,6 +599,7 @@ mod tests {
 
     #[test]
     fn notifications_survive_atomic_save_and_filter_unrelated_names() {
+        let _one = one_watcher();
         let dir = std::env::temp_dir().join(format!("relax-notify-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let source = dir.join("source.rs");
@@ -555,28 +608,27 @@ mod tests {
         std::fs::write(&source, "old").unwrap();
         let new_watch = || super::Watch::new(std::iter::once(source.to_str().unwrap())).unwrap();
         let mut watch = new_watch();
-        if !cfg!(target_os = "linux") {
+        if cfg!(target_os = "macos") {
             // FSEvents may still deliver the writes made just before the stream started (fseventsd
             // had not processed them yet): the file's (a stray stat) or the fresh directory's own
             // (None: events may be lost, and the caller rebuilds the watch -- as here)
             for _ in 0..5 {
                 std::thread::sleep(std::time::Duration::from_millis(300));
-                if drain(&mut watch).is_some() { break; }
+                if next(&mut watch).is_some() { break; }
                 watch = new_watch();
             }
         }
         std::fs::write(&unrelated, "unrelated").unwrap();
-        if !cfg!(target_os = "linux") { std::thread::sleep(std::time::Duration::from_millis(300)); }
-        assert_eq!(drain(&mut watch), Some(vec![]));
+        assert_eq!(next(&mut watch), Some(vec![]), "an unwatched name in the folder reported");
         for text in ["first", "second"] {
             std::fs::write(&temporary, text).unwrap();
             std::fs::rename(&temporary, &source).unwrap();
-            assert_eq!(next(&mut watch), Some(vec![0]));
+            assert_eq!(next(&mut watch), Some(vec![0]), "no event after the atomic save of {text:?}");
         }
         std::fs::write(&source, "direct").unwrap();
-        assert_eq!(next(&mut watch), Some(vec![0]));
+        assert_eq!(next(&mut watch), Some(vec![0]), "no event after the write");
         std::fs::remove_file(&source).unwrap();
-        assert_eq!(next(&mut watch), Some(vec![0]));
+        assert_eq!(next(&mut watch), Some(vec![0]), "no event after the delete");
         drop(watch);
         std::fs::remove_file(unrelated).unwrap();
         std::fs::remove_dir(dir).unwrap();
@@ -587,22 +639,18 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn moving_the_watched_directory_loses_events() {
+        let _one = one_watcher();
         let base = std::env::temp_dir().join(format!("relax-notify-move-{}", std::process::id()));
         let dir = base.join("src");
         std::fs::create_dir_all(&dir).unwrap();
         let source = dir.join("source.rs");
         std::fs::write(&source, "old").unwrap();
         let mut watch = super::Watch::new(std::iter::once(source.to_str().unwrap())).unwrap();
-        if !cfg!(target_os = "linux") { std::thread::sleep(std::time::Duration::from_millis(300)); drain(&mut watch); }
+        if cfg!(target_os = "macos") { std::thread::sleep(std::time::Duration::from_millis(300)); next(&mut watch); }
         let moved = base.join("moved");
         std::fs::rename(&dir, &moved).unwrap();
-        let start = std::time::Instant::now();
-        let mut lost = false;
-        while start.elapsed().as_secs() < 2 {
-            if drain(&mut watch).is_none() { lost = true; break; }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        assert!(lost);
+        let seen = next(&mut watch);
+        assert!(seen.is_none(), "no lost-events report after the watched folder moved: {seen:?}");
         drop(watch);
         std::fs::remove_file(moved.join("source.rs")).unwrap();
         std::fs::remove_dir(&moved).unwrap();
@@ -613,6 +661,7 @@ mod tests {
     /// rebuilds the watch, which then covers the new folder.
     #[test]
     fn a_missing_folder_keeps_the_watch_and_its_return_loses_events() {
+        let _one = one_watcher();
         let dir = std::env::temp_dir().join(format!("relax-notify-missing-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let source = dir.join("source.rs");
@@ -621,24 +670,19 @@ mod tests {
         let inside = gone.join("deeper").join("inside.rs");
         let new_watch = || super::Watch::new([source.to_str().unwrap(), inside.to_str().unwrap()].into_iter()).unwrap();
         let mut watch = new_watch();
-        if !cfg!(target_os = "linux") {
+        if cfg!(target_os = "macos") {
             // FSEvents may still deliver the fresh directory's own creation (see above)
             for _ in 0..5 {
                 std::thread::sleep(std::time::Duration::from_millis(300));
-                if drain(&mut watch).is_some() { break; }
+                if next(&mut watch).is_some() { break; }
                 watch = new_watch();
             }
         }
         std::fs::write(&source, "new").unwrap();
-        assert_eq!(next(&mut watch), Some(vec![0]));
+        assert_eq!(next(&mut watch), Some(vec![0]), "no event after the write beside a missing folder");
         std::fs::create_dir(&gone).unwrap();
-        let start = std::time::Instant::now();
-        let mut lost = false;
-        while start.elapsed().as_secs() < 2 {
-            if drain(&mut watch).is_none() { lost = true; break; }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        assert!(lost);
+        let seen = next(&mut watch);
+        assert!(seen.is_none(), "no lost-events report after the missing folder came back: {seen:?}");
         drop(watch);
         std::fs::remove_dir(&gone).unwrap();
         std::fs::remove_file(&source).unwrap();
