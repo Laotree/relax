@@ -298,13 +298,6 @@ pub struct Options {
     /// signaling NaN) stay ops. Compute kernels set it: their results are bit-specified (the
     /// interpreter's), and Rust leaves the payload unspecified, so Relax's tiers fold them.
     pub nan_exact: bool,
-    /// `MAKEPAD_RUN_O3_PROFILE`; default `None`. Deterministic O3: a missing/empty file records the
-    /// run's O3 decisions (each installed build's inputs and inline set), a recorded one replays them
-    /// strictly (only its slots build O3 code, each once at its first call; its O2 slots get O2 builds);
-    /// both runs are check-first and have no baseline tier (MAKEPAD_RUN_O1=0).
-    pub tier1_profile: Option<std::ffi::OsString>,
-    /// Profile replay contents frozen by the driver, separately from its environment path.
-    pub tier1_profile_data: Option<String>,
     /// `--cfg <name>` / `--cfg name="value"` of `makepad run|check` (what `RUSTFLAGS=--cfg` is to
     /// cargo), as `name` / `name=value` entries added to the cfg set the program is read with.
     pub cfgs: Vec<String>,
@@ -392,8 +385,6 @@ impl Default for Options {
             const_fuel: false,
             ra_quick_coalesce: false,
             nan_exact: false,
-            tier1_profile: None,
-            tier1_profile_data: None,
             cfgs: Vec::new(),
             target: String::new(),
             cpu: CpuFeatures::default(),
@@ -501,8 +492,6 @@ impl Options {
             ctfe: { let os = get("MAKEPAD_RUN_CTFE"); let v = os.and_then(|v| v.into_string().ok()); match v.as_deref() { Some("0") => Ctfe::Off, Some("check") => Ctfe::Check, _ => Ctfe::On } },
             ra_quick_coalesce: false,
             nan_exact: false,
-            tier1_profile: { let os = get("MAKEPAD_RUN_O3_PROFILE"); os },
-            tier1_profile_data: None,
             cfgs: Vec::new(),
             target: String::new(),
             cpu: CpuFeatures::default(),
@@ -595,8 +584,7 @@ impl Options {
             const_fuel,
             ra_quick_coalesce,
             nan_exact,
-            tier1_profile,
-            tier1_profile_data, cfgs, target, cpu,
+            cfgs, target, cpu,
         } = self;
         let mut h = Sip128::new();
         h.str("relax-options-v1");
@@ -758,9 +746,6 @@ impl Options {
             h.str("nan_exact");
             h.u8(1);
         }
-        h.str("o3_profile");
-        match tier1_profile { Some(v) => { h.u8(1); h.u64(v.as_encoded_bytes().len() as u64); h.write(v.as_encoded_bytes()); }, None => h.u8(0) }
-        match tier1_profile_data { Some(v) => { h.u8(1); h.str(v); }, None => h.u8(0) }
         h.str(target);
         let CpuFeatures { avx, bmi2, popcnt, lzcnt, bmi1, fma, avx2, avx512 } = cpu;
         for b in [avx, bmi2, popcnt, lzcnt, bmi1, fma, avx2, avx512] { h.u8(*b as u8); }
@@ -916,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn q2_options_hash_effective_cpu_target_and_replay_contents() {
+    fn q2_options_hash_effective_cpu_and_target() {
         let base = Options::default();
         let fingerprint = base.fingerprint();
         let mut changed = base.clone();
@@ -927,11 +912,6 @@ mod tests {
         assert_ne!(fingerprint, changed.fingerprint());
         changed = base.clone();
         changed.target = "x86_64-pc-windows-gnu".to_string();
-        assert_ne!(fingerprint, changed.fingerprint());
-        changed = base.clone();
-        changed.tier1_profile_data = Some("record".to_string());
-        assert_ne!(fingerprint, changed.fingerprint());
-        changed.tier1_profile_data = Some("other record".to_string());
         assert_ne!(fingerprint, changed.fingerprint());
         assert_eq!(base.fingerprint(), base.clone().fingerprint());
     }
@@ -944,7 +924,6 @@ mod tests {
         assert!(!opts.no_avx);
         assert!(opts.no_simd);
         assert!(opts.live_stream);
-        assert!(opts.tier1_profile.is_some());
         assert!(opts.derives);
         assert_eq!(opts.core_hint, None);
     }
