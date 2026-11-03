@@ -2300,7 +2300,6 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, sources: &[Edit], partial:
             let cur = snap(&edits);
             (edits, cur)
         });
-        let mut stale = 0;
         loop {
             let (macro_table, epoch, snapshots) = cur;
             // Only owned snapshots are reachable here; never retain a Unit/Program reference
@@ -2316,10 +2315,9 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, sources: &[Edit], partial:
                     drop(macro_table); // allow commit's Arc::make_mut to update an unshared table
                     return Ok(apply_locked(up, edits, pre, t0, partial, 8, module, &base));
                 }
-                stale += 1;
-                if stale == 3 {
-                    return Ok(Outcome { failure: None, kept: 0, pending: false, rung: Rung::Refuse, files: files.clone(), lines: vec!["program context changed while parsing -- retry the edit; running code is unchanged".into()], names: Vec::new(), changed: 0, test_changes: None, group: 0, ms: [ms(t0), 0.0, 0.0, 0.0], undo: None, work: [0; 5] });
-                }
+                // a module load or a rollback moved the program while this parsed: parse again
+                // against it. Each pass follows such a move, and loads end (the parse itself
+                // moves nothing), so the edit applies once they do instead of being refused.
                 let cur = snap(&edits);
                 Err((edits, cur))
             });
@@ -5477,9 +5475,6 @@ impl Ledger {
     }
 }
 
-/// A source that could not be read, or a refused edit's quiet retry, is looked at again this
-/// much later.
-const LIVE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 /// Stillness, not an overall deadline: a busy checkout can take as long as it needs. Also the
 /// stat poll of a watch without native file events.
 const LIVE_QUIET: std::time::Duration = std::time::Duration::from_millis(100);
@@ -5615,11 +5610,13 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         }
     };
     // Refused texts stay pending until a batch containing them applies, or they
-    // return to their running text. Every tree change retries the entire set.
-    // One quiet retry also handles a save whose last notification preceded its
-    // final write; a persistent source error then waits for the next change.
+    // return to their running text. Every tree change retries the entire set, and
+    // nothing else does: a batch's inputs are its files, so an unchanged tree
+    // compiles the same verdict (no timer; at rest the watch makes no wakeup).
     let mut stalled: std::collections::HashMap<usize, (Vec<u8>, Vec<String>)> = std::collections::HashMap::new();
-    let mut retry_at: Option<Instant> = None;
+    // one more round at once, whatever the events say: a write resumed while the batch was read,
+    // or files moved outside a dock app's sync
+    let mut again = false;
     // installed patches whose landing is checked once LANDING has passed: (when, patch group, the edit)
     let mut landing: Vec<(Instant, u32, String)> = Vec::new();
     let mut last_scan = Instant::now();
@@ -5655,14 +5652,15 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // native file events: sleep on them while nothing else is in flight (startup, a domain
         // loading, verdicts pending, an open stream); else the 5 ms poll. Every other input wakes
         // it (watch_events::kick: a streamed edit, a domain's inputs, the post-boot loader's files,
-        // a late include, the startup's end, an unpin, a recovery); a timeout only for what is
-        // due (a retry, a landing check, the startup scan). At rest it makes no system call.
+        // a late include, the startup's end, an unpin, a recovery, a disarmed real-time root); a
+        // timeout only for what is due (a landing check, the startup scan). At rest it makes no
+        // system call.
         let quiet = (crate::harness::live::enabled() || jit::live_startup_done()) && !DOMAIN_LOADING.load(std::sync::atomic::Ordering::Acquire)
             && pending.is_empty() && !streams_busy(up);
         match events.as_mut() {
             Some(w) if quiet => {
-                let next = retry_at.iter().map(|t| t.saturating_duration_since(Instant::now()))
-                    .chain(landing.iter().map(|l| l.0.saturating_duration_since(Instant::now())))
+                let next = again.then_some(std::time::Duration::ZERO)
+                    .into_iter().chain(landing.iter().map(|l| l.0.saturating_duration_since(Instant::now())))
                     .chain(startup_scan.then_some(STARTUP_SCAN_LOOK)).min();
                 w.wait(next.map(|t| t.max(std::time::Duration::from_millis(5))));
             }
@@ -5691,7 +5689,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             repositories.include(files.iter().map(|f| f.0.as_str()));
             hot.clear();
             stalled.clear();
-            retry_at = None;
+            again = false;
             undos.clear();
             restart_required = false;
             restart_message.clear();
@@ -5805,7 +5803,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // a sync moved the dock app's checkout: every file is compared with what runs
         let synced = dock.as_mut().is_some_and(DockGate::synced);
         let caught_up = CATCH_UP.swap(false, std::sync::atomic::Ordering::AcqRel);
-        let retry_due = retry_at.is_some_and(|t| t <= Instant::now()) || RETRY_NOW.swap(false, std::sync::atomic::Ordering::AcqRel);
+        let retry_due = std::mem::take(&mut again) | RETRY_NOW.swap(false, std::sync::atomic::Ordering::AcqRel);
         let all = lost || rewatched || synced || caught_up || retry_due
             || (events.is_none() && last_scan.elapsed() >= LIVE_QUIET);
         if rewatched || synced || virt.is.len() != files.len() { virt = Virtual::of(&files); }
@@ -5828,7 +5826,6 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         if changed.is_empty() && !quiet_retry {
             continue;
         }
-        retry_at = None;
         changed.extend(stalled.keys().copied());
         changed.sort_unstable();
         changed.dedup();
@@ -5837,7 +5834,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             // a hand edit): held, the app keeps running the synced code; the next sync applies
             // whatever the files say then
             // (its revision moved meanwhile: the next round is the sync's, at once)
-            if gate.held(changed.iter().map(|&k| files[k].0.as_str())) { retry_at = Some(Instant::now()); }
+            if gate.held(changed.iter().map(|&k| files[k].0.as_str())) { again = true; }
             continue;
         }
         let seen = std::time::Instant::now();
@@ -6068,12 +6065,13 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             }
             let src = match stalled.get(&k).filter(|_| current == f.2).map(|(src, _)| Ok(src.clone())).unwrap_or_else(|| crate::vfs::read(&f.0)) {
                 Ok(s) => s,
-                Err(_) => {
-                    // A removed module can be unbound by its parent's edit.
-                    // A file that still exists but cannot be read must never
-                    // turn a multi-file batch into a partial transaction.
-                    read_failed |= current.is_some();
-                    if current.is_none() { f.2 = current; }
+                Err(e) => {
+                    // A removed module can be unbound by its parent's edit: a file gone from disk,
+                    // or a mounted store's file whose edit was taken back and that the store
+                    // lacks (its stamp is the store's, its read finds nothing). A file that still
+                    // exists but cannot be read must never turn a multi-file batch into a partial
+                    // transaction: the batch waits for that file's next change (its stamp kept).
+                    if current.is_none() || e.kind() == std::io::ErrorKind::NotFound { f.2 = current; } else { read_failed = true; }
                     continue;
                 }
             };
@@ -6096,7 +6094,6 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             }
         }
         if read_failed {
-            retry_at = Some(Instant::now() + LIVE_RETRY);
             continue;
         }
         if !moved.is_empty() {
@@ -6133,7 +6130,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // collect its next batch before compiling or requesting a recovery.
         let look = Look::new();
         if files.iter().enumerate().map(|(k, f)| look.stamp(&virt, k, &f.0)).ne(settled_stamps.iter().copied()) || repositories.snapshot() != git_state {
-            retry_at = Some(Instant::now());
+            again = true;
             continue;
         }
         trace_input(watch_ms, (read_started - seen).as_secs_f64() * 1000., ms(read_started), scanned);
@@ -6163,9 +6160,12 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             eprintln!("makepad live: {}: NOT applied (errors below); the app runs the previous code", what);
             for l in &o.lines { eprintln!("makepad live:   {}", l); }
             patch_refused_event(&what, true, &o.lines);
+            // An unchanged tree compiles the same verdict again: a failure of makepad itself
+            // recovers now, the edit's own errors wait for the tree's next change. A tree that
+            // moved while this compiled has that move's events queued: their round retries it.
             let look = Look::new();
             let unchanged = files.iter().enumerate().map(|(k, f)| look.stamp(&virt, k, &f.0)).eq(settled_stamps.iter().copied()) && repositories.snapshot() == git_state;
-            if quiet_retry && unchanged {
+            if unchanged {
                 if let Some(failure) = failure {
                     drop(_reloading);
                     if crate::harness::live::enabled() {
@@ -6178,8 +6178,6 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                         }
                     } else { recover_hot_failure(failure, &o.lines, None); }
                 }
-            } else {
-                retry_at = Some(Instant::now() + LIVE_RETRY);
             }
             continue;
         }
