@@ -2140,14 +2140,20 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, sources: &[Edit], partial:
             // under the lock, before the parse snapshot and the pairing against the running version.
             let edits: Vec<Edit> = {
                 let prog = &(*up).prog;
-                let current = (!module).then(|| prog.current_source_files());
-                edits.into_iter().map(|mut e| {
-                    if let Some(current) = &current {
-                        let path = &prog.file_paths[e.file as usize];
-                        if let Some(&file) = current.get(path) { e.file = file; }
+                let current = (!module).then(|| prog.current_source_file_sets());
+                // every crate's copy of the file takes the edit: a --lib test root's harness crate
+                // and the plain library its dev-dependencies link (M50). The other copies follow
+                // the edits as given, whose outcome files stay at their positions.
+                let mut twins = Vec::new();
+                let mut out: Vec<Edit> = edits.into_iter().map(|mut e| {
+                    if let Some((&last, others)) = current.as_ref().and_then(|c| c.get(&prog.file_paths[e.file as usize])).and_then(|f| f.split_last()) {
+                        e.file = last;
+                        twins.extend(others.iter().map(|&file| Edit { file, path: e.path.clone(), src: e.src.clone() }));
                     }
                     e
-                }).collect()
+                }).collect();
+                out.append(&mut twins);
+                out
             };
             let cur = snap(&edits);
             (edits, cur)
