@@ -673,9 +673,38 @@ fn vectorize_stream_maps(f: &mut Func) -> bool {
             bad |= uses.iter().any(|v| (v.0 as usize) < nv && defined[v.0 as usize] && !inputs[v.0 as usize] && !redefined[v.0 as usize]);
             if bad { continue 'candidate; }
         }
+        // entry: one guard's run length against a vector's elements, so a short run (the common
+        // entry of a loop over a few elements) goes to the scalar loop after two instructions;
+        // guard: every check (any one failing also leaves for the scalar loop); body: the vector loop
         let entry = f.blocks.len() as u32;
-        let body = entry + 1;
+        let guard = entry + 1;
+        let body = entry + 2;
         let pos = f.blocks[head as usize].term_pos;
+        let mut pre = Vec::new();
+        let long = f.vreg(Cls::I);
+        if let Some(&(p, oa, e, _)) = end_guards.first() {
+            // bytes (an index: elements) left to `e`, `oa` of them ahead of the entry value
+            let step = if walkers.contains(&p) { sz } else { 1 };
+            let left = f.vreg(Cls::I);
+            pre.push(Inst::IBin(IOp::Sub, U64_TY, left, e, p));
+            pre.push(Inst::ICmpI(Cond::Ge, false, long, left, (lanes + oa / step) * step));
+        } else if let Some(&(c, o)) = zero_guards.iter().find(|g| counts.contains(&g.0)) {
+            pre.push(Inst::ICmpI(Cond::Ge, false, long, c, lanes + (-o).max(0)));
+        } else if let Some(&(iv, o, nb, _)) = lt_guards.first() {
+            let n = match nb {
+                Bound::Reg(r) => r,
+                Bound::Imm(k) => {
+                    let n = f.vreg(Cls::I);
+                    pre.push(Inst::Iconst(n, k));
+                    n
+                }
+            };
+            let left = f.vreg(Cls::I);
+            pre.push(Inst::IBin(IOp::Sub, U64_TY, left, n, iv));
+            pre.push(Inst::ICmpI(Cond::Ge, false, long, left, lanes + o.max(0)));
+        } else {
+            pre.push(Inst::Iconst(long, 1));
+        }
         let trip = f.vreg(Cls::I);
         let mut init = vec![Inst::Iconst(trip, -1)];
         let min_into = |f: &mut Func, init: &mut Vec<Inst>, trip: VReg, c: VReg| {
@@ -867,6 +896,7 @@ fn vectorize_stream_maps(f: &mut Func) -> bool {
                 block.term.map_succs(|s| if s == head { entry } else { s });
             }
         }
+        f.blocks.push(Block { pos: vec![pos; pre.len()], insts: pre, term: Term::Branch(long, guard, head), term_pos: pos, count: -1.0 });
         f.blocks.push(Block { pos: vec![pos; init.len()], insts: init, term: Term::Branch(ok, body, head), term_pos: pos, count: -1.0 });
         f.blocks.push(Block { pos: vec![pos; wide.len()], insts: wide, term: Term::Branch(again, body, head), term_pos: pos, count: -1.0 });
         for (done, member) in transformed.iter_mut().zip(&members) { *done |= *member; }
