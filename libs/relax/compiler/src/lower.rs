@@ -3539,9 +3539,9 @@ impl<'a> Lcx<'a> {
             let sig = self.u.tcx.fn_sig(&self.u.prog, next).cloned();
             match sig {
                 Some(sig) => {
-                    let x = self.u.tcx.tys.subst_erasing_regions(sig.ret, &nargs);
+                    let x = self.u.tcx.tys.subst(sig.ret, &nargs);
                     let u = self.u;
-                    u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), x)
+                    u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), x)
                 }
                 None => self.u.tcx.tys.error,
             }

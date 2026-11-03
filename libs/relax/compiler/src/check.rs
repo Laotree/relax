@@ -1273,8 +1273,8 @@ fn mono_check(up: *mut Unit, own: &[bool], root: u32) {
                     if let Some(sig) = uu.tcx.fn_sig(&uu.prog, d).cloned() {
                         let env = crate::tcx::TypingEnv::fully_monomorphized(&uu.prog);
                         for t in sig.params.iter().chain(std::iter::once(&sig.ret)) {
-                            let t = uu.tcx.tys.subst_erasing_regions(*t, &args);
-                            let Ok(t) = uu.tcx.try_normalize_erasing_regions(&uu.prog, env, t) else { return true };
+                            let t = uu.tcx.tys.subst(*t, &args);
+                            let Ok(t) = uu.tcx.try_normalize_erasing_late_bound_regions(&uu.prog, env, t) else { return true };
                             if uu.tcx.is_coroutine(t) { continue; }
                             if uu.layout_of(t).size > (1 << 28) { return true; }
                         }
