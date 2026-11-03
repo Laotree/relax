@@ -2219,7 +2219,6 @@ pub struct MainHost {
     pub run: fn(Box<dyn FnMut() -> i32 + Send>) -> i32,
     pub open: fn(&str, &str) -> Result<(), String>,
     pub start: fn(crate::domain::AppSpec) -> Result<(), String>,
-    pub relaunch: fn() -> Result<(), String>,
 }
 
 static MAIN_HOST: std::sync::OnceLock<MainHost> = std::sync::OnceLock::new();
@@ -2341,12 +2340,6 @@ pub fn set_app_domain(id: u32) { APP_DOMAIN.store(id, Ordering::Release); }
 pub fn app_domain() -> Option<u32> {
     let id = APP_DOMAIN.load(Ordering::Acquire);
     (id != 0).then_some(id)
-}
-
-/// All whole-app restart requests use the native host's existing HAL domain relaunch path.
-pub fn relaunch() -> Result<(), String> {
-    if app_domain().is_none() { return Err("no hosted app domain is running".into()); }
-    (MAIN_HOST.get().ok_or("no run host")?.relaunch)()
 }
 
 /// Registers the host for programs that link the HAL (once, before `cmd_run`).

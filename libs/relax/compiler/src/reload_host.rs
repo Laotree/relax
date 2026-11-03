@@ -272,9 +272,7 @@ fn apply_ready(why: String) -> Result<&'static str, String> {
         return super::restart_in_place(why);
     }
     let h = take().ok_or("the rebuilt makepad is not ready")?;
-    // A domain may already have saved its state and stopped before discovering the mismatch.
-    let state = super::DOMAIN_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    restart(h, state.as_deref().map(str::as_bytes));
+    restart(h, None);
     Ok("restart into the rebuilt makepad")
 }
 

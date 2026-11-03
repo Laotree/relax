@@ -24759,6 +24759,8 @@ pub(crate) unsafe fn preserve_closure_bodies(up: *mut Unit, files: &[u32]) -> Re
         for &file in files {
             for &d in u.prog.defs_in_file(file) {
                 let mut d = DefId(d);
+                // an async fn's body is a closure of its own (its coroutine)
+                if u.tcx.async_fns.contains_key(&d) { holders.insert(d, file); }
                 if u.prog.def(d).kind != DefKind::Closure { continue; }
                 while u.prog.def(d).kind == DefKind::Closure { d = u.prog.def(d).parent; }
                 holders.insert(d, file);
@@ -24801,9 +24803,9 @@ pub(crate) unsafe fn preserve_closure_bodies(up: *mut Unit, files: &[u32]) -> Re
         };
         // The environments this version gives its closures, recorded now while it is current: a
         // closure of it may be laid out first after the edit, also when no body of this version
-        // was lowered in this run (code from the disk cache, or an owner that never ran).
+        // was lowered in this run (code from the disk cache, or an owner that never ran). An async
+        // fn's body (its coroutine) is one of them.
         let storages: Vec<(u32, crate::layout::ClosureStorage)> = body.min_captures.keys()
-            .filter(|ce| *ce & crate::tcx::ASYNC_FN_BODY == 0)
             .map(|&ce| (ce, crate::layout::ClosureStorage::for_codegen(&u.prog, &u.tcx, &body, ce)))
             .collect();
         u.lay.note_closure_storages(&u.prog, &u.tcx, &body, storages.iter().map(|(ce, s)| (*ce, s)));

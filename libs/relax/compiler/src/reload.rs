@@ -2123,7 +2123,7 @@ pub unsafe fn apply_update(up: *mut Unit, edits: Vec<Edit>) -> Outcome {
     // A disk save/checkout is one transaction, including on retry. Never install
     // a parseable subset of a tree that is still being written.
     let out = apply_mode(up, edits, &sources, 0, false);
-    crate::hot_failure::classified(&out.lines, out.rung == Rung::Restart && out.failure.is_none());
+    crate::hot_failure::classified(&out.lines);
     if out.rung == Rung::Patch { crate::hot_failure::applied(out.group); }
     out
 }
@@ -2161,8 +2161,8 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, sources: &[Edit], partial:
     }
     // an internal compiler panic in the transaction refuses the edit with its message. Nothing
     // undoes what the transaction had changed of the program by then (its file versions, defs,
-    // query inputs), so the unit is marked suspect: the recovery is a fresh process
-    // (mark_unit_suspect), never a relaunch on this unit.
+    // query inputs), so the unit is marked suspect: no edit applies to it again, and the
+    // recovery is a fresh process (mark_unit_suspect).
     let r = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // takes the parse snapshots of the edits (under the unit call)
         let snap = |edits: &[Edit]| {
@@ -3192,13 +3192,35 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // has real errors (those alone refuse it).
     if errs.is_empty() {
         let mut default_restart = Vec::new();
+        let mut default_errs = Vec::new();
         for (d, name, c) in added_defaults {
-            if (&*up).const_addr_shared(c, Vec::new()).is_none() {
+            // The derive runs the initial value where its `vm` is bound; the const the front makes
+            // of it binds nothing. One that names `vm` is never evaluated here (its build fails), and
+            // any other error in it is the edit's own.
+            let checked = {
                 let u = &*up;
-                default_restart.push(format!("struct `{}`: field `{}` added; its `#[rust(..)]` initial value is its derive's code (it may name the derive's `vm`), running values cannot take it -- restart the app", u.prog.def_path(d), u.prog.syms.str(name)));
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::checked_body(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, c, &[])))
+            };
+            let names_vm = match &checked {
+                Ok(b) if !b.errors.is_empty() && b.errors.iter().all(|e| e.contains("E0425: cannot find value `vm` in this scope")) => true,
+                Ok(b) if !b.errors.is_empty() => {
+                    default_errs.extend(b.errors.iter().cloned());
+                    continue;
+                }
+                Ok(_) => false,
+                Err(p) => {
+                    default_errs.push(format!("internal compiler error type-checking {} ({}) -- makepad run bug, report it", (&*up).prog.def_path(c), crate::lifeline::panic_line(&*p)));
+                    continue;
+                }
+            };
+            if names_vm || (&*up).const_addr_shared(c, Vec::new()).is_none() {
+                let u = &*up;
+                default_restart.push(format!("struct `{}`: field `{}` added; its `#[rust(..)]` initial value is its derive's code ({}), running values cannot take it -- restart the app", u.prog.def_path(d), u.prog.syms.str(name), if names_vm { "it names the derive's `vm`" } else { "not a constant" }));
             }
         }
-        if !default_restart.is_empty() {
+        if !default_errs.is_empty() {
+            errs = default_errs;
+        } else if !default_restart.is_empty() {
             errs = default_restart;
             as_restart = true;
         }
@@ -3507,6 +3529,19 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             carry_gandalf(u, from, &visible_crates, if full_inputs { None } else { Some(&files) });
         }
         unsafe { u.prog.reclaim_caches(); }
+        // the running enum variants and struct layouts come back with the versions, under the
+        // same write: a background type check reads them (and the declarations they publish)
+        for (d, n) in saved_variants {
+            u.prog.truncate_variants(d, n);
+        }
+        if !saved_adts.is_empty() {
+            for (d, a) in saved_adts {
+                u.tcx.adts.insert(d, a);
+            }
+            u.tcx.publish_collected();
+            u.lay.clear();
+            out.lines.retain(|l| !l.starts_with("field `"));
+        }
         drop(fw);
         jit::bump_patch_epoch();
         let mut invalidated = u.reload_rir.take().unwrap_or_default();
@@ -3537,17 +3572,6 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
         for k in saved_failed {
             u.const_failed.insert(k);
-        }
-        for (d, n) in saved_variants {
-            u.prog.truncate_variants(d, n);
-        }
-        if !saved_adts.is_empty() {
-            for (d, a) in saved_adts {
-                u.tcx.adts.insert(d, a);
-            }
-            u.tcx.publish_collected();
-            u.lay.clear();
-            out.lines.retain(|l| !l.starts_with("field `"));
         }
         out.rung = if as_restart { Rung::Restart } else { Rung::Refuse };
         out.lines.extend(errs);
@@ -3720,9 +3744,9 @@ fn ms(t0: Instant) -> f64 {
 /// The program announced it can restart with its state (std::relax::restart_supported).
 static RESTART_SUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Why this process's unit cannot be trusted (None: it can): a compiler panic inside an edit's
-/// transaction, or an internal compiler error at a call after edits. Every restart from then on
-/// is a fresh process (exec_restart: the same sources, the warm cache, the app's state when it
-/// left one), never a domain relaunch, which keeps the unit.
+/// transaction, or an internal compiler error at a call after edits. No edit applies to it again:
+/// the recovery is a fresh process (exec_restart: the same sources, the warm cache, the app's
+/// state when it left one).
 static UNIT_SUSPECT: relax_session::sync::Mutex<Option<String>> = relax_session::sync::Mutex::new(None);
 
 pub(crate) fn mark_unit_suspect(why: &str) {
@@ -3768,7 +3792,6 @@ static RESTART_REASON: relax_session::sync::Mutex<String> = relax_session::sync:
 /// measures save -> back on screen from it (MAKEPAD_RUN_RESTART_T0).
 static RESTART_SAVED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DOMAIN_RESTORED: relax_session::sync::Mutex<Option<String>> = relax_session::sync::Mutex::new(None);
-static DOMAIN_SNAPSHOT: relax_session::sync::Mutex<Option<String>> = relax_session::sync::Mutex::new(None);
 static DOMAIN_LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DOMAIN_INPUTS: relax_session::sync::Mutex<Option<Inputs>> = relax_session::sync::Mutex::new(None);
 /// The watcher's reload inputs, also readable while it waits for a live test verdict.
@@ -3785,14 +3808,14 @@ pub fn domain_stopping(id: u32) {
 }
 
 pub(crate) fn domain_loaded(inputs: Option<Inputs>) {
-    // the first domain of a process that restarted into a rebuilt makepad gets the state the
-    // previous process left (MAKEPAD_RUN_RESTORE, read once)
+    // the first domain of a restarted process gets the state the previous process left
+    // (MAKEPAD_RUN_RESTORE, read once)
     static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
     // this run loads the sources as they are: no edit waits for a restart any more
     SOURCES_WAIT.store(false, Ordering::Release);
     clear_restart_pending();
-    let mut restored = DOMAIN_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()).take();
-    if FIRST.swap(false, std::sync::atomic::Ordering::AcqRel) && restored.is_none() {
+    let mut restored = None;
+    if FIRST.swap(false, std::sync::atomic::Ordering::AcqRel) {
         if let Some(path) = std::env::var_os("MAKEPAD_RUN_RESTORE") {
             let _k = crate::zone_alloc::kept();
             restored = std::fs::read_to_string(&path).ok();
@@ -4008,31 +4031,13 @@ pub extern "C" fn __relax_hot_load_failed(why: *const u8, len: usize) {
     })
 }
 
-/// A hosted app queues a fresh domain with this state and returns for cooperative shutdown.
-/// A directly running program writes MAKEPAD_RUN_RESTORE and replaces its process as before.
+/// The app's restart with its state: the process starts again with it (MAKEPAD_RUN_RESTORE).
+/// Returns only when replacing the process failed.
 pub extern "C" fn __relax_restart_now(state: *const u8, len: usize) {
     crate::jit::host_boundary("__relax_restart_now", move || {
         let st = unsafe { if state.is_null() { &[][..] } else { std::slice::from_raw_parts(state, len) } };
         // a rebuilt makepad waits: the process restarts into it (or this returns, said why)
         if host::restart_now(st) { return; }
-        if unit_suspect().is_some() {
-            RESTART_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
-            if let Err(e) = exec_restart(Some(st)) {
-                crate::hot_failure::restart_failed(&e);
-                eprintln!("makepad live: {e}");
-            }
-            return;
-        }
-        if crate::domain::current_app_domain().is_some() && crate::domain::current_app_domain() == crate::run::app_domain() {
-            *DOMAIN_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(String::from_utf8_lossy(st).into_owned());
-            RESTART_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
-            if let Err(e) = crate::run::relaunch() {
-                crate::hot_failure::restart_failed(&e);
-                eprintln!("makepad live: relaunch: {e}");
-            }
-            // The queued HAL quit runs the app's normal cleanup after this event returns.
-            return;
-        }
         RESTART_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
         if let Err(e) = exec_restart(Some(st)) {
             crate::hot_failure::restart_failed(&e);
@@ -4216,13 +4221,12 @@ fn running_old_code(u: &Unit, gen: u32) -> Option<String> {
     None
 }
 
-/// Restarts the program in place to apply `why`: a program that restarts with its state
-/// (std::relax::restart_supported) is asked to at its next safe point (a hosted app then
-/// relaunches its domain, window kept; a direct program starts its process again with the state),
-/// a hosted app that does not relaunches its domain, any other program's process starts again
-/// (same binary and command line). The program's sources are compiled by the new run; the loader
-/// itself is current (a change of its own inputs goes through host::request), so nothing is
-/// rebuilt. Returns how, or why it cannot.
+/// Restarts the program to apply `why`: a program that restarts with its state
+/// (std::relax::restart_supported) is asked to at its next safe point and its process starts
+/// again with the state; any other program's process starts again right away (same binary and
+/// command line). The program's sources are compiled by the new run; the loader itself is current
+/// (a change of its own inputs goes through host::request), so nothing is rebuilt. Returns how,
+/// or why it cannot.
 fn restart_in_place(why: String) -> Result<&'static str, String> {
     if crate::harness::live::enabled() {
         return restart_process(&why).map(|_| "test process restart");
@@ -4234,20 +4238,15 @@ fn restart_in_place(why: String) -> Result<&'static str, String> {
         wake_program();
         return Ok("restart with the program's state");
     }
-    if crate::run::app_domain().is_some() && unit_suspect().is_none() {
-        crate::run::relaunch()?;
-        return Ok("domain relaunch");
-    }
     exec_restart(None).map(|_| "process restart")
 }
 
-/// The process starts again, same binary and command line, with the state the app left for the
-/// relaunch (std::relax::restart_now) when it left one (`makepad test --live`'s restart of its
-/// test process). Returns only on failure.
+/// The process starts again now, same binary and command line, without the app's state (the
+/// app is not asked: a test process of `makepad test --live`, an app stopped at a parked panic or
+/// at an internal compiler error in a call). Returns only on failure.
 pub fn restart_process(why: &str) -> Result<(), String> {
-    let state = DOMAIN_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()).take();
     *RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()) = why.to_string();
-    exec_restart(state.as_deref().map(str::as_bytes))
+    exec_restart(None)
 }
 
 /// Failures alone automatically request the same restart as `session relaunch`.
@@ -5109,7 +5108,6 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         if DOMAIN_LOADING.load(std::sync::atomic::Ordering::Acquire) { gate_note(1); continue; }
         let latest = DOMAIN_REVISION.load(std::sync::atomic::Ordering::Acquire);
         if latest != revision {
-            let relaunched = revision != 0;
             revision = latest;
             if let Some(next) = DOMAIN_INPUTS.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 inputs = next;
@@ -5118,7 +5116,6 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 *WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(snapshot);
             }
             let loaded = crate::owner::call(crate::owner::Class::Program, || own_files(&*up));
-            let previous: std::collections::HashMap<_, _> = std::mem::take(&mut files).into_iter().map(|(p, _, s)| (p, s)).collect();
             files = inputs.paths.iter().map(|(p, (s, _))| (p.clone(), u32::MAX, *s)).collect();
             for (path, file) in loaded {
                 if let Some(f) = files.iter_mut().find(|f| f.0 == path) { f.1 = file; }
@@ -5126,14 +5123,6 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             }
             late_seen = crate::sip::late_count();
             add_included(&mut files);
-            // Report edits the new domain loaded before the watcher could answer them.
-            if relaunched && !crate::harness::live::enabled() {
-                let changed: Vec<_> = files.iter().filter(|f| previous.get(&f.0).is_some_and(|s| s.is_some() && *s != f.2)).collect();
-                if !changed.is_empty() {
-                    let names: Vec<String> = changed.iter().take(3).map(|f| short(&f.0)).collect();
-                    patch_verified_event(&format!("{}{}: loaded by the relaunch", names.join(", "), if changed.len() > 3 { ", ..." } else { "" }), 0, &[]);
-                }
-            }
             events = LiveWatch::new(files.iter().map(|f| f.0.as_str()));
             repositories = git::Repositories::default();
             repositories.include(files.iter().map(|f| f.0.as_str()));
