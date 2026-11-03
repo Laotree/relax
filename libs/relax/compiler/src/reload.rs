@@ -4110,6 +4110,7 @@ pub(crate) fn set_pinned(on: bool) -> bool {
     if was && !on {
         CATCH_UP.store(true, std::sync::atomic::Ordering::Release);
         host::unpinned();
+        watch_events::kick();
     }
     on
 }
@@ -4214,16 +4215,17 @@ impl DockGate {
 
     /// Files changed outside a sync: reported once per revision, not applied. A sync writes
     /// the files first and its revision last, so files seen before their revision are given
-    /// that long to be a sync's (the next watch round applies them).
-    pub(crate) fn held<'a>(&mut self, paths: impl Iterator<Item = &'a str>) {
+    /// that long to be a sync's: true when the revision moved (the next watch round, due at once,
+    /// applies them).
+    pub(crate) fn held<'a>(&mut self, paths: impl Iterator<Item = &'a str>) -> bool {
         if self.warned {
-            return;
+            return false;
         }
         let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < until {
             let now = std::fs::read_to_string(&self.revision).unwrap_or_default();
             if !now.is_empty() && now != self.applied {
-                return;
+                return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -4232,6 +4234,7 @@ impl DockGate {
         let message = format!("dock app: {} changed outside a devhub sync of landed work; not applied: the app keeps running the synced code", paths.join(", "));
         eprintln!("makepad live: {message}");
         live_log(&format!("{{\"event\":\"dock_held\",\"message\":{}}}", json_str(&message)));
+        false
     }
 }
 
@@ -5250,7 +5253,7 @@ impl LiveWatch {
         }
         Some(Self { watch: watch_events::Watch::new(watched.iter().map(String::as_str))?, files })
     }
-    fn wait(&mut self, timeout: std::time::Duration) { self.watch.wait(timeout) }
+    fn wait(&mut self, timeout: Option<std::time::Duration>) { self.watch.wait(timeout) }
     /// None: events may have been lost, or a new edit was recorded: stat every file, watch again.
     fn changed(&mut self) -> Option<Vec<usize>> {
         let ids = self.watch.changed()?;
@@ -5260,10 +5263,45 @@ impl LiveWatch {
     }
 }
 
-/// The live watcher's longest sleep on file events (a backstop: every input wakes it).
-const LIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
-/// Stillness, not an overall deadline: a busy checkout can take as long as it needs.
+/// The edits ledger (`.makepad-run-edits`) as the watcher last looked at the virtual files. A
+/// mounted store's file changes only through the edits folder, and every edit rewrites the ledger
+/// (a devhub ship writes it last, after its files): while it stands still the virtual files are
+/// as they were, and their stamps (an edits-folder lookup and a failing stat each; 2,700 files
+/// every 100 ms took a third of a core on a phone) are not read. A round that sees it move looks
+/// at every virtual file, whatever woke it, and only that round takes the new stamp. (A backstop
+/// round that took it without looking lost overlay edits for good, 11-03: the stamp moved between
+/// a ship's ledger write and its file event, whose round then found the ledger quiet.)
+struct Ledger(Option<(std::time::SystemTime, u64)>);
+
+impl Ledger {
+    fn now() -> Ledger {
+        Ledger(crate::vfs::edits_ledger_stamp())
+    }
+
+    /// The watched files a round stats, given the ledger's stamp now: every disk file (`full`), or
+    /// those the native watch named (none: the polled hot set's disk files); and every virtual
+    /// file when the ledger moved.
+    fn round(&mut self, now: Option<(std::time::SystemTime, u64)>, full: bool, named: Option<Vec<usize>>, hot: &[usize], virt: &[bool]) -> Vec<usize> {
+        let disk = |k: &usize| !virt[*k];
+        let mut ids: Vec<usize> = if full { (0..virt.len()).filter(disk).collect() } else { named.unwrap_or_else(|| hot.iter().copied().filter(disk).collect()) };
+        if now != self.0 {
+            self.0 = now;
+            ids.extend((0..virt.len()).filter(|&k| virt[k]));
+            ids.sort_unstable();
+            ids.dedup();
+        }
+        ids
+    }
+}
+
+/// A source that could not be read, or a refused edit's quiet retry, is looked at again this
+/// much later.
+const LIVE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+/// Stillness, not an overall deadline: a busy checkout can take as long as it needs. Also the
+/// stat poll of a watch without native file events.
 const LIVE_QUIET: std::time::Duration = std::time::Duration::from_millis(100);
+/// How often a watcher whose startup scan waits for the first frames to pass looks again.
+const STARTUP_SCAN_LOOK: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The harness is parked: verify this group, run its tests, then undo faulting code before another edit.
 unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &mut Vec<Undo>) -> Vec<(u32, u32)> {
@@ -5322,6 +5360,8 @@ unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &
 }
 
 unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
+    // a body that includes a file for the first time: the watcher watches it from now on
+    crate::sip::on_late_new(watch_events::kick);
     inputs.add_runner();
     let snapshot = crate::zone_alloc::kept_with(|| std::sync::Arc::new(inputs.clone()));
     *WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(snapshot);
@@ -5374,11 +5414,12 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     let mut undos: Vec<Undo> = Vec::new();
     // SPEC-V: patches that ran before their verdict
     let mut pending: Vec<PendingPatch> = Vec::new();
-    // a save is seen within 100 ms (a restart's whole budget is 1 s); one round is a stat per
-    // watched file (MAKEPAD_RUN_LIVE_TRACE=1 prints its cost once)
+    // with native file events a round runs only on an event or a kick: a watcher at rest makes no
+    // system call. Without them a save is seen within 100 ms; one round is a stat per watched file
+    // (MAKEPAD_RUN_LIVE_TRACE=1 prints its cost once)
     let mut traced = !live_trace();
-    // the hot set: the program's own package (its root crate's directory) and every file saved
-    // this session, polled every 5 ms (a few stats); every file is polled every 100 ms
+    // the hot set (no native events): the program's own package (its root crate's directory) and
+    // every file saved this session, polled every 5 ms (a few stats); every file every 100 ms
     let mut hot: Vec<usize> = {
         let dir = crate::owner::call(crate::owner::Class::Program, || {
             let u = &*up;
@@ -5401,9 +5442,10 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     let mut last_scan = Instant::now();
     // a WM dock app: only a devhub sync of landed work may change its code (`DockGate`)
     let mut dock = DockGate::from_env();
-    // the edits ledger as the last round saw it (`virtual_quiet`), and which files are a mounted
-    // store's (asked once per watch set: the lookup normalizes the path and walks the mounts)
-    let mut ledger = crate::vfs::edits_ledger_stamp();
+    // the edits ledger as the last round that looked at the virtual files saw it (`Ledger`), and
+    // which files are a mounted store's (asked once per watch set: the lookup normalizes the path
+    // and walks the mounts)
+    let mut ledger = Ledger::now();
     let mut virt: Vec<bool> = Vec::new();
     let mut startup_scan = true;
     let mut restart_required = false;
@@ -5427,15 +5469,18 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             continue;
         }
         // native file events: sleep on them while nothing else is in flight (startup, a domain
-        // loading, verdicts pending, a refused edit to retry, an open stream); else the 5 ms
-        // poll. Other inputs wake it (watch_events::kick); one look a second regardless.
+        // loading, verdicts pending, an open stream); else the 5 ms poll. Every other input wakes
+        // it (watch_events::kick: a streamed edit, a domain's inputs, the post-boot loader's files,
+        // a late include, the startup's end, an unpin, a recovery); a timeout only for what is
+        // due (a retry, a landing check, the startup scan). At rest it makes no system call.
         let quiet = (crate::harness::live::enabled() || jit::live_startup_done()) && !DOMAIN_LOADING.load(std::sync::atomic::Ordering::Acquire)
             && pending.is_empty() && !streams_busy(up);
         match events.as_mut() {
             Some(w) if quiet => {
                 let next = retry_at.iter().map(|t| t.saturating_duration_since(Instant::now()))
-                    .chain(landing.iter().map(|l| l.0.saturating_duration_since(Instant::now()))).min();
-                w.wait(next.unwrap_or(LIVE_IDLE).min(LIVE_IDLE).max(std::time::Duration::from_millis(5)));
+                    .chain(landing.iter().map(|l| l.0.saturating_duration_since(Instant::now())))
+                    .chain(startup_scan.then_some(STARTUP_SCAN_LOOK)).min();
+                w.wait(next.map(|t| t.max(std::time::Duration::from_millis(5))));
             }
             _ => std::thread::sleep(std::time::Duration::from_millis(5)),
         }
@@ -5487,10 +5532,10 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             let notifications = events.as_mut().and_then(|w| w.changed());
             let lost = events.is_some() && notifications.is_none();
             if lost { events = LiveWatch::new(files.iter().map(|f| f.0.as_str())); }
-            let ids = if lost || last_scan.elapsed() >= if events.is_some() { LIVE_IDLE } else { LIVE_QUIET } {
-                last_scan = Instant::now();
-                (0..files.len()).collect()
-            } else { notifications.unwrap_or_else(|| hot.clone()) };
+            let full = lost || (events.is_none() && last_scan.elapsed() >= LIVE_QUIET);
+            if full { last_scan = Instant::now(); }
+            if virt.len() != files.len() { virt = files.iter().map(|f| crate::vfs::is_virtual(&f.0)).collect(); }
+            let ids = ledger.round(crate::vfs::edits_ledger_stamp(), full, notifications, &hot, &virt);
             let changed: Vec<_> = ids.into_iter().filter_map(|k| {
                 let f = &files[k];
                 let current = stamp(&f.0);
@@ -5577,46 +5622,14 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let caught_up = CATCH_UP.swap(false, std::sync::atomic::Ordering::AcqRel);
         let retry_due = retry_at.is_some_and(|t| t <= Instant::now()) || RETRY_NOW.swap(false, std::sync::atomic::Ordering::AcqRel);
         let all = lost || rewatched || synced || caught_up || retry_due
-            || last_scan.elapsed() >= if events.is_some() { LIVE_IDLE } else { LIVE_QUIET };
-        let backstop_only = all && !(lost || rewatched || synced || caught_up || retry_due);
-        // A mounted store's file changes only through the edits folder, whose ledger is rewritten
-        // with every edit: while the ledger is as the last full round saw it (and no sync moved the
-        // checkout), the virtual files are as they were, and their stamps (an edits-folder lookup
-        // and a failing stat each; 2,700 files every 100 ms took a third of a core on a phone)
-        // are not read. Only a full round takes the new stamp: a hot-set round does not look at
-        // every virtual file.
-        let now_ledger = crate::vfs::edits_ledger_stamp();
-        let virtual_quiet = now_ledger == ledger && !synced;
-        if all { ledger = now_ledger; }
-        if rewatched || virt.len() != files.len() { virt = files.iter().map(|f| crate::vfs::is_virtual(&f.0)).collect(); }
+            || (events.is_none() && last_scan.elapsed() >= LIVE_QUIET);
+        if rewatched || synced || virt.len() != files.len() { virt = files.iter().map(|f| crate::vfs::is_virtual(&f.0)).collect(); }
         let t_round = std::time::Instant::now();
-        let mut changed: Vec<usize> = Vec::new();
-        let mut scanned = 0;
-        if all {
-            last_scan = Instant::now();
-            for (k, f) in files.iter_mut().enumerate() {
-                // Virtual files change only through the edits folder: unchanged while its ledger
-                // is, and on a backstop round the native watch covers that folder.
-                if virt[k] && (virtual_quiet || (backstop_only && events.is_some())) { continue; }
-                scanned += 1;
-                if stamp(&f.0) != f.2 {
-                    changed.push(k);
-                }
-            }
-        } else if let Some(ids) = notifications {
-            for k in ids {
-                scanned += 1;
-                if stamp(&files[k].0) != files[k].2 { changed.push(k); }
-            }
-        } else {
-            scanned = hot.len();
-            for &k in &hot {
-                if virtual_quiet && virt[k] { continue; }
-                if stamp(&files[k].0) != files[k].2 {
-                    changed.push(k);
-                }
-            }
-        }
+        if all { last_scan = Instant::now(); }
+        // a sync moved the checkout: every file, the virtual ones too
+        let ids = if synced { (0..files.len()).collect() } else { ledger.round(crate::vfs::edits_ledger_stamp(), all, notifications, &hot, &virt) };
+        let mut scanned = ids.len();
+        let mut changed: Vec<usize> = ids.into_iter().filter(|&k| stamp(&files[k].0) != files[k].2).collect();
         if !traced && all {
             traced = true;
             eprintln!("makepad live: one watch round: {} files in {:.2} ms; hot set {} files", files.len(), t_round.elapsed().as_secs_f64() * 1e3, hot.len());
@@ -5633,7 +5646,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             // changed by something other than the sync (a lane's build or checkout in this tree,
             // a hand edit): held, the app keeps running the synced code; the next sync applies
             // whatever the files say then
-            gate.held(changed.iter().map(|&k| files[k].0.as_str()));
+            // (its revision moved meanwhile: the next round is the sync's, at once)
+            if gate.held(changed.iter().map(|&k| files[k].0.as_str())) { retry_at = Some(Instant::now()); }
             continue;
         }
         let seen = std::time::Instant::now();
@@ -5858,7 +5872,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             }
         }
         if read_failed {
-            retry_at = Some(Instant::now() + LIVE_IDLE);
+            retry_at = Some(Instant::now() + LIVE_RETRY);
             continue;
         }
         if !moved.is_empty() {
@@ -5939,7 +5953,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                     } else { recover_hot_failure(failure, &o.lines, None); }
                 }
             } else {
-                retry_at = Some(Instant::now() + LIVE_IDLE);
+                retry_at = Some(Instant::now() + LIVE_RETRY);
             }
             continue;
         }
@@ -6629,5 +6643,28 @@ mod dock_gate_tests {
         std::fs::remove_file(&rev).unwrap();
         assert!(!gate.synced());
         let _ = std::fs::remove_dir(&dir);
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    /// The 11-03 overlay loss: an overlay edit rewrites the edits ledger, and the round that first
+    /// sees it move must stat every virtual file, whatever woke it (a kick or an empty drain before
+    /// the ledger's own event, a full round, the poll without native events); a round that finds
+    /// it standing still stats none of them.
+    #[test]
+    fn every_round_that_sees_the_edits_ledger_move_looks_at_every_virtual_file() {
+        let at = |s| Some((std::time::UNIX_EPOCH + std::time::Duration::from_secs(s), 10));
+        // files 0 and 2 are on disk, 1 and 3 virtual; the polled hot set is 0 and 1
+        let (virt, hot) = ([false, true, false, true], [0, 1]);
+        let none = Vec::<usize>::new();
+        let mut ledger = super::Ledger(at(1));
+        assert_eq!(ledger.round(at(1), false, Some(vec![]), &hot, &virt), none, "at rest: an empty drain stats nothing");
+        assert_eq!(ledger.round(at(1), true, None, &hot, &virt), [0, 2], "at rest: a full round stats the disk files only");
+        assert_eq!(ledger.round(at(2), false, Some(vec![]), &hot, &virt), [1, 3], "a round before the ledger's event: every virtual file");
+        assert_eq!(ledger.round(at(2), true, None, &hot, &virt), [0, 2], "the event's full round after that: the disk files");
+        assert_eq!(ledger.round(at(2), false, None, &hot, &virt), [0], "no native events: the hot set's disk files");
+        assert_eq!(ledger.round(at(3), false, None, &hot, &virt), [0, 1, 3], "no native events, the ledger moved: and every virtual file");
+        assert_eq!(ledger.round(at(3), false, Some(vec![3]), &hot, &virt), [3], "a virtual file the watch named (an in-app edit leaves the ledger)");
     }
 }

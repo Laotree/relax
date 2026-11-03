@@ -2,6 +2,7 @@
 //! proportional to the watch set; normal drains visit only delivered source-file events.
 //! Linux: inotify, macOS: FSEvents file events, Windows: ReadDirectoryChangesW. Other
 //! platforms and lost events (queue overflow, a watched directory moved) keep the stat fallback.
+//! `wait(None)` sleeps until a file event or a `kick`: a watcher at rest makes no system call.
 #[cfg(target_os = "linux")]
 mod native {
     use std::{collections::HashMap, ffi::CString, os::{fd::{AsRawFd, FromRawFd, OwnedFd}, unix::ffi::OsStrExt}, path::Path};
@@ -64,11 +65,12 @@ mod native {
             }).collect();
             Some(Self { fd, names, directories })
         }
-        /// Sleeps until the inotify fd has events, `kick` is called or `timeout` passes.
-        pub fn wait(&mut self, timeout: std::time::Duration) {
+        /// Sleeps until the inotify fd has events, `kick` is called or `timeout` passes (None: no
+        /// timeout).
+        pub fn wait(&mut self, timeout: Option<std::time::Duration>) {
             let k = kick_fd();
             let mut fds = [PollFd { fd: self.fd.as_raw_fd(), events: 1, revents: 0 }, PollFd { fd: k, events: 1, revents: 0 }];
-            let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+            let ms = timeout.map_or(-1, |t| t.as_millis().min(i32::MAX as u128) as i32);
             unsafe { poll(fds.as_mut_ptr(), if k >= 0 { 2 } else { 1 }, ms) };
             if k >= 0 && fds[1].revents != 0 {
                 let mut n = 0u64;
@@ -229,10 +231,13 @@ mod native {
                 Some(watch)
             }
         }
-        /// Sleeps until FSEvents delivers, `kick` is called or `timeout` passes.
-        pub fn wait(&mut self, timeout: std::time::Duration) {
+        /// Sleeps until FSEvents delivers, `kick` is called or `timeout` passes (None: no timeout).
+        pub fn wait(&mut self, timeout: Option<std::time::Duration>) {
             let g = KICK.0.lock().unwrap_or_else(|e| e.into_inner());
-            let mut g = KICK.1.wait_timeout_while(g, timeout, |k| !*k).unwrap_or_else(|e| e.into_inner()).0;
+            let mut g = match timeout {
+                Some(t) => KICK.1.wait_timeout_while(g, t, |k| !*k).unwrap_or_else(|e| e.into_inner()).0,
+                None => KICK.1.wait_while(g, |k| !*k).unwrap_or_else(|e| e.into_inner()),
+            };
             *g = false;
         }
         /// None means events may have been lost: stat every source this round.
@@ -265,8 +270,9 @@ mod native {
 #[cfg(windows)]
 mod native {
     //! ReadDirectoryChangesW per directory, overlapped: `changed` only reads the completion
-    //! status of each pending read and re-arms the ones that completed.
-    use crate::os::win32::{CancelIoEx, CloseHandle, CreateFileW, GetOverlappedResult, ReadDirectoryChangesW, Overlapped, HANDLE};
+    //! status of each pending read and re-arms the ones that completed. Every directory handle
+    //! completes to one I/O completion port, which `wait` sleeps on and `kick` posts to.
+    use crate::os::win32::{CancelIoEx, CloseHandle, CreateFileW, CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatusEx, PostQueuedCompletionStatus, ReadDirectoryChangesW, Overlapped, OverlappedEntry, HANDLE};
     use std::{collections::HashMap, os::windows::ffi::OsStrExt, path::Path};
     type Handle = HANDLE;
     const STATUS_PENDING: usize = 0x103;
@@ -299,9 +305,18 @@ mod native {
         }
     }
     pub struct Watch { dirs: Vec<Box<Dir>> }
-    /// (Windows reads the completion status without an event to wait on: `wait` keeps the 5 ms
-    /// poll, and `kick` has nothing to wake.)
-    pub fn kick() {}
+    /// The process's completion port (0: none could be made; `wait` then polls every 5 ms). Its
+    /// packets only wake `wait`: what completed is read from each directory's OVERLAPPED, so the
+    /// cancelled reads of a watch that was replaced are harmless wakes.
+    fn port() -> HANDLE {
+        static PORT: std::sync::OnceLock<HANDLE> = std::sync::OnceLock::new();
+        // INVALID_HANDLE_VALUE: a new port, one concurrent thread
+        *PORT.get_or_init(|| unsafe { CreateIoCompletionPort(-1, 0, 0, 1) })
+    }
+    pub fn kick() {
+        let port = port();
+        if port != 0 { unsafe { PostQueuedCompletionStatus(port, 0, 0, std::ptr::null_mut()) }; }
+    }
     // directory handles may be used and closed from any thread
     unsafe impl Send for Watch {}
     impl Watch {
@@ -320,6 +335,12 @@ mod native {
                     // OPEN_EXISTING; BACKUP_SEMANTICS (a directory) | OVERLAPPED
                     let handle = unsafe { CreateFileW(wide.as_ptr(), 0x1, 0x7, std::ptr::null_mut(), 3, 0x0200_0000 | 0x4000_0000, 0) };
                     if handle == -1 { return None; }
+                    // its completions wake `wait` (a handle that cannot join the port is a watch
+                    // that cannot sleep on it: none)
+                    if port() == 0 || unsafe { CreateIoCompletionPort(handle, port(), 0, 0) } == 0 {
+                        unsafe { CloseHandle(handle) };
+                        return None;
+                    }
                     let mut entry = Box::new(Dir { handle, overlapped: Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event: 0 }, buf: [0; 16384], names: HashMap::new(), own_index: None });
                     if !entry.arm() { return None; }
                     dirs.push(entry);
@@ -335,8 +356,16 @@ mod native {
             }
             Some(Self { dirs })
         }
-        pub fn wait(&mut self, timeout: std::time::Duration) {
-            std::thread::sleep(timeout.min(std::time::Duration::from_millis(5)));
+        /// Sleeps until a directory read completes, `kick` is called or `timeout` passes (None: no
+        /// timeout). Every queued packet is taken: they only wake.
+        pub fn wait(&mut self, timeout: Option<std::time::Duration>) {
+            let mut entries: [OverlappedEntry; 64] = unsafe { std::mem::zeroed() };
+            let mut removed = 0u32;
+            // INFINITE = u32::MAX
+            let mut ms = timeout.map_or(u32::MAX, |t| t.as_millis().min(u32::MAX as u128 - 1) as u32);
+            while unsafe { GetQueuedCompletionStatusEx(port(), entries.as_mut_ptr(), entries.len() as u32, &mut removed, ms, 0) } != 0 && removed as usize == entries.len() {
+                ms = 0;
+            }
         }
         /// None means events may have been lost: stat every source this round.
         pub fn changed(&mut self) -> Option<Vec<usize>> {
@@ -376,7 +405,7 @@ mod native {
     pub fn kick() {}
     impl Watch {
         pub fn new<'a>(_: impl Iterator<Item = &'a str>) -> Option<Self> { None }
-        pub fn wait(&mut self, timeout: std::time::Duration) { std::thread::sleep(timeout.min(std::time::Duration::from_millis(5))) }
+        pub fn wait(&mut self, timeout: Option<std::time::Duration>) { std::thread::sleep(timeout.map_or(std::time::Duration::from_millis(5), |t| t.min(std::time::Duration::from_millis(5)))) }
         pub fn changed(&mut self) -> Option<Vec<usize>> { None }
     }
 }
