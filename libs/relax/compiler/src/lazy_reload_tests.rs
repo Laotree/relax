@@ -856,7 +856,7 @@ fn gandalf_carry_keeps_only_crates_that_cannot_see_the_edit() {
     assert!(gandalf_keeps(&p, &visible, def("h")), "a crate that cannot see the edit keeps its verdicts");
     let plan_of = |src: &str| {
         let v = p.parse_snapshot(file, &a_path).parse(src.as_bytes().to_vec()).unwrap();
-        classify(&p, file, &v.pf, &a_path)
+        classify(&p, file, &v.pf, &a_path, &Default::default())
     };
     let body = plan_of(&a_src.replace("{ 1 }", "{ 7 }")).unwrap();
     assert!(gandalf_carries(&body.changes, [&body].into_iter()), "a body edit carries");

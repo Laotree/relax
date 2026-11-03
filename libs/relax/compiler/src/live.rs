@@ -37,7 +37,8 @@ fn run_tests(u: &mut Unit, tests: &[DefId]) -> Option<jit::PanicInfo> {
 
 /// The files of an edit step: a file (the crate root's new text) or a directory (an overlay:
 /// each file in it replaces the loaded file at the same path relative to the crate root's
-/// directory). All of a step's files apply as one transaction.
+/// directory; its other files, include_str!/include_bytes! inputs, are written over the
+/// crate's copies). All of a step's files apply as one transaction.
 fn step_files(arg: &str, root_dir: &str) -> Result<Vec<(String, String)>, String> {
     let p = std::path::Path::new(arg);
     if !crate::vfs::is_dir(p) {
@@ -51,7 +52,7 @@ fn step_files(arg: &str, root_dir: &str) -> Result<Vec<(String, String)>, String
             let q = d.join(name);
             if crate::vfs::is_dir(&q) {
                 stack.push(q);
-            } else if q.extension().map_or(false, |x| x == "rs" || x == "context") {
+            } else {
                 let rel = q.strip_prefix(p).unwrap().to_string_lossy().into_owned();
                 out.push((format!("{}/{}", root_dir, rel), q.to_string_lossy().into_owned()));
             }
@@ -109,7 +110,17 @@ pub fn cmd_live(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         let read_started = Instant::now();
         let mut edits = Vec::new();
         let mut bad = None;
+        let mut included = Vec::new();
         for (loaded, src_path) in files {
+            if !loaded.is_empty() && !loaded.ends_with(".rs") && !loaded.ends_with(".context") {
+                // an included file: its includers take the edit
+                if let Err(e) = crate::vfs::read(&src_path).and_then(|b| std::fs::write(&loaded, b)) {
+                    bad = Some(format!("{}: {}", src_path, e));
+                    break;
+                }
+                included.push(crate::vfs::normalize_path(&loaded));
+                continue;
+            }
             let loaded = if loaded.is_empty() { root.clone() } else { loaded };
             let file = match running.iter().find(|(p, _)| *p == loaded) {
                 Some((_, f)) => *f,
@@ -129,6 +140,10 @@ pub fn cmd_live(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         if let Some(b) = bad {
             println!("edit {}: rung=refuse {}", step, b);
             continue;
+        }
+        if !included.is_empty() {
+            let skip: Vec<String> = edits.iter().map(|e| u.prog.file_paths[e.file as usize].clone()).collect();
+            edits.extend(crate::reload::include_edits(&u.prog, &included, &skip));
         }
         crate::reload::trace_input(0.0, read_started.elapsed().as_secs_f64() * 1000., edits.len());
         let olds: Vec<u32> = edits.iter().map(|e| e.file).collect();
@@ -158,10 +173,6 @@ pub fn cmd_live(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         );
         for l in &o.lines {
             println!("  {}", l);
-        }
-        if !o.stale.is_empty() {
-            for l in &o.stale { println!("  {}", l); }
-            println!("  hot failure: stale_frame (a warm restart applies the edit)");
         }
         for (k, old) in olds.iter().enumerate() {
             for r in running.iter_mut() {
