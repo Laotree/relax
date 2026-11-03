@@ -74,3 +74,33 @@ fn unused_mut_follows_the_crate_root_and_cap_lints() {
     assert_eq!(warnings, ["b_deny_capped"], "warned");
     assert!(errors.is_empty(), "--cap-lints warn left errors: {errors:?}");
 }
+
+/// WARNZERO class 7: a lint group on a let (cargo_makepad android/mod.rs:600,
+/// `#[allow(unused)] let mut host_os = ..` shadowed by a cfg'd one) and an attribute on a let a
+/// `macro_rules!` expansion writes (hal cmds.rs:98 and events.rs:91: `let mut n` that only a
+/// repetition mutates).
+#[test]
+fn unused_mut_follows_groups_and_macro_written_lets() {
+    const CHILD: &str = "RELAX_LINT_GROUP_TEST";
+    if std::env::var(CHILD).is_err() {
+        return run_alone("borrowck::lint_scope_tests::unused_mut_follows_groups_and_macro_written_lets", CHILD, "");
+    }
+    let (errors, warnings) = unused_mut_in(r#"
+        pub fn group() -> u32 { #[allow(unused)] let mut a_group = 1; let a_group = 2; a_group }
+        macro_rules! make {
+            ($name:ident $(, $f:ident)*) => {
+                pub fn $name() -> u32 {
+                    let mut total = 0;
+                    $( total += 1; let $f = 0; let _ = $f; )*
+                    { #[allow(unused_mut, unused_assignments)] let mut b_macro = 1u32; $( b_macro += 1; let $f = 0; let _ = $f; )* total += b_macro; }
+                    { let mut c_macro_control = 1u32; total += c_macro_control; }
+                    total
+                }
+            };
+        }
+        make!(none);
+        pub fn d_control() { let mut d_control = 1; let _ = d_control; }
+    "#);
+    assert_eq!(warnings, ["c_macro_control", "d_control"], "warned");
+    assert!(errors.is_empty(), "{errors:?}");
+}

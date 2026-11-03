@@ -1270,6 +1270,12 @@ mod lazy_reload_tests;
 mod calls_tests;
 
 #[cfg(test)]
+mod value_tests;
+
+#[cfg(test)]
+mod check_lint_tests;
+
+#[cfg(test)]
 #[test]
 fn round18_rpit_diagnostic() {
     // `makepad test` is process-global (it installs the runtime and exits): run it in a child of

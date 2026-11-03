@@ -5698,6 +5698,12 @@ impl<'a> Fcx<'a> {
                                         if self.field_visible(d, f) {
                                             self.b.field_idx.insert(e.0, (derefs as u32, *idx));
                                             self.set_operand_derefs(e.0, derefs);
+                                            // as check_field: the struct whose field this is, also
+                                            // when an overloaded deref (`Pin<&mut S>`, `Arc<S>`) reached it
+                                            if !self.b.field_uses.contains(&(d, *idx)) {
+                                                self.b.field_uses.push((d, *idx));
+                                                self.b.dependencies.push(d);
+                                            }
                                             return self.instantiate_field_type(f.ty, adt.region_params, regions, self.tcx.tys.list(args));
                                         }
                                     }
