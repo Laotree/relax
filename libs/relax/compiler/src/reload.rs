@@ -5071,6 +5071,10 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     let mut last_scan = Instant::now();
     // a WM dock app: only a devhub sync of landed work may change its code (`DockGate`)
     let mut dock = DockGate::from_env();
+    // the edits ledger as the last round saw it (`virtual_quiet`), and which files are a mounted
+    // store's (asked once per watch set: the lookup normalizes the path and walks the mounts)
+    let mut ledger = crate::vfs::edits_ledger_stamp();
+    let mut virt: Vec<bool> = Vec::new();
     let mut startup_scan = true;
     let mut restart_required = false;
     let mut restart_message = String::new();
@@ -5245,14 +5249,25 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let all = lost || rewatched || synced || caught_up || retry_due
             || last_scan.elapsed() >= if events.is_some() { LIVE_IDLE } else { LIVE_QUIET };
         let backstop_only = all && !(lost || rewatched || synced || caught_up || retry_due);
+        // A mounted store's file changes only through the edits folder, whose ledger is rewritten
+        // with every edit: while the ledger is as the last full round saw it (and no sync moved the
+        // checkout), the virtual files are as they were, and their stamps (an edits-folder lookup
+        // and a failing stat each; 2,700 files every 100 ms took a third of a core on a phone)
+        // are not read. Only a full round takes the new stamp: a hot-set round does not look at
+        // every virtual file.
+        let now_ledger = crate::vfs::edits_ledger_stamp();
+        let virtual_quiet = now_ledger == ledger && !synced;
+        if all { ledger = now_ledger; }
+        if rewatched || virt.len() != files.len() { virt = files.iter().map(|f| crate::vfs::is_virtual(&f.0)).collect(); }
         let t_round = std::time::Instant::now();
         let mut changed: Vec<usize> = Vec::new();
         let mut scanned = 0;
         if all {
             last_scan = Instant::now();
             for (k, f) in files.iter_mut().enumerate() {
-                // Virtual files change only through the edits folder, which the native watch covers.
-                if backstop_only && events.is_some() && crate::vfs::is_virtual(&f.0) { continue; }
+                // Virtual files change only through the edits folder: unchanged while its ledger
+                // is, and on a backstop round the native watch covers that folder.
+                if virt[k] && (virtual_quiet || (backstop_only && events.is_some())) { continue; }
                 scanned += 1;
                 if stamp(&f.0) != f.2 {
                     changed.push(k);
@@ -5266,6 +5281,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         } else {
             scanned = hot.len();
             for &k in &hot {
+                if virtual_quiet && virt[k] { continue; }
                 if stamp(&files[k].0) != files[k].2 {
                     changed.push(k);
                 }
