@@ -3475,7 +3475,15 @@ fn quit_mark() {
 /// again while its parent's code sat unwritten: 20 s of relax-compiler's 37 s first run).
 pub(crate) extern "C" fn relax_self_spawn() {
     static ONE: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
-    if unsafe { RUN_UNIT }.is_null() || crate::forkexec::exec_child() { return; }
+    if unsafe { RUN_UNIT }.is_null() {
+        return;
+    }
+    // a forked child on its way to exec writes nothing (forkexec.rs). Windows makes the new
+    // process without a fork: the spawning process is always the program itself, and writes.
+    #[cfg(unix)]
+    if crate::forkexec::exec_child() {
+        return;
+    }
     let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
     let t = Instant::now();
     let r = mid_flush(true, true);
