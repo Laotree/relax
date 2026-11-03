@@ -10700,6 +10700,8 @@ pub(crate) struct Frame {
     o3_first: bool,
     o3_first_at: u64,
     missing: (Vec<(u32, String)>, usize),
+    /// the type layer's computations in progress (layouts, struct tails, folds: its cycle guards)
+    cycles: relax_types::cycle::Active,
     rec: *const std::cell::Cell<Option<MainCompile>>,
     tainted: bool,
     taint_built: Vec<(usize, u32)>,
@@ -10733,6 +10735,7 @@ pub(crate) fn frame_enter(rec: *const ()) -> Frame {
         o3_first: O3_FIRST.with(|c| c.replace(false)),
         o3_first_at: O3_FIRST_AT.with(|c| c.replace(0)),
         missing: crate::program::missing_save(),
+        cycles: relax_types::cycle::take(),
         rec: MAIN_REC_AT.with(|r| r.replace(rec as *const std::cell::Cell<Option<MainCompile>>)),
         tainted: TAINTED.with(|t| t.replace(false)),
         taint_built: TAINT_BUILT.with(|b| std::mem::take(&mut *b.borrow_mut())),
@@ -10760,6 +10763,7 @@ pub(crate) fn frame_leave(f: Frame) -> bool {
     O3_FIRST.with(|c| c.set(f.o3_first));
     O3_FIRST_AT.with(|c| c.set(f.o3_first_at));
     crate::program::missing_restore(f.missing);
+    relax_types::cycle::restore(f.cycles);
     MAIN_REC_AT.with(|r| r.set(f.rec));
     // what a tainted request built is not kept for others to inline
     for (unit, id) in TAINT_BUILT.with(|b| std::mem::replace(&mut *b.borrow_mut(), f.taint_built)) {
