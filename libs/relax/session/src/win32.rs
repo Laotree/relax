@@ -75,6 +75,9 @@ extern "system" {
     pub fn ReadDirectoryChangesW(dir: HANDLE, buf: *mut u8, len: u32, subtree: i32, filter: u32, returned: *mut u32, overlapped: *mut Overlapped, routine: *mut u8) -> i32;
     pub fn GetOverlappedResult(file: HANDLE, overlapped: *mut Overlapped, bytes: *mut u32, wait: i32) -> i32;
     pub fn CancelIoEx(file: HANDLE, overlapped: *mut Overlapped) -> i32;
+    pub fn CreateIoCompletionPort(file: HANDLE, port: HANDLE, key: usize, threads: u32) -> HANDLE;
+    pub fn GetQueuedCompletionStatusEx(port: HANDLE, entries: *mut OverlappedEntry, count: u32, removed: *mut u32, ms: u32, alertable: i32) -> i32;
+    pub fn PostQueuedCompletionStatus(port: HANDLE, bytes: u32, key: usize, overlapped: *mut Overlapped) -> i32;
     pub fn CreateDirectoryW(name: *const u16, attributes: *const SecurityAttributes) -> i32;
     pub fn GetDriveTypeW(root: *const u16) -> u32;
     pub fn CompareStringOrdinal(a: *const u16, a_len: i32, b: *const u16, b_len: i32, ignore_case: i32) -> i32;
@@ -146,6 +149,15 @@ pub struct Overlapped {
     pub offset: u32,
     pub offset_high: u32,
     pub event: HANDLE,
+}
+
+/// minwinbase.h OVERLAPPED_ENTRY: one dequeued I/O completion
+#[repr(C)]
+pub struct OverlappedEntry {
+    pub key: usize,
+    pub overlapped: *mut Overlapped,
+    pub internal: usize,
+    pub bytes: u32,
 }
 
 /// minwinbase.h SECURITY_ATTRIBUTES
