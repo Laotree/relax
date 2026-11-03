@@ -850,6 +850,9 @@ struct Seg {
     wait: bool,
     /// a wait: what ended it (thread handle of the waker / server) and when, if known
     woke_by: Option<(u64, u64)>,
+    /// a wait: the wake key that ends it (the futex / object; an owner request: u64::MAX - the
+    /// requester's handle, the owner's `Served`)
+    key: u64,
     depth: u32,
     /// still open when the capture stopped (cut there)
     open: bool,
@@ -877,9 +880,9 @@ fn build(recs: Vec<(u64, u64, Vec<Rec>)>, stop: u64) -> Vec<Thread> {
                     // the innermost open record of the same kind
                     let want_wait = r.kind == 4;
                     if let Some(k) = stack.iter().rposition(|x| x.2 == want_wait) {
-                        let (t0, what, wait, obj, holder) = stack.remove(k);
-                        let _ = holder;
-                        segs.push(Seg { t0, t1: r.t, what, wait, woke_by: if wait { Some((0, obj)) } else { None }, depth: k as u32, open: false });
+                        let (t0, what, wait, obj, _) = stack.remove(k);
+                        let key = wait_key(&what, obj, handle);
+                        segs.push(Seg { t0, t1: r.t, what, wait, woke_by: None, key, depth: k as u32, open: false });
                     }
                 }
                 5 => wakes.push((r.t, r.a)),
@@ -889,24 +892,39 @@ fn build(recs: Vec<(u64, u64, Vec<Rec>)>, stop: u64) -> Vec<Thread> {
         }
         // still open at the stop: cut there
         for (k, (t0, what, wait, obj, _)) in stack.into_iter().enumerate() {
-            segs.push(Seg { t0, t1: stop, what, wait, woke_by: if wait { Some((0, obj)) } else { None }, depth: k as u32, open: true });
+            let key = wait_key(&what, obj, handle);
+            segs.push(Seg { t0, t1: stop, what, wait, woke_by: None, key, depth: k as u32, open: true });
         }
         segs.sort_by_key(|s| (s.t0, s.depth));
         out.push(Thread { os_id, handle, segs, wakes });
     }
-    // edges: a wait on futex A ending at t is ended by the latest wake of A at or before t; a wait
-    // for the owner is ended by the owner's `Served` for this thread
+    // edges: what ended a wait is a wake of its key by another thread (a waiter never wakes
+    // itself: its own unlock just after it took the lock is no waker) after the wait began and
+    // at most just after its end (a wake stamped just after it: another thread's clock read). A
+    // wait with one waiter (the owner idle, a park) is ended by the first such wake: a later one
+    // found it waking already. A lock or condvar has many: each wake ends one waiter, the last
+    // one before the end ended this wait.
     let all_wakes: Vec<(u64, u64, u64)> = out.iter().flat_map(|th| th.wakes.iter().map(move |w| (w.0, w.1, th.handle))).collect();
     for th in out.iter_mut() {
         let me = th.handle;
         for s in th.segs.iter_mut().filter(|s| s.wait) {
-            let obj = s.woke_by.map_or(0, |w| w.1);
-            let key = if s.what.starts_with("wait: owner") { u64::MAX - me } else { obj };
-            let w = all_wakes.iter().filter(|w| w.1 == key && w.0 <= s.t1 + 50_000 && w.0 + 50_000_000 >= s.t1).max_by_key(|w| w.0);
+            let cand = all_wakes.iter().filter(|w| w.1 == s.key && w.2 != me && w.0 > s.t0 && w.0 <= s.t1 + 50_000);
+            let w = if one_waiter(&s.what) { cand.min_by_key(|w| w.0) } else { cand.max_by_key(|w| w.0) };
             s.woke_by = w.map(|w| (w.2, w.0));
         }
     }
     out
+}
+
+/// The wake key that ends wait `what` on `obj` of thread `handle`: an owner request is ended by
+/// the owner's `Served` for the thread, anything else by a wake of its object.
+fn wait_key(what: &str, obj: u64, handle: u64) -> u64 {
+    if what.starts_with("wait: owner") { u64::MAX - handle } else { obj }
+}
+
+/// A wait only one thread waits on: the owner idle (any requester's post wakes it), a park.
+fn one_waiter(what: &str) -> bool {
+    what == "wait: idle" || what == "wait: futex park"
 }
 
 /// `timeline start [max_s=30]` | `timeline stop` | `timeline frames [n=30]` | `timeline frame
@@ -1015,6 +1033,9 @@ fn busy_in(th: &Thread, t0: u64, t1: u64) -> (u64, u64) {
 fn critical(ths: &[Thread], ui: usize, t0: u64, t1: u64) -> Vec<(usize, u64, u64, String)> {
     let mut path = Vec::new();
     let (mut th, mut t) = (ui, t1);
+    // the thread whose wait moved the walk here: the next wait met is explained by its wake if it
+    // has one (the owner woke for the UI's own request, not for a post just after it)
+    let mut from: Option<usize> = None;
     // (a cold lazy compile's frame is hundreds of UI -> owner -> UI round trips, three pieces each)
     for _ in 0..16384 {
         if t <= t0 {
@@ -1032,10 +1053,12 @@ fn critical(ths: &[Thread], ui: usize, t0: u64, t1: u64) -> Vec<(usize, u64, u64
                 // it (this thread's own request woke the owner while it waited), the thread waited
                 // since the wait began. A wake stamped just after the end (another thread's clock
                 // read) counts as just before it, so the walk only goes back in time.
-                match s.woke_by.and_then(|(h, at)| ths.iter().position(|x| x.handle == h).map(|i| (i, at))) {
+                let came = from.take().and_then(|f| ths[f].wakes.iter().filter(|w| w.1 == s.key && w.0 > s.t0 && w.0 <= s.t1 + 50_000).min_by_key(|w| w.0).map(|w| (f, w.0)));
+                match came.or_else(|| s.woke_by.and_then(|(h, at)| ths.iter().position(|x| x.handle == h).map(|i| (i, at)))) {
                     Some((i, at)) if i != th && at > s.t0 && end == s.t1 => {
                         let at = at.min(end.saturating_sub(1));
                         path.push((th, at.max(s.t0), end, format!("{} (ended by {})", s.what, super::tid_label(ths[i].os_id))));
+                        from = Some(th);
                         th = i;
                         t = at.max(t0);
                     }
@@ -1414,5 +1437,44 @@ mod tests {
         };
         let s = super::analyse(&l, 0, 10_000_000);
         assert!(s.contains("\"owner_waits\":[{\"wait\":\"owner (main)\",\"at_ms\":0.0,\"ms\":3.00,"), "{s}");
+    }
+
+    fn rec(t: u64, kind: super::Kind, label: &'static str, a: u64, detail: &'static str) -> super::Rec {
+        let b = if detail.is_empty() { 0 } else { (detail.as_ptr() as u64 & ((1 << 47) - 1)) | ((detail.len() as u64) << 48) };
+        super::Rec { t, kind: kind as u8, label_len: label.len() as u16, label: label.as_ptr() as u64, a, b }
+    }
+
+    /// A lock wait is ended by the holder's unlock, not by the waiter's own unlock just after it
+    /// took the lock; the critical path follows the holder.
+    #[test]
+    fn a_lock_wait_is_ended_by_the_holder_not_the_waiter() {
+        use super::Kind::*;
+        const M: u64 = 0x1000;
+        let ui = vec![rec(0, SpanBegin, "Actions", 0, ""), rec(10_000_000, WaitBegin, "futex", M, "mutex"), rec(110_000_000, WaitEnd, "", 0, ""), rec(110_020_000, Wake, "", M, ""), rec(120_000_000, SpanEnd, "Actions", 0, "")];
+        let holder = vec![rec(0, SpanBegin, "work", 0, ""), rec(109_990_000, Wake, "", M, ""), rec(115_000_000, SpanEnd, "work", 0, "")];
+        let ths = super::build(vec![(1, 11, ui), (2, 22, holder)], 120_000_000);
+        let w = ths[0].segs.iter().find(|s| s.wait).unwrap();
+        assert_eq!(w.woke_by, Some((22, 109_990_000)));
+        let cp = super::critical(&ths, 0, 0, 120_000_000);
+        assert!(cp.iter().any(|p| p.0 == 1 && p.3 == "run" && p.2 - p.1 > 50_000_000), "{:?}", cp.iter().map(|p| (p.0, p.1, p.2, p.3.clone())).collect::<Vec<_>>());
+    }
+
+    /// The owner idle is ended by the request of the thread the walk came from (or the first post
+    /// after it began), never by a post that came while it was waking: a run monitor's post
+    /// right after the UI's is not on the UI's critical path.
+    #[test]
+    fn the_owner_idle_is_ended_by_the_walks_own_request() {
+        use super::Kind::*;
+        const W: u64 = 0x2000;
+        for monitor_post in [45_000, 38_000] {
+            let owner = vec![rec(0, WaitBegin, "idle", W, ""), rec(50_000, WaitEnd, "", 0, ""), rec(60_000, Served, "", 11, ""), rec(68_000, Served, "", 44, ""), rec(68_500, WaitBegin, "idle", W, "")];
+            let ui = vec![rec(0, SpanBegin, "Actions", 0, ""), rec(40_000, Wake, "", W, ""), rec(40_500, WaitBegin, "owner", 0, "program"), rec(60_500, WaitEnd, "", 0, ""), rec(70_000, SpanEnd, "Actions", 0, "")];
+            let monitor = vec![rec(monitor_post, Wake, "", W, ""), rec(monitor_post + 500, WaitBegin, "owner", 0, "job"), rec(68_500, WaitEnd, "", 0, "")];
+            let ths = super::build(vec![(3, 33, owner), (1, 11, ui), (4, 44, monitor)], 70_000);
+            let cp = super::critical(&ths, 1, 0, 70_000);
+            let steps: Vec<_> = cp.iter().map(|p| (p.0, p.1, p.2, p.3.clone())).collect();
+            assert!(!cp.iter().any(|p| p.0 == 2), "monitor post at {monitor_post}: {steps:?}");
+            assert!(cp.iter().any(|p| p.0 == 0 && p.3 == "run"), "{steps:?}");
+        }
     }
 }

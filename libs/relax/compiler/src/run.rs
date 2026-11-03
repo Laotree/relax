@@ -2837,6 +2837,8 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             let idle = still >= MONITOR_QUIET && present.is_none() && mem_snapshot.is_none() && settle_stress.is_none()
                 && !mid_busy.load(Ordering::Relaxed) && FIRST_PRESENT_WALL.load(Ordering::Relaxed) != 0;
             if idle { std::thread::park_timeout(MONITOR_IDLE) } else { std::thread::sleep(MONITOR_TICK) }
+            // inspect's timeline names the monitor's work (its owner requests and its own time)
+            let _tick = crate::inspect::timeline::span("run-monitor tick");
             let now = monitor_activity();
             if now == activity { still = still.saturating_add(1) } else { (activity, still) = (now, 0) }
             crate::lifeline::beat();
@@ -2927,9 +2929,9 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             }
             let _job = jit::compile_job();
             jit::reassert_signals();
-            flush_errors(false);
+            { let _s = crate::inspect::timeline::span("run-monitor flush errors"); flush_errors(false); }
             // the deferred cache records of this tick's installs (rule I-PUB: bounded publishes)
-            if jit::records_due() { jit::drain_records_bounded(); }
+            if jit::records_due() { let _s = crate::inspect::timeline::span("run-monitor cache records"); jit::drain_records_bounded(); }
             if settle_on {
                 let present = FIRST_PRESENT_WALL.load(Ordering::Acquire).max(DOMAIN_PRESENT_WALL.load(Ordering::Acquire));
                 if present != settle_present {
@@ -2962,12 +2964,13 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 let settled_d = if (FIRST_PRESENT_WALL.load(Ordering::Acquire) != 0 || reclaim_requested)
                     && (reclaimed != Some(n) && now_ns.saturating_sub(last_drop_ns) >= SETTLE_DROP_EVERY_NS || reclaim_requested) {
                     last_drop_ns = now_ns;
+                    let _s = crate::inspect::timeline::span("run-monitor settle sweep");
                     let mut sweep = jit::SettleSweep::default();
                     while !crate::owner::call(crate::owner::Class::Program, || unsafe { sweep.step(RUN_UNIT, jit::SETTLE_STEP) }) {}
                     Some(sweep.drops)
                 } else { None };
                 if let Some(mut d) = settled_d {
-                    d.release();
+                    { let _s = crate::inspect::timeline::span("run-monitor settle release"); d.release(); }
                     drops.fns += d.fns;
                     drops.rir += d.rir;
                     drops.typeck += d.typeck;
@@ -2987,6 +2990,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 }
                 let quiet = settle_watch.ready(jit::wall_ns(), present, compiled);
                 if quiet || requested {
+                    let _s = crate::inspect::timeline::span("run-monitor settle");
                     if try_settle(&mut drops, runtime.mem_trim) {
                         settle_watch.settled = Some(compiled);
                     } else if requested {
@@ -3041,6 +3045,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 let up = unsafe { RUN_UNIT };
                 if !up.is_null() {
                     rebuild_tries += 1;
+                    let _s = crate::inspect::timeline::span("run-monitor settle rebuild");
                     match jit::settle_rebuild::run(up, settle_stress.is_none() && rebuild_tries <= jit::settle_rebuild::TAIL_WAIT) {
                         jit::settle_rebuild::Outcome::Done => rebuild_done = true,
                         jit::settle_rebuild::Outcome::Refused(why) => { verbose!("makepad-run settle rebuild refused: {why}"); rebuild_over = true; }
@@ -3057,7 +3062,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             jit::aot_drain();
             jit::ahead_complete_tick();
             // recorded disk-cache entries are written out as they pile up, not held to the exit
-            spill_cache();
+            { let _s = crate::inspect::timeline::span("run-monitor cache spill"); spill_cache(); }
             // Independent allocator relief for later O3 bursts and non-GUI programs.
             // After 1 s without new compiles (O1 or O3), the malloc allocator's free
             // pages go back to the system, once per compile burst: compile working sets (O3
