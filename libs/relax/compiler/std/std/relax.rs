@@ -38,6 +38,7 @@ extern "C" {
     fn __relax_realtime_compiled(ticket: u64) -> bool;
     fn __relax_realtime_lazy(ticket: u64) -> u32;
     fn __relax_realtime_misses() -> u64;
+    fn __relax_realtime_thread();
     fn __relax_realtime_arm(on: bool);
 }
 
@@ -94,6 +95,14 @@ impl Drop for RealtimeArmed {
 /// compile): 0 is the goal; a rise names a hole in what `realtime` reached.
 pub fn realtime_misses() -> u64 {
     unsafe { __relax_realtime_misses() }
+}
+
+/// The calling thread is a real-time thread from now on: its lazy compiles count in
+/// `realtime_misses` (and are reported), as a thread with a real-time policy or one named in
+/// MAKEPAD_RUN_RT_THREADS. For a thread that runs real-time code without that policy (a box that
+/// refuses SCHED_FIFO, a test standing in for the device's thread).
+pub fn realtime_thread() {
+    unsafe { __relax_realtime_thread() }
 }
 
 /// The code reachable from `x` runs on a real-time thread (an audio device's callback, a

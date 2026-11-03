@@ -1021,3 +1021,16 @@ fn realtime_strict_ready_lazy_and_patch_freeze() {
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// std::relax::realtime_thread marks the calling thread only, for good: is_realtime_thread
+/// (what counts a lazy compile in realtime_misses) answers so there, not on other threads.
+#[test]
+fn realtime_thread_marks_the_calling_thread() {
+    let marked = std::thread::spawn(|| {
+        let before = crate::jit::is_realtime_thread();
+        crate::jit::__relax_realtime_thread();
+        (before, crate::jit::is_realtime_thread())
+    }).join().unwrap();
+    assert_eq!(marked, (false, true));
+    assert!(!std::thread::spawn(crate::jit::is_realtime_thread).join().unwrap(), "another thread is not marked");
+}
