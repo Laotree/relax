@@ -75,10 +75,6 @@ impl CheckTarget {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ctfe { Off, Check, On }
-/// Register allocation order (regalloc prio): weighted references, or per square root of the live
-/// range's length (compute kernels).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Priority { References, Sqrt }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerQos { Default, Background, Utility }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,8 +290,6 @@ pub struct Options {
     /// so one that never ends is rustc's `long_running_const_eval` error (the interpreter's
     /// terminator limit) instead of a hang. Changes the compiled code.
     pub const_fuel: bool,
-    /// Register allocation order; `Priority::References` (compute kernels: `Sqrt`).
-    pub ra_prio: Priority,
     /// Default `false`: the quick allocation round (no live-range splitting) also coalesces
     /// copies. Compute kernels set it.
     pub ra_quick_coalesce: bool,
@@ -396,7 +390,6 @@ impl Default for Options {
             web_threads: WebThreads::Off,
             ctfe: Ctfe::On,
             const_fuel: false,
-            ra_prio: Priority::References,
             ra_quick_coalesce: false,
             nan_exact: false,
             tier1_profile: None,
@@ -506,7 +499,6 @@ impl Options {
             web_threads: if get("MAKEPAD_RUN_WEB_THREADS").as_deref() == Some(std::ffi::OsStr::new("1")) { WebThreads::On } else { WebThreads::Off },
             const_fuel: false,
             ctfe: { let os = get("MAKEPAD_RUN_CTFE"); let v = os.and_then(|v| v.into_string().ok()); match v.as_deref() { Some("0") => Ctfe::Off, Some("check") => Ctfe::Check, _ => Ctfe::On } },
-            ra_prio: Priority::References,
             ra_quick_coalesce: false,
             nan_exact: false,
             tier1_profile: { let os = get("MAKEPAD_RUN_O3_PROFILE"); os },
@@ -601,7 +593,6 @@ impl Options {
             web_threads,
             ctfe,
             const_fuel,
-            ra_prio,
             ra_quick_coalesce,
             nan_exact,
             tier1_profile,
@@ -760,8 +751,6 @@ impl Options {
         h.u8(*ctfe as u8);
         h.str("const_fuel");
         h.u8(*const_fuel as u8);
-        h.str("ra_prio");
-        h.u8(*ra_prio as u8);
         h.str("ra_quick_coalesce");
         h.u8(*ra_quick_coalesce as u8);
         // (only when set: the default key stays the key it was before the option existed)
