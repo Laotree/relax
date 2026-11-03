@@ -1277,6 +1277,85 @@ fn realtime_reach_skips_trait_objects_it_only_makes_itself() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// FABARMS3's misses on node (W1207: 24 lazy compiles on the real-time thread, drop glue of generic
+/// containers and core::fmt's float path): code ran before the mark (the planner's simulation), so
+/// the reach found slots compiled already whose RIR was dropped after their install. A drop glue's
+/// references were never read again (only fns' RIR was rebuilt), and with a disk cache a lookup
+/// that missed left the last entry's references in place. Here `warm` compiles `take` and the drop
+/// glue of `Option<Item>` (dropping `None`: the glue of `Item`, its `Vec` and its `Weak` stay
+/// lazy) and formats an integer; the marked `run` drops a `Some` and formats a float.
+#[test]
+fn realtime_reach_walks_code_that_ran_before_the_mark() {
+    const CHILD: &str = "MAKEPAD_RUN_RT_WARM_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::realtime_reach_walks_code_that_ran_before_the_mark", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
+            .output().unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-rt-warm-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    std::fs::write(dir.join("app/src/lib.rs"), "use std::rc::{Rc, Weak};\n\
+        pub struct Item(pub Vec<u32>, pub Weak<u32>);\n\
+        #[inline(never)]\n\
+        pub fn take(o: Option<Item>) -> u32 { match &o { Some(i) => i.0.len() as u32, None => 0 } }\n\
+        #[repr(C)]\n\
+        pub struct Cell { pub x: u32, pub out: u32 }\n\
+        pub fn warm(c: &mut Cell) { c.out = take(None) + format!(\"{}\", c.x).len() as u32; }\n\
+        pub fn run(c: &mut Cell) {\n\
+            let rc = Rc::new(c.x);\n\
+            let n = take(Some(Item(vec![c.x, 2, 3], Rc::downgrade(&rc))));\n\
+            let s = format!(\"{:.3}\", c.x as f64 * 1.5);\n\
+            c.out = n + s.len() as u32;\n\
+        }\n").unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "rt_warm_app", false).unwrap();
+    let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let (run_d, warm_d) = (def("run"), def("warm"));
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let upn = up as usize;
+    let (root, [run_e, warm_e]) = crate::owner::call(crate::owner::Class::Program, || {
+        let ids = [run_d, warm_d].map(|d| u.fn_id(crate::jit::FnKey::Inst(d, vec![])));
+        (ids[0], ids.map(|id| u.entry(id)))
+    });
+    let mut cell = [2u32, 0];
+    let cp = cell.as_mut_ptr() as u64;
+    // what ran before the mark
+    unsafe { crate::jit::call_jit(up, warm_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+    assert_eq!(cell[1], 1);
+    let ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![root]) });
+    for _ in 0..5000 {
+        if crate::jit::__relax_realtime_compiled(ticket) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(crate::jit::__relax_realtime_compiled(ticket), "the real-time reach was not compiled in 10 s");
+    let (out, misses) = std::thread::spawn(move || {
+        crate::jit::__relax_realtime_thread();
+        let before = crate::jit::__relax_realtime_misses();
+        unsafe { crate::jit::call_jit(upn as *mut crate::jit::Unit, run_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        (unsafe { *((cp + 4) as *const u32) }, crate::jit::__relax_realtime_misses() - before)
+    }).join().unwrap();
+    assert_eq!((out, misses), (3 + 5, 0), "the real-time thread met lazy compiles (MAKEPAD_RUN_RT_TRACE=1 names them)");
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// What FABARMS3's misses on node (W1207) were, on a cold store: the marked root formats floats
 /// (core::fmt's float path is reached through the formatter fn pointer an `Argument` holds, data the
 /// reach reads) and drops containers (`Vec`, `vec::IntoIter`, `array::IntoIter`, `Weak`: drop glue

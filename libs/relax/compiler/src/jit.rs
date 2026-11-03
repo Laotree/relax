@@ -26254,16 +26254,21 @@ unsafe fn realtime_top_tier(up: *mut Unit, ids: &[u32]) {
 unsafe fn realtime_refs(up: *mut Unit, id: u32) -> Vec<u32> {
     let was = RT_KEEP.with(|k| k.replace(true));
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // (the references a cache entry linked just now names: this slot's, never an earlier link's)
+        let clear = |up: *mut Unit| if let Some(c) = (&mut *up).cache.as_mut() {
+            c.last_callees.clear();
+            c.last_thunks.clear();
+            c.last_data.clear();
+        };
+        clear(up);
         if !(&*up).fns[id as usize].compiled {
-            if let Some(c) = (&mut *up).cache.as_mut() {
-                c.last_callees.clear();
-                c.last_thunks.clear();
-                c.last_data.clear();
-            }
             let _ = compile_slot_locked(up, id, false);
         } else if (&*up).fns[id as usize].rir.is_none() && (&*up).cache.is_some() && !matches!((&*up).fns[id as usize].key, FnKey::Sandbox(_)) {
             // installed from the disk cache (or the startup image): its entry names its references
-            let _ = cache_lookup(up, id);
+            // (none linked: it was built this run, its RIR dropped at its install)
+            if cache_lookup(up, id).is_none() {
+                clear(up);
+            }
         }
         let u = &*up;
         let mut slots = Vec::new();
@@ -26278,7 +26283,9 @@ unsafe fn realtime_refs(up: *mut Unit, id: u32) -> Vec<u32> {
             for &a in &c.last_data {
                 crate::syms::data_thunks(u, a, &mut slots);
             }
-        } else if matches!(u.fns[id as usize].key, FnKey::Inst(..) | FnKey::Closure(..)) && build_rir(up, id).is_ok() {
+        } else if build_rir(up, id).is_ok() {
+            // its code was built before the mark and its RIR dropped at the install (any slot: a
+            // drop glue's or a shim's references are as much real-time code as a fn's)
             let u = &*up;
             if let Some(r) = u.fns[id as usize].rir.clone() {
                 realtime_rir_refs(u, &r, &mut slots);
