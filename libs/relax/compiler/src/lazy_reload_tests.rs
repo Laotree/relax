@@ -892,7 +892,8 @@ fn restored_images_take_live_edits() {
     // (a `global_asm!` block: a restore runs no collection, so the image must carry it -- a warm
     // run of a crate with one could not resolve the labels it defines)
     const ASM: &str = "std::arch::global_asm!(\".p2align 2\", \"restored_asm_label:\", \"  ret\");\n";
-    std::fs::write(&path, format!("pub struct S {{ pub a: u32 }}\nimpl S {{ pub fn get(&self) -> u32 {{ self.a }} }}\npub fn value(out: &mut u32) {{ *out = S {{ a: 11 }}.get(); }}\n{ASM}")).unwrap();
+    const W0: &str = "pub struct W<T>(pub T);\nimpl<T> W<T> { pub fn gone(&self) -> usize { std::mem::size_of::<T>() } pub fn kept(&self) {} }\n";
+    std::fs::write(&path, format!("pub struct S {{ pub a: u32 }}\nimpl S {{ pub fn get(&self) -> u32 {{ self.a }} }}\npub fn value(out: &mut u32) {{ *out = S {{ a: 11 }}.get(); }}\n{W0}{ASM}")).unwrap();
     let session = Arc::new(crate::Session::default());
     let (mut prog, core, app) = crate::load_with_std(&session, &path, "restored", false).unwrap();
     assert!(prog.global_asms.iter().any(|g| prog.file_crate[g.0 as usize] == app), "the app's global_asm! block is collected");
@@ -935,10 +936,21 @@ fn restored_images_take_live_edits() {
     let edit = |src: &str| unsafe {
         crate::reload::apply(up, vec![crate::reload::Edit { file: (*up).prog.def(def).file, path: path.clone(), src: format!("{src}{ASM}").into_bytes() }])
     };
-    let body = edit("pub struct S { pub a: u32 }\nimpl S { pub fn get(&self) -> u32 { self.a + 1 } }\npub fn value(out: &mut u32) { *out = S { a: 22 }.get(); }\n");
+    // the restored image's first edit removes a method from a generic impl and adds items ahead of
+    // it: the def of `gone` stays in the version before (no definition collection recorded its
+    // calls since the restore, so the legacy-call pass walks it), its impl's moves on, and the pass
+    // reads the impl's generics in `gone`'s own version -- not at the new version's item number,
+    // outside that tree (an internal compiler error)
+    let w1: String = (0..16).map(|i| format!("pub fn more{i}() {{}}\n")).collect::<String>() + "pub struct W<T>(pub T);\nimpl<T> W<T> { pub fn kept(&self) {} }\n";
+    let removed = edit(&format!("pub struct S {{ pub a: u32 }}\nimpl S {{ pub fn get(&self) -> u32 {{ self.a }} }}\npub fn value(out: &mut u32) {{ *out = S {{ a: 11 }}.get(); }}\n{w1}"));
+    assert!(removed.failure.is_none(), "{:?}", removed.lines);
+    assert_eq!(removed.rung, crate::reload::Rung::Patch, "{:?}", removed.lines);
+    run(11);
+    let body = edit(&format!("pub struct S {{ pub a: u32 }}\nimpl S {{ pub fn get(&self) -> u32 {{ self.a + 1 }} }}\npub fn value(out: &mut u32) {{ *out = S {{ a: 22 }}.get(); }}\n{w1}"));
     assert_eq!(body.rung, crate::reload::Rung::Patch, "{:?}", body.lines);
     run(23);
-    let added = edit("pub struct S { pub a: u32 }\nimpl S { pub fn get(&self) -> u32 { self.a + extra() } }\npub fn extra() -> u32 { 9 }\npub fn value(out: &mut u32) { *out = S { a: 22 }.get(); }\n");
+    const S2: &str = "pub struct S { pub a: u32 }\nimpl S { pub fn get(&self) -> u32 { self.a + extra() } }\npub fn extra() -> u32 { 9 }\npub fn value(out: &mut u32) { *out = S { a: 22 }.get(); }\n";
+    let added = edit(&format!("{S2}{w1}"));
     assert_eq!(added.rung, crate::reload::Rung::Patch, "{:?}", added.lines);
     run(31);
     // Like settle_tests: process exit owns the runtime worker/executable-memory teardown.

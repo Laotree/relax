@@ -126,6 +126,9 @@ struct Req {
     rec: *const (),
     state: AtomicU8,
     panic: Cell<Option<Box<dyn Any + Send>>>,
+    /// where it panicked on the owner (lifeline's record there): the requester's own record when
+    /// it resumes the panic, so a caught compiler panic names its position (lifeline::panic_line)
+    panic_at: Cell<crate::lifeline::PanicAt>,
     /// false: posted (heap, nobody waits); the owner frees it
     waited: bool,
     /// main-thread request accounting (0: not a main-thread request): wall ns at the push, and at
@@ -894,7 +897,9 @@ pub fn queued_detail() -> String {
 pub fn main_wait_behind() -> String {
     match MAIN_WAIT_BEHIND.load(Ordering::Relaxed) {
         u64::MAX => "-".to_string(),
-        c => CLASS_NAMES[c as usize & 7].to_string(),
+        // (u8::MAX: the owner was idle when main's request was queued)
+        0xff => "idle".to_string(),
+        c => CLASS_NAMES[c as usize].to_string(),
     }
 }
 
@@ -995,6 +1000,7 @@ fn request<R>(site: &'static std::panic::Location<'static>, class: Class, deadli
         rec: crate::jit::main_rec_target(),
         state: AtomicU8::new(QUEUED),
         panic: Cell::new(None),
+        panic_at: Cell::new(crate::lifeline::NO_PANIC_AT),
         waited: true,
         t_push: if class == Class::Program && on_main { crate::jit::wall_ns().max(1) } else { 0 },
         t_main: if main_after { crate::jit::wall_ns().max(1) } else { 0 },
@@ -1085,7 +1091,10 @@ fn request<R>(site: &'static std::panic::Location<'static>, class: Class, deadli
         Some(p) if p.is::<crate::preempt::OwnerBusy>() => {
             std::panic::resume_unwind(Box::new(crate::preempt::Preempted));
         }
-        Some(p) => resume_said(p),
+        Some(p) => {
+            crate::lifeline::set_panic_at_raw(req.panic_at.get());
+            resume_said(p)
+        }
         None => Some(out.unwrap()),
     }
 }
@@ -1121,6 +1130,7 @@ pub fn post_queued(class: Class, f: impl FnOnce() + Send + 'static) {
         rec: std::ptr::null(),
         state: AtomicU8::new(QUEUED),
         panic: Cell::new(None),
+        panic_at: Cell::new(crate::lifeline::NO_PANIC_AT),
         waited: false,
         t_push: 0,
         t_main: 0,
@@ -1382,6 +1392,7 @@ fn serve(r: usize) {
     match req.waited {
         true => {
             if let Err(p) = res {
+                req.panic_at.set(crate::lifeline::panic_at_raw());
                 req.panic.set(Some(p));
             }
             if traced {
