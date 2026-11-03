@@ -3320,41 +3320,7 @@ fn block_weights(f: &Func, reach: &[bool], freq: Option<&[f32]>) -> Vec<f32> {
 /// Unreachable or Resume, and landing pads) ~0.
 fn static_weights(f: &Func, reach: &[bool], depth: &[u32]) -> Vec<f32> {
     let nb = f.blocks.len();
-    let mut cold = vec![false; nb];
-    for b in &f.blocks {
-        if let Term::Invoke(_, u) = b.term {
-            cold[u as usize] = true;
-        }
-    }
-    for (bi, b) in f.blocks.iter().enumerate() {
-        if matches!(b.term, Term::Unreachable | Term::Resume) {
-            cold[bi] = true;
-        }
-    }
-    // a block whose every successor is cold is cold (back to front until nothing changes)
-    loop {
-        let mut changed = false;
-        for bi in (0..nb).rev() {
-            if cold[bi] || !reach[bi] {
-                continue;
-            }
-            let mut n = 0;
-            let mut all = true;
-            for s in f.blocks[bi].term.succs() {
-                n += 1;
-                if !cold[s as usize] {
-                    all = false;
-                }
-            }
-            if n > 0 && all {
-                cold[bi] = true;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+    let cold = crate::dom::cold_blocks(f, reach);
     (0..nb).map(|b| if cold[b] { 0.001 } else { 8f32.powi(depth[b].min(DEPTH_CAP) as i32) }).collect()
 }
 
