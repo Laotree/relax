@@ -1260,6 +1260,7 @@ struct OwnerSnap {
     seq: u64,
     wall: u64,
     sites: Vec<(*const std::panic::Location<'static>, u8, Vec<u64>)>,
+    pumps: Vec<(*const std::panic::Location<'static>, *const std::panic::Location<'static>, [u64; 4])>,
     main: [u64; 12],
     behind: [[u64; 2]; crate::owner::CLASSES + 1],
 }
@@ -1279,16 +1280,23 @@ fn owner_snap() -> OwnerSnap {
         seq: OWNER_SEQ.fetch_add(1, Relaxed) + 1,
         wall: crate::clock::wall_ns(),
         sites: crate::owner::site_rows().into_iter().map(|(s, c, a)| (s, c, a.to_vec())).collect(),
+        pumps: crate::owner::pump_rows(),
         main: std::array::from_fn(|i| MAIN_ACC[i].load(Relaxed)),
         behind,
     }
+}
+
+/// `file.rs:line` of a request or wait site.
+fn loc_name(site: *const std::panic::Location<'static>) -> String {
+    // SAFETY: only &'static Locations are stored
+    unsafe { site.as_ref() }.map_or("other".to_string(), |l| format!("{}:{}", l.file().rsplit('/').next().unwrap_or(""), l.line()))
 }
 
 /// `owner [n=10] [since=<seq>]`: what the owner serves now and its queue, then how long its
 /// requests held it, by request site (a hold histogram), most main-thread queue time behind it
 /// first. Atomics only: it answers while the owner is busy.
 fn cmd_owner(req: &Req, out: &mut Out) {
-    use crate::owner::{CLASSES, CLASS_NAMES, HOLD_BUCKETS, HOLD_EDGES_US, SITE_BEHIND_N, SITE_BEHIND_NS, SITE_HIST, SITE_LONG_N, SITE_MAX_NS, SITE_NS, SITE_REQS};
+    use crate::owner::{CLASSES, CLASS_NAMES, HOLD_BUCKETS, HOLD_EDGES_US, SITE_BEHIND_N, SITE_BEHIND_NS, SITE_HIST, SITE_LONG_N, SITE_MAX_NS, SITE_NS, SITE_PUMP_NS, SITE_REQS};
     out.measured("owner thread", "owner counters (no owner)", &[]);
     let now = owner_snap();
     let mut snaps = OWNER_SNAPS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1326,8 +1334,7 @@ fn cmd_owner(req: &Req, out: &mut Out) {
         if f(SITE_REQS) == 0 {
             continue;
         }
-        // SAFETY: only &'static Locations are stored
-        let name = unsafe { site.as_ref() }.map_or("other".to_string(), |l| format!("{}:{}", l.file().rsplit('/').next().unwrap_or(""), l.line()));
+        let name = loc_name(*site);
         let label = |b: usize| {
             let us = |v: u64| if v < 1000 { format!("{}", v as f64 / 1000.0) } else { format!("{}", v / 1000) };
             match b {
@@ -1339,8 +1346,8 @@ fn cmd_owner(req: &Req, out: &mut Out) {
         let hist: Vec<String> = (0..HOLD_BUCKETS).filter(|&b| f(SITE_HIST + b) > 0).map(|b| format!("\"{}\":{}", label(b), f(SITE_HIST + b))).collect();
         let max = if was.is_none() { format!(",\"max_ms\":{}", ms(a[SITE_MAX_NS])) } else { String::new() };
         rows.push((f(SITE_BEHIND_NS), f(SITE_NS), format!(
-            "{{\"site\":{},\"class\":\"{}\",\"n\":{},\"ms\":{}{},\"over_1ms\":{},\"hist_ms\":{{{}}},\"main_behind\":{}}}",
-            json_str(&name), CLASS_NAMES[*class as usize % CLASSES], f(SITE_REQS), ms(f(SITE_NS)), max, f(SITE_LONG_N), hist.join(","), pair(f(SITE_BEHIND_N), f(SITE_BEHIND_NS))
+            "{{\"site\":{},\"class\":\"{}\",\"n\":{},\"ms\":{}{},\"over_1ms\":{},\"hist_ms\":{{{}}},\"waiting_ms\":{},\"main_behind\":{}}}",
+            json_str(&name), CLASS_NAMES[*class as usize % CLASSES], f(SITE_REQS), ms(f(SITE_NS)), max, f(SITE_LONG_N), hist.join(","), ms(f(SITE_PUMP_NS)), pair(f(SITE_BEHIND_N), f(SITE_BEHIND_NS))
         )));
     }
     rows.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
@@ -1348,6 +1355,23 @@ fn cmd_owner(req: &Req, out: &mut Out) {
     out.line(&format!("{{\"holds\":\"per request site: services n, owner ms, services by length in ms (hist_ms), main's program/publish requests queued behind it after the first present [n, ms]; most main_behind first, then owner ms\",\"sites\":{},\"shown\":{}}}", rows.len(), rows.len().min(n)));
     for r in rows.into_iter().take(n) {
         out.line(&r.2);
+    }
+    // the owner's waits inside requests (a request holds the owner while it waits; main's program
+    // requests are not served meanwhile)
+    let mut pumps: Vec<(u64, String)> = Vec::new();
+    for (site, rs, a) in &now.pumps {
+        let old = was.and_then(|w| w.pumps.iter().find(|x| x.0 == *site && x.1 == *rs)).map(|x| x.2);
+        let f = |i: usize| d(a[i], old.map(|o| o[i]));
+        if f(0) == 0 {
+            continue;
+        }
+        let max = if was.is_none() { format!(",\"max_ms\":{}", ms(a[3])) } else { String::new() };
+        pumps.push((f(1), format!("{{\"wait\":{},\"in\":{},\"n\":{},\"ms\":{},\"serving_ms\":{}{}}}", json_str(&loc_name(*site)), json_str(&if rs.is_null() { "between requests".to_string() } else { loc_name(*rs) }), f(0), ms(f(1)), ms(f(2)), max)));
+    }
+    pumps.sort_by(|a, b| b.0.cmp(&a.0));
+    out.line(&format!("{{\"waits\":\"the owner's waits inside requests by wait site and request site: n, ms, of it serving Job/Publish requests (serving_ms)\",\"sites\":{},\"shown\":{}}}", pumps.len(), pumps.len().min(n)));
+    for r in pumps.into_iter().take(n) {
+        out.line(&r.1);
     }
     let old = snaps.len().saturating_sub(15);
     snaps.drain(..old);

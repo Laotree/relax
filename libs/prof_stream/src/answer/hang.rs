@@ -234,14 +234,25 @@ pub fn owner(a: &mut Answer) {
     let rows = a.take("site");
     if !rows.is_empty() {
         a.line("Holds of the owner by request site, most main-thread queue time behind them first:");
-        let mut t = Table::new(&["site", "class", "requests", "owner ms", "longest ms", "held for (ms: count)", "main behind it"]);
+        let mut t = Table::new(&["site", "class", "requests", "owner ms", "longest ms", "held for (ms: count)", "of it waiting ms", "main behind it"]);
         for r in &rows {
             let hist = match r.get("hist_ms") {
                 Some(Value::Obj(h)) => h.iter().map(|(k, x)| format!("{}: {}", k, sig(super::num(Some(x)).unwrap_or(0.0)))).collect::<Vec<_>>().join(", "),
                 _ => String::new(),
             };
             let longest = if r.get("max_ms").is_some() { sig(f(r, "max_ms")) } else { "-".to_string() };
-            t.row(vec![s(r, "site").into(), s(r, "class").into(), sig(f(r, "n")), sig(f(r, "ms")), longest, hist, pair(r.get("main_behind"))]);
+            t.row(vec![s(r, "site").into(), s(r, "class").into(), sig(f(r, "n")), sig(f(r, "ms")), longest, hist, sig(f(r, "waiting_ms")), pair(r.get("main_behind"))]);
+        }
+        a.line(&t.md());
+    }
+    let _ = a.take1("waits");
+    let waits = a.take("wait");
+    if !waits.is_empty() {
+        a.line("The owner's waits inside requests (no program request is served meanwhile), longest first:");
+        let mut t = Table::new(&["wait", "in request", "waits", "ms", "of it serving ms", "longest ms"]);
+        for r in &waits {
+            let longest = if r.get("max_ms").is_some() { sig(f(r, "max_ms")) } else { "-".to_string() };
+            t.row(vec![s(r, "wait").into(), s(r, "in").into(), sig(f(r, "n")), sig(f(r, "ms")), sig(f(r, "serving_ms")), longest]);
         }
         a.line(&t.md());
     }
