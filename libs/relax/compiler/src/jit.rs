@@ -7653,10 +7653,22 @@ fn main_how(how: u8) {
 pub static RT_LAZY: AtomicU64 = AtomicU64::new(0);
 pub static RT_LAZY_NS: AtomicU64 = AtomicU64::new(0);
 
-/// The calling thread runs under a real-time policy, or MAKEPAD_RUN_RT_THREADS=name,.. names it.
-/// Asked at each lazy compile, not cached: a thread's policy and name are set after it starts.
+thread_local! {
+    /// std::relax::realtime_thread() marked this thread real-time.
+    static RT_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// std::relax::realtime_thread: the calling thread counts as real-time from now on (as one
+/// MAKEPAD_RUN_RT_THREADS names, or one with a real-time policy).
+pub(crate) extern "C" fn __relax_realtime_thread() {
+    RT_THREAD.with(|t| t.set(true));
+}
+
+/// The calling thread runs under a real-time policy, marked itself (std::relax::realtime_thread),
+/// or MAKEPAD_RUN_RT_THREADS=name,.. names it. Asked at each lazy compile, not cached: a thread's
+/// policy and name are set after it starts.
 pub fn is_realtime_thread() -> bool {
-    if os::thread::realtime() {
+    if RT_THREAD.with(|t| t.get()) || os::thread::realtime() {
         return true;
     }
     static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -21493,6 +21505,7 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_realtime_lazy" => Some(__relax_realtime_lazy as *const () as usize),
         b"__relax_realtime_misses" => Some(__relax_realtime_misses as *const () as usize),
         b"__relax_realtime_arm" => Some(__relax_realtime_arm as *const () as usize),
+        b"__relax_realtime_thread" => Some(__relax_realtime_thread as *const () as usize),
         // makepad inspect's wait registry: program lock / condvar / park waits (Relax's std sync/raw.rs)
         b"__relax_wait_enter" => Some(crate::inspect::relax_wait_enter as *const () as usize),
         b"__relax_wait_leave" => Some(crate::inspect::relax_wait_leave as *const () as usize),
