@@ -4344,9 +4344,6 @@ impl Unit {
     pub(crate) fn index_code(&mut self, at: u64, len: u32, id: u32, unwind: Option<relax_backend::rir::UnwindInfo>) {
         let kind = code_as_now().unwrap_or_else(|| self.default_code_kind(id));
         self.code.write().unwrap_or_else(|e| e.into_inner()).add(at, len, id, unwind, kind);
-        if kind.tier == tier::O2 && t1prof_on(&self.prog.session.options) {
-            t1prof_note_o2(self, id);
-        }
         crate::inspect::flightrec::jit_install(id, len, kind.tier, kind.origin);
         if crate::inspect::pstream::viewing() {
             let src = crate::inspect::codever::fn_lines(self, id).and_then(|(f, lo, _)| self.prog.file_paths.get(f as usize).map(|p| format!("{}:{}", p, lo))).unwrap_or_default();
@@ -7168,8 +7165,7 @@ impl Unit {
                     FnVerdict::Pending => Verdict::Pending,
                     FnVerdict::Unchecked(why) if matches!(why.as_str(), "stale" | "not queued" | "changed") => Verdict::Pending,
                     // the checker ended without a verdict: never verified, `--check-first` too (it runs
-                    // such a body, as a lazy run does, as unverified code: the deterministic O3 profile
-                    // runs use check-first and must build the code a live run builds)
+                    // such a body, as a lazy run does, as unverified code)
                     FnVerdict::Unchecked(why) => return Verdict::Unverifiable(why),
                 };
                 // `--check-first`: every body is checked before its first lowering and refused when it
@@ -8479,9 +8475,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
             note_entered(&*up, id);
             spec_enqueue(up, id, 0);
             drop_completed_body(&mut *up, id);
-            if (*tier_rec(&u.slots, id).add(3)).load(Ordering::Acquire) == T_REPLAY {
-                (*tier_rec(&u.slots, id).add(2)).load(Ordering::Relaxed)
-            } else { a }
+            a
         }
     }
 }
@@ -9780,17 +9774,13 @@ fn note_slow_base(u: &Unit, id: u32) {
             w0_wake();
         }
     }
-    TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime, &u.prog.session.options));
+    TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime));
 }
 
 /// The first O3 worker's poll (no lock held): SLOW_BASE's O2 builds, and (at most once a second)
 /// the parked counting entries whose counted code is gone.
 fn drain_slow_base() {
     static LAST_FORGET: AtomicU64 = AtomicU64::new(0);
-    // (profile replay: no O2 builds from this run's timing; T1PROF is set only when profiling)
-    if T1PROF.lock().unwrap().as_ref().is_some_and(|p| p.replay) {
-        return;
-    }
     let ids = std::mem::take(&mut *SLOW_BASE.lock().unwrap_or_else(|e| e.into_inner()));
     let now = wall_ns();
     // (counted code goes only with an install, a patch or a reclaim: none since the last look, no
@@ -9893,7 +9883,7 @@ fn settle_tier_tick() {
         return;
     }
     let up = TIER_UNIT.load(Ordering::Acquire);
-    if up.is_null() || T1PROF.lock().unwrap().as_ref().is_some_and(|p| p.replay) || !BASE.lock().unwrap_or_else(|e| e.into_inner()).released {
+    if up.is_null() || !BASE.lock().unwrap_or_else(|e| e.into_inner()).released {
         return;
     }
     let now = tier_clock();
@@ -14098,7 +14088,7 @@ impl<'a> InlineBodies<'a> {
         let asked = asked.into_inner();
         if let Some(old) = shared.filter(|_| verify) {
             // MAKEPAD_RUN_PREP_VERIFY=1: a shared preparation is made again and compared
-            let h = |b: &Option<std::sync::Arc<Prepared>>| b.as_ref().map(|b| (t1_norm_hash(&b.raw), t1_norm_hash(&b.priced), b.deps.clone()));
+            let h = |b: &Option<std::sync::Arc<Prepared>>| b.as_ref().map(|b| (rir_norm_hash(&b.raw), rir_norm_hash(&b.priced), b.deps.clone()));
             if h(&old.body) != h(&prepared) || old.nounwind != asked {
                 eprintln!("PREP-VERIFY mismatch {} (root {}): reads {} / {}, nounwind {} / {}", o1.name, self.root, old.bodies.len(), bodies.len(), old.nounwind.len(), asked.len());
             } else {
@@ -14831,7 +14821,6 @@ fn sampler_thread() {
 impl Drop for Unit {
     fn drop(&mut self) {
         crate::domain::forget_tls_keys(self.syms.dom0());
-        let options = &self.prog.session.clone().options;
         if !self.retired {
             crate::borrowck::lazy::stop();
         }
@@ -14854,9 +14843,6 @@ impl Drop for Unit {
             tier_wake_all();
             if profile_path().is_some() {
                 profile_write();
-            }
-            if t1prof_on(options) {
-                t1prof_finish();
             }
             TIER_UNIT.store(std::ptr::null_mut(), Ordering::SeqCst);
             if !owner::is_owner() {
@@ -14975,7 +14961,7 @@ unsafe fn queue_marked(u: &Unit, id: u32) {
         let _ = s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
         TIER_QUEUED.fetch_add(1, Ordering::Relaxed);
         tier_push(id, Q_MARKED, 0);
-        TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime, &u.prog.session.options));
+        TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime));
     }
 }
 
@@ -15470,8 +15456,6 @@ mod tier_cost_tests {
 }
 const T_COUNTING: u64 = 1;
 const T_QUEUED: u64 = 2;
-// A loop counter cannot queue a recorded instance before its first call.
-const T_REPLAY: u64 = 3;
 
 thread_local! {
     /// makepad inspect's O3 build on this thread (compile_tier1_inspect): the edit putting its
@@ -16452,11 +16436,6 @@ fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) {
         return;
     }
     let u = unsafe { &*up };
-    // (profile replay builds what its profile names, as recorded)
-    // (T1PROF is set only when profiling: no program read off the owner here)
-    if T1PROF.lock().unwrap().as_ref().is_some_and(|p| p.replay) {
-        return;
-    }
     let Some(threshold) = u.tier1.as_ref().map(|t| t.threshold) else { return };
     let mut n = 0u64;
     q.retain(|&(id, why, at, _)| {
@@ -16668,7 +16647,7 @@ pub(crate) fn tier_explain(u: &Unit, id: u32) -> (String, Vec<(String, String)>)
         "not in the slot (other code was installed over it)".to_string()
     };
     rows.push(("count stub".into(), format!("{}; weight {} per call ({} code bytes); re-arms {}{}", stub_state, weight, w5 & CODE_BYTES, n(tl::ev::ARM), last_s(tl::ev::ARM).map_or(String::new(), |t| format!(" (last {t})")))));
-    let st = match state { 0 => "not armed", T_COUNTING => "counting", T_QUEUED => "queued / tiered (calls not counted)", T_REPLAY => "replay", T_FINAL => "final (settled lukewarm code: count stub out, calls not counted)", _ => "?" };
+    let st = match state { 0 => "not armed", T_COUNTING => "counting", T_QUEUED => "queued / tiered (calls not counted)", T_FINAL => "final (settled lukewarm code: count stub out, calls not counted)", _ => "?" };
     let half_s = COST_HALF_LIFE_NS / 1e9;
     rows.push(("tier record".into(), format!("{}; decayed cost {} of {} ({} spent since the last check {} ago in program time (wall less foreground compiles); half-life {:.1} s: O3 needs a steady ~{:.0} units/s = ~{:.0} calls/s at this weight); rearmed once {}; hot loop charged {}", st, cost, threshold, spent, ms(tier_clock().saturating_sub(last_check)), half_s, threshold as f64 * std::f64::consts::LN_2 / half_s, threshold as f64 * std::f64::consts::LN_2 / half_s / weight.max(1) as f64, w5 & REARMED != 0, w5 & LOOP_CHARGED != 0)));
     if loop_left != 0 {
@@ -16834,13 +16813,11 @@ pub(crate) fn queue_view(n: usize) -> Vec<String> {
 /// same priority as the other workers (below the program's threads, performance cores) and, like
 /// every worker past the first, only while the program's threads have no lazy compile in flight.
 /// MAKEPAD_RUN_O3_BURST=0 (A/B) keeps the level's workers only; MAKEPAD_RUN_O3_THREADS a fixed pool.
-fn spawn_tier1_threads(runtime: &crate::options::RuntimeOptions, options: &crate::options::Options) {
+fn spawn_tier1_threads(runtime: &crate::options::RuntimeOptions) {
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
     let cap = cores.saturating_sub(1).max(1);
     let forced = runtime.tier1_threads;
-    let (normal, max) = if options.tier1_profile.is_some() {
-        (1, 1)
-    } else if let Some(n) = forced {
+    let (normal, max) = if let Some(n) = forced {
         let n = n.clamp(1, cap);
         (n, n)
     } else {
@@ -17110,13 +17087,6 @@ impl Unit {
             return;
         }
         crate::inspect::tierlog::init();
-        // (profile replay arms slot by slot: the image is prelinked with names then)
-        if t1prof_replay(&self.prog.session.options) {
-            for &(id, code) in ids {
-                self.arm_counter_as(id, code, true);
-            }
-            return;
-        }
         let now = tier_clock();
         // no-codegen: each count stub is an interpreter entry of its own (interp::count_entry)
         if self.prog.session.options.no_codegen {
@@ -17213,53 +17183,19 @@ impl Unit {
         if !counted {
             return;
         }
-        let replay = t1prof_replay(&self.prog.session.options);
-        let key = replay.then(|| unsafe { t1_key(self, id) });
-        let recorded = key.as_ref().is_some_and(|k| {
-            let mut g = T1PROF.lock().unwrap();
-            let p = g.as_mut().unwrap();
-            // a body recorded builds took as O2 RIR: its slot, for their O2-first builds
-            if p.full_keys.contains(k) {
-                crate::zone_alloc::kept_with(|| p.full_slots.insert(k.clone(), id));
-            }
-            p.map.contains_key(k)
-        });
-        // strict replay: only the recorded decisions build O3 code. A slot the profile does not
-        // name keeps the code it has, without a count stub: no tier-up from this run's timing
-        // (hotness rates, sampler, counted windows), no rt_hot on the program's threads.
-        if replay && !recorded {
-            // ... its recorded O2 decision is replayed: the O2 build, queued once
-            let o2 = {
-                let k = key.unwrap();
-                let mut g = T1PROF.lock().unwrap();
-                let p = g.as_mut().unwrap();
-                let want = p.o2.contains(&k);
-                if want { crate::zone_alloc::kept_with(|| p.o2_queued.insert(k)); }
-                want
-            };
-            if o2 {
-                unsafe { o2_enqueue(self as *mut Unit, id) };
-            }
-            return;
-        }
         let rec = tier_rec(&self.slots, id);
         unsafe {
             if (*rec.add(3)).load(Ordering::Relaxed) != 0 {
                 return;
             }
             tier_count_fresh(rec, threshold, tier_clock());
-            // a recorded instance (profile replay) builds at its first call
-            if recorded {
-                (*rec).store(1, Ordering::Relaxed);
-            }
             let bytes = self.fns[id as usize].code_len as u64;
             (*rec.add(5)).store(bytes, Ordering::Relaxed);
             (*rec.add(1)).store(code, Ordering::Relaxed);
             // Once the threshold-one stub has fired, another caller must also enter
             // rt_hot and wait for the build, rather than underflowing into O1.
             let at = if self.prog.session.options.no_codegen {
-                // no-codegen: an interpreter entry of its own counts (interp::count_entry); a
-                // recorded instance (profile replay) builds at its first call: its budget is 1
+                // no-codegen: an interpreter entry of its own counts (interp::count_entry)
                 match relax_codegen::interp::count_entry(rec as u64, id, code, call_weight(bytes)) {
                     Ok(at) => at,
                     Err(e) => {
@@ -17269,16 +17205,15 @@ impl Unit {
                     }
                 }
             } else {
-                let fallback = if recorded { self.emit_code(&x64::stub(id, self.hot_entry), "relax::hot_stub") } else { code };
                 let at = bump(&self.code_next, x64::COUNT_STUB_SIZE as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
-                os::mem::write_code(at, &x64::count_stub(at, rec as u64, id, fallback, self.hot_entry, call_weight(bytes)));
+                os::mem::write_code(at, &x64::count_stub(at, rec as u64, id, code, self.hot_entry, call_weight(bytes)));
                 at
             };
             if perf_map_on() {
                 perf_map(at, x64::COUNT_STUB_SIZE, &format!("count {}", perf_name(self, id)));
             }
             (*rec.add(2)).store(at, Ordering::Relaxed);
-            (*rec.add(3)).store(if recorded { T_REPLAY } else { T_COUNTING }, Ordering::Release);
+            (*rec.add(3)).store(T_COUNTING, Ordering::Release);
             let slot = SlotWord::of(&self.slots, id);
             slot.store(at, Ordering::SeqCst);
         }
@@ -17326,7 +17261,6 @@ impl Unit {
     /// names the line that asked.
     #[track_caller]
     fn retier(&mut self, id: u32) {
-        if t1prof_replay(&self.prog.session.options) { return; }
         if tier1_trace() { eprintln!("O3 retier #{} from line {} (n={})", id, std::panic::Location::caller().line(), self.retiers.get(&id).copied().unwrap_or(0)); }
         const RETIERS: u8 = 4;
         let _k = crate::zone_alloc::kept();
@@ -17352,11 +17286,11 @@ impl Unit {
 // carry them (Block::count) to the profile-driven block layout and the register allocator's
 // block weights. Counts live in this process only (no profile files).
 
-/// The counted tier runs unless block frequencies are off or an O3 profile is replayed.
+/// The counted tier runs unless block frequencies are off.
 /// A W32 web program (codegen web32.rs) addresses only its window: its block counters live there
 /// (web32::alloc_counters), so a wasm export's O3 bodies are built from the trace's counts.
 fn pgo_on(options: &crate::options::Options) -> bool {
-    !options.no_block_freq && !t1prof_replay(options)
+    !options.no_block_freq
 }
 
 /// MAKEPAD_RUN_PGO_HOLD=1: counted code stays installed (no counting window ends): with
@@ -17823,41 +17757,7 @@ fn rt_hot(slot: u64) -> u64 {
         let code = (*rec.add(1)).load(Ordering::Relaxed);
         let stub = (*rec.add(2)).load(Ordering::Relaxed);
         let s = SlotWord::of(&u.slots, slot as u32);
-        if (*rec.add(3)).load(Ordering::Acquire) == T_REPLAY {
-            if startup_holds_tier1() {
-                if (*rec.add(3)).compare_exchange(T_REPLAY, T_QUEUED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                    TIER_QUEUED.fetch_add(1, Ordering::Relaxed);
-                    let _ = s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
-                    tier_push(slot as u32, Q_CALLS, 0);
-                    TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime, &u.prog.session.options));
-                }
-                return code;
-            }
-            let _job = compile_job();
-            ensure_sufficient_stack(|| {
-                // One unit call for the whole build, its back end included. Concurrent
-                // callers wait for it.
-                owner::call(owner::Class::Program, || {
-                    if (*rec.add(3)).load(Ordering::Acquire) == T_REPLAY {
-                        TIER_QUEUED.fetch_add(1, Ordering::Relaxed);
-                        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_tier1(up, slot as u32)));
-                        if let Err(_) = ok {
-                            // (a cancelled nested build too: the O1 code stays; never unwound
-                            // through the JIT frames that called rt_hot)
-                            t1prof_divergence("first-call-build", &t1_key(up, slot as u32));
-                            s.store(code, Ordering::SeqCst);
-                        } else if !matches!(ok, Ok(true)) {
-                            t1prof_divergence("first-call-build", &t1_key(up, slot as u32));
-                            s.store(code, Ordering::SeqCst);
-                        }
-                        (*rec.add(3)).store(T_QUEUED, Ordering::Release);
-                        t1prof_finish_quiet();
-                    }
-                });
-            });
-            return s.load(Ordering::SeqCst);
-        }
-        // from here on atomics only (rule I-CALL; the T_REPLAY build above is the named exception)
+        // from here on atomics only (rule I-CALL)
         let _no_wait = owner::NoWait::enter();
         let now = tier_clock();
         let Some(threshold) = u.tier1.as_ref().map(|t| t.threshold) else { return code };
@@ -17892,7 +17792,7 @@ fn rt_hot(slot: u64) -> u64 {
             let why = if (*rec.add(5)).load(Ordering::Relaxed) & LOOP_CHARGED != 0 { Q_LOOP } else { Q_CALLS };
             crate::inspect::tierlog::note(slot as u32, crate::inspect::tierlog::ev::QUEUE, why, rate, code);
             tier_inbox_push(rec, slot as u32, why, rate);
-            TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime, &u.prog.session.options));
+            TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime));
         }
         s.load(Ordering::SeqCst)
     }
@@ -18015,10 +17915,6 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
         if up.is_null() || TIER_STOP.load(Ordering::SeqCst) {
             continue;
         }
-        // strict replay: a slot the profile does not name is not built (whatever queued it)
-        if owner::publish(|| unsafe { t1prof_refuse(up, id) }) {
-            continue;
-        }
         let _job = compile_job();
         if why == Q_CALLS || why == Q_LOOP {
             owner::publish(|| unsafe { o2_hot(up, id) });
@@ -18065,180 +17961,14 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
     }
 }
 
-/// Builds slot `id` at O3 and installs it (O3 thread). False: dropped (no RIR,
-/// failed, or the slot changed meanwhile).
-/// MAKEPAD_RUN_O3_PROFILE=<file>: missing file records the last decisions per instance;
-/// an existing file replays those decisions on the instance's first call. Unrecorded
-/// instances still tier on live hotness, and are listed separately in the summary.
-/// Decisions include the snapshot, never-run and single-reference sets, both inlining
-/// rounds' frequencies and the backend frequencies.
-struct T1Entry {
-    cold: Vec<String>,
-    /// callees whose RIR the build had (inline candidates)
-    snap: Vec<String>,
-    /// Single-reference callees at snapshot time (lazy builds can change live counts).
-    single: Vec<String>,
-    freq: Option<Vec<f32>>,
-    // Frequencies before each inlining round; backend frequencies describe a later RIR.
-    inline_freq: Option<[Option<Vec<f32>>; 2]>,
-    /// PGO: the counted build's block counts of the O3 input (replay puts them on its blocks again)
-    counts: Option<Vec<f32>>,
-    /// ... and of the counted inline candidates (by key)
-    callee_counts: Vec<(String, Vec<f32>)>,
-    /// the root's O3 build gets the large growth room: it was counted (PGO) or, replayed, as recorded
-    hot: bool,
-    input: u64,
-    code: u64,
-    /// the decisions the installed build took: the keys of the callees it inlined (sorted, one per
-    /// inlined body); replay checks its own build against them (inline-differ)
-    inlined: Vec<String>,
-    /// the input bodies' hashes (O3Assembled::rir_hashes): root first
-    rirs: Vec<(String, u64)>,
-    /// the input bodies that were O2 RIR (an O2 build had replaced their O1 RIR before the
-    /// snapshot): their keys, "" for the root. Replay builds those O2 builds first (t1prof_o2_first)
-    full: Vec<String>,
-}
-struct T1Profile {
-    replay: bool,
-    path: String,
-    map: std::collections::HashMap<String, T1Entry>,
-    installed: usize,
-    live: std::collections::HashSet<String>,
-    differ: Vec<String>,
-    /// replay: keys installed already (later hot triggers do not rebuild them)
-    done: std::collections::HashSet<String>,
-    /// replay: hot slots the profile does not name, kept at their code (strict: only the
-    /// recorded decisions build O3 code)
-    refused: std::collections::BTreeSet<String>,
-    /// slots that got O2 code (record: installed in the run; replay: the recorded set, queued for
-    /// their O2 build when first armed) -- the run's tier decisions below O3
-    o2: std::collections::BTreeSet<String>,
-    /// replay: recorded O2 slots queued for their O2 build
-    o2_queued: std::collections::HashSet<String>,
-    /// replay: the slots of the bodies recorded builds took as O2 RIR (T1Entry::full), by key, as
-    /// they are armed
-    full_slots: std::collections::HashMap<String, u32>,
-    /// replay: the keys T1Entry::full names (besides roots)
-    full_keys: std::collections::HashSet<String>,
-}
-static T1PROF: relax_session::sync::Mutex<Option<T1Profile>> = relax_session::sync::Mutex::new(None);
-
-fn t1prof_on(options: &crate::options::Options) -> bool {
-    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| {
-        let _k = crate::zone_alloc::kept();
-        let Some(p) = options.tier1_profile.as_ref().and_then(|p| p.to_str()) else { return false };
-        let p = p.to_string();
-        let mut map = std::collections::HashMap::new();
-        let mut o2 = std::collections::BTreeSet::new();
-        let replay = match options.tier1_profile_data.as_deref() {
-            Some(t) if !t.is_empty() => {
-                for l in t.lines() {
-                    let x: Vec<&str> = l.split('\t').collect();
-                    if x.len() == 2 && x[0] == "o2" {
-                        o2.insert(x[1].to_string());
-                        continue;
-                    }
-                    if x.len() != 15 {
-                        continue;
-                    }
-                    let list = |t: &str| -> Vec<String> { if t.is_empty() { Vec::new() } else { t.split('\u{1f}').map(|c| c.to_string()).collect() } };
-                    let parse_freq = |v: &str| if v == "-" { None } else { Some(v.split(',').filter_map(|v| u32::from_str_radix(v, 16).ok()).map(f32::from_bits).collect()) };
-                    let freq = parse_freq(x[3]);
-                    let inline_freq = (x.len() >= 8).then(|| [parse_freq(x[6]), parse_freq(x[7])]);
-                    // Append single-reference keys after both rounds; older profiles
-                    // have no single-reference facts to replay.
-                    let single = list(x[8]);
-                    let hot = x[9] == "1";
-                    let counts = x.get(10).and_then(|v| parse_freq(v));
-                    let callee_counts = x.get(11).map_or_else(Vec::new, |v| v.split('\u{1e}').filter_map(|e| e.split_once('\u{1d}')).filter_map(|(k, c)| Some((k.to_string(), parse_freq(c)?))).collect());
-                    map.insert(x[0].to_string(), T1Entry { cold: list(x[1]), snap: list(x[2]), single, freq, inline_freq, hot, counts, callee_counts, input: u64::from_str_radix(x[4], 16).unwrap_or(0), code: u64::from_str_radix(x[5], 16).unwrap_or(0), inlined: list(x[12]), rirs: x[13].split('\u{1e}').filter_map(|e| e.split_once('\u{1d}')).filter_map(|(k, h)| Some((k.to_string(), u64::from_str_radix(h, 16).ok()?))).collect() , full: list(x[14]) });
-                }
-                true
-            }
-            _ => false,
-        };
-        eprintln!("makepad: O3 profile {} ({}, {} entries, {} O2)", p, if replay { "replay" } else { "record" }, map.len(), o2.len());
-        let full_keys = map.values().flat_map(|e: &T1Entry| e.full.iter().filter(|k| !k.is_empty()).cloned()).collect();
-        *T1PROF.lock().unwrap() = Some(T1Profile { replay, path: p, map, installed: 0, live: std::collections::HashSet::new(), differ: Vec::new(), done: std::collections::HashSet::new(), refused: Default::default(), o2, o2_queued: Default::default(), full_slots: Default::default(), full_keys });
-        true
-    })
-}
-
-fn t1_hash<T: std::hash::Hash + ?Sized>(x: &T) -> u64 {
-    use std::hash::Hasher;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    x.hash(&mut h);
-    h.finish()
-}
-
-/// Instance identity independent of slot allocation and RIR availability. Pretty
-/// type names alone collide (e.g. two modules' Entry types), so include stable hashes.
-unsafe fn t1_key(up: *const Unit, id: u32) -> String {
-    let u = &*up;
-    let ty = |t| format!("{}#{:032x}", crate::typeck::ty_to_string(false, &u.prog, &u.tcx, t), crate::stable::type_hash(&u.prog, &u.tcx, t));
-    let inst = match &u.fns[id as usize].key {
-        FnKey::Inst(d, a) => {
-            let mut s = format!("{}@{:?}", u.prog.def_path(*d), d);
-            for t in a.iter() { s.push(','); s.push_str(&ty(*t)); }
-            s
-        }
-        FnKey::Closure(file, e, parent) => format!("closure:{}:{}:{}", file, e, t1_key(up, *parent)),
-        FnKey::Shim(shim) => crate::lower::shim_name(&u.prog, &u.tcx, shim),
-        FnKey::Glue(g, t) => format!("glue{}:{}", g, ty(*t)),
-        FnKey::Plain(b) => format!("plain:{}", t1_key(up, *b)),
-        FnKey::Sandbox(b) if (*b as usize) < u.fns.len() => format!("sandbox:{}", t1_key(up, *b)),
-        FnKey::Sandbox(b) => format!("sandbox:{}", b),
-    };
-    inst.replace('\t', " ")
-}
-
-/// Deterministic O3 replay (on the owner, before slot `id`'s snapshot): the bodies its recorded build
-/// took as O2 RIR (T1Entry::full: the root, inline candidates) get their O2 build now. In the record an
-/// O2 build that finished first replaced their O1 RIR, and O3 starts from that RIR (o2_finish); a
-/// replay builds O3 at the first call, before an O2 worker would have, so the snapshot took the O1
-/// RIR: a different input (root-differ / callee-differ), whose recorded block frequencies no longer
-/// fit it (frequency-shape: they were dropped, and the hot sites of set_uniform, set_material,
-/// reconcile inlined nothing). A body whose O2 RIR could not be made is a divergence ("o2-first";
-/// "o2-first-noslot": its slot was not armed in this run yet).
-unsafe fn t1prof_o2_first(up: *mut Unit, id: u32) {
-    let key = t1_key(up, id);
-    let ids: Vec<(u32, String)> = {
-        let g = T1PROF.lock().unwrap();
-        let p = g.as_ref().unwrap();
-        let Some(e) = p.map.get(&key) else { return };
-        e.full.iter().map(|k| (if k.is_empty() { Some(id) } else { p.full_slots.get(k).copied() }, k)).map(|(c, k)| (c.unwrap_or(u32::MAX), if k.is_empty() { key.clone() } else { k.clone() })).collect()
-    };
-    for (c, k) in ids {
-        let has_o2 = |c: u32| (c as usize) < (&*up).fns.len() && (&*up).fns[c as usize].rir.as_ref().is_some_and(|r| r.full);
-        if c != u32::MAX && !has_o2(c) && (&*up).fns[c as usize].compiled {
-            // (once: a later queue entry for it is not built again)
-            O2_SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert((up as usize, c));
-            // (a failed or bailed O2 build leaves the O1 RIR: the divergence below)
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if let Some(w) = o2_begin(up, c) {
-                    let done = w.run();
-                    o2_finish(up, done);
-                }
-            }));
-        }
-        if c == u32::MAX {
-            // (not armed in this run yet: a closure, glue, or a body not compiled before this build)
-            t1prof_divergence("o2-first-noslot", &k);
-        } else if !has_o2(c) {
-            t1prof_divergence("o2-first", &k);
-        }
-    }
-}
-
-/// Hash of a RIR dump without fn slot numbers, symbol ids and host addresses (they differ
-/// between runs), its virtual registers numbered by first appearance (two lowerings of one body can
-/// number them differently, e.g. core::heap::from_size_align: an O1 build's and an O2 front's: the
-/// same code, which read as callee-differ in every replay).
-fn t1_norm_hash(rir: &relax_backend::rir::Func) -> u64 {
+/// Hash of a RIR dump without fn slot numbers, symbol ids and host addresses, its virtual
+/// registers numbered by first appearance (two lowerings of one body can number them differently,
+/// e.g. core::heap::from_size_align: an O1 build's and an O2 front's). MAKEPAD_RUN_PREP_VERIFY
+/// compares two preparations of one body with it.
+fn rir_norm_hash(rir: &relax_backend::rir::Func) -> u64 {
     let d = rir.dump();
-    // The key already identifies the instance. Closure display names include the
-    // parent's process-local slot ("{closure#n}@slot"), which is not a code input.
+    // Closure display names include the parent's process-local slot ("{closure#n}@slot"),
+    // which is not a code input.
     let d = d.find(" params ").map_or(d.as_str(), |i| &d[i..]);
     let b = d.as_bytes();
     let mut norm: Vec<u8> = Vec::with_capacity(b.len());
@@ -18294,120 +18024,10 @@ fn t1_norm_hash(rir: &relax_backend::rir::Func) -> u64 {
             i += 1;
         }
     }
-    t1_hash(&norm)
-}
-
-fn t1prof_replay(options: &crate::options::Options) -> bool {
-    t1prof_on(options) && T1PROF.lock().unwrap().as_ref().is_some_and(|p| p.replay)
-}
-
-/// MAKEPAD_RUN_O3_PROFILE_DUMP=<substring of a key>: the O3 snapshot's input bodies of matching
-/// candidates as hashed (t1_norm_hash), to <profile>.dump/<record|replay>/<hash of key>.<hash>.rir
-/// (diff a record's against a replay's to see why their inputs differ).
-fn t1prof_dump(key: &str, f: &relax_backend::rir::Func, attrs: u8) {
-    static W: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    let Some(want) = W.get_or_init(|| std::env::var("MAKEPAD_RUN_O3_PROFILE_DUMP").ok()) else { return };
-    if !key.contains(want.as_str()) {
-        return;
-    }
-    let Some((path, replay)) = T1PROF.lock().unwrap().as_ref().map(|p| (p.path.clone(), p.replay)) else { return };
-    let dir = format!("{}.dump/{}", path, if replay { "replay" } else { "record" });
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(format!("{}/{:016x}.{:016x}.rir", dir, t1_hash(key), t1_norm_hash(f)), format!("{}\nattrs {}\n{}", key, attrs, f.dump()));
-}
-
-/// Deterministic O3, record: slot `id` got O2 code (fresh or from the cache); the profile file is
-/// rewritten at most every 2 s for these (each O3 install rewrites it too).
-fn t1prof_note_o2(u: &Unit, id: u32) {
-    static LAST: AtomicU64 = AtomicU64::new(0);
-    let k = unsafe { t1_key(u, id) };
-    let write = {
-        let mut g = T1PROF.lock().unwrap();
-        let Some(p) = g.as_mut().filter(|p| !p.replay) else { return };
-        let new = crate::zone_alloc::kept_with(|| p.o2.insert(k));
-        let now = wall_ns();
-        new && now.saturating_sub(LAST.load(Ordering::Relaxed)) >= 2_000_000_000 && { LAST.store(now, Ordering::Relaxed); true }
-    };
-    if write {
-        t1prof_finish();
-    }
-}
-
-/// Strict replay: slot `id` turned hot (a queue pop) but the profile does not name it: it gets
-/// no O3 (or O2) build; noted in the summary (REFUSED). False outside replay.
-unsafe fn t1prof_refuse(up: *const Unit, id: u32) -> bool {
-    if !t1prof_replay(&(&*up).prog.session.options) {
-        return false;
-    }
-    let k = t1_key(up, id);
-    let mut g = T1PROF.lock().unwrap();
-    let p = g.as_mut().unwrap();
-    if p.map.contains_key(&k) {
-        return false;
-    }
-    crate::zone_alloc::kept_with(|| p.refused.insert(k));
-    true
-}
-
-fn t1prof_divergence(kind: &str, key: &str) {
-    if let Some(p) = T1PROF.lock().unwrap().as_mut() {
-        crate::zone_alloc::kept_with(|| p.differ.push(format!("{} {}", kind, key)));
-    }
-}
-
-fn t1prof_summary(p: &T1Profile) -> String {
-    let mut missing: Vec<_> = p.map.keys().filter(|k| !p.done.contains(*k)).collect();
-    missing.sort();
-    let mut live: Vec<_> = p.live.iter().collect();
-    live.sort();
-    let mut kinds = std::collections::BTreeMap::new();
-    for d in &p.differ { *kinds.entry(d.split(' ').next().unwrap_or("unknown")).or_insert(0usize) += 1; }
-    let mut out = format!("installed {} / recorded {} / unrecorded-live {} / refused {} / divergences {} / O2 queued {} of {}\n",
-        p.installed, p.map.len(), p.live.len(), p.refused.len(), p.differ.len(), p.o2_queued.len(), p.o2.len());
-    for (kind, count) in kinds { out.push_str(&format!("{} {}\n", kind, count)); }
-    for k in missing { out.push_str(&format!("MISSING {}\n", k)); }
-    for k in live { out.push_str(&format!("UNRECORDED-LIVE {}\n", k)); }
-    for k in &p.refused { out.push_str(&format!("REFUSED {}\n", k)); }
-    for d in &p.differ { out.push_str(&format!("{}\n", d)); }
-    out
-}
-
-/// Keep the summary complete even when the process exits without dropping the Unit.
-fn t1prof_finish_quiet() {
-    let g = T1PROF.lock().unwrap();
-    let Some(p) = g.as_ref() else { return };
-    if p.replay { let _ = std::fs::write(format!("{}.replay", p.path), t1prof_summary(p)); }
-}
-
-fn t1prof_finish() {
-    let g = T1PROF.lock().unwrap();
-    let Some(p) = g.as_ref() else { return };
-    if p.replay {
-        let out = t1prof_summary(p);
-        let _ = std::fs::write(format!("{}.replay", p.path), &out);
-        eprintln!("makepad: O3 profile replay: {}", out.lines().next().unwrap_or(""));
-        return;
-    }
-    let mut keys: Vec<&String> = p.map.keys().collect();
-    keys.sort();
-    let mut out = String::new();
-    for k in keys {
-        let e = &p.map[k];
-        let fmt_freq = |f: &Option<Vec<f32>>| match f {
-            Some(f) => f.iter().map(|x| format!("{:x}", x.to_bits())).collect::<Vec<_>>().join(","),
-            None => "-".to_string(),
-        };
-        let inline = e.inline_freq.as_ref().expect("recorded inlining frequencies");
-        let callees = e.callee_counts.iter().map(|(k, c)| format!("{}\u{1d}{}", k, fmt_freq(&Some(c.clone())))).collect::<Vec<_>>().join("\u{1e}");
-        out.push_str(&format!("{}\t{}\t{}\t{}\t{:016x}\t{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", k, e.cold.join("\u{1f}"), e.snap.join("\u{1f}"), fmt_freq(&e.freq), e.input, e.code, fmt_freq(&inline[0]), fmt_freq(&inline[1]), e.single.join("\u{1f}"), if e.hot { "1" } else { "0" }, fmt_freq(&e.counts), callees, e.inlined.join("\u{1f}"), e.rirs.iter().map(|(k, h)| format!("{}\u{1d}{:x}", k, h)).collect::<Vec<_>>().join("\u{1e}"), e.full.join("\u{1f}")));
-    }
-    for k in &p.o2 {
-        out.push_str(&format!("o2\t{}\n", k));
-    }
-    let _ = std::fs::write(&p.path, out);
-    if !p.differ.is_empty() {
-        eprintln!("makepad: O3 profile record: {} fns rebuilt with equal inputs gave different code: {}", p.differ.len(), p.differ.iter().take(8).cloned().collect::<Vec<_>>().join(", "));
-    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    norm.hash(&mut h);
+    h.finish()
 }
 
 /// MAKEPAD_RUN_O3_CHURN=1: every 5 s, O3 work on stderr -- builds and their CPU in the period,
@@ -18499,6 +18119,8 @@ fn trace_tier1_phase(id: u32, phase: &str) {
     }
 }
 
+/// Builds slot `id` at O3 and installs it (O3 thread). False: dropped (no RIR,
+/// failed, or the slot changed meanwhile).
 pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let _site = FrontSite::enter(7);
     let _census_context = (&*up).exec_context(relax_codegen::exec_census::active() && crate::exec_profile::is_call(up as usize, id));
@@ -18518,18 +18140,6 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         None => &session.options,
     };
     let runtime = &session.runtime;
-    // Replay has one active O3 build, including live fallback builds: the whole build is one
-    // unit call (its back end too), so it cannot race a caller's first-call build. The named
-    // exception to rule I-PUB (OWNERARCH.DESIGN.md: deterministic A/Bs only): a program-class
-    // request, not a publish.
-    // (deterministic O3, record too: both runs build the same way, their inputs on one path)
-    if t1prof_on(options) && !owner::is_owner() {
-        return owner::call(owner::Class::Program, || compile_tier1(up, id));
-    }
-    // replay: the O2 builds whose RIR the recorded build took, first (MAKEPAD_RUN_OPT=-o2first: not; A/B)
-    if t1prof_replay(options) && !relax_backend::stats::opt_off(options, "-o2first") {
-        t1prof_o2_first(up, id);
-    }
     // SPEC-V: unverified code gets O3 code too, built as it is (Unit::o3_allowed)
     if !owner::publish(|| (&*up).o3_allowed(id)) {
         crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_REFUSED, crate::inspect::tierlog::REFUSE_VERDICT, 0, 0);
@@ -18561,7 +18171,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         f.compiled && f.rir.is_none() && f.build_err.is_none() && !f.building
     };
     let (needs, front) = owner::publish(|| refront_settled(up, id, needs_rir(up)));
-    if needs && !t1prof_on(options) && !owner::is_owner() {
+    if needs && !owner::is_owner() {
         while !tier1_workers_ready() {
             job_sleep(TIER1_POLL);
         }
@@ -18577,7 +18187,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // off the unit (typeck_ahead, lower_ahead) and asks again, one traversal level per round.
     // The owner's build then only takes the lowered RIR (O1 optimisation and the candidate's own
     // small inline candidates stay there). Warm Stage: single snapshots of 100-680 ms on the owner.
-    let prefront = !owner::is_owner() && !t1prof_on(options) && pipelined();
+    let prefront = !owner::is_owner() && pipelined();
     let mut fronted: std::collections::HashSet<u32> = Default::default();
     // (slot, def, args, the base of an unverified-mode twin: its body is the base's, lowered as unverified code)
     let fronts: std::cell::RefCell<Vec<(u32, DefId, Vec<TyId>, Option<u32>)>> = Default::default();
@@ -18655,7 +18265,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let _take_watch = TakeWatch;
         // a round's walk resumed where the last publish of the round stopped (WALK_ITEMS)
         let resumed = walk.borrow_mut().take();
-        let (epoch, rir, version, t1key, sandboxed, mut callees, mut seen, src_toks, inline_all, t1_rec, mut frontier, mut level, mut idx) = if let Some(w) = resumed { w } else {
+        let (epoch, rir, version, sandboxed, mut callees, mut seen, src_toks, inline_all, mut frontier, mut level, mut idx) = if let Some(w) = resumed { w } else {
         if needs_rir(up) {
             if splittable(up, id, false) && split_tried.borrow_mut().insert((id, false)) {
                 splits.borrow_mut().push((id, RirMode::Tier0));
@@ -18705,20 +18315,6 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 }
             }
         };
-        // deterministic O3 (MAKEPAD_RUN_O3_PROFILE): recorded fns replay once;
-        // only the recorded ones build at all (strict: t1prof_refuse, arm_counter_as).
-        let t1key: Option<String> = if t1prof_on(options) { Some(t1_key(up, id)) } else { None };
-        if let Some(k) = &t1key {
-            let g = T1PROF.lock().unwrap();
-            let p = g.as_ref().unwrap();
-            if p.replay && p.done.contains(k) {
-                drop(g);
-                drop_why(up, "replay: done");
-                (&mut *up).stats.tier1_dropped += 1;
-                return None;
-            }
-
-        }
         let sandboxed = matches!((&*up).fns[id as usize].key, FnKey::Sandbox(_));
         let mut callees: Vec<u32> = Vec::new();
         for b in &rir.blocks {
@@ -18740,20 +18336,14 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             let t = (&*up).tier1.as_ref().unwrap();
             (t.src_toks, t.opt.inline_all)
         };
-        // deterministic O3, replay: the recorded build's never-run, snapshot and single sets
-        let t1_rec: Option<(Vec<String>, Vec<String>, Vec<String>)> = t1key.as_ref().and_then(|k| {
-            let g = T1PROF.lock().unwrap();
-            let p = g.as_ref().unwrap();
-            if p.replay { p.map.get(k).map(|e| (e.cold.clone(), e.snap.clone(), e.single.clone())) } else { None }
-    });
         let seen: std::collections::HashSet<u32> = callees.iter().copied().collect();
         let frontier = callees.clone();
         TIER1_TAKE_PARTS[0].fetch_add(cpu_ns() - s0, Ordering::Relaxed);
-        (epoch, rir, version, t1key, sandboxed, callees, seen, src_toks, inline_all, t1_rec, frontier, 0usize, 0usize)
+        (epoch, rir, version, sandboxed, callees, seen, src_toks, inline_all, frontier, 0usize, 0usize)
         };
     // (no TIER_ACTIVE pins for the callees: the walk and the snapshot's Arc clones are one publish,
     // and what reads TIER_ACTIVE to keep RIR (settle_drop, the O2 install) are publishes too)
-    let ensure_rir = |c: u32, force: bool| {
+    let ensure_rir = |c: u32| {
         let u = &mut *up;
         u.sync_entry_ref(c);
         if u.fns[c as usize].rir.as_ref().is_some_and(|r| upgradable(r)) {
@@ -18797,7 +18387,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let cached_code = (&mut *up).ran_before(c);
         let u = &mut *up;
         let source_size = src_size(u, c);
-        if force || cached_code || source_size <= src_toks || attr & relax_codegen::opt::ATTR_ALWAYS != 0 {
+        if cached_code || source_size <= src_toks || attr & relax_codegen::opt::ATTR_ALWAYS != 0 {
             if prefront && !fronted.contains(&c) {
                 let twin_of = match u.fns[c as usize].key { FnKey::Plain(b) => Some(b), _ => None };
                 if let FnKey::Inst(d, args) = &u.fns[twin_of.unwrap_or(c) as usize].key {
@@ -18826,21 +18416,20 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     };
     const LEVELS: usize = 16;
     // a publish visits at most WALK_ITEMS callees (rule I-PUB: bounded by its item count); the
-    // round's next publish goes on from there (off the owner: replay walks a round in one)
+    // round's next publish goes on from there
     let mut budget = if prefront { WALK_ITEMS } else { usize::MAX };
     while level < LEVELS && !frontier.is_empty() {
         while idx < frontier.len() {
             if budget == 0 {
-                *walk.borrow_mut() = Some((epoch, rir, version, t1key, sandboxed, callees, seen, src_toks, inline_all, t1_rec, frontier, level, idx));
+                *walk.borrow_mut() = Some((epoch, rir, version, sandboxed, callees, seen, src_toks, inline_all, frontier, level, idx));
                 resume.set(true);
                 owner_ns.set(owner_ns.get() + cpu_ns() - s0);
                 return None;
             }
             budget -= 1;
             let c = frontier[idx];
-            let force = t1_rec.as_ref().is_some_and(|(_, snap, _)| snap.contains(&t1_key(up, c)));
             let te = cpu_ns();
-            ensure_rir(c, force);
+            ensure_rir(c);
             views.borrow_mut().insert(c, o3_view(&*up, c));
             TIER1_TAKE_PARTS[1].fetch_add(cpu_ns() - te, Ordering::Relaxed);
             idx += 1;
@@ -18850,31 +18439,15 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         }
         // the level's scan (o3_next_level): off the owner when prefronted, then the walk resumes
         if prefront {
-            *walk.borrow_mut() = Some((epoch, rir, version, t1key, sandboxed, callees, seen, src_toks, inline_all, t1_rec, frontier, level, idx));
+            *walk.borrow_mut() = Some((epoch, rir, version, sandboxed, callees, seen, src_toks, inline_all, frontier, level, idx));
             resume.set(true);
             scan.set(true);
             owner_ns.set(owner_ns.get() + cpu_ns() - s0);
             return None;
         }
-        frontier = o3_next_level(up, owner_front(up), options, id, inline_all, &frontier, &views.borrow(), &t1_rec, &mut callees, &mut seen);
+        frontier = o3_next_level(up, owner_front(up), options, id, inline_all, &frontier, &views.borrow(), &mut callees, &mut seen);
         level += 1;
         idx = 0;
-    }
-    // Recorded descendants can be absent from the live traversal (different
-    // O1 inlining). Resolve all known keys, repeating when lowering adds slots.
-    if let Some((_, recorded, _)) = &t1_rec {
-        let mut done = 0;
-        while done < (&*up).fns.len() {
-            let end = (&*up).fns.len();
-            for c in done..end {
-                if recorded.contains(&t1_key(up, c as u32)) {
-                    ensure_rir(c as u32, true);
-                    views.borrow_mut().insert(c as u32, o3_view(&*up, c as u32));
-                    if seen.insert(c as u32) { callees.push(c as u32); }
-                }
-            }
-            done = end;
-        }
     }
     // candidates whose fronts (or O1 builds) this thread runs first: asked again after them
     if !fronts.borrow().is_empty() || !splits.borrow().is_empty() {
@@ -18890,20 +18463,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // the assembly and its owner part: here when the walk ran on the owner, else the assembly off
     // it after this publish and the owner part in one more
     let assembled = (!prefront).then(|| {
-        let mut a = o3_assemble(up, owner_front(up), options, id, &rir, &t1key, &t1_rec, &callees, &views.borrow(), inline_all);
-        o3_assemble_owner(up, options, &mut a, &t1key, &t1_rec);
+        let mut a = o3_assemble(up, owner_front(up), id, &rir, &callees, &views.borrow(), inline_all);
+        o3_assemble_owner(up, options, &mut a);
         a
-    });
-    // recorded frequencies (replay)
-    let t1_freq: Option<Option<Vec<f32>>> = t1key.as_ref().and_then(|k| {
-        let g = T1PROF.lock().unwrap();
-        let p = g.as_ref().unwrap();
-        if p.replay { p.map.get(k).map(|e| e.freq.clone()) } else { None }
-    });
-    let t1_inline_freq = t1key.as_ref().and_then(|k| {
-        let g = T1PROF.lock().unwrap();
-        let p = g.as_ref().unwrap();
-        if p.replay { p.map.get(k).map(|e| e.inline_freq.clone()) } else { None }
     });
     let ro = u.ro_reader();
     let env = x64::Env { slots: u.env.slots, tls_key: u.env.tls_key, tls_slow: u.env.tls_slow, resume: u.env.resume, opt_regs: true, syms: u.env.syms, sym_class: u.env.sym_class, near: u.env.near };
@@ -18911,28 +18473,16 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let name = u.fns[id as usize].name.to_string();
     // PGO: the counted build's block counts for the O3 input (they go onto its blocks; the
     // passes carry them to layout and register allocation)
-    let counts = if options.no_block_freq { None } else if t1prof_replay(options) {
-        t1key.as_ref().and_then(|k| T1PROF.lock().unwrap().as_ref().unwrap().map.get(k).and_then(|e| e.counts.clone()))
-            .filter(|c| c.len() == rir.blocks.len())
-    } else {
-        u.frequency_profiles.get(&id).and_then(|p| p.counts_for(&rir))
-    };
-    // hot (INL5's large growth room): a counted root turned hot; replay: as recorded
-    let hot_root = match t1key.as_ref().and_then(|k| {
-        let g = T1PROF.lock().unwrap();
-        let p = g.as_ref().unwrap();
-        if p.replay { p.map.get(k).map(|e| e.hot) } else { None }
-    }) {
-        Some(h) => h,
-        None => counts.is_some(),
-    };
+    let counts = if options.no_block_freq { None } else { u.frequency_profiles.get(&id).and_then(|p| p.counts_for(&rir)) };
+    // hot (INL5's large growth room): a counted root turned hot
+    let hot_root = counts.is_some();
     if tier1_trace() {
         eprintln!("O3-frequency input @{:.3} ms {} {}", crate::clock::ms_since_start(),
             match &counts { Some(c) => format!("counted entries={} blocks={}", c.first().copied().unwrap_or(0.0), c.iter().filter(|x| **x > 0.0).count()), None => "structural".to_string() }, name);
     }
     TIER1_TAKE_PARTS[3].fetch_add(cpu_ns() - ta, Ordering::Relaxed);
     owner_ns.set(owner_ns.get() + cpu_ns() - s0);
-    Some((rir, version, epoch, t1key, sandboxed, assembled, callees, t1_rec, inline_all, t1_freq, t1_inline_freq, ro, env, cfg, name, counts, hot_root))
+    Some((rir, version, epoch, sandboxed, assembled, callees, inline_all, ro, env, cfg, name, counts, hot_root))
     })();
     (r, owner::take_needs())
     });
@@ -18973,10 +18523,10 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             let front = front_read("O3 snapshot walk");
             let mut w = walk.borrow_mut();
             let w = w.as_mut().unwrap();
-            let frontier = std::mem::take(&mut w.10);
-            w.10 = o3_next_level(up, front.unit(up), options, id, w.8, &frontier, &views.borrow(), &w.9, &mut w.5, &mut w.6);
-            w.11 += 1;
-            w.12 = 0;
+            let frontier = std::mem::take(&mut w.8);
+            w.8 = o3_next_level(up, front.unit(up), options, id, w.7, &frontier, &views.borrow(), &mut w.4, &mut w.5);
+            w.9 += 1;
+            w.10 = 0;
             TIER1_TAKE_PARTS[2].fetch_add(cpu_ns() - ts, Ordering::Relaxed);
         }
         continue;
@@ -19074,28 +18624,18 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     }
     drop(front);
     let t1 = cpu_ns();
-    let Some((rir, version, epoch, t1key, sandboxed, assembled, callees, t1_rec, inline_all, t1_freq, t1_inline_freq, ro, env, cfg, name, counts, hot_root)) = snapped else {
+    let Some((rir, version, epoch, sandboxed, assembled, callees, inline_all, ro, env, cfg, name, counts, hot_root)) = snapped else {
         return false;
     };
     let assembled = assembled.unwrap_or_else(|| {
         let mut a = {
             let front = front_read("O3 snapshot assembly");
-            o3_assemble(up, front.unit(up), options, id, &rir, &t1key, &t1_rec, &callees, &views.borrow(), inline_all)
+            o3_assemble(up, front.unit(up), id, &rir, &callees, &views.borrow(), inline_all)
         };
-        owner::publish(|| o3_assemble_owner(up, options, &mut a, &t1key, &t1_rec));
+        owner::publish(|| o3_assemble_owner(up, options, &mut a));
         a
     });
-    let O3Assembled { mut snap, singles, cold_keys: t1_cold_keys, snap_keys: t1_snap_keys, single_keys: t1_single_keys, rir_hashes: t1_rir_hashes, snap_counts, unverified_left, root_unverified, unverified_in, .. } = assembled;
-    // deterministic O3 (record): the input bodies that were O2 RIR ("" the root), T1Entry::full
-    let t1_full_keys: Vec<String> = match &t1key {
-        Some(_) => {
-            let mut v: Vec<String> = std::iter::once(String::new()).filter(|_| rir.full)
-                .chain(snap.iter().filter(|x| x.1.full).map(|x| unsafe { t1_key(up, x.0) })).collect();
-            v.sort();
-            v
-        }
-        None => Vec::new(),
-    };
+    let O3Assembled { mut snap, singles, snap_counts, unverified_left, root_unverified, unverified_in, .. } = assembled;
     // nocapture facts for the calls the build keeps (coalesce_slot_copies); the callees the answers
     // need RIR of are built off the owner first (a foreground build takes what exists)
     let nocapture = if relax_backend::stats::opt_off(options, "-o3nocap") { Vec::new() } else {
@@ -19114,7 +18654,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     trace_tier1_phase(id, "backend");
     // PGO: counted inline candidates carry their counts into the inliner (it scales them to the
     // call site's count)
-    for (c, _, cc) in &snap_counts {
+    for (c, cc) in &snap_counts {
         if let Some(x) = snap.iter_mut().find(|x| x.0 == *c) {
             let mut g = (*x.1).clone();
             for (b, n) in g.blocks.iter_mut().zip(cc) {
@@ -19146,26 +18686,14 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             relax_backend::stats::pass_timing_on();
         }
         let (p0, n0) = if trace { (relax_backend::stats::pass_local(), relax_codegen::opt::inst_count(&func)) } else { ([0; 16], 0) };
-        let mut inline_freq = [None, None];
-        let mut frequencies = |round: usize, f: &relax_backend::rir::Func| {
-            let freq = match &t1_inline_freq {
-                Some(Some(fr)) => match &fr[round] {
-                    Some(v) if v.len() != f.blocks.len() => {
-                        t1prof_divergence("inline-frequency-shape", t1key.as_deref().unwrap());
-                        None
-                    }
-                    v => v.clone(),
-                },
-                Some(None) => {
-                    t1prof_divergence("inline-frequency-missing", t1key.as_deref().unwrap());
-                    None
-                }
-                None if options.no_block_freq => None,
-                None if relax_backend::profile::has_counts(f) => relax_backend::profile::inline_freqs(f).or_else(|| Some(inline_structural_freqs(f))),
-                None => Some(inline_structural_freqs(f)),
-            };
-            inline_freq[round] = freq.clone();
-            freq
+        let mut frequencies = |_round: usize, f: &relax_backend::rir::Func| {
+            if options.no_block_freq {
+                None
+            } else if relax_backend::profile::has_counts(f) {
+                relax_backend::profile::inline_freqs(f).or_else(|| Some(inline_structural_freqs(f)))
+            } else {
+                Some(inline_structural_freqs(f))
+            }
         };
         let queries = crate::nounwind::QueryCx::new(&snap);
         let optimize = || queries.optimize(id, func, &mut |func, nounwind| {
@@ -19196,21 +18724,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             EXPORT_O3.with(|c| *c.borrow_mut() = Some(Some(f)));
             return Err(EXPORT_O3_TAKEN.to_string());
         }
-        let freq = match &t1_freq {
-            Some(_) if counts.is_some() => {
-                counted_freqs(&mut func)
-            }
-            Some(Some(fr)) if fr.len() == func.blocks.len() => Some(fr.clone()),
-            Some(None) => None,
-            Some(Some(_)) => {
-                if let Some(k) = &t1key { t1prof_divergence("frequency-shape", k); }
-                None
-            }
-            // counted: profile-driven block order, then the counts' frequencies
-            _ if counts.is_some() => {
-                counted_freqs(&mut func)
-            }
-            _ => (!options.no_block_freq).then(|| inline_structural_freqs(&func)),
+        // counted: profile-driven block order, then the counts' frequencies
+        let freq = if counts.is_some() {
+            counted_freqs(&mut func)
+        } else {
+            (!options.no_block_freq).then(|| inline_structural_freqs(&func))
         };
         // makepad inspect `asm`: the PGO block counts this O3 code was built from, by position
         if func.blocks.iter().any(|b| b.count >= 0.0) {
@@ -19228,36 +18746,6 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         crate::memstat::note_big("codegen O3", &func.name, mps, || cg_shape(&func));
         let c = c?;
         code_sig(id, &func, &c.code, c.alloc_sig, true);
-        let mut profile_entry = None;
-        if let Some(k) = &t1key {
-            let bits = |f: &Option<Vec<f32>>| f.as_ref().map(|f| f.iter().map(|x| x.to_bits()).collect::<Vec<u32>>());
-            let input = t1_hash(&(t1_cold_keys.clone(), t1_snap_keys.clone(), t1_single_keys.clone(), bits(&freq), inline_freq.iter().map(bits).collect::<Vec<_>>(), hot_root));
-            // the optimised RIR (normalised) and the code size: code bytes hold slot numbers that
-            // differ between runs
-            let code = t1_norm_hash(&func) ^ (c.text_len as u64).rotate_left(48);
-            let _k = crate::zone_alloc::kept();
-            let mut g = T1PROF.lock().unwrap();
-            let p = g.as_mut().unwrap();
-            match p.map.get(k) {
-                Some(e) if p.replay && e.input != input => {
-                    p.differ.push(format!("input-differ {} (cold {}/{}, snapshot {}/{})", k, t1_cold_keys.len(), e.cold.len(), t1_snap_keys.len(), e.snap.len()));
-                    // where the inputs first differ: the root's body or which candidates' bodies
-                    if e.rirs.first() != t1_rir_hashes.first() {
-                        p.differ.push(format!("root-differ {}", k));
-                    }
-                    let rec: std::collections::HashMap<&str, u64> = e.rirs.iter().skip(1).map(|(k, h)| (k.as_str(), *h)).collect();
-                    let bad: Vec<&str> = t1_rir_hashes.iter().skip(1).filter(|(c, h)| rec.get(c.as_str()).is_some_and(|r| r != h)).map(|(c, _)| c.as_str()).collect();
-                    if !bad.is_empty() {
-                        p.differ.push(format!("callee-differ {} ({} of {}: {})", k, bad.len(), rec.len(), bad.iter().take(3).map(|c| short_name(c)).collect::<Vec<_>>().join(", ")));
-                    }
-                }
-                Some(e) if e.input == input && e.code != code => p.differ.push(format!("output-differ {}", k)),
-                _ => {}
-            }
-            if !p.replay {
-                profile_entry = Some(T1Entry { cold: t1_cold_keys.clone(), snap: t1_snap_keys.clone(), single: t1_single_keys.clone(), freq: freq.clone(), inline_freq: Some(inline_freq.clone()), hot: hot_root, counts: counts.clone(), callee_counts: snap_counts.iter().filter_map(|(_, k, c)| Some((k.clone()?, c.clone()))).collect(), input, code, inlined: Vec::new(), rirs: t1_rir_hashes.clone(), full: t1_full_keys.clone() });
-            }
-        }
         note_frame(id, c.frame_size, slot_bytes(&func), true);
         if trace && cpu_ns() - t1 > 1_000_000_000 {
             // a slow build: where its time went (passes, sizes)
@@ -19348,7 +18836,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         // the result leaves the job arena; the job's own copies die with it
         let c = copied_out(c);
         let (left, cold_left, absent, inlined, nounwind_used) = crate::zone_alloc::copy_out(|| (left.clone(), cold_left.clone(), absent.clone(), inlined.clone(), nounwind_used.clone()));
-        Ok((c.code, c.pc_map, c.relocs, (inlined, left, cold_left, absent, c.frame_size, self_call, nounwind_used, profile_entry)))
+        Ok((c.code, c.pc_map, c.relocs, (inlined, left, cold_left, absent, c.frame_size, self_call, nounwind_used)))
     }));
     if export_o3_mode() {
         return false;
@@ -19376,7 +18864,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         u.stats.tier1_locked_ns += owner_ns.get();
         u.stats.tier1_free_ns += t2 - t1;
         let ok = match built {
-            Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, absent, frame_size, self_call, nounwind_used, profile_entry)))) if PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && (!crate::inspect::instrument::active(id) || inspect_o3_on()) && !inlined_rejected(u, &unverified_in, &inlined)
+            Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, absent, frame_size, self_call, nounwind_used)))) if PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && (!crate::inspect::instrument::active(id) || inspect_o3_on()) && !inlined_rejected(u, &unverified_in, &inlined)
                 // (code of an invalidated group -- an unloaded module's -- is never built again)
                 && crate::invalid::group_of(u, id, 0, &inlined).map_or(true, |g| !crate::invalid::is_dead(u, g)) && {
                 let n = if relax_codegen::interp::blob::is_blob(&code) { code.len() } else { relax_backend::rir::split_unwind_info(&code).0 };
@@ -19503,11 +18991,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 }
                 if tier1_trace() {
                     eprintln!("O3 keep #{} {}: {}", id, short_name(&u.fns[id as usize].name),
-                        if unverified { "no (unverified)" } else if inspect_o3_on() { "no (inspect)" } else if frame_size > frame_max { "no (frame)" } else if t1prof_on(options) { "no (deterministic O3)" } else if incomplete { "entry (incomplete)" } else { "entry" });
+                        if unverified { "no (unverified)" } else if inspect_o3_on() { "no (inspect)" } else if frame_size > frame_max { "no (frame)" } else if incomplete { "entry (incomplete)" } else { "entry" });
                 }
-                // (deterministic O3 runs cache no O3 code: a later record or replay links none, every O3
-                // slot of theirs is a recorded build)
-                if frame_size <= frame_max && !unverified && !inspect_o3_on() && !t1prof_on(options) {
+                if frame_size <= frame_max && !unverified && !inspect_o3_on() {
                     // its key and certificate encoding in the bounded record batches (records_due),
                     // not in this publish
                     if let Some(mut c) = u.cache.take() {
@@ -19632,43 +19118,12 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 }
                 o3_owner(3, tx);
                 let tn = cpu_ns();
-                // deterministic O3: the decisions this build took (its inlined callees by key)
-                let inl_keys: Option<Vec<String>> = t1key.as_ref().map(|_| {
-                    let _k = crate::zone_alloc::kept();
-                    let mut v: Vec<String> = inlined.iter().map(|&c| t1_key(up, c)).collect();
-                    v.sort();
-                    v
-                });
                 // a patch of an inlined callee recompiles this slot (live.rs)
                 let n_inl = inlined.len();
                 for c in inlined {
                     u.exec_event(c, "inline");
                     if !u.fns[c as usize].history().inlined_into.contains(&id) {
                         crate::zone_alloc::slots_with(|| u.fns[c as usize].history.get_or_insert_with(Default::default).inlined_into.push(id));
-                    }
-                }
-                // Publish only installed builds. A rejected/stale build must not
-                // replace the profile of the code the program actually executes.
-                if let (Some(k), Some(mut entry)) = (&t1key, profile_entry) {
-                    entry.inlined = inl_keys.clone().unwrap_or_default();
-                    crate::zone_alloc::kept_with(|| T1PROF.lock().unwrap().as_mut().unwrap().map.insert(k.clone(), entry));
-                    t1prof_finish();
-                }
-                // replay: the same inline decisions as the recorded build, else name the difference
-                if let (Some(k), Some(keys)) = (&t1key, &inl_keys) {
-                    let _k = crate::zone_alloc::kept();
-                    let mut g = T1PROF.lock().unwrap();
-                    if let Some(p) = g.as_mut().filter(|p| p.replay) {
-                        if let Some(e) = p.map.get(k) {
-                            if &e.inlined != keys {
-                                let (mut add, mut del) = (0usize, 0usize);
-                                let mut rec: std::collections::HashMap<&str, isize> = Default::default();
-                                for x in &e.inlined { *rec.entry(x.as_str()).or_default() += 1; }
-                                for x in keys { *rec.entry(x.as_str()).or_default() -= 1; }
-                                for v in rec.values() { if *v > 0 { del += *v as usize } else { add += (-*v) as usize } }
-                                p.differ.push(format!("inline-differ {} (+{} -{} of {} recorded)", k, add, del, e.inlined.len()));
-                            }
-                        }
                     }
                 }
                 o3_owner(4, tn);
@@ -19709,7 +19164,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 if built_unverified && !unverified_now && !matches!(u.fns[id as usize].key, FnKey::Plain(_)) && u.verdict_clean(id) {
                     again = true;
                 }
-                if again && !(t1prof_on(options) && T1PROF.lock().unwrap().as_ref().map_or(false, |p| p.replay)) {
+                if again {
                     u.retier(id);
                 }
                 o3_owner(6, tr);
@@ -19735,20 +19190,6 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 TIER1_INSTALLS.fetch_add(1, Ordering::Relaxed);
                 crate::boot_stats::o3_installed(boot_arm(u, id), id);
                 crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_INSTALLED, 0, t2 - t1, at);
-                // deterministic O3, replay: installed (a build whose install was refused is retried
-                // by the next trigger)
-                if let Some(k) = &t1key {
-                    let _k = crate::zone_alloc::kept();
-                    let mut g = T1PROF.lock().unwrap();
-                    if let Some(p) = g.as_mut() {
-                        if p.replay {
-                            if p.map.contains_key(k) { p.installed += 1; } else { p.live.insert(k.clone()); }
-                            p.done.insert(k.clone());
-                        }
-                    }
-                    drop(g);
-                    t1prof_finish_quiet();
-                }
                 if tier1_trace() {
                     trace_build(u, id, "installed", t2 - t1);
                 }
@@ -19798,10 +19239,6 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // without it (the snapshot leaves a rejected callee out)
                 if why == "inlined a rejected callee" {
                     u.retier(id);
-                }
-                // Replay never retries according to install order; expose a refused install.
-                if let Some(k) = &t1key {
-                    if t1prof_replay(options) { t1prof_divergence(why, k); }
                 }
                 if tier1_trace() {
                     let what = match &built {
@@ -20099,10 +19536,7 @@ pub fn startup_main(runtime: &crate::options::RuntimeOptions, presents: bool) {
 static PIPELINE: AtomicBool = AtomicBool::new(false);
 
 pub fn enable_pipelining(options: &crate::options::Options) {
-    // deterministic O3 (MAKEPAD_RUN_O3_PROFILE): no speculative builds -- a caller prepared while a
-    // callee's build is in flight on a speculative worker does not inline it at O1, so O1
-    // RIR (O3's input) would depend on the worker race
-    PIPELINE.store(options.spec && options.tier1_profile.is_none(), Ordering::SeqCst);
+    PIPELINE.store(options.spec, Ordering::SeqCst);
 }
 
 fn pipelined() -> bool {
@@ -20974,17 +20408,14 @@ fn o3_view(u: &Unit, c: u32) -> O3View {
 /// outside cold blocks, skipping never-run bodies the cost model does not admit. Reads only the
 /// views, immutable slot keys and prog/tcx (off the owner: under a front read).
 unsafe fn o3_next_level(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &crate::options::Options, id: u32, inline_all: bool, frontier: &[u32], views: &HashMap<u32, O3View>,
-    t1_rec: &Option<(Vec<String>, Vec<String>, Vec<String>)>, callees: &mut Vec<u32>, seen: &mut std::collections::HashSet<u32>) -> Vec<u32> {
+    callees: &mut Vec<u32>, seen: &mut std::collections::HashSet<u32>) -> Vec<u32> {
     let (fns, core) = (&*std::ptr::addr_of!((*up).fns), *std::ptr::addr_of!((*up).core_crate));
     let mut next = Vec::new();
     for &c in frontier {
         let Some(v) = views.get(&c) else { continue };
         if let Some(r) = &v.rir {
             // Cost-model admissions also expose calls in never-run bodies.
-            let never_run = match t1_rec {
-                Some((cold, _, _)) => cold.contains(&t1_key(up, c)),
-                None => !v.ran && v.uninlined,
-            };
+            let never_run = !v.ran && v.uninlined;
             let cost_admits = !relax_backend::stats::opt_off(options, "-costmodel")
                 && callee_attrs(prog, tcx, fns, core, c, inline_all, true, unverified_root(fns, id))
                     .map_or(false, |attrs| relax_codegen::opt::rustc_inline_cost(r, c) <= relax_codegen::opt::rustc_inline_threshold(r, attrs));
@@ -21017,21 +20448,14 @@ unsafe fn o3_next_level(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &
 }
 
 /// An O3 snapshot: the inline candidates (slot, RIR, attrs), the single-reference ones with
-/// their one owner, the deterministic-O3 key lists, the candidates' PGO counts.
+/// their one owner, the candidates' PGO counts.
 struct O3Assembled {
     snap: Vec<(u32, std::sync::Arc<relax_backend::rir::Func>, u8)>,
     /// called once in the snapshot, by (candidate, its owner): singles if referenced once and not
     /// recursive (owner state: o3_assemble_owner)
     single_cands: Vec<(u32, u32)>,
     singles: HashMap<u32, u32>,
-    cold_keys: Vec<String>,
-    snap_keys: Vec<String>,
-    single_keys: Vec<String>,
-    /// deterministic O3 (profiling only): (key, hash) of the input bodies, the root's first (key
-    /// "", with its verified state), then each candidate's (with its attrs): where a replayed
-    /// build's inputs first differ from the recorded ones
-    rir_hashes: Vec<(String, u64)>,
-    snap_counts: Vec<(u32, Option<String>, Vec<f32>)>,
+    snap_counts: Vec<(u32, Vec<f32>)>,
     /// SPEC-V: callees left out as unverified (never inlined before their verdict): the build is
     /// queued again once they are verified (UNVERIFIED_LEFT, owner part), their verdicts first
     unverified_left: Vec<u32>,
@@ -21053,25 +20477,16 @@ fn unverified_root(fns: &crate::conc::AppendVec<FnEntry>, id: u32) -> bool {
     f.unverified.load(Ordering::Relaxed) || matches!(f.key, FnKey::Plain(_))
 }
 
-/// The snapshot from the walk's views (the views, immutable slot keys, prog/tcx and the replay
-/// profile; off the owner: under a front read).
-unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &crate::options::Options, id: u32, rir: &relax_backend::rir::Func, t1key: &Option<String>,
-    t1_rec: &Option<(Vec<String>, Vec<String>, Vec<String>)>, callees: &[u32], views: &HashMap<u32, O3View>, inline_all: bool) -> O3Assembled {
+/// The snapshot from the walk's views (the views, immutable slot keys and prog/tcx; off the
+/// owner: under a front read).
+unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), id: u32, rir: &relax_backend::rir::Func,
+    callees: &[u32], views: &HashMap<u32, O3View>, inline_all: bool) -> O3Assembled {
     let ta = cpu_ns();
     let (fns, core) = (&*std::ptr::addr_of!((*up).fns), *std::ptr::addr_of!((*up).core_crate));
     let mut snap: Vec<(u32, std::sync::Arc<relax_backend::rir::Func>, u8)> = Vec::new();
-    let mut t1_cold_keys: Vec<String> = Vec::new();
-    let mut t1_snap_keys: Vec<String> = Vec::new();
-    // PGO: block counts of counted inline candidates (slot, key when profiling, counts)
-    let mut snap_counts: Vec<(u32, Option<String>, Vec<f32>)> = Vec::new();
     let mut unverified_left: Vec<u32> = Vec::new();
     let mut unverified_in: Vec<u32> = Vec::new();
     let root_unverified = unverified_root(fns, id);
-    let mut rir_hashes: Vec<(String, u64)> = Vec::new();
-    if let Some(k) = t1key {
-        t1prof_dump(&format!("root:{}", k), rir, 255);
-        rir_hashes.push((String::new(), t1_norm_hash(rir) ^ root_unverified as u64));
-    }
     // MAKEPAD_RUN_INLINE_TRACE: the candidates this snapshot leaves out, and why (the inliner's
     // trace names them only as fn#<slot>)
     let trace = relax_codegen::opt::inline_trace(&fns[id as usize].name);
@@ -21097,62 +20512,11 @@ unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &cr
             eprintln!("inline-trace-snap {}: out fn#{} {} (no RIR)", fns[id as usize].name, c, fns[c as usize].name);
         }
         if let Some(r) = &v.rir {
-            let cold = match t1key {
-                Some(k) => {
-                    let ck = t1_key(up, c);
-                    // replay: exactly the recorded snapshot
-                    if let Some((_, rs, _)) = t1_rec {
-                        if !rs.contains(&ck) {
-                            continue;
-                        }
-                    }
-                    t1_snap_keys.push(ck.clone());
-                    let g = T1PROF.lock().unwrap();
-                    let p = g.as_ref().unwrap();
-                    let cold = if p.replay { p.map.get(k).map_or(live_cold, |e| e.cold.contains(&ck)) } else { live_cold };
-                    drop(g);
-                    if cold {
-                        t1_cold_keys.push(ck);
-                    }
-                    cold
-                }
-                None => live_cold,
-            };
-            let attrs = if cold { attrs | relax_codegen::opt::ATTR_COLD } else { attrs };
-            if !options.no_block_freq {
-                let ck = t1key.as_ref().map(|_| t1_key(up, c));
-                // (live counts are owner state: o3_assemble_owner)
-                let cc = if t1prof_replay(options) {
-                    let g = T1PROF.lock().unwrap();
-                    let p = g.as_ref().unwrap();
-                    t1key.as_ref().and_then(|k| p.map.get(k)).and_then(|e| e.callee_counts.iter().find(|x| Some(&x.0) == ck.as_ref()).map(|x| x.1.clone()))
-                } else {
-                    None
-                };
-                if let Some(cc) = cc.filter(|v| v.len() == r.blocks.len()) {
-                    snap_counts.push((c, ck, cc));
-                }
-            }
+            let attrs = if live_cold { attrs | relax_codegen::opt::ATTR_COLD } else { attrs };
             if root_unverified && (fns[c as usize].unverified.load(Ordering::Relaxed) || matches!(fns[c as usize].key, FnKey::Plain(_))) {
                 unverified_in.push(c);
             }
-            if t1key.is_some() {
-                let ck = t1_key(up, c);
-                t1prof_dump(&ck, r, attrs);
-                rir_hashes.push((ck, t1_norm_hash(r) ^ ((attrs as u64) << 56)));
-            }
             snap.push((c, r.clone(), attrs));
-        }
-    }
-    let from = rir_hashes.len().min(1);
-    rir_hashes[from..].sort();
-    t1_cold_keys.sort();
-    t1_cold_keys.dedup();
-    t1_snap_keys.sort();
-    t1_snap_keys.dedup();
-    if let Some((_, recorded, _)) = t1_rec {
-        for k in recorded {
-            if !t1_snap_keys.contains(k) { t1prof_divergence("snapshot-missing", k); }
         }
     }
     // Freeze both the single-reference fact and its O1 owner before unlocking.
@@ -21172,13 +20536,13 @@ unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &cr
         _ => None,
     }).collect();
     TIER1_TAKE_PARTS[5].fetch_add(cpu_ns() - ta, Ordering::Relaxed);
-    O3Assembled { snap, single_cands, singles: HashMap::new(), cold_keys: t1_cold_keys, snap_keys: t1_snap_keys, single_keys: Vec::new(), rir_hashes, snap_counts, unverified_left, root_unverified, unverified_in, root: id }
+    O3Assembled { snap, single_cands, singles: HashMap::new(), snap_counts: Vec::new(), unverified_left, root_unverified, unverified_in, root: id }
 }
 
 /// The owner part of a snapshot (a publish: O(candidates), recursive_fn walks a candidate's calls):
 /// which single-call candidates are referenced once and not recursive, and the candidates' live
 /// PGO block counts.
-unsafe fn o3_assemble_owner(up: *mut Unit, options: &crate::options::Options, a: &mut O3Assembled, t1key: &Option<String>, t1_rec: &Option<(Vec<String>, Vec<String>, Vec<String>)>) {
+unsafe fn o3_assemble_owner(up: *mut Unit, options: &crate::options::Options, a: &mut O3Assembled) {
     let t = cpu_ns();
     // SPEC-V: an unverified callee the borrow checker rejected is never optimised into other code
     // (o3_allowed's rule for its own code)
@@ -21201,22 +20565,14 @@ unsafe fn o3_assemble_owner(up: *mut Unit, options: &crate::options::Options, a:
     }
     let u = &*up;
     for &(c, owner) in &a.single_cands {
-        // (the key lists exist for deterministic O3 only)
-        let key = (t1key.is_some() || t1_rec.is_some()).then(|| t1_key(up, c));
-        let is_single = match t1_rec {
-            Some((_, _, recorded)) => key.as_ref().is_some_and(|k| recorded.contains(k)),
-            None => u.single_ref(c) && !u.recursive_fn(c),
-        };
-        if is_single {
+        if u.single_ref(c) && !u.recursive_fn(c) {
             a.singles.insert(c, owner);
-            if let Some(k) = key { a.single_keys.push(k); }
         }
     }
-    a.single_keys.sort();
-    if !options.no_block_freq && !t1prof_replay(options) {
+    if !options.no_block_freq {
         for (c, r, _) in &a.snap {
             if let Some(cc) = u.frequency_profiles.get(c).and_then(|p| p.counts_for(r)).filter(|v| v.len() == r.blocks.len()) {
-                a.snap_counts.push((*c, t1key.as_ref().map(|_| t1_key(up, *c)), cc));
+                a.snap_counts.push((*c, cc));
             }
         }
     }
