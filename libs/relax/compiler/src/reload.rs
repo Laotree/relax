@@ -5002,25 +5002,24 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // mixture of revisions into the old process. A fresh run restores live editing.
         if restart_required {
             gate_note(3);
-            if !crate::harness::live::enabled() {
-                let notifications = events.as_mut().and_then(|w| w.changed());
-                let lost = events.is_some() && notifications.is_none();
-                if lost { events = LiveWatch::new(files.iter().map(|f| f.0.as_str())); }
-                let ids = if lost || last_scan.elapsed() >= if events.is_some() { LIVE_IDLE } else { LIVE_QUIET } {
-                    last_scan = Instant::now();
-                    (0..files.len()).collect()
-                } else { notifications.unwrap_or_else(|| hot.clone()) };
-                let changed: Vec<_> = ids.into_iter().filter_map(|k| {
-                    let f = &files[k];
-                    let current = stamp(&f.0);
-                    (current != f.2).then_some((k, current))
-                }).collect();
-                if !changed.is_empty() {
-                    let names: Vec<String> = changed.iter().take(3).map(|&(k, _)| short(&files[k].0)).collect();
-                    let message = format!("{}{}: restart pending ({restart_message}); this edit applies with it", names.join(", "), if changed.len() > 3 { ", ..." } else { "" });
-                    patch_refused_event(&message, false, std::slice::from_ref(&message));
-                    for (k, current) in changed { files[k].2 = current; }
-                }
+            let notifications = events.as_mut().and_then(|w| w.changed());
+            let lost = events.is_some() && notifications.is_none();
+            if lost { events = LiveWatch::new(files.iter().map(|f| f.0.as_str())); }
+            let ids = if lost || last_scan.elapsed() >= if events.is_some() { LIVE_IDLE } else { LIVE_QUIET } {
+                last_scan = Instant::now();
+                (0..files.len()).collect()
+            } else { notifications.unwrap_or_else(|| hot.clone()) };
+            let changed: Vec<_> = ids.into_iter().filter_map(|k| {
+                let f = &files[k];
+                let current = stamp(&f.0);
+                (current != f.2).then_some((k, current))
+            }).collect();
+            if !changed.is_empty() {
+                let names: Vec<String> = changed.iter().take(3).map(|&(k, _)| short(&files[k].0)).collect();
+                let message = format!("{}{}: restart pending ({restart_message}); this edit applies with it", names.join(", "), if changed.len() > 3 { ", ..." } else { "" });
+                // (a live test session's restart would not apply it either: refused there)
+                patch_refused_event(&message, crate::harness::live::enabled(), std::slice::from_ref(&message));
+                for (k, current) in changed { files[k].2 = current; }
             }
             continue;
         }
@@ -5234,12 +5233,16 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             for &k in &unloaded { files[k].2 = settled_stamps[k]; }
             changed = rest;
             if changed.is_empty() {
-                if !crate::harness::live::enabled() {
-                    let unloaded: Vec<_> = unloaded.into_iter().filter(|&k| !std::path::Path::new(&files[k].0).is_dir()).collect();
-                    if !unloaded.is_empty() {
-                        let names: Vec<String> = unloaded.iter().take(3).map(|&k| short(&files[k].0)).collect();
-                        patch_verified_event(&format!("{}{}: not loaded by the app (nothing to patch)", names.join(", "), if unloaded.len() > 3 { ", ..." } else { "" }), 0, &[]);
-                    }
+                let unloaded: Vec<_> = unloaded.into_iter().filter(|&k| !std::path::Path::new(&files[k].0).is_dir()).collect();
+                if !unloaded.is_empty() {
+                    let names: Vec<String> = unloaded.iter().take(3).map(|&k| short(&files[k].0)).collect();
+                    let what = format!("{}{}: not loaded by the app (nothing to patch)", names.join(", "), if unloaded.len() > 3 { ", ..." } else { "" });
+                    // a live test session's verdict is its tests' run: they run again as they are
+                    if crate::harness::live::enabled() {
+                        let mut o = idle_outcome(None, &what);
+                        let back = test_edit(up, unloaded.iter().map(|&k| files[k].0.clone()).collect(), &mut o, &mut undos);
+                        for (old, new) in back { for f in &mut files { if f.1 == new { f.1 = old; } } }
+                    } else { patch_verified_event(&what, 0, &[]); }
                 }
                 continue;
             }
@@ -5276,7 +5279,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             let what = if changed.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };
             // provided crates and std are built into this binary: cargo rebuilds it on the way
             let restart = if inputs.host_restart_required(changed.iter().map(|&k| files[k].0.as_str())) {
-                format!("restart it through cargo (which rebuilds makepad): {}", crate::srchash::rebuild_command(&std::env::args().skip(1).collect::<Vec<_>>()))
+                format!("needs a JIT rebuild: restart it through cargo (which rebuilds makepad): {}", crate::srchash::rebuild_command(&std::env::args().skip(1).collect::<Vec<_>>()))
             } else {
                 format!("restart `makepad run {package}`")
             };
@@ -5284,10 +5287,10 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             note_restart_pending(&message);
             eprintln!("makepad live: {message}");
             live_log(&format!("{{\"restart_required\":true,\"message\":{}}}", json_str(&message)));
-            if !crate::harness::live::enabled() {
-                patch_refused_event(&message, false, std::slice::from_ref(&message));
-                for &k in &changed { files[k].2 = settled_stamps[k]; }
-            }
+            // The edit's one verdict, at once. A live test session cannot restart into it (the
+            // restarted tests would run this binary again): there it is refused.
+            patch_refused_event(&message, crate::harness::live::enabled(), std::slice::from_ref(&message));
+            for &k in &changed { files[k].2 = settled_stamps[k]; }
             restart_message = message;
             restart_required = true;
             continue;
