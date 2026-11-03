@@ -1678,7 +1678,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 // before: its manifest's entries are all in the cache): no speculative body checks
                 // ahead of the lazy compiles -- an edited start's slots link stored code but for the
                 // few the edit reaches, and a build checks its own body (an edited Sandbox start
-                // checked 80k bodies ahead, 13 s cpu, for 31 its 8 builds took)
+                // checked 80k bodies ahead, 13 s cpu, for 31 its 8 builds took); until its lookups
+                // show it links little (cache.rs cold_linked_start)
                 u.front.linked_start.store(c.startup_manifest_valid() && c.stats.packs_rejected == 0, Ordering::Relaxed);
                 jit::CODE_CACHE_EMPTY.store(c.stats.code_stores == 0, Ordering::Relaxed);
                 if warm {
