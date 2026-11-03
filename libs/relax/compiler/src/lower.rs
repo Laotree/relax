@@ -15266,7 +15266,7 @@ pub fn valid_moves(out: &mut usize) {
         tcx.collect(&prog);
         let mut u = crate::jit::Unit::new(prog, tcx, core);
         let up = &mut *u as *mut crate::jit::Unit;
-        let mut run = |name: &str| -> Result<usize, String> {
+        let run = |name: &str| -> Result<usize, String> {
             let def = (0..u.prog.defs.len()).map(|i| crate::program::DefId(i as u32)).find(|&d| u.prog.def(d).krate == krate && u.prog.name(d) == name).unwrap();
             let entry = crate::owner::call(crate::owner::Class::Program, || { let f = u.fn_id(crate::jit::FnKey::Inst(def, vec![])); u.entry(f) });
             let mut out = 0usize;
