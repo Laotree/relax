@@ -1070,7 +1070,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
         }
         // recomputing costs about what a reload does, without the store: half the weight (times the
         // instructions a recomputation takes: an arm64 64-bit constant is up to four)
-        weight[v as usize] = prio(options, r, l) * if remat[v as usize].is_some() { 0.5 * (cfg.remat_cost)(&remat[v as usize]) as f32 } else { 1.0 };
+        weight[v as usize] = prio(r, l) * if remat[v as usize].is_some() { 0.5 * (cfg.remat_cost)(&remat[v as usize]) as f32 } else { 1.0 };
         if low.map_or(false, |lw| lw.get(v as usize).copied().unwrap_or(false)) {
             weight[v as usize] *= 1e-6;
         }
@@ -1259,7 +1259,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
                 let mut parts: Vec<u32> = m.clone();
                 parts.push(v);
                 dissolved[v as usize].set(true);
-                parts.sort_by(|a, b| prio(options, refs[*b as usize], lens[*b as usize]).partial_cmp(&prio(options, refs[*a as usize], lens[*a as usize])).unwrap_or(std::cmp::Ordering::Equal));
+                parts.sort_by(|a, b| prio(refs[*b as usize], lens[*b as usize]).partial_cmp(&prio(refs[*a as usize], lens[*a as usize])).unwrap_or(std::cmp::Ordering::Equal));
                 let parts: Vec<u32> = parts.into_iter().filter(|u| !ranges.of(*u).is_empty()).collect();
                 order.splice(oi..oi, parts);
                 continue;
@@ -3633,14 +3633,13 @@ fn spill_weights(f: &Func, reach: &[bool], tab: &OpTab, ranges: &Ranges, wts: &[
     (refs, lens)
 }
 
-/// Allocation priority: weighted references (the values whose spilling costs most go first;
-/// live-range splitting keeps long ones from blocking whole functions), or per square root of the
-/// live range's length (compute kernels, Options::ra_prio).
-fn prio(options: &relax_session::Options, refs: f32, len: u32) -> f32 {
-    match options.ra_prio {
-        relax_session::options::Priority::References => refs,
-        relax_session::options::Priority::Sqrt => refs / (len.max(1) as f32).sqrt(),
-    }
+/// Allocation priority: weighted references per square root of the live range's length. The
+/// allocator places in this order and never evicts, so a value used once right after its
+/// definition goes before one that holds a register across a loop for as many references: by
+/// references alone those short temporaries came last and each spilled (a store and a reload
+/// through one shared slot per orient64 term in the slicer's pair loop).
+fn prio(refs: f32, len: u32) -> f32 {
+    refs / (len.max(1) as f32).sqrt()
 }
 
 /// A move between locations (registers or spill/stack addresses as backends define them).
@@ -5631,5 +5630,53 @@ mod dead_store_tests {
         assert!(!skipped(&sel, x64), "x64 reads the compare's operands at the cmov");
         assert!(skipped(&sel, a64), "arm64 compares at the compare's own position");
         assert!(skipped(&add, a64) && skipped(&add, x64), "an add feeding the next instruction is emitted where it stands");
+    }
+
+    /// A loop whose values are each read three times per iteration (p, n, i, acc, a), with four
+    /// registers, and two temporaries read once by the very next instruction (t, x): the
+    /// temporaries go first and get registers, a loop-long value takes the slot (one reload per
+    /// read). By references alone the temporaries came last and each went through the slot (a
+    /// store and a reload per iteration each: split_until_planar's orient64 terms on x64).
+    #[test]
+    fn one_instruction_temporaries_get_registers_before_loop_long_values() {
+        let mut f = Func::new("pressure".into(), 0);
+        let v: Vec<VReg> = (0..9).map(|_| f.vreg(Cls::I)).collect();
+        let (p, n, i, acc, a, t, x, c, one) = (v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]);
+        f.params = vec![p, n];
+        for _ in 0..3 {
+            f.block();
+        }
+        let m = Mem::Int(8, false);
+        f.blocks[0].insts = vec![Inst::Iconst(i, 0), Inst::Iconst(acc, 0)];
+        f.blocks[0].term = Term::Jump(1);
+        f.blocks[1].insts = vec![
+            Inst::Load(m, a, p, 0),
+            Inst::IBin(IOp::Add, W, t, a, i),
+            Inst::IBin(IOp::Xor, W, acc, acc, t),
+            Inst::IBin(IOp::Add, W, acc, acc, n),
+            Inst::Load(m, x, p, 8),
+            Inst::IBin(IOp::Mul, W, acc, acc, x),
+            Inst::IBin(IOp::Sub, W, acc, acc, n),
+            Inst::IBin(IOp::Add, W, acc, acc, a),
+            Inst::IBin(IOp::Xor, W, acc, acc, a),
+            Inst::Iconst(one, 1),
+            Inst::IBin(IOp::Add, W, i, i, one),
+            Inst::Store(m, p, 16, acc),
+            Inst::ICmp(Cond::Lt, false, c, i, n),
+        ];
+        f.blocks[1].term = Term::Branch(c, 1, 2);
+        f.blocks[2].term = Term::Ret(Vec::new());
+        for b in f.blocks.iter_mut() {
+            b.pos = vec![0; b.insts.len()];
+        }
+        f.verify().unwrap();
+        let o = relax_session::Options::default();
+        let mut cfg = crate::x64::reg_config(&o);
+        // rsi, rdi; rbx, r12
+        cfg.int_caller = vec![6, 7];
+        cfg.int_callee = vec![3, 12];
+        let al = allocate(&o, &f, &cfg);
+        let in_reg = |v: VReg| matches!(al.loc[v.0 as usize], Loc::Reg(_));
+        assert!(in_reg(t) && in_reg(x), "t {:?} x {:?}", al.loc[t.0 as usize], al.loc[x.0 as usize]);
     }
 }
