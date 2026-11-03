@@ -258,6 +258,9 @@ pub fn mode_from_env(options: &crate::options::Options) -> Option<Mode> {
     }
 }
 
+/// Missed lookups after which a start that links little is judged a cold one (cold_linked_start).
+const LINKED_START_MISSES: u64 = 512;
+
 /// This process's warm-cache outcomes, readable without the unit (`makepad inspect cache`, flight
 /// recordings' `jit.cache` event): code lookups by outcome, the startup image, the stores opened.
 pub mod warm_count {
@@ -3424,6 +3427,18 @@ impl Cache {
     /// in the index.
     pub fn startup_manifest_valid(&self) -> bool {
         self.has_startup_manifest() && self.manifest_missing == 0
+    }
+
+    /// A start that links cached code checks nothing ahead (slot_ahead's rule: its few misses
+    /// check their own bodies). Whether it does is known from its links, not at the open: once
+    /// LINKED_START_MISSES lookups missed and more missed than slots linked (from the startup image
+    /// or a lookup; an edit reached most of the program, as a field of a type almost every fn
+    /// touches does), it is a cold start, and the ahead checks go back on.
+    fn cold_linked_start(&self, u: &Unit) {
+        let (linked, missed) = (self.stats.prelinked + self.stats.hits, self.stats.misses);
+        if missed >= LINKED_START_MISSES && missed > linked && u.front.linked_start.swap(false, std::sync::atomic::Ordering::Relaxed) && self.verbose {
+            eprintln!("makepad-run cache: the start links little ({linked} slots linked, {missed} lookups missed): ahead checks on");
+        }
     }
 
     // ------------------------------------------------------------ writing
@@ -8204,6 +8219,7 @@ impl Linker {
                 warm_count::add(warm_count::NO_ENTRY, 1);
             }
             trace_lookup(u, id, "miss");
+            self.cache().cold_linked_start(u);
             return None;
         }
         self.cache().stats.link_ns += crate::jit::wall_ns() - t0;
