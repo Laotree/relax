@@ -2535,6 +2535,9 @@ fn flush_errors(block: bool) {
         let u = unsafe { &mut *up };
         u.flush_query_errors(false);
         let seen = ERRORS_SEEN.load(Ordering::Relaxed) as usize;
+        if u.errors.iter().skip(seen).any(|e| e.contains("internal compiler error")) {
+            crate::tui::keep_log();
+        }
         if !QUIET.load(Ordering::Relaxed) {
             for e in u.errors.iter().skip(seen) {
                 eprintln!("makepad-run: [t={:.0} ms] {}", crate::clock::ms_since_start(), e);

@@ -1570,11 +1570,20 @@ fn pump_wait_at(site: &'static std::panic::Location<'static>, runner: u64, done:
 /// request's wait, a type check's constant (a Job) waited for a constant an ahead checker ran, whose
 /// own constant request was that earlier request (makepad-fab-slice's tests with the dependency check
 /// beside them hung 650 s, 2026-11-03).
+///
+/// That chain is the nested request's alone. It is read from the wait registry, whose rows lag: a
+/// waiter whose query finished keeps its row until it runs again, so a runner that is about to go
+/// on can look as if it waited for the owner. Served nested, a chain read wrongly costs a retry.
+/// Outermost there is nothing lower to cancel and nothing the query engine does not see (the
+/// requester's queries are the request's context: a cycle through them is the engine's cycle
+/// error), so there only the owner's own query is a cycle; a chain is waited out (four cold Fab,
+/// synth and arm-lab starts at once stopped on an internal compiler error, 2026-11-03).
 fn pump_latch(runner: u64, done: &dyn Fn() -> bool) {
     if runner == 0 {
         return pump_wait_for(runner, done);
     }
-    pump_wait_at(std::panic::Location::caller(), runner, done, &|| stack_blocks(runner));
+    let owner = OWNER_TID.load(Ordering::Relaxed);
+    pump_wait_at(std::panic::Location::caller(), runner, done, &|| runner == owner || nested() && stack_blocks(runner));
 }
 
 /// Whether thread `t` cannot go on before a request open on the owner's stack ends: it is the owner
@@ -1600,7 +1609,9 @@ fn stack_blocked() -> ! {
     if nested() {
         std::panic::resume_unwind(Box::new(crate::preempt::OwnerBusy));
     }
-    panic!("makepad: a query waits for itself on the compiler's owner thread (a query cycle the engine did not see)");
+    let (class, from) = serving();
+    panic!("makepad: a query waits for itself on the compiler's owner thread (a query cycle the engine did not see; serving a {} request of {}, own work {})",
+        CLASS_NAMES[class as usize], crate::os::thread::name(from), OWN_WORK.with(|w| w.get()));
 }
 
 /// A request served nested cannot do what only the owner's earlier request may finish (a load,
@@ -1829,6 +1840,50 @@ mod tests {
     fn a_nested_job_waiting_through_another_checker_for_the_stack_is_cancelled() {
         isolated_test!(a_nested_job_waiting_through_another_checker_for_the_stack_is_cancelled);
         nested_wait_on_the_stack(true);
+    }
+
+    /// Four cold starts at once (Fab, synth, arm-lab; 2026-11-03): the owner, serving an outermost
+    /// request, waited for a query a type-check thread ran, and that thread's wait-registry row still
+    /// named a query the owner (or the request's requester) had finished: the waiter had not run
+    /// since its latch completed. The chain read "the runner waits for the owner's stack", an
+    /// internal compiler error, where the runner went on a few ms later. Outermost, the wait is
+    /// waited out; only the owner's own query is a cycle there.
+    fn outermost_wait_on_a_lagging_row(names_requester: bool) {
+        static RUNNER: AtomicU64 = AtomicU64::new(0);
+        static ROW: AtomicBool = AtomicBool::new(false);
+        static DONE: AtomicBool = AtomicBool::new(false);
+        call(Class::Program, || {});
+        let holder = if names_requester { me() } else { OWNER_TID.load(Ordering::SeqCst) };
+        let runner = std::thread::spawn(move || {
+            RUNNER.store(me(), Ordering::SeqCst);
+            {
+                let _w = crate::waits::begin(crate::waits::Kind::Query, 0, holder, "query");
+                ROW.store(true, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            DONE.store(true, Ordering::SeqCst);
+        });
+        while !ROW.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        let t0 = std::time::Instant::now();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(Class::Program, || pump_latch(RUNNER.load(Ordering::SeqCst), &|| DONE.load(Ordering::SeqCst)))));
+        runner.join().unwrap();
+        let msg = r.as_ref().err().map(|p| p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default());
+        assert!(r.is_ok(), "the outermost request stopped: {msg:?}");
+        assert!(t0.elapsed().as_millis() < 1000, "{:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn an_outermost_wait_through_a_row_naming_the_owner_is_waited_out() {
+        isolated_test!(an_outermost_wait_through_a_row_naming_the_owner_is_waited_out);
+        outermost_wait_on_a_lagging_row(false);
+    }
+
+    #[test]
+    fn an_outermost_wait_through_a_row_naming_the_requester_is_waited_out() {
+        isolated_test!(an_outermost_wait_through_a_row_naming_the_requester_is_waited_out);
+        outermost_wait_on_a_lagging_row(true);
     }
 
     /// Rule I-PUB: a publish that asks the owner (or pumps) is a bug and panics; under
