@@ -4170,7 +4170,11 @@ pub(crate) fn domain_loaded(inputs: Option<Inputs>) {
     }
     *DOMAIN_RESTORED.lock().unwrap_or_else(|e| e.into_inner()) = restored;
     *DOMAIN_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = inputs;
-    PATCHED_FILES.lock().unwrap_or_else(|e| e.into_inner()).1.clear();
+    {
+        let mut p = PATCHED.lock().unwrap_or_else(|e| e.into_inner());
+        p.files.clear();
+        p.items.clear();
+    }
     DOMAIN_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
     DOMAIN_LOADING.store(false, std::sync::atomic::Ordering::Release);
     watch_events::kick();
@@ -4270,35 +4274,75 @@ fn wake_program() {
     if let Some((scope, wake)) = wake { let _ = scope.call(|| wake()); }
 }
 
-/// The source files installed patches changed, each with the patch count when it last changed
-/// (and the count): what the program built from a file's text at run time (makepad's
-/// `script_mod!` designs, evaluated from their fns once) it builds again from the patched code
-/// (std::relax::patched_files). A loaded domain starts with none.
-static PATCHED_FILES: relax_session::sync::Mutex<(u64, Vec<(u64, String)>)> = relax_session::sync::Mutex::new((0, Vec::new()));
+/// What installed patches changed, for the program (std::relax::patched): what it built from code
+/// at run time (makepad's `script_mod!` designs, evaluated from their fns once) it builds again
+/// when that code changed. A loaded domain starts with none.
+struct Patched {
+    /// patches installed
+    count: u64,
+    /// each source file a patch changed, with the count when one last did
+    files: Vec<(u64, String)>,
+    /// each item whose body a patch changed (its name), with the count when one last did
+    items: Vec<(u64, String)>,
+    /// the count of the last patch that changed more than item bodies (an item added or removed,
+    /// a const, a layout): to a program that has not seen it every item changed
+    whole: u64,
+}
 
-/// A patch of `paths` is installed: noted for the program, which is woken.
-fn patch_landed(paths: impl Iterator<Item = String>) {
-    {
-        let mut p = PATCHED_FILES.lock().unwrap_or_else(|e| e.into_inner());
-        p.0 += 1;
-        let n = p.0;
+impl Patched {
+    const fn new() -> Self {
+        Self { count: 0, files: Vec::new(), items: Vec::new(), whole: 0 }
+    }
+
+    /// A patch of `paths` that changed the bodies of `items` (None: more than bodies).
+    fn land(&mut self, paths: impl Iterator<Item = String>, items: Option<Vec<String>>) {
+        self.count += 1;
+        let n = self.count;
         for path in paths {
-            p.1.retain(|(_, q)| *q != path);
-            p.1.push((n, path));
+            self.files.retain(|(_, q)| *q != path);
+            self.files.push((n, path));
+        }
+        match items {
+            Some(items) => for item in items {
+                self.items.retain(|(_, q)| *q != item);
+                self.items.push((n, item));
+            },
+            None => self.whole = n,
         }
     }
+
+    /// What changed after count `since`: "<count> <1 when every item>\n", a path per line, then
+    /// a tab and an item name per line.
+    fn since(&self, since: u64) -> String {
+        let mut s = format!("{} {}\n", self.count, u8::from(self.whole > since));
+        for (n, path) in &self.files {
+            if *n > since { s.push_str(path); s.push('\n'); }
+        }
+        for (n, item) in &self.items {
+            if *n > since { s.push('\t'); s.push_str(item); s.push('\n'); }
+        }
+        s
+    }
+}
+
+static PATCHED: relax_session::sync::Mutex<Patched> = relax_session::sync::Mutex::new(Patched::new());
+
+/// The names of the items whose bodies an installed patch changed; None when it changed more (an
+/// item added or removed, a const, a layout).
+unsafe fn changed_items(up: *mut Unit, o: &Outcome) -> Option<Vec<String>> {
+    o.test_changes.as_ref().map(|defs| defs.iter().map(|&d| def_name(&(*up).prog, d)).collect())
+}
+
+/// A patch of `paths` is installed: noted for the program, which is woken.
+fn patch_landed(paths: impl Iterator<Item = String>, items: Option<Vec<String>>) {
+    PATCHED.lock().unwrap_or_else(|e| e.into_inner()).land(paths, items);
     wake_program();
 }
 
-/// The files patched after count `since`: "<count>\n" then one path per line.
+/// What patches changed after count `since` ([`Patched::since`]).
 pub extern "C" fn __relax_patched_files(since: u64, buf: *mut u8, cap: usize) -> usize {
     crate::jit::host_boundary("__relax_patched_files", move || {
-        let p = PATCHED_FILES.lock().unwrap_or_else(|e| e.into_inner());
-        let mut s = format!("{}\n", p.0);
-        for (n, path) in &p.1 {
-            if *n > since { s.push_str(path); s.push('\n'); }
-        }
-        copy_out(&s, buf, cap)
+        copy_out(&PATCHED.lock().unwrap_or_else(|e| e.into_inner()).since(since), buf, cap)
     })
 }
 
@@ -4996,12 +5040,12 @@ unsafe fn target_file(up: *mut Unit, target: &StreamTarget) -> Option<(u32, Stri
     }
 }
 
-fn record_stream(target: &StreamTarget, o: &Outcome) {
+unsafe fn record_stream(up: *mut Unit, target: &StreamTarget, o: &Outcome) {
     if o.rung != Rung::Patch { return; }
     match target {
         StreamTarget::Module(h) => if let Some(&file) = o.files.first() { crate::modules::stream_applied(*h, file); },
         // (a streamed edit of a program file: the program hears of it as of a save)
-        StreamTarget::Path(path) => if o.changed > 0 { patch_landed(std::iter::once(path.clone())); },
+        StreamTarget::Path(path) => if o.changed > 0 { patch_landed(std::iter::once(path.clone()), changed_items(up, o)); },
     }
 }
 
@@ -5010,7 +5054,7 @@ unsafe fn feed_stream(up: *mut Unit, target: &StreamTarget, file: u32, path: &st
     let seen = Instant::now();
     let mut o = apply_mode(up, vec![Edit { file, path: path.to_string(), src: text }], &[],
         2, matches!(target, StreamTarget::Module(_)));
-    record_stream(target, &o);
+    record_stream(up, target, &o);
     state.last = Some(Instant::now());
     if o.rung == Rung::Refuse {
         o.lines = vec!["incomplete: no item applied".to_string()];
@@ -5070,7 +5114,7 @@ pub(crate) unsafe fn finish_module_stream(up: *mut Unit, h: u64, text: Vec<u8>) 
     streams.retain(|s| !(s.0 == up as usize && s.1 == StreamTarget::Module(h)));
     let (file, path) = crate::modules::stream_target(h)?;
     let o = apply_full(up, vec![Edit { file, path, src: text }]);
-    record_stream(&StreamTarget::Module(h), &o);
+    record_stream(up, &StreamTarget::Module(h), &o);
     Some(o)
 }
 
@@ -5111,7 +5155,7 @@ unsafe fn drain_streams(up: *mut Unit) {
                     eprintln!("makepad live: {}", error);
                 } else if let Some(src) = composed {
                     let o = apply_mode(up, vec![Edit { file, path: path.clone(), src }], &[], 0, matches!(target, StreamTarget::Module(_)));
-                    record_stream(target, &o);
+                    record_stream(up, target, &o);
                     if o.rung != Rung::Patch {
                         log_edit(&path, &o, None, seen);
                         for line in &o.lines { eprintln!("makepad live: {}: {}", path, line); }
@@ -5370,7 +5414,7 @@ unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &
         return Vec::new();
     }
     eprintln!("makepad live: {what}: patched ({} item(s) changed, {} fn(s) installed) in {:.1} ms", o.changed, o.names.len(), o.ms.iter().sum::<f64>());
-    patch_landed(edit.paths.iter().cloned());
+    patch_landed(edit.paths.iter().cloned(), changed_items(up, o));
     let mut pending = Vec::new();
     if let Some(undo) = o.undo.take() {
         let ids = crate::owner::call(crate::owner::Class::Program, || {
@@ -6092,7 +6136,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         }
         crate::tui::flush();
         if o.rung == Rung::Patch {
-            patch_landed(which.iter().map(|&k| files[k].0.clone()));
+            patch_landed(which.iter().map(|&k| files[k].0.clone()), changed_items(up, &o));
             if o.group != 0 { landing.push((Instant::now() + LANDING, o.group, what.clone())); }
         }
         // what is left unverified reports when the borrow checker answers; else the verdict is now
@@ -6750,6 +6794,26 @@ mod ledger_tests {
         assert_eq!(ledger.round(at(2), false, None, &hot, &virt), [0], "no native events: the hot set's disk files");
         assert_eq!(ledger.round(at(3), false, None, &hot, &virt), [0, 1, 3], "no native events, the ledger moved: and every virtual file");
         assert_eq!(ledger.round(at(3), false, Some(vec![3]), &hot, &virt), [3], "a virtual file the watch named (an in-app edit leaves the ledger)");
+    }
+}
+
+#[cfg(test)]
+mod patched_tests {
+    /// A program that keeps up hears each patch's files and the items whose bodies it changed;
+    /// one that fell behind hears everything since it last asked; a patch that changed more than
+    /// bodies changed every item for a program that has not seen it.
+    #[test]
+    fn a_program_hears_the_items_each_patch_changed() {
+        let v = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let mut p = super::Patched::new();
+        p.land(v(&["a.rs"]).into_iter(), Some(v(&["handle_event"])));
+        assert_eq!(p.since(0), "1 0\na.rs\n\thandle_event\n");
+        p.land(v(&["a.rs", "b.rs"]).into_iter(), Some(v(&["script_mod"])));
+        assert_eq!(p.since(1), "2 0\na.rs\nb.rs\n\tscript_mod\n");
+        assert_eq!(p.since(0), "2 0\na.rs\nb.rs\n\thandle_event\n\tscript_mod\n");
+        p.land(v(&["b.rs"]).into_iter(), None);
+        assert_eq!(p.since(2), "3 1\nb.rs\n");
+        assert_eq!(p.since(3), "3 0\n");
     }
 }
 
