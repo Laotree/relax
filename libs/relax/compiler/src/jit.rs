@@ -14428,6 +14428,7 @@ fn inline_structural_freqs(f: &relax_backend::rir::Func) -> Vec<f32> {
     if nb == 0 { return Vec::new(); }
     let reach = relax_backend::regalloc::reachable(f);
     let depth = relax_backend::regalloc::loop_depths(f, &reach);
+    let cold = relax_backend::dom::cold_blocks(f, &reach);
     // Propagate path probability over the forward CFG. Reverse postorder
     // cuts feedback edges; loop depth supplies their repeat weight instead.
     let mut seen = vec![false; nb];
@@ -14448,8 +14449,7 @@ fn inline_structural_freqs(f: &relax_backend::rir::Func) -> Vec<f32> {
     let mut mass = vec![0.0f32; nb];
     mass[0] = 1.0;
     for &b in &order {
-        let forward = |to: &u32| rank[*to as usize] > rank[b]
-            && !matches!(f.blocks[*to as usize].term, relax_backend::rir::Term::Unreachable | relax_backend::rir::Term::Resume);
+        let forward = |to: &u32| rank[*to as usize] > rank[b] && !cold[*to as usize];
         let n = f.blocks[b].term.succs().filter(forward).count();
         if n > 0 {
             let share = mass[b] / n as f32;

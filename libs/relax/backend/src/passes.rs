@@ -4575,8 +4575,10 @@ pub fn sink_consts(f: &mut Func) {
             nuse[u.0 as usize] += 1;
         }
     }
-    // constants used only on a cold path (a block ending in Unreachable: panics) move there
+    // constants used only on a cold path (a panic: a block ending in Unreachable, or the
+    // invoke of a panic call in a function with cleanups) move there
     let nb = f.blocks.len();
+    let cold = crate::dom::cold_blocks(f, &reachable(f));
     let mut use_block = vec![u32::MAX; nv]; // u32::MAX-1: several blocks
     for (bi, b) in f.blocks.iter().enumerate() {
         for i in &b.insts {
@@ -4611,7 +4613,7 @@ pub fn sink_consts(f: &mut Func) {
                 }
             };
             let ub = use_block[d.0 as usize];
-            if ub < nb as u32 && ub != bi as u32 && matches!(f.blocks[ub as usize].term, Term::Unreachable | Term::Resume) {
+            if ub < nb as u32 && ub != bi as u32 && cold[ub as usize] {
                 let i = f.blocks[bi].insts.remove(k);
                 let p = f.blocks[bi].pos.remove(k);
                 f.blocks[ub as usize].insts.insert(0, i);
@@ -8458,5 +8460,60 @@ mod tests {
         let before = g.blocks[0].insts.clone();
         assert!(!signed_mulhi(&mut g));
         assert_eq!(g.blocks[0].insts, before);
+    }
+
+    /// A bounds check in a loop of a function with cleanups: its panic call is an invoke (it
+    /// unwinds into the landing pad), so the panic block ends in Invoke, not Unreachable.
+    /// b0 -> b1 (i < n?) -> b2 (check: panic b4 | ok b3) -> b3 (i += 1) -> b1; b4 calls the
+    /// panic with the location's address, b5 Unreachable, b6 the pad (Resume), b7 returns.
+    fn loop_with_invoked_panic() -> (Func, VReg) {
+        let mut f = Func::new("bounds".into(), 0);
+        let v: Vec<VReg> = (0..6).map(|_| f.vreg(Cls::I)).collect();
+        let (n, len, i, c, ok, loc) = (v[0], v[1], v[2], v[3], v[4], v[5]);
+        f.params = vec![n, len];
+        for _ in 0..8 {
+            f.block();
+        }
+        let b = &mut f.blocks;
+        b[0].insts = vec![Inst::Iconst(i, 0)];
+        b[0].term = Term::Jump(1);
+        b[1].insts = vec![Inst::ICmp(Cond::Lt, false, c, i, n)];
+        b[1].term = Term::Branch(c, 2, 7);
+        b[2].insts = vec![Inst::Addr(loc, Sym::new(5)), Inst::ICmp(Cond::Ge, false, ok, i, len)];
+        b[2].term = Term::Branch(ok, 4, 3);
+        b[3].insts = vec![Inst::IBinI(IOp::Add, U64, i, i, 1)];
+        b[3].term = Term::Jump(1);
+        b[4].insts = vec![Inst::Call(Callee::Fn(9), vec![i, len, loc], Vec::new())];
+        b[4].term = Term::Invoke(5, 6);
+        b[5].term = Term::Unreachable;
+        b[6].term = Term::Resume;
+        b[7].term = Term::Ret(Vec::new());
+        for blk in b.iter_mut() {
+            blk.pos = vec![0; blk.insts.len()];
+        }
+        (f, loc)
+    }
+
+    #[test]
+    fn an_invoked_panic_is_a_cold_path() {
+        let (f, loc) = loop_with_invoked_panic();
+        f.verify().unwrap();
+        let reach = reachable(&f);
+        let cold = crate::dom::cold_blocks(&f, &reach);
+        assert_eq!(cold, vec![false, false, false, false, true, true, true, false]);
+        // the location's address moves out of the loop's check into the panic block
+        let mut g = f.clone();
+        sink_consts(&mut g);
+        assert!(!g.blocks[2].insts.iter().any(|x| matches!(x, Inst::Addr(..))));
+        assert_eq!(g.blocks[4].insts[0], Inst::Addr(loc, Sym::new(5)));
+        g.verify().unwrap();
+        // layout: the check falls through to the loop's next step, the panic path goes last
+        let order = relayout_order(&mut g);
+        let at = |b: u32| order.iter().position(|x| *x == b).unwrap();
+        assert!(at(3) == at(2) + 1, "{order:?}");
+        assert!([4, 5, 6].iter().all(|&p| at(p) > at(7)), "{order:?}");
+        // the no-count estimate gives the panic block next to nothing
+        let s = crate::profile::structural_for_test(&f);
+        assert!(s[4] < s[3] * 1e-2, "{s:?}");
     }
 }
