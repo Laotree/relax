@@ -13782,6 +13782,10 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
             verify_pass(func, "split_branch_conditions");
         }
         relax_backend::passes::rotate_loops(func);
+        // a rotated slice loop's entry test compares indices, its pointers built on entry only
+        if cfg.fold && relax_codegen::opt::fold_empty_tests(options, func) {
+            verify_pass(func, "fold_empty_tests");
+        }
     }
     // hot code: small counted single-block loops unrolled (rotation made them single blocks;
     // address modes then fold the copies' i + j into displacements)
