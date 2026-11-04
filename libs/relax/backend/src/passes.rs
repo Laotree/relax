@@ -77,7 +77,7 @@ pub fn map_inst(x: &Inst, m: &dyn Fn(VReg) -> VReg, slot_base: u32) -> Inst {
         Inst::TlsStatic(d, off) => Inst::TlsStatic(m(*d), *off),
         Inst::Sel(d, c, a, b) => Inst::Sel(m(*d), m(*c), m(*a), m(*b)),
         Inst::VSel(d, k, a, b) => Inst::VSel(m(*d), m(*k), m(*a), m(*b)),
-        Inst::VFma(np, na, keep, d, a, b, c) => Inst::VFma(*np, *na, *keep, m(*d), m(*a), m(*b), m(*c)),
+        Inst::VFma(np, na, keep, w, d, a, b, c) => Inst::VFma(*np, *na, *keep, *w, m(*d), m(*a), m(*b), m(*c)),
         Inst::VSplat(d, a) => Inst::VSplat(m(*d), m(*a)),
         Inst::VExtract(d, a, l) => Inst::VExtract(m(*d), m(*a), *l),
         Inst::VInsert(d, v, l, a) => Inst::VInsert(m(*d), m(*v), *l, m(*a)),
@@ -3205,7 +3205,7 @@ pub fn rename(i: &Inst, a: &dyn Fn(VReg) -> VReg) -> Inst {
         Inst::AtomicCas(k, o1, o2, d, x, e, n) => Inst::AtomicCas(*k, *o1, *o2, *d, a(*x), a(*e), a(*n)),
         Inst::Sel(d, c, x, y) => Inst::Sel(*d, a(*c), a(*x), a(*y)),
         Inst::VSel(d, k, x, y) => Inst::VSel(*d, a(*k), a(*x), a(*y)),
-        Inst::VFma(np, na, keep, d, x, y, z) => Inst::VFma(*np, *na, *keep, *d, a(*x), a(*y), a(*z)),
+        Inst::VFma(np, na, keep, w, d, x, y, z) => Inst::VFma(*np, *na, *keep, *w, *d, a(*x), a(*y), a(*z)),
         Inst::VSplat(d, x) => Inst::VSplat(*d, a(*x)),
         Inst::VExtract(d, x, l) => Inst::VExtract(*d, a(*x), *l),
         Inst::VInsert(d, v, l, x) => Inst::VInsert(*d, a(*v), *l, a(*x)),
@@ -5978,7 +5978,7 @@ pub fn gvn_pure(f: &mut Func) -> bool {
             let key = match *i {
                 Inst::VX(op, _, a, b) => GvnKey::X(op, o(a), o(b), 0),
                 Inst::VX3(op, _, a, b, c) => GvnKey::X(op, o(a), o(b), o(c)),
-                Inst::VFma(np, na, keep, _, a, b, c) => GvnKey::Fma(np, na, keep, o(a), o(b), o(c)),
+                Inst::VFma(np, na, keep, w, _, a, b, c) => GvnKey::Fma(np, na, keep, w, o(a), o(b), o(c)),
                 Inst::VSel(_, m, a, b) => GvnKey::Sel(o(m), o(a), o(b)),
                 Inst::VShuffle(_, a, b, k) => GvnKey::Shuf(o(a), o(b), k),
                 _ => match cse_key(i) {
@@ -6019,7 +6019,7 @@ pub fn gvn_pure(f: &mut Func) -> bool {
 enum GvnKey {
     K([u64; 3]),
     X(VX, u64, u64, u64),
-    Fma(bool, bool, bool, u64, u64, u64),
+    Fma(bool, bool, bool, bool, u64, u64, u64),
     Sel(u64, u64, u64),
     Shuf(u64, u64, [u8; 16]),
 }

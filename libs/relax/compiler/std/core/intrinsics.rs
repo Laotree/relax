@@ -351,9 +351,9 @@ pub mod intrinsics_vx {
     // Ternary: 0 x86 sha256rnds2; 1/2/3 Arm sha1c/p/m (b is u32),
     // 4 Arm sha1su0, 5 sha256h, 6 sha256h2, 7 sha256su1 (b is a vector).
     // 8 / 9 NEON f32 fused a + b * c / a - b * c (FMLA / FMLS .4s); 10 bitwise select
-    // (a & b) | (!a & c) (BSL; a, the mask, is passed as T); 11..14 x86 f32 fused a * b + c,
-    // a * b - c, -(a * b) + c, -(a * b) - c (vfmadd / vfmsub / vfnmadd / vfnmsub .ps: a NaN
-    // operand keeps its sign, where FMLS flips it).
+    // (a & b) | (!a & c) (BSL; a, the mask, is passed as T); 11..14 x86 f32, 15..18 x86 f64 fused
+    // a * b + c, a * b - c, -(a * b) + c, -(a * b) - c (vfmadd / vfmsub / vfnmadd / vfnmsub .ps /
+    // .pd: a NaN operand keeps its sign, where FMLS flips it).
     // vx_sha1rnds4: x86, immediate FUNC in 0..=3, checked at lowering.
     // vx_sha1h: Arm, scalar u32 -> u32 through lane 0 of a V128.
     // vx_crc32: Arm crc32{b,h,w,x} of data's low `bytes` (1/2/4/8, constant) bytes into crc;

@@ -128,11 +128,12 @@ pub fn expand_fma_negations(f: &mut Func, x86: bool) -> bool {
                     }
                     out.push(Inst::FMulAdd(false, false, w, d, a, b, c));
                 }
-                Inst::VFma(np, na, keep, d, a, b, c) => {
+                Inst::VFma(np, na, keep, w, d, a, b, c) => {
                     let cls = f.vregs[d.0 as usize];
+                    let vw = if w { VW::D } else { VW::S };
                     let mut neg = |x: VReg| {
                         let t = f.vreg(cls);
-                        out.push(Inst::VX(VX::FNeg(VW::S), t, x, x));
+                        out.push(Inst::VX(VX::FNeg(vw), t, x, x));
                         pos.push(p);
                         if !keep {
                             return t;
@@ -140,14 +141,14 @@ pub fn expand_fma_negations(f: &mut Func, x86: bool) -> bool {
                         // the lanes equal to themselves (not NaN) take the negation
                         let m = f.vreg(cls);
                         let s = f.vreg(cls);
-                        out.push(Inst::VX(VX::FCmp(Cond::Eq, VW::S), m, x, x));
+                        out.push(Inst::VX(VX::FCmp(Cond::Eq, vw), m, x, x));
                         out.push(Inst::VSel(s, m, t, x));
                         pos.extend([p, p]);
                         s
                     };
                     let a = if np { neg(a) } else { a };
                     let c = if na { neg(c) } else { c };
-                    out.push(Inst::VFma(false, false, false, d, a, b, c));
+                    out.push(Inst::VFma(false, false, false, w, d, a, b, c));
                 }
                 _ => unreachable!(),
             }

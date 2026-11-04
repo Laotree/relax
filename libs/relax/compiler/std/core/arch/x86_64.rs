@@ -2638,9 +2638,10 @@ pub unsafe fn _mm256_mask_i64gather_pd<const SCALE: i32>(src: __m256d, slice: *c
     __m256d([l(0), l(1), l(2), l(3)])
 }
 
-// ---- FMA f64: one rounding per lane, (neg_prod ? -(a*b) : a*b) + (neg_add ? -c : c), with the x86 NaN rule:
-// the first NaN operand of a, b, c quieted (its sign as given: the negations do not apply to NaNs), else
-// the negative default NaN for an invalid lane (inf * 0, inf - inf). Per lane (no f64 vector fma op yet).
+// ---- FMA f64: one rounding, a*b + c (fmadd), a*b - c (fmsub), -(a*b) + c (fnmadd), -(a*b) - c (fnmsub). A NaN
+// operand passes on with its own sign: the negations act on the product and the addend inside the fused op. With
+// hardware FMA each is the packed instruction; without it, per lane: the first NaN operand of a, b, c quieted, else
+// the negative default NaN for an invalid lane (inf * 0, inf - inf).
 #[inline(always)]
 fn fma_f64(a: f64, b: f64, c: f64, neg_prod: bool, neg_add: bool) -> f64 {
     const QUIET: u64 = 1 << 51;
@@ -2657,31 +2658,40 @@ fn fma_f64(a: f64, b: f64, c: f64, neg_prod: bool, neg_add: bool) -> f64 {
     if r.is_nan() { f64::from_bits(0xfff8_0000_0000_0000) } else { r }
 }
 #[inline(always)]
-unsafe fn fma_pd(a: __m128d, b: __m128d, c: __m128d, neg_prod: bool, neg_add: [bool; 2]) -> __m128d {
-    __m128d([fma_f64(a.0[0], b.0[0], c.0[0], neg_prod, neg_add[0]), fma_f64(a.0[1], b.0[1], c.0[1], neg_prod, neg_add[1])])
+unsafe fn fma_pd(a: __m128d, b: __m128d, c: __m128d, neg_prod: bool, neg_add: bool) -> __m128d {
+    if crate::intrinsics::fma_native() {
+        match (neg_prod, neg_add) {
+            (false, false) => vx::vx_ternary(a, b, c, 15),
+            (false, true) => vx::vx_ternary(a, b, c, 16),
+            (true, false) => vx::vx_ternary(a, b, c, 17),
+            (true, true) => vx::vx_ternary(a, b, c, 18),
+        }
+    } else {
+        __m128d([fma_f64(a.0[0], b.0[0], c.0[0], neg_prod, neg_add), fma_f64(a.0[1], b.0[1], c.0[1], neg_prod, neg_add)])
+    }
 }
 #[inline(always)]
-unsafe fn fma_pd256(a: __m256d, b: __m256d, c: __m256d, neg_prod: bool, neg_add: [bool; 2]) -> __m256d {
+unsafe fn fma_pd256(a: __m256d, b: __m256d, c: __m256d, neg_prod: bool, neg_add: bool) -> __m256d {
     pd_join(fma_pd(pd_lo(&a), pd_lo(&b), pd_lo(&c), neg_prod, neg_add), fma_pd(pd_hi(&a), pd_hi(&b), pd_hi(&c), neg_prod, neg_add))
 }
-pub unsafe fn _mm_fmadd_pd(a: __m128d, b: __m128d, c: __m128d) -> __m128d { fma_pd(a, b, c, false, [false; 2]) }
-pub unsafe fn _mm_fmsub_pd(a: __m128d, b: __m128d, c: __m128d) -> __m128d { fma_pd(a, b, c, false, [true; 2]) }
-pub unsafe fn _mm_fnmadd_pd(a: __m128d, b: __m128d, c: __m128d) -> __m128d { fma_pd(a, b, c, true, [false; 2]) }
-pub unsafe fn _mm_fnmsub_pd(a: __m128d, b: __m128d, c: __m128d) -> __m128d { fma_pd(a, b, c, true, [true; 2]) }
+pub unsafe fn _mm_fmadd_pd(a: __m128d, b: __m128d, c: __m128d) -> __m128d { fma_pd(a, b, c, false, false) }
+pub unsafe fn _mm_fmsub_pd(a: __m128d, b: __m128d, c: __m128d) -> __m128d { fma_pd(a, b, c, false, true) }
+pub unsafe fn _mm_fnmadd_pd(a: __m128d, b: __m128d, c: __m128d) -> __m128d { fma_pd(a, b, c, true, false) }
+pub unsafe fn _mm_fnmsub_pd(a: __m128d, b: __m128d, c: __m128d) -> __m128d { fma_pd(a, b, c, true, true) }
 /// even lanes a*b - c, odd lanes a*b + c
-pub unsafe fn _mm_fmaddsub_pd(a: __m128d, b: __m128d, c: __m128d) -> __m128d { fma_pd(a, b, c, false, [true, false]) }
+pub unsafe fn _mm_fmaddsub_pd(a: __m128d, b: __m128d, c: __m128d) -> __m128d { _mm_move_sd(fma_pd(a, b, c, false, false), fma_pd(a, b, c, false, true)) }
 /// even lanes a*b + c, odd lanes a*b - c
-pub unsafe fn _mm_fmsubadd_pd(a: __m128d, b: __m128d, c: __m128d) -> __m128d { fma_pd(a, b, c, false, [false, true]) }
+pub unsafe fn _mm_fmsubadd_pd(a: __m128d, b: __m128d, c: __m128d) -> __m128d { _mm_move_sd(fma_pd(a, b, c, false, true), fma_pd(a, b, c, false, false)) }
 pub unsafe fn _mm_fmadd_sd(a: __m128d, b: __m128d, c: __m128d) -> __m128d { _mm_move_sd(a, _mm_fmadd_pd(a, b, c)) }
 pub unsafe fn _mm_fmsub_sd(a: __m128d, b: __m128d, c: __m128d) -> __m128d { _mm_move_sd(a, _mm_fmsub_pd(a, b, c)) }
 pub unsafe fn _mm_fnmadd_sd(a: __m128d, b: __m128d, c: __m128d) -> __m128d { _mm_move_sd(a, _mm_fnmadd_pd(a, b, c)) }
 pub unsafe fn _mm_fnmsub_sd(a: __m128d, b: __m128d, c: __m128d) -> __m128d { _mm_move_sd(a, _mm_fnmsub_pd(a, b, c)) }
-pub unsafe fn _mm256_fmadd_pd(a: __m256d, b: __m256d, c: __m256d) -> __m256d { fma_pd256(a, b, c, false, [false; 2]) }
-pub unsafe fn _mm256_fmsub_pd(a: __m256d, b: __m256d, c: __m256d) -> __m256d { fma_pd256(a, b, c, false, [true; 2]) }
-pub unsafe fn _mm256_fnmadd_pd(a: __m256d, b: __m256d, c: __m256d) -> __m256d { fma_pd256(a, b, c, true, [false; 2]) }
-pub unsafe fn _mm256_fnmsub_pd(a: __m256d, b: __m256d, c: __m256d) -> __m256d { fma_pd256(a, b, c, true, [true; 2]) }
-pub unsafe fn _mm256_fmaddsub_pd(a: __m256d, b: __m256d, c: __m256d) -> __m256d { fma_pd256(a, b, c, false, [true, false]) }
-pub unsafe fn _mm256_fmsubadd_pd(a: __m256d, b: __m256d, c: __m256d) -> __m256d { fma_pd256(a, b, c, false, [false, true]) }
+pub unsafe fn _mm256_fmadd_pd(a: __m256d, b: __m256d, c: __m256d) -> __m256d { fma_pd256(a, b, c, false, false) }
+pub unsafe fn _mm256_fmsub_pd(a: __m256d, b: __m256d, c: __m256d) -> __m256d { fma_pd256(a, b, c, false, true) }
+pub unsafe fn _mm256_fnmadd_pd(a: __m256d, b: __m256d, c: __m256d) -> __m256d { fma_pd256(a, b, c, true, false) }
+pub unsafe fn _mm256_fnmsub_pd(a: __m256d, b: __m256d, c: __m256d) -> __m256d { fma_pd256(a, b, c, true, true) }
+pub unsafe fn _mm256_fmaddsub_pd(a: __m256d, b: __m256d, c: __m256d) -> __m256d { pd_join(_mm_fmaddsub_pd(pd_lo(&a), pd_lo(&b), pd_lo(&c)), _mm_fmaddsub_pd(pd_hi(&a), pd_hi(&b), pd_hi(&c))) }
+pub unsafe fn _mm256_fmsubadd_pd(a: __m256d, b: __m256d, c: __m256d) -> __m256d { pd_join(_mm_fmsubadd_pd(pd_lo(&a), pd_lo(&b), pd_lo(&c)), _mm_fmsubadd_pd(pd_hi(&a), pd_hi(&b), pd_hi(&c))) }
 
 // a vector prints its lanes as a tuple, as stdarch's Debug impls (`uint8x16_t(3, 3, ..)`)
 macro_rules! simd_debug {

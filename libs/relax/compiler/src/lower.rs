@@ -11417,17 +11417,18 @@ impl<'a> Lcx<'a> {
                 let a = vector(self, 0);
                 let b = vector(self, 1);
                 let c = vector(self, 2);
-                self.emit(Inst::VFma(selector == 9, false, false, d, b, c, a));
+                self.emit(Inst::VFma(selector == 9, false, false, false, d, b, c, a));
                 return self.vx_result(d, t);
             }
-            if (11..=14).contains(&selector) {
-                // x86 FMA3 .ps: a * b + c, a * b - c, -(a * b) + c, -(a * b) - c, fused, a NaN
-                // operand passing on with its own sign (vfmadd / vfmsub / vfnmadd / vfnmsub)
+            if (11..=18).contains(&selector) {
+                // x86 FMA3 .ps (11..14) and .pd (15..18): a * b + c, a * b - c, -(a * b) + c,
+                // -(a * b) - c, fused, a NaN operand passing on with its own sign (vfmadd /
+                // vfmsub / vfnmadd / vfnmsub)
                 let a = vector(self, 0);
                 let b = vector(self, 1);
                 let c = vector(self, 2);
-                let k = selector - 11;
-                self.emit(Inst::VFma(k >= 2, k & 1 != 0, true, d, a, b, c));
+                let k = (selector - 11) % 4;
+                self.emit(Inst::VFma(k >= 2, k & 1 != 0, true, selector >= 15, d, a, b, c));
                 return self.vx_result(d, t);
             }
             let op = match selector {
