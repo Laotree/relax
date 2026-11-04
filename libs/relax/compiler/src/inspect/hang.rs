@@ -188,9 +188,9 @@ pub fn why_hung(req: &Req, out: &mut Out) {
         let name = caps.iter().find(|c| c.t.os_id == *os_id).map(|c| c.t.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| thread.clone());
         findings.push(("parked panic", format!("P{} parked on thread {} ({}): {} at {} -- see `panics`, decide with `resume P{} panic`", id, name, super::tid_label(*os_id), super::short(message, 300), location, id)));
     }
-    // a start held by its boot window: the load is done, the app's main has not been called
-    if let Some((waits, since)) = crate::run::boot_window_wait() {
-        findings.push(("boot window", format!("the app has not started: its load finished {:.1} s ago and its start waits for the boot window's first present: {waits}", since.as_secs_f64())));
+    // a boot window that has not presented: the app's main is not called before it does
+    if let Some((_, note)) = crate::run::boot_window_note() {
+        findings.push(("boot window", note));
     }
     if let Some(m) = main_i {
         let busy = cpu(&caps[m]);

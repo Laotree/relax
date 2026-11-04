@@ -4,7 +4,7 @@ use makepad_remote::hot::{Outcome, Record};
 use makepad_strict_json::Value;
 use std::io::{Read, Seek, Write};
 use std::sync::OnceLock;
-use std::sync::atomic::Ordering::Acquire;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::{Acquire, Release}};
 use std::time::Duration;
 
 pub(crate) static THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
@@ -108,6 +108,63 @@ pub(crate) fn arm(package: &str) {
         eprintln!("makepad: cannot arm first-frame timeout: {e}");
         crate::run::failed_run(&format!("cannot arm the first-frame timeout: {e}"));
     }
+}
+
+/// The cache's state once the load classified it (run.rs): 0 not yet (or no cache), 1 cold, 2 warm.
+static CACHE_STATE: AtomicU8 = AtomicU8::new(0);
+/// The boot window has opened: its first present happened (or the run draws none of its own).
+static WINDOW_OPEN: AtomicBool = AtomicBool::new(false);
+static WINDOW_THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
+
+/// The load classified the cache (`warm`: it holds this program's startup manifest).
+pub(crate) fn classified(warm: bool) {
+    CACHE_STATE.store(if warm { 2 } else { 1 }, Release);
+    if let Some(t) = WINDOW_THREAD.get() { t.unpark(); }
+}
+
+/// The boot window's first present happened (its open returned).
+pub(crate) fn window_opened() {
+    WINDOW_OPEN.store(true, Release);
+    if let Some(t) = WINDOW_THREAD.get() { t.unpark(); }
+}
+
+/// From before the boot window opens: the run's start waits for the window's first present
+/// (finish_window), so a window that never presents holds the app forever. Its first present has
+/// the first frame's deadline (`deadline`: cold until the load classifies its cache); past it,
+/// the run is captured, reported and failed as a first-frame timeout.
+pub(crate) fn arm_window(package: &str) {
+    let _kept = crate::zone_alloc::kept();
+    let package = package.to_string();
+    if let Err(e) = std::thread::Builder::new().name("boot-window-watch".into()).spawn(move || {
+        let _kept = crate::zone_alloc::kept();
+        let _ = WINDOW_THREAD.set(std::thread::current());
+        watch_window(&package);
+    }) {
+        eprintln!("makepad: cannot arm the boot window's first-frame timeout: {e}");
+        crate::run::failed_run(&format!("cannot arm the boot window's first-frame timeout: {e}"));
+    }
+}
+
+fn watch_window(package: &str) {
+    let (secs, basis) = loop {
+        if WINDOW_OPEN.load(Acquire) { return; }
+        // a warm start that compiles most of its code fresh is judged as a cold one (`watch`)
+        let state = if CACHE_STATE.load(Acquire) == 2 && !cold_like() { "warm" } else { "cold" };
+        let (secs, basis) = deadline(package, state);
+        let left = secs as f64 * 1000.0 - crate::clock::ms_since_process_start();
+        if left <= 0.0 { break (secs, basis); }
+        // woken by the window's open and the cache's classification; a warm start's
+        // compile-or-link verdict is looked at again each second
+        std::thread::park_timeout(Duration::from_secs_f64((left / 1000.0).min(1.0)));
+    };
+    if WINDOW_OPEN.load(Acquire) { return; }
+    let s = snapshot::capture(&format!("first-frame timeout after {secs} s ({basis}): the boot window has not presented"));
+    eprintln!("makepad: first-frame timeout: {package}'s boot window presented no frame in {secs} s ({basis})");
+    eprintln!("makepad: likely cause: {}", s.cause);
+    eprintln!("makepad: report: {}", s.path.display());
+    let reason = format!("{} [report {}]", s.cause, s.path.display());
+    persist("ff", Outcome::FirstFrameTimeout, package, &reason);
+    crate::run::failed_run(&format!("first-frame timeout: {}", s.cause));
 }
 
 fn watch(package: &str, state: &str, secs: u64, basis: &str) {
