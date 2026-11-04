@@ -131,6 +131,8 @@ pub fn fork_while_jit_busy() {
     println!("| forks that reached exec: {} of 200", ok);
 }
 
+const SIBLING_SPAWNS: usize = 100;
+
 static HEAT_STOP: AtomicBool = AtomicBool::new(false);
 
 /// Hot code for the tiers: each instantiation a slot of its own, whose calls and loop turn it hot
@@ -184,6 +186,45 @@ pub fn concurrent_spawns_while_tiers_build() {
     }
     println!("| concurrent spawns that reached exec: {} of 48", ok);
     eprintln!("os_fork_busy: longest spawn {:.1} ms", SPAWN_MAX_US.load(Ordering::Relaxed) as f64 / 1e3);
+}
+
+/// Spawns from four threads whose children outlive them: no spawn waits for another spawn's child.
+/// Between `pipe` and `fcntl(FD_CLOEXEC)` another thread's fork left this spawn's error pipe open in
+/// its child, and the spawn read that pipe until that child ended (a devhub test's hub held its
+/// lease table through it, and its tools waited for the run that never started, 2026-11-04). Real
+/// std's `pipe2` has no such moment on Linux; macOS has no pipe2, in real std either.
+#[test]
+fn a04_spawns_never_wait_for_each_others_children() {
+    spawns_never_wait_for_each_others_children();
+}
+
+/// The test's body (also run by `relax-fork-busy`).
+pub fn spawns_never_wait_for_each_others_children() {
+    const LIFE: Duration = Duration::from_secs(1);
+    let waited = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| {
+                let mut children = Vec::new();
+                for _ in 0..SIBLING_SPAWNS {
+                    let mut c = Command::new("sleep");
+                    c.arg("1").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+                    unsafe {
+                        c.pre_exec(|| Ok(()));
+                    }
+                    let t = Instant::now();
+                    children.push(c.spawn().unwrap());
+                    if t.elapsed() >= LIFE {
+                        waited.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                for mut c in children {
+                    let _ = c.wait();
+                }
+            });
+        }
+    });
+    println!("| spawns that waited for another spawn's child: {}", waited.load(Ordering::Relaxed));
 }
 
 trait Probe: Sync {
