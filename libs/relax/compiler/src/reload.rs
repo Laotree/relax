@@ -4344,6 +4344,19 @@ impl Patched {
 
 static PATCHED: relax_session::sync::Mutex<Patched> = relax_session::sync::Mutex::new(Patched::new());
 
+/// SPEC-V: the slots patch `group` installed without a clean verdict (owner thread). Their owners go
+/// first in the borrow checker's queue: the edit's verdict is what the person waits for. Queued at
+/// the default rank, the first edit after a start waited 7.7 s behind the startup's checks (Fab,
+/// 11-04).
+unsafe fn unverified_patch(up: *mut Unit, group: u32) -> Vec<u32> {
+    let ids: Vec<u32> = {
+        let u = &*up;
+        (0..u.fns.len() as u32).filter(|&id| u.fns[id as usize].patch_gen == group && u.fns[id as usize].unverified.load(Ordering::Relaxed)).collect()
+    };
+    if !ids.is_empty() { jit::prioritize_verdicts(up, &ids); }
+    ids
+}
+
 /// The names of the items whose bodies an installed patch changed; None when it changed more (an
 /// item added or removed, a const, a layout).
 unsafe fn changed_items(up: *mut Unit, o: &Outcome) -> Option<Vec<String>> {
@@ -5530,10 +5543,7 @@ unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &
     patch_landed(edit.paths.iter().cloned(), changed_items(up, o));
     let mut pending = Vec::new();
     if let Some(undo) = o.undo.take() {
-        let ids = crate::owner::call(crate::owner::Class::Program, || {
-            let u = &*up;
-            (0..u.fns.len() as u32).filter(|&id| u.fns[id as usize].patch_gen == o.group && u.fns[id as usize].unverified.load(Ordering::Relaxed)).collect::<Vec<_>>()
-        });
+        let ids = crate::owner::call(crate::owner::Class::Program, || unverified_patch(up, o.group));
         if !ids.is_empty() {
             UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
             pending.push(PendingPatch { group: o.group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq() });
@@ -6310,10 +6320,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             // SPEC-V: the slots this group installed without a clean verdict (all of them, unless
             // --check-first refused what failed before the install)
             let group = u.group;
-            let ids: Vec<u32> = crate::owner::call(crate::owner::Class::Program, || {
-                let up = &*up;
-                (0..up.fns.len() as u32).filter(|&id| up.fns[id as usize].patch_gen == group && up.fns[id as usize].unverified.load(Ordering::Relaxed)).collect()
-            });
+            let ids: Vec<u32> = crate::owner::call(crate::owner::Class::Program, || unverified_patch(up, group));
             if !ids.is_empty() {
                 UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
                 pending.push(PendingPatch { group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq() });

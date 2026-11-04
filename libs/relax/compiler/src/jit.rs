@@ -16620,7 +16620,7 @@ unsafe fn relower_twin_callers(up: *mut Unit, tc: &TwinCallers) {
 /// waiting for quiet compiles): hot code waits seconds for its verdict, not the whole backlog. An
 /// owner the checker never got (a closure's parent with no code of its own, a slot whose first code
 /// took a path that queues nothing: 39 of the city's rank requests) is queued here (owner thread).
-unsafe fn prioritize_verdicts(up: *mut Unit, ids: &[u32]) {
+pub(crate) unsafe fn prioritize_verdicts(up: *mut Unit, ids: &[u32]) {
     for &c in ids {
         (&mut *up).note_first_borrowck(c, Some(0));
     }
