@@ -106,6 +106,11 @@ pub(crate) fn first_present_ms() -> Option<f64> {
 }
 
 fn cause(sections: &[(&str, String)]) -> String {
+    // the app's start waits for its boot window, which has not presented (run.rs boot_window_waits);
+    // while the load goes on, the cause is the load's
+    if let Some((true, note)) = crate::run::boot_window_note() {
+        return format!("boot window: {note}");
+    }
     let get = |name| sections.iter().find(|s| s.0 == name).map_or("", |s| s.1.as_str());
     for view in objects(get("session view")) {
         if let Some(error) = view.get("compile_errors").and_then(Value::as_arr).and_then(|a| a.first()).and_then(Value::as_str) {
