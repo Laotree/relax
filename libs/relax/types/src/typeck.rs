@@ -4988,7 +4988,7 @@ impl<'a> Fcx<'a> {
             self.file, self.prog.files[self.file as usize].ast.expr(e).lo, self.b.def, "typeck-expression")));
         let save_div = self.diverges;
         self.diverges = false;
-        let t = self.check_expr_inner(e, expected);
+        let t = crate::stack::ensure_sufficient_stack(|| self.check_expr_inner(e, expected));
         let ts = self.shallow(t);
         if ts == self.tcx.tys.never {
             self.diverges = true;
