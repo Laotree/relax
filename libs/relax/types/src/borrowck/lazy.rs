@@ -684,7 +684,8 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
         let (identity, def, epoch) = &item.key;
         let phase = std::cell::Cell::new("start");
         *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = Some((rank, *def, crate::clock::wall_ns()));
-        let ok = item.src.with_front(&mut |prog, tcx, cx| {
+        // (the catch: this item's steps around the body's own check below)
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| item.src.with_front(&mut |prog, tcx, cx| {
             struct Slow<'a>(std::time::Instant, &'a std::cell::Cell<&'static str>, &'a Program, DefId, usize);
             impl Drop for Slow<'_> {
                 fn drop(&mut self) {
@@ -786,12 +787,26 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
             }
             phase.set("finish");
             finish_verdict(prog, *identity, *epoch, *def, args, result, Origin::Background);
-        });
+        })));
         CHECK_NS.fetch_add(relax_backend::cpu_ns() - t0, Ordering::Relaxed);
         *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // An exit cancels the whole attempt, including constant deferrals/discovery.
         // Only a front writer's temporary preemption is queued again below.
         if crate::preempt::is_stopped() { return; }
+        // A panic in the item's other steps (its stored verdict, its owner's identity arguments, a
+        // discovery batch) ends this item, reported like the check's own; the worker goes on.
+        let ok = match ok {
+            Ok(ok) => ok,
+            Err(p) => {
+                let msg = panic_message(&p);
+                PANICS.fetch_add(1, Ordering::Relaxed);
+                let mut notes = PANIC_NOTES.lock().unwrap_or_else(|e| e.into_inner());
+                if notes.len() < 5 { notes.push(format!("{:?} ({}): {}", def, phase.get(), msg)); }
+                drop(notes);
+                record(item.key.clone(), FnVerdict::Unchecked(format!("checker failure: {}", msg)));
+                continue;
+            }
+        };
         if stale {
             STALE.fetch_add(1, Ordering::Relaxed);
             // Epoch-purged entries stay purged; verdict() supplies the stale reason.
