@@ -450,6 +450,7 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
         };
         let moves = MoveData::gather_moves(&mir, prog, tcx, env, &|_| true);
         let mut infcx = BorrowckInferCtxt::new(tcx, prog, typeck.def, typeck.def, &typeck.args);
+        infcx.root_typeck = Some(typeck);
         let input = MirNllInput { sig: &sig, nested, def_span: mir.span, moves: &moves, has_loans: true };
         let tc = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| type_check_body(tcx, prog, &mut infcx, &mut *mir, &input))) {
             Ok(tc) => tc,
