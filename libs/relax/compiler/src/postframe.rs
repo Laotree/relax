@@ -594,6 +594,16 @@ pub fn image_window_open() -> bool {
     fp == 0 || FRAMES_AFTER_PRESENT.load(Relaxed) == 0 && wall_ns() < fp + IMAGE_WINDOW_NS
 }
 
+/// The live patches the newest window frame on the glass was built with (makepad-platform calls
+/// the loader symbol `relax_frame_patch` before `relax_frame_done`): `inspect live`'s
+/// `frame_patch`, which devhub's "→ frame" of a live edit waits for. A frame count says nothing
+/// about the edit in an app that animates.
+pub static FRAME_PATCH: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) extern "C" fn relax_frame_patch(patches: u64) {
+    FRAME_PATCH.fetch_max(patches, Relaxed);
+}
+
 /// The program presented a frame (makepad-platform calls the loader symbol `relax_frame_done`
 /// after each frame the HAL finished; on the thread that handles the HAL's events).
 pub(crate) extern "C" fn relax_frame_done() {
