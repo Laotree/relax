@@ -6209,10 +6209,35 @@ impl<'a> Lcx<'a> {
     /// `a = v` for a place expression `a`: drops its old value (what of it was not moved out),
     /// then writes.
     fn assign_to(&mut self, a: ExprId, v: Val) {
-                // a local: drop its old value if it holds one, then it owns the new one
+                // a local: drop its old value if it holds one, then it owns the new one. A
+                // capture of an Fn/FnMut closure always holds a value (never moved out, and rustc
+                // rejects capturing an unassigned local): it takes the place path below, its old
+                // value dropped before the write (it leaked: app_main!'s `app_value = ..` kept
+                // every design re-run's app tree)
                 if let ExprKind::Path(_) = &self.ast().expr(strip_paren(self.ast(), a)).kind {
-                    if let Some(Res::Local(li)) = self.b.res.get(&strip_paren(self.ast(), a).0).copied() {
+                    if let Some(Res::Local(li)) = self.b.res.get(&strip_paren(self.ast(), a).0).copied().filter(|r| !matches!(r, Res::Local(li) if self.foreign[*li as usize] && !self.capture_flag.contains_key(li))) {
                         let lt = self.monomorphize(self.b.locals[li as usize].ty);
+                        if self.foreign[li as usize] {
+                            // a by-value capture in a state with drop flags: the old value drops
+                            // if its flag says it is there, and the state owns the new one
+                            let (env, off) = self.capture_flag[&li];
+                            let pl = self.local_place(li);
+                            if self.needs_drop_glue(lt) && self.dead_blk != Some(self.cur) {
+                                let f = self.f.vreg(Cls::I);
+                                self.emit(Inst::Load(Mem::Int(1, false), f, env, off));
+                                let (yes, join) = (self.f.block(), self.f.block());
+                                self.term(Term::Branch(f, yes, join));
+                                self.switch(yes);
+                                let addr = self.place_addr(&pl, lt);
+                                self.drop_at(addr, lt);
+                                self.goto(join);
+                                self.switch(join);
+                            }
+                            self.write_place(&pl, lt, v);
+                            let one = self.iconst(1);
+                            self.emit(Inst::Store(Mem::Int(1, false), env, off, one));
+                            return;
+                        }
                         let dynamic = self.unwind_on() && self.nounwind == 0 && self.needs_drop_glue(lt) && self.drop_flags[li as usize].is_some() && !self.foreign[li as usize] && self.u.drop_may_unwind(lt);
                         if dynamic && self.dead_blk != Some(self.cur) {
                             // rustc's drop-and-replace: if dropping the old value panics, the new
