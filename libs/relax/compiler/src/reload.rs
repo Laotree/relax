@@ -6111,12 +6111,14 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 for &k in &changed { files[k].2 = settled_stamps[k]; stalled.remove(&k); }
                 continue;
             }
-            // a change the running process cannot take: makepad rebuilds itself in the background
-            // and restarts into the new binary; the app keeps running (and patching) meanwhile
+            // a change the running process cannot take: offered, and the person's restart builds
+            // makepad in the background and restarts into it; the app keeps running (and
+            // patching) meanwhile. A live test session builds now: its verdict is the restarted run
             let what = if changed.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };
             let names: Vec<String> = changed.iter().take(3).map(|&k| short(&files[k].0)).collect();
             let why = format!("{} {what} changed ({}{}): {reason}", changed.len(), names.join(", "), if changed.len() > 3 { ", ..." } else { "" });
-            match host::request(why.clone(), inputs.process_paths(&|_| true)) {
+            let paths = inputs.process_paths(&|_| true);
+            match if crate::harness::live::enabled() { host::request(why.clone(), paths) } else { host::offer(why.clone(), paths) } {
                 Ok(()) => {
                     // answered at once (a restart follows the build); the build's end answers
                     // again: refused with its errors, no change, or the restart into it

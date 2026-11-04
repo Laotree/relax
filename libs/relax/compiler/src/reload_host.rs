@@ -1,7 +1,10 @@
 //! Changes a running process cannot take in place: the provided crates built into makepad, std,
 //! makepad run's own sources, the Cargo graph and build scripts (a program edit the patcher
-//! cannot absorb restarts in place without a rebuild: reload.rs restart_in_place). The loader is
-//! rebuilt with cargo in
+//! cannot absorb restarts in place without a rebuild: reload.rs restart_in_place). A running app
+//! offers the update ([`offer`]): each landing built makepad in every app on the person's machine,
+//! whether or not they meant to restart (96 min of builds in 13 h, 11-04). The person's restart,
+//! or the next `cargo run`, builds it. A live test session and a dock app's sync build at once.
+//! The loader is rebuilt with cargo in
 //! the background (nice) while the app keeps running the code it has, then the process truly
 //! restarts: the rebuilt binary replaces it (exec) with the same command line, and an app that
 //! restarts with its state (std::relax::restart_supported) is asked first, at its next safe point
@@ -133,10 +136,12 @@ struct State {
     failed: String,
     /// A source-check mismatch waits for the same rebuild/restart action as a watched edit.
     provided: Option<crate::provided::ProvidedChange>,
+    /// A change of what makepad is built from waits for the person's restart ([`offer`]).
+    offered: bool,
     update_message: Option<std::sync::Arc<str>>,
 }
 
-static STATE: Mutex<State> = Mutex::new(State { phase: Phase::Idle, since: None, why: String::new(), paths: Vec::new(), again: false, failed: String::new(), provided: None, update_message: None });
+static STATE: Mutex<State> = Mutex::new(State { phase: Phase::Idle, since: None, why: String::new(), paths: Vec::new(), again: false, failed: String::new(), provided: None, offered: false, update_message: None });
 
 /// Best effort, once on the compiler worker when the mismatch is found. Group paths by their
 /// repository (a worktree's .git may be a file); removed inputs still name a commit in git log.
@@ -247,7 +252,7 @@ pub fn update_message() -> Option<std::sync::Arc<str>> {
 pub(super) fn relaunch() -> Option<Result<&'static str, String>> {
     let (phase, why, paths) = {
         let st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-        if st.phase == Phase::Idle && st.provided.is_none() { return None; }
+        if st.phase == Phase::Idle && st.provided.is_none() && !st.offered { return None; }
         if st.phase == Phase::Building {
             RESTART_AFTER_BUILD.store(true, std::sync::atomic::Ordering::SeqCst);
             return Some(Ok("rebuild makepad, then restart with the program's state"));
@@ -323,12 +328,38 @@ fn stamps(paths: &[String]) -> Vec<super::inputs::Stamp> {
 
 /// The watcher: `why` changed, which needs a new process. Starts the rebuild (or one more after
 /// the running one). Err: this run cannot rebuild itself (the caller says how to restart).
+/// A change of what makepad is built from, in a running app: offered on the ring, and built when
+/// the person restarts ([`relaunch`]). Err: this makepad cannot rebuild itself.
+pub(super) fn offer(why: String, paths: Vec<String>) -> Result<(), String> {
+    let _k = crate::zone_alloc::kept();
+    command(true)?;
+    {
+        let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        st.why = why.clone();
+        st.paths = paths;
+        st.offered = true;
+        match st.phase {
+            // the build the person asked for takes it too
+            Phase::Building => st.again = true,
+            // older than this change: the click builds first
+            Phase::Restarting => {
+                HANDOVER.lock().unwrap_or_else(|e| e.into_inner()).take();
+                st.phase = Phase::Idle;
+            }
+            Phase::Idle | Phase::Failed => {}
+        }
+    }
+    super::offer_restart(&why);
+    Ok(())
+}
+
 pub(super) fn request(why: String, paths: Vec<String>) -> Result<(), String> {
     let _k = crate::zone_alloc::kept();
     command(true)?;
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     st.why = why;
     st.paths = paths;
+    st.offered = false;
     match st.phase {
         Phase::Building => {
             st.again = true;
@@ -427,6 +458,9 @@ fn build_loop() {
             st.phase = Phase::Idle;
             st.since = Some(Instant::now());
             RESTART_AFTER_BUILD.store(false, std::sync::atomic::Ordering::SeqCst);
+            drop(st);
+            // the offer the click answered: nothing is left to update to
+            super::clear_restart_pending();
             return;
         }
         super::live_log(&format!("{{\"event\":\"host_rebuild\",\"ok\":true,\"s\":{secs:.1}}}"));
