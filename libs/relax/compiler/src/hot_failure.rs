@@ -131,6 +131,22 @@ fn jit_error(record: &str, reason: &str) {
         &format!("\"record\":{},\"reason\":{}", crate::inspect::json_str(record), crate::inspect::json_str(reason)));
 }
 
+/// Records per run (a checker broken for every body of an app wrote one synced file per body; the
+/// run's summary counts them all).
+const CHECKER_PANIC_RECORDS: u64 = 16;
+
+/// A panic in a check of `body` (borrowck::lazy's sink, typeck_bg): its own record, since no hot load
+/// failed and the app runs on. This ledger is where the next one is seen. Runs on the checking
+/// thread: a write that fails stays pending for the next flush, and nothing here waits for it.
+pub fn checker_panic(body: &str, message: &str) {
+    static RECORDED: AtomicU64 = AtomicU64::new(0);
+    if RECORDED.fetch_add(1, Ordering::Relaxed) >= CHECKER_PANIC_RECORDS { return; }
+    let _kept = crate::zone_alloc::kept();
+    let r = record(&empty_attempt(), Outcome::CheckerPanic, format!("checker panic in `{body}`: {message}"), String::new(), Vec::new());
+    state().pending.push_back(r);
+    flush();
+}
+
 pub fn recovering() -> bool { ACTIVE.load(Ordering::Acquire) }
 pub(crate) fn enable() { REPORTING.store(true, Ordering::Release); }
 pub fn has_error() -> bool { ERROR.load(Ordering::Acquire) }

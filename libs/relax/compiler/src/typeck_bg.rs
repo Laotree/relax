@@ -205,9 +205,10 @@ fn check(f: &FrontShared, d: DefId, todo: &[bool], failed: &mut HashSet<u32>) ->
                 continue;
             }
             Err(p) if p.is::<crate::preempt::NeedsLoad>() && !prog.skipped_files.is_empty() => return Checked::Later,
-            Err(_) => {
+            Err(p) => {
                 // the checker failed on a body: a makepad run bug, reported like a build's
                 // internal error, and the crate's verdict is not stored
+                crate::hot_failure::checker_panic(&prog.def_path(d), &jit::payload_text(&*p));
                 let e = format!("internal compiler error while checking {} -- makepad run bug, report it{}", prog.def_path(d), jit::take_ice_location());
                 STATS[1].fetch_add(1, Ordering::Relaxed);
                 failed.insert(krate);

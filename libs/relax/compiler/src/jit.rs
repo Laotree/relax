@@ -3975,6 +3975,7 @@ impl Unit {
     }
 
     pub fn new(prog: Program, tcx: Tcx, core_crate: u32) -> Box<Unit> {
+        crate::borrowck::lazy::set_panic_sink(crate::hot_failure::checker_panic);
         owner::start();
         let query_errors = tcx.dcx.clone();
         let sess = prog.session.clone();
@@ -7801,7 +7802,7 @@ pub fn demand_compiled() -> u64 {
 /// progress: a busy queue is reported as busy and sampled again on the next tick.
 #[cfg(unix)]
 pub(crate) fn compile_progress() -> (Option<usize>, u64) {
-    (Some(queue::counts().iter().sum()), STARTUP_COMPILES.load(Ordering::Relaxed))
+    (Some(queue::counts()[..5].iter().sum()), STARTUP_COMPILES.load(Ordering::Relaxed))
 }
 /// O3 installs (read off the unit: run.rs's monitor)
 pub static TIER1_INSTALLS: AtomicU64 = AtomicU64::new(0);
@@ -26545,7 +26546,18 @@ fn run_job(job: queue::Job) {
         queue::Job::O3(entry) => { let _mem = crate::memstat::tag(crate::memstat::Tag::Tier1); run_o3(entry); }
         queue::Job::Spec(unit, id) => { let _mem = crate::memstat::tag(crate::memstat::Tag::Codegen); run_spec(unit, id); },
         queue::Job::Tick => run_tick(),
+        queue::Job::Check(batch) => { let _mem = crate::memstat::tag(crate::memstat::Tag::Typeck); crate::check::run_check_slice(batch); }
     }
+}
+
+/// `n` jobs of a check's `batch` on the queue (check.rs queued_map).
+pub(crate) fn queue_check(batch: &std::sync::Arc<crate::check::CheckBatch>, n: usize) {
+    for _ in 0..n { queue::push(queue::Job::Check(batch.clone()), wall_ns()); }
+}
+
+/// Something waits for the check beside the program: its jobs run in the waiter's class.
+pub(crate) fn promote_checks() {
+    queue::promote_checks();
 }
 static TICK_STATE: relax_session::sync::Mutex<([u64; 8], u32)> = relax_session::sync::Mutex::new(([0; 8], 0));
 fn tick_delay() -> std::time::Duration {

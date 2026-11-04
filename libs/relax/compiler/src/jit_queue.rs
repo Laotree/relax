@@ -20,21 +20,24 @@ pub(super) enum Job {
     O3(TierEntry),
     Spec(usize, u32),
     Tick,
+    /// a slice of a check beside the program (check.rs CheckBatch): below every build until
+    /// something waits for it
+    Check(Arc<crate::check::CheckBatch>),
 }
 impl Job {
     fn slot(&self) -> Option<(usize, u32)> {
         match self {
             Self::Ahead(f, AheadWork::Slot(id)) => Some((f.unit.load(Ordering::Acquire) as usize, *id)),
-            Self::Ahead(_, AheadWork::Body(..) | AheadWork::Look(..)) | Self::Tick => None,
+            Self::Ahead(_, AheadWork::Body(..) | AheadWork::Look(..)) | Self::Tick | Self::Check(..) => None,
             Self::O2(u, id, _) | Self::Spec(u, id) => Some((*u, *id)),
             Self::O3(e) => Some((TIER_UNIT.load(Ordering::Acquire) as usize, e.0)),
         }
     }
     fn label(&self) -> &'static str {
-        match self { Self::Ahead(..) => "JIT ahead", Self::O2(..) => "JIT O2", Self::O3(..) => "JIT O3", Self::Spec(..) => "JIT spec", Self::Tick => "JIT tick" }
+        match self { Self::Ahead(..) => "JIT ahead", Self::O2(..) => "JIT O2", Self::O3(..) => "JIT O3", Self::Spec(..) => "JIT spec", Self::Tick => "JIT tick", Self::Check(..) => "JIT check" }
     }
     fn tier(&self) -> usize {
-        match self { Self::Ahead(..) => 0, Self::O2(..) => 1, Self::O3(..) => 2, Self::Spec(..) => 3, Self::Tick => 4 }
+        match self { Self::Ahead(..) => 0, Self::O2(..) => 1, Self::O3(..) => 2, Self::Spec(..) => 3, Self::Tick => 4, Self::Check(..) => 5 }
     }
 }
 /// `slot`: the job's slot when it was queued (a wait for that slot promotes it).
@@ -56,10 +59,12 @@ impl Serials {
 struct Policy {
     /// the burst gate: one build at a time below Interactive while the startup or the UI runs
     burst: bool,
+    /// running builds below Interactive (the burst gate's count: a check beside the program is none)
+    builds: usize,
     noninteractive: usize,
     background: usize,
     /// the running jobs per tier (the startup's tier widths)
-    tiers: [usize; 5],
+    tiers: [usize; TIERS],
     /// through the startup the checks ahead of the main thread run on a few workers, as many as its
     /// helper threads were (STARTUP_AHEAD), and all of them do: a slot the main thread waits for is
     /// admitted beyond
@@ -84,7 +89,7 @@ pub(super) struct Queue {
     waiters: HashMap<(usize, u32), usize>,
     /// the queued entries per tier and stored class, hottest first: a pick reads the buckets that
     /// hold any, each from its front
-    plan: [[BTreeSet<(std::cmp::Reverse<i64>, u64)>; 3]; 5],
+    plan: [[BTreeSet<(std::cmp::Reverse<i64>, u64)>; 3]; TIERS],
     indices: HashMap<u64, usize>,
     /// the queued entries (serials) per slot: a wait promotes and restores them without a scan of
     /// the queue (the main thread's waits hold the queue lock for those)
@@ -200,9 +205,10 @@ impl Queue {
     fn policy(&self) -> Policy {
         let mut policy = Policy {
             burst: !past_startup() || crate::postframe::ui_idle_ns() < BURST_UI_QUIET_NS,
+            builds: 0,
             noninteractive: 0,
             background: 0,
-            tiers: [0; 5],
+            tiers: [0; TIERS],
             ahead_full: false,
             limit: budget::limit() as usize,
             background_limit: budget::background_limit() as usize,
@@ -215,6 +221,7 @@ impl Queue {
         for r in &self.running {
             let class = r.class.class();
             if r.tier != 4 && class != budget::INTERACTIVE { policy.noninteractive += 1; }
+            if r.tier < 4 && class != budget::INTERACTIVE { policy.builds += 1; }
             if class == budget::BACKGROUND { policy.background += 1; }
             policy.tiers[r.tier] += 1;
             if r.tier == 0 && !r.promoted { ahead += 1; }
@@ -222,8 +229,9 @@ impl Queue {
         policy.ahead_full = startup_phase() && ahead >= startup_ahead();
         policy
     }
+    /// (a check beside the program is no build: the budget alone decides how much of it runs beside them)
     fn class_blocked(&self, class: u8, tier: usize, policy: &Policy) -> Option<&'static str> {
-        if tier != 4 && !eligible(class, policy.burst, policy.noninteractive) { return Some("UI burst"); }
+        if tier < 4 && !eligible(class, policy.burst, policy.builds) { return Some("UI burst"); }
         if class != budget::INTERACTIVE {
             if let Some(why) = drain_blocked(class, policy.noninteractive, policy.background, policy.limit, policy.background_limit) { return Some(why); }
             if policy.widths {
@@ -317,9 +325,11 @@ fn eligible(class: u8, burst: bool, noninteractive: usize) -> bool {
 /// ahead of the main thread's lazy compiles serve the startup and the UI's bursts; a tier-up (O2,
 /// O3) or a speculative build only speeds code up, so it runs in the background class, below the
 /// app's visible work, however hot its slot (its heat orders it among the background builds).
+/// A check beside the program runs in the background class until something waits for it.
 fn job_class(job: &Job, _now: &HeatNow) -> u8 {
     match job {
         Job::Ahead(..) if startup_phase() || ui_burst() => budget::INTERACTIVE,
+        Job::Check(..) if crate::check::check_waited() => budget::INTERACTIVE,
         _ => budget::BACKGROUND,
     }
 }
@@ -327,8 +337,13 @@ pub(super) fn heat_key(heat: u64, ui: bool, waited_ns: u64) -> u64 {
     let lg = if heat == 0 { 0 } else { ((heat as f64).log2() * 1024.0) as u64 };
     lg.saturating_add(waited_ns.saturating_mul(1024) / 4_000_000_000).saturating_add(if ui { 1024 } else { 0 })
 }
+/// A check that something waits for goes before every build of its class: the first frame and the
+/// run's exit wait for nothing else.
+const CHECK_WAITED_KEY: i64 = i64::MAX - 1;
 fn key(e: &Entry, now: &HeatNow) -> i64 {
     if matches!(e.job, Job::Tick) { return i64::MAX; }
+    // (a check beside the program goes behind every build of its class, until it is waited for)
+    if matches!(e.job, Job::Check(..)) { return if crate::check::check_waited() { CHECK_WAITED_KEY } else { i64::MIN }; }
     let (heat, ui) = match &e.job {
         Job::O2(u, id, _) => now.heat(*u, *id),
         Job::O3(t) => now.heat(0, t.0),
@@ -354,8 +369,10 @@ fn epoch_key(heat: u64, ui: bool, at: u64) -> i64 {
     bucket + if ui { 1024 } else { 0 } - age_key(at)
 }
 static QUEUE: OnceLock<relax_session::sync::Mutex<Queue>> = OnceLock::new();
-static COUNTS: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
-static RUNNING: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
+/// The queue's tiers: ahead, O2, O3, spec, tick, check beside the program.
+const TIERS: usize = 6;
+static COUNTS: [AtomicUsize; TIERS] = [const { AtomicUsize::new(0) }; TIERS];
+static RUNNING: [AtomicUsize; TIERS] = [const { AtomicUsize::new(0) }; TIERS];
 /// A worker's park state, on its own cache line (each worker writes its flag at every job).
 #[repr(align(64))]
 struct Sleeper { thread: OnceLock<budget::Wake>, waiting: AtomicBool }
@@ -478,10 +495,10 @@ fn drain_ahead_inbox(q: &mut Queue) {
     for (front, work, at) in items.drain(..) { q.push(Job::Ahead(front, work), at); }
     q.inbox = items;
 }
-pub(super) fn counts() -> [usize; 5] {
+pub(super) fn counts() -> [usize; TIERS] {
     std::array::from_fn(|i| COUNTS[i].load(Ordering::Relaxed))
 }
-pub(super) fn running() -> [usize; 5] {
+pub(super) fn running() -> [usize; TIERS] {
     std::array::from_fn(|i| RUNNING[i].load(Ordering::Relaxed))
 }
 pub(super) fn tiers() -> Vec<TierEntry> {
@@ -581,6 +598,28 @@ pub(super) fn promote(unit: usize, id: u32) -> WaitPriority {
     drop(q);
     if runnable { wake(); }
     WaitPriority { unit, id }
+}
+
+/// Something waits for the check beside the program: its queued and running jobs take the waiter's
+/// class and go first in it (job_class and key give the jobs it queues from now on the same).
+pub(super) fn promote_checks() {
+    if FORKED.load(Ordering::Relaxed) { return; }
+    let _kept = crate::zone_alloc::kept();
+    let mut q = lock();
+    let checks: Vec<u64> = q.entries.iter().filter(|e| matches!(e.job, Job::Check(..)) && e.class != budget::INTERACTIVE).map(|e| e.serial).collect();
+    for serial in checks {
+        let i = q.indices[&serial];
+        let (key, class) = (q.entries[i].key, q.entries[i].class);
+        q.plan[5][class as usize].remove(&order(key, serial));
+        budget::queued(class, budget::JIT, -1);
+        q.entries[i].class = budget::INTERACTIVE;
+        q.entries[i].key = CHECK_WAITED_KEY;
+        q.plan[5][budget::INTERACTIVE as usize].insert(order(CHECK_WAITED_KEY, serial));
+        budget::queued(budget::INTERACTIVE, budget::JIT, 1);
+    }
+    for r in q.running.iter().filter(|r| r.tier == 5) { r.class.reclass(budget::INTERACTIVE); }
+    drop(q);
+    wake_all();
 }
 
 impl Source for CompilerSource {
@@ -722,7 +761,7 @@ pub(super) fn view(n: usize) -> Vec<String> {
     q.refresh(&now);
     let mut rows = vec![format!("building: {} jobs; queued: {}; queue lock max: {:.3} ms", q.running.len(), q.entries.len(), LOCK_MAX_NS.load(Ordering::Relaxed) as f64 / 1e6)];
     for r in &q.running {
-        rows.push(format!("running {} class={} {}", ["ahead", "O2", "O3", "spec", "tick"][r.tier], class_name(r.class.class()), slot_label(r.slot)));
+        rows.push(format!("running {} class={} {}", ["ahead", "O2", "O3", "spec", "tick", "check"][r.tier], class_name(r.class.class()), slot_label(r.slot)));
     }
     for (i, blocked) in q.ordered(n).into_iter() {
         let e = &q.entries[i];
@@ -734,7 +773,7 @@ pub(super) fn view(n: usize) -> Vec<String> {
         let why = match &e.job {
             Job::O3(t) => Q_WHY[t.1 as usize],
             Job::O2(_, _, kind) => match kind { O2Kind::Normal => "optimize", O2Kind::Base => "baseline", O2Kind::Borrow => "borrow", O2Kind::Verified => "verified O1" },
-            Job::Ahead(_, AheadWork::Slot(_)) => "prepare", Job::Ahead(_, AheadWork::Body(..)) => "inline candidate", Job::Ahead(_, AheadWork::Look(..)) => "look ahead", Job::Spec(..) => "speculate", Job::Tick => "housekeeping",
+            Job::Ahead(_, AheadWork::Slot(_)) => "prepare", Job::Ahead(_, AheadWork::Body(..)) => "inline candidate", Job::Ahead(_, AheadWork::Look(..)) => "look ahead", Job::Spec(..) => "speculate", Job::Tick => "housekeeping", Job::Check(..) => "dependency check",
         };
         let name = slot_label(e.slot);
         rows.push(format!("queued {} class={} heat={}{} why={} waited={:.3}s {}{}", e.job.label(), class_name(q.class_of(e)), heat,

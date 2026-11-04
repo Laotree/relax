@@ -194,6 +194,91 @@ fn gandalf_live_edit_guard_and_reporting() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A panic in the background checker stays in that check and is reported; the query it left
+/// unfinished is not poisoned, so the app's compile of the same body runs that query itself. If
+/// that panics too, it is this compile's own failure with its own message, and the app runs on.
+/// (One Windows run: the check of a Drop body panicked, the app's first call of that body failed
+/// with `typeck query: Poisoned`, parked, and the run's restart failed.)
+#[test]
+fn a_background_check_panic_leaves_the_query_to_the_apps_compile() {
+    // The checker's worker and its panic counters are process-global: each case has its process.
+    const CHILD: &str = "MAKEPAD_RUN_CHECK_PANIC_TEST";
+    let Ok(case) = std::env::var(CHILD) else {
+        for (case, panics_in) in [("check", "target:gandalf"), ("both", "target")] {
+            // (its own home: the injected panics are no record for this machine's ledger)
+            let home = std::env::temp_dir().join(format!("relax-check-panic-home-{}-{case}", std::process::id()));
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "lazy_reload_tests::a_background_check_panic_leaves_the_query_to_the_apps_compile", "--nocapture", "--test-threads=1"])
+                .env(CHILD, case).env("MAKEPAD_RUN_TEST_TYPECK_PANIC", panics_in).env("MAKEPAD_RUN_PANIC_PARK", "0").env("MAKEPAD_HOME", &home)
+                .output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{case}: {}\n{stderr}", String::from_utf8_lossy(&output.stdout));
+            std::fs::remove_dir_all(&home).unwrap();
+            // the check's panic is on the run's log when it happens
+            assert!(stderr.contains("thread 'gandalf'") && stderr.contains("forced panic type-checking `target`"), "{case}: {stderr}");
+        }
+        return;
+    };
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-check-panic-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"check_panic\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"lib.rs\"\n").unwrap();
+    let root = dir.join("lib.rs").to_string_lossy().into_owned();
+    std::fs::write(&root, "pub fn target(out: &mut u32) { *out = 11; }\npub fn other(out: &mut u32) { *out = 3; }\n").unwrap();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &root, "check_panic", false).unwrap();
+    let named = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let (target, other) = (named("target"), named("other"));
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    crate::borrowck::event::set_app_scope(vec![crate::vfs::normalize_path(&root)]);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    // The check gets there first, as discovery does for a body the app has not called yet.
+    let (target_entry, other_entry) = crate::owner::call(crate::owner::Class::Program, || {
+        let (t, o) = (u.fn_id(crate::jit::FnKey::Inst(target, vec![])), u.fn_id(crate::jit::FnKey::Inst(other, vec![])));
+        u.note_first_borrowck(t, None);
+        (u.entry(t), u.entry(o))
+    });
+    let epoch = u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst);
+    // no wall-clock limit (as lazy_tests): a worker that never delivers hangs the test
+    let why = loop {
+        match crate::borrowck::lazy::verdict(u.front.checker_id, target, &[], epoch) {
+            crate::borrowck::lazy::FnVerdict::Unchecked(why) if why.starts_with("checker failure") => break why,
+            _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    };
+    assert!(why.contains("forced panic type-checking `target`"), "{why}");
+    assert_eq!(crate::borrowck::lazy::PANICS.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert!(crate::borrowck::lazy::PANIC_NOTES.lock().unwrap()[0].contains("target"));
+    // devhub's ledger gets it, naming the body and what panicked, with no hot load counted
+    let records: Vec<_> = std::fs::read_dir(makepad_remote::hot::outbox()).unwrap().map(|f| std::fs::read_to_string(f.unwrap().path()).unwrap()).collect();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = makepad_remote::hot::Record::parse(&records[0]).unwrap();
+    assert_eq!(record.outcome, makepad_remote::hot::Outcome::CheckerPanic);
+    assert_eq!(record.reason, "checker panic in `check_panic::target`: MAKEPAD_RUN_TEST_TYPECK_PANIC: forced panic type-checking `target`");
+    assert!(!record.outcome.failure());
+    // call_jit returns a recovery status, so the function's output comes back via its argument.
+    let call = |entry| {
+        let mut result = 0u32;
+        unsafe { crate::jit::call_jit(up, entry, &mut result as *mut u32 as u64) }.map(|_| result)
+    };
+    if case == "check" {
+        let result = call(target_entry).unwrap_or_else(|p| panic!("the app's compile of the checked body failed: {}", p.message));
+        assert_eq!(result, 11);
+    } else {
+        let failed = call(target_entry).expect_err("the provider panics on the app's thread as well");
+        assert!(failed.message.contains("internal compiler error") && failed.message.contains("forced panic type-checking `target`"), "{}", failed.message);
+    }
+    assert_eq!(call(other_entry).unwrap_or_else(|p| panic!("another body after it: {}", p.message)), 3);
+    // Like settle_tests: process exit owns the runtime worker/executable-memory teardown.
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// SPEC-V: a patch runs before its verdict as baseline code with `noalias` dropped; a rejected one
 /// is never promoted, is reported and reverts; a clean one is promoted with its `noalias` facts.
 #[test]
