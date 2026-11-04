@@ -347,7 +347,7 @@ fn allocator_swap_serves_background_finish() {
     began_rx.recv().unwrap();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let pauser = std::thread::spawn(move || {
-        pause_compile_jobs(false);
+        pause_compile_jobs("test pause", false);
         done_tx.send(()).unwrap();
         resume_compile_jobs(false);
     });

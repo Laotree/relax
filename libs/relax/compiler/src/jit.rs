@@ -1682,9 +1682,10 @@ extern "C" {
 /// the child has no owner thread and no workers: its one thread runs every request itself,
 /// pipelining off, the in-flight back ends (gone with their threads) forgotten.
 ///
-/// Only the program's forks do this. A fork of the loader's own native code (a build script's
-/// Command on Android, where std forks instead of posix_spawn; a provided crate starting a
-/// process) execs at once and never compiles in the child, so it pauses nothing. A process-wide
+/// Only the program's plain forks do this. A fork for an exec never compiles in the child and
+/// pauses nothing: the program's (Relax std's Command with pre_exec closures, forkexec.rs) and
+/// the loader's own native code's (a build script's Command on Android, where std forks instead
+/// of posix_spawn; a provided crate starting a process). A process-wide
 /// pthread_atfork did, and deadlocked: a domain loader holds its compile job while it waits for
 /// its build-script threads, and a script thread's fork waited for that job (Pixel WM: every
 /// app not yet running hung at 'compiling: build scripts' on a cold cache).
@@ -1704,7 +1705,7 @@ extern "C" fn relax_fork() -> i32 {
 
 #[cfg(unix)]
 pub(crate) fn fork_prepare() {
-    pause_compile_jobs(false);
+    pause_compile_jobs("fork", false);
     owner::fork_prepare();
     // (every code writer paused: the child's copy of the W^X code views is consistent)
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1735,7 +1736,9 @@ pub(crate) fn fork_child() {
             }
         }
     }
-    // the child has no workers: nothing waits at the job gate, no job is running elsewhere
+    // the child has no workers: nothing waits at the job gate, no job is running elsewhere, and
+    // nothing is queued for them
+    queue::fork_child();
     TIER_STOP.store(true, Ordering::SeqCst);
     BG_ACTIVE.store(JOB_DEPTH.with(|d| (d.get() > 0) as u32), Ordering::SeqCst);
     BG_DRAINED.store(false, Ordering::SeqCst);
@@ -15036,7 +15039,7 @@ impl Drop for Unit {
 /// runtime's unit pointer no longer names it. Its Drop then leaves the process-wide machinery
 /// alone. Called with no unit lock held.
 pub unsafe fn retire_unit(up: *mut Unit) {
-    pause_compile_jobs(false);
+    pause_compile_jobs("unit's retirement", false);
     owner::call(owner::Class::Program, || {
         (&mut *up).flush_cache_records();
         (&mut *up).retired = true;
@@ -15232,6 +15235,11 @@ fn rt_loop_hot(counter: u64, fp: u64) {
         let rec = tier_rec(&u.slots, id);
         let chunk = (threshold / LOOP_CHUNK_DIV).max(1);
         (*rec.add(8)).store(chunk, Ordering::Relaxed);
+        // a forked child on its way to exec decides no tier (forkexec.rs): its loop runs on
+        #[cfg(unix)]
+        if crate::forkexec::exec_child() {
+            return;
+        }
         let st = (*rec.add(3)).load(Ordering::Relaxed);
         if st == T_FINAL {
             // an earlier run parked the slot's code: its loops do not decide again. (Its O2 code
@@ -20977,6 +20985,7 @@ fn take_pause_turn(mine: u32) {
         return;
     }
     if mine > 0 {
+        job_rows::counted(false);
         BG_ACTIVE.fetch_sub(1, Ordering::SeqCst);
     }
     while PAUSE_HOLDER.compare_exchange(0, me, Ordering::SeqCst, Ordering::SeqCst).is_err() {
@@ -20984,6 +20993,7 @@ fn take_pause_turn(mine: u32) {
     }
     if mine > 0 {
         BG_ACTIVE.fetch_add(1, Ordering::SeqCst);
+        job_rows::counted(true);
     }
 }
 
@@ -20995,6 +21005,57 @@ static BG_MX: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new((
 static BG_CV: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
 thread_local! {
     static JOB_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The threads BG_ACTIVE counts now (a compile job running, not lifted for a wait), each since
+/// when: whom a pause that waits names (its log, why-hung). A row per thread that ran a job, given
+/// back when the thread ends; one store per outermost job.
+pub(crate) mod job_rows {
+    use std::sync::atomic::{AtomicU64, Ordering::{Acquire, Relaxed, Release}};
+    const ROWS: usize = 512;
+    static TID: [AtomicU64; ROWS] = [const { AtomicU64::new(0) }; ROWS];
+    /// wall ns the thread is counted from (0: not counted)
+    static SINCE: [AtomicU64; ROWS] = [const { AtomicU64::new(0) }; ROWS];
+    struct Row(usize);
+    impl Drop for Row {
+        fn drop(&mut self) {
+            if self.0 < ROWS {
+                SINCE[self.0].store(0, Relaxed);
+                TID[self.0].store(0, Release);
+            }
+        }
+    }
+    thread_local! {
+        static ROW: Row = Row(claim());
+    }
+    fn claim() -> usize {
+        let me = crate::os::thread::current().max(1);
+        (0..ROWS).find(|&k| TID[k].load(Relaxed) == 0 && TID[k].compare_exchange(0, me, Acquire, Relaxed).is_ok()).unwrap_or(ROWS)
+    }
+    /// This thread is counted from now (true), or no longer (false).
+    pub(super) fn counted(on: bool) {
+        let _ = ROW.try_with(|r| {
+            if r.0 < ROWS {
+                SINCE[r.0].store(if on { super::wall_ns().max(1) } else { 0 }, Relaxed);
+            }
+        });
+    }
+    /// (thread, counted since wall ns) of every listed thread counted now.
+    pub(crate) fn snapshot() -> Vec<(u64, u64)> {
+        (0..ROWS)
+            .filter_map(|k| {
+                let tid = TID[k].load(Acquire);
+                let since = SINCE[k].load(Relaxed);
+                (tid != 0 && since != 0).then_some((tid, since))
+            })
+            .collect()
+    }
+    /// "name for 4.2 s, .." of the threads counted now (a pause's wait log).
+    pub(crate) fn describe() -> String {
+        let now = super::wall_ns();
+        let v: Vec<String> = snapshot().into_iter().map(|(t, since)| format!("{} for {:.1} s", crate::os::thread::name(t), now.saturating_sub(since) as f64 / 1e9)).collect();
+        if v.is_empty() { "none listed".to_string() } else { v.join(", ") }
+    }
 }
 
 /// A compile job in progress (outermost guard per thread counts).
@@ -21030,6 +21091,7 @@ fn job_gate() -> JobGuard {
         // or fork code after the risky moment): it does not wait for its own resume; the owner
         // never waits here (while paused it serves only the pauser's requests: owner.rs pick)
         if !BG_PAUSE.load(Ordering::SeqCst) || BG_PAUSER.load(Ordering::SeqCst) == me() || owner::is_owner() {
+            job_rows::counted(true);
             return JobGuard;
         }
         BG_ACTIVE.fetch_sub(1, Ordering::SeqCst);
@@ -21052,13 +21114,23 @@ pub(crate) struct JobIdle(bool);
 
 impl JobIdle {
     pub(crate) fn enter() -> JobIdle {
-        // only the outermost job of the thread counts (JOB_DEPTH 1): it is lifted for the wait
-        let held = JOB_DEPTH.try_with(|d| d.get() == 1).unwrap_or(false);
+        // The thread counts once, for its outermost job, and is lifted for the wait at any depth
+        // (once: a wait inside a wait is lifted already). Lifted at depth 1 only, a job inside a
+        // job -- a check ahead's wait for a helper under a speculative build, a lazy compile
+        // under a compile -- stayed counted while it waited, and a pause waited for it while it
+        // waited for what the pause held back (an owner request: only the pauser's are served).
+        let held = JOB_DEPTH.try_with(|d| d.get() > 0).unwrap_or(false) && JOB_LIFTED.try_with(|l| !l.replace(true)).unwrap_or(false);
         if held {
+            job_rows::counted(false);
             BG_ACTIVE.fetch_sub(1, Ordering::SeqCst);
         }
         JobIdle(held)
     }
+}
+
+thread_local! {
+    /// this thread's job is lifted for a wait now (JobIdle): not counted in BG_ACTIVE
+    static JOB_LIFTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl Drop for JobIdle {
@@ -21072,6 +21144,8 @@ impl Drop for JobIdle {
         loop {
             BG_ACTIVE.fetch_add(1, Ordering::SeqCst);
             if !BG_DRAINED.load(Ordering::SeqCst) || BG_PAUSER.load(Ordering::SeqCst) == me() || owner::is_owner() {
+                let _ = JOB_LIFTED.try_with(|l| l.set(false));
+                job_rows::counted(true);
                 return;
             }
             BG_ACTIVE.fetch_sub(1, Ordering::SeqCst);
@@ -21108,6 +21182,7 @@ impl Drop for JobGuard {
             n == 0
         });
         if outer {
+            job_rows::counted(false);
             BG_ACTIVE.fetch_sub(1, Ordering::SeqCst);
             if JOB_SPAN.with(|s| s.replace(false)) {
                 crate::inspect::timeline::push(crate::inspect::timeline::Kind::SpanEnd, "compile", 0, 0);
@@ -21116,10 +21191,9 @@ impl Drop for JobGuard {
     }
 }
 
-/// phase 0: an allocator swap begins (park compile jobs); 1: it is done (resume). Called by
-/// the program on its own thread, outside any compile job of that thread.
-/// Holds new compile jobs at their start and waits for running ones to finish (no time limit).
-fn pause_compile_jobs(trace: bool) {
+/// Holds new compile jobs at their start and waits for running ones to finish (no time limit),
+/// for `what`: an allocator swap, a plain fork (relax_fork), a unit's retirement.
+fn pause_compile_jobs(what: &str, trace: bool) {
     let t0 = std::time::Instant::now();
     let mine = if JOB_DEPTH.with(|d| d.get()) > 0 { 1 } else { 0 };
     take_pause_turn(mine);
@@ -21146,10 +21220,10 @@ fn pause_compile_jobs(trace: bool) {
         if t0.elapsed().as_millis() >= next_log {
             next_log += 5000;
             if t0.elapsed().as_secs() >= 30 && !std::mem::replace(&mut told, true) {
-                crate::inspect::say_why_hung("the allocator swap waits");
+                crate::inspect::say_why_hung(&format!("the {} waits", what));
             }
-            eprintln!("makepad: the allocator swap waits for compile jobs ({:.0} s): jobs active {}, owner busy for another thread {} ({}); queued: {}",
-                t0.elapsed().as_secs_f64(), BG_ACTIVE.load(Ordering::SeqCst), owner::busy_for_other(me()), owner::serving_note(), owner::queued_detail());
+            eprintln!("makepad: the {} waits for compile jobs ({:.0} s): jobs active {} ({}), owner busy for another thread {} ({}); queued: {}",
+                what, t0.elapsed().as_secs_f64(), BG_ACTIVE.load(Ordering::SeqCst), job_rows::describe(), owner::busy_for_other(me()), owner::serving_note(), owner::queued_detail());
         }
         std::thread::sleep(std::time::Duration::from_micros(200));
     }
@@ -21173,10 +21247,12 @@ fn resume_compile_jobs(_trace: bool) {
     end_pause_turn();
 }
 
+/// phase 0: an allocator swap begins (park compile jobs); 1: it is done (resume). Called by
+/// the program on its own thread, outside any compile job of that thread.
 pub fn allocator_swap(phase: u32) {
     let trace = std::env::var("MAKEPAD_RUN_TRACE").map_or(false, |v| v.split(',').any(|x| x == "startup"));
     if phase == 0 {
-        pause_compile_jobs(trace);
+        pause_compile_jobs("allocator swap", trace);
         // the compiler leaves the default zone before it becomes the program's new allocator
         crate::zone_alloc::use_own_zone();
         SWAP_T0.store(wall_ns(), Ordering::Relaxed);
@@ -24910,7 +24986,7 @@ mod allocator_swap_tests {
         let b_go = std::sync::Arc::new(AtomicBool::new(false));
         let (bp, bg) = (b_paused.clone(), b_go.clone());
         let b = std::thread::spawn(move || {
-            pause_compile_jobs(false);
+            pause_compile_jobs("second pause", false);
             bp.store(true, Ordering::SeqCst);
             while !bg.load(Ordering::SeqCst) {
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -24996,6 +25072,93 @@ mod allocator_swap_tests {
         let mut status = 0i32;
         assert_eq!(unsafe { waitpid(pid, &mut status, 0) }, pid);
         assert_eq!(status, 0, "the child saw a job counted or the jobs paused");
+        job.join().unwrap();
+    }
+
+    /// A pause never waits for a job that waits on the owner, however deep in jobs its thread is:
+    /// such a thread is not running compile work, and its request is one the pause holds back (it
+    /// was counted at depth 2 and the pause waited for it for good: a devhub test gate's spawn,
+    /// 2026-11-04). Its request is served once the pause ends.
+    #[test]
+    fn a_pause_does_not_wait_for_a_nested_job_waiting_on_the_owner() {
+        isolated_test!(a_pause_does_not_wait_for_a_nested_job_waiting_on_the_owner);
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        owner::start();
+        let wait_for = |f: &AtomicBool, what: &str| {
+            let t0 = std::time::Instant::now();
+            while !f.load(Ordering::SeqCst) {
+                assert!(t0.elapsed().as_secs() < 30, "{what}");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        let (in_job, served) = (std::sync::Arc::new(AtomicBool::new(false)), std::sync::Arc::new(AtomicBool::new(false)));
+        let (j, s) = (in_job.clone(), served.clone());
+        let nested = std::thread::spawn(move || {
+            let _outer = compile_job();
+            let _inner = compile_job();
+            j.store(true, Ordering::SeqCst);
+            while paused_for() == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            owner::call(owner::Class::Program, || ());
+            s.store(true, Ordering::SeqCst);
+        });
+        wait_for(&in_job, "the nested job never began");
+        let (paused, go) = (std::sync::Arc::new(AtomicBool::new(false)), std::sync::Arc::new(AtomicBool::new(false)));
+        let (p, g) = (paused.clone(), go.clone());
+        let pauser = std::thread::spawn(move || {
+            allocator_swap(0);
+            p.store(true, Ordering::SeqCst);
+            while !g.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            allocator_swap(1);
+        });
+        wait_for(&paused, "the pause waited for a job that waits on the owner");
+        assert!(!served.load(Ordering::SeqCst), "the owner served another thread inside the pause");
+        go.store(true, Ordering::SeqCst);
+        pauser.join().unwrap();
+        wait_for(&served, "the nested job's request was never served after the pause");
+        nested.join().unwrap();
+    }
+
+    /// A spawn's fork (Relax std's Command with pre_exec closures: `__relax_fork_exec`) goes ahead
+    /// while a compile job runs: its child runs only code built before the fork and never compiles,
+    /// so nothing waits for the job (the loader's plain `fork` does, above).
+    #[cfg(unix)]
+    #[test]
+    fn a_spawns_fork_does_not_wait_for_running_jobs() {
+        isolated_test!(a_spawns_fork_does_not_wait_for_running_jobs);
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let addr = loader_symbol(b"__relax_fork_exec").expect("the loader provides __relax_fork_exec");
+        let fork_exec: extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
+        let (job_over, go) = (std::sync::Arc::new(AtomicBool::new(false)), std::sync::Arc::new(AtomicBool::new(false)));
+        let (running_tx, running_rx) = std::sync::mpsc::channel();
+        let (flag, g) = (job_over.clone(), go.clone());
+        let job = std::thread::spawn(move || {
+            let guard = compile_job();
+            running_tx.send(()).unwrap();
+            while !g.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            flag.store(true, Ordering::SeqCst);
+            drop(guard);
+        });
+        running_rx.recv().unwrap();
+        let pid = fork_exec();
+        if pid == 0 {
+            os::thread::exit_now(if crate::forkexec::exec_child() { 0 } else { 1 });
+        }
+        assert!(pid > 0, "fork failed");
+        assert!(!job_over.load(Ordering::SeqCst), "the spawn's fork waited for a running compile job");
+        go.store(true, Ordering::SeqCst);
+        extern "C" {
+            fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+        }
+        let mut status = 0i32;
+        assert_eq!(unsafe { waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(status, 0, "the child was not marked as a spawn's child");
+        assert_eq!(crate::forkexec::relax_fork_exec_done(pid), 0);
         job.join().unwrap();
     }
 }
