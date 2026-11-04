@@ -228,7 +228,8 @@ fn prune(dir: &Path) {
 
 /// A copy of `src` (a session's log) in the captures directory, `<stamp>-<app>-<pid>-<what>.log`,
 /// where it outlives the run's temporary directory (a devhub lease's, deleted when the lease
-/// ends); the newest 20 of each kind are kept.
+/// ends); the newest 20 of each kind are kept. (The terminal session's log: unix only.)
+#[cfg(unix)]
 pub(crate) fn keep_file(src: &Path, what: &str) -> std::io::Result<PathBuf> {
     let dir = makepad_remote::hot::home().join("captures");
     std::fs::create_dir_all(&dir)?;
