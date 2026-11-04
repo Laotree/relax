@@ -682,6 +682,9 @@ pub struct CodeTables {
     /// unwinds. `image_keep` keeps the image mapped.
     image_unwind: Vec<(u64, u64, u32)>,
     image_keep: Option<std::sync::Arc<PcFiles>>,
+    /// glue that calls out with a frame record (lazy and hot entries, `enter`, the TLS slow path,
+    /// register-block trampolines): (start, len, fp - sp at its call), for walks from sp alone
+    glue: Vec<(u64, u32, u32)>,
 }
 
 impl CodeTables {
@@ -689,7 +692,7 @@ impl CodeTables {
         // identity state (panics and faults walk it): the tables are the program's
         let _k = crate::zone_alloc::kept();
         if let Some(i) = unwind {
-            let own = relax_backend::rir::UnwindInfo { saved: i.saved.clone(), pads: i.pads.clone(), sp_off: i.sp_off };
+            let own = relax_backend::rir::UnwindInfo { saved: i.saved.clone(), pads: i.pads.clone(), sp_off: i.sp_off, staged: i.staged.clone() };
             self.unwind.insert(at, own);
         }
         if self.index.last().map_or(true, |l| l.0 < at) {
@@ -758,6 +761,25 @@ impl CodeTables {
 
     pub fn slot_at(&self, pc: u64) -> Option<u32> {
         self.entry_at(pc).map(|e| e.2)
+    }
+
+    /// The frame pointer of the JIT frame whose call returns to `ret`, from the stack pointer
+    /// it will have there (`sp`: the walk of a thread blocked in a syscall knows its sp and pc
+    /// only): the function's frame size and the call's staged arguments, or the glue's frame.
+    pub fn frame_pointer_at(&self, ret: u64, sp: u64) -> Result<u64, &'static str> {
+        let pc = ret.wrapping_sub(1);
+        if let Some((start, _, _)) = self.entry_at(pc) {
+            let info = match self.unwind.get(&start) {
+                Some(i) => i.fp_from_sp((ret - start) as u32, sp),
+                None => self.image_unwind_at(start).ok_or("its code has no unwind info")?.fp_from_sp((ret - start) as u32, sp),
+            };
+            return Ok(info);
+        }
+        let k = self.glue.partition_point(|g| g.0 <= pc);
+        match self.glue.get(k.wrapping_sub(1)) {
+            Some(&(at, len, frame)) if pc < at + len as u64 => Ok(sp + frame as u64),
+            _ => Err("its code has no frame size (glue without a frame record)"),
+        }
     }
 
     /// The unwind info of the startup image code at `start` (its trailer, parsed now).
@@ -3370,6 +3392,25 @@ pub(crate) fn in_jit_code(pc: u64) -> bool {
     unsafe { !cur_unit().is_null() && pc >= (*cur_unit()).exec_base && pc - (*cur_unit()).exec_base < (*cur_unit()).exec_size }
 }
 
+/// The frame pointer of the JIT frame whose call returns to `ret`, from its stack pointer there
+/// (CodeTables::frame_pointer_at): the step of a stack walk that knows sp and pc only. Never
+/// waits on the tables' lock (the thread walked may be the one writing them): a writer that
+/// stays past a short spin ends the step, saying so.
+pub fn frame_pointer_at(ret: u64, sp: u64) -> Result<u64, &'static str> {
+    let u = cur_unit();
+    if u.is_null() {
+        return Err("there is no JIT unit");
+    }
+    for _ in 0..1000 {
+        match unsafe { &*u }.code.try_read() {
+            Ok(t) => return t.frame_pointer_at(ret, sp),
+            Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner().frame_pointer_at(ret, sp),
+            Err(std::sync::TryLockError::WouldBlock) => std::thread::yield_now(),
+        }
+    }
+    Err("the JIT's code tables are being written")
+}
+
 /// The name of slot `id` (None: no unit or no such slot; the flight recorder, no lock: names are
 /// kept data of an append-only table).
 pub(crate) fn slot_name(id: u32) -> Option<String> {
@@ -3689,6 +3730,12 @@ fn panic_tramp(target: u64) -> Vec<u8> {
     b
 }
 
+/// `regs_call_tramp`'s frame below its frame record at its call (push 0; push r11)
+#[cfg(not(target_arch = "aarch64"))]
+const REGS_CALL_FRAME: u32 = 16;
+#[cfg(target_arch = "aarch64")]
+const REGS_CALL_FRAME: u32 = x64::REGS_CALL_FRAME;
+
 /// JIT trampoline in front of a host function that returns (makepad inspect's breakpoint):
 /// the register block of `panic_tramp`, made the frame record (rbp = its address: [rbp, return
 /// address] lead it, so frame walks go on into the JIT caller), passed as argument 7 (the first
@@ -3742,7 +3789,7 @@ impl Unit {
         if let Some(x) = m.iter().find(|x| x.0 == me && x.1 == target) {
             return Some(x.2);
         }
-        let at = self.emit_code(&regs_call_tramp(target), "relax::regs_call_tramp");
+        let at = self.emit_glue(&regs_call_tramp(target), "relax::regs_call_tramp", REGS_CALL_FRAME);
         let _k = crate::zone_alloc::kept();
         m.push((me, target, at));
         Some(at)
@@ -4124,11 +4171,11 @@ impl Unit {
             }
         } else {
             let lazy = x64::lazy_entry(rt_compile as *const () as usize as u64);
-            u.lazy_entry = u.emit_code(&lazy, "relax::lazy_entry");
+            u.lazy_entry = u.emit_glue(&lazy, "relax::lazy_entry", x64::LAZY_ENTRY_FRAME);
             let hot = x64::lazy_entry(rt_hot as *const () as usize as u64);
-            u.hot_entry = u.emit_code(&hot, "relax::hot_entry");
+            u.hot_entry = u.emit_glue(&hot, "relax::hot_entry", x64::LAZY_ENTRY_FRAME);
             let (el, leave_off) = x64::enter_leave();
-            u.enter = u.emit_code(&el, "relax::enter_leave");
+            u.enter = u.emit_glue(&el, "relax::enter_leave", x64::ENTER_FRAME);
             u.leave = u.enter + leave_off as u64;
         }
         let ps = panic_tramp(rt_panic_site as *const () as usize as u64);
@@ -4609,6 +4656,18 @@ impl Unit {
         at
     }
 
+    /// Glue that calls out with a frame record `frame` bytes above its sp at the call: emitted
+    /// and registered for walks from sp alone (CodeTables::frame_pointer_at).
+    fn emit_glue(&self, b: &[u8], what: &str, frame: u32) -> u64 {
+        let at = self.emit_code(b, what);
+        let mut t = self.code.write().unwrap_or_else(|e| e.into_inner());
+        let _k = crate::zone_alloc::kept();
+        let e = (at, b.len() as u32, frame);
+        let k = t.glue.partition_point(|g| g.0 < at);
+        t.glue.insert(k, e);
+        at
+    }
+
     /// Copies bytes into the data area; returns their address. `kind` says what the bytes
     /// hold (syms.rs: whether constant loads from them may fold, and to what).
     pub fn data(&self, b: &[u8], align: u64, kind: crate::syms::DataKind) -> u64 {
@@ -4924,7 +4983,7 @@ impl Unit {
         os::tls::static_tls_init(&|b| self.emit_code(b, "relax::static_tls"));
         let off = os::tls::jit_offset(key, &|b| self.emit_code(b, "relax::tls_offset"));
         self.env.tls_key = off;
-        self.env.tls_slow = self.emit_code(&x64::tls_slow(rt_tls_block as *const () as usize as u64, off), "relax::tls_slow");
+        self.env.tls_slow = self.emit_glue(&x64::tls_slow(rt_tls_block as *const () as usize as u64, off), "relax::tls_slow", x64::TLS_SLOW_FRAME);
     }
 
     pub fn site(&self, file: u32, pos: u32, msg: &str) -> u64 {
@@ -6075,8 +6134,8 @@ impl Unit {
         let t = self.code.read().unwrap_or_else(|e| e.into_inner());
         let (start, _, _) = t.entry_at(pc)?;
         match t.unwind.get(&start) {
-            Some(i) => Some((start, i.saved.clone())),
-            None => t.image_unwind_at(start).map(|i| (start, i.saved)),
+            Some(i) => Some((start, i.saved.to_vec())),
+            None => t.image_unwind_at(start).map(|i| (start, i.saved.into_vec())),
         }
     }
 
