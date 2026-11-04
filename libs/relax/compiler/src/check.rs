@@ -217,7 +217,7 @@ impl PreparedErrors {
 }
 
 /// One check of check_prepared -- a body owner's errors, or an impl's soundness -- owning what it
-/// reads: a scoped thread runs it, or a job of the JIT's queue (the test dependency check).
+/// reads: a scoped thread runs it, or beside a running program a job of the JIT's queue.
 struct BodyCheck {
     upn: usize,
     front: std::sync::Arc<jit::FrontShared>,
@@ -278,21 +278,18 @@ impl BodyCheck {
     }
 }
 
-/// Checks prepared bodies. Beside a running program each body holds a front read, yields to
-/// writers and retries after them. Test dependencies use the full error pipeline as jobs of the
-/// JIT's queue (`queued_map`); the app's type check keeps its few threads.
+/// Checks prepared bodies. Beside a running program they are jobs of the JIT's queue (`queued_map`):
+/// each body holds a front read, yields to writers and retries after them. Test dependencies use
+/// the full error pipeline.
 fn check_prepared(up: *mut Unit, p: AppCheck, beside: Option<&crate::options::RuntimeOptions>, mode: CheckMode) -> PreparedErrors {
     let AppCheck { t0, todo, keys, owners } = p;
     let strict = mode == CheckMode::Errors;
     let front = unsafe { (*up).front.clone() };
-    let init = || if beside.is_some() { makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND); };
-    let threads = if beside.is_some() { beside_jobs() } else { jobs() };
     let ctx = std::sync::Arc::new(BodyCheck {
         upn: up as usize, front: front.clone(), strict, beside: beside.is_some(), cpu: std::sync::atomic::AtomicU64::new(0),
     });
-    let queued = strict && beside.is_some();
     let check_all = |items: Vec<crate::program::DefId>, impl_check: bool| -> Vec<Option<Vec<String>>> {
-        if queued { queued_map(&ctx, items, impl_check) } else { par_map(&items, threads, &init, |&d| ctx.check(d, impl_check)) }
+        if beside.is_some() { queued_map(&ctx, items, impl_check) } else { par_map(&items, jobs(), |&d| ctx.check(d, impl_check)) }
     };
     // Impl soundness once per crate, in parallel before its bodies. Dependencies are checked
     // regardless of the app-only scope used by the ordinary run's checker.
@@ -353,15 +350,16 @@ fn check_prepared(up: *mut Unit, p: AppCheck, beside: Option<&crate::options::Ru
     PreparedErrors { errors, cpu_ns: ctx.cpu.load(std::sync::atomic::Ordering::Relaxed) }
 }
 
-/// A batch of the test dependency check on the JIT's queue (jit_queue `Job::Check`): no threads of
-/// its own. Its jobs run in the Background class behind every build of the queue, on what the
-/// budget gives Background beside the program, the JIT and the app's pools (it yields to their
-/// waiters between items), and take the waiter's class once the run's exit waits for them
-/// (finish_test_deps). Each job takes the next item until its slice is used, then queues itself
-/// again: its worker goes back to the queue's order every few milliseconds. (On threads of its own
-/// it took every core beside a cold Fab start, first frame 27.5 s; on two of them the start drew
-/// at 14.8 s, but the check ended 66 s after the tests.)
-pub(crate) struct DepBatch {
+/// A batch of a check beside the running program (the app's own crates, a test's dependencies) on
+/// the JIT's queue (jit_queue `Job::Check`): no threads of its own. Its jobs run in the Background
+/// class behind every build of the queue, on what the budget gives Background beside the program,
+/// the JIT and the app's pools (it yields to their waiters between items), and go first in the
+/// waiter's class once something waits for them (`waited`: the app's first window frame, the run's
+/// exit). Each job takes the next item until its slice is used, then queues itself again: its
+/// worker goes back to the queue's order every few milliseconds. (On threads of its own a test's
+/// dependency check took every core beside a cold Fab start, first frame 27.5 s; on two of them
+/// the start drew at 14.8 s, but the check ended 66 s after the tests.)
+pub(crate) struct CheckBatch {
     ctx: std::sync::Arc<BodyCheck>,
     items: Vec<crate::program::DefId>,
     impl_check: bool,
@@ -372,14 +370,19 @@ pub(crate) struct DepBatch {
     done: (relax_session::sync::Mutex<()>, relax_session::sync::Condvar),
 }
 
-/// The run's exit waits for the dependency check (finish_test_deps).
-static DEP_WAITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Something waits for the check beside the program (`waited`).
+static CHECK_WAITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// A job's slice: past it, the job gives its worker back to the queue after the item it is on.
-const DEP_SLICE: std::time::Duration = std::time::Duration::from_millis(20);
+const CHECK_SLICE: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// The run's exit waits for the dependency check: its jobs run in the Interactive class.
-pub(crate) fn dep_check_waited() -> bool {
-    DEP_WAITED.load(std::sync::atomic::Ordering::Acquire)
+/// Something waits for the check beside the program: its jobs run first in the Interactive class.
+pub(crate) fn check_waited() -> bool {
+    CHECK_WAITED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The app's first window frame or the run's exit waits for the check beside the program.
+fn waited() {
+    if !CHECK_WAITED.swap(true, std::sync::atomic::Ordering::AcqRel) { jit::promote_checks(); }
 }
 
 /// `items` checked by jobs of the JIT's queue, results in order.
@@ -387,12 +390,12 @@ fn queued_map(ctx: &std::sync::Arc<BodyCheck>, items: Vec<crate::program::DefId>
     use std::sync::atomic::{AtomicUsize, Ordering};
     let n = items.len();
     if n == 0 { return Vec::new(); }
-    let batch = std::sync::Arc::new(DepBatch {
+    let batch = std::sync::Arc::new(CheckBatch {
         ctx: ctx.clone(), items, impl_check, next: AtomicUsize::new(0), left: AtomicUsize::new(n),
         out: relax_session::sync::Mutex::new(Vec::with_capacity(n)), done: (relax_session::sync::Mutex::new(()), relax_session::sync::Condvar::new()),
     });
     // as many jobs as the budget admits at most: its classes decide how many of them run
-    jit::queue_dep_check(&batch, n.min(makepad_cpu_budget::limit() as usize));
+    jit::queue_check(&batch, n.min(makepad_cpu_budget::limit() as usize));
     {
         let mut g = batch.done.0.lock().unwrap_or_else(|e| e.into_inner());
         while batch.left.load(Ordering::Acquire) != 0 { g = batch.done.1.wait(g).unwrap_or_else(|e| e.into_inner()); }
@@ -402,9 +405,9 @@ fn queued_map(ctx: &std::sync::Arc<BodyCheck>, items: Vec<crate::program::DefId>
     out.into_iter().map(|(_, r)| r).collect()
 }
 
-/// One job of a dependency check batch (on a worker of the JIT's queue): items until its slice is
+/// One job of a check batch (on a worker of the JIT's queue): items until its slice is
 /// used, then the job queues itself again while items are left.
-pub(crate) fn run_dep_slice(batch: std::sync::Arc<DepBatch>) {
+pub(crate) fn run_check_slice(batch: std::sync::Arc<CheckBatch>) {
     use std::sync::atomic::Ordering;
     let start = std::time::Instant::now();
     loop {
@@ -412,18 +415,18 @@ pub(crate) fn run_dep_slice(batch: std::sync::Arc<DepBatch>) {
         let Some(&d) = batch.items.get(i) else { return };
         // (a check's own panics are its ICE verdict; this is one outside them, its bookkeeping)
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| batch.ctx.check(d, batch.impl_check)))
-            .unwrap_or_else(|_| Some(vec!["internal compiler error while checking test dependencies -- makepad run bug, report it".to_string()]));
+            .unwrap_or_else(|_| Some(vec!["internal compiler error in the check beside the program -- makepad run bug, report it".to_string()]));
         batch.out.lock().unwrap_or_else(|e| e.into_inner()).push((i, r));
         if batch.left.fetch_sub(1, Ordering::AcqRel) == 1 {
             let _g = batch.done.0.lock().unwrap_or_else(|e| e.into_inner());
             batch.done.1.notify_all();
             return;
         }
-        if start.elapsed() >= DEP_SLICE {
-            if batch.next.load(Ordering::Relaxed) < batch.items.len() { jit::queue_dep_check(&batch, 1); }
+        if start.elapsed() >= CHECK_SLICE {
+            if batch.next.load(Ordering::Relaxed) < batch.items.len() { jit::queue_check(&batch, 1); }
             return;
         }
-        crate::pool::checkpoint(0, "dependency check");
+        crate::pool::checkpoint(0, "check beside the program");
     }
 }
 
@@ -507,8 +510,7 @@ pub fn finish_test_deps(code: i32) -> i32 {
     let Some(check) = TEST_DEPS.get() else { return code };
     let failed = check.failed.get_or_init(|| {
         let t0 = jit::wall_ns();
-        DEP_WAITED.store(true, std::sync::atomic::Ordering::Release);
-        jit::promote_dep_check();
+        waited();
         let worker = check.worker.lock().unwrap_or_else(|e| e.into_inner()).take().expect("test dependency check worker");
         let result = worker.join();
         let waited = jit::wall_ns() - t0;
@@ -574,9 +576,15 @@ pub fn start_app_check(up: *mut Unit, p: AppCheck, runtime: crate::options::Runt
 /// The first frame's gate (the platform asks before it submits its first window frame): waits
 /// for the app check beside main. An error it finds ends the process instead (start_app_check).
 pub fn wait_app_check() {
+    if *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner()) != 1 { return; }
+    waited();
+    let t0 = std::time::Instant::now();
     let mut g = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
     while *g == 1 {
         g = BESIDE.1.wait(g).unwrap_or_else(|e| e.into_inner());
+    }
+    if crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("makepad-run: the first frame waited {:.0} ms for the app check", t0.elapsed().as_secs_f64() * 1e3);
     }
 }
 
@@ -591,21 +599,13 @@ fn jobs() -> usize {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()).min(16))
 }
 
-/// The app check beside main: a few threads, an eighth of the hardware's (2 to 4). It has the
-/// time until the first frame (a cold Fab: 2 threads end it 3.3 s after main, the frame comes 8 s
-/// later), and more threads slow main down (on 16, by half a second: they share its core).
-fn beside_jobs() -> usize {
-    (std::thread::available_parallelism().map_or(4, |n| n.get()) / 8).clamp(2, 4)
-}
-
-fn par_map<T: Sync, R: Send>(items: &[T], jobs: usize, init: &(dyn Fn() + Sync), f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+fn par_map<T: Sync, R: Send>(items: &[T], jobs: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let out: relax_session::sync::Mutex<Vec<(usize, R)>> = relax_session::sync::Mutex::new(Vec::with_capacity(items.len()));
     std::thread::scope(|sc| {
         for w in 0..jobs.min(items.len().max(1)) {
             let (next, out, f) = (&next, &out, &f);
             std::thread::Builder::new().name(format!("run-check-{}", w)).stack_size(256 << 20).spawn_scoped(sc, move || { let _z = crate::zone_alloc::compiler_thread();
-                init();
                 let mut local = Vec::new();
                 loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -766,7 +766,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         let check_times = std::env::var_os("MAKEPAD_RUN_CHECK_TIMES").is_some();
         let defs: Vec<crate::program::DefId> = (0..u.prog.defs.len()).filter(|&i| own[u.prog.defs[i].krate as usize]).map(|i| crate::program::DefId(i as u32)).filter(|&d| !is_live_default(&u.prog, d)).collect();
         let (prog, tcx) = (&u.prog, &u.tcx);
-        for e in par_map(&defs, jobs(), &|| {}, |&d| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for e in par_map(&defs, jobs(), |&d| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let t0 = std::time::Instant::now();
                 let mut e = tcx.check_def_signature(prog, d);
                 let dt_sig = t0.elapsed();
@@ -817,7 +817,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         let (prog, tcx) = (&u.prog, &u.tcx);
         // (a constant a well-formedness check evaluates may find the compiler's owner busy: preempted
         // work is asked again, as the body checks do)
-        for e in par_map(&defs, jobs(), &|| {}, |&d| {
+        for e in par_map(&defs, jobs(), |&d| {
             let mut tries = 0;
             loop {
                 let t0 = std::time::Instant::now();
@@ -1031,7 +1031,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         .collect();
     if !retry_idxs.is_empty() {
         let t_retry = std::time::Instant::now();
-        let retried = par_map(&retry_idxs, jobs, &|| {}, |&idx| {
+        let retried = par_map(&retry_idxs, jobs, |&idx| {
             let fi = outcomes[idx].0;
             let (owner, generic) = &fns[fi];
             check_one(owner, *generic)
