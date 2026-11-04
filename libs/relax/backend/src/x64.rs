@@ -1092,6 +1092,10 @@ struct Gen<'a> {
     depth: Vec<u32>,
     /// the last spill store emitted: (rbp displacement, register, position right after it)
     last_spill: Option<(i32, u8, usize)>,
+    /// r11 holds the spill slot at this rbp displacement, from the base reload of the load that
+    /// ended at this code position: the next load through the same spilled base, with nothing
+    /// emitted between, reads r11 (`mov r11, [rbp-0x60]` once for `at[c]`, `at[c + 1]`)
+    r11_base: Option<(i32, usize)>,
     /// spill windows (Alloc::windows): vreg -> (first use pos, last use pos, register); and the
     /// loads to emit before the instruction at a position
     win: std::collections::HashMap<u32, Vec<(u32, u32, u8)>>,
@@ -1360,6 +1364,40 @@ impl<'a> Gen<'a> {
         if let Some(c) = self.win.get(&v.0).and_then(|ws| ws.iter().find(|w| w.0 == self.cur_pos + 1)).map(|w| w.2) {
             self.a.mov_rr(c, r);
         }
+    }
+    /// The rbp displacement `use_i` reloads `v` from (a spilled value with no window or copy
+    /// register at this position).
+    fn reload_disp(&self, v: VReg) -> Option<i32> {
+        let Loc::Stack(o) = self.al.loc[v.0 as usize] else { return None };
+        let p = self.cur_pos;
+        if self.win.get(&v.0).is_some_and(|ws| ws.iter().any(|(a, z, _)| *a <= p && p <= *z)) || self.copy_reg.contains_key(&(p, v.0)) {
+            return None;
+        }
+        Some(self.spill_disp(o))
+    }
+    /// A load's base: r11 when it still holds the base's slot from the load before (`held`,
+    /// ending where this instruction starts, `p0`; what this one emitted before its base -- a
+    /// spilled index -- went to r10), else as base_disp.
+    fn base_disp_held(&mut self, options: &relax_session::Options, base: VReg, off: i32, held: Option<(i32, usize)>, p0: usize) -> (u8, i32, Option<i32>) {
+        let sd = self.reload_disp(base);
+        if sd.is_some() && held == sd.map(|d| (d, p0)) {
+            return (R11, off, sd);
+        }
+        let (rb, o) = self.base_disp(options, base, R11, off);
+        (rb, o, sd.filter(|_| rb == R11))
+    }
+    /// After a load through a base reloaded into r11 (`sd`): r11 keeps it unless the load's
+    /// result went home to that same slot.
+    fn keep_r11_base(&mut self, sd: Option<i32>, def: Option<VReg>) {
+        let Some(d) = sd else { return };
+        if let Some(v) = def {
+            if let Loc::Stack(o) = self.al.loc[v.0 as usize] {
+                if self.spill_disp(o) == d {
+                    return;
+                }
+            }
+        }
+        self.r11_base = Some((d, self.a.pos()));
     }
     /// dst = the spill slot at disp: a register move (or nothing) when the slot was stored from a
     /// register by the very last instruction emitted (same block: block starts clear it)
@@ -1775,6 +1813,7 @@ impl<'a> Gen<'a> {
             // the flags of the ALU op that ended the block above (a jump arrives with other ones)
             self.last_spill = None;
             self.last_alu = None;
+            self.r11_base = None;
             // window lookups of this block never see the previous block's last position (an empty
             // block's terminator reads at its start: no window there, the slot is read)
             self.cur_pos = self.al.block_start[bi];
@@ -3725,8 +3764,9 @@ impl<'a> Gen<'a> {
             Inst::LoadX(m, d, base, idx, sh, off) => {
                 // a spilled index loads into r10 (base: r11; the value may land in r10 too: the
                 // load reads its address first)
+                let (held, p0) = (self.r11_base.take(), self.a.pos());
                 let ri = self.use_i(options, *idx, R10);
-                let (rb, off) = self.base_disp(options, *base, R11, *off);
+                let (rb, off, sd) = self.base_disp_held(options, *base, *off, held, p0);
                 match m {
                     Mem::Int(n, signed) => {
                         let rd = self.def_i(*d, R10);
@@ -3741,6 +3781,7 @@ impl<'a> Gen<'a> {
                         self.fin_f(*d, xd);
                     }
                 }
+                self.keep_r11_base(sd, Some(*d));
             }
             Inst::StoreX(m, base, idx, sh, off, src) => {
                 // a spilled index loads into r10, the base into r11 (rax stays allocatable)
@@ -3771,7 +3812,8 @@ impl<'a> Gen<'a> {
                 }
             }
             Inst::Load(m, d, base, off) => {
-                let (rb, off) = self.base_disp(options, *base, R11, *off);
+                let (held, p0) = (self.r11_base.take(), self.a.pos());
+                let (rb, off, sd) = self.base_disp_held(options, *base, *off, held, p0);
                 match m {
                     Mem::Int(n, signed) => {
                         let rd = self.def_i(*d, R10);
@@ -3784,6 +3826,7 @@ impl<'a> Gen<'a> {
                         self.fin_f(*d, xd);
                     }
                 }
+                self.keep_r11_base(sd, Some(*d));
             }
             Inst::Store(m, base, off, src) => {
                 let (rb, off) = self.base_disp(options, *base, R11, *off);
@@ -6723,6 +6766,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         depth: Vec::new(),
         jt_fix: Vec::new(),
         last_spill: None,
+        r11_base: None,
         win,
         win_start,
         low_only: crate::passes::low_bits_only(options, f),
