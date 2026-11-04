@@ -1763,12 +1763,19 @@ impl<'a> Gen<'a> {
             // window lookups of this block never see the previous block's last position (an empty
             // block's terminator reads at its start: no window there, the slot is read)
             self.cur_pos = self.al.block_start[bi];
+            self.sel_flags = None;
             for (ii, inst) in b.insts.iter().enumerate() {
                 self.pc_map.push((self.a.pos() as u32, b.pos[ii]));
                 if self.rir_map_on {
                     self.rir_map.push((self.a.pos() as u32, bi as u32, ii as u32));
                 }
                 self.cur_pos = self.al.inst_pos(bi, ii);
+                // a compare's flags serve the run of selects on it right after it only
+                if let Some((fc, _)) = self.sel_flags {
+                    if !matches!(inst, Inst::Sel(_, c, ..) if *c == fc) {
+                        self.sel_flags = None;
+                    }
+                }
                 if let Some(ls) = self.win_start.get(&self.cur_pos).cloned() {
                     for (v, r) in ls {
                         if let Loc::Stack(o) = self.al.loc[v as usize] {
@@ -1813,9 +1820,24 @@ impl<'a> Gen<'a> {
                             continue;
                         }
                         // other uses: the compare is emitted (setcc) and the select reads its flags
+                        // (so do the integer selects on it right after: cmov keeps the flags). When
+                        // those selects are all its uses (x.min(y) next to x.max(y), pair_selects),
+                        // the compare only sets the flags: no setcc
                         if *sc == cd && data == Cls::I {
                             if let Inst::ICmp(cc, sg, ..) | Inst::ICmpI(cc, sg, ..) = inst {
-                                self.inst(options, inst);
+                                let run = b.insts[ii + 1..].iter().take_while(|j| matches!(j, Inst::Sel(d, c, ..) if *c == cd && self.f.vregs[d.0 as usize] == Cls::I)).count();
+                                if run == self.al.uses[cd.0 as usize] as usize {
+                                    match *inst {
+                                        Inst::ICmp(_, _, _, x, y) => self.cmp_vregs(options, x, y),
+                                        Inst::ICmpI(_, _, _, x, k) => {
+                                            let rx = self.use_i(options, x, R10);
+                                            self.cmp_imm(rx, k);
+                                        }
+                                        _ => unreachable!(),
+                                    }
+                                } else {
+                                    self.inst(options, inst);
+                                }
                                 self.sel_flags = Some((cd, icc(*cc, *sg)));
                                 continue;
                             }
@@ -5372,7 +5394,8 @@ impl<'a> Gen<'a> {
             return self.float_sel(d, a, b, cc, parity);
         }
         if int_data {
-            if let Some((fc, cc)) = self.sel_flags.take() {
+            // (kept for the next select on c: the block loop drops it at any other instruction)
+            if let Some((fc, cc)) = self.sel_flags {
                 if fc == c {
                     return self.cmov_sel(options, d, a, b, cc);
                 }
@@ -6593,7 +6616,10 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // (hot code only: the rewrite copies the function, +15% back-end time at O1)
     let hoisted = if env.opt_regs || f.full { regalloc::hoist_loop_consts(f, &imm_fits, false, false, None) } else { None };
     let f = hoisted.as_ref().unwrap_or(f);
-    // compares next to the selects that read them (the cmov takes the flags)
+    // selects on one compare next to each other, then compares next to the selects that read
+    // them (the cmovs take the flags)
+    let paired = if env.opt_regs || f.full { regalloc::pair_selects(f) } else { None };
+    let f = paired.as_ref().unwrap_or(f);
     let sunk = if env.opt_regs || f.full { regalloc::sink_compares(f) } else { None };
     let f = sunk.as_ref().unwrap_or(f);
     // counter steps after the last read of the old value (no copy per iteration)
