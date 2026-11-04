@@ -376,6 +376,16 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 static STOP: AtomicBool = AtomicBool::new(false);
 
 fn stopping() -> bool { STOP.load(Ordering::SeqCst) || crate::preempt::is_stopped() }
+/// The worker paces itself (`ms`) on WAKE, not in a sleep: a check queued at rank `rank` or
+/// ahead ends the wait at once. A plain sleep missed the wake of a live edit's check, which then
+/// waited out the rest of it at the front of the queue (Fab early in a session: up to 500 ms
+/// behind the compile-quiet pacing, verdicts 110-450 ms late, 11-04).
+fn pace(ms: u64, rank: u32) {
+    let guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = WAKE.wait_timeout_while(guard, std::time::Duration::from_millis(ms), |q| {
+        !stopping() && !q.as_ref().and_then(|q| q.order.first()).is_some_and(|a| a.0 <= rank)
+    });
+}
 pub static CHECKED: AtomicU64 = AtomicU64::new(0);
 /// checks that failed inside the checker (a panic): those fns are NOT checked
 pub static PANICS: AtomicU64 = AtomicU64::new(0);
@@ -612,7 +622,7 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
             started = src.started();
             let edit_first = || QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|q| q.order.first()).is_some_and(|a| a.0 == RANK_EDIT);
             if !started && !edit_first() {
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                pace(20, RANK_EDIT);
                 continue;
             }
         }
@@ -624,7 +634,7 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
         // a live edit's checks and hot code waiting for its verdict (set_ranks) run while compiles go on
         let urgent = || QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|q| q.order.first()).is_some_and(|a| a.0 <= RANK_HOT);
         if quiet < QUIET_NS && !urgent() {
-            std::thread::sleep(std::time::Duration::from_millis(((QUIET_NS - quiet) / 1_000_000).clamp(20, 500)));
+            pace(((QUIET_NS - quiet) / 1_000_000).clamp(20, 500), RANK_HOT);
             continue;
         }
         let (rank, item) = {
@@ -799,11 +809,10 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
             if let Some(q) = guard.as_mut() {
                 if !q.epoch.get(identity).is_some_and(|e| *e > *epoch) { q.insert(item, rank); }
             }
-            let edit_next = guard.as_ref().and_then(|q| q.order.first()).is_some_and(|a| a.0 == RANK_EDIT);
             drop(guard);
             // the writer runs; checking again at once would only meet it again (a live edit's
             // check, which preempted this one, runs at once)
-            if !edit_next { std::thread::sleep(std::time::Duration::from_millis(50)); }
+            pace(50, RANK_EDIT);
             continue;
         }
         if !ok {
@@ -812,8 +821,9 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
                 if q.epoch.get(identity).is_some_and(|e| *e > *epoch) { STALE.fetch_add(1, Ordering::Relaxed); }
                 else { q.insert(item, rank); }
             }
-            drop(guard);
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            // the front was not to be had (the failed check went back at its rank, maybe the
+            // front of the queue): again after a while, or when other work is queued
+            let _ = WAKE.wait_timeout(guard, std::time::Duration::from_millis(200));
             continue;
         }
         if let Some(next) = discovery_next {
