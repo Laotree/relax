@@ -25646,7 +25646,7 @@ unsafe fn realtime_mark(up: *mut Unit, root: u64, data: u64, meta: u64, ticket: 
         crate::syms::data_thunks(u, meta, &mut roots);
         values.extend(u.vtables.snapshot().into_iter().filter(|(_, a)| *a == meta).map(|((t, _), _)| t));
     }
-    // what the roots' callers pass them (FABARMS3's `run_until(&mut self, link: &mut dyn
+    // what the roots' callers pass them (a Fab arms run's `run_until(&mut self, link: &mut dyn
     // CellLink, ..)`: the planner's `Box<dyn Route>`, the link)
     let params = realtime_root_params(u, &roots, &values);
     values.extend(params);

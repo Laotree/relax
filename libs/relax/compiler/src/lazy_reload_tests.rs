@@ -1043,7 +1043,7 @@ fn restored_images_take_live_edits() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// std::relax::realtime for arming a machine (FABARMS): `compiled` is the strict ready (the whole
+/// std::relax::realtime for arming a machine (the Fab arms experiment): `compiled` is the strict ready (the whole
 /// reach compiled, never "the wait ran out"), `lazy` counts what would still compile on a call, and
 /// an armed root freezes live edits of real-time code (refused "frozen", applied at the disarm)
 /// while edits of other code patch as usual.
@@ -1132,7 +1132,7 @@ fn realtime_thread_marks_the_calling_thread() {
     assert!(!std::thread::spawn(crate::jit::is_realtime_thread).join().unwrap(), "another thread is not marked");
 }
 
-/// FABARMS3's hole: the marked root calls through `dyn Route` (its value holds no trait object),
+/// A Fab arms run's hole: the marked root calls through `dyn Route` (its value holds no trait object),
 /// and other code makes the first `Box<Ded> -> Box<dyn Route>` after the mark, and a second type's
 /// after the reach is done. The root's lowering names the trait object it calls through, so the
 /// reach follows its vtables: the strict ready is false the moment a new one is made (polled
@@ -1210,7 +1210,7 @@ fn realtime_reach_follows_vtables_made_after_the_mark() {
         }
         panic!("the real-time reach was not compiled in 10 s");
     };
-    // the mark, then at once the first unsizing (FABARMS3's order), polled right after it ran
+    // the mark, then at once the first unsizing (a Fab arms run's order), polled right after it ran
     let ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![root]) });
     call(start_e);
     assert!(!compiled(ticket) || next_built(), "compiled right after the first `Box<Ded> -> Box<dyn Route>`, with `<Ded as Route>::next` lazy");
@@ -1374,7 +1374,7 @@ fn realtime_reach_skips_trait_objects_it_only_makes_itself() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// FABARMS3's misses on a node (W1207: 24 lazy compiles on the real-time thread, drop glue of generic
+/// A Fab run's misses on a node (24 lazy compiles on the real-time thread, drop glue of generic
 /// containers and core::fmt's float path): code ran before the mark (the planner's simulation), so
 /// the reach found slots compiled already whose RIR was dropped after their install. A drop glue's
 /// references were never read again (only fns' RIR was rebuilt), and with a disk cache a lookup
@@ -1453,7 +1453,7 @@ fn realtime_reach_walks_code_that_ran_before_the_mark() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// What FABARMS3's misses on a node (W1207) were, on a cold store: the marked root formats floats
+/// What a Fab run's misses on a node were, on a cold store: the marked root formats floats
 /// (core::fmt's float path is reached through the formatter fn pointer an `Argument` holds, data the
 /// reach reads) and drops containers (`Vec`, `vec::IntoIter`, `array::IntoIter`, `Weak`: drop glue
 /// of generic types). Nothing else ran before the mark: the reach alone compiles them, and the
