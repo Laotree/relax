@@ -1066,7 +1066,10 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
                 let outer = uu.tcx.typeck(&uu.prog, owner);
                 if !outer.errors.is_empty() || (outer.has_expr(e) && outer.expr_typed.get(outer.expr_ix(e))) { return; }
                 let body = uu.tcx.typeck(&uu.prog, anon);
-                if body.errors.is_empty() { relax_types::lint::check_literals(&uu.prog, &uu.tcx, &body); }
+                if body.errors.is_empty() {
+                    relax_types::lint::check_literals(&uu.prog, &uu.tcx, &body);
+                    relax_types::lint_dead::collect_body(&uu.prog, &uu.tcx, &body);
+                }
             }));
         }
     }
