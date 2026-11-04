@@ -2734,13 +2734,25 @@ impl SettleWatch {
 
 /// A successful settle takes pending cache entries even below the normal spill threshold.
 /// Disk IO and allocator relief run off the monitor and never hold the unit/front locks.
-/// False: a checker held FRONT_RW (the type side was not retired).
+/// False: a checker held FRONT_RW (the type side was not retired; nothing is trimmed).
 fn try_settle(drops: &mut jit::SettleDrops, trim: bool) -> bool {
     let up = unsafe { RUN_UNIT };
     if up.is_null() { return false; }
     // the deferred cache records first, in bounded publishes (the type side they are keyed from
     // is retired below: what installs add meanwhile is flushed in the request)
     jit::drain_records_bounded();
+    // The type side is retired under a front write. In a big app the readers (type checks ahead,
+    // Gandalf, the background type check, coherence) overlap without a gap, so a write that only
+    // tried never won (Fab cold: 201 settles in 90 s, every retire refused and every one trimmed,
+    // 37 s of trims): a writer waits from here on, so the readers stop at their next preemption
+    // point, and the wait for the front to come free runs here, off the owner, which goes on
+    // serving meanwhile (the main thread's requests, the questions the readers wait on).
+    let _waiting = crate::preempt::WriterWaiting::new();
+    while jit::front_try_write().is_none() {
+        if jit::QUIT_SEEN.load(Ordering::Relaxed) || crate::preempt::is_stopped() { return false; }
+        crate::lifeline::beat();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     // a front write: structural work, a program-class request (rule I-PUB: no publish)
     let Some(Some((drops, pending, spill, at, landmark, retired))) = Some(crate::owner::call(crate::owner::Class::Program, || {
         // Immediate releases must be reported even when an ahead checker kept FRONT_RW busy.
@@ -2761,6 +2773,9 @@ fn try_settle(drops: &mut jit::SettleDrops, trim: bool) -> bool {
         };
         Some((drops, pending, spill, at, landmark, retired))
     })) else { return false };
+    // a retire refused (a reader that does not stop got in first) frees nothing to trim: the next
+    // tick settles again
+    let trim = trim && retired.is_some();
     { let _k = crate::zone_alloc::kept();
     std::thread::spawn(move || { let _z = crate::zone_alloc::compiler_thread();
         let result = spill.map(|s| s.write());
@@ -2775,7 +2790,7 @@ fn try_settle(drops: &mut jit::SettleDrops, trim: bool) -> bool {
             let mb = |n: u64| n as f64 / 1048576.0;
             eprintln!("makepad-run mem: settle at t={:.0} ms ({}): completed-body drops RIR of {} fns ({:.1} MB), typeck {:.1} MB, lower {:.1} MB, spec {:.1} MB (max sweep {:.1} ms), cache spill {:.1} MB ({:?}); retired {} query values + {} solver entries (recomputed since: {} values); trim{} rss {:.1} -> {:.1} MB in {:.1} ms; before [{}], after [{}]{}",
                 at, landmark, drops.fns, mb(drops.rir), mb(drops.typeck), mb(drops.lower), mb(drops.spec),
-                drops.max_sweep_ns as f64 / 1e6, mb(pending as u64), result, retired.map_or(0, |r| r.0), retired.map_or(0, |r| r.1), crate::query::RECOMPUTED_VALUES.load(Ordering::Relaxed), if trim { "" } else { " disabled" }, mb(before.0), mb(after.0), trim_ms, before.2, after.2,
+                drops.max_sweep_ns as f64 / 1e6, mb(pending as u64), result, retired.map_or(0, |r| r.0), retired.map_or(0, |r| r.1), crate::query::RECOMPUTED_VALUES.load(Ordering::Relaxed), if trim { "" } else if retired.is_none() { " skipped (the type side was not retired)" } else { " disabled" }, mb(before.0), mb(after.0), trim_ms, before.2, after.2,
                 if crate::memstat::enabled() { "" } else { " (RIR estimated; other heap bytes require MAKEPAD_RUN_MEM_REPORT)" });
         }
     });
@@ -3040,6 +3055,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 else if COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).is_some() { Some("the collected image's tables are not adopted yet") }
                 else if !MID_MANIFEST_DONE.load(Ordering::Relaxed) { Some("the mid-run manifest is not written") }
                 else if crate::cache::front_graph_pending() { Some("front graphs are pending") }
+                else if crate::typeck_bg::running() { Some("the background type check is running") }
                 else if mid_busy.load(Ordering::SeqCst) { Some("a mid-run cache write is running") }
                 else if !teardown_started { Some("the teardown is not scheduled") }
                 else if jit::QUIT_SEEN.load(Ordering::Relaxed) { Some("the run is quitting") }

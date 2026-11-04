@@ -11075,11 +11075,10 @@ fn freed_since(before: i64) -> u64 {
 
 /// Settle (the run is quiet after first present): drop the type side's solver cache and the
 /// query values nothing holds, which a query derives again on demand. Caller holds the unit
-/// lock; FRONT_RW excludes the off-lock checkers. None when a checker is busy (retried).
+/// lock; FRONT_RW excludes the off-lock checkers. None when a checker is busy (retried). The
+/// settle waits for the front to come free off the owner, as a waiting writer (run.rs
+/// `try_settle`): the readers that overlap without a gap in a big app stop at their next point.
 pub unsafe fn retire_type_side(up: *mut Unit) -> Option<(usize, usize)> {
-    // A settle-swap run waits (the owner serves while it does) for the readers that overlap
-    // without a gap in a big app (Scope cold: ahead checkers and the lazy file loader), which
-    // try_write never wins; writers waiting make new checks stop at their next point.
     let _front = front_try_write()?;
     Some((*up).tcx.retire_settled())
 }

@@ -708,7 +708,35 @@ mod os {
     pub unsafe fn unreserve(base: usize, size: usize) {
         munmap(base as *mut c_void, size);
     }
+    /// Resident bytes of `[at, at + size)` (diagnostics only). macOS: the pages the task's footprint
+    /// counts, present and not reusable: a page given back with MADV_FREE_REUSABLE (`release`) stays
+    /// present until the kernel takes it, and mincore counted it (the devhub panel's old chunks:
+    /// 319 MB "resident" for 2 MB live).
+    #[cfg(target_vendor = "apple")]
+    pub unsafe fn resident(at: usize, size: usize) -> usize {
+        extern "C" {
+            static mach_task_self_: u32;
+            fn mach_vm_page_range_query(task: u32, address: u64, size: u64, dispositions: u64, count: *mut u64) -> i32;
+        }
+        const P: usize = 16 << 10;
+        // VM_PAGE_QUERY_PAGE_PRESENT, VM_PAGE_QUERY_PAGE_REUSABLE
+        const PRESENT: i32 = 0x1;
+        const REUSABLE: i32 = 0x800;
+        let mut v = [0i32; 512];
+        let (mut n, mut off) = (0, 0);
+        while off < size {
+            let len = (size - off).min(512 * P);
+            let mut count = ((len + P - 1) / P) as u64;
+            if mach_vm_page_range_query(mach_task_self_, (at + off) as u64, len as u64, v.as_mut_ptr() as u64, &mut count) != 0 {
+                return n;
+            }
+            n += v[..(count as usize).min(512)].iter().filter(|&&d| d & PRESENT != 0 && d & REUSABLE == 0).count() * P;
+            off += len;
+        }
+        n
+    }
     /// Resident bytes of `[at, at + size)` (mincore; diagnostics only).
+    #[cfg(not(target_vendor = "apple"))]
     pub unsafe fn resident(at: usize, size: usize) -> usize {
         extern "C" {
             fn mincore(addr: *mut c_void, len: usize, vec: *mut u8) -> i32;
@@ -721,17 +749,10 @@ mod os {
             if mincore((at + off) as *mut c_void, len, v.as_mut_ptr()) != 0 {
                 return n;
             }
-            let pages = (len + page_size() - 1) / page_size();
-            n += v[..pages.min(512)].iter().filter(|&&b| b & 1 != 0).count() * page_size();
+            n += v[..(len + P - 1) / P].iter().filter(|&&b| b & 1 != 0).count() * P;
             off += len;
         }
         n
-    }
-    fn page_size() -> usize {
-        #[cfg(target_vendor = "apple")]
-        return 16 << 10;
-        #[cfg(not(target_vendor = "apple"))]
-        return 4 << 10;
     }
     pub unsafe fn commit(p: *mut u8, size: usize) -> bool {
         if mprotect(p.cast(), size, 1 | 2) != 0 {
