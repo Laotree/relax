@@ -1140,6 +1140,9 @@ pub(crate) fn cmd_stacks(req: &Req, out: &mut Out) {
             None => groups.push((key, vec![i])),
         }
     }
+    // stacks with JIT code (the program's threads) first: a reply cut at its size limit drops
+    // runtime threads, not the program's
+    groups.sort_by_key(|g| !caps[g.1[0]].frames.iter().any(|&pc| crate::jit::in_jit_code(pc)));
     for (key, members) in &groups {
         let names: Vec<String> = members.iter().map(|&i| json_str(&format!("{} ({})", caps[i].t.name, tid_label(caps[i].t.os_id)))).collect();
         let c = &caps[members[0]];

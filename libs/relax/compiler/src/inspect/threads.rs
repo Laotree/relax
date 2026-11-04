@@ -815,7 +815,8 @@ mod imp {
     }
 
     /// Each step is proven or the walk ends there, saying why (`raw.stop`): a JIT frame by its
-    /// frame record (JIT code keeps one in rbp), a host frame by its CFI. Never a caller guessed
+    /// frame record (JIT code keeps one in rbp; where rbp is not known, at its unwind info's
+    /// distance above sp), a host frame by its CFI. Never a caller guessed
     /// from stack contents: a scan for something shaped like a frame record finds return
     /// addresses that earlier calls left on the stack (a CI hang's main thread, blocked in poll,
     /// read as called from the feature resolver that had run there before).
@@ -835,10 +836,22 @@ mod imp {
             raw.n += 1;
             let sp0 = r.rsp;
             if jit {
-                // [rbp] = the caller's rbp, [rbp + 8] = the return address
+                // [rbp] = the caller's rbp, [rbp + 8] = the return address. A thread blocked in a
+                // syscall is walked from its sp and pc: when no frame below saved rbp, the frame
+                // pointer at this call comes from the function's frame size and the call's
+                // staged arguments (its unwind info), which need sp only
                 if r.rbp == 0 {
-                    raw.stop = Some("it is JIT code and its frame pointer is not known (the thread blocks in a syscall, walked from the syscall's sp and pc, and no frame below it saved rbp)");
-                    break;
+                    if top {
+                        raw.stop = Some("it is JIT code at no call (it makes the syscall itself) and its frame pointer is not known");
+                        break;
+                    }
+                    match crate::jit::frame_pointer_at(r.rip, sp0) {
+                        Ok(fp) => r.rbp = fp,
+                        Err(why) => {
+                            raw.stop = Some(why);
+                            break;
+                        }
+                    }
                 }
                 if r.rbp < sp0 || r.rbp - sp0 > 1 << 20 {
                     raw.stop = Some("it is JIT code and its frame pointer is not in its stack");

@@ -1720,7 +1720,7 @@ impl<'a> Gen<'a> {
         // unwind info for the runtime's frame walk (crate::unwind_info)
         let mut saved: Vec<u32> = self.al.used_callee_int.iter().map(|r| *r as u32).collect();
         saved.extend(self.al.used_callee_flt.iter().map(|x| 0x100 | *x as u32));
-        let words = crate::rir::unwind_info_words(&saved, &unwind_tab, self.frame as u32);
+        let words = crate::rir::unwind_info_words(&saved, &unwind_tab, &[], self.frame as u32);
         if crate::rir::unwind_stats_on() {
             crate::rir::UNWIND_STATS[2].fetch_add((words.len() * 4) as u64, std::sync::atomic::Ordering::Relaxed);
         }
@@ -5722,6 +5722,9 @@ thread_local! {
 
 // ------------------------------------------------------------ runtime glue
 
+/// `lazy_entry`'s frame below its frame record at its host call (fp - sp there: x0-x7, d0-d7, x8)
+pub const LAZY_ENTRY_FRAME: u32 = 144;
+
 /// The lazy-compile entry shared by all stubs: saves the argument registers, calls
 /// `compile_fn(slot) -> code address`, restores them and jumps to the code.
 /// On entry x16 holds the slot index.
@@ -5729,7 +5732,7 @@ pub fn lazy_entry(host_compile: u64) -> Vec<u8> {
     let mut a = Asm { w: Vec::new() };
     a.stp_pre(FP, LR, SP, -16);
     a.mov_sp(FP, SP);
-    a.sub_imm(SP, SP, 144);
+    a.sub_imm(SP, SP, LAZY_ENTRY_FRAME);
     for k in 0..4u8 {
         a.stp(false, 2 * k, 2 * k + 1, SP, 16 * k as i32);
         a.stp(true, 2 * k, 2 * k + 1, SP, 64 + 16 * k as i32);
@@ -5866,6 +5869,9 @@ pub fn stub(slot: u32, lazy: u64) -> Vec<u8> {
     words_to_bytes(&a.w)
 }
 
+/// `enter`'s frame below its frame record at its call of fn (fp - sp there: x19-x28, d8-d15)
+pub const ENTER_FRAME: u32 = 160;
+
 /// enter(fn, arg, ctx): saves the callee-saved registers and sp into *ctx, calls fn(arg).
 /// Returns 0 normally. `leave(ctx, code)` (at the returned offset) restores them and
 /// returns `code` from enter (used by panics, faults and hangs to get back to the host).
@@ -5874,7 +5880,7 @@ pub fn enter_leave() -> (Vec<u8>, usize) {
     // enter: x0 = fn, x1 = arg, x2 = ctx
     a.stp_pre(FP, LR, SP, -16);
     a.mov_sp(FP, SP);
-    a.sub_imm(SP, SP, 160);
+    a.sub_imm(SP, SP, ENTER_FRAME);
     for k in 0..5u8 {
         a.stp(false, 19 + 2 * k, 20 + 2 * k, SP, 16 * k as i32);
     }
@@ -5895,7 +5901,7 @@ pub fn enter_leave() -> (Vec<u8>, usize) {
     for k in 0..4u8 {
         a.ldp(true, 8 + 2 * k, 9 + 2 * k, SP, 80 + 16 * k as i32);
     }
-    a.add_imm(SP, SP, 160);
+    a.add_imm(SP, SP, ENTER_FRAME);
     a.ldp_post(FP, LR, SP, 16);
     a.ret();
     // leave(ctx = x0, code = x1)
@@ -5941,6 +5947,9 @@ pub fn panic_tramp(target: u64) -> Vec<u8> {
     a.br(IP0);
     words_to_bytes(&a.w)
 }
+
+/// `regs_call_tramp`'s frame below its frame record at its call: none (the record is at sp)
+pub const REGS_CALL_FRAME: u32 = 0;
 
 /// JIT trampoline in front of a host function that returns (makepad inspect's breakpoint):
 /// stores the register block as `panic_tramp` does, makes it the frame record (x29 = its
@@ -5994,6 +6003,9 @@ pub fn jump_with_arg0(arg: u64, target: u64) -> Vec<u8> {
     words_to_bytes(&a.w)
 }
 
+/// `tls_slow`'s frame below its frame record at its host call (fp - sp there: x0-x15, q0-q31)
+pub const TLS_SLOW_FRAME: u32 = 640;
+
 /// This thread's thread-local block in x16, preserving every other register JIT code may hold
 /// (x0-x15, q0-q31): the fast path `tls_addr` inlines (slot `key` of the thread's slot
 /// array), and when the slot is still null `host() -> block`. `tls_addr` calls it after its own
@@ -6010,7 +6022,7 @@ pub fn tls_slow(host: u64, key: u64) -> Vec<u8> {
     a.ret();
     a.stp_pre(FP, LR, SP, -16);
     a.mov_sp(FP, SP);
-    a.sub_imm(SP, SP, 640);
+    a.sub_imm(SP, SP, TLS_SLOW_FRAME);
     for k in 0..8u8 {
         a.stp(false, 2 * k, 2 * k + 1, SP, 16 * k as i32);
     }
