@@ -1210,15 +1210,18 @@ impl Program {
         out
     }
 
-    /// Current module versions, one per authored path (excluding deferred macro fragments).
-    pub fn current_source_files(&self) -> std::collections::BTreeMap<String, u32> {
-        self.current_source_file_sets().into_iter().filter_map(|(path, files)| Some((path, *files.last()?))).collect()
+    /// Current module versions, one per authored path `keep` takes (excluding deferred macro
+    /// fragments).
+    pub fn current_source_files(&self, keep: impl Fn(&str) -> bool) -> std::collections::BTreeMap<String, u32> {
+        self.current_source_file_sets(keep).into_iter().filter_map(|(path, files)| Some((path, *files.last()?))).collect()
     }
 
     /// `current_source_files` with every crate's file of a path, one per crate: a `--lib` test
     /// root's harness crate and the plain library its dev-dependencies link are two crates of one
-    /// path (M50). The last is the one `current_source_files` names.
-    pub fn current_source_file_sets(&self) -> std::collections::BTreeMap<String, Vec<u32>> {
+    /// path (M50). The last is the one `current_source_files` names. `keep` picks the paths before
+    /// any is copied: a live session asking whether its few saved paths are sources had every
+    /// module's path (std's too) cloned into the map, 25-40 ms of the owner per edit (Fab, 11-04).
+    pub fn current_source_file_sets(&self, keep: impl Fn(&str) -> bool) -> std::collections::BTreeMap<String, Vec<u32>> {
         let mut files: std::collections::BTreeMap<String, Vec<u32>> = std::collections::BTreeMap::new();
         let mut bound = Vec::with_capacity(self.mods.len());
         for module in &self.mods {
@@ -1230,7 +1233,7 @@ impl Program {
             });
             bound.push(live);
             if !live { continue; }
-            if let Some(path) = self.file_paths.get(module.file as usize) {
+            if let Some(path) = self.file_paths.get(module.file as usize).filter(|p| keep(p)) {
                 // the last module of a path names its crate's file and orders it
                 let krate = self.file_crate.get(module.file as usize);
                 let of = files.entry(path.clone()).or_default();

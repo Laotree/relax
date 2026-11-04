@@ -1196,8 +1196,8 @@ fn includes_moved(pf: &crate::parser::ParsedFile, path: &str, it: &crate::ast::I
 /// batch edits already.
 pub(crate) fn include_edits(prog: &crate::program::Program, changed: &[String], skip: &[String]) -> Vec<Edit> {
     let mut out = Vec::new();
-    for (path, file) in prog.current_source_files() {
-        if skip.contains(&path) || !own_source_file(prog, file) { continue; }
+    for (path, file) in prog.current_source_files(|p| !skip.iter().any(|s| s == p)) {
+        if !own_source_file(prog, file) { continue; }
         let pf = &prog.files[file as usize];
         let src = &pf.src[..pf.src_len as usize];
         if !src.windows(8).any(|w| w == b"include_") { continue; }
@@ -2282,7 +2282,7 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, sources: &[Edit], partial:
             // under the lock, before the parse snapshot and the pairing against the running version.
             let edits: Vec<Edit> = {
                 let prog = &(*up).prog;
-                let current = (!module).then(|| prog.current_source_file_sets());
+                let current = (!module).then(|| prog.current_source_file_sets(|p| edits.iter().any(|e| prog.file_paths[e.file as usize] == p)));
                 // every crate's copy of the file takes the edit: a --lib test root's harness crate
                 // and the plain library its dev-dependencies link (M50). The other copies follow
                 // the edits as given, whose outcome files stay at their positions.
@@ -5052,7 +5052,7 @@ fn idle_outcome(file: Option<u32>, line: &str) -> Outcome {
 unsafe fn stream_file(up: *mut Unit, path: &str) -> Option<u32> {
     crate::owner::call(crate::owner::Class::Program, || {
         let prog = &(&*up).prog;
-        prog.current_source_files().get(path).copied()
+        prog.current_source_files(|p| p == path).get(path).copied()
     })
 }
 
@@ -5267,7 +5267,7 @@ pub fn start_watcher(up: *mut Unit, inputs: Inputs) {
 /// among `edited`: the program still declares them, each one's refusal line. A file the program
 /// does not run (its module unbound by an earlier edit) or a crate root is no such module.
 fn undeclared_removals(prog: &crate::program::Program, removed: &[&str], edited: &std::collections::HashSet<&str>) -> Vec<String> {
-    let loaded = prog.current_source_files();
+    let loaded = prog.current_source_files(|p| removed.contains(&p));
     removed.iter().filter_map(|&path| {
         let &file = loaded.get(path)?;
         let module = prog.mods.iter().find(|m| m.file == file)?;
@@ -5289,7 +5289,8 @@ fn removed_module_line(path: &str, declares: &str) -> String {
 
 /// Inspect takes the loaded paths on the owner: tests can load more files while the watcher
 /// waits for their verdict. No inputs lock survives that request or the path formatting.
-pub(crate) fn input_paths() -> Result<Vec<String>, String> {
+/// The run's inputs `keep` takes (an absolute path; `inspect inputs` answers relative ones).
+pub(crate) fn input_paths(keep: &dyn Fn(&str) -> bool) -> Result<Vec<String>, String> {
     // a live session's request that comes before its watcher started (a patch sent right after
     // the launch) waits for it: it was refused "not started" (11-03)
     let mut g = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -5302,9 +5303,9 @@ pub(crate) fn input_paths() -> Result<Vec<String>, String> {
     if up.is_null() { return Err("no running program".into()); }
     let std_dir = std::env::var("MAKEPAD_RUN_STD").unwrap_or_default();
     let loaded = crate::owner::call(crate::owner::Class::Program, || unsafe {
-        (*up).prog.current_source_files().into_keys().filter(|p| own_source(p, &std_dir)).collect::<Vec<_>>()
+        (*up).prog.current_source_files(|p| keep(p) && own_source(p, &std_dir)).into_keys().collect::<Vec<_>>()
     });
-    Ok(inputs.source_paths(loaded.into_iter()))
+    Ok(inputs.source_paths(loaded.into_iter(), keep))
 }
 
 /// A source file a live session watches and patches (`own_source`).
@@ -5577,9 +5578,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     // (path, running file index, last stamp)
     // the program's own source files (not std, registry or git dependencies), loaded so far
     let own_files = |u: &Unit| -> Vec<(String, u32)> {
-        u.prog.current_source_files().into_iter().filter(|(p, _)| {
-            own_source(p, &std_dir) && crate::vfs::is_file(p)
-        }).collect()
+        u.prog.current_source_files(|p| own_source(p, &std_dir)).into_iter().filter(|(p, _)| crate::vfs::is_file(p)).collect()
     };
     // (the watcher's holds read the program's files only: lock_unit_quick)
     let mut files: Vec<(String, u32, Option<(std::time::SystemTime, u64)>)> = {
@@ -5978,7 +5977,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 let names: Vec<String> = host_side.iter().take(3).map(|&k| short(&files[k].0)).collect();
                 let why = format!("{} makepad input(s) changed ({}{}): {}", host_side.len(), names.join(", "), if host_side.len() > 3 { ", ..." } else { "" },
                     inputs.restart_reason(host_side.iter().map(|&k| files[k].0.as_str())).unwrap_or("its sources changed"));
-                if let Err(e) = host::request(why.clone(), inputs.process_paths()) {
+                if let Err(e) = host::request(why.clone(), inputs.process_paths(&|_| true)) {
                     let message = format!("{why}; cannot rebuild makepad here ({e}); the app goes on with the makepad it runs");
                     eprintln!("makepad live: {message}");
                     live_log(&format!("{{\"event\":\"host_rebuild\",\"ok\":false,\"message\":{}}}", json_str(&message)));
@@ -6033,7 +6032,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             let what = if changed.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };
             let names: Vec<String> = changed.iter().take(3).map(|&k| short(&files[k].0)).collect();
             let why = format!("{} {what} changed ({}{}): {reason}", changed.len(), names.join(", "), if changed.len() > 3 { ", ..." } else { "" });
-            match host::request(why.clone(), inputs.process_paths()) {
+            match host::request(why.clone(), inputs.process_paths(&|_| true)) {
                 Ok(()) => {
                     // answered at once (a restart follows the build); the build's end answers
                     // again: refused with its errors, no change, or the restart into it
@@ -6242,7 +6241,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             continue;
         }
         if o.rung == Rung::Patch {
-            let loaded = crate::owner::call(crate::owner::Class::Program, || (*up).prog.current_source_files());
+            let loaded = crate::owner::call(crate::owner::Class::Program, || (*up).prog.current_source_files(|p| own_source(p, &std_dir)));
             for &k in &which {
                 if loaded.contains_key(&files[k].0) {
                     stalled.remove(&k);

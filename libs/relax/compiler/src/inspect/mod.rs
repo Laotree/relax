@@ -185,7 +185,7 @@ pub fn start(app: &str) {
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("session", "view [open|dismiss]", "the run's view over the app (compile errors, a parked panic, the JIT's state): what it shows, or open / dismiss it (the caption's JIT ring is display only)"),
     ("pin", "[on|off]", "pin the running app while an operation runs: no edit or landing reaches it and it does not restart; off: it catches up"),
-    ("inputs", "[match=<path substring>]", "the live session's reload source files, workspace-relative, one path per line and a count; unloaded sources are excluded"),
+    ("inputs", "[match=<path substring>] [of=<paths, one per line>]", "the live session's reload source files, workspace-relative, one path per line and a count; unloaded sources are excluded; of= answers only which of those paths are inputs"),
     ("session", "relaunch", "apply the edits waiting for a restart: the process starts again (an app that restarts itself, std::relax::restart_supported, with its state and window frames)"),
     ("why-hung", "[probe_ms=200]", "is it stuck and why: verdict (deadlock / blocked / busy / idle), the wait chain or cycle, stacks of the threads in it"),
     ("capture", "[why=<text>]", "capture the JIT's state and flight recording; answers the likely cause and report path"),
@@ -344,18 +344,24 @@ fn dispatch_command(req: &Req, out: &mut Out) {
             out.line(&format!("{{\"pinned\":{on}}}"));
         }
         "help" => help(req, out),
-        "inputs" => match crate::reload::input_paths() {
-            Ok(paths) => {
-                let paths: Vec<_> = paths.into_iter().filter(|p| p.contains(req.get("match").unwrap_or(""))).collect();
-                // Callers use absence to skip a patch wait: never truncate this source list.
-                out.always(&format!("{{\"count\":{}}}", paths.len()));
-                for path in paths {
-                    if out.cancelled() { break; }
-                    out.always(&format!("{{\"path\":{}}}", json_str(&path)));
+        "inputs" => {
+            // `of`: the paths asked about, one per line (a live session's saves): only those are
+            // looked at; every input path cost the owner 25-40 ms an edit (Fab, 11-04)
+            let of: Vec<&str> = req.get("of").map_or_else(Vec::new, |v| v.lines().filter(|l| !l.is_empty()).collect());
+            let keep = |p: &str| of.is_empty() || of.iter().any(|a| ends_with_rel(p, a.trim_start_matches("../")));
+            match crate::reload::input_paths(&keep) {
+                Ok(paths) => {
+                    let paths: Vec<_> = paths.into_iter().filter(|p| (of.is_empty() || of.contains(&p.as_str())) && p.contains(req.get("match").unwrap_or(""))).collect();
+                    // Callers use absence to skip a patch wait: never truncate this source list.
+                    out.always(&format!("{{\"count\":{}}}", paths.len()));
+                    for path in paths {
+                        if out.cancelled() { break; }
+                        out.always(&format!("{{\"path\":{}}}", json_str(&path)));
+                    }
                 }
+                Err(e) => out.err(&e),
             }
-            Err(e) => out.err(&e),
-        },
+        }
         "pf" => out.err("pf is answered by the client: makepad inspect <app> pf <query> (it attaches to the app's prof stream)"),
         "ping" => out.line(&format!("{{\"pid\":{},\"app\":{},\"ms\":{}}}", std::process::id(), json_str(&APP.lock().unwrap()), now_ms())),
         "threads" => cmd_threads(out),
@@ -459,6 +465,14 @@ pub(crate) fn owner_loading<T>(ms: u64, mut f: impl FnMut() -> Result<Result<T, 
 }
 
 /// `req` with `word` put in front of its positional words (an alias for a subcommand).
+/// Whether `path` ends with the relative `rel` at a path component ('/' and '\\' alike).
+fn ends_with_rel(path: &str, rel: &str) -> bool {
+    let (p, r) = (path.as_bytes(), rel.as_bytes());
+    let sep = |c: u8| c == b'/' || c == b'\\';
+    let Some(at) = p.len().checked_sub(r.len()) else { return false };
+    !r.is_empty() && p[at..].iter().zip(r).all(|(&a, &b)| a == b || (sep(a) && sep(b))) && (at == 0 || sep(p[at - 1]))
+}
+
 fn shifted(req: &Req, word: &str) -> Req {
     let mut pos = vec![word.to_string()];
     pos.extend(req.pos.iter().cloned());
@@ -1786,3 +1800,18 @@ pub extern "C" fn relax_wait_leave() {
     crate::waits::leave();
 }
 
+
+#[cfg(test)]
+mod tests {
+    /// `inputs of=`: a saved path names an input at a whole path component, either separator.
+    #[test]
+    fn a_saved_path_names_an_input_at_a_whole_component() {
+        use super::ends_with_rel as ends;
+        assert!(ends("/w/apps/fab/src/a.rs", "apps/fab/src/a.rs"));
+        assert!(ends("apps/fab/src/a.rs", "apps/fab/src/a.rs"));
+        assert!(ends("C:\\w\\apps\\fab\\a.rs", "apps/fab/a.rs"));
+        assert!(!ends("/w/xapps/fab/a.rs", "apps/fab/a.rs"));
+        assert!(!ends("a.rs", "src/a.rs"));
+        assert!(!ends("/w/a.rs", ""));
+    }
+}
