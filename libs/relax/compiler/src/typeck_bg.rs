@@ -17,11 +17,21 @@ use crate::jit::{self, FrontShared, Unit};
 use crate::program::{DefId, DefKind, Program};
 use crate::typeck::{Body, Res};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// body owners checked, owners with errors, crates whose clean verdict was stored, cpu ns, wall ns
 /// from its start to its end (0 while it runs)
 pub static STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// The check is under way (started and not ended): it fills the type side for every body owner of
+/// the dependency crates, so the settle rebuild waits for its end. Rebuilt before it, the devhub
+/// panel's compiler arena grew back from 0.55 to 1.05 GB committed (352 MB live, against 81 MB when
+/// the rebuild came after it): signatures and declarations of 63k checked owners.
+static RUNNING: AtomicBool = AtomicBool::new(false);
+
+pub fn running() -> bool {
+    RUNNING.load(Ordering::Acquire)
+}
 
 /// Starts the background check of unit `up` (`root`: the program's crate; `main`: where the
 /// reachability walk starts).
@@ -30,11 +40,19 @@ pub fn start(up: *mut Unit, root: u32, main: Option<DefId>, runtime: &crate::opt
     let upn = up as usize;
     let runtime = crate::zone_alloc::kept_clone(runtime);
     let _k = crate::zone_alloc::kept();
+    RUNNING.store(true, Ordering::Release);
     // (typeck recurses deeply on big bodies: the check workers' stack)
-    let _ = std::thread::Builder::new().name("run-typeck-bg".into()).stack_size(256 << 20).spawn(move || {
+    let spawned = std::thread::Builder::new().name("run-typeck-bg".into()).stack_size(256 << 20).spawn(move || {
         let _z = crate::zone_alloc::compiler_thread();
+        // ended however it ends (done, the run stopping, a panic)
+        struct Ended;
+        impl Drop for Ended {
+            fn drop(&mut self) { RUNNING.store(false, Ordering::Release); }
+        }
+        let _ended = Ended;
         run(upn as *mut Unit, root, main, &runtime);
     });
+    if spawned.is_err() { RUNNING.store(false, Ordering::Release); }
 }
 
 fn stopping() -> bool {
