@@ -303,11 +303,53 @@ fn hal_window_pending() -> bool {
     PENDING_WINDOW.lock().unwrap().is_some() && MAIN_HOST.get().is_some_and(|h| !h.domain_zero)
 }
 
+/// The load is done and the run's start waits for its host window to open: its first present
+/// (`finish_window`).
+static WINDOW_AWAITED: AtomicBool = AtomicBool::new(false);
+/// What that first present waits for, as the window's pump says it (`boot_window_waits`), and
+/// since when the start waits.
+static WINDOW_WAITS: relax_session::sync::Mutex<Option<(&'static str, Instant)>> = relax_session::sync::Mutex::new(None);
+
+/// Whether the run's load is done and its start waits for the host window's first present.
+pub fn window_awaited() -> bool {
+    WINDOW_AWAITED.load(Ordering::Acquire)
+}
+
+/// The host window's pump, while the run's start waits for the window's first present
+/// (`window_awaited`): what that present waits for, on each change, and `None` once it presented.
+/// The log says each (but under --silent) and `why-hung` shows it: a start held by its window
+/// never waits silently.
+pub fn boot_window_waits(waits: Option<&'static str>) {
+    let mut held = WINDOW_WAITS.lock().unwrap();
+    match (waits, *held) {
+        (Some(now), Some((was, _))) if now == was => {}
+        (Some(now), was) => {
+            *held = Some((now, was.map_or_else(Instant::now, |(_, since)| since)));
+            if !silent() {
+                eprintln!("makepad-run: the app's start waits for its boot window's first present: {now}");
+            }
+        }
+        (None, Some((_, since))) => {
+            *held = None;
+            if !silent() {
+                eprintln!("makepad-run: the boot window presented {:.0} ms after the app's load; the app starts", since.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        (None, None) => {}
+    }
+}
+
+/// What the run's start waits for in its boot window's first present, and for how long (`why-hung`).
+pub(crate) fn boot_window_wait() -> Option<(&'static str, std::time::Duration)> {
+    WINDOW_WAITS.lock().unwrap().map(|(waits, since)| (waits, since.elapsed()))
+}
+
 /// Waits for the host window the resolve started to open (it opens beside the load, which does not
 /// need it), and says whether the run is hosted (HAL_RUN).
 fn finish_window() -> Result<(), String> {
     let Some(window) = PENDING_WINDOW.lock().unwrap().take() else { return Ok(()) };
     let t_window = Instant::now();
+    WINDOW_AWAITED.store(true, Ordering::Release);
     let opened = window.map_err(|e| format!("opening the host window: {e}"))?.join().map_err(|_| "opening the host window: the thread panicked".to_string())?;
     opened?;
     if crate::preload::trace() { eprintln!("boot-trace: host window open, waited {:.1} ms for it after the load", t_window.elapsed().as_secs_f64() * 1e3); }
