@@ -1369,6 +1369,16 @@ impl<'a> Gen<'a> {
         }
         self.a.load64(dst, RBP, disp);
     }
+    /// Alloc::exit_stores at position p (a block's start or its terminator): region registers home
+    fn exit_stores(&mut self, p: u32) {
+        let Some(st) = self.al.exit_stores.get(&p).cloned() else { return };
+        for (v, r) in st {
+            if let Loc::Stack(o) = self.al.loc[v as usize] {
+                let d = self.spill_disp(o);
+                self.a.store64(RBP, d, r);
+            }
+        }
+    }
     /// Spill-window loads happen before the instruction at position p.
     fn pos_events(&self, p: u32) -> bool {
         self.win_start.contains_key(&p)
@@ -1678,6 +1688,8 @@ impl<'a> Gen<'a> {
             }
             self.block_pads[bi] = self.pads_n;
             self.block_pos[bi] = self.a.pos();
+            // a region's register home on the way out of the region (Alloc::exit_stores)
+            self.exit_stores(self.al.block_start[bi]);
             if bi != 0 && self.dom_read.get(bi) == Some(&true) {
                 // a value live into this block may be in rax (keeps_rax): the TLS read's slow path
                 // keeps every register but rax / r11, so rax waits in r10
@@ -1923,9 +1935,11 @@ impl<'a> Gen<'a> {
             if self.rir_map_on {
                 self.rir_map.push((self.a.pos() as u32, bi as u32, u32::MAX));
             }
-            // region windows entered from here: loaded before the terminator (regalloc edge loads)
+            // region windows entered from here: loaded before the terminator (regalloc edge loads);
+            // the region's register home before it (exit stores)
             if matches!(b.term, Term::Jump(_) | Term::Branch(..) | Term::Switch(..)) {
                 let tp = self.al.block_end[bi] - 1;
+                self.exit_stores(tp);
                 if let Some(ls) = self.win_start.get(&tp).cloned() {
                     for (v, r) in ls {
                         if let Loc::Stack(o) = self.al.loc[v as usize] {
@@ -2869,8 +2883,10 @@ impl<'a> Gen<'a> {
             let b = &self.f.blocks[bi];
             let Term::Jump(t) = b.term else { continue };
             // the block that reads the domain base is not skipped, whatever else it holds
-            // nor a block that loads a region window before its jump
-            if !reach[bi] || t as usize == bi || self.dom_read.get(bi) == Some(&true) || self.pos_events(self.al.block_end[bi] - 1) {
+            // nor a block that loads a region window before its jump, or stores a region's
+            // register home (Alloc::exit_stores)
+            let (bs, tp) = (self.al.block_start[bi], self.al.block_end[bi] - 1);
+            if !reach[bi] || t as usize == bi || self.dom_read.get(bi) == Some(&true) || self.pos_events(tp) || self.al.exit_stores.contains_key(&bs) || self.al.exit_stores.contains_key(&tp) {
                 continue;
             }
             let silent = b.insts.iter().enumerate().all(|(ii, i)| match *i {
