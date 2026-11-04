@@ -73,3 +73,30 @@ fn assign_in_a_boxed_fnmut_drops_the_old_value() {
     drop(handler);
     assert_eq!(dropped(), 10);
 }
+
+/// makepad-widgets' `child_in`: a fn's own local set from a `&mut dyn FnMut` callback. The empty
+/// ref it starts with was never released under Relax (a Tweaker sidebar frame leaked one per
+/// lookup, ~0.7 MB/s).
+fn find_in(id: u32, children: &mut dyn FnMut(&mut dyn FnMut(u32, D))) -> D {
+    let mut found = D(1000);
+    children(&mut |name, child| {
+        if found.0 == 1000 && name == id {
+            found = child;
+        }
+    });
+    found
+}
+
+#[test]
+fn assign_to_a_local_from_a_dyn_fnmut_callback_drops_the_old_value() {
+    dropped();
+    let mut kids = |f: &mut dyn FnMut(u32, D)| {
+        f(1, D(1));
+        f(2, D(10));
+    };
+    let got = find_in(2, &mut kids);
+    assert_eq!(dropped(), 1001, "the child not taken and the replaced start value");
+    assert_eq!(got.0, 10);
+    drop(got);
+    assert_eq!(dropped(), 10);
+}
