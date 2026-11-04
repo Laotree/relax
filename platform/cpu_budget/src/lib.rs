@@ -47,7 +47,7 @@ struct Job {
     admitted_at: u64,
     checkpoint_at: u64,
 }
-struct Waiter { class: u8, ticket: u64, thread: Thread }
+struct Waiter { class: u8, client: u8, ticket: u64, thread: Thread }
 #[derive(Clone, Copy, Default)]
 struct Span { label: Label, ns: u64 }
 #[derive(Clone, Copy)]
@@ -72,10 +72,18 @@ struct Budget {
     origin: Instant,
     cores: usize,
     limit: usize,
+    /// Background's ceiling: below Visible's, and at most the physical cores but one. A background
+    /// build on an SMT sibling of a busy core takes far more CPU for the same work (a cold plate on
+    /// 8 cores / 16 threads: the same 990 O3 builds took 31.6 CPU-s 8 wide, 58.5 CPU-s 13 wide)
+    /// and gets the work done little sooner.
+    background_limit: usize,
     state: Mutex<State>,
     classes: Box<[AtomicU8]>,
     // A precomputed bit per yielding class: should_yield needs just two relaxed loads.
     yield_classes: AtomicU8,
+    // ... and per class that a waiter of its own class or above (or a budget over its cores) wants
+    // a slot of: `contended`.
+    contended_classes: AtomicU8,
     // 0: not begun, 1: startup warm-up, 2: permanently ended.
     warmup: AtomicU8,
     queued: [[AtomicI64; 3]; 3],
@@ -83,10 +91,12 @@ struct Budget {
     max_wait: [AtomicU64; 3],
 }
 impl Budget {
-    fn new(cores: usize) -> Self {
+    fn new(cores: usize, physical: usize) -> Self {
         assert!(cores > 0);
+        let limit = cores.saturating_sub(1).max(1);
         Self {
-            origin: Instant::now(), cores, limit: cores.saturating_sub(1).max(1),
+            origin: Instant::now(), cores, limit,
+            background_limit: limit.saturating_sub(2).min(physical.saturating_sub(1)).max(1),
             state: Mutex::new(State {
                 slots: vec![None; cores].into_boxed_slice(), waiters: Vec::new(), ticket: 0,
                 running: 0, background: 0, waiting: 0, parked: [0; 3], admitted: [0; 3],
@@ -96,66 +106,81 @@ impl Budget {
                 changed: None,
             }),
             classes: (0..cores).map(|_| AtomicU8::new(INTERACTIVE)).collect(),
-            yield_classes: AtomicU8::new(0), warmup: AtomicU8::new(0),
+            yield_classes: AtomicU8::new(0), contended_classes: AtomicU8::new(0), warmup: AtomicU8::new(0),
             queued: std::array::from_fn(|_| std::array::from_fn(|_| AtomicI64::new(0))),
             waits: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             max_wait: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
     fn now(&self) -> u64 { self.origin.elapsed().as_nanos().min(u64::MAX as u128) as u64 }
-    fn room(&self, s: &State, class: u8) -> bool {
+    fn room(&self, s: &State, class: u8, client: u8) -> bool {
         s.running < match class {
             INTERACTIVE => self.cores,
             VISIBLE => self.limit,
-            BACKGROUND => self.limit.saturating_sub(2).max(1),
+            BACKGROUND => self.background_limit,
             _ => unreachable!(),
-        } && (class != BACKGROUND || !self.warming() || s.background == 0)
+        } && (class != BACKGROUND || client != APP || !self.warming() || s.background == 0)
     }
-    fn first(s: &State) -> Option<usize> {
-        s.waiters.iter().enumerate().min_by_key(|(_, w)| (w.class, w.ticket)).map(|(i, _)| i)
+    fn first(&self, s: &State) -> Option<usize> {
+        s.waiters.iter().enumerate().filter(|(_, w)| self.room(s, w.class, w.client)).min_by_key(|(_, w)| (w.class, w.ticket)).map(|(i, _)| i)
     }
     fn refresh(&self, s: &mut State) {
         s.waiting = s.waiters.iter().fold(0, |bits, w| bits | (1 << w.class));
-        let mut bits = 0;
+        let (mut bits, mut contended) = (0, 0);
         for class in 0..3 {
             if s.waiting & ((1 << class) - 1) != 0 || s.running > self.cores
-                || (class == BACKGROUND && self.warming() && s.background > 1)
             { bits |= 1 << class; }
+            if s.waiting & ((2 << class) - 1) != 0 || s.running > self.cores
+            { contended |= 1 << class; }
         }
         self.yield_classes.store(bits, Relaxed);
-        if let Some(i) = Self::first(s) {
-            if self.room(s, s.waiters[i].class) { s.waiters[i].thread.unpark(); }
+        self.contended_classes.store(contended, Relaxed);
+        for (index, job) in s.slots.iter().enumerate() {
+            if let Some(job) = job {
+                self.classes[index].store(job.class | if job.class == BACKGROUND && job.client == APP
+                    && self.warming() && s.background > 1 { 0x80 } else { 0 }, Relaxed);
+            }
+        }
+        if let Some(i) = self.first(s) {
+            if self.room(s, s.waiters[i].class, s.waiters[i].client) { s.waiters[i].thread.unpark(); }
         }
         #[cfg(test)]
         if let Some(tx) = &s.changed { let _ = tx.send(()); }
     }
-    fn acquire<'a>(&'a self, mut s: MutexGuard<'a, State>, mut job: Job) -> u32 {
+    fn acquire<'a>(&'a self, mut s: MutexGuard<'a, State>, mut job: Job, desired: Option<&AtomicU8>) -> u32 {
         let key = (job.class, job.ticket);
-        let first = Self::first(&s);
-        let immediate = self.room(&s, job.class)
+        let first = self.first(&s);
+        let immediate = self.room(&s, job.class, job.client)
             && first.is_none_or(|i| key < (s.waiters[i].class, s.waiters[i].ticket));
         if !immediate {
             // Only the contended path grows the waiter list. No thread is created here.
-            s.waiters.push(Waiter { class: job.class, ticket: job.ticket, thread: thread::current() });
+            s.waiters.push(Waiter { class: job.class, client: job.client, ticket: job.ticket, thread: thread::current() });
             self.refresh(&mut s);
             loop {
-                let i = Self::first(&s).unwrap();
-                if s.waiters[i].ticket == job.ticket && self.room(&s, job.class) {
+                if let Some(i) = self.first(&s).filter(|&i| s.waiters[i].ticket == job.ticket) {
                     s.waiters.swap_remove(i);
                     break;
                 }
                 drop(s);
                 thread::park();
                 s = self.state.lock().unwrap();
+                if let Some(desired) = desired {
+                    job.class = desired.load(Relaxed);
+                    if let Some(w) = s.waiters.iter_mut().find(|w| w.ticket == job.ticket) { w.class = job.class; }
+                    self.refresh(&mut s);
+                }
             }
         }
+        self.install(s, job)
+    }
+    fn install(&self, mut s: MutexGuard<'_, State>, mut job: Job) -> u32 {
         let index = s.slots.iter().position(Option::is_none).unwrap();
         let now = self.now();
         job.admitted_at = now;
         job.checkpoint_at = now;
         s.slots[index] = Some(job);
         s.running += 1;
-        s.background += usize::from(job.class == BACKGROUND);
+        s.background += usize::from(job.class == BACKGROUND && job.client == APP);
         s.admitted[job.class as usize] += 1;
         self.classes[index].store(job.class, Relaxed);
         self.refresh(&mut s);
@@ -168,10 +193,15 @@ impl Budget {
         let mut s = self.state.lock().unwrap();
         let ticket = s.ticket;
         s.ticket = s.ticket.checked_add(1).expect("CPU budget ticket overflow");
-        self.acquire(s, Job { class, client, label: Label::new(label), ticket, admitted_at: 0, checkpoint_at: 0 })
+        self.acquire(s, Job { class, client, label: Label::new(label), ticket, admitted_at: 0, checkpoint_at: 0 }, None)
     }
     fn should_yield(&self, permit: u32) -> bool {
-        self.yield_classes.load(Relaxed) & (1 << self.classes[permit as usize].load(Relaxed)) != 0
+        let class = self.classes[permit as usize].load(Relaxed);
+        class & 0x80 != 0 || self.yield_classes.load(Relaxed) & (1 << (class & 0x7f)) != 0
+    }
+    fn contended(&self, permit: u32) -> bool {
+        let class = self.classes[permit as usize].load(Relaxed);
+        class & 0x80 != 0 || self.contended_classes.load(Relaxed) & (1 << (class & 0x7f)) != 0
     }
     fn span(s: &mut State, label: Label, ns: u64) {
         if let Some(span) = s.spans.iter_mut().find(|span| span.label == label) {
@@ -184,12 +214,15 @@ impl Budget {
     fn remove(&self, s: &mut State, permit: u32, now: u64) -> Job {
         let job = s.slots[permit as usize].take().expect("released CPU permit");
         s.running -= 1;
-        s.background -= usize::from(job.class == BACKGROUND);
+        s.background -= usize::from(job.class == BACKGROUND && job.client == APP);
         s.runtime[job.class as usize] += now.saturating_sub(job.admitted_at);
         Self::span(s, job.label, now.saturating_sub(job.checkpoint_at));
         job
     }
     fn checkpoint(&self, permit: u32, held_locks: u32, lock_site: &str) -> u32 {
+        self.checkpoint_following(permit, held_locks, lock_site, None)
+    }
+    fn checkpoint_following(&self, permit: u32, held_locks: u32, lock_site: &str, desired: Option<&AtomicU8>) -> u32 {
         let mut s = self.state.lock().unwrap();
         let now = self.now();
         let job = s.slots[permit as usize].as_mut().expect("released CPU permit");
@@ -205,7 +238,7 @@ impl Budget {
                 let job = self.remove(&mut s, permit, now);
                 s.parked[class as usize] += 1;
                 // Release and enqueue under the same lock; retain the original admission ticket.
-                return self.acquire(s, job);
+                return self.acquire(s, job, desired);
             }
         }
         drop(s);
@@ -224,11 +257,12 @@ impl Budget {
         let job = s.slots[permit as usize].as_mut().expect("released CPU permit");
         let old = job.class;
         let elapsed = now.saturating_sub(job.admitted_at);
+        let app = job.client == APP;
         job.class = class;
         job.admitted_at = now;
         s.runtime[old as usize] += elapsed;
-        s.background -= usize::from(old == BACKGROUND);
-        s.background += usize::from(class == BACKGROUND);
+        s.background -= usize::from(old == BACKGROUND && app);
+        s.background += usize::from(class == BACKGROUND && app);
         self.classes[permit as usize].store(class, Relaxed);
         self.refresh(&mut s);
     }
@@ -331,17 +365,159 @@ fn human(ns: u64) -> String {
 }
 fn global() -> &'static Budget {
     static BUDGET: OnceLock<Budget> = OnceLock::new();
-    BUDGET.get_or_init(|| Budget::new(thread::available_parallelism().map_or(1, usize::from)))
+    BUDGET.get_or_init(|| {
+        let cores = thread::available_parallelism().map_or(1, usize::from);
+        // (a machine whose topology is not known: every CPU a core)
+        Budget::new(cores, match physical_cores() { 0 => cores, n => n.min(cores) })
+    })
 }
+
+/// The machine's cores, an SMT core's hardware threads counted once (Linux: one per distinct
+/// sibling set of the online CPUs).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn physical_cores() -> usize {
+    let mut sets = Vec::new();
+    for entry in std::fs::read_dir("/sys/devices/system/cpu").into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let Some(n) = name.to_str().and_then(|n| n.strip_prefix("cpu")) else { continue };
+        if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) { continue; }
+        // (an offline CPU has no topology)
+        if let Ok(set) = std::fs::read_to_string(entry.path().join("topology/thread_siblings_list")) {
+            sets.push(set.trim().to_owned());
+        }
+    }
+    sets.sort_unstable();
+    sets.dedup();
+    sets.len()
+}
+#[cfg(target_vendor = "apple")]
+fn physical_cores() -> usize {
+    unsafe extern "C" {
+        fn sysctlbyname(name: *const u8, old: *mut u8, oldlen: *mut usize, new: *const u8, newlen: usize) -> i32;
+    }
+    let mut n: i32 = 0;
+    let mut len = std::mem::size_of::<i32>();
+    let r = unsafe { sysctlbyname(b"hw.physicalcpu\0".as_ptr(), &mut n as *mut i32 as *mut u8, &mut len, std::ptr::null(), 0) };
+    if r == 0 { n.max(0) as usize } else { 0 }
+}
+#[cfg(windows)]
+fn physical_cores() -> usize {
+    // SYSTEM_LOGICAL_PROCESSOR_INFORMATION: one RelationProcessorCore (0) entry per core
+    #[repr(C)]
+    struct Info { mask: usize, relationship: u32, union: [u64; 2] }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLogicalProcessorInformation(buffer: *mut Info, length: *mut u32) -> i32;
+    }
+    let mut len = 0u32;
+    unsafe { GetLogicalProcessorInformation(std::ptr::null_mut(), &mut len) };
+    let mut infos: Vec<Info> = Vec::with_capacity(len as usize / std::mem::size_of::<Info>());
+    if unsafe { GetLogicalProcessorInformation(infos.as_mut_ptr(), &mut len) } == 0 { return 0; }
+    unsafe { infos.set_len(len as usize / std::mem::size_of::<Info>()) };
+    infos.iter().filter(|info| info.relationship == 0).count()
+}
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple", windows)))]
+fn physical_cores() -> usize { 0 }
 
 #[relax_api]
 pub fn cores() -> u32 { global().cores as u32 }
 #[relax_api]
 pub fn limit() -> u32 { global().limit as u32 }
+/// How many Background jobs run at once.
+#[relax_api]
+pub fn background_limit() -> u32 { global().background_limit as u32 }
+
+/// The budget's native park token. JIT and native std have different thread-local
+/// parkers; queue notifications and admission notifications must wake the same one.
+#[relax_api(handle, clone)]
+#[derive(Clone)]
+pub struct Wake(thread::Thread);
+
+#[relax_api]
+impl Wake {
+    pub fn current() -> Self { Self(thread::current()) }
+    pub fn unpark(&self) { self.0.unpark(); }
+}
+
+#[relax_api]
+pub fn park() { thread::park(); }
+
+#[relax_api]
+pub fn park_for(ns: u64) { thread::park_timeout(std::time::Duration::from_nanos(ns)); }
+
+/// Admission whose class follows a native job while its worker waits.
+#[relax_api]
+pub fn admit_following(desired: &AtomicU8, client: u8, label: &str) -> u32 {
+    let b = global();
+    let class = desired.load(Relaxed);
+    valid(class, client);
+    let mut s = b.state.lock().unwrap();
+    let ticket = s.ticket;
+    s.ticket = s.ticket.checked_add(1).expect("CPU budget ticket overflow");
+    b.acquire(s, Job { class, client, label: Label::new(label), ticket, admitted_at: 0, checkpoint_at: 0 }, Some(desired))
+}
+
+/// Native workers whose waiters may promote them while they are parked. Like
+/// `checkpoint`, with a live class and an unpark from the promoting waiter.
+#[relax_api]
+pub fn checkpoint_following(permit: u32, held_locks: u32, lock_site: &str, desired: &AtomicU8) -> u32 {
+    global().checkpoint_following(permit, held_locks, lock_site, Some(desired))
+}
+
+/// A native pool's admission request. The pool may change its head class while
+/// waiting, without occupying a worker with a stale lower-priority admission.
+/// `poll` never parks: budget changes unpark the requesting thread.
+/// The request keeps its FIFO ticket across class changes and cancels on drop.
+#[relax_api(handle)]
+pub struct Admission { ticket: Option<u64> }
+#[relax_api]
+impl Default for Admission {
+    fn default() -> Self { Self { ticket: None } }
+}
+#[relax_api]
+impl Admission {
+    pub fn poll(&mut self, class: u8, client: u8, label: &str) -> Option<u32> {
+        valid(class, client);
+        let b = global();
+        let mut s = b.state.lock().unwrap();
+        let ticket = *self.ticket.get_or_insert_with(|| {
+            let ticket = s.ticket;
+            s.ticket = s.ticket.checked_add(1).expect("CPU budget ticket overflow");
+            s.waiters.push(Waiter { class, client, ticket, thread: thread::current() });
+            ticket
+        });
+        let w = s.waiters.iter_mut().find(|w| w.ticket == ticket).unwrap();
+        w.class = class;
+        w.client = client;
+        if let Some(i) = b.first(&s).filter(|&i| s.waiters[i].ticket == ticket) {
+            s.waiters.swap_remove(i);
+            self.ticket = None;
+            Some(b.install(s, Job { class, client, label: Label::new(label), ticket, admitted_at: 0, checkpoint_at: 0 }))
+        } else {
+            b.refresh(&mut s);
+            None
+        }
+    }
+}
+impl Drop for Admission {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket.take() {
+            let b = global();
+            let mut s = b.state.lock().unwrap();
+            s.waiters.retain(|w| w.ticket != ticket);
+            b.refresh(&mut s);
+        }
+    }
+}
+
 #[relax_api]
 pub fn admit(class: u8, client: u8, label: &str) -> u32 { global().admit(class, client, label) }
 #[relax_api]
 pub fn should_yield(permit: u32) -> bool { global().should_yield(permit) }
+/// A finished job's permit goes back rather than on to the worker's next job of its class: a
+/// waiter of that class or above wants a slot, or it should yield (lock-free).
+#[relax_api]
+pub fn contended(permit: u32) -> bool { global().contended(permit) }
 /// Returns the permit to use from now on. A yielding, unlocked caller releases its
 /// slot and parks with its original FIFO ticket; readmission may use a different slot.
 /// With held locks it records a warning and keeps running with the existing permit.
@@ -384,12 +560,34 @@ pub fn report_string() -> String {
     }
 }
 
-thread_local! { static THREAD_CLASS: Cell<Option<u8>> = const { Cell::new(None) }; }
+thread_local! {
+    static THREAD_CLASS: Cell<Option<u8>> = const { Cell::new(None) };
+    /// set_ui_thread's thread: its OS class stays the UI's
+    static UI_THREAD: Cell<bool> = const { Cell::new(false) };
+}
 /// Applies the class to the calling thread, caching successful applications only.
 /// Linux may refuse a promotion without CAP_SYS_NICE; failure is returned, not hidden.
+/// On a set_ui_thread thread it changes nothing.
 #[relax_api]
 pub fn set_thread_class(class: u8) -> bool {
     valid(class, APP);
+    if UI_THREAD.with(Cell::get) { return true; }
+    apply_thread_class(class)
+}
+
+/// The UI thread, and the thread it waits on for its work (the JIT owner), are outside admission
+/// and keep the UI's OS priority, above pool jobs, for good: a job's class taken on later (a scope's
+/// task run here, a pool job's admission borrowed for one request) leaves it. (A Linux thread
+/// without CAP_SYS_NICE could not come back from a lower class: the owner, once it served a
+/// background job's request, served the UI at that job's priority from then on.)
+#[relax_api]
+pub fn set_ui_thread() -> bool {
+    let applied = apply_thread_class(3);
+    UI_THREAD.with(|ui| ui.set(true));
+    applied
+}
+
+fn apply_thread_class(class: u8) -> bool {
     THREAD_CLASS.with(|current| {
         if current.get() == Some(class) { return true; }
         let applied = os_class(class);
@@ -401,7 +599,7 @@ pub fn set_thread_class(class: u8) -> bool {
 #[cfg(target_os = "macos")]
 fn os_class(class: u8) -> bool {
     unsafe extern "C" { fn pthread_set_qos_class_self_np(class: u32, relative: i32) -> i32; }
-    unsafe { pthread_set_qos_class_self_np([0x19, 0x15, 0x11][class as usize], 0) == 0 }
+    unsafe { pthread_set_qos_class_self_np([0x19, 0x15, 0x11, 0x21][class as usize], 0) == 0 }
 }
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn os_class(class: u8) -> bool {
@@ -415,7 +613,7 @@ fn os_class(class: u8) -> bool {
     }
     static BASE: OnceLock<i32> = OnceLock::new();
     let base = *BASE.get_or_init(|| unsafe { getpriority(0, getpid() as u32) }.clamp(0, 19));
-    let nice = (base + [1, 3, 8][class as usize]).min(19);
+    let nice = (base + [1, 3, 8, 0][class as usize]).min(19);
     unsafe {
         let priority = setpriority(0, 0, nice) == 0;
         let policy = sched_setscheduler(0, if class == BACKGROUND { 3 } else { 0 }, &SchedParam { priority: 0 }) == 0;
@@ -429,7 +627,7 @@ fn os_class(class: u8) -> bool {
         fn GetCurrentThread() -> *mut std::ffi::c_void;
         fn SetThreadPriority(thread: *mut std::ffi::c_void, priority: i32) -> i32;
     }
-    unsafe { SetThreadPriority(GetCurrentThread(), [1, 0, -1][class as usize]) != 0 }
+    unsafe { SetThreadPriority(GetCurrentThread(), [1, 0, -1, 2][class as usize]) != 0 }
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android", windows)))]
 fn os_class(_class: u8) -> bool { false }

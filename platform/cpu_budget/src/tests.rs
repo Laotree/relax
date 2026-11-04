@@ -2,7 +2,7 @@ use super::*;
 use std::sync::{mpsc::{self, Receiver, Sender}, Arc};
 
 fn budget(cores: usize) -> (Arc<Budget>, Receiver<()>) {
-    let budget = Arc::new(Budget::new(cores));
+    let budget = Arc::new(Budget::new(cores, cores));
     let (tx, rx) = mpsc::channel();
     budget.state.lock().unwrap().changed = Some(tx);
     (budget, rx)
@@ -110,12 +110,18 @@ fn background_reserves_two_visible_slots_and_visible_reserves_one() {
 }
 
 #[test]
-fn warmup_ends_once_and_restores_background_width() {
+fn warmup_limits_app_background_once_and_leaves_room_for_jit() {
     let (b, changed) = budget(6);
-    b.begin_warmup();
+    let early = b.admit(BACKGROUND, APP, "before warm-up");
     let p = b.admit(BACKGROUND, APP, "warm seed");
+    let jit = b.admit(BACKGROUND, JIT, "warm compiler");
+    b.begin_warmup();
+    assert!(b.should_yield(early) && b.should_yield(p), "the app's background past one yields while warming");
+    assert!(!b.should_yield(jit), "the JIT's background does not");
+    b.release(early);
+    assert!(!b.should_yield(p));
     let (tx, rx) = mpsc::channel();
-    let w = worker(&b, BACKGROUND, JIT, 1, &tx);
+    let w = worker(&b, BACKGROUND, APP, 1, &tx);
     until(&b, &changed, |s| s.waiters.len() == 1);
     assert!(rx.try_recv().is_err());
     assert!(!b.should_yield(p));
@@ -125,7 +131,8 @@ fn warmup_ends_once_and_restores_background_width() {
     assert_eq!(rx.recv().unwrap(), 1);
     b.begin_warmup();
     assert!(!b.warming(), "a later compile burst cannot restart warm-up");
-    assert!(!b.should_yield(p));
+    assert!(!b.should_yield(p) && !b.should_yield(jit));
+    b.release(jit);
     let full = b.admit(BACKGROUND, APP, "restored third slot");
     assert_eq!(b.state.lock().unwrap().background, 3);
     b.release(full);

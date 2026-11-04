@@ -224,7 +224,7 @@ fn check_prepared(up: *mut Unit, p: AppCheck, beside: Option<&crate::options::Ru
     let strict = mode == CheckMode::Errors;
     let upn = up as usize;
     let front = unsafe { (*up).front.clone() };
-    let init = || if let Some(r) = beside { jit::lower_this_thread_priority(r) };
+    let init = || if beside.is_some() { makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND); };
     let threads = if beside.is_some() && !strict { beside_jobs() } else { jobs() };
     let cpu = std::sync::atomic::AtomicU64::new(0);
     struct Cpu<'a>(&'a std::sync::atomic::AtomicU64, u64);
@@ -353,7 +353,7 @@ pub fn start_test_deps(up: *mut Unit, select: impl FnOnce(&crate::program::Progr
     let _k = crate::zone_alloc::kept();
     let worker = std::thread::Builder::new().name("test-deps-check".into()).stack_size(256 << 20).spawn(move || {
         let _z = crate::zone_alloc::compiler_thread();
-        jit::lower_this_thread_priority(&runtime);
+        makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
         let (t0, cpu0) = (jit::wall_ns(), relax_backend::cpu_ns());
         let up = upn as *mut Unit;
         let front = unsafe { (*up).front.clone() };
@@ -457,7 +457,7 @@ pub fn start_app_check(up: *mut Unit, p: AppCheck, runtime: crate::options::Runt
     let upn = up as usize;
     std::thread::Builder::new().name("run-app-check".into()).stack_size(256 << 20).spawn(move || {
         let _z = crate::zone_alloc::compiler_thread();
-        jit::lower_this_thread_priority(&runtime);
+        makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
         let errors = check_prepared(upn as *mut Unit, p, Some(&runtime), CheckMode::Typeck).strings();
         if crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
             eprintln!("makepad-run: app check beside main: {} crates, {} body owners, {} errors, {:.0} ms",

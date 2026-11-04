@@ -1292,7 +1292,7 @@ fn launch_main(upn: usize, id: DomainId, base: u64, target: u64, arg: u64, packa
             // is the HAL's). At the default QoS the scheduler moved the race's UI thread to the
             // efficiency cores 20-25% of the time whenever the performance cores were busy
             // (ARMIPC, mini); a native app's never goes there.
-            crate::os::thread::interactive();
+            makepad_cpu_budget::set_ui_thread();
         }
         let up = upn as *mut Unit;
         relax_domain_enter(base, token);

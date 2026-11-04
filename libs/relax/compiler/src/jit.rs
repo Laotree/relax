@@ -4,6 +4,9 @@
 //! stubs, the host runtime (formatting, panics, faults, hang watchdog) and the
 //! compile-on-first-call path.
 
+#[path = "jit_queue.rs"]
+mod queue;
+
 include!("rt_abi.rs");
 use relax_types::next_solver::TraitRef;
 use relax_types::instance::{Instance, InstanceKind, ShimKind};
@@ -1427,7 +1430,6 @@ pub static ORDER_PRESENT_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic
 /// order that run installed the slots: they link the cached code ahead of the main thread.
 /// The keys are decoded on a thread of their own, a chunk per unit call.
 pub unsafe fn spec_seed_manifest(up: *mut Unit) {
-    let session = unsafe { crate::jit::unit_session(up) };
     // after the first present: what the earlier run installed after its first present (the
     // slots before it were linked as this run's start called them)
     let list = owner::call(owner::Class::Program, || (&mut *up).cache.as_ref().map(|c| c.manifest[c.manifest_present..].to_vec()).unwrap_or_default());
@@ -1439,11 +1441,10 @@ pub unsafe fn spec_seed_manifest(up: *mut Unit) {
     let p = P(up);
     { let _k = crate::zone_alloc::kept();
     let _ = std::thread::Builder::new().name("run-seed".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
-        let runtime = &session.runtime;
         let p = p;
         let up = p.0;
-        set_worker();
-        lower_worker_priority(runtime);
+        set_worker(true);
+        makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
         while startup_phase() {
             if SPEC_STOP.load(Ordering::SeqCst) { return; }
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1567,7 +1568,7 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
         let _ = std::thread::Builder::new().name("run-prelink-notes".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
             let p = p;
             let up = p.0;
-            set_worker();
+            set_worker(true);
             while startup_phase() || !FIRST_PRESENT.load(Ordering::Acquire) && wall_ns() < ORDER_UNTIL_NS.load(Ordering::Relaxed) {
                 if SPEC_STOP.load(Ordering::SeqCst) {
                     return;
@@ -1701,10 +1702,7 @@ pub(crate) fn fork_child() {
     PIPELINE.store(false, Ordering::SeqCst);
     SPEC_STOP.store(true, Ordering::SeqCst);
     // no lock in the child (another thread may have held it at the fork, for good): nothing
-    // takes from the queue once SPEC_STOP is set, so a queue that is busy is just left
-    if let Ok(mut q) = SPEC_Q.try_lock() {
-        q.clear();
-    }
+    // takes from the queue in this child: the other pool threads did not survive the fork
     unsafe {
         if !cur_unit().is_null() {
             for f in (&mut *cur_unit()).fns.iter_mut() {
@@ -1906,7 +1904,7 @@ pub(crate) fn install_ice_hook() {
         // (and reports) that body, so they are not diagnostics
         // (the pthread name: std::thread::current() aborts on a thread whose locals are destroyed,
         // and a program's thread-local destructor may panic there)
-        if crate::os::thread::name(crate::os::thread::current()).starts_with("run-ahead") { return; }
+        if crate::pool::current_job_label() == Some("JIT ahead") { return; }
         prev(info);
     }));
 }
@@ -5718,17 +5716,14 @@ impl Unit {
         // after the first present only the slots the program's own builds make (their callees),
         // not a speculative or tier-up build's, and no cold callee (panics, formatting): what
         // the UI thread's next calls most likely meet
-        // (a start that links cached code checks nothing ahead: ahead_helper's rule)
+        // (a start that links cached code checks nothing ahead: ahead_helper's rule; nor does a
+        // program that never presents once its startup is over: ahead_phase)
         if self.front.linked_start.load(Ordering::Relaxed) && crate::reload::edited_crates().is_empty() { return; }
-        if self.front.helpers > 0 && (startup_phase() || ahead_policy().post_present_helpers > 0 && ahead_foreground() && !match key {
+        if self.front.ahead_enabled && (startup_phase() || ahead_phase() && ahead_policy().ahead_after_present && ahead_foreground() && !match key {
             FnKey::Inst(d, _) => is_cold_def(&self.prog, &self.tcx, *d) || is_cold_name(&self.prog.def_path(*d)),
             _ => true,
         }) {
-            let mut q = self.front.queue.lock().unwrap_or_else(|e| e.into_inner());
-            q.push_back(AheadWork::Slot(id));
-            if !startup_phase() { spawn_helpers(&self.front, &q); }
-            drop(q);
-            self.front.wake.notify_one();
+            queue::ahead(self.front.clone(), id);
         }
     }
 
@@ -7712,13 +7707,7 @@ pub fn demand_compiled() -> u64 {
 /// progress: a busy queue is reported as busy and sampled again on the next tick.
 #[cfg(unix)]
 pub(crate) fn compile_progress() -> (Option<usize>, u64) {
-    let queued = (|| {
-        let spec = SPEC_Q.try_lock().ok()?.len();
-        let base = O2_QUEUE.try_lock().ok()?.len();
-        let tier = TIER_QUEUE.try_lock().ok()?.len();
-        Some(spec + base + tier)
-    })();
-    (queued, STARTUP_COMPILES.load(Ordering::Relaxed))
+    (Some(queue::counts().iter().sum()), STARTUP_COMPILES.load(Ordering::Relaxed))
 }
 /// O3 installs (read off the unit: run.rs's monitor)
 pub static TIER1_INSTALLS: AtomicU64 = AtomicU64::new(0);
@@ -7916,7 +7905,8 @@ unsafe fn compile_slot_on_stack_rt(up: *mut Unit, id: u32) -> u64 {
         if FIRST_PRESENT.load(Ordering::Relaxed) {
             rec.jobs = BG_ACTIVE.load(Ordering::Relaxed);
             let len = |n: Option<usize>| n.map_or(u32::MAX, |n| n as u32);
-            rec.queued = [len(SPEC_Q.try_lock().ok().map(|q| q.len())), len(O2_QUEUE.try_lock().ok().map(|q| q.len())), len(TIER_QUEUE.try_lock().ok().map(|q| q.len()))];
+            let counts = queue::counts();
+            rec.queued = [len(Some(counts[0] + counts[3])), len(Some(counts[1])), len(Some(counts[2]))];
         }
         MAIN_REC.with(|c| c.set(Some(rec)));
     }
@@ -9575,11 +9565,9 @@ static O2_LATER: relax_session::sync::Mutex<Vec<(usize, u32)>> = relax_session::
 /// The first present released the O2 worker's full builds.
 fn o2_release_later() {
     let later = std::mem::take(&mut *O2_LATER.lock().unwrap_or_else(|e| e.into_inner()));
-    // (also with nothing later: verified O1 rebuilds queued before the present wait for it)
-    let mut q = O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    let now = wall_ns();
-    crate::zone_alloc::kept_with(|| q.extend(later.into_iter().map(|(u, id)| (u, id, now))));
-    O2_WAKE.notify_one();
+    for (unit, id) in later { queue::o2(unit, id, queue::O2Kind::Normal, wall_ns()); }
+    // (also with nothing later: the verified O1 rebuilds queued before the present wait for it)
+    queue::wake();
 }
 
 fn o2_build() -> bool {
@@ -9628,29 +9616,15 @@ fn export_full() -> bool {
     EXPORT_FULL.try_with(|c| c.get()).unwrap_or(false)
 }
 
-/// `#[relax(O2)]` slots waiting for their O2 build: (unit, slot)
-/// the slot the O2 worker builds now (u32::MAX: none; makepad inspect `jit queue`)
-static O2_SLOT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
-/// (unit, slot, queued at wall_ns or O2_FRONT_AT)
-static O2_QUEUE: relax_session::sync::Mutex<Vec<(usize, u32, u64)>> = relax_session::sync::Mutex::new(Vec::new());
 /// slots ever queued (each is built once; live patches rebuild through the usual paths)
 static O2_SEEN: relax_session::sync::Mutex<Option<std::collections::HashSet<(usize, u32)>>> = relax_session::sync::Mutex::new(None);
-static O2_WAKE: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
-static O2_THREAD: std::sync::Once = std::sync::Once::new();
-/// the O2 worker is building one (O2 or a verified O1 rebuild) now
-pub(crate) static O2_RUNNING: AtomicBool = AtomicBool::new(false);
-
-/// O2 builds and verified O1 rebuilds queued, whether the O2 worker builds one now, and the
-/// worker's builds finished so far (installed or dropped; postframe::activity). Each queue's lock
-/// is taken alone, never nested.
-pub(crate) fn o2_counts() -> (u64, bool, u64) {
+/// O2 and verified O1 builds queued, running, and finished (installed or dropped).
+/// Reads the common queue counters without locking (postframe::activity).
+pub(crate) fn o2_counts() -> (u64, u64, u64) {
     use crate::cache::warm_count as wc;
-    let queued = O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).len()
-        + O2_BASE.lock().unwrap_or_else(|e| e.into_inner()).len()
-        + BORROW_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).len()
-        + O1V_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let queued = queue::counts()[1];
     let done = O2_STATS[0].load(Ordering::Relaxed) + O2_STATS[2].load(Ordering::Relaxed) + wc::get(wc::O1V_BUILT) + wc::get(wc::O1V_DROPPED);
-    (queued as u64, O2_RUNNING.load(Ordering::Relaxed), done)
+    (queued as u64, queue::running()[1] as u64, done)
 }
 /// O2 builds installed, their worker CPU ns (front + back end), dropped builds, the main
 /// thread's unit-lock wait ns while the O2 worker held it, and the number of such waits
@@ -9764,10 +9738,8 @@ unsafe fn o2_enqueue_front(up: *mut Unit, id: u32) {
             return;
         }
     }
-    O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).insert(0, (up as usize, id, O2_FRONT_AT));
+    queue::o2(up as usize, id, queue::O2Kind::Normal, O2_FRONT_AT);
     crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O2_QUEUED, 1, 0, 0);
-    O2_WAKE.notify_one();
-    o2_start(up);
 }
 
 /// The hottest slot queued for O3 by its calls or a loop that has no O2 build yet: the O2
@@ -9776,16 +9748,29 @@ unsafe fn o2_enqueue_front(up: *mut Unit, id: u32) {
 /// 3-core headset the hottest slot waited 136 s in it, running baseline code all along).
 fn o2_hottest_queued(offered: &std::collections::HashSet<(usize, u32)>) -> Option<(*mut Unit, u32)> {
     let up = TIER_UNIT.load(Ordering::Acquire);
-    if up.is_null() {
-        return None;
-    }
+    if up.is_null() { return None; }
     // (the queue's lock is not held while O2_SEEN is taken)
-    let mut hot: Vec<(u64, u32)> = tier_queue().unwrap_or_else(|e| e.into_inner()).iter()
-        .filter(|e| queued_hot(e.1) && !offered.contains(&(up as usize, e.0))).map(|e| (e.3, e.0)).collect();
-    hot.sort_unstable_by(|a, b| b.cmp(a));
+    let candidates = queue::tiers_where(|e| queued_hot(e.1) && !offered.contains(&(up as usize, e.0)));
     let seen = O2_SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    let id = hot.into_iter().map(|(_, id)| id).find(|id| !seen.as_ref().is_some_and(|m| m.contains(&(up as usize, *id))))?;
-    Some((up, id))
+    let now = HeatNow::take();
+    candidates.iter().filter(|e| !seen.as_ref().is_some_and(|s| s.contains(&(up as usize, e.0))))
+        .max_by_key(|e| (now.key(0, e.0, e.2), std::cmp::Reverse(e.2)))
+        .map(|e| (up, e.0))
+}
+
+/// Before every O2 build (and at a tick, for a queue with no O2 build to run) the hottest slot
+/// `o2_hottest_queued` finds is offered to `o2_hot` once, on the owner: one offer per build, as
+/// the O2 worker offered one before each of its builds, keeps the hot code's O2 builds coming
+/// as fast as they run (through a cold start the snapshot builds take the hot slots out of
+/// baseline / O1 code before the first frame).
+fn o2_offer_hottest() {
+    static OFFERED: std::sync::OnceLock<relax_session::sync::Mutex<std::collections::HashSet<(usize, u32)>>> = std::sync::OnceLock::new();
+    let offered = crate::zone_alloc::kept_with(|| OFFERED.get_or_init(Default::default));
+    let next = { let offered = offered.lock().unwrap_or_else(|e| e.into_inner()); o2_hottest_queued(&offered) };
+    if let Some((up, id)) = next {
+        crate::zone_alloc::kept_with(|| offered.lock().unwrap_or_else(|e| e.into_inner()).insert((up as usize, id)));
+        owner::publish(|| unsafe { o2_hot(up, id) });
+    }
 }
 
 /// Queues slot `id` (marked O2 or higher) for its O2 build on the O2 worker, once.
@@ -9796,21 +9781,10 @@ unsafe fn o2_enqueue(up: *mut Unit, id: u32) {
             return;
         }
     }
-    O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id, wall_ns()));
+    queue::o2(up as usize, id, queue::O2Kind::Normal, wall_ns());
     crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O2_QUEUED, 1, 0, 0);
-    O2_WAKE.notify_one();
-    o2_start(up);
 }
 
-unsafe fn o2_start(up: *mut Unit) {
-    // (kept: the thread outlives the compiler generation)
-    let runtime = crate::zone_alloc::kept_clone(&(&*up).prog.session.runtime);
-    O2_THREAD.call_once(move || {
-        { let _k = crate::zone_alloc::kept();
-        crate::lifeline::spawn("run-O2".into(), crate::lifeline::OnPanic::Restart, None, move || { let _z = crate::zone_alloc::compiler_thread(); o2_thread(&runtime) });
-        }
-    });
-}
 
 /// Baseline slots that keep running (a cost check under the threshold found a quarter of it: rt_hot): their
 /// O2 builds -- `hit` until the startup releases its workers after the first present
@@ -9820,10 +9794,6 @@ struct BaseSlots {
     hit: Vec<(usize, u32)>,
 }
 static BASE: relax_session::sync::Mutex<BaseSlots> = relax_session::sync::Mutex::new(BaseSlots { released: false, hit: Vec::new() });
-/// baseline slots waiting for their O2 build: (unit, slot, queued at wall_ns), served when
-/// O2_QUEUE is empty
-static O2_BASE: relax_session::sync::Mutex<std::collections::VecDeque<(usize, u32, u64)>> = relax_session::sync::Mutex::new(std::collections::VecDeque::new());
-
 /// Slot `id` runs baseline code -- built so the cold start compiles fast, but every launch that
 /// links it from the cache runs it again (unoptimised RIR, no inlining of user fns: a warm
 /// Calculator's first frame ran ~2x native in it). Baseline code that keeps running gets
@@ -9856,7 +9826,7 @@ const BASE_O2_DIV: u64 = 64;
 /// O2 builds, queued by the first O3 worker (drain_slow_base)
 static SLOW_BASE: relax_session::sync::Mutex<Vec<u32>> = relax_session::sync::Mutex::new(Vec::new());
 
-fn note_slow_base(u: &Unit, id: u32) {
+fn note_slow_base(_u: &Unit, id: u32) {
     // a program thread (rt_hot) never waits on the lock (rule I-CALL): busy, the slot is noted at
     // its next cost check
     if let Ok(mut g) = SLOW_BASE.try_lock() {
@@ -9867,7 +9837,7 @@ fn note_slow_base(u: &Unit, id: u32) {
             w0_wake();
         }
     }
-    TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime));
+    queue::start();
 }
 
 /// The first O3 worker's poll (no lock held): SLOW_BASE's O2 builds, and (at most once a second)
@@ -10017,8 +9987,8 @@ fn settle_tier_tick() {
     }
     // quiet, and the queues drained: no O3 / O2 build pending or running, no counted window open
     let (o2q, o2run, _) = o2_counts();
-    if now.saturating_sub(st.quiet_since) < SETTLE_QUIET_NS || o2q != 0 || o2run || !TIER_INBOX.is_empty() || pgo_counting()
-        || !tier_queue().unwrap_or_else(|e| e.into_inner()).is_empty() || !TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    if now.saturating_sub(st.quiet_since) < SETTLE_QUIET_NS || o2q != 0 || o2run != 0 || !TIER_INBOX.is_empty() || pgo_counting()
+        || queue::counts()[2] != 0 || !TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     {
         st.window_at = 0;
         return;
@@ -10233,19 +10203,12 @@ unsafe fn o2_base(up: *mut Unit, id: u32) -> bool {
     }
     u.fns[id as usize].hot_hint.store(true, Ordering::Relaxed);
     crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O2_QUEUED, 0, 0, 0);
-    {
-        // under O2_QUEUE's lock: the worker checks both queues under it before it waits
-        let _q = O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-        O2_BASE.lock().unwrap_or_else(|e| e.into_inner()).push_back((up as usize, id, wall_ns()));
-        O2_WAKE.notify_one();
-    }
-    o2_start(up);
+    queue::o2(up as usize, id, queue::O2Kind::Base, wall_ns());
     true
 }
 
 /// Verified O1 rebuilds (o1v): slots whose cache entry is to become verified O1 code, served by
 /// the O2 worker after its O2 work and only after the first present: (unit, slot)
-static O1V_QUEUE: relax_session::sync::Mutex<std::collections::VecDeque<(usize, u32)>> = relax_session::sync::Mutex::new(std::collections::VecDeque::new());
 /// slots ever queued for a verified O1 rebuild (each once)
 static O1V_SEEN: relax_session::sync::Mutex<Option<std::collections::HashSet<(usize, u32)>>> = relax_session::sync::Mutex::new(None);
 
@@ -10274,14 +10237,7 @@ unsafe fn o1v_enqueue(up: *mut Unit, id: u32, inlined: bool) {
         crate::zone_alloc::kept_with(|| O1V_STANDALONE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert((up as usize, id)));
     }
     crate::cache::warm_count::add(if inlined { crate::cache::warm_count::O1V_INLINED } else { crate::cache::warm_count::O1V_LATE }, 1);
-    {
-        // under O2_QUEUE's lock: the worker checks every queue under it before it waits
-        let _q = O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-        let mut q = O1V_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-        crate::zone_alloc::kept_with(|| q.push_back((up as usize, id)));
-        O2_WAKE.notify_one();
-    }
-    o2_start(up);
+    queue::o2(up as usize, id, queue::O2Kind::Verified, wall_ns());
 }
 
 /// A background build (O2, O3, a verified O1 rebuild) replaces the code that ran and becomes the
@@ -10348,8 +10304,7 @@ unsafe fn o1v_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     }
     // a lazy compile's back end for the slot is running: again later
     if f.inflight {
-        let mut q = O1V_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-        crate::zone_alloc::kept_with(|| q.push_back((up as usize, id)));
+        queue::o2(up as usize, id, queue::O2Kind::Verified, wall_ns());
         return None;
     }
     let rank = {
@@ -10402,53 +10357,14 @@ unsafe fn o1v_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
 /// code otherwise. The program's threads never wait for it: a call before the O2 code is
 /// installed runs O1 code compiled on demand as usual. Its code is the slot's ordinary cache
 /// entry, so warm launches link O2 code at the first call.
-fn o2_thread(runtime: &crate::options::RuntimeOptions) {
-    ensure_altstack();
-    lower_worker_priority(runtime);
-    // the O3-queued slots offered to `o2_hot` (one that gets no O2 build -- glue, no cache -- is
-    // not offered again)
-    let mut offered: std::collections::HashSet<(usize, u32)> = std::collections::HashSet::new();
-    loop {
-        if let Some((up, id)) = o2_hottest_queued(&offered) {
-            offered.insert((up as usize, id));
-            // (`o2_hot` on the owner, as an O3 worker does: it goes to the front of the queue)
-            owner::publish(|| unsafe { o2_hot(up, id) });
-        }
-        let next = {
-            let mut q = O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-            // each pop is its own statement: a lock guard in an `if let` chain's condition
-            // lives to the end of the chain (it was held across the wait below, and the owner
-            // waited for BORROW_QUEUE forever)
-            let borrowed = if q.is_empty() { BORROW_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).pop_front() } else { None };
-            let base = if q.is_empty() && borrowed.is_none() { O2_BASE.lock().unwrap_or_else(|e| e.into_inner()).pop_front().map(|e| (e.0, e.1)) } else { None };
-            let o1v = if q.is_empty() && borrowed.is_none() && base.is_none() && past_startup() {
-                O1V_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
-            } else { None };
-            if !q.is_empty() {
-                let e = q.remove(0);
-                Some(((e.0, e.1), false, false))
-            } else if let Some(x) = borrowed {
-                // (SPEC-V: base slots running their twins' code get their own)
-                Some((x, false, true))
-            } else if let Some(x) = base {
-                Some((x, false, false))
-            } else if let Some(x) = o1v {
-                // verified O1 rebuilds last, and never before the first frame
-                Some((x, true, false))
-            } else {
-                // a wake (a push here, or an O3 queue push: its hottest slot is looked at first)
-                crate::zone_alloc::compiler_hand_back_idle();
-                drop(O2_WAKE.wait(q).unwrap_or_else(|e| e.into_inner()));
-                None
-            }
-        };
-        let Some(((unit, id), o1, borrowed)) = next else { continue };
+fn run_o2(unit: usize, id: u32, kind: queue::O2Kind) {
+    let o1 = kind == queue::O2Kind::Verified;
+    let borrowed = kind == queue::O2Kind::Borrow;
         let _job = compile_job();
+        o2_offer_hottest();
         if !o1 {
             O2_TAKEN.fetch_add(1, Ordering::Relaxed);
         }
-        O2_SLOT.store(id, Ordering::Relaxed);
-        O2_RUNNING.store(true, Ordering::Relaxed);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let live = || {
                 let up = SPEC_UNIT.load(Ordering::Acquire);
@@ -10485,12 +10401,9 @@ fn o2_thread(runtime: &crate::options::RuntimeOptions) {
                 owner::publish(|| o2_finish(up, done));
             }
         }));
-        O2_SLOT.store(u32::MAX, Ordering::Relaxed);
-        O2_RUNNING.store(false, Ordering::Relaxed);
         if r.is_err() {
             if o1 { crate::cache::warm_count::add(crate::cache::warm_count::O1V_DROPPED, 1) } else { o2_drop(D_PANIC, std::ptr::null_mut(), id); }
         }
-    }
 }
 
 /// One O2 build, in three parts: its front (`o2_begin`, a unit call), the optimisation and code
@@ -10527,7 +10440,7 @@ unsafe fn o2_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     }
     // a lazy compile's back end for the slot started since o2_thread looked: again later
     if (&*up).fns[id as usize].inflight {
-        crate::zone_alloc::kept_with(|| O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id, wall_ns())));
+        crate::zone_alloc::kept_with(|| queue::o2(up as usize, id, queue::O2Kind::Normal, wall_ns()));
         o2_noop(N_REQUEUED);
         return None;
     }
@@ -10603,11 +10516,13 @@ struct O2Done {
 
 impl O2Work {
     fn run(self) -> O2Done {
+        compile_checkpoint();
         let O2Work { id, capture_unit, prep, epoch, snapshot, o1, session, env, fold, layout, lc, t0 } = self;
         let options = &session.options;
         let mut done: Vec<Deferred> = Vec::new();
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let (func, inlined) = optimize_tree(options, id, prep, &mut done)?;
+            compile_checkpoint();
             let cg = tier0_codegen_rir(options, &func, fold, layout);
             crate::wasm_export::capture(capture_unit, id, &cg);
             let cg = with_loop_counters(cg, lc);
@@ -10792,8 +10707,10 @@ fn me() -> u64 {
 }
 
 /// Marks a background driver thread (stats: its type checks ahead count as workers').
-fn set_worker() {
-    IS_WORKER.with(|w| w.set(true));
+/// This pool thread now runs a tier-up or speculative build (`true`) or checks ahead of the
+/// program's own builds (`false`: their rules, ahead_foreground).
+fn set_worker(worker: bool) {
+    IS_WORKER.with(|w| w.set(worker));
 }
 
 /// The calling thread's id (os thread id).
@@ -10838,6 +10755,7 @@ unsafe fn wait_inflight(up: *mut Unit, id: u32) {
     if BATCH_FLIGHT.with(|b| b.borrow().contains(&id)) {
         return;
     }
+    let _priority = main_discovery().then(|| queue::promote(up as usize, id));
     owner::busy_if_nested();
     owner::pump_wait(&|| !(&*up).fns[id as usize].inflight);
 }
@@ -11049,7 +10967,7 @@ fn drop_completed_body(u: &mut Unit, id: u32) {
             })
         }));
     if !drop_rir && !drop_body { return; }
-    let queue = tier_queue().unwrap_or_else(|e| e.into_inner());
+    let queue = queue::tiers();
     let active = TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
     if queue.iter().any(|x| x.0 == id) || active.contains(&id) { return; }
     let before = crate::memstat::live_total();
@@ -11148,7 +11066,7 @@ impl SettleSweep {
                     self.n = u.fns.len();
                     // the O3 queue and the builds running: they and their known RIR inputs keep
                     // their RIR (each queued caller would check the shared callees again)
-                    self.pinned = tier_queue().unwrap_or_else(|e| e.into_inner()).iter().map(|x| x.0)
+                    self.pinned = queue::tiers().iter().map(|x| x.0)
                         .chain(TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).iter().copied()).collect();
                     // aot: the slots whose callees are speculated after the burst keep their RIR until then
                     self.pinned.extend(AOT_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|x| x.0 == up as usize).map(|x| x.1));
@@ -11223,7 +11141,7 @@ impl SettleSweep {
                 }
                 SWEEP_RIR => {
                     // what is queued or building at O3 now keeps its RIR as well
-                    self.pinned.extend(tier_queue().unwrap_or_else(|e| e.into_inner()).iter().map(|x| x.0));
+                    self.pinned.extend(queue::tiers().iter().map(|x| x.0));
                     self.pinned.extend(TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).iter().copied());
                     let end = self.n.min(self.at.saturating_add(budget));
                     for id in self.at..end {
@@ -12380,6 +12298,7 @@ type Deferred = (u32, Result<(relax_backend::rir::Func, Vec<(u32, usize)>), Stri
 /// optimize_rir after optimising the deferred inline candidates (bottom-up), which then
 /// inline like candidates that were ready. Their results come back for store_rir.
 fn optimize_tree(options: &crate::options::Options, id: u32, mut prep: Prep, done: &mut Vec<Deferred>) -> Result<(relax_backend::rir::Func, Vec<(u32, usize)>), String> {
+    compile_checkpoint();
     let _cost = relax_codegen::fncost::Record::ensure(id, 0, "ahead");
     relax_codegen::fncost::size(true, &prep.func);
     let _cost_opt = relax_codegen::fncost::phase(4);
@@ -12678,6 +12597,7 @@ const EXPORT_DEST_SLOT: u32 = 8;
 /// Fatal: a broken function panics with the pass's name (an ICE for the build: the body is
 /// never compiled from broken RIR). The gates' diff_fast legs turn it on.
 fn verify_pass(func: &relax_backend::rir::Func, pass: &str) {
+    compile_checkpoint();
     if let Err(e) = func.verify_after(pass) {
         panic!("makepad: {}\n{}", e, func.dump());
     }
@@ -12955,11 +12875,10 @@ unsafe fn load_modules(up: *mut Unit, mods: &[u32], why: &str) {
     }
 }
 
-pub fn start_completion(up: *mut Unit, runtime: &crate::options::RuntimeOptions) {
+pub fn start_completion(up: *mut Unit) {
     if std::env::var("MAKEPAD_RUN_LAZY_COMPLETE").is_ok_and(|v| v == "0") { return; }
     if unsafe { (*up).prog.skipped_files.is_empty() } { return; }
     let upn = up as usize;
-    let runtime = crate::zone_alloc::kept_clone(runtime);
     { let _k = crate::zone_alloc::kept();
     let _ = std::thread::Builder::new().name("run-complete".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
         let up = upn as *mut Unit;
@@ -12967,8 +12886,8 @@ pub fn start_completion(up: *mut Unit, runtime: &crate::options::RuntimeOptions)
             if crate::preempt::is_stopped() { return; }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        lower_worker_priority(&runtime);
-        set_worker();
+        makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
+        set_worker(true);
         {
             let _r = front_read("completion indexes");
             unsafe { (*up).prog.warm_skipped_indexes() };
@@ -13781,10 +13700,12 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         prep_ns.set(prep_ns.get() + cpu_ns() - tp);
         r
     };
+    compile_checkpoint();
     let mut inlined = tier1_simplify(options, func, id, name, get, &prepared, single, ro, cfg, nounwind, frequencies, inline_stats.as_mut(), None, None, hot);
     if let Some(st) = inline_stats.as_mut() {
         crate::inspect::remarks::record_inline(id, std::mem::take(&mut st.remarks));
     }
+    compile_checkpoint();
     bodies.expand(&mut inlined);
     TIER1_PREP[0].fetch_add(prep_ns.get(), Ordering::Relaxed);
     TIER1_PREP[2].fetch_add(bodies.index.borrow().values().filter(|b| b.is_some()).count() as u64, Ordering::Relaxed);
@@ -13799,6 +13720,7 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     // a second round reaches the loop around an unrolled inner one
     let mut unrolled = false;
     for _ in 0..2 {
+        compile_checkpoint();
         if !(cfg.fold && relax_codegen::loops::unroll_const_loops(options, func)) {
             break;
         }
@@ -14259,6 +14181,7 @@ impl<'a> InlineBodies<'a> {
 /// `inlined_only`: receives the body after the first inlining round, before any optimisation,
 /// with the callees that round inlined.
 fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::rir::Func, id: u32, name: &str, get: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, u8)>, prepared: &dyn Fn(u32) -> Option<(*const relax_backend::rir::Func, *const relax_backend::rir::Func)>, single: &dyn Fn(u32, u32) -> bool, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg, nounwind: &dyn Fn(u32) -> bool, frequencies: &mut dyn FnMut(usize, &relax_backend::rir::Func) -> Option<Vec<f32>>, mut inline_stats: Option<&mut relax_codegen::opt::InlineStats>, inlined_only: Option<&mut (relax_backend::rir::Func, Vec<(u32, usize)>)>, growth_cap: Option<usize>, hot: bool) -> Vec<(u32, usize)> {
+    compile_checkpoint();
     let mut limits = relax_codegen::opt::InlineLimits::tier1_for(func, hot);
     // a wasm export's O3 body ships: size-first at its cold sites
     limits.cold_tiny = export_o3_mode() && crate::wasm_export::o3_cold_tiny();
@@ -14290,6 +14213,7 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
     if let Some(raw) = inlined_only {
         *raw = (func.clone(), inlined.clone());
     }
+    compile_checkpoint();
     opt_pipeline(options, func, ro, cfg, layout_for(options, name), true, nounwind);
     // optimisation exposes calls inlining could not see (a call through a known fn address
     // became a direct call: `.map(GlyphId)`): one more inlining round for them
@@ -14308,6 +14232,7 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
             relax_backend::passes::simplify(options, func, ro, cfg.imm, cfg.cse);
             // simplify merges the blocks a copy and its reads were split over: forward again
             for _ in 0..2 {
+                compile_checkpoint();
                 if !(cfg.sroa && (relax_codegen::opt::forward_const_slots(func, ro) | relax_codegen::opt::forward_slot_copies(func) | relax_codegen::opt::forward_slot_dests(func) | relax_codegen::opt::forward_slot_dests_x(options, func, if export_o3_mode() { EXPORT_DEST_SLOT } else { BIG_SLOT }) | relax_codegen::opt::forward_slot_loads(func))) {
                     break;
                 }
@@ -14329,6 +14254,7 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
 fn slot_cleanup(options: &crate::options::Options, func: &mut relax_backend::rir::Func, ro: Option<relax_backend::passes::RoReader>, cfg: &relax_codegen::opt::OptCfg) {
     {
         for _ in 0..3 {
+            compile_checkpoint();
             // field-wise copies (a derived Clone's loads and stores) as one copy, which the
             // passes below forward and join along; MAKEPAD_RUN_OPT=-copyruns
             let ch = !relax_backend::stats::opt_off(options, "-copyruns") && relax_codegen::opt::merge_copy_runs(func);
@@ -14780,7 +14706,7 @@ fn progress_start() {
 /// O3 builds queued, and running now, with the slot of one running (postframe::activity: the
 /// run's JIT ring, makepad inspect `jit`).
 pub(crate) fn o3_counts() -> (u64, u64, Option<u32>) {
-    let queued = tier_queue().map_or(0, |q| q.len()) as u64;
+    let queued = queue::counts()[2] as u64;
     let active = TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
     (queued, active.len() as u64, active.first().copied())
 }
@@ -14799,7 +14725,7 @@ fn o3_progress_write(last: &mut std::time::Instant) -> bool {
     }
     *last = std::time::Instant::now();
     // (PGO: slots in their counting window are O3 builds to come)
-    let pending = tier_queue().map_or(0, |q| q.len()) + TIER_ACTIVE.lock().map_or(0, |a| a.len()) + usize::from(startup_holds_tier1())
+    let pending = queue::counts()[2] + TIER_ACTIVE.lock().map_or(0, |a| a.len()) + usize::from(startup_holds_tier1())
         + COUNTING.lock().map_or(0, |c| c.iter().filter(|e| !e.parked).count());
     let line = format!("{} {}\n", pending, TIER1_INSTALLS.load(Ordering::Relaxed));
     // an unchanged state is not written again (a reader sees the same file)
@@ -14820,7 +14746,7 @@ fn sampler_thread() {
     // macOS coalesces the timers of background-QoS threads (a process started from a
     // daemon or a script): a 2 ms sleep then lasts tens of ms and loops never get enough
     // samples to tier up. The sampler asks for interactive QoS (no coalescing).
-    os::thread::interactive();
+    makepad_cpu_budget::set_thread_class(makepad_cpu_budget::INTERACTIVE);
     let mut wait = os::sample::Wait::new();
     let mut pcs: Vec<os::sample::Sample> = Vec::with_capacity(4096);
     let mut selfs: Vec<os::sample::Sample> = Vec::with_capacity(1024);
@@ -14957,9 +14883,8 @@ impl Drop for Unit {
         // checks ahead in flight finish against this unit's program first
         {
             let _w = front_write();
-            self.front.alive.store(false, Ordering::SeqCst);
+            queue::retire_front(&self.front);
         }
-        self.front.wake.notify_all();
         lowered_end();
         // Only the unit the process-wide O3 machinery (tier threads: TIER_UNIT; sampler:
         // UNIT) can reach is stopped, and its lock is kept: a build that loaded the pointer
@@ -15032,9 +14957,9 @@ pub unsafe fn retire_unit(up: *mut Unit) {
         if SPEC_UNIT.load(Ordering::Acquire) == up {
             SPEC_UNIT.store(std::ptr::null_mut(), Ordering::Release);
         }
-        // its queued ids too when speculation is on another unit: a unit allocated at its
+        // its queued ids, also when speculation is on another unit: a unit allocated at its
         // address later must not take them
-        SPEC_Q.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(unit, _)| unit != up as usize);
+        queue::retain(|job| !matches!(job, queue::Job::Spec(unit, _) if *unit == up as usize));
         if UNIT == up {
             UNIT = std::ptr::null_mut();
         }
@@ -15072,7 +14997,7 @@ fn trace_build(u: &Unit, id: u32, what: &str, build_ns: u64) {
         Q_WHY.get(why as usize).copied().unwrap_or("?"),
         now.saturating_sub(at) as f64 / 1e6,
         build_ns as f64 / 1e6,
-        tier_queue().unwrap_or_else(|e| e.into_inner()).len()
+        queue::tiers().len()
     );
 }
 
@@ -15092,7 +15017,7 @@ unsafe fn queue_now(u: &Unit, id: u32, why: u8, rate: u64) {
         let _ = s.compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
         TIER_QUEUED.fetch_add(1, Ordering::Relaxed);
         tier_push(id, why, rate);
-        TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime));
+        queue::start();
     }
 }
 
@@ -15447,6 +15372,12 @@ impl HeatNow {
         HeatNow { hu: heat_unit(), wall: wall_ns(), tier: tier_clock() }
     }
 
+    fn key(&self, unit: usize, id: u32, at: u64) -> u64 {
+        let (heat, ui) = self.heat(unit, id);
+        if at == O2_FRONT_AT { queue::heat_key(heat, ui, 0) + 64 * 1024 }
+        else { queue::heat_key(heat, ui, self.wall.saturating_sub(at)) }
+    }
+
     /// Slot `id`'s heat and UI mark (`unit` 0: the tiering unit; another unit's slot: none).
     fn heat(&self, unit: usize, id: u32) -> (u64, bool) {
         match self.hu {
@@ -15783,15 +15714,11 @@ impl Drop for TierActive {
 /// queued O3 builds: (slot, why: Q_*, queued at wall_ns, rate at enqueue: cost units per second, or a
 /// counted window's RIR instructions per second for Q_PROFILED). The workers' ordered
 /// set (OWNERARCH.DESIGN.md §5.3): program threads never take it -- a count stub (rt_hot) pushes
-/// onto TIER_INBOX, which every holder drains first (tier_queue).
-static TIER_QUEUE: relax_session::sync::Mutex<Vec<(u32, u8, u64, u64)>> = relax_session::sync::Mutex::new(Vec::new());
+/// onto TIER_INBOX, which the common queue drains before selecting work.
 /// rt_hot's queue (rule I-CALL: atomics only): a Treiber stack of slots through their tier records'
 /// link words; the T_COUNTING -> T_QUEUED CAS puts a slot in it at most once.
 static TIER_INBOX: crate::lockfree::IdStack = crate::lockfree::IdStack::new();
-/// the O3 workers parked on the queue, and a counter every push bumps (SeqCst) before waking them:
-/// a worker that saw the queue empty under TIER_QUEUE sleeps only while the counter it read then
-/// is unchanged (the Dekker pair of Sleepers rules out a lost wakeup)
-static TIER_SLEEPERS: crate::lockfree::Sleepers = crate::lockfree::Sleepers::new();
+/// Queue activity generation, sampled by periodic housekeeping to detect idle work.
 static TIER_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// A slot's TIER_INBOX link word: the low half of its tier record's word 6 (both targets are
@@ -15806,7 +15733,7 @@ unsafe fn tier_why<'a>(rec: *const AtomicU64) -> &'a std::sync::atomic::AtomicU3
 }
 
 /// Puts slot `id` (just moved T_COUNTING -> T_QUEUED by the caller) on TIER_INBOX with its reason
-/// and rate (published by the push's release); a worker moves it into TIER_QUEUE (tier_drain).
+/// and rate (published by the push's release); a pool worker moves it into the common queue.
 /// Atomics only: program threads call it (rt_hot, rt_loop_hot).
 unsafe fn tier_inbox_push(rec: *const AtomicU64, id: u32, why: u8, rate: u64) {
     (*rec.add(7)).store(rate, Ordering::Relaxed);
@@ -15815,22 +15742,8 @@ unsafe fn tier_inbox_push(rec: *const AtomicU64, id: u32, why: u8, rate: u64) {
     tier_wake();
 }
 
-/// TIER_QUEUE, with what rt_hot pushed since moved into it (in push order, oldest first).
-fn tier_queue() -> std::sync::LockResult<relax_session::sync::MutexGuard<'static, Vec<(u32, u8, u64, u64)>>> {
-    match TIER_QUEUE.lock() {
-        Ok(mut q) => {
-            tier_drain(&mut q);
-            Ok(q)
-        }
-        Err(e) => {
-            let mut q = e.into_inner();
-            tier_drain(&mut q);
-            Err(std::sync::PoisonError::new(q))
-        }
-    }
-}
+fn drain_tier_inbox() {
 
-fn tier_drain(q: &mut Vec<(u32, u8, u64, u64)>) {
     if TIER_INBOX.is_empty() {
         return;
     }
@@ -15848,8 +15761,9 @@ fn tier_drain(q: &mut Vec<(u32, u8, u64, u64)>) {
         let rec = tier_rec(slots, id);
         let rate = unsafe { (*rec.add(7)).load(Ordering::Relaxed) };
         let why = unsafe { tier_why(rec).load(Ordering::Relaxed) } as u8;
-        tier_push_locked(q, id, why, rate, now);
+        tier_push_locked(id, why, rate, now);
     }
+
 }
 
 /// Slot `id`, queued for O3 by its calls or loops at cost rate `rate`, stays queued: a worker took
@@ -15875,7 +15789,7 @@ pub(crate) fn record_queued_at_exit(u: &mut Unit) {
     }
     let revalidate = ahead_policy().o3_revalidate;
     let now = wall_ns();
-    let keep: Vec<(u32, u64)> = tier_queue().unwrap_or_else(|e| e.into_inner()).iter()
+    let keep: Vec<(u32, u64)> = queue::tiers().iter()
         .filter(|e| matches!(e.1, Q_CALLS | Q_LOOP) && (e.0 as usize) < u.fns.len()
             && !(revalidate && unsafe { queued_gone_cold(tier_rec(&u.slots, e.0), e.2, now, threshold) }))
         .map(|e| (e.0, e.3)).collect();
@@ -15885,19 +15799,17 @@ pub(crate) fn record_queued_at_exit(u: &mut Unit) {
     }
 }
 
-/// A push happened (rt_hot's, or one under TIER_QUEUE): one parked worker looks.
+/// A tier push happened: one parked pool worker looks.
 #[inline]
 fn tier_wake() {
     TIER_GEN.fetch_add(1, Ordering::SeqCst);
-    TIER_SLEEPERS.wake_one();
-    // the O2 worker builds the hottest queued slots first (`o2_hottest_queued`)
-    O2_WAKE.notify_one();
+    queue::wake();
 }
 
 /// Every parked worker looks (stop, admission changes).
 fn tier_wake_all() {
     TIER_GEN.fetch_add(1, Ordering::SeqCst);
-    TIER_SLEEPERS.wake_all();
+    queue::wake_all();
 }
 const Q_CALLS: u8 = 0;
 const Q_LOOP: u8 = 1;
@@ -16041,9 +15953,7 @@ pub(crate) fn specv_release() {
     if (s == 1 || s == 2) && SPECV_HOLD.compare_exchange(s, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
         let held = std::mem::take(&mut *O1V_HELD.lock().unwrap_or_else(|e| e.into_inner()));
         if !held.is_empty() {
-            let _q = O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-            crate::zone_alloc::kept_with(|| O1V_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).extend(held));
-            O2_WAKE.notify_one();
+            for (unit, id) in held { queue::o2(unit, id, queue::O2Kind::Verified, wall_ns()); }
         }
         SPECV_RELEASES.fetch_add(1, Ordering::Relaxed);
         SWEPT.store(u64::MAX, Ordering::Relaxed);
@@ -16277,22 +16187,13 @@ pub(crate) static SPECV_BORROWS_OWN: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TWINS_RAN: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LAZY_FRONTS: AtomicU64 = AtomicU64::new(0);
 
-/// base slots running borrowed twin code, waiting for their own build (the O2 worker serves them
-/// after O2_QUEUE): (unit, slot)
-static BORROW_QUEUE: relax_session::sync::Mutex<std::collections::VecDeque<(usize, u32)>> = relax_session::sync::Mutex::new(std::collections::VecDeque::new());
-
 /// SPEC-V: slot `id` runs borrowed twin code: its own build in the background (O2 worker: the
 /// cache's entry when it has one, else an O2 build). Owner thread.
 unsafe fn borrow_build_enqueue(up: *mut Unit, id: u32) {
     // (an O2 build: marked hot, as o2_base marks the slots it queues)
     (&*up).fns[id as usize].hot_hint.store(true, Ordering::Relaxed);
     O2_SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert((up as usize, id));
-    {
-        let _q = O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-        crate::zone_alloc::kept_with(|| BORROW_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push_back((up as usize, id)));
-        O2_WAKE.notify_one();
-    }
-    o2_start(up);
+    crate::zone_alloc::kept_with(|| queue::o2(up as usize, id, queue::O2Kind::Borrow, wall_ns()));
 }
 
 /// SPEC-V: at most this many callees are built ahead of one replacement's install (prebuild_callees)
@@ -16985,11 +16886,9 @@ pub(crate) fn tier_explain(u: &Unit, id: u32) -> (String, Vec<(String, String)>)
     // the O3 queue and the build running now
     let active = TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).contains(&id);
     let queued = {
-        let q = TIER_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         let inbox = !TIER_INBOX.is_empty();
-        q.iter().find(|e| e.0 == id).map(|&(_, why, at, rate)| {
-            let ahead = q.iter().filter(|e| (e.3, std::cmp::Reverse(e.2)) > (rate, std::cmp::Reverse(at))).count();
-            format!("waiting ({}, {}/s) for {}, {} of {} entries go first", Q_WHY[why as usize], rate, ms(now.saturating_sub(at)), ahead, q.len())
+        queue::tier_position(id).map(|((_, why, at, _), ahead, total)| {
+            format!("waiting ({}) for {}, {} of {} jobs go first", Q_WHY[why as usize], ms(now.saturating_sub(at)), ahead, total)
         }).or_else(|| (inbox && state == T_QUEUED).then(|| "in rt_hot's inbox (moved into the queue by the next worker)".to_string()))
     };
     rows.push(("O3 queue".into(), match (&queued, active) { (_, true) => "its O3 build runs now".into(), (Some(q), _) => q.clone(), (None, _) => "not in it".into() }));
@@ -17064,112 +16963,25 @@ pub(crate) fn tier_explain(u: &Unit, id: u32) -> (String, Vec<(String, String)>)
 
 fn tier_push(id: u32, why: u8, rate: u64) {
     crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::QUEUE, why, rate, 0);
-    let mut q = tier_queue().unwrap_or_else(|e| e.into_inner());
-    tier_push_locked(&mut *q, id, why, rate, wall_ns());
-    drop(q);
-    tier_wake();
+    tier_push_locked(id, why, rate, wall_ns());
+    // (the push woke a worker if the entry can start)
+    TIER_GEN.fetch_add(1, Ordering::SeqCst);
 }
 
-fn tier_push_locked(q: &mut Vec<(u32, u8, u64, u64)>, id: u32, why: u8, rate: u64, now: u64) {
+fn tier_push_locked(id: u32, why: u8, rate: u64, now: u64) {
     TIER_PUSHES.fetch_add(1, Ordering::Relaxed);
     busy::note(busy::PUSH + (why as usize).min(Q_WHY.len() - 1));
-    q.push((id, why, now, rate));
+    queue::push(queue::Job::O3((id, why, now, rate)), now);
     if tier1_trace() {
         // no unit lock here (rt_hot): the slot, not its name
-        eprintln!("O3q @{:.3} queued #{} ({}) q={}", wall_ns() as f64 / 1e9, id, Q_WHY[why as usize], q.len());
+        eprintln!("O3q @{:.3} queued #{} ({}) q={}", wall_ns() as f64 / 1e9, id, Q_WHY[why as usize], queue::counts()[2]);
     }
 }
 
-/// The highest rate first (cost units per second since the slot's last check; a
-/// counted window's work, RIR instructions per second), then the oldest. One scan: O(queue), ~1,000 cheap
-/// compares for a build that takes milliseconds.
-fn tier_pop(q: &mut Vec<(u32, u8, u64, u64)>) -> Option<(u32, u8, u64, u64)> {
-    let best = q.iter().enumerate().max_by_key(|(k, e)| (e.3, std::cmp::Reverse(e.2), std::cmp::Reverse(*k))).map(|(k, _)| k)?;
-    Some(q.remove(best))
-}
-static TIER_THREAD: std::sync::Once = std::sync::Once::new();
+/// Common queue admission order, including running jobs, class, heat, age and blocking reason.
+pub(crate) fn queue_view(n: usize) -> Vec<String> { queue::view(n) }
 
-/// makepad inspect `jit queue [n=10]`: what the JIT builds now and the next `n` of the O3 and O2
-/// queues in the order they are taken (O3: tier_pop's; O2: the O2 queue, then baseline code), one
-/// line each: heat now as a multiple of the O3 threshold (`ui`: on the UI thread's path), why
-/// queued, seconds waited (`hot`: o2_hot's build), the fn. Locks each queue for one scan.
-pub(crate) fn queue_view(n: usize) -> Vec<String> {
-    let now = HeatNow::take();
-    let th = now.hu.map_or(1, |x| x.1).max(1) as f64;
-    let name = |id: u32| slot_name(id).map_or_else(|| format!("S{id}"), |s| crate::postframe::short_fn(&s));
-    let row = |tier: &str, unit: usize, id: u32, at: u64, why: &str| {
-        let (h, ui) = now.heat(unit, id);
-        let waited = if at == O2_FRONT_AT { "hot".to_string() } else { format!("{:.1}s", now.wall.saturating_sub(at) as f64 / 1e9) };
-        format!("{tier} {:.2}x{} {why} {waited} {} (S{id})", h as f64 / th, if ui { " ui" } else { "" }, name(id))
-    };
-    let mut out = Vec::new();
-    let active: Vec<u32> = TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let o2 = O2_SLOT.load(Ordering::Relaxed);
-    let mut now_line = format!("building: O3 {}", active.len());
-    for id in &active {
-        now_line += &format!(" [{}]", name(*id));
-    }
-    now_line += &if o2 != u32::MAX { format!("; O2 [{}]", name(o2)) } else { "; O2 idle".into() };
-    now_line += &format!("; ahead {} queued", ahead_queued());
-    out.push(now_line);
-    let mut o3: Vec<(u32, u8, u64, u64)> = {
-        let q = tier_queue().unwrap_or_else(|e| e.into_inner());
-        let hot = q.iter().filter(|e| now.heat(0, e.0).0 as f64 >= th).count();
-        out.push(format!("O3 queue {} ({} at or over the threshold now), next {}:", q.len(), hot, n.min(q.len())));
-        q.clone()
-    };
-    // (tier_pop's order: the highest rate queued at, then the oldest)
-    o3.sort_by_key(|e| (std::cmp::Reverse(e.3), e.2));
-    out.extend(o3.iter().take(n).map(|e| row("O3", 0, e.0, e.2, Q_WHY.get(e.1 as usize).copied().unwrap_or("?"))));
-    let q = O2_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let b: Vec<(usize, u32, u64)> = O2_BASE.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
-    out.push(format!("O2 queue {} + baseline {}, next {}:", q.len(), b.len(), n.min(q.len() + b.len())));
-    out.extend(q.iter().map(|e| (e, "o2")).chain(b.iter().map(|e| (e, "base"))).take(n).map(|(e, why)| row("O2", e.0, e.1, e.2, why)));
-    out
-}
-
-/// The level's O3 workers (`o3_threads`) always run. A level with `o3_burst` also starts burst workers
-/// (user, 10-22: every performance core but one, the program's main thread's): after the first present,
-/// while the queue is not trivial, burst worker j builds only while more than O3_BURST_PER * (j + 1)
-/// builds wait (hottest first, tier_pop), so a cold app's backlog (thousands of builds) drains on every
-/// performance core and a short queue on a few; once it drains they sleep on the queue (no polling:
-/// 0% CPU) and the lean policy is back. They run at the
-/// same priority as the other workers (below the program's threads, performance cores) and, like
-/// every worker past the first, only while the program's threads have no lazy compile in flight.
-/// MAKEPAD_RUN_O3_BURST=0 (A/B) keeps the level's workers only; MAKEPAD_RUN_O3_THREADS a fixed pool.
-fn spawn_tier1_threads(runtime: &crate::options::RuntimeOptions) {
-    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
-    let cap = cores.saturating_sub(1).max(1);
-    let forced = runtime.tier1_threads;
-    let (normal, max) = if let Some(n) = forced {
-        let n = n.clamp(1, cap);
-        (n, n)
-    } else {
-        let n = 3.min(cap).min(ahead_policy().o3_threads);
-        let burst = if runtime.tier1_burst && ahead_policy().o3_burst { os::thread::performance_cores().saturating_sub(1).min(cap) } else { 0 };
-        (n, burst.max(n))
-    };
-    for k in 0..max {
-        let runtime = crate::zone_alloc::kept_clone(runtime);
-        { let _k = crate::zone_alloc::kept();
-        crate::lifeline::spawn(format!("run-o3-{}", k), crate::lifeline::OnPanic::Restart, None, move || { let _z = crate::zone_alloc::compiler_thread(); tier1_thread(&runtime, k, normal) });
-        }
-    }
-}
-
-/// queued builds per burst worker (spawn_tier1_threads)
-const O3_BURST_PER: usize = 8;
-
-/// Burst worker `j` (0 = the first past the level's workers) may build now: the program is past
-/// its startup (past_startup) and more than O3_BURST_PER * (j + 1) builds wait.
-fn tier1_burst_admits(j: usize, queued: usize) -> bool {
-    // only while the UI thread has not waited on the JIT for a second: a level load's thousands
-    // of lazy compiles (each typed and lowered on the UI thread) never share the cores with the
-    // burst (the user's cold Sandbox: 11 burst workers ran through the 'leap' load)
-    past_startup() && queued > O3_BURST_PER * (j + 1) && crate::postframe::ui_idle_ns() >= BURST_UI_QUIET_NS
-}
-
-/// the UI thread's JIT-idle time burst workers wait for
+/// The UI must be quiet this long before concurrent non-Interactive builds resume.
 const BURST_UI_QUIET_NS: u64 = 1_000_000_000;
 
 /// Opt-in only: no extra clocks, pass timing, allocations or statistics locks when off.
@@ -17349,7 +17161,7 @@ static W0_IDLING: AtomicBool = AtomicBool::new(false);
 
 fn w0_wake() {
     if W0_IDLING.swap(false, Ordering::SeqCst) {
-        TIER_SLEEPERS.wake_one();
+        queue::wake();
     }
 }
 
@@ -17854,7 +17666,7 @@ fn profiled_heat() {
     if PROFILED_HEAT.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
         return;
     }
-    let queued: std::collections::HashSet<u32> = tier_queue().unwrap_or_else(|e| e.into_inner()).iter().filter(|e| e.1 == Q_PROFILED).map(|e| e.0).collect();
+    let queued: std::collections::HashSet<u32> = queue::tiers().iter().filter(|e| e.1 == Q_PROFILED).map(|e| e.0).collect();
     let mut g = PROFILED_HEAT.lock().unwrap_or_else(|e| e.into_inner());
     g.retain_mut(|e| unsafe {
         if e.id as usize >= u.fns.len() || !queued.contains(&e.id) {
@@ -18123,134 +17935,39 @@ fn rt_hot(slot: u64) -> u64 {
         if (*rec.add(3)).compare_exchange(T_COUNTING, T_QUEUED, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
             TIER_QUEUED.fetch_add(1, Ordering::Relaxed);
             // queued without a lock (rule I-CALL): the rate in the record (published by the push's
-            // release), the slot on TIER_INBOX; the workers move it into TIER_QUEUE (tier_drain).
+            // release), the slot on TIER_INBOX; the workers move it into the common queue.
             // A hot loop's cost made it hot: queued for its loops (never lukewarm)
             note_ui_path(rec);
             let why = if (*rec.add(5)).load(Ordering::Relaxed) & LOOP_CHARGED != 0 { Q_LOOP } else { Q_CALLS };
             crate::inspect::tierlog::note(slot as u32, crate::inspect::tierlog::ev::QUEUE, why, rate, code);
             tier_inbox_push(rec, slot as u32, why, rate);
-            TIER_THREAD.call_once(|| spawn_tier1_threads(&u.prog.session.runtime));
+            queue::start();
         }
         s.load(Ordering::SeqCst)
     }
 }
 }
 
-/// Runs this compile worker (speculation, O3: never the critical path, which the program's
-/// own threads compile) below the program's threads, so a launched app's background compiles
-/// do not take the CPU from a UI -- its own, or a launcher's (the runner's frames stuttered to
-/// 208 ms under a child's workers). macOS: the default QoS class at relative priority -15
-/// (still on performance cores; QOS_CLASS_UTILITY made startup 9-14% slower on the mini);
-/// Linux: nice +5 per thread; Windows: THREAD_PRIORITY_BELOW_NORMAL.
-/// MAKEPAD_RUN_WORKER_QOS=0 keeps the default, =utility uses QOS_CLASS_UTILITY (A/B).
-/// Background-thread priority for this thread (the cache's pruning).
-pub fn lower_this_thread_priority(runtime: &crate::options::RuntimeOptions) {
-    lower_worker_priority(runtime);
-}
 
-fn lower_worker_priority(runtime: &crate::options::RuntimeOptions) {
-    // aot-min: every background compile thread in the OS background class
-    if ahead_policy().background_class {
-        os::thread::background();
-        return;
-    }
-    let mode = runtime.worker_qos as u8;
-    if mode == 0 {
-        return;
-    }
-    os::thread::lower_priority(mode == 2);
-}
 
-fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usize) {
-    let _mem = crate::memstat::tag(crate::memstat::Tag::Tier1);
-    ensure_altstack();
-    lower_worker_priority(runtime);
-    TIER_SLEEPERS.register(k);
-    // the first worker's idle look: what its polls serve, and polls in a row it stayed the same
-    let (mut w0_seen, mut w0_still) = (w0_activity(), 0u32);
-    loop {
-        if k == 0 {
-            crate::lifeline::beat();
-        }
-        // PGO: every worker closes the counting windows that are over before it picks its next
-        // build (the first worker's poll alone waited out its own builds: hot slots came out of
-        // the window one at a time behind a long O3 build)
-        pgo_poll();
-        // SPEC-V: the first worker sweeps the verdicts before each build too, not only when the
-        // queue is empty (rate-limited inside: once per TIER1_POLL, and only when verdicts or
-        // patches moved). With a long O3 queue the idle-only sweep starved: the race's cold launch
-        // left its draw roots ({closure#241}, whose verdict was clean at 29 s) flagged unverified
-        // until 141 s, their unverified lowerings calling the whole draw path as twins; those
-        // entries went into the cache and every warm launch ran the twins
-        if k == 0 {
-            sweep_verdicts();
-        }
-        // the deferred cache records (its O3 installs' among them) are encoded here too, not only
-        // by the run monitor: cold races where the monitor stopped draining at ~40 s left 12k
-        // records (4k of them O3 code) for the quit write, and the warm launch re-tiered them
-        if records_due() { drain_records_bounded(); }
-        let (id, why, queued_at, rate) = {
-            let mut q = tier_queue().unwrap_or_else(|e| e.into_inner());
-            loop {
-                if TIER_STOP.load(Ordering::SeqCst) { return; }
-                // Recheck admission on every wake and pop, including a wake from an empty
-                // queue during startup. Already-running builds finish when demand drops.
-                let ready = tier1_workers_ready();
-                if !startup_holds_tier1() && (k == 0 || ready) && (k < normal || tier1_burst_admits(k - normal, q.len())) {
-                    tier_revalidate(&mut q);
-                    if let Some(e) = tier_pop(&mut q) {
-                        TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).push(e.0);
-                        break e;
-                    }
-                }
-                // nothing for this worker until the queue grows (empty, or too short for a burst
-                // worker): the next push wakes it, no 50 ms polls of an idle app; the first worker
-                // polls on for the verdict sweep below
-                let parked = k != 0 && (q.is_empty() || k >= normal && !tier1_burst_admits(k - normal, q.len()));
-                // the first worker polls faster while the PGO counted window is open, and once a
-                // second when nothing its polls serve has moved for W0_QUIET polls (an idle app)
-                let counting = k == 0 && pgo_counting();
-                // (the queue counter read under the lock: a push after it wakes this worker)
-                let seen = TIER_GEN.load(Ordering::SeqCst);
-                drop(q);
-                crate::zone_alloc::compiler_hand_back_idle();
-                let ready = || TIER_GEN.load(Ordering::SeqCst) != seen || TIER_STOP.load(Ordering::SeqCst);
-                // (the activity read takes other locks: after the queue's is dropped)
-                let poll = if counting {
-                    PGO_POLL
-                } else if k == 0 {
-                    let now = w0_activity();
-                    if now == w0_seen { w0_still = w0_still.saturating_add(1) } else { (w0_seen, w0_still) = (now, 0) }
-                    let idle = w0_still >= W0_QUIET;
-                    W0_IDLING.store(idle, Ordering::SeqCst);
-                    if idle { W0_IDLE } else { TIER1_POLL }
-                } else { TIER1_POLL };
-                if parked { TIER_SLEEPERS.sleep(k, ready) } else { TIER_SLEEPERS.sleep_timeout(k, poll, ready) }
-                if k == 0 {
-                    crate::lifeline::beat();
-                    crate::inspect::tierlog::drain();
-                    // SPEC-V: verdicts that arrived release the promotions that waited for them
-                    sweep_verdicts();
-                    // PGO: counted slots whose window is over go to the queue
-                    pgo_poll();
-                    // baseline code that keeps running under the O3 threshold: its O2 builds
-                    drain_slow_base();
-                    // the settled state: lukewarm code optimised, its count stubs out (SETTLE-TIER)
-                    settle_tier_tick();
-                }
-                q = tier_queue().unwrap_or_else(|e| e.into_inner());
-            }
-        };
-        let _active = TierActive(id);
+
+
+fn run_o3(entry: (u32, u8, u64, u64)) {
+        // Housekeeping is Background too: a Visible backlog must not make it build
+        // expired startup heat before the next tick can revalidate that backlog.
+        let mut candidate = vec![entry];
+        tier_revalidate(&mut candidate);
+        if candidate.is_empty() { return; }
+        let (id, why, queued_at, rate) = entry;
         crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::POP, why, wall_ns().saturating_sub(queued_at), 0);
         crate::inspect::tierlog::drain();
         if tier1_trace() {
             crate::zone_alloc::kept_with(|| TRACE_WHY.lock().unwrap().insert(id, (why, queued_at)));
-            eprintln!("O3p @{:.6} #{} worker={} phase=popped ready={} startup={} last_compile={:.6} demand={} last_demand={:.6}", wall_ns() as f64 / 1e9, id, k, tier1_workers_ready(), STARTUP_COMPILES.load(Ordering::SeqCst), COMPILE_LAST.load(Ordering::SeqCst) as f64 / 1e9, DEMAND_COMPILES.load(Ordering::SeqCst), DEMAND_LAST.load(Ordering::SeqCst) as f64 / 1e9);
+            eprintln!("O3p @{:.6} #{} worker={} phase=popped ready={} startup={} last_compile={:.6} demand={} last_demand={:.6}", wall_ns() as f64 / 1e9, id, 0, tier1_workers_ready(), STARTUP_COMPILES.load(Ordering::SeqCst), COMPILE_LAST.load(Ordering::SeqCst) as f64 / 1e9, DEMAND_COMPILES.load(Ordering::SeqCst), DEMAND_LAST.load(Ordering::SeqCst) as f64 / 1e9);
         }
         let up = TIER_UNIT.load(Ordering::Acquire);
         if up.is_null() || TIER_STOP.load(Ordering::SeqCst) {
-            continue;
+            return;
         }
         let _job = compile_job();
         if queued_hot(why) {
@@ -18273,13 +17990,13 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
             // PGO: its counted build first; the O3 build follows once that code has run
             if unsafe { counted_build(up, id, lukewarm) } {
                 crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::COUNTED, lukewarm as u8, 0, 0);
-                continue;
+                return;
             }
         }
         // a counted slot patched (or rebuilt) since: its profile is gone, so is this build
         if why == Q_PROFILED && !owner::publish(|| unsafe { (&*up).frequency_profiles.contains_key(&id) }) {
             crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_REFUSED, crate::inspect::tierlog::REFUSE_PROFILE_GONE, 0, 0);
-            continue;
+            return;
         }
         let _active = tier1_stats_on().then(|| Tier1Active::new(queued_at));
         // a panic escaping the build (snapshot, install: outside its own catch_unwind) ended
@@ -18302,7 +18019,6 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
                 }
             }
         }
-    }
 }
 
 /// Hash of a RIR dump without fn slot numbers, symbol ids and host addresses, its virtual
@@ -18430,7 +18146,7 @@ unsafe fn churn_note(up: *mut Unit, id: u32, ns: u64, installed: bool) {
     }
     c.last = Some(now);
     let u = &*up;
-    let qlen = tier_queue().map(|q| q.len()).unwrap_or(0);
+    let qlen = queue::counts()[2];
     let oldest = CHURN_QUEUED_AT.lock().unwrap().as_ref().and_then(|m| m.iter().min_by_key(|x| *x.1).map(|(i, t)| (*i, now.duration_since(*t).as_secs_f64())));
     let mut top: Vec<(&u32, &(u32, u64, u32))> = c.per.iter().collect();
     top.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
@@ -18458,6 +18174,7 @@ unsafe fn churn_note(up: *mut Unit, id: u32, ns: u64, installed: bool) {
 }
 
 fn trace_tier1_phase(id: u32, phase: &str) {
+    compile_checkpoint();
     if tier1_trace() {
         eprintln!("O3p @{:.6} #{} phase={}", wall_ns() as f64 / 1e9, id, phase);
     }
@@ -19687,6 +19404,14 @@ fn startup_phase() -> bool {
     STARTUP_PHASE.load(Ordering::Acquire) == 1
 }
 
+/// Only actual UI demand opens the next frontier. Helper lowering and tier-up builds
+/// may discover slots, but never recursively seed another ahead generation.
+fn main_discovery() -> bool {
+    let main = MAIN_TID.load(Ordering::Relaxed);
+    main != 0 && if owner::is_owner() { owner::serving().1 == main } else { me() == main }
+        && !LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false)
+}
+
 /// A build for a program thread (not a speculative or tier-up worker's) past startup (the first
 /// present, or a headless program's main).
 /// Its lazy compiles are built as the startup's are (baseline code, no inline candidates but Relax
@@ -19742,7 +19467,7 @@ pub extern "C" fn relax_first_present() {
                 exec_check_now("first frame");
             }
             FIRST_PRESENT_NS.store(wall_ns(), Ordering::Release);
-            // burst O3 workers wait for the present (tier1_burst_admits)
+            // the queue holds O3 until the present
             tier_wake_all();
             for i in 0..8 { AHEAD_AT_PRESENT[i].store(AHEAD_STATS[i].load(Ordering::Relaxed), Ordering::Relaxed); }
             owner::pure_mark_present();
@@ -19793,14 +19518,13 @@ const RECORD_BATCH: usize = 8;
 /// Speculation stays lean: it is released, for any program that does not present, once its demand
 /// compiles have been quiet for STARTUP_QUIET_NS. No unit pointer is retained: an exiting program
 /// can retire its unit while this thread sleeps.
-pub fn startup_main(runtime: &crate::options::RuntimeOptions, presents: bool) {
+pub fn startup_main(presents: bool) {
     let main_at = wall_ns();
     if !presents {
         HEADLESS.store(true, Ordering::Release);
     }
-    let runtime = crate::zone_alloc::kept_clone(runtime);
     let release = move || {
-        lower_worker_priority(&runtime);
+        makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
         let _ = STARTUP_THREAD.set(std::thread::current());
         while !FIRST_PRESENT.load(Ordering::Acquire) {
             let quiet = if DEMAND_COMPILES.load(Ordering::SeqCst) == 0 {
@@ -19825,8 +19549,8 @@ pub fn startup_main(runtime: &crate::options::RuntimeOptions, presents: bool) {
         });
         relax_codegen::exec_census::startup_release(FIRST_PRESENT.load(Ordering::Acquire));
         STARTUP_PHASE.store(2, Ordering::Release);
-        SPEC_WAKE.notify_all();
-        set_worker();
+        queue::wake();
+        set_worker(true);
         // the cache entries of the installs made before the present; nothing of the unit is kept
         // in between
         drain_records_bounded();
@@ -19939,7 +19663,7 @@ pub fn bump_patch_epoch() {
 // - teardown built ahead (prepare_teardown), Gandalf's whole-app discovery (note_program), the
 //   previous run's fns compiled on a worker (run.rs start_ahead);
 // - the O3 queue: an entry queued long ago for code that has gone cold is counted again
-//   (tier_pop), so a backlog of once-busy startup code never builds unless it runs hot again.
+//   (the common queue), so a backlog of once-busy startup code never builds unless it runs hot again.
 // Cold Stage on the old default (aot without these bounds, 165): 27k teardown builds (85% never
 // called, 4.6 s), Gandalf 4.4k app bodies (8.4 s; 13.8 s warm, 5.3k bodies), a 2k-entry O3 backlog
 // at the first present, 1.8k O3 builds dropped behind their own O2 build: 2-4 cores busy for 25 s+.
@@ -19972,12 +19696,10 @@ pub(crate) struct AheadPolicy {
     spec_hot_from: Option<u8>,
     /// fn pointers and vtables of code that ran are followed
     spec_dyn: bool,
-    /// speculative workers at most
-    spec_jobs: usize,
     /// built-ahead results nobody called expire (MAKEPAD_RUN_SPEC_TTL_MS)
     spec_expire: bool,
-    /// ahead helpers after the first present (0: the UI's builds check and lower their own bodies)
-    post_present_helpers: u32,
+    /// ahead checks after the first present
+    ahead_after_present: bool,
     /// the program's teardown is built ahead
     teardown: bool,
     /// Gandalf checks every body of the app, not only the ones that ran
@@ -19986,38 +19708,32 @@ pub(crate) struct AheadPolicy {
     pub(crate) last_run: bool,
     /// O3 queue entries of code gone cold are counted again
     o3_revalidate: bool,
-    /// O3 workers that always run
-    o3_threads: usize,
-    /// burst workers drain a long O3 queue after the first present (spawn_tier1_threads)
-    o3_burst: bool,
     /// an AOT level: builds made during a UI burst have their callees speculated after it
     /// (aot_drain), speculation does not follow only the fall-through path on battery
     aot: bool,
-    /// every background compile thread runs in the OS's background class (os::thread::background)
-    background_class: bool,
 }
 
 pub(crate) fn ahead_policy() -> &'static AheadPolicy {
     use crate::options::AheadLevel;
     const MINIMAL: AheadPolicy = AheadPolicy {
-        spec_calls: false, spec_cached: false, spec_depth: Some(0), spec_hot_from: Some(0), spec_dyn: false, spec_jobs: 1, spec_expire: true,
-        post_present_helpers: 0, teardown: false, borrowck_discovery: false, last_run: false, o3_revalidate: true, o3_threads: 2,
-        o3_burst: false, aot: false, background_class: false,
+        spec_calls: false, spec_cached: false, spec_depth: Some(0), spec_hot_from: Some(0), spec_dyn: false, spec_expire: true,
+        ahead_after_present: false, teardown: false, borrowck_discovery: false, last_run: false, o3_revalidate: true,
+        aot: false,
     };
     const BALANCED: AheadPolicy = AheadPolicy {
-        spec_calls: true, spec_cached: true, spec_depth: None, spec_hot_from: None, spec_dyn: true, spec_jobs: 2, spec_expire: true,
-        post_present_helpers: u32::MAX, teardown: false, borrowck_discovery: false, last_run: false, o3_revalidate: true, o3_threads: 2,
-        o3_burst: true, aot: false, background_class: false,
+        spec_calls: true, spec_cached: true, spec_depth: None, spec_hot_from: None, spec_dyn: true, spec_expire: true,
+        ahead_after_present: true, teardown: false, borrowck_discovery: false, last_run: false, o3_revalidate: true,
+        aot: false,
     };
     const AOT_MAX: AheadPolicy = AheadPolicy {
-        spec_calls: true, spec_cached: true, spec_depth: Some(AOT_DEPTH), spec_hot_from: Some(AOT_DEPTH), spec_dyn: true, spec_jobs: usize::MAX, spec_expire: false,
-        post_present_helpers: u32::MAX, teardown: true, borrowck_discovery: true, last_run: true, o3_revalidate: false, o3_threads: 3,
-        o3_burst: true, aot: true, background_class: false,
+        spec_calls: true, spec_cached: true, spec_depth: Some(AOT_DEPTH), spec_hot_from: Some(AOT_DEPTH), spec_dyn: true, spec_expire: false,
+        ahead_after_present: true, teardown: true, borrowck_discovery: true, last_run: true, o3_revalidate: false,
+        aot: true,
     };
     const AOT_MIN: AheadPolicy = AheadPolicy {
-        spec_calls: true, spec_cached: true, spec_depth: Some(AOT_DEPTH), spec_hot_from: Some(AOT_DEPTH), spec_dyn: true, spec_jobs: 2, spec_expire: false,
-        post_present_helpers: u32::MAX, teardown: true, borrowck_discovery: true, last_run: true, o3_revalidate: false, o3_threads: 2,
-        o3_burst: false, aot: true, background_class: true,
+        spec_calls: true, spec_cached: true, spec_depth: Some(AOT_DEPTH), spec_hot_from: Some(AOT_DEPTH), spec_dyn: true, spec_expire: false,
+        ahead_after_present: true, teardown: true, borrowck_discovery: true, last_run: true, o3_revalidate: false,
+        aot: true,
     };
     match ahead_level() {
         AheadLevel::Minimal => &MINIMAL,
@@ -20056,17 +19772,9 @@ fn spec_depth_max(options: &crate::options::Options) -> u8 {
     ahead_policy().spec_depth.unwrap_or(options.spec_depth)
 }
 
-fn spec_jobs(options: &crate::options::Options) -> usize {
-    options.spec_jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()).saturating_sub(1).clamp(1, 6).min(ahead_policy().spec_jobs))
-}
+
 
 static SPEC_UNIT: std::sync::atomic::AtomicPtr<Unit> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-/// (unit, slot id): a slot id means something only in its own unit, and SPEC_UNIT follows the
-/// unit that compiled last (the proc-macro world's ids indexed the program's table after an
-/// edit: "AppendVec index out of bounds" on run-spec threads)
-static SPEC_Q: relax_session::sync::Mutex<std::collections::VecDeque<(usize, u32)>> = relax_session::sync::Mutex::new(std::collections::VecDeque::new());
-static SPEC_WAKE: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
-static SPEC_START: std::sync::Once = std::sync::Once::new();
 /// calls not speculated because they sit on a cold path
 pub static SPEC_COLD_SKIPPED: AtomicU64 = AtomicU64::new(0);
 /// a worker's front whose build another thread took over while it was suspended
@@ -20076,9 +19784,15 @@ const YIELDED: &str = "(background build gave way)";
 /// relock wait, waits for in-flight builds]; and the same front/back cpu on workers
 pub static SPLIT_NS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
-/// Slots queued to be built ahead (postframe::ahead_progress; 1 while the queue is locked).
+/// Slots queued to be built ahead (postframe::ahead_progress).
 pub(crate) fn ahead_queued() -> u64 {
-    SPEC_Q.try_lock().map_or(1, |q| q.len() as u64)
+    let counts = queue::counts();
+    (counts[0] + counts[3]) as u64
+}
+
+pub(crate) fn ahead_running() -> u64 {
+    let running = queue::running();
+    (running[0] + running[3]) as u64
 }
 
 /// Queues the not-inlined direct callees of slot `id` (lock held), one level deeper.
@@ -20311,27 +20025,9 @@ unsafe fn spec_enqueue_calls(up: *mut Unit, id: u32, func: &relax_backend::rir::
             }
         }
     }
-    let added = front.len() + back.len();
     mark_spec_cached(u, &front);
     mark_spec_cached(u, &back);
-    {
-        let mut q = SPEC_Q.lock().unwrap_or_else(|e| e.into_inner());
-        for c in front.into_iter().rev() {
-            q.push_front((up as usize, c));
-        }
-        q.extend(back.into_iter().map(|c| (up as usize, c)));
-    }
-    if added > 0 {
-        SPEC_START.call_once(|| {
-            for k in 0..spec_jobs(options) {
-                let session = session.clone();
-            { let _k = crate::zone_alloc::kept();
-            crate::lifeline::spawn(format!("run-spec{}", k), crate::lifeline::OnPanic::Restart, None, move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime) });
-            }
-            }
-        });
-        SPEC_WAKE.notify_all();
-    }
+    for id in front.into_iter().chain(back) { queue::spec(up as usize, id); }
 }
 
 /// Initializers must enter through const_addr/static_addr: those reserve storage
@@ -20387,16 +20083,7 @@ pub unsafe fn spec_seed(up: *mut Unit, ids: &[u32]) {
     mark_spec_cached(u, &add);
     SEED_PROBE_NS.fetch_add(cpu_ns() - probe, Ordering::Relaxed);
     SEED_QUEUED.fetch_add(add.len() as u64, Ordering::Relaxed);
-    SPEC_Q.lock().unwrap_or_else(|e| e.into_inner()).extend(add.into_iter().map(|id| (up as usize, id)));
-    SPEC_START.call_once(|| {
-        for k in 0..spec_jobs(options) {
-            let session = session.clone();
-            { let _k = crate::zone_alloc::kept();
-            crate::lifeline::spawn(format!("run-spec{}", k), crate::lifeline::OnPanic::Restart, None, move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime) });
-            }
-        }
-    });
-    SPEC_WAKE.notify_all();
+    for id in add { queue::spec(up as usize, id); }
 }
 
 /// Teardown preparation: (slots built ahead, thread cpu ns)
@@ -20428,8 +20115,8 @@ pub fn ahead_complete_tick() {
     }
     drop(seen);
     // one lock at a time (each its own statement: no two held together)
-    let spec = SPEC_Q.lock().unwrap_or_else(|e| e.into_inner()).len();
-    let tier = tier_queue().unwrap_or_else(|e| e.into_inner()).len();
+    let spec = queue::counts()[3];
+    let tier = queue::tiers().len();
     let tier_active = TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).len();
     let deferred = AOT_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).len();
     let checks = crate::borrowck::lazy::queued();
@@ -20465,7 +20152,6 @@ pub unsafe fn prepare_teardown(up: *mut Unit) {
     struct P(*mut Unit);
     unsafe impl Send for P {}
     let p = P(up);
-    let session = unsafe { crate::jit::unit_session(up) };
     { let _k = crate::zone_alloc::kept();
     TEARDOWN_RUNNING.store(true, Ordering::SeqCst);
     let _ = std::thread::Builder::new().name("run-teardown".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
@@ -20475,8 +20161,8 @@ pub unsafe fn prepare_teardown(up: *mut Unit) {
         let p = p;
         let up = p.0;
         ensure_altstack();
-        set_worker();
-        lower_worker_priority(&session.runtime);
+        set_worker(true);
+        makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
         let stopped = || SPEC_STOP.load(Ordering::SeqCst) || crate::preempt::is_stopped() || owner::exit_tid() != 0;
         let c0 = cpu_ns();
         let mut seen: crate::fxhash::HashSet<u32> = Default::default();
@@ -21107,34 +20793,17 @@ fn expire_spec_now(now: u64, ttl: u64) -> ExpiredSpec {
     out
 }
 
-fn spec_worker(runtime: &crate::options::RuntimeOptions) {
-    ensure_altstack();
-    lower_worker_priority(runtime);
-    set_worker();
-    loop {
-        let (unit, id) = {
-            let mut q = SPEC_Q.lock().unwrap_or_else(|e| e.into_inner());
-            loop {
-                if SPEC_STOP.load(Ordering::SeqCst) {
-                    return;
-                }
-                let next = q.pop_front();
-                if let Some(id) = next {
-                    break id;
-                }
-                crate::zone_alloc::compiler_hand_back_idle();
-                q = SPEC_WAKE.wait(q).unwrap_or_else(|e| e.into_inner());
-            }
-        };
+fn run_spec(unit: usize, id: u32) {
+    set_worker(true);
         let _job = compile_job();
         let up = SPEC_UNIT.load(Ordering::Acquire);
-        // the unit the queue was for was retired (retire_unit), or speculation moved to another
-        // unit: this id is not a slot of the current one
-        if up.is_null() || up as usize != unit {
-            continue;
+        if up as usize != unit || SPEC_STOP.load(Ordering::Acquire) { return; }
+        // the unit the queue was for was retired (retire_unit)
+        if up.is_null() {
+            return;
         }
         // This also covers disk-manifest and callee speculation, not only explicit hints.
-        if unsafe { skip_initializer_seed(&*up, id) } { continue; }
+        if unsafe { skip_initializer_seed(&*up, id) } { return; }
         // a panic escaping the build (outside its own catch_unwind) must not leave the unit
         // lock held by a thread that is gone: every lazy compile would wait for it forever
         let _census_context = unsafe { (&*up).exec_context(false) };
@@ -21143,9 +20812,7 @@ fn spec_worker(runtime: &crate::options::RuntimeOptions) {
         if !unsafe { (&*up).spec_cached.contains(&id) } {
             unsafe { typeck_ahead_slot(up, id) };
         }
-        crate::postframe::AHEAD_RUNNING.fetch_add(1, Ordering::Relaxed);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { spec_build(up, id) }));
-        crate::postframe::AHEAD_RUNNING.fetch_sub(1, Ordering::Relaxed);
         // (compiles only: a warm-cache link ahead is not a function built -- the warm-up hint and
         // the ring said "N functions" for a warm start's manifest links)
         if FIRST_PRESENT.load(Ordering::Relaxed) && matches!(r, Ok(true)) && SPEC_BACK_RAN.with(|b| b.get()) {
@@ -21153,13 +20820,12 @@ fn spec_worker(runtime: &crate::options::RuntimeOptions) {
         }
         match r {
             // gave way to a program thread: first in line again
-            Ok(false) => SPEC_Q.lock().unwrap_or_else(|e| e.into_inner()).push_front((unit, id)),
+            Ok(false) => queue::spec(unit, id),
             Ok(true) => {}
             Err(_) => {
                 SPEC_PANICS.fetch_add(1, Ordering::Relaxed);
             }
         }
-    }
 }
 
 /// speculative workers stop taking work (exit summary, Unit drop)
@@ -21178,7 +20844,6 @@ pub fn stop_background_tiers() {
     DRAIN_ANYWAY.store(true, Ordering::SeqCst);
     SPEC_STOP.store(true, Ordering::SeqCst);
     TIER_STOP.store(true, Ordering::SeqCst);
-    SPEC_WAKE.notify_all();
     tier_wake_all();
 }
 /// background jobs that panicked outside their build's own recovery (lock released)
@@ -21192,7 +20857,7 @@ pub fn begin_exit() {
     owner::begin_exit();
     SPEC_STOP.store(true, Ordering::SeqCst);
     TIER_STOP.store(true, Ordering::SeqCst);
-    SPEC_WAKE.notify_all();
+    queue::wake();
     tier_wake_all();
 }
 
@@ -21336,6 +21001,7 @@ impl Drop for JobIdle {
 /// held up by that very swap (a job polling for quiet compiles, while the jobs the swap parked keep
 /// their startup-compile counts, waited for the swap's whole length: the swap for it, forever).
 pub(crate) fn job_sleep(d: std::time::Duration) {
+    let _budget = crate::pool::suspend();
     let _idle = JobIdle::enter();
     std::thread::sleep(d);
 }
@@ -22988,6 +22654,7 @@ pub(crate) mod front_holders {
 thread_local! {
     /// this thread's front reads held now
     static FRONT_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static FRONT_READ_SITE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
 }
 
 /// The front reads this thread holds now.
@@ -22996,12 +22663,14 @@ pub(crate) fn front_reads_held() -> u32 {
 }
 
 pub struct FrontRead {
+    prior_site: &'static str,
     _g: std::sync::RwLockReadGuard<'static, ()>,
     traced: Option<(&'static str, std::time::Instant)>,
     row: Option<usize>,
 }
 impl Drop for FrontRead {
     fn drop(&mut self) {
+        let _ = FRONT_READ_SITE.try_with(|site| site.set(self.prior_site));
         let _ = FRONT_READS.try_with(|c| c.set(c.get().saturating_sub(1)));
         if let Some(k) = self.row {
             front_holders::release(k);
@@ -23049,7 +22718,7 @@ unsafe fn owner_front<'u>(up: *const Unit) -> (&'u Program, &'u Tcx) {
 pub fn front_read(site: &'static str) -> FrontRead {
     let g = FRONT_RW.read().unwrap_or_else(|e| e.into_inner());
     let _ = FRONT_READS.try_with(|c| c.set(c.get() + 1));
-    FrontRead { _g: g, traced: front_trace().then(|| (site, std::time::Instant::now())), row: front_holders::claim(site) }
+    FrontRead { prior_site: FRONT_READ_SITE.try_with(|old| old.replace(site)).unwrap_or(""), _g: g, traced: front_trace().then(|| (site, std::time::Instant::now())), row: front_holders::claim(site) }
 }
 /// What type checks ahead need of a unit, reachable without its lock: the program and type
 /// context (shared, Sync), slot keys, and the checked bodies waiting for their builds.
@@ -23123,22 +22792,11 @@ pub struct FrontShared {
     /// inline const blocks' bytes): any thread's lowering reads it here, the tiers of one instance
     /// share one value. A source change bumps the epoch in the key, so nothing stale is read.
     body_consts: crate::conc::MemoMap<(u64, u32, u32, bool), (u64, u32)>,
-    /// Until the first present, `helpers` threads type-check every new slot's body ahead (queue
-    /// of slots): a cold start's main thread finds most bodies it calls checked
-    /// (MAKEPAD_RUN_AHEAD_HELPERS=n; default ahead_helpers()). After it they serve the UI
-    /// thread's bursts of lazy compiles (ahead_phase): started by a burst's first queued slot,
-    /// ended once the queue is empty and the burst over (no thread stays)
-    helpers: u32,
-    /// helper threads running (changed with `queue` locked)
-    live_helpers: std::sync::atomic::AtomicU32,
+    /// Ahead checks are queued during startup and UI bursts.
+    ahead_enabled: bool,
     /// bodies checked ahead after the first present: those no build took are dropped when a
     /// burst ends (ahead_helper), not kept for the rest of the run
     ahead_post: relax_session::sync::Mutex<Vec<AheadKey>>,
-    queue: relax_session::sync::Mutex<std::collections::VecDeque<AheadWork>>,
-    /// The startup's look-ahead (look_ahead): taken when `queue` is empty (the slots made go
-    /// first), changed with `queue` locked, cleared with it.
-    looks: relax_session::sync::Mutex<std::collections::VecDeque<AheadWork>>,
-    wake: relax_session::sync::Condvar,
 }
 
 impl FrontShared {
@@ -23177,9 +22835,9 @@ impl FrontShared {
     /// Memory report for the shared slot index and pending ahead-work queue.
     pub fn mem_lines(&self) -> Vec<(String, u64)> {
         let (sn, sb) = self.slot_keys.mem_stats(|_, _| 0);
-        let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let queued = queue::counts()[0];
         vec![(format!("front: slot keys ({})", sn), sb as u64),
-             (format!("front: queued slots ({})", queue.len()), (queue.capacity() * std::mem::size_of::<u32>()) as u64)]
+             (format!("front: queued slots ({})", queued), (queued * std::mem::size_of::<u32>()) as u64)]
     }
 
     fn new(sess: &std::sync::Arc<crate::Session>) -> Self {
@@ -23209,12 +22867,8 @@ impl FrontShared {
             // helper's lowering of main raced the exit with its layout errors, limits/issue-55878)
             tls: crate::conc::MemoMap::with_bits(8),
             body_consts: crate::conc::MemoMap::with_bits(12),
-            helpers: if options.tyck_ahead && !options.const_fuel { options.ahead_helpers.unwrap_or_else(ahead_helpers) } else { 0 },
-            live_helpers: std::sync::atomic::AtomicU32::new(0),
+            ahead_enabled: options.tyck_ahead && !options.const_fuel,
             ahead_post: Default::default(),
-            queue: Default::default(),
-            looks: Default::default(),
-            wake: Default::default(),
         }
     }
 }
@@ -23305,36 +22959,7 @@ fn set_shared_front(u: &mut Unit, core_crate: u32) {
     f.core_crate.store(core_crate, Ordering::SeqCst);
     f.src_toks.store(inline_src_toks(options, tier1).max(inline_src_toks(options, !tier1)), Ordering::SeqCst);
     f.alive.store(true, Ordering::SeqCst);
-    if startup_phase() {
-        let q = f.queue.lock().unwrap_or_else(|e| e.into_inner());
-        spawn_helpers(f, &q);
-    }
-}
-
-/// Starts the ahead helpers unless they run (`q`: the queue's lock, held).
-fn spawn_helpers(f: &std::sync::Arc<FrontShared>, _q: &std::collections::VecDeque<AheadWork>) {
-    if f.live_helpers.load(Ordering::Relaxed) != 0 {
-        return;
-    }
-    let _k = crate::zone_alloc::kept();
-    // after the startup: the level's share of them (they serve the UI's bursts)
-    let n = if startup_phase() { f.helpers } else { f.helpers.min(ahead_policy().post_present_helpers) };
-    for i in 0..n {
-        let f2 = f.clone();
-        // the UI thread waits for a helper's check of the body it is about to build (startup: 3.5k
-        // waits, 1.8 s of a cold Fab's main thread on a busy Mac): the helpers run in the UI's class,
-        // as the owner does, not at a script-started process's inherited low QoS (efficiency cores,
-        // coalesced timers), so a busy machine does not starve the threads the UI waits behind
-        if std::thread::Builder::new().name(format!("run-ahead{}", i)).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); crate::os::thread::interactive(); ahead_helper(f2, i) }).is_ok() {
-            f.live_helpers.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
-/// Ahead helpers by default: the main thread's lazy compiles spend about a third of a cold
-/// start's main -> first present in type checks; a few threads keep ahead of them.
-fn ahead_helpers() -> u32 {
-    std::thread::available_parallelism().map_or(2, |n| n.get()).saturating_sub(2).clamp(1, 4) as u32
+    queue::wake();
 }
 
 /// The ahead helpers run: the startup, and the warm-up after the first present (its burst of lazy
@@ -23358,91 +22983,35 @@ pub fn ui_burst() -> bool {
     FIRST_PRESENT.load(Ordering::Acquire) && ahead_burst()
 }
 
-/// A helper thread: checks and lowers queued slots' bodies ahead through the startup and the
-/// warm-up after the first present (then speculative workers check what they build ahead) or
-/// until the unit is dropped.
-fn ahead_helper(f: std::sync::Arc<FrontShared>, index: u32) {
-    loop {
-        let id = {
-            let mut q = f.queue.lock().unwrap_or_else(|e| e.into_inner());
-            loop {
-                // a startup helper past the level's post-present share ends at the present (the
-                // others serve the UI's bursts; the last one out drops what no build took)
-                if !startup_phase() && FIRST_PRESENT.load(Ordering::Acquire) && index >= ahead_policy().post_present_helpers.max(1) {
-                    f.live_helpers.fetch_sub(1, Ordering::Relaxed);
-                    return;
-                }
-                let burst_over = !startup_phase() && FIRST_PRESENT.load(Ordering::Acquire) && q.is_empty() && !ahead_burst();
-                if !f.alive.load(Ordering::SeqCst) || !ahead_phase() || burst_over {
-                    if burst_over {
-                        let keys = std::mem::take(&mut *f.ahead_post.lock().unwrap_or_else(|e| e.into_inner()));
-                        let unused: Vec<_> = keys.iter().filter_map(|k| f.ahead.remove(k).map(|b| (k.0, b))).collect();
-                        AHEAD_DROPPED.fetch_add(unused.len() as u64, Ordering::Relaxed);
-                        // (its line after the count: it reports the drops)
-                        crate::postframe::ahead_over();
-                        drop(keys);
-                        drop(q);
-                        if ahead_trace() {
-                            let r = front_read("ahead_trace");
-                            // (a front state a settle rebuild replaced names a dropped program)
-                            if f.alive.load(Ordering::SeqCst) {
-                                let (prog, _) = r.of(&f);
-                                for (d, _) in &unused { eprintln!("ahead-dropped {}", prog.def_path(*d)); }
-                            }
-                        }
-                        drop(unused);
-                        q = f.queue.lock().unwrap_or_else(|e| e.into_inner());
-                        // a slot queued meanwhile: this burst goes on
-                        if !q.is_empty() { continue; }
-                    }
-                    f.live_helpers.fetch_sub(1, Ordering::Relaxed);
-                    q.clear();
-                    f.looks.lock().unwrap_or_else(|e| e.into_inner()).clear();
-                    drop(q);
-                    // Unused raw RIR is startup work only. Drop it on a helper, outside the
-                    // queue/publication locks; in-flight helpers cannot republish removed slots.
-                    let unused = std::mem::take(&mut *f.lowered.lock().unwrap_or_else(|e| e.into_inner()));
-                    lowered_end();
-                    drop(unused);
-                    return;
-                }
-                if let Some(id) = q.pop_front() {
-                    break id;
-                }
-                if startup_phase() {
-                    if let Some(w) = f.looks.lock().unwrap_or_else(|e| e.into_inner()).pop_front() {
-                        break w;
-                    }
-                }
-                crate::zone_alloc::compiler_hand_back_idle();
-                q = f.wake.wait_timeout(q, std::time::Duration::from_millis(50)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0);
-            }
-        };
-        // a start that links cached code: no bodies to check (typeck_ahead_slot's rule)
-        if f.linked_start.load(Ordering::Relaxed) && crate::reload::edited_crates().is_empty() {
-            continue;
-        }
-        let (d, args, slot, normal, look) = match id {
-            AheadWork::Slot(id) => match f.slot_keys.get(&id) {
-                Some(FnKey::Inst(d, args)) => (d, args, Some(id), false, LOOK_LEVELS),
-                _ => continue,
-            },
-            AheadWork::Body((d, args), normal) => (d, args, None, normal, 0),
-            // (checked already, by a build or ahead: looked at already, or its slot was made)
-            AheadWork::Look(key, _) if f.is_built(&key) || f.ahead.contains_key(&key) => continue,
-            AheadWork::Look((d, args), levels) => (d, args, None, false, levels),
-        };
-        let _job = compile_job();
-        let _census_context = relax_codegen::exec_census::Context::new(f.census_id, false);
-        let _cost = slot.map(|id| relax_codegen::fncost::Record::new(id, 0, "ahead"));
-        let t0 = cpu_ns();
-        typeck_ahead(&f, d, args.clone(), 1, true, normal);
-        AHEAD_STATS[4].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
-        if let Some(id) = slot {
-            lower_ahead(&f, id, false);
-        }
-        look_ahead(&f, d, &args, look);
+/// One ahead job while its front remains live: checks and lowers a queued slot's body, or checks a
+/// callee the startup's look-ahead found (look_ahead); either looks below the body it checked.
+fn run_ahead(f: std::sync::Arc<FrontShared>, work: AheadWork) {
+    // (past the startup of a program that never presents -- a test, a bench, a CLI tool -- what
+    // the startup queued is not checked: its threads' lazy compiles check their own bodies)
+    if !f.alive.load(Ordering::Acquire) || !ahead_phase() { return; }
+    // A linked start checks missing bodies on demand, without speculative helpers.
+    if f.linked_start.load(Ordering::Relaxed) && crate::reload::edited_crates().is_empty() { return; }
+    let (d, args, slot, normal, look) = match work {
+        AheadWork::Slot(id) => match f.slot_keys.get(&id) {
+            Some(FnKey::Inst(d, args)) => (d, args, Some(id), false, LOOK_LEVELS),
+            _ => return,
+        },
+        AheadWork::Body((d, args), normal) => (d, args, None, normal, 0),
+        // the startup is over, or a build or a check ahead took it meanwhile (its slot was made)
+        AheadWork::Look(key, _) if !startup_phase() || f.is_built(&key) || f.ahead.contains_key(&key) => return,
+        AheadWork::Look((d, args), levels) => (d, args, None, false, levels),
+    };
+    let _job = compile_job();
+    let _census_context = relax_codegen::exec_census::Context::new(f.census_id, false);
+    let _cost = slot.map(|id| relax_codegen::fncost::Record::new(id, 0, "ahead"));
+    let t0 = cpu_ns();
+    let bodies = typeck_ahead(&f, d, args.clone(), 1, true, normal);
+    AHEAD_STATS[4].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
+    queue::ahead_found(&f, bodies);
+    if let Some(id) = slot {
+        lower_ahead(&f, id, false);
     }
+    look_ahead(&f, d, &args, look);
 }
 
 /// MAKEPAD_RUN_AHEAD_TRACE: also one line per body the helpers check after the present (its typeck
@@ -23590,7 +23159,9 @@ fn lower_ahead(f: &FrontShared, id: u32, own: bool) -> u8 {
                     // the writer may need the front: hold neither lock while the helper finishes
                     drop(pending);
                     drop(r);
+                    let _priority = (MAIN_TID.load(Ordering::Relaxed) == me()).then(|| queue::promote(f.unit.load(Ordering::Acquire) as usize, id));
                     let _idle = JobIdle::enter();
+                    let _budget = crate::pool::suspend();
                     let _w = AheadWait::begin(4);
                     let mut g = LOWER_AHEAD_DONE.0.lock().unwrap_or_else(|e| e.into_inner());
                     while matches!(f.lowered.lock().unwrap_or_else(|e| e.into_inner()).get(&id), Some(LoweredState::Running)) && f.alive.load(Ordering::SeqCst) {
@@ -23974,9 +23545,12 @@ fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<relax_backend::rir::Func>
 
 type AheadKey = (DefId, Vec<TyId>);
 
+/// What an ahead job (queue::Job::Ahead) checks.
 enum AheadWork {
+    /// A slot's body, checked and lowered.
     Slot(u32),
-    /// An inline candidate (normal O1), before lowering creates its slot.
+    /// An inline candidate a checked body calls (normal O1: its own candidates by the normal
+    /// source-size rule), before lowering creates its slot: checked ahead of the queue's slots.
     Body(AheadKey, bool),
     /// A callee a checked body calls (look_ahead), before lowering creates its slot: checked,
     /// then its own callees looked at `levels` more calls deep.
@@ -23993,10 +23567,10 @@ const LOOK_FANOUT: usize = 24;
 const LOOK_BUDGET: u64 = 80_000;
 pub(crate) static LOOK_QUEUED: AtomicU64 = AtomicU64::new(0);
 
-/// A checked body's callees -- the slots its lowering will make -- go to the helpers' queue behind
-/// the slots already made (startup only, within LOOK_BUDGET): the main thread finds them checked
-/// when it gets there instead of waiting on a helper's check in flight or checking them itself.
-fn look_ahead(f: &FrontShared, d: DefId, args: &[TyId], levels: u8) {
+/// A checked body's callees -- the slots its lowering will make -- go to the queue behind the
+/// slots already made (startup only, within LOOK_BUDGET): the main thread finds them checked when
+/// it gets there instead of waiting on a check in flight or checking them itself.
+fn look_ahead(f: &std::sync::Arc<FrontShared>, d: DefId, args: &[TyId], levels: u8) {
     if levels == 0 || !startup_phase() || LOOK_QUEUED.load(Ordering::Relaxed) >= LOOK_BUDGET {
         return;
     }
@@ -24031,17 +23605,14 @@ fn look_ahead(f: &FrontShared, d: DefId, args: &[TyId], levels: u8) {
         return;
     }
     LOOK_QUEUED.fetch_add(next.len() as u64, Ordering::Relaxed);
-    let q = f.queue.lock().unwrap_or_else(|e| e.into_inner());
-    f.looks.lock().unwrap_or_else(|e| e.into_inner()).extend(next);
-    drop(q);
-    f.wake.notify_all();
+    queue::ahead_found(f, next);
 }
 
 fn publish_ahead(f: &FrontShared, key: AheadKey, epoch: u64, body: std::sync::Arc<Body>) {
     let before = crate::memstat::live_total();
     let claim = f.inprog.lock().unwrap_or_else(|e| e.into_inner());
     if !f.is_built(&key) {
-        if f.helpers > 0 && FIRST_PRESENT.load(Ordering::Acquire) {
+        if f.ahead_enabled && FIRST_PRESENT.load(Ordering::Acquire) {
             crate::zone_alloc::kept_with(|| f.ahead_post.lock().unwrap_or_else(|e| e.into_inner()).push(key.clone()));
         }
         f.ahead.insert(key, (epoch, body));
@@ -24159,6 +23730,8 @@ pub unsafe fn typeck_ahead_slot(up: *mut Unit, id: u32) {
         // a helper is checking this very body: wait for its result rather than check it again
         // under the unit lock (not while holding that lock: a constant evaluation's call)
         if !owner::is_owner() && f.inprog.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
+            let _priority = (MAIN_TID.load(Ordering::Relaxed) == me()).then(|| queue::promote(up as usize, id));
+            let _budget = crate::pool::suspend();
             // (a wait for another thread: not a running job meanwhile, job_sleep's reason)
             let _idle = JobIdle::enter();
             let _w = AheadWait::begin(0);
@@ -24232,7 +23805,10 @@ fn inprog_end(f: &FrontShared, key: &AheadKey) {
     AHEAD_DONE.1.notify_all();
 }
 
-fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: bool, normal: bool) {
+/// Checks body `d` with `args` ahead (and, `depth` > 0, its inline candidates). `queued` (an ahead
+/// job): the candidates are not checked here but returned, for the queue (run_ahead).
+fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: bool, normal: bool) -> Vec<AheadWork> {
+    let mut next = Vec::new();
     let _census_context = relax_codegen::exec_census::Context::new(f.census_id, false);
     let core = f.core_crate.load(Ordering::Relaxed);
     let src_toks = f.src_toks.load(Ordering::Relaxed);
@@ -24249,7 +23825,7 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
         let fr = front_read("typeck_ahead");
         if !f.alive.load(Ordering::SeqCst) {
             inprog_end(f, &key);
-            return;
+            return next;
         }
         if f.is_built(&key) {
             inprog_end(f, &key);
@@ -24273,13 +23849,13 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
         }
         if r.as_ref().is_err_and(|p| crate::preempt::is_preempted(&**p)) {
             inprog_end(f, &key);
-            if crate::preempt::is_stopped() { return; }
+            if crate::preempt::is_stopped() { return next; }
             drop(fr);
             // a writer waits: this check waits for it to finish and is done again -- unless this
             // thread holds another front read, which the writer waits for: then the check is
             // given up (its build checks the body itself), never waited for under that read
             if front_reads_held() > 0 {
-                return;
+                return next;
             }
             todo.push((key.0, key.1, depth, normal));
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -24310,7 +23886,6 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
         AHEAD_STATS[0].fetch_add(1, Ordering::Relaxed);
         publish_ahead(f, key.clone(), epoch, b);
         inprog_end(f, &key);
-        let mut next = Vec::new();
         for (c, mut cargs) in callees {
             let cd = prog.def(c);
             if cd.krate != core || !matches!(cd.kind, DefKind::Fn | DefKind::AssocFn) {
@@ -24340,12 +23915,8 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
                 }
             }
         }
-        if !next.is_empty() {
-            let mut q = f.queue.lock().unwrap_or_else(|e| e.into_inner());
-            for work in next.into_iter().rev() { q.push_front(work); }
-            f.wake.notify_all();
-        }
     }
+    next
 }
 
 /// The fn instances a checked body calls, as lowering will most likely key them (trait
@@ -24754,21 +24325,7 @@ unsafe fn spec_enqueue_cached(up: *mut Unit, ids: &[u32], depth: u8) {
         return;
     }
     SPEC_UNIT.store(up, Ordering::Release);
-    {
-        let mut q = SPEC_Q.lock().unwrap_or_else(|e| e.into_inner());
-        for id in add.into_iter().rev() {
-            q.push_front((up as usize, id));
-        }
-    }
-    SPEC_START.call_once(|| {
-        for k in 0..spec_jobs(options) {
-            let session = session.clone();
-            { let _k = crate::zone_alloc::kept();
-            crate::lifeline::spawn(format!("run-spec{}", k), crate::lifeline::OnPanic::Restart, None, move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime) });
-            }
-        }
-    });
-    SPEC_WAKE.notify_all();
+    for id in add { queue::spec(up as usize, id); }
 }
 
 /// Zeroed read-write memory (`n` bytes, page granular).
@@ -24829,7 +24386,7 @@ impl crate::borrowck::lazy::FrontSource for BorrowckFront {
         self.0.alive.load(Ordering::SeqCst)
     }
     fn lower_priority(&self) {
-        lower_worker_priority(&self.0.session.runtime);
+        makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
     }
 }
 
@@ -24857,7 +24414,7 @@ pub fn start_background_coherence(u: &Unit) {
     { let _k = crate::zone_alloc::kept();
     let _ = std::thread::Builder::new().name("run-coherence".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
         let _mem = crate::memstat::tag(crate::memstat::Tag::Borrowck);
-        lower_worker_priority(&front.session.runtime);
+        makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
         while STARTUP_PHASE.load(Ordering::Acquire) != 0 && !SPEC_STOP.load(Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -26629,4 +26186,52 @@ pub fn global_allocator_static_of(prog: &crate::program::Program) -> Option<DefI
             crate::lang_items::has_attr(prog, def.file, ast.list(ast.item(def.item).attrs), "global_allocator")
         }
     })
+}
+
+/// A job the worker was admitted for a moment ago (its admission was its checkpoint).
+fn run_job(job: queue::Job) {
+    set_worker(!matches!(job, queue::Job::Ahead(..)));
+    match job {
+        queue::Job::Ahead(front, work) => { let _mem = crate::memstat::tag(crate::memstat::Tag::Typeck); run_ahead(front, work); },
+        queue::Job::O2(unit, id, kind) => { let _mem = crate::memstat::tag(crate::memstat::Tag::Opt); run_o2(unit, id, kind); }
+        queue::Job::O3(entry) => { let _mem = crate::memstat::tag(crate::memstat::Tag::Tier1); run_o3(entry); }
+        queue::Job::Spec(unit, id) => { let _mem = crate::memstat::tag(crate::memstat::Tag::Codegen); run_spec(unit, id); },
+        queue::Job::Tick => run_tick(),
+    }
+}
+static TICK_STATE: relax_session::sync::Mutex<([u64; 8], u32)> = relax_session::sync::Mutex::new(([0; 8], 0));
+fn tick_delay() -> std::time::Duration {
+    if pgo_counting() { PGO_POLL }
+    else if W0_IDLING.load(Ordering::Relaxed) { W0_IDLE }
+    else { TIER1_POLL }
+}
+fn run_tick() {
+    if TIER_UNIT.load(Ordering::Acquire).is_null() && SPEC_UNIT.load(Ordering::Acquire).is_null() {
+        W0_IDLING.store(true, Ordering::Relaxed);
+        return;
+    }
+    crate::lifeline::beat();
+    crate::inspect::tierlog::drain();
+    sweep_verdicts();
+    pgo_poll();
+    queue::cleanup_ahead();
+    drain_slow_base();
+    settle_tier_tick();
+    if records_due() { drain_records_bounded(); }
+    let mut tiers = queue::tiers();
+    let before: std::collections::HashSet<_> = tiers.iter().map(|e| e.0).collect();
+    tier_revalidate(&mut tiers);
+    let kept: std::collections::HashSet<_> = tiers.iter().map(|e| e.0).collect();
+    queue::retain(|job| !matches!(job, queue::Job::O3(e) if before.contains(&e.0) && !kept.contains(&e.0)));
+    o2_offer_hottest();
+    let now = w0_activity();
+    let mut state = TICK_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if state.0 == now { state.1 = state.1.saturating_add(1); } else { *state = (now, 0); }
+    W0_IDLING.store(state.1 >= W0_QUIET, Ordering::Relaxed);
+}
+
+fn compile_checkpoint() {
+    let held = front_reads_held() + u32::from(owner::is_owner());
+    let site = if owner::is_owner() { "jit owner unit" } else { FRONT_READ_SITE.try_with(|site| site.get()).unwrap_or("jit front read") };
+    crate::pool::checkpoint(held, site);
 }

@@ -76,8 +76,6 @@ impl CheckTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ctfe { Off, Check, On }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WorkerQos { Default, Background, Utility }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier0Baseline { Off, Startup, Always }
 /// How much the JIT compiles ahead of the program's calls (`makepad run --ahead=<level>`,
 /// `MAKEPAD_RUN_AHEAD`). Every level compiles what runs on its first call and tiers hot code up to
@@ -246,9 +244,6 @@ pub struct Options {
     pub relaxed: Option<String>,
     /// `MAKEPAD_RUN_UNROLL_ONLY`; default `None`.
     pub unroll_only: Option<String>,
-    /// `MAKEPAD_RUN_AHEAD_HELPERS`; default `None` (jit::ahead_helpers: a few threads, until the
-    /// first present).
-    pub ahead_helpers: Option<u32>,
     /// `MAKEPAD_RUN_PERTURB`; default `0`.
     pub perturb: u64,
     /// `MAKEPAD_RUN_SPEC_DEPTH`; default `3`.
@@ -268,8 +263,6 @@ pub struct Options {
     pub sandbox_opt: Option<bool>,
     /// `MAKEPAD_RUN_INLINE_SRC`; default `None`.
     pub inline_src: Option<u32>,
-    /// `MAKEPAD_RUN_SPEC_JOBS`; default `None`.
-    pub spec_jobs: Option<usize>,
     /// `MAKEPAD_RUN_INLINE_LEAF`; default `(40, 8)`.
     pub inline_leaf: (usize, usize),
     /// `MAKEPAD_RUN_OPT`; default `Vec::new()`.
@@ -363,7 +356,6 @@ impl Default for Options {
             noinl_callee: None,
             relaxed: None,
             unroll_only: None,
-            ahead_helpers: None,
             perturb: 0,
             spec_depth: 3,
             spec_hot_from: 2,
@@ -373,7 +365,6 @@ impl Default for Options {
             spec_hot: None,
             sandbox_opt: None,
             inline_src: None,
-            spec_jobs: None,
             inline_leaf: (40, 8),
             opt: Vec::new(),
             a64: Vec::new(),
@@ -470,7 +461,6 @@ impl Options {
             noinl_callee: { let os = get("MAKEPAD_RUN_NOINL_CALLEE"); let v = os.and_then(|v| v.into_string().ok()); v },
             relaxed: { let os = get("MAKEPAD_RUN_RELAXED"); let v = os.and_then(|v| v.into_string().ok()); v },
             unroll_only: { let os = get("MAKEPAD_RUN_UNROLL_ONLY"); let v = os.and_then(|v| v.into_string().ok()); v },
-            ahead_helpers: { let os = get("MAKEPAD_RUN_AHEAD_HELPERS"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()) },
             perturb: { let os = get("MAKEPAD_RUN_PERTURB"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()).unwrap_or(0) },
             spec_depth: { let os = get("MAKEPAD_RUN_SPEC_DEPTH"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()).unwrap_or(3) },
             spec_hot_from: { let os = get("MAKEPAD_RUN_SPEC_HOT_FROM"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()).unwrap_or(2) },
@@ -480,7 +470,6 @@ impl Options {
             spec_hot: { let os = get("MAKEPAD_RUN_SPEC_HOT"); let v = os.and_then(|v| v.into_string().ok()); v.map(|v| v == "1") },
             sandbox_opt: { let os = get("MAKEPAD_RUN_SANDBOX_OPT"); let v = os.and_then(|v| v.into_string().ok()); match v.as_deref() { Some("0") => Some(false), Some("1") => Some(true), _ => None } },
             inline_src: { let os = get("MAKEPAD_RUN_INLINE_SRC"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()) },
-            spec_jobs: { let os = get("MAKEPAD_RUN_SPEC_JOBS"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()) },
             inline_leaf: { let os = get("MAKEPAD_RUN_INLINE_LEAF"); let v = os.and_then(|v| v.into_string().ok()); parse_leaf(v.as_deref()) },
             opt: { let os = get("MAKEPAD_RUN_OPT"); let v = os.and_then(|v| v.into_string().ok()); split(v) },
             a64: { let os = get("MAKEPAD_RUN_A64"); let v = os.and_then(|v| v.into_string().ok()); split(v) },
@@ -557,22 +546,19 @@ impl Options {
             noinl_callee,
             relaxed,
             unroll_only,
-            ahead_helpers,
             perturb,
             spec_depth,
             spec_hot_from,
             spec_ttl_ms,
             tier1_calls,
             core_hint,
-            // run-time scheduling knobs, filled in from the machine's state at session start
-            // (lib.rs session_from_env: on battery, online cores): they decide when bodies are
-            // compiled, not what code they compile to -- hashing them made a cache written on
-            // mains, or with other cores online, a stranger to the next launch (every record
-            // rejected: "identity: parser options")
+            // a run-time scheduling knob, filled in from the machine's state at session start
+            // (lib.rs session_from_env: on battery): it decides when bodies are compiled, not
+            // what code they compile to -- hashing it made a cache written on mains a stranger
+            // to the next launch (every record rejected: "identity: parser options")
             spec_hot: _,
             sandbox_opt,
             inline_src,
-            spec_jobs: _,
             inline_leaf,
             opt,
             a64,
@@ -692,8 +678,6 @@ impl Options {
         match relaxed { Some(v) => { h.u8(1); h.str(v); }, None => h.u8(0) }
         h.str("unroll_only");
         match unroll_only { Some(v) => { h.u8(1); h.str(v); }, None => h.u8(0) }
-        h.str("ahead_helpers");
-        match ahead_helpers { Some(v) => { h.u8(1); h.u64(*v as u64); }, None => h.u8(0) }
         h.str("perturb");
         h.u64(*perturb as u64);
         h.str("spec_depth");
@@ -779,9 +763,6 @@ pub struct RuntimeOptions {
     pub settle_drop: bool,
     /// `MAKEPAD_RUN_BURST_ARENA`; default `true`.
     pub burst_arena: bool,
-    /// `MAKEPAD_RUN_O3_BURST` (`0`: off, for A/Bs); default `true`: after the first present, while the O3
-    /// queue is not trivial, more O3 workers run (every performance core but one) until it drains.
-    pub tier1_burst: bool,
     /// `MAKEPAD_RUN_MODULE_FUEL`; default `4_000_000_000`.
     pub module_fuel: i64,
     /// `MAKEPAD_RUN_MODULE_MEM_MB`; default `256`.
@@ -793,12 +774,8 @@ pub struct RuntimeOptions {
     pub test_domains: usize,
     /// `MAKEPAD_RUN_WATCHDOG_MS`; default `20_000`.
     pub watchdog_ms: u64,
-    /// `MAKEPAD_RUN_O3_THREADS`; default `None`.
-    pub tier1_threads: Option<usize>,
     /// `MAKEPAD_RUN_RESTORE`; default `None`.
     pub restore: Option<String>,
-    /// `MAKEPAD_RUN_WORKER_QOS`; default `WorkerQos::Background`.
-    pub worker_qos: WorkerQos,
     /// `MAKEPAD_RUN_AHEAD` (`--ahead=<level>` sets it); default `AheadLevel::Balanced`. Not part of
     /// the code identity: every level makes the same code for a slot, so they share warm caches.
     pub ahead: AheadLevel,
@@ -816,15 +793,12 @@ impl Default for RuntimeOptions {
             mem_trim: true,
             settle_drop: true,
             burst_arena: true,
-            tier1_burst: true,
             module_fuel: 4_000_000_000,
             module_mem_mb: 256,
             repeat: 1,
             test_domains: 1,
             watchdog_ms: 20_000,
-            tier1_threads: None,
             restore: None,
-            worker_qos: WorkerQos::Background,
             ahead: AheadLevel::Balanced,
         }
     }
@@ -846,15 +820,12 @@ impl RuntimeOptions {
             mem_trim: { let os = get("MAKEPAD_RUN_MEM_TRIM"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             settle_drop: { let os = get("MAKEPAD_RUN_SETTLE_DROP"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             burst_arena: { let os = get("MAKEPAD_RUN_BURST_ARENA"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
-            tier1_burst: { let os = get("MAKEPAD_RUN_O3_BURST"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             module_fuel: { let os = get("MAKEPAD_RUN_MODULE_FUEL"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()).unwrap_or(4_000_000_000) },
             module_mem_mb: { let os = get("MAKEPAD_RUN_MODULE_MEM_MB"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()).unwrap_or(256) },
             repeat: { let os = get("MAKEPAD_RUN_REPEAT"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()).unwrap_or(1) },
             test_domains: { let os = get("MAKEPAD_RUN_TEST_DOMAINS"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()).filter(|n: &usize| *n >= 1).unwrap_or(1) },
             watchdog_ms: { let os = get("MAKEPAD_RUN_WATCHDOG_MS"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()).unwrap_or(20_000) },
-            tier1_threads: { let os = get("MAKEPAD_RUN_O3_THREADS"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()) },
             restore: { let os = get("MAKEPAD_RUN_RESTORE"); let v = os.and_then(|v| v.into_string().ok()); v },
-            worker_qos: { let os = get("MAKEPAD_RUN_WORKER_QOS"); let v = os.and_then(|v| v.into_string().ok()); match v.as_deref() { Some("0") => WorkerQos::Default, Some("utility") => WorkerQos::Utility, _ => WorkerQos::Background } },
             ahead: { let os = get("MAKEPAD_RUN_AHEAD"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref().and_then(AheadLevel::parse).unwrap_or(AheadLevel::Balanced) },
         }
     }

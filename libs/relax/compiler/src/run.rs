@@ -1913,7 +1913,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     crate::mainprof::start();
     MAIN_START_WALL.store(jit::wall_ns(), Ordering::Relaxed);
     if ahead {
-        start_ahead(up, fn_defs, runtime);
+        start_ahead(up, fn_defs);
     }
     let mut domain_inputs = None;
     // a live session: hot reload of the program's own sources (reload.rs); none for store sources
@@ -1925,13 +1925,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if !HARNESS_RUN.load(Ordering::Acquire) && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none() {
         jit::start_cpu_budget();
     }
-    jit::start_completion(up, runtime);
+    jit::start_completion(up);
     // the dependencies' bodies no build asked for are type-checked after the first frame
-    if !harness && plain_test.is_none() { crate::typeck_bg::start(up, root, main_def, runtime); }
+    if !harness && plain_test.is_none() { crate::typeck_bg::start(up, root, main_def); }
     let platform = u.prog.crates.iter().any(|c| u.prog.syms.str(c.name) == "makepad_platform");
     jit::live_needs_present(!live_tests && platform);
     // a test harness never presents, nor does a program without the platform: no startup to wait out
-    jit::startup_main(runtime, platform && !HARNESS_RUN.load(Ordering::Acquire));
+    jit::startup_main(platform && !HARNESS_RUN.load(Ordering::Acquire));
     if HAL_RUN.load(Ordering::Acquire) && platform && !HARNESS_RUN.load(Ordering::Acquire) && !live_tests {
         crate::first_frame::arm(&package);
     }
@@ -2493,12 +2493,11 @@ fn startup_defs(prog: &crate::program::Program, path: &str) -> Vec<DefId> {
 /// Ahead-of-call compilation on a worker (`--ahead=aot-max|aot-min`): the previous run's startup functions, in
 /// order, at worker priority. Compiles serialize with lazy compiles on the owner thread, so the
 /// worker overlaps with the program's own execution, not with its compiles.
-fn start_ahead(up: *mut Unit, defs: Vec<DefId>, runtime: &crate::options::RuntimeOptions) {
+fn start_ahead(up: *mut Unit, defs: Vec<DefId>) {
     let upn = up as usize;
-    let runtime = crate::zone_alloc::kept_clone(runtime);
     { let _k = crate::zone_alloc::kept();
     std::thread::spawn(move || { let _z = crate::zone_alloc::compiler_thread();
-        jit::lower_this_thread_priority(&runtime);
+        makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
         let up = upn as *mut Unit;
         let t = Instant::now();
         let mut n = 0;
