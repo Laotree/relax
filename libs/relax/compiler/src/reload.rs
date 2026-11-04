@@ -4356,6 +4356,12 @@ fn patch_landed(paths: impl Iterator<Item = String>, items: Option<Vec<String>>)
     wake_program();
 }
 
+/// How many patches are installed (std::relax::patched's count): a grab's `patch` that is lower
+/// shows a frame drawn before the newest one.
+pub fn patches_installed() -> u64 {
+    PATCHED.lock().unwrap_or_else(|e| e.into_inner()).count
+}
+
 /// What patches changed after count `since` ([`Patched::since`]).
 pub extern "C" fn __relax_patched_files(since: u64, buf: *mut u8, cap: usize) -> usize {
     crate::jit::host_boundary("__relax_patched_files", move || {
