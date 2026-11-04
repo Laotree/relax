@@ -5352,9 +5352,11 @@ fn removed_module_line(path: &str, declares: &str) -> String {
 /// The run's inputs `keep` takes (an absolute path; `inspect inputs` answers relative ones).
 pub(crate) fn input_paths(keep: &dyn Fn(&str) -> bool) -> Result<Vec<String>, String> {
     // a live session's request that comes before its watcher started (a patch sent right after
-    // the launch) waits for it: it was refused "not started" (11-03)
+    // the launch) waits for it: it was refused "not started" (11-03). The run's own flag: this
+    // answers from before the program is laid out (the layout's flag), and a save that came then
+    // read "watches no sources" and ended the session (12 min of native build lost, 11-04)
     let mut g = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner());
-    while g.is_none() && crate::layout::LIVE_SESSION.load(std::sync::atomic::Ordering::Acquire) && !WATCH_GONE.load(std::sync::atomic::Ordering::Acquire) {
+    while g.is_none() && crate::run::live_session() && !WATCH_GONE.load(std::sync::atomic::Ordering::Acquire) {
         g = WATCH_READY.wait(g).unwrap_or_else(|e| e.into_inner());
     }
     let (inputs, loaded) = g.as_ref().map(|v| (v.inputs.clone(), v.loaded.clone())).ok_or("this run watches no sources (not a live session, or its watcher ended)")?;
@@ -6560,6 +6562,25 @@ mod use_edit_tests {
         }
         std::mem::forget(unit);
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod watch_wait_tests {
+    use super::*;
+
+    #[test]
+    fn an_inputs_ask_during_the_boot_waits_for_the_watcher() {
+        isolated_test!(an_inputs_ask_during_the_boot_waits_for_the_watcher);
+        assert!(input_paths(&|_| true).is_err(), "no live run: no watcher to wait for");
+        // a live run that has not laid out its program yet
+        crate::run::LIVE_SESSION.store(true, std::sync::atomic::Ordering::Release);
+        assert!(!crate::layout::LIVE_SESSION.load(std::sync::atomic::Ordering::Acquire));
+        let ask = std::thread::spawn(|| input_paths(&|_| true));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!ask.is_finished(), "the ask waits for the watcher");
+        set_watch_inputs(&Inputs::default(), &[]);
+        assert_eq!(ask.join().unwrap(), Ok(Vec::new()));
     }
 }
 

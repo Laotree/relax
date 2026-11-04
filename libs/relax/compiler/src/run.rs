@@ -52,7 +52,7 @@ pub(crate) fn silent() -> bool {
     SILENT.load(Ordering::Relaxed)
 }
 /// This run is a live session (watcher and hot reload: a failed build is fixed by an edit).
-static LIVE_SESSION: AtomicBool = AtomicBool::new(false);
+pub(crate) static LIVE_SESSION: AtomicBool = AtomicBool::new(false);
 
 /// Whether this run is a live session: one that takes edits while it runs (a run window can wait
 /// for one after a failed build). A run without (`--no-live`, a store's sources, a program a test
