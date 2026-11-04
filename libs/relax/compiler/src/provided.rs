@@ -327,14 +327,15 @@ pub fn finish_sources() -> Result<(), SourceCheckError> {
 }
 
 /// Reads what `check_sources` reads, for the identity of every registered crate in the program,
-/// and nothing else. A check for another target binds nothing, but the run on that target
-/// (the phone) compares these identities: `pack-src` records the files this reads so its archive
-/// holds them.
+/// and nothing else, each package folder once. A check for another target binds nothing, but the
+/// run on that target (the phone) compares these identities: `pack-src` records the files this
+/// reads so its archive holds them (run.rs calls it only while the read log records).
 pub fn read_identity_files(pkgs: &[crate::srchash::SrcPkg]) {
     let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut files = std::collections::HashMap::new();
     for p in reg.iter() {
         for (root, _) in pkgs.iter().enumerate().filter(|(_, k)| k.name.replace('-', "_") == p.name) {
-            let _ = crate::srchash::closure_hash(pkgs, root);
+            let _ = crate::srchash::closure_manifest_with(pkgs, root, &mut files);
         }
     }
 }

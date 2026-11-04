@@ -580,7 +580,9 @@ pub(crate) fn resolve_package(
         // resolve and a failing hash all end here.
         let later = bind && boot && !check_only;
         let pkgs = std::sync::Arc::new(pkgs);
-        if !bind { crate::provided::read_identity_files(&pkgs); }
+        // a run that binds nothing reads the identity files only for the read log (`pack-src`): a
+        // test harness or a check would hash every provided crate's closure for nothing
+        if !bind && crate::vfs::recording() { crate::provided::read_identity_files(&pkgs); }
         if later { crate::provided::check_sources_later(pkgs.clone()); }
         let (sources, scripts, scripts_ms, wait_ms) = std::thread::scope(|scope| {
             let sources = (bind && !later).then(|| scope.spawn(|| {
