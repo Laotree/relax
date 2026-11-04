@@ -1984,7 +1984,8 @@ unsafe fn initializer_deps_changed(up: *mut Unit, root: u32, changed: &[DefId], 
         for &c in &u.fns[s as usize].calls { reach(&mut from, &mut todo, s, c); }
         for i in rir.blocks.iter().flat_map(|b| &b.insts) {
             match i {
-                Inst::Call(Callee::Fn(c) | Callee::CFn(c, _), _, _) | Inst::FnAddr(_, c) | Inst::SlotAddr(_, c) => reach(&mut from, &mut todo, s, *c),
+                // (SlotAddr is a frame slot of this code, not a fn slot)
+                Inst::Call(Callee::Fn(c) | Callee::CFn(c, _), _, _) | Inst::FnAddr(_, c) => reach(&mut from, &mut todo, s, *c),
                 Inst::Call(Callee::Indirect(_) | Callee::CIndirect(..), _, _) => return Err(format!("an indirect call in `{}`, reached as {}", u.fns[s as usize].name, path(&from, s))),
                 Inst::Addr(_, sym) => match u.syms.kind(sym.id) {
                     Some(crate::syms::SymKind::Thunk(c)) => reach(&mut from, &mut todo, s, c),
