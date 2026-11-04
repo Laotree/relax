@@ -14174,15 +14174,22 @@ impl<'a> InlineBodies<'a> {
                 ids.push(*c);
             }
         }
-        // the calls a preparation inlines (outside cold blocks)
+        // every call of every block: a cold block's calls too, since inlining a callee at an invoke
+        // turns its cleanup into ordinary code a preparation asks about. A cycle only a cold block
+        // closes (recursive drop glue) stays one component; apart, its members' preparations would
+        // ask for each other without end. A body with calls only in cold blocks has nothing to prepare.
+        let mut inlines = vec![false; ids.len()];
         let edges: Vec<Vec<usize>> = ids.iter().enumerate().map(|(k, &c)| {
             let mut e = Vec::new();
             for b in &unsafe { &*get(c).unwrap().0 }.blocks {
-                if matches!(b.term, Term::Unreachable | Term::Resume) { continue; }
+                let cold = matches!(b.term, Term::Unreachable | Term::Resume);
                 for i in &b.insts {
                     if let Inst::Call(Callee::Fn(x), _, _) | Inst::FnAddr(_, x) = i {
                         if let Some(&n) = at.get(x) {
-                            if n != k && !e.contains(&n) { e.push(n); }
+                            if n != k {
+                                inlines[k] |= !cold;
+                                if !e.contains(&n) { e.push(n); }
+                            }
                         }
                     }
                 }
@@ -14191,7 +14198,7 @@ impl<'a> InlineBodies<'a> {
         }).collect();
         let mut node = HashMap::new();
         for (ci, comp) in sccs(&edges).iter().enumerate() {
-            for &k in comp { node.insert(ids[k], (ci, !edges[k].is_empty())); }
+            for &k in comp { node.insert(ids[k], (ci, inlines[k])); }
         }
         InlineBodies { options, root, get, reads, single, ro, cfg, nounwind, node, arc_of, index: Default::default() }
     }
@@ -14336,6 +14343,74 @@ impl<'a> InlineBodies<'a> {
             }
             k += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod inline_bodies_tests {
+    use super::*;
+    use relax_backend::rir::{Callee, Cls, Func, Inst, Term};
+
+    fn fill(f: &mut Func, blocks: Vec<(Vec<Inst>, Term)>) {
+        for (insts, term) in blocks {
+            let b = f.block() as usize;
+            f.blocks[b].pos = vec![0; insts.len()];
+            f.blocks[b].insts = insts;
+            f.blocks[b].term = term;
+        }
+    }
+
+    /// `callee` called in a loop whose exit test no pass can fold: invoked, or a plain call.
+    fn looping(name: &str, test: u32, callee: u32, invoke: bool) -> Func {
+        let mut f = Func::new(name.into(), 0);
+        let c = f.vreg(Cls::I);
+        fill(&mut f, vec![
+            (vec![], Term::Jump(1)),
+            (vec![Inst::Call(Callee::Fn(test), vec![], vec![c])], Term::Branch(c, 2, 3)),
+            (vec![Inst::Call(Callee::Fn(callee), vec![], vec![])], if invoke { Term::Invoke(1, 4) } else { Term::Jump(1) }),
+            (vec![], Term::Ret(vec![])),
+            (vec![], Term::Resume),
+        ]);
+        f
+    }
+
+    /// The shape of recursive drop glue: `a` runs `h` in a loop, `h`'s cleanup calls `b`, `b` runs
+    /// `a` in a loop. Only `h`'s cold block closes the cycle, and inlining `h` at `a`'s invoke turns
+    /// that block into a site in `a`'s loop.
+    #[test]
+    fn a_cycle_only_a_cold_block_closes_ends() {
+        const ROOT: u32 = 0xF100_0000;
+        const A: u32 = ROOT + 1;
+        const H: u32 = ROOT + 2;
+        const B: u32 = ROOT + 3;
+        const TEST: u32 = ROOT + 4;
+        const LEAF: u32 = ROOT + 5;
+        let always = relax_codegen::opt::ATTR_ALWAYS;
+        let mut h = Func::new("h".into(), 0);
+        fill(&mut h, vec![
+            (vec![Inst::Call(Callee::Fn(LEAF), vec![], vec![])], Term::Invoke(1, 2)),
+            (vec![], Term::Ret(vec![])),
+            (vec![Inst::Call(Callee::Fn(B), vec![], vec![])], Term::Resume),
+        ]);
+        let snap = vec![
+            (A, std::sync::Arc::new(looping("a", TEST, H, true)), always),
+            (H, std::sync::Arc::new(h), always),
+            (B, std::sync::Arc::new(looping("b", TEST, A, false)), always),
+        ];
+        let options = crate::options::Options::default();
+        let cfg = relax_codegen::opt::OptCfg::from_options(&options);
+        // a preparation reads each body a few times: far past that, they are asking for each other
+        let reads_of_bodies = std::cell::Cell::new(0u32);
+        let get = |c: u32| {
+            reads_of_bodies.set(reads_of_bodies.get() + 1);
+            assert!(reads_of_bodies.get() < 20_000, "the preparations ask for each other without end");
+            snap.iter().find(|x| x.0 == c).map(|x| (&*x.1 as *const Func, x.2))
+        };
+        let reads = std::cell::RefCell::new(Vec::new());
+        let bodies = InlineBodies::new(&options, ROOT, &snap, &get, &reads, &|_, _| false, None, &cfg, &|_| false);
+        bodies.prepared(A);
+        // `h` has calls only in its cold block and in no snapshot body outside it: nothing to prepare
+        assert!(bodies.prepared(H).is_none());
     }
 }
 
