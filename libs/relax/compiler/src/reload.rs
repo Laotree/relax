@@ -5287,16 +5287,14 @@ pub use host::set_loader_package;
 pub fn start_watcher(up: *mut Unit, inputs: Inputs) {
     crate::hot_failure::enable();
     crate::hot_failure::restore();
-    let session = unsafe { crate::jit::unit_session(up) };
     struct P(*mut Unit);
     unsafe impl Send for P {}
     let p = P(up);
     let spawned = std::thread::Builder::new()
         .name("run-live".to_string())
         .spawn(move || { let _z = crate::zone_alloc::compiler_thread();
-            let runtime = &session.runtime;
             let p = p;
-            jit::lower_this_thread_priority(runtime);
+            makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
             // a panic here (the ICE hook is silent on the compiler's owner thread) would end
             // live editing without a word: say so
             loop {

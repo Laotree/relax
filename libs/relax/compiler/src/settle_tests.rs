@@ -131,11 +131,18 @@ fn settle_rebuild_segregates_slot_lifetimes() {
     crate::zone_alloc::compiler_mark_old();
     let before = crate::zone_alloc::arena_states().0;
     assert!(before[21] > 0 && before[22] > 0, "fixture must populate cold compiler chunks");
+    let retired_front = u.front.clone();
+    queue::queue().lock().unwrap().push(queue::Job::Ahead(retired_front.clone(), AheadWork::Slot(0)), wall_ns());
+    assert_eq!(queue::counts()[0], 1, "fixture queues work against the old front");
     FIRST_PRESENT.store(true, Ordering::Release);
     match settle_rebuild::run(up, false) {
         settle_rebuild::Outcome::Done => {}
         settle_rebuild::Outcome::Retry(why) | settle_rebuild::Outcome::Refused(why) => panic!("settle rebuild did not replace: {why}"),
     }
+    assert_eq!(queue::counts()[0], 0, "settle discards jobs against the replaced front");
+    queue::queue().lock().unwrap().push(queue::Job::Ahead(retired_front.clone(), AheadWork::Slot(0)), wall_ns());
+    assert_eq!(queue::counts()[0], 0, "late producers cannot enqueue a retired front");
+    drop(retired_front);
     crate::owner::call(crate::owner::Class::Program, || {
         let after_fields = check_slots(&u);
         assert!(!after_fields[5], "rebuild clears build errors");
@@ -422,8 +429,8 @@ fn main() {}
             assert_eq!(u.stats.tier1_installed, 0, "warm linking must not rebuild O3");
             assert!(u.fns[id as usize].rir.is_none());
             assert_eq!(unsafe { (*tier_rec(&u.slots, id).add(3)).load(Ordering::Acquire) }, T_QUEUED);
-            assert!(TIER_QUEUE.lock().unwrap().is_empty());
-            assert!(O2_QUEUE.lock().unwrap().is_empty());
+            assert_eq!(queue::counts()[2], 0, "warm linking must not queue O3");
+            assert_eq!(queue::counts()[1], 0, "warm linking must not queue O2");
         }
         id
     });
@@ -716,7 +723,7 @@ fn unrelated(x: u32) -> u32 { x + 1 }
         u.install(unrelated, &code.0, &code.2, code.1, 0).unwrap();
         let saved_refs = std::mem::replace(&mut u.fns[id as usize].rir_refs, crate::zone_alloc::slots_with(|| vec![unrelated].into_boxed_slice()));
         // Pending and popped/in-flight O3 jobs both pin their input slots.
-        TIER_QUEUE.lock().unwrap().push((id, Q_CALLS, wall_ns(), 0));
+        queue::queue().lock().unwrap().push(queue::Job::O3((id, Q_CALLS, wall_ns(), 0)), wall_ns());
         TIER_ACTIVE.lock().unwrap().push(closure);
         let active = TierActive(closure);
         let generation = reclaim_generation();
@@ -727,7 +734,7 @@ fn unrelated(x: u32) -> u32 { x + 1 }
         assert!(u.fns[closure as usize].rir.is_some());
         assert!(u.fns[unrelated as usize].rir.is_some(), "queued readers pin their known callee inputs too");
         u.fns[id as usize].rir_refs = saved_refs;
-        TIER_QUEUE.lock().unwrap().clear();
+        queue::retain(|job| !matches!(job, queue::Job::O3(_)));
         drop(active);
         assert!(reclaim_generation() > generation, "finishing the last reader must wake reclamation without a new install");
         // A suspended O1 front must keep all of its not-yet-snapshotted candidates.

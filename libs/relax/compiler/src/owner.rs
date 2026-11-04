@@ -124,6 +124,7 @@ struct Req {
     ctx: *const (),
     /// the requester's compile record (jit::main_rec)
     rec: *const (),
+    budget_job: Option<std::sync::Arc<crate::pool::JobClass>>,
     state: AtomicU8,
     panic: Cell<Option<Box<dyn Any + Send>>>,
     /// where it panicked on the owner (lifeline's record there): the requester's own record when
@@ -932,9 +933,9 @@ pub fn start() {
                 let _ = OWNER_THREAD.set(std::thread::current());
                 crate::jit::ensure_altstack();
                 // the UI thread waits on this thread for every lazy compile: it runs in the UI's
-                // class (macOS: user-interactive QoS), so a busy machine does not starve the one
-                // thread the UI waits behind
-                crate::os::thread::interactive();
+                // class (macOS: user-interactive QoS), whoever's request it serves, so a busy machine
+                // does not starve the one thread the UI waits behind
+                makepad_cpu_budget::set_ui_thread();
                 let _ = crate::zone_alloc::kept_with(|| tx.send(()));
                 // a panic outside a request (serve catches those) ends the process with a report:
                 // a dead owner would leave every requester waiting forever
@@ -998,6 +999,7 @@ fn request<R>(site: &'static std::panic::Location<'static>, class: Class, deadli
         bg: is_background_request(class),
         ctx: crate::query::context_ptr(),
         rec: crate::jit::main_rec_target(),
+        budget_job: crate::pool::current_job(),
         state: AtomicU8::new(QUEUED),
         panic: Cell::new(None),
         panic_at: Cell::new(crate::lifeline::NO_PANIC_AT),
@@ -1128,6 +1130,7 @@ pub fn post_queued(class: Class, f: impl FnOnce() + Send + 'static) {
         bg: is_background_request(class),
         ctx: std::ptr::null(),
         rec: std::ptr::null(),
+        budget_job: None,
         state: AtomicU8::new(QUEUED),
         panic: Cell::new(None),
         panic_at: Cell::new(crate::lifeline::NO_PANIC_AT),
@@ -1315,6 +1318,7 @@ fn serve(r: usize) {
     if req.t_push != 0 || req.t_main != 0 {
         req.t_serve.store(t0.max(1), Ordering::Relaxed);
     }
+    let budget_context = crate::pool::enter_job(req.budget_job.clone());
     let prev_ctx = unsafe { crate::query::swap_context(req.ctx) };
     let prev = SERVING.with(|s| s.replace((req.class, req.from)));
     let prev_bg = SERVING_BG.with(|b| b.replace(req.bg));
@@ -1389,6 +1393,8 @@ fn serve(r: usize) {
     if res.as_ref().is_err_and(|p| p.is::<ExitParked>()) {
         return;
     }
+    // Restore the requester's wake target before it can resume using its admission.
+    drop(budget_context);
     match req.waited {
         true => {
             if let Err(p) = res {

@@ -1115,7 +1115,7 @@ impl Drop for ScriptSlot {
 fn script_slot() -> ScriptSlot {
     let mut n = SCRIPT_RUNNING.lock().unwrap_or_else(|e| e.into_inner());
     while *n >= script_slots() {
-        n = SCRIPT_FREE.wait(n).unwrap_or_else(|e| e.into_inner());
+        n = crate::pool::wait(&SCRIPT_FREE, &SCRIPT_RUNNING, n).unwrap_or_else(|e| e.into_inner());
     }
     *n += 1;
     ScriptSlot

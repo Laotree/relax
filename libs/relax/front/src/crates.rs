@@ -394,7 +394,7 @@ pub fn discover(sess: &std::sync::Arc<crate::Session>, crates: &[CrateUnit], cfg
                         if s.active == 0 {
                             break None;
                         }
-                        s = cv.wait(s).unwrap();
+                        s = crate::pool::wait(&cv, &state, s).unwrap();
                     }
                 };
                 let job = match job {
