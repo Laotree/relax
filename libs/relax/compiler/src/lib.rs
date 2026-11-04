@@ -369,6 +369,7 @@ pub fn print_as_rustc(sess: &std::sync::Arc<crate::Session>, args: &[String], in
 /// Construct the invocation inputs before parsing; CLI overrides replace environment values.
 /// rustc: compiler/rustc_session/src/config.rs:2428, session.rs:90-93.
 pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
+    crate::pool::thread_start(crate::jit::ensure_altstack);
     let mut options = crate::options::Options::from_env();
     // `--no-asm` / `--allow-c` anywhere before `--`, for every command (run, test, check, the
     // relax runner): the environment carries them to the processes this one starts (build
@@ -392,7 +393,6 @@ pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
     }
     options.cpu = relax_backend::x64::detect_cpu(&options);
     options.spec_hot = Some(options.spec_hot.unwrap_or_else(crate::jit::on_battery));
-    options.spec_jobs = Some(options.spec_jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()).saturating_sub(1).clamp(1, 6)));
     let mut session = crate::Session { options, runtime: crate::options::RuntimeOptions::from_env() };
     session.options.target = match session.options.check_target {
         crate::options::CheckTarget::WindowsX64 => "x86_64-pc-windows-gnu",

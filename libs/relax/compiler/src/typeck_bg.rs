@@ -35,10 +35,9 @@ pub fn running() -> bool {
 
 /// Starts the background check of unit `up` (`root`: the program's crate; `main`: where the
 /// reachability walk starts).
-pub fn start(up: *mut Unit, root: u32, main: Option<DefId>, runtime: &crate::options::RuntimeOptions) {
+pub fn start(up: *mut Unit, root: u32, main: Option<DefId>) {
     if std::env::var("MAKEPAD_RUN_BG_TYPECK").is_ok_and(|v| v == "0") { return; }
     let upn = up as usize;
-    let runtime = crate::zone_alloc::kept_clone(runtime);
     let _k = crate::zone_alloc::kept();
     RUNNING.store(true, Ordering::Release);
     // (typeck recurses deeply on big bodies: the check workers' stack)
@@ -50,7 +49,7 @@ pub fn start(up: *mut Unit, root: u32, main: Option<DefId>, runtime: &crate::opt
             fn drop(&mut self) { RUNNING.store(false, Ordering::Release); }
         }
         let _ended = Ended;
-        run(upn as *mut Unit, root, main, &runtime);
+        run(upn as *mut Unit, root, main);
     });
     if spawned.is_err() { RUNNING.store(false, Ordering::Release); }
 }
@@ -92,12 +91,12 @@ enum Checked {
     Stop,
 }
 
-fn run(up: *mut Unit, root: u32, main: Option<DefId>, runtime: &crate::options::RuntimeOptions) {
+fn run(up: *mut Unit, root: u32, main: Option<DefId>) {
     while !jit::past_startup() {
         if stopping() { return; }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    jit::lower_this_thread_priority(runtime);
+    makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
     let (t0, w0) = (relax_backend::cpu_ns(), jit::wall_ns());
     let f = unsafe { (*up).front.clone() };
     // the crates' skipped files read here, the keys made on the owner (the cache is the owner's)

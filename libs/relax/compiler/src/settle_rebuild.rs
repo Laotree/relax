@@ -257,7 +257,7 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
     // during the tail: 18-22k RIR bodies and 190k query nodes regrown, 400 MB live, against 2k
     // and 250 MB after a rebuild behind it)
     if patient {
-        let queued = tier_queue().map_or(0, |q| q.len()) + TIER_ACTIVE.lock().map_or(0, |a| a.len());
+        let queued = queue::counts()[2] + TIER_ACTIVE.lock().map_or(0, |a| a.len());
         if queued > 0 {
             return Outcome::Retry("O3 builds are queued".into());
         }
@@ -500,7 +500,7 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
     u.front.retire_memos();
     // the old front state names the old program: no reader may reach it after the replace (a
     // reader checks `alive` under its front read, and this runs under the front write)
-    u.front.alive.store(false, Ordering::SeqCst);
+    queue::retire_front(&u.front);
     let mut rir = Vec::new();
     for e in u.fns.iter_mut() {
         if let Some(r) = e.rir.take() {

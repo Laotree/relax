@@ -199,7 +199,7 @@ pub fn verify_front_images() {
     }
     { let _k = crate::zone_alloc::kept();
     let _ = std::thread::Builder::new().name("run-cache-verify".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
-        crate::os::thread::lower_priority(true);
+        makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
         let mut bad: Vec<std::path::PathBuf> = Vec::new();
         for (st, i) in &used {
             if !st.verify_at(*i) && !bad.contains(&st.path) {
@@ -857,7 +857,6 @@ impl Cache {
     /// program no other thread reaches (settle_rebuild opens the new state's cache before its
     /// replace).
     pub fn open_from(from: &OpenFrom<'_>, mode: Mode, root: PathBuf, collected: Option<&CollectedCache>) -> Result<Cache, String> {
-        let runtime = from.prog.session.runtime.clone();
         let options = &from.prog.session.clone().options;
         let verbose = options.verbose;
         let t0 = std::time::Instant::now();
@@ -1177,7 +1176,7 @@ impl Cache {
             let r = root.clone();
             { let _k = crate::zone_alloc::kept();
             let _ = std::thread::Builder::new().name("run-cache-prune".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
-                crate::jit::lower_this_thread_priority(&runtime);
+                makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
                 let (b, a) = prune_root(&r);
                 if verbose && std::env::var_os("MAKEPAD_RUN_CACHE_TRACE").is_some() && b != a {
                     eprintln!("makepad-run cache: pruned {} -> {} MB", b >> 20, a >> 20);
@@ -4965,7 +4964,7 @@ pub fn start_deferred_front() {
     if DEFERRED_FRONT.lock().unwrap().is_empty() { return; }
     let _k = crate::zone_alloc::kept();
     let _ = std::thread::Builder::new().name("run-front-graph".into()).spawn(|| { let _z = crate::zone_alloc::compiler_thread();
-        crate::os::thread::lower_priority(true);
+        makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
         let t = std::time::Instant::now();
         let r = flush_front_graphs();
         if crate::preload::trace() {
@@ -6196,7 +6195,7 @@ impl FrontWriters {
             let queue = self.queue.clone();
             self.workers.push(std::thread::Builder::new().name("run-front-writer".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
                 // the records written after the first present must not slow the first frames
-                if low { crate::os::thread::lower_priority(true); }
+                if low { makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND); }
                 let (queue, wake) = &*queue;
                 let mut recorded = Vec::new();
                 loop {

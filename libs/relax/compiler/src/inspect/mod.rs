@@ -245,8 +245,9 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("writes", "<Type::field> | (none: the watches) | W<n> [n=20] | rm <W<n>|all>", "who writes a struct field: the compiled fns that assign `x.field` (`=`, `op=`) are rebuilt to record every write: its site (fn, file:line), the value written and the field's address; `writes W<n>` reads the sites and the latest writes"),
     ("vms", "", "every live Splash VM: label, thread, heap objects / strings / arrays and bytes, GC runs and time, errors, evaluations"),
     ("live", "[after=<next>]", "an instant look for live graphs (no window, no sleep), one JSON line: now_ms, frames presented, live patches installed and the ones the newest presented window frame was built with (frame_patch), finished builds so far per kind (lazy, ahead, o2, o3, linked; diff two looks for a rate), queues [ahead,o2,o3], UI ms waited on the JIT; with after=<the last answer's next>: the UI frames since then (the last minute at most) as ft [[ms before now_ms the frame ended, ms it worked], ...]"),
+    ("cpu", "", "the shared CPU budget: running and queued app/JIT jobs per class, waits and checkpoint warnings"),
     ("jit", "[ms=250]","live compile activity in one line (what the JIT ring shows): busy or idle, the jobs running now, the queues per tier (ahead, O2, O3), builds finished and their rate over ms, the UI thread's JIT duty"),
-    ("jit queue", "[n=10]","what the JIT builds now, then the next n of the O3 and O2 queues in the order they are built: heat (x the O3 threshold; ui: the UI thread's path), why queued, seconds waited, fn"),
+    ("jit queue", "[n=10]","running JIT jobs, then the unified queue in admission order: class, heat, UI path, wait, function"),
     ("threads", "", "every thread: name, role, state, CPU time, what it waits on; JIT threads: alive/restarting/dead, panics, heartbeat"),
     ("stacks", "[thread=<name|tid|main|owner|all>] [depth=12]", "symbolised stacks (identical stacks folded)"),
     ("waits", "", "the wait registry: who waits for what, held by whom"),
@@ -374,6 +375,7 @@ fn dispatch_command(req: &Req, out: &mut Out) {
         "ping" => out.line(&format!("{{\"pid\":{},\"app\":{},\"ms\":{}}}", std::process::id(), json_str(&APP.lock().unwrap()), now_ms())),
         "threads" => cmd_threads(out),
         "jit" => cmd_jit(req, out),
+        "cpu" => { for line in makepad_cpu_budget::report_string().lines() { out.line(line); } },
         "live" => cmd_live(req, out),
         "stacks" => cmd_stacks(req, out),
         "waits" => cmd_waits(out),
@@ -541,7 +543,7 @@ fn role(name: &str, os_id: u64, handle: u64) -> &'static str {
     let _ = os_id;
     match name {
         n if n.starts_with("run-inspect") || n.starts_with("makepad-remote") => "inspect",
-        n if n.starts_with("run-spec") || n.starts_with("run-O2") || n.starts_with("run-o3") || n.starts_with("run-ahead") || n.starts_with("gandalf") || n.starts_with("run-check") => "compiler",
+        n if n.starts_with("run-jit-") || n.starts_with("gandalf") || n.starts_with("run-check") => "compiler",
         n if n.starts_with("run-") => "makepad run",
         // an unnamed thread: the OS's dispatch workers, or a program thread spawned without a name
         "" => "unnamed",
@@ -1200,7 +1202,7 @@ fn cmd_waits(out: &mut Out) {
 fn cmd_jit(req: &Req, out: &mut Out) {
     use crate::postframe::activity;
     if req.pos.first().map(String::as_str) == Some("queue") {
-        out.measured("JIT compile queues", "jit::queue_view: each queue locked for one scan, heat from the tier records", &[]);
+        out.measured("JIT compile queues", "jit::queue_view: unified queue admission order, heat from tier records", &[]);
         for l in crate::jit::queue_view(req.num("n", 10) as usize) {
             out.line(&l);
         }
@@ -1301,11 +1303,11 @@ fn jit_line(a: &crate::postframe::Activity, b: &crate::postframe::Activity, ms: 
     if b.ahead_running > 0 && !b.ui_waiting {
         running.push(format!("{} ahead", b.ahead_running));
     }
-    if b.o2_running && b.o3_slot.is_some() {
-        running.push("O2 build".into());
+    if b.o2_running > 0 && (b.o3_slot.is_some() || b.ahead_running > 0 || b.ui_waiting || b.settling) {
+        running.push(format!("{} O2 builds", b.o2_running));
     }
     parts.push(format!("running: {}", if running.is_empty() { "nothing".into() } else { running.join(", ") }));
-    parts.push(format!("queued: ahead {}, O2 {}, O3 {}", k(b.ahead), k(b.o2), k(b.o3)));
+    parts.push(format!("queued: ahead {}, O2 {}, O3 {}", k(b.ahead.saturating_sub(b.ahead_running)), k(b.o2), k(b.o3)));
     let rate = built as f64 * 1000.0 / ms as f64;
     parts.push(format!(
         "finished {} (+{} in {} ms = {:.0} fns/s: lazy {}, ahead {}, O2 {}, O3 {}, linked {})",
