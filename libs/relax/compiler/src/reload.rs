@@ -4787,6 +4787,21 @@ pub(crate) fn recover_compile_ice(message: &str, on_main: bool) -> bool {
 type Handover = (fn() -> Vec<(String, String)>, fn());
 static BEFORE_EXEC: std::sync::Mutex<Option<Handover>> = std::sync::Mutex::new(None);
 
+/// What the host does when the restart itself begins, on the thread that restarts: the window goes
+/// from the app to the start screen (hal_run), before the run's end takes its time.
+static RESTART_BEGINS: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Set once by the runner.
+pub fn set_restart_begins(begins: fn()) {
+    let _ = RESTART_BEGINS.set(begins);
+}
+
+pub(crate) fn restart_begins() {
+    if let Some(begins) = RESTART_BEGINS.get() {
+        begins();
+    }
+}
+
 /// The host's handover at an exec ([`BEFORE_EXEC`]); set once by the runner.
 pub fn set_before_exec(prepare: fn() -> Vec<(String, String)>, undo: fn()) {
     *BEFORE_EXEC.lock().unwrap_or_else(|e| e.into_inner()) = Some((prepare, undo));
@@ -4832,6 +4847,7 @@ fn exec_restart(state: Option<&[u8]>) -> Result<(), String> {
             None => { cmd.env_remove("MAKEPAD_RUN_RESTORE"); }
         }
         cmd.env("MAKEPAD_RUN_RESTART_T0", RESTART_SAVED_MS.load(std::sync::atomic::Ordering::Relaxed).to_string());
+        restart_begins();
         // the run's end as at exit: compiles stop and this run's code goes into the disk cache,
         // so the restarted run links it instead of compiling it again (exec skips the exit handlers)
         crate::run::summary("restart");
@@ -4878,10 +4894,22 @@ fn note_restart_pending(why: &str) {
 
 /// `session relaunch`: applies the edits waiting for a restart (restart_in_place). Returns how.
 pub fn relaunch_pending() -> Result<&'static str, String> {
+    RELAUNCH_ASKED.store(true, Ordering::SeqCst);
     let why = RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).join("; ");
-    eprintln!("makepad live: session relaunch: {}", if why.is_empty() { "nothing waits" } else { why.as_str() });
+    // (a repeat while it is on its way changes nothing, and says nothing)
+    if !host::restart_asked() {
+        eprintln!("makepad live: session relaunch: {}", if why.is_empty() { "nothing waits" } else { why.as_str() });
+    }
     if let Some(result) = host::relaunch() { return result; }
     restart_in_place(if why.is_empty() { "session relaunch".into() } else { why })
+}
+
+/// `session relaunch` (a click on the ring's dot) asked for this restart: the window shows it
+/// happening. An edit's restart keeps the app's last frame instead.
+static RELAUNCH_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn relaunch_asked() -> bool {
+    RELAUNCH_ASKED.load(Ordering::SeqCst)
 }
 
 /// The edits that wait for a relaunch, oldest first (cleared once a run loads the sources).
@@ -6168,6 +6196,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             let what = if changed.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };
             // provided crates and std are built into this binary: cargo rebuilds it on the way
             let restart = if inputs.host_restart_required(changed.iter().map(|&k| files[k].0.as_str())) {
+                host::note_cannot_build();
                 format!("needs a JIT rebuild: restart it through cargo (which rebuilds makepad): {}", crate::srchash::rebuild_command(&std::env::args().skip(1).collect::<Vec<_>>()))
             } else {
                 format!("restart `makepad run {package}`")
