@@ -5263,6 +5263,30 @@ pub fn start_watcher(up: *mut Unit, inputs: Inputs) {
     }
 }
 
+/// The files of `removed` (gone from disk) that are running modules whose declaring file is not
+/// among `edited`: the program still declares them, each one's refusal line. A file the program
+/// does not run (its module unbound by an earlier edit) or a crate root is no such module.
+fn undeclared_removals(prog: &crate::program::Program, removed: &[&str], edited: &std::collections::HashSet<&str>) -> Vec<String> {
+    let loaded = prog.current_source_files();
+    removed.iter().filter_map(|&path| {
+        let &file = loaded.get(path)?;
+        let module = prog.mods.iter().find(|m| m.file == file)?;
+        let declares = prog.file_paths.get(prog.mods[module.parent_mod? as usize].file as usize)?;
+        (!edited.contains(declares.as_str())).then(|| removed_module_line(path, declares))
+    }).collect()
+}
+
+/// The refusal of a module whose file `path` was removed while `declares` still declares it:
+/// rustc's E0583 for the module's name (its folder's for a `mod.rs`).
+fn removed_module_line(path: &str, declares: &str) -> String {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let name = match file {
+        "mod.rs" => path.rsplit('/').nth(1).unwrap_or(file),
+        _ => file.strip_suffix(".rs").unwrap_or(file),
+    };
+    format!("error[E0583]: file not found for module `{name}`: {path} was removed and {declares} still declares it")
+}
+
 /// Inspect takes the loaded paths on the owner: tests can load more files while the watcher
 /// waits for their verdict. No inputs lock survives that request or the path formatting.
 pub(crate) fn input_paths() -> Result<Vec<String>, String> {
@@ -6057,6 +6081,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let mut edits = Vec::new();
         let mut which = Vec::new();
         let mut read_failed = false;
+        // the files gone from disk (a module's file removed, or a store's edit taken back)
+        let mut removed = Vec::new();
         // the included files saved
         let mut moved = Vec::new();
         for &k in &changed {
@@ -6077,7 +6103,12 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                     // lacks (its stamp is the store's, its read finds nothing). A file that still
                     // exists but cannot be read must never turn a multi-file batch into a partial
                     // transaction: the batch waits for that file's next change (its stamp kept).
-                    if current.is_none() || e.kind() == std::io::ErrorKind::NotFound { f.2 = current; } else { read_failed = true; }
+                    if current.is_none() || e.kind() == std::io::ErrorKind::NotFound {
+                        f.2 = current;
+                        removed.push(k);
+                    } else {
+                        read_failed = true;
+                    }
                     continue;
                 }
             };
@@ -6100,6 +6131,29 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             }
         }
         if read_failed {
+            continue;
+        }
+        // A running module's file removed while the file that declares it is not in this batch:
+        // the program still declares the module and has no file for it (rustc E0583). Nothing of
+        // the batch is installed and the app keeps the module's previous code; the batch's edits
+        // wait for the next change (the file's return, or the declaring file's edit).
+        let undeclared = if removed.is_empty() { Vec::new() } else {
+            let edited: std::collections::HashSet<&str> = edits.iter().map(|e| e.path.as_str()).chain(moved.iter().map(|&k| files[k].0.as_str())).collect();
+            let gone: Vec<&str> = removed.iter().map(|&k| files[k].0.as_str()).collect();
+            crate::owner::call(crate::owner::Class::Program, || undeclared_removals(&(*up).prog, &gone, &edited))
+        };
+        if !undeclared.is_empty() {
+            for (&k, e) in which.iter().zip(&edits) {
+                stalled.insert(k, (e.src.clone(), undeclared.clone()));
+            }
+            for &k in &moved { stalled.insert(k, (Vec::new(), undeclared.clone())); }
+            let what: Vec<String> = removed.iter().chain(&which).map(|&k| files[k].0.rsplit('/').next().unwrap_or("").to_string()).collect();
+            let what = what.join(", ");
+            let o = Outcome { failure: None, kept: 0, pending: false, rung: Rung::Refuse, files: Vec::new(), lines: undeclared.clone(), names: Vec::new(), changed: 0, test_changes: None, group: 0, ms: [0.0; 4], undo: None, work: [0; 5] };
+            log_edit(&what, &o, saved, seen);
+            eprintln!("makepad live: {}: NOT applied (errors below); the app runs the previous code", what);
+            for l in &undeclared { eprintln!("makepad live:   {}", l); }
+            patch_refused_event(&what, true, &undeclared);
             continue;
         }
         if !moved.is_empty() {
@@ -6417,6 +6471,43 @@ mod use_edit_tests {
         }
         std::mem::forget(unit);
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod removed_module_tests {
+    use super::*;
+
+    /// A running module's file gone from disk while the file that declares it stays as it was is
+    /// refused as rustc's E0583 (the app keeps the module's code; a "patched (0 items)" verdict
+    /// was a silent wrong patch, 11-04). The declaring file's edit in the same batch decides
+    /// instead (the compile unbinds the module or reports it), and a crate root or a file the
+    /// program does not run is no such module.
+    #[test]
+    fn a_removed_module_file_its_parent_still_declares_is_refused() {
+        isolated_test!(a_removed_module_file_its_parent_still_declares_is_refused);
+        std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+        let dir = std::env::temp_dir().join(format!("relax-removed-module-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("zz")).unwrap();
+        std::fs::write(dir.join("main.rs"), "mod zz;\nmod leaf;\nfn main() { let _ = zz::f() + leaf::g(); }\n").unwrap();
+        std::fs::write(dir.join("zz/mod.rs"), "pub fn f() -> u32 { 1 }\n").unwrap();
+        std::fs::write(dir.join("leaf.rs"), "pub fn g() -> u32 { 2 }\n").unwrap();
+        let session = std::sync::Arc::new(crate::Session::default());
+        let (prog, _, _) = crate::load_with_std(&session, dir.join("main.rs").to_str().unwrap(), "removed_module", false).unwrap();
+        let path = |end: &str| prog.file_paths.iter().find(|p| p.ends_with(end)).cloned().unwrap();
+        let (main, zz, leaf) = (path("/main.rs"), path("/zz/mod.rs"), path("/leaf.rs"));
+        let none = std::collections::HashSet::new();
+        let lines = undeclared_removals(&prog, &[zz.as_str(), leaf.as_str()], &none);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("error[E0583]: file not found for module `zz`") && lines[0].contains(&main), "{lines:?}");
+        assert!(lines[1].starts_with("error[E0583]: file not found for module `leaf`"), "{lines:?}");
+        // the declaring file is in the batch: its compile decides
+        let edited: std::collections::HashSet<&str> = [main.as_str()].into_iter().collect();
+        assert!(undeclared_removals(&prog, &[zz.as_str()], &edited).is_empty());
+        // the crate root, and a file the program does not run
+        let other = dir.join("other.rs").to_string_lossy().into_owned();
+        assert!(undeclared_removals(&prog, &[main.as_str(), other.as_str()], &none).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 
