@@ -566,9 +566,12 @@ pub(crate) fn resolve_package(
         // The boundary audit (`check --boundary`) binds as a run does: what it reports is what
         // JIT-compiled code reaches past the bound ops.
         let machine = crate::cfg::CfgSet::machine(sess, &[]).triple();
-        // A test harness (`makepad test`) binds none either: its crates are the tests' subject, built
-        // from their source as `cargo test` builds them, internals and all.
-        let bind = crate::cfg::CfgSet::host(sess, &[]).triple() == machine && (!check_only || crate::boundary::requested()) && !HARNESS_RUN.load(Ordering::Acquire);
+        // A test harness (`makepad test`) binds only the CPU budget (provided::HARNESS_BINDS): its
+        // crates are the tests' subject, built from their source as `cargo test` builds them,
+        // internals and all. The budget's own tests build it from source too.
+        let only = HARNESS_RUN.load(Ordering::Acquire).then_some(crate::provided::HARNESS_BINDS);
+        let bind = crate::cfg::CfgSet::host(sess, &[]).triple() == machine && (!check_only || crate::boundary::requested())
+            && only.is_none_or(|o| package.replace('-', "_") != o);
         // The sources are hashed while the build scripts run (and, for a run's boot, while the
         // program loads): they share nothing (the hash reads the provided packages, the scripts
         // write the graph's cfgs and env).
@@ -580,15 +583,15 @@ pub(crate) fn resolve_package(
         // resolve and a failing hash all end here.
         let later = bind && boot && !check_only;
         let pkgs = std::sync::Arc::new(pkgs);
-        // a run that binds nothing reads the identity files only for the read log (`pack-src`): a
-        // test harness or a check would hash every provided crate's closure for nothing
-        if !bind && crate::vfs::recording() { crate::provided::read_identity_files(&pkgs); }
-        if later { crate::provided::check_sources_later(pkgs.clone()); }
+        // a run that does not bind them all reads the identity files only for the read log (`pack-src`):
+        // a test harness or a check would hash every provided crate's closure for nothing
+        if (!bind || only.is_some()) && crate::vfs::recording() { crate::provided::read_identity_files(&pkgs); }
+        if later { crate::provided::check_sources_later(pkgs.clone(), only); }
         let (sources, scripts, scripts_ms, wait_ms) = std::thread::scope(|scope| {
             let sources = (bind && !later).then(|| scope.spawn(|| {
                 let _z = crate::zone_alloc::compiler_thread();
                 let t = Instant::now();
-                (crate::provided::check_sources(&pkgs), t.elapsed())
+                (crate::provided::check_sources(&pkgs, only), t.elapsed())
             }));
             // `--allow-c`: cargo builds the native dependencies (front native.rs); a build
             // script's own child run never builds them again

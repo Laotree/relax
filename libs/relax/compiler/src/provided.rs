@@ -242,11 +242,19 @@ mod source_tests {
     }
 }
 
-/// Compares registered crates against the embedded library closure; absent crates skip.
+/// The one crate a test harness binds. Its other crates are the tests' subject, built from source;
+/// the CPU budget is the process's one, and a copy built from source would admit the tests' pool
+/// beside the JIT, neither seeing the other.
+pub const HARNESS_BINDS: &str = "makepad_cpu_budget";
+
 const IDENTITY_THREADS: usize = 4;
 
-pub fn check_sources(pkgs: &[crate::srchash::SrcPkg]) -> Result<(), SourceCheckError> {
-    let reg: Vec<_> = REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|p| (p.name.clone(), p.source, p.manifest)).collect();
+/// Compares registered crates (`only`: that one) against the embedded library closure; absent
+/// crates skip.
+pub fn check_sources(pkgs: &[crate::srchash::SrcPkg], only: Option<&str>) -> Result<(), SourceCheckError> {
+    let reg: Vec<_> = REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).iter()
+        .filter(|p| only.is_none_or(|o| p.name == o))
+        .map(|p| (p.name.clone(), p.source, p.manifest)).collect();
     let mut verified = Vec::new();
     let mut files = std::collections::HashMap::new();
     // the identity files of every package folder the registered crates reach, read and hashed
@@ -297,12 +305,12 @@ static PENDING: Mutex<Option<std::thread::JoinHandle<Result<(), SourceCheckError
 /// run and goes on loading; nothing may bind a provided crate before `finish_sources` has
 /// returned Ok (`take_for`, `take_for_crates` and the boot's own join before the unit is built
 /// call it). The hashes, the manifests and the error are those of `check_sources`.
-pub fn check_sources_later(pkgs: std::sync::Arc<Vec<crate::srchash::SrcPkg>>) {
+pub fn check_sources_later(pkgs: std::sync::Arc<Vec<crate::srchash::SrcPkg>>, only: Option<&'static str>) {
     let _k = crate::zone_alloc::kept();
     let spawned = std::thread::Builder::new().name("run-provided-sources".into()).spawn(move || {
         let _z = crate::zone_alloc::compiler_thread();
         let t = std::time::Instant::now();
-        let verdict = check_sources(&pkgs);
+        let verdict = check_sources(&pkgs, only);
         if crate::preload::trace() { eprintln!("boot-trace: provided sources checked in {:.1} ms (beside the load)", t.elapsed().as_secs_f64() * 1e3); }
         verdict
     });
