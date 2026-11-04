@@ -132,6 +132,23 @@ fn priority_order_respected() {
 }
 
 #[test]
+fn a_live_edits_check_goes_ahead_of_hot_code() {
+    if child("a_live_edits_check_goes_ahead_of_hot_code") { return; }
+    let front = TestFront::new(0);
+    let (id, rx) = subscribe();
+    // the startup queued a and b; the edit's c comes next, and hot code then promotes a and b
+    let a = front.enqueue("a", false); let b = front.enqueue("b", false);
+    let c = named(&front.prog, "c");
+    let src: Arc<dyn FrontSource> = front.clone();
+    note_compiled(&front.prog.session.options, &src, NoteFn { def: c, args: Vec::new(), cache_key: None, epoch: front.epoch(), rank: Some(RANK_EDIT), cached: None });
+    set_ranks(front.identity(), front.epoch(), &[(a, vec![], RANK_HOT), (b, vec![], RANK_HOT)]);
+    front.ungate();
+    let events = [event(&rx), event(&rx), event(&rx)];
+    assert_eq!(events.each_ref().map(|e| e.error.owner), [c, a, b]);
+    unsubscribe(id); stop();
+}
+
+#[test]
 fn gate_returns_app_errors() {
     if child("gate_returns_app_errors") { return; }
     let (prog, tcx) = fixture("app", SOURCE);

@@ -188,8 +188,9 @@ pub fn carry_whole(src: usize, from: u64, to: u64) {
 
 /// A source of the program / type context for the worker (the unit's shared front end).
 pub trait FrontSource: Send + Sync {
-    /// Wait for the runner to admit background checking (once, before any work).
-    fn wait_start(&self) {}
+    /// Whether the runner admits background checking (its startup is over). Before that the
+    /// worker checks a live edit's owners only.
+    fn started(&self) -> bool { true }
     /// Runs `f` with the program and type context if the unit is alive (under the front
     /// end's read lock); None when it is gone or not checkable right now.
     fn with_front(&self, f: &mut dyn FnMut(&Program, &Tcx, &crate::tcx::EvalCx<'_>)) -> bool;
@@ -238,6 +239,12 @@ struct Queue {
     /// (src, epoch) -> the earlier epoch it stands for (carry_epoch): keys hold that one
     alias: HashMap<(usize, u64), u64>,
 }
+/// A live edit's checks: the person waits for its verdict. Ahead of hot code's: those are
+/// promoted keeping their place among the startup's checks, so a first edit after a cold start,
+/// at rank 0 with them, waited 9 s behind 362 promoted after it (Fab, 11-04).
+pub const RANK_EDIT: u32 = 0;
+/// Hot code waiting for its verdict (SPEC-V twins and callers).
+pub const RANK_HOT: u32 = 1;
 pub const RANK_DEFAULT: u32 = 1 << 31;
 const RANK_DISCOVER: u32 = u32::MAX - 1;
 const RANK_OWNER: u32 = u32::MAX;
@@ -455,6 +462,13 @@ fn enqueue(options: &crate::options::Options, src: &Arc<dyn FrontSource>, def: D
     }
     WAKE.notify_one();
 }
+/// (trace) Where `def`'s check stands: its rank and the checks queued ahead of it; None: not queued.
+pub fn queue_place(src: usize, def: DefId, epoch: u64) -> Option<(u32, usize)> {
+    let guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let q = guard.as_ref()?;
+    let at = *q.rank_of.get(&(src, def, q.canon(src, epoch)))?;
+    Some((at.0, q.order.range(..at).count()))
+}
 /// Checks queued (0 also before the worker started); the aot levels' completion line reads it.
 pub fn queued() -> usize {
     QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |q| q.order.len())
@@ -578,16 +592,28 @@ impl FrontSource for Parked {
 
 fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
     let _mem = crate::memstat::tag(crate::memstat::Tag::Borrowck);
-    src.lower_priority(); src.wait_start();
+    src.lower_priority();
+    let mut started = false;
     loop {
         if stopping() { return; }
+        // The startup's checks wait for the runner; a live edit's do not: the person waits for its
+        // verdict (a cold Fab releases the checker 1.5 s after its first present; an edit saved
+        // in that time waited for the release, 11-04).
+        if !started {
+            started = src.started();
+            let edit_first = || QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|q| q.order.first()).is_some_and(|a| a.0 == RANK_EDIT);
+            if !started && !edit_first() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
+        }
         // (the source the worker started with must not keep a replaced front state alive)
         if !src.alive() {
             if let Some(n) = rehomed(&src) { src = n; }
         }
         let quiet = src.quiet_ns();
-        // rank 0 (hot code waiting for its verdict, set_ranks) runs while compiles go on
-        let urgent = || QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|q| q.order.first()).is_some_and(|a| a.0 == 0);
+        // a live edit's checks and hot code waiting for its verdict (set_ranks) run while compiles go on
+        let urgent = || QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|q| q.order.first()).is_some_and(|a| a.0 <= RANK_HOT);
         if quiet < QUIET_NS && !urgent() {
             std::thread::sleep(std::time::Duration::from_millis(((QUIET_NS - quiet) / 1_000_000).clamp(20, 500)));
             continue;

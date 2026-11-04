@@ -7120,9 +7120,10 @@ impl Unit {
         }
         // borrowck lane: a fn instance's first code, and every live-patched version of it, is checked
         // lazily in the background (D3: a patch is never refused synchronously unless --check-first;
-        // its verdict arrives as a Gandalf event, at the front of the queue).
+        // its verdict arrives as a Gandalf event, at the front of the queue: RANK_EDIT, ahead of hot
+        // code's checks too).
         if (first && gen == 0 || gen > 0) && crate::borrowck::lazy::gandalf_enabled(options) {
-            self.note_first_borrowck(id, (gen > 0).then_some(0));
+            self.note_first_borrowck(id, (gen > 0).then_some(crate::borrowck::lazy::RANK_EDIT));
         }
         // (SPEC-V: a slot that ran its twin's code runs its own now)
         if std::mem::take(&mut self.fns[id as usize].borrowed) {
@@ -7210,6 +7211,15 @@ impl Unit {
             FnKey::Closure(_, _, parent) => self.verdict_owner(*parent),
             _ => None,
         }
+    }
+
+    /// MAKEPAD_RUN_SPECV_TRACE: what slot `id`'s pending verdict waits on: the checker's entry for
+    /// its owner, the epoch, and the check's (rank, checks ahead) when it is queued.
+    pub(crate) fn pending_why(&self, id: u32) -> String {
+        let Some(d) = self.verdict_owner(id) else { return "no owner".into() };
+        let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
+        let src = self.front.checker_id;
+        format!("{} {:?} epoch {} queued {:?}", self.prog.def_path(d), crate::borrowck::lazy::verdict(src, d, &[], epoch), epoch, crate::borrowck::lazy::queue_place(src, d, epoch))
     }
 
     /// SPEC-V: where slot `id`'s body stands with the borrow checker (see `verdict_clean`).
@@ -16439,7 +16449,7 @@ unsafe fn prebuild_callees(up: *mut Unit, relocs: &[relax_backend::rir::RelocAt]
 
 /// MAKEPAD_RUN_SPECV_TRACE=1: SPEC-V verdict sweeps (slots turning verified) and twins tiering up,
 /// with the callers whose lowering still calls them.
-fn specv_trace() -> bool {
+pub(crate) fn specv_trace() -> bool {
     static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *T.get_or_init(|| std::env::var_os("MAKEPAD_RUN_SPECV_TRACE").is_some())
 }
@@ -16598,7 +16608,7 @@ unsafe fn drain_twin_pending(up: *mut Unit) {
 
 /// SPEC-V: brings twin callers below O3 to the base slots (twin_callers; the O3 ones are the
 /// caller's to retier): an O2 build lowers them again; unverified ones have their owners' verdicts
-/// checked first (Gandalf rank 0: it runs them even while compiles go on) and wait for them.
+/// checked first (Gandalf RANK_HOT: it runs them even while compiles go on) and wait for them.
 unsafe fn relower_twin_callers(up: *mut Unit, tc: &TwinCallers) {
     let key = up as usize;
     if !tc.o3.is_empty() || !tc.below.is_empty() {
@@ -16627,17 +16637,18 @@ unsafe fn relower_twin_callers(up: *mut Unit, tc: &TwinCallers) {
     }
 }
 
-/// SPEC-V: the owners of `ids` go first in the background checker's queue (rank 0 runs without
-/// waiting for quiet compiles): hot code waits seconds for its verdict, not the whole backlog. An
+/// SPEC-V: the owners of `ids` go first in the background checker's queue after live edits
+/// (`RANK_HOT` runs without waiting for quiet compiles): hot code waits seconds for its verdict,
+/// not the whole backlog. An
 /// owner the checker never got (a closure's parent with no code of its own, a slot whose first code
 /// took a path that queues nothing: 39 of the city's rank requests) is queued here (owner thread).
 unsafe fn prioritize_verdicts(up: *mut Unit, ids: &[u32]) {
     for &c in ids {
-        (&mut *up).note_first_borrowck(c, Some(0));
+        (&mut *up).note_first_borrowck(c, Some(crate::borrowck::lazy::RANK_HOT));
     }
     let u = &*up;
     let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
-    let ranks: Vec<(DefId, Vec<TyId>, u32)> = ids.iter().filter_map(|&c| Some((u.verdict_owner(c)?, Vec::new(), 0))).collect();
+    let ranks: Vec<(DefId, Vec<TyId>, u32)> = ids.iter().filter_map(|&c| Some((u.verdict_owner(c)?, Vec::new(), crate::borrowck::lazy::RANK_HOT))).collect();
     if !ranks.is_empty() {
         crate::borrowck::lazy::set_ranks(u.front.checker_id, epoch, &ranks);
     }
@@ -24815,10 +24826,8 @@ impl crate::borrowck::lazy::FrontSource for BorrowckFront {
         trace_stored_verdict(prog, def, "owner", found.1.as_ref());
         found
     }
-    fn wait_start(&self) {
-        while STARTUP_PHASE.load(Ordering::Acquire) != 0 && !SPEC_STOP.load(Ordering::SeqCst) {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+    fn started(&self) -> bool {
+        STARTUP_PHASE.load(Ordering::Acquire) == 0 || SPEC_STOP.load(Ordering::SeqCst)
     }
     fn identity(&self) -> usize {
         self.0.checker_id

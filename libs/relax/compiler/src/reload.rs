@@ -3576,7 +3576,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let u = &mut *up;
     trace_stage("typecheck");
     // D3: the gate is synchronous only under `makepad run --check-first`; otherwise the patched
-    // instances are queued to Gandalf when their new code is installed (jit.rs install, rank 0).
+    // instances are queued to Gandalf when their new code is installed (jit.rs install, RANK_EDIT).
     if errs.is_empty() && crate::borrowck::enabled(options) && crate::jit::CHECK_FIRST.load(std::sync::atomic::Ordering::Relaxed) {
         // Check/report one changed owner at a time: do not hold its diagnostics until
         // another body has finished, compilation has run, or the transaction unwinds.
@@ -4361,6 +4361,13 @@ impl Patched {
 
 static PATCHED: relax_session::sync::Mutex<Patched> = relax_session::sync::Mutex::new(Patched::new());
 
+/// SPEC-V: the slots patch `group` installed without a clean verdict (owner thread); their checks
+/// were queued at the install, first in the borrow checker's queue (`RANK_EDIT`).
+unsafe fn unverified_patch(up: *mut Unit, group: u32) -> Vec<u32> {
+    let u = &*up;
+    (0..u.fns.len() as u32).filter(|&id| u.fns[id as usize].patch_gen == group && u.fns[id as usize].unverified.load(Ordering::Relaxed)).collect()
+}
+
 /// The names of the items whose bodies an installed patch changed; None when it changed more (an
 /// item added or removed, a const, a layout).
 unsafe fn changed_items(up: *mut Unit, o: &Outcome) -> Option<Vec<String>> {
@@ -4498,6 +4505,18 @@ pub(crate) struct PendingPatch {
     pub(crate) event_seq: u64,
 }
 
+/// MAKEPAD_RUN_SPECV_TRACE: the slots a patch group's verdict waits on, printed when they change
+/// (the queue position aside: it moves on every poll).
+fn trace_patch_wait(group: u32, waits: &[String]) {
+    static LAST: relax_session::sync::Mutex<Vec<(u32, String)>> = relax_session::sync::Mutex::new(Vec::new());
+    let stable: String = waits.iter().map(|w| w.split(" queued Some((").next().unwrap_or(w)).collect::<Vec<_>>().join("; ");
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.iter().any(|(g, s)| *g == group && *s == stable) { return; }
+    last.retain(|(g, _)| *g != group);
+    last.push((group, stable));
+    eprintln!("specv @{:.3} patch group {group} waits on {}", crate::jit::wall_ns() as f64 / 1e9, waits.join("; "));
+}
+
 /// SPEC-V: settles the patch groups awaiting verdicts. A group whose every slot is clean is verified
 /// (an inspect event says which observations that makes verified). A group with a failed verdict is
 /// rolled back -- newer groups first, they were made on top of it -- the slots return to their
@@ -4516,15 +4535,20 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
                 let u = &*up;
                 let mut failed = Vec::new();
                 let mut waiting = false;
+                let mut waits: Vec<String> = Vec::new();
                 for &id in &p.ids {
                     match u.verdict_state(id) {
                         Verdict::Clean => {}
                         Verdict::Failed(events) => failed.extend(events),
                         // never verified, never reported: the slots stay unverified (baseline)
                         Verdict::Unverifiable(why) => unchecked.push(format!("{}: {}", u.fns[id as usize].name, why)),
-                        Verdict::Pending => waiting = true,
+                        Verdict::Pending => {
+                            waiting = true;
+                            if crate::jit::specv_trace() { waits.push(format!("#{id} {}", u.pending_why(id))); }
+                        }
                     }
                 }
+                if !waits.is_empty() { trace_patch_wait(p.group, &waits); }
                 if !failed.is_empty() { Some(Some(failed)) }
                 else if waiting { None }
                 else {
@@ -5547,10 +5571,7 @@ unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &
     patch_landed(edit.paths.iter().cloned(), changed_items(up, o));
     let mut pending = Vec::new();
     if let Some(undo) = o.undo.take() {
-        let ids = crate::owner::call(crate::owner::Class::Program, || {
-            let u = &*up;
-            (0..u.fns.len() as u32).filter(|&id| u.fns[id as usize].patch_gen == o.group && u.fns[id as usize].unverified.load(Ordering::Relaxed)).collect::<Vec<_>>()
-        });
+        let ids = crate::owner::call(crate::owner::Class::Program, || unverified_patch(up, o.group));
         if !ids.is_empty() {
             UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
             pending.push(PendingPatch { group: o.group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq() });
@@ -5753,6 +5774,18 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 paths: std::mem::take(&mut host_edit), group, compile_ms: None, restarted: true, changed: None,
             }, &why);
         }
+        // A patch's verdict settles ahead of the gates below: they hold the watch's own work (the
+        // startup scan for the UI thread's first frames, a pending restart), never the verdict
+        // the person waits for. A patch sets the startup scan again when the tree holds files
+        // the program has not loaded (Fab: always), so the first edit after a cold start had its
+        // verdict held until the first-frames window closed, 10 s after the present (11-04).
+        if !pending.is_empty() {
+            for (o, n) in settle_verdicts(up, &mut pending, &mut undos) {
+                for f in files.iter_mut() {
+                    if f.1 == n { f.1 = o; }
+                }
+            }
+        }
         // Once the tree no longer matches this session, later saves must not patch a
         // mixture of revisions into the old process. A fresh run restores live editing.
         if restart_required {
@@ -5781,8 +5814,16 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         }
         // the startup's file scan (own_files: an owner request of 10-15 ms on Sandbox) waits until
         // the UI thread's first frames after the present are done: run right at the present, the
-        // UI thread's first lazy links queued behind it (36 ms of a first post-present episode)
-        if startup_scan && crate::postframe::in_first_frames() { continue; }
+        // UI thread's first lazy links queued behind it (36 ms of a first post-present episode).
+        // A save ends the wait: the person waits for that edit, not for the first frames (Fab's
+        // first edit right after its window showed waited 7.6 s here, 11-04). The scan's round
+        // looks at every file, those the taken notifications named among them.
+        if startup_scan && crate::postframe::in_first_frames() {
+            let named = events.as_mut().map(|w| w.changed());
+            // (events lost: the watch starts over)
+            if matches!(named, Some(None)) { events = LiveWatch::new(files.iter().map(|f| f.0.as_str())); }
+            if !named.is_some_and(|n| n.is_none_or(|c| !c.is_empty())) && crate::vfs::edits_ledger_stamp() == ledger.0 { continue; }
+        }
         gate_note(0);
         let loads = jit::DEFERRED_LOADS.load(std::sync::atomic::Ordering::Relaxed);
         // a new watch set drops the events the old one had not delivered yet (a save made
@@ -5815,13 +5856,6 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let t_dr = Instant::now();
         drain_streams(up);
         if live_trace() && t_dr.elapsed().as_millis() > 20 { eprintln!("makepad live: drain_streams took {:.1} ms at t={:.0} ms", t_dr.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start()); }
-        if !pending.is_empty() {
-            for (o, n) in settle_verdicts(up, &mut pending, &mut undos) {
-                for f in files.iter_mut() {
-                    if f.1 == n { f.1 = o; }
-                }
-            }
-        }
         if crate::hot_failure::recovering() { continue; }
         // The landing check: a patch whose old code is still running a while after the install
         // has not reached that call (a loop that never returns): the edit restarts the app.
@@ -6319,10 +6353,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             // SPEC-V: the slots this group installed without a clean verdict (all of them, unless
             // --check-first refused what failed before the install)
             let group = u.group;
-            let ids: Vec<u32> = crate::owner::call(crate::owner::Class::Program, || {
-                let up = &*up;
-                (0..up.fns.len() as u32).filter(|&id| up.fns[id as usize].patch_gen == group && up.fns[id as usize].unverified.load(Ordering::Relaxed)).collect()
-            });
+            let ids: Vec<u32> = crate::owner::call(crate::owner::Class::Program, || unverified_patch(up, group));
             if !ids.is_empty() {
                 UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
                 pending.push(PendingPatch { group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq() });
