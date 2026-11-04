@@ -784,17 +784,39 @@ pub fn file_stat(path: &str) -> Option<FileStat> {
     disk_stat(path)
 }
 
+#[cfg(unix)]
 fn disk_stat(path: &str) -> Option<FileStat> {
+    use std::os::unix::fs::MetadataExt;
     let m = std::fs::metadata(path).ok()?;
-    let ns = |t: std::io::Result<std::time::SystemTime>| t.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos() as u64);
-    #[cfg(unix)]
-    let (ctime_ns, ino) = {
-        use std::os::unix::fs::MetadataExt;
-        (m.ctime().max(0) as u64 * 1_000_000_000 + m.ctime_nsec().max(0) as u64, m.ino())
+    let mtime_ns = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() as u64;
+    Some(FileStat { size: m.len(), mtime_ns, ctime_ns: m.ctime().max(0) as u64 * 1_000_000_000 + m.ctime_nsec().max(0) as u64, ino: m.ino() })
+}
+
+/// Windows' metadata has no change time or file index on stable Rust, so one attributes-only
+/// handle (nothing reads the content; a folder opens too) answers all of it. A file system without
+/// a change time answers 0: size and mtime are all its stat can say.
+#[cfg(windows)]
+fn disk_stat(path: &str) -> Option<FileStat> {
+    use makepad_windows_sys::Win32::Foundation::HANDLE;
+    use makepad_windows_sys::Win32::Storage::FileSystem::{
+        FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
     };
-    #[cfg(not(unix))]
-    let (ctime_ns, ino) = (0, 0);
-    Some(FileStat { size: m.len(), mtime_ns: ns(m.modified())?, ctime_ns, ino })
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    let f = std::fs::OpenOptions::new().access_mode(0).custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0).open(path).ok()?;
+    let h = HANDLE(f.as_raw_handle() as _);
+    let mut file = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(h, &mut file) }.ok()?;
+    let mut times = FILE_BASIC_INFO::default();
+    unsafe { GetFileInformationByHandleEx(h, FileBasicInfo, &mut times as *mut FILE_BASIC_INFO as *mut std::ffi::c_void, std::mem::size_of::<FILE_BASIC_INFO>() as u32) }.ok()?;
+    // 100 ns ticks since 1601
+    let ns = |t: i64| (t as u64).checked_sub(116_444_736_000_000_000).map(|t| t * 100);
+    let wide = |high: u32, low: u32| (high as u64) << 32 | low as u64;
+    Some(FileStat {
+        size: wide(file.nFileSizeHigh, file.nFileSizeLow),
+        mtime_ns: ns(times.LastWriteTime)?,
+        ctime_ns: ns(times.ChangeTime).unwrap_or(0),
+        ino: wide(file.nFileIndexHigh, file.nFileIndexLow),
+    })
 }
 
 /// When the file last changed (a git file: never, None; the caller treats it as unchanged).
