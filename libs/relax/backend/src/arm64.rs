@@ -1119,6 +1119,16 @@ impl<'a> Gen<'a> {
             self.def_win_copy(v, r);
         }
     }
+    /// Alloc::exit_stores at position p (a block's start or its terminator): region registers home
+    fn exit_stores(&mut self, p: u32) {
+        let Some(st) = self.al.exit_stores.get(&p).cloned() else { return };
+        for (v, r) in st {
+            if let Loc::Stack(o) = self.al.loc[v as usize] {
+                let off = self.spill_sp(o);
+                self.a.ldst(STRX, 8, r, SP, off);
+            }
+        }
+    }
     /// A window that starts at this definition (def windows, regions over redefining blocks)
     /// holds the result: computed elsewhere (a scratch), it is copied there.
     fn def_win_copy(&mut self, v: VReg, r: u8) {
@@ -1346,6 +1356,8 @@ impl<'a> Gen<'a> {
             if !reach[bi] {
                 continue;
             }
+            // a region's register home on the way out of the region (Alloc::exit_stores)
+            self.exit_stores(self.al.block_start[bi]);
             if bi != 0 && self.dom_read.get(bi) == Some(&true) {
                 self.dom_base();
             }
@@ -1544,9 +1556,11 @@ impl<'a> Gen<'a> {
             if self.tail.get(bi).is_some_and(|t| t.is_some()) {
                 continue;
             }
-            // region windows entered from here: loaded before the terminator (regalloc edge loads)
+            // region windows entered from here: loaded before the terminator (regalloc edge loads);
+            // the region's register home before it (exit stores)
             if matches!(b.term, Term::Jump(_) | Term::Branch(..) | Term::Switch(..)) {
                 let tp = self.al.block_end[bi] - 1;
+                self.exit_stores(tp);
                 if let Some(ls) = self.win_start.get(&tp).cloned() {
                     for (v, r) in ls {
                         if let Loc::Stack(o) = self.al.loc[v as usize] {
