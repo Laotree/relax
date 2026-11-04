@@ -358,7 +358,15 @@ fn serve(config: &FrontConfig, tcp: TcpStream, peer: SocketAddr) -> Result<(), R
                 "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
-            let _ = tcp.shutdown(Shutdown::Both);
+            // A close with the request still unread resets the connection,
+            // and on Windows the reset drops the answer from the client's
+            // buffer before it reads it. End the write side, read what the
+            // client sent until it closes (within the head deadline), then
+            // close.
+            let _ = tcp.shutdown(Shutdown::Write);
+            let deadline = Instant::now() + HEAD_DEADLINE;
+            let mut sink = [0u8; 1024];
+            while Instant::now() < deadline && matches!(tcp.read(&mut sink), Ok(n) if n > 0) {}
             return Err(Refusal::Other("plain HTTP refused".into()));
         }
         Ok(1) => {}
