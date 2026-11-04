@@ -2817,6 +2817,8 @@ fn region_windows_alloc(
     let preds = preds_of(f, reach);
     // a predecessor ending in an invoke reaches its successors (the landing pad) after a call
     let invoke_pred: Vec<bool> = (0..nb).map(|b| preds[b].iter().any(|&p| matches!(f.blocks[p as usize].term, Term::Invoke(..)))).collect();
+    // loop depths, uncapped (edge_preds: a loop's exits)
+    let depth = if edge_loads { loop_depths(f, reach) } else { Vec::new() };
     let regs: Vec<u8> = cfg.int_caller.iter().chain(used_callee_int.iter()).copied().collect();
     let min_blocks = if edge_loads { 1 } else { 2 };
     let mut order: Vec<u32> = (0..nv as u32).filter(|v| cand[*v as usize] && uses_in.get(v).map_or(false, |m| m.len() >= min_blocks)).collect();
@@ -2897,7 +2899,10 @@ fn region_windows_alloc(
             // the join of a cold path. The register must be free from the predecessor's last two
             // instructions on (fused compares and loads are emitted with the terminator and read
             // operands whose ranges ended there) to its end (whatever it holds into another
-            // successor is live out). None: b loads at its start.
+            // successor is live out). A predecessor in a loop b is not in (deeper: b is its exit)
+            // runs every iteration, whatever the weights say: past the depth cap they tie, and
+            // estimated frequencies put a loop's latch below its exit (a nested search loop loaded
+            // five outer values per iteration). None: b loads at its start.
             let edge_preds = |b: u32, inset: &dyn Fn(u32) -> bool| -> Option<Vec<u32>> {
                 let bu = b as usize;
                 if !edge_loads || invoke_pred[bu] || preds[bu].is_empty() {
@@ -2911,7 +2916,7 @@ fn region_windows_alloc(
                     let pu = p as usize;
                     let from = block_end[pu].saturating_sub(5).max(block_start[pu]);
                     let term_ok = matches!(f.blocks[pu].term, Term::Jump(_) | Term::Branch(..) | Term::Switch(..));
-                    if p == b || !reach[pu] || !term_ok || (!o.is_empty() && bits_any(o, from, block_end[pu])) {
+                    if p == b || !reach[pu] || !term_ok || depth[pu] > depth[bu] || (!o.is_empty() && bits_any(o, from, block_end[pu])) {
                         return None;
                     }
                     at_end.push(p);
