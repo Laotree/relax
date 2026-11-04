@@ -4251,6 +4251,15 @@ pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
             nuse[u.0 as usize] += 1;
         }
     }
+    // integer constants (single definitions): a threaded branch may compare the choice to them
+    let mut const_vreg = vec![false; nv];
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::Iconst(d, _) = i {
+                const_vreg[d.0 as usize] = ndef[d.0 as usize] == 1;
+            }
+        }
+    }
     // compares and selects only: the arms of a value choice (an Ordering), not general arithmetic
     // (speculating sums cost iterator loops more instructions than their branches: iter_chain +27%)
     // A float negation too: `if x < 0.0 { -x } else { x }` (box3d's scalar abs_v: -0.0 and NaN keep
@@ -4364,7 +4373,12 @@ pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
         }
         // a choice the join then branches on stays a branch: the branch can be threaded to
         // its known outcome on each arm (an Option's Some / None test after a select would
-        // turn a threadable branch into a select plus a test)
+        // turn a threadable branch into a select plus a test). Threadable means computed from
+        // the choice and constants by what thread_known evaluates (integer moves, arithmetic,
+        // compares): a branch on a distance computed from a `min` of two loaded coordinates
+        // and a point (a float compare) cannot be threaded, and the `min` stayed a branch that
+        // mispredicts half the time (painted slicing's nearest-segment walk: its bounding-box
+        // test, `a.y.min(b.y)`, once per segment; rustc's code has a csel)
         {
             let mut taint = dests.clone();
             let mut seen = Vec::new();
@@ -4376,9 +4390,10 @@ pub fn if_convert(f: &mut Func, spec_on: bool) -> bool {
                 }
                 seen.push(at);
                 for i in &f.blocks[at as usize].insts {
-                    let mut hit = false;
-                    for_uses(i, |u| hit |= taint.contains(&u));
-                    if hit {
+                    let (mut hit, mut other) = (false, false);
+                    for_uses(i, |u| if taint.contains(&u) { hit = true } else if !const_vreg.get(u.0 as usize).copied().unwrap_or(false) { other = true });
+                    let evaluable = matches!(i, Inst::Mov(..) | Inst::IBinI(..) | Inst::IBin(..) | Inst::ICmpI(..) | Inst::ICmp(..) | Inst::Conv(Conv::IntToInt(_), ..));
+                    if hit && !other && evaluable {
                         for_defs(i, |d| taint.push(d));
                     }
                 }
