@@ -154,6 +154,11 @@ pub fn start(app: &str) {
     // run_dir: the cache this run uses (devhub's JIT cache clear names the apps running on it)
     let run_dir = crate::dirs::relax_dir().display().to_string();
     let extra = format!(",\"session_log\":{},\"run\":{},\"run_dir\":{},\"agent\":{},\"test_run\":{}", json_str(&log), json_str(crate::jit::PROVENANCE), json_str(&run_dir), AGENT.load(Relaxed), TEST_RUN.load(Relaxed));
+    #[cfg(windows)]
+    let extra = match crate::restart_parent::parent_pid() {
+        Some(parent) => format!("{extra},\"restart_parent\":{parent}"),
+        None => extra,
+    };
     let endpoint = makepad_remote::Endpoint::new(app);
     endpoint.set_hooks(makepad_remote::Hooks { enter: server_thread_enter, exit: server_thread_exit });
     endpoint.register_cmd(dispatch);
