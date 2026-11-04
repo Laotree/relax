@@ -5389,6 +5389,14 @@ pub(crate) fn input_paths(keep: &dyn Fn(&str) -> bool) -> Result<Vec<String>, St
     Ok(inputs.source_paths(loaded.iter().filter(|p| keep(p)).cloned().chain(included), keep))
 }
 
+/// Of `asked` (workspace-relative paths), those in no package of the app's graph.
+pub(crate) fn outside_packages<'a>(asked: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    let g = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(v) = g.as_ref() else { return Vec::new() };
+    let std_dir = std::env::var("MAKEPAD_RUN_STD").unwrap_or_default();
+    asked.filter(|p| v.inputs.outside_packages(p, &std_dir)).collect()
+}
+
 /// A source file a live session watches and patches (`own_source`).
 pub(crate) fn own_source_file(prog: &crate::program::Program, file: u32) -> bool {
     static STD: std::sync::OnceLock<String> = std::sync::OnceLock::new();

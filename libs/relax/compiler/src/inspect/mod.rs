@@ -193,7 +193,7 @@ pub fn start(app: &str) {
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("session", "view [open|dismiss]", "the run's view over the app (compile errors, a parked panic, the JIT's state): what it shows, or open / dismiss it (the caption's JIT ring is display only)"),
     ("pin", "[on|off]", "pin the running app while an operation runs: no edit or landing reaches it and it does not restart; off: it catches up"),
-    ("inputs", "[match=<path substring>] [of=<paths, one per line>]", "the live session's reload source files, workspace-relative, one path per line and a count; unloaded sources are excluded; of= answers only which of those paths are inputs"),
+    ("inputs", "[match=<path substring>] [of=<paths, one per line>]", "the live session's reload source files, workspace-relative, one path per line and a count; unloaded sources are excluded; of= answers only which of those paths are inputs, and which others lie in no package of the graph (`outside`)"),
     ("session", "relaunch", "apply the edits waiting for a restart: the process starts again (an app that restarts itself, std::relax::restart_supported, with its state and window frames)"),
     ("why-hung", "[probe_ms=200]", "is it stuck and why: verdict (deadlock / blocked / busy / idle), the wait chain or cycle, stacks of the threads in it"),
     ("capture", "[why=<text>]", "capture the JIT's state and flight recording; answers the likely cause and report path"),
@@ -363,6 +363,9 @@ fn dispatch_command(req: &Req, out: &mut Out) {
                     let paths: Vec<_> = paths.into_iter().filter(|p| (of.is_empty() || of.contains(&p.as_str())) && p.contains(req.get("match").unwrap_or(""))).collect();
                     // Callers use absence to skip a patch wait: never truncate this source list.
                     out.always(&format!("{{\"count\":{}}}", paths.len()));
+                    for path in crate::reload::outside_packages(of.iter().copied().filter(|a| !paths.iter().any(|p| p == a))) {
+                        out.always(&format!("{{\"outside\":{}}}", json_str(path)));
+                    }
                     for path in paths {
                         if out.cancelled() { break; }
                         out.always(&format!("{{\"path\":{}}}", json_str(&path)));
