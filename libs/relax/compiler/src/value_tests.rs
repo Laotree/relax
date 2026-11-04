@@ -3,7 +3,7 @@
 //!
 //! `cfg!` is the literal the crate's cfg gives (rustc_builtin_macros cfg.rs expand_cfg) wherever
 //! it is read: in run-time code, and in the consts the type layer evaluates for it (an array
-//! length, a const generic argument, a constant pattern). sdf_engine bake.rs:127's
+//! length, a const generic argument, a constant pattern). a crate's
 //! `const _: () = assert!(cfg!(target_endian = "little"))` failed `makepad check` (E0080) on
 //! x86_64: the check-mode interpreter runs MIR built by the type layer, which had made every
 //! `cfg!` false (check_lint_tests covers that path). The run-time lowering reads the crate's cfg

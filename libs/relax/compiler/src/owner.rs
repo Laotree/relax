@@ -1825,7 +1825,7 @@ mod tests {
         assert!(APP_RAN.load(Ordering::SeqCst));
     }
 
-    /// M55 (makepad-sdf-engine's thin-wall tests on the Vulkan HAL, 2026-11-03): the owner,
+    /// M55 (a crate's compute tests on the Vulkan HAL, 2026-11-03): the owner,
     /// computing the layout of `OnceLock<Result<Arc<Program>, String>>` for one request, waited in
     /// a query and served a Job there that needed the same layout. The type layer's cycle guard is
     /// per thread: the Job met the layout in progress, reported E0391 and got a zero-size one. A

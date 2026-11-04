@@ -1350,11 +1350,11 @@ mod tests {
     /// (`makepad test` read it as "not a member of the workspace" with a byte offset at best).
     #[test]
     fn a_duplicate_key_names_its_line_and_column() {
-        let text = "[package]\nname = \"p\"\n\n[dev-dependencies]\na = { path = \"../a\" }\nmakepad-sdf-engine = { path = \"x\" }\n  makepad-sdf-engine = { path = \"y\" }\n";
+        let text = "[package]\nname = \"p\"\n\n[dev-dependencies]\na = { path = \"../a\" }\nmakepad-core-util = { path = \"x\" }\n  makepad-core-util = { path = \"y\" }\n";
         let err = parse_toml(text).unwrap_err();
         assert_eq!((err.line, err.col), (7, 3));
-        assert_eq!(err.in_file("fab/slice/Cargo.toml"), "fab/slice/Cargo.toml:7:3: duplicate key `makepad-sdf-engine`");
-        assert_eq!(err.to_string(), "duplicate key `makepad-sdf-engine` at line 7 column 3");
+        assert_eq!(err.in_file("fab/slice/Cargo.toml"), "fab/slice/Cargo.toml:7:3: duplicate key `makepad-core-util`");
+        assert_eq!(err.to_string(), "duplicate key `makepad-core-util` at line 7 column 3");
         // columns count characters, not bytes
         let err = parse_toml("x = 1\na = { \"\u{e9}\" = 1, \"\u{e9}\" = 2 }\n").unwrap_err();
         assert_eq!((err.line, err.col, err.msg.as_str()), (2, 16, "duplicate key `\u{e9}`"));

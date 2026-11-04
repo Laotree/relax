@@ -125,7 +125,7 @@ fn a_second_binary_targets_main_is_its_entry() {
     assert_eq!(warnings, ["function `unused_in_bin` is never used [dead_code]"]);
 }
 
-/// sdf_engine bake.rs:127 (E0080 under the JIT's check only): the check evaluates every const
+/// A crate's `const _: () = assert!(cfg!(..))` (E0080 under the JIT's check only): the check evaluates every const
 /// item (rustc_hir_analysis check_crate), and `cfg!` in one is the literal the crate's cfg gives
 /// (rustc_builtin_macros cfg.rs expand_cfg); MIR building had made every `cfg!` false.
 #[test]
