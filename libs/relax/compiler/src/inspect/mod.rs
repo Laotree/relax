@@ -534,6 +534,16 @@ pub struct Captured {
     pub lr: u64,
     pub sp: u64,
     pub err: Option<&'static str>,
+    /// why the walk ended at the last frame when that is not the stack's outermost (threads::Raw)
+    pub stop: Option<&'static str>,
+}
+
+impl Captured {
+    /// Where the walk ended short of the stack's outermost frame and why: "walk stops at <pc>: <why>".
+    pub fn stops(&self) -> Option<String> {
+        let why = self.stop?;
+        Some(format!("walk stops at {:#x}: {why}", self.frames.last().copied().unwrap_or(0)))
+    }
 }
 
 /// The threads `want` picks with their stacks, captured now; Err: another capture holds the lock
@@ -555,7 +565,7 @@ pub fn capture_all(want: &dyn Fn(&threads::Thread) -> bool) -> Result<Vec<Captur
         if t.handle == 0 && raw.handle != 0 {
             t.handle = raw.handle;
         }
-        out.push(Captured { frames: raw.frames().to_vec(), lr: raw.lr, sp: raw.sp, err: r.err(), t });
+        out.push(Captured { frames: raw.frames().to_vec(), lr: raw.lr, sp: raw.sp, err: r.err(), stop: raw.stop, t });
     }
     Ok(out)
 }
@@ -1120,6 +1130,10 @@ pub(crate) fn cmd_stacks(req: &Req, out: &mut Out) {
         let names: Vec<String> = members.iter().map(|&i| json_str(&format!("{} ({})", caps[i].t.name, tid_label(caps[i].t.os_id)))).collect();
         let c = &caps[members[0]];
         let mut err = c.err.map(|e| format!(",\"err\":{}", json_str(e))).unwrap_or_default();
+        // a walk cut short above the depth shown: where and why it ends there
+        if let Some(stops) = c.stops().filter(|_| c.frames.len() <= depth.max(1)) {
+            err.push_str(&format!(",\"stops\":{}", json_str(&stops)));
+        }
         if c.t.handle != 0 && instrument::stopped(&c.t) {
             err.push_str(&script_stack_field("script", c.t.handle));
         }

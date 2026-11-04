@@ -296,7 +296,11 @@ pub fn why_hung(req: &Req, out: &mut Out) {
     for &i in &involved {
         let c = &caps[i];
         let fr: Vec<String> = syms[i].iter().take(depth).map(frame_json).collect();
-        let w = wait_of(c.t.handle).map(|w| format!(",\"waits\":{}", json_str(&super::wait_text(w, &list)))).unwrap_or_default();
+        let mut w = wait_of(c.t.handle).map(|w| format!(",\"waits\":{}", json_str(&super::wait_text(w, &list)))).unwrap_or_default();
+        // a walk cut short within the frames shown: where and why it ends there
+        if let Some(stops) = c.stops().filter(|_| c.frames.len() <= depth) {
+            w.push_str(&format!(",\"stops\":{}", json_str(&stops)));
+        }
         out.line(&format!("{{\"thread\":{},\"id\":\"{}\",\"state\":\"{}\",\"cpu_pct\":{}{},\"frames\":[{}]}}", json_str(&c.t.name), super::tid_label(c.t.os_id), c.t.state, cpu(c), w, fr.join(",")));
     }
     let mut others: Vec<String> = Vec::new();

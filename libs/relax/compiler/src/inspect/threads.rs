@@ -62,11 +62,14 @@ pub struct Raw {
     pub sp: u64,
     /// the thread's pthread handle as the thread itself reported it (Linux capture), else 0
     pub handle: u64,
+    /// why the walk ended at the last frame when that frame is not the stack's outermost: the
+    /// step to its caller could not be proven (a walk never guesses a caller)
+    pub stop: Option<&'static str>,
 }
 
 impl Raw {
     pub fn new() -> Raw {
-        Raw { pcs: [0; MAX_FRAMES], n: 0, lr: 0, sp: 0, handle: 0 }
+        Raw { pcs: [0; MAX_FRAMES], n: 0, lr: 0, sp: 0, handle: 0, stop: None }
     }
     pub fn frames(&self) -> &[u64] {
         &self.pcs[..self.n]
@@ -95,6 +98,7 @@ pub fn self_os_id() -> u64 {
 /// suspends itself (macOS) never runs again, one that signals itself (Linux) waits for itself.
 pub fn capture(t: &Thread, raw: &mut Raw) -> Result<(), &'static str> {
     raw.n = 0;
+    raw.stop = None;
     if t.os_id == self_os_id() {
         return Err("the calling thread (not captured)");
     }
@@ -648,17 +652,11 @@ mod imp {
     }
 
     /// A paused thread's pc, frame pointer and callee-saved integer registers (x86_64: rbx,
-    /// r12..r15 as the panic trampoline's block holds them: indices 2..6).
-    /// A thread blocked in a syscall (a pause never signals one: its stack stands still while
-    /// it blocks) gives its syscall's pc and the first frame record above its sp, no registers.
+    /// r12..r15 as the panic trampoline's block holds them: indices 2..6). None for a thread
+    /// blocked in a syscall: a pause never signals one (its stack stands still while it blocks),
+    /// and the syscall's sp and pc do not give its frame pointer.
     pub fn regs_now(t: &Thread) -> Option<(u64, u64, Vec<(usize, u64)>)> {
-        let Some(slot) = held(t.os_id) else {
-            let (_, _, sp, pc) = read_syscall(t.os_id)?;
-            #[cfg(target_arch = "x86_64")]
-            return find_record(sp, &read).map(|fp| (pc, fp, Vec::new()));
-            #[cfg(not(target_arch = "x86_64"))]
-            return super::arm64_walk::find_record(sp, &super::arm64_walk::code_ranges(), &read).map(|fp| (pc, fp, Vec::new()));
-        };
+        let slot = held(t.os_id)?;
         let r = |k: usize| slot.regs[k].load(Relaxed);
         #[cfg(target_arch = "x86_64")]
         return Some((r(0), r(2), (3..8).map(|k| (k - 1, r(k))).collect()));
@@ -710,6 +708,10 @@ mod imp {
         (n == 8).then_some(v)
     }
 
+    /// Why a walk of a thread blocked in a syscall ends where its frame pointer is needed (each
+    /// `Raw::stop` says why the walk ends at its last frame: "walk stops at <pc>: <why>").
+    pub const BLOCKED_NO_FP: &str = "its caller is found through the frame pointer, which a thread blocked in a syscall does not give (it is walked from the syscall's sp and pc only, not signalled)";
+
     pub fn capture(t: &Thread, raw: &mut Raw) -> Result<(), &'static str> {
         raw.n = 0;
         // a paused thread already stands still in its handler: walked from the registers it was
@@ -730,6 +732,7 @@ mod imp {
                     return Ok(());
                 }
                 raw.n = 0;
+                raw.stop = None;
             }
         }
         let slot = hold(t.os_id, HOLD_CAPTURE)?;
@@ -759,16 +762,15 @@ mod imp {
         super::arm64_walk::walk_fp(raw, r(2), &ranges, &read);
     }
 
-    /// A thread blocked in a syscall: its pc, then the frame records above the syscall's sp.
+    /// A thread blocked in a syscall: its pc. The syscall stub keeps no frame record, and the
+    /// record (x29) and return address (lr) it was called with are registers the syscall's sp
+    /// and pc do not give: the caller is not known.
     #[cfg(target_arch = "aarch64")]
     fn walk_blocked(raw: &mut Raw, sp: u64, pc: u64) {
         raw.sp = sp;
         raw.pcs[0] = pc;
         raw.n = 1;
-        let ranges = super::arm64_walk::code_ranges();
-        if let Some(fp) = super::arm64_walk::find_record(sp, &ranges, &read) {
-            super::arm64_walk::walk_fp(raw, fp, &ranges, &read);
-        }
+        raw.stop = Some(BLOCKED_NO_FP);
     }
 
     /// Walks from registers into `out` (pcs, innermost first; a running thread's own stack:
@@ -782,30 +784,7 @@ mod imp {
         n
     }
 
-    /// A frame record at or above `sp`: [a] = a higher record (or 0), [a+8] = code, and the record
-    /// it links to looks the same (two links checked: stale data rarely chains twice).
-    #[cfg(target_arch = "x86_64")]
-    fn find_record(sp: u64, read: &dyn Fn(u64) -> Option<u64>) -> Option<u64> {
-        let code = |a: u64| crate::jit::in_jit_code(a) || super::super::cfi::covers(a);
-        let ok = |a: u64| -> Option<u64> {
-            let next = read(a)?;
-            let ra = read(a + 8)?;
-            (code(ra) && (next == 0 || (next > a && next - a < 1 << 20))).then_some(next)
-        };
-        let mut a = sp;
-        while a < sp + (64 << 10) {
-            if let Some(next) = ok(a) {
-                if next == 0 || ok(next).is_some() {
-                    return Some(a);
-                }
-            }
-            a += 8;
-        }
-        None
-    }
-
-    /// Mixed walk: JIT frames by their frame pointers, host frames by their CFI (frame pointers
-    /// where a module has none).
+    /// Mixed walk: JIT frames by their frame records, host frames by their CFI.
     #[cfg(target_arch = "x86_64")]
     fn walk(raw: &mut Raw, r: &mut super::super::cfi::Regs) {
         walk_with(raw, r, &read)
@@ -835,54 +814,59 @@ mod imp {
         }
     }
 
+    /// Each step is proven or the walk ends there, saying why (`raw.stop`): a JIT frame by its
+    /// frame record (JIT code keeps one in rbp), a host frame by its CFI. Never a caller guessed
+    /// from stack contents: a scan for something shaped like a frame record finds return
+    /// addresses that earlier calls left on the stack (a CI hang's main thread, blocked in poll,
+    /// read as called from the feature resolver that had run there before).
     #[cfg(target_arch = "x86_64")]
     fn walk_with(raw: &mut Raw, r: &mut super::super::cfi::Regs, read: &dyn Fn(u64) -> Option<u64>) {
         use super::super::cfi;
         let mut top = true;
         while raw.n < MAX_FRAMES && r.rip != 0 {
-            // a caller that is no code we know ends the walk (a frame-pointer guess through code
-            // without frame pointers or CFI reads garbage)
-            if !top && !crate::jit::in_jit_code(r.rip.wrapping_sub(1)) && !cfi::covers(r.rip.wrapping_sub(1)) {
+            // the lookup pc: a return address points past its call
+            let look = if top { r.rip } else { r.rip.wrapping_sub(1) };
+            let jit = crate::jit::in_jit_code(look);
+            if !top && !jit && !cfi::covers(look) {
+                raw.stop = Some("its return address is in neither JIT code nor a module with CFI");
                 break;
             }
             raw.pcs[raw.n] = r.rip;
             raw.n += 1;
             let sp0 = r.rsp;
-            let jit = crate::jit::in_jit_code(r.rip);
-            let mut stepped = false;
-            if !jit && cfi::covers(r.rip) {
-                match cfi::step(r, top, read) {
-                    cfi::Step::Done => stepped = true,
-                    cfi::Step::NeedRbp => {
-                        // a frame-pointer frame of a walk without registers: its record is the
-                        // first chained one above sp
-                        let Some(fp) = find_record(r.rsp, read) else { break };
-                        r.rbp = fp;
-                        stepped = cfi::step(r, top, read) == cfi::Step::Done;
-                    }
-                    cfi::Step::Fail => {}
-                }
-            }
-            if !stepped && jit && (r.rbp < r.rsp || r.rbp - r.rsp > 1 << 20) {
-                // a JIT frame reached from host frames that never saved rbp (a walk from a
-                // syscall's sp/pc has no rbp): its frame record is the first one above sp that
-                // chains to another record
-                match find_record(r.rsp, read) {
-                    Some(fp) => r.rbp = fp,
-                    None => break,
-                }
-            }
-            if !stepped {
-                // frame record: [rbp] = caller's rbp, [rbp+8] = return address
-                let (Some(ra), Some(next)) = (read(r.rbp.wrapping_add(8)), read(r.rbp)) else { break };
-                if r.rbp == 0 || r.rbp < sp0 {
+            if jit {
+                // [rbp] = the caller's rbp, [rbp + 8] = the return address
+                if r.rbp == 0 {
+                    raw.stop = Some("it is JIT code and its frame pointer is not known (the thread blocks in a syscall, walked from the syscall's sp and pc, and no frame below it saved rbp)");
                     break;
                 }
+                if r.rbp < sp0 || r.rbp - sp0 > 1 << 20 {
+                    raw.stop = Some("it is JIT code and its frame pointer is not in its stack");
+                    break;
+                }
+                let (Some(ra), Some(next)) = (read(r.rbp.wrapping_add(8)), read(r.rbp)) else {
+                    raw.stop = Some("it is JIT code and its frame record is unreadable");
+                    break;
+                };
                 r.rsp = r.rbp + 16;
                 r.rip = ra;
                 r.rbp = next;
+            } else {
+                match cfi::step(r, top, read) {
+                    cfi::Step::Done => {}
+                    cfi::Step::End => break,
+                    cfi::Step::NeedRbp => {
+                        raw.stop = Some(BLOCKED_NO_FP);
+                        break;
+                    }
+                    cfi::Step::Fail(why) => {
+                        raw.stop = Some(why);
+                        break;
+                    }
+                }
             }
             if r.rsp <= sp0 {
+                raw.stop = Some("its caller's frame is not above it");
                 break;
             }
             top = false;
@@ -927,9 +911,16 @@ mod arm64_walk {
     /// Appends the frames of the record chain from `fp` (the top pc is already in `raw`).
     pub fn walk_fp(raw: &mut Raw, mut fp: u64, ranges: &[(u64, u64)], read: &dyn Fn(u64) -> Option<u64>) {
         while raw.n < MAX_FRAMES && fp != 0 && fp % 8 == 0 {
-            let (Some(next), Some(ra)) = (read(fp), read(fp + 8)) else { break };
+            let (Some(next), Some(ra)) = (read(fp), read(fp + 8)) else {
+                raw.stop = Some("its frame record is unreadable");
+                break;
+            };
             let ra = strip(ra);
-            if ra == 0 || !is_code(ranges, ra) {
+            if ra == 0 {
+                break;
+            }
+            if !is_code(ranges, ra) {
+                raw.stop = Some("its frame record's return address is not code");
                 break;
             }
             raw.pcs[raw.n] = ra;
@@ -939,27 +930,6 @@ mod arm64_walk {
             }
             fp = next;
         }
-    }
-
-    /// A frame record at or above `sp` (a thread stopped in a syscall stub, which keeps no
-    /// record of its own): [a] = a higher record (or 0), [a+8] = code, and the record it links
-    /// to looks the same (two links checked: stale data rarely chains twice).
-    pub fn find_record(sp: u64, ranges: &[(u64, u64)], read: &dyn Fn(u64) -> Option<u64>) -> Option<u64> {
-        let ok = |a: u64| -> Option<u64> {
-            let next = read(a)?;
-            let ra = strip(read(a + 8)?);
-            (is_code(ranges, ra) && (next == 0 || (next > a && next - a < 1 << 20))).then_some(next)
-        };
-        let mut a = sp;
-        while a < sp + (64 << 10) {
-            if let Some(next) = ok(a) {
-                if next == 0 || ok(next).is_some() {
-                    return Some(a);
-                }
-            }
-            a += 8;
-        }
-        None
     }
 }
 
@@ -980,5 +950,98 @@ mod imp {
     }
     pub fn capture(_t: &Thread, _raw: &mut Raw) -> Result<(), &'static str> {
         Err("stack capture is not implemented on this target")
+    }
+}
+
+/// A walk proves each step or stops there and says why; it never takes a caller from stack
+/// contents that look like a frame record. The CI shape: a thread blocked in poll whose own frame
+/// holds what earlier calls left there (here: two chained frame records naming `fake_caller`), with
+/// a garbage rbp. The walk from the syscall's sp and pc must not name `fake_caller`: it reaches
+/// `park_in_poll` through the CFI (a libc without frame pointers), or stops where the frame
+/// pointer is needed and says so (a libc built with them).
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+mod tests {
+    use super::{capture, imp::BLOCKED_NO_FP, list, Raw};
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicU64, Ordering::{Acquire, Release}};
+
+    #[repr(C)]
+    struct PollFd { fd: i32, events: i16, revents: i16 }
+    extern "C" {
+        fn poll(fds: *mut PollFd, n: u64, timeout: i32) -> i32;
+        fn gettid() -> i32;
+    }
+
+    #[inline(never)]
+    extern "C" fn fake_caller() -> u64 {
+        std::hint::black_box(7)
+    }
+
+    /// poll(fd) with rbp holding `rbp` (garbage, as rustc code without frame pointers leaves it)
+    #[inline(never)]
+    fn park_in_poll(fd: i32, rbp: u64, tid: &AtomicU64) {
+        // two chained records pointing into `fake_caller`, in this frame above poll's sp
+        let mut stale = [0u64; 64];
+        let base = stale.as_mut_ptr() as u64;
+        let ra = fake_caller as extern "C" fn() -> u64 as usize as u64 + 4;
+        stale[8] = base + 8 * 16;
+        stale[9] = ra;
+        stale[16] = 0;
+        stale[17] = ra;
+        std::hint::black_box(&mut stale);
+        tid.store(unsafe { gettid() } as u64, Release);
+        let mut p = PollFd { fd, events: 1, revents: 0 };
+        let pp = &mut p as *mut PollFd;
+        unsafe {
+            std::arch::asm!(
+                "push rbp", ".cfi_adjust_cfa_offset 8",
+                "sub rsp, 8", ".cfi_adjust_cfa_offset 8",
+                "mov rbp, {rbp}",
+                "call {poll}",
+                "add rsp, 8", ".cfi_adjust_cfa_offset -8",
+                "pop rbp", ".cfi_adjust_cfa_offset -8",
+                rbp = in(reg) rbp,
+                poll = sym poll,
+                inout("rdi") pp => _,
+                inout("rsi") 1u64 => _,
+                inout("edx") -1i32 => _,
+                clobber_abi("C"),
+            );
+        }
+        std::hint::black_box(&stale);
+    }
+
+    #[test]
+    fn a_blocked_threads_walk_never_takes_a_caller_from_stack_contents() {
+        super::super::cfi::refresh();
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        static TID: AtomicU64 = AtomicU64::new(0);
+        let read_fd = reader.as_raw_fd();
+        let parked = std::thread::spawn(move || park_in_poll(read_fd, 0x10, &TID));
+        // until it blocks in poll (syscall 7)
+        let t = loop {
+            let tid = TID.load(Acquire);
+            let blocked = tid != 0 && std::fs::read_to_string(format!("/proc/self/task/{tid}/syscall")).is_ok_and(|s| s.split_whitespace().next() == Some("7"));
+            if blocked {
+                if let Some(t) = list().into_iter().find(|t| t.os_id == tid && t.state != "running") {
+                    break t;
+                }
+            }
+            std::thread::yield_now();
+        };
+        let mut raw = Raw::new();
+        let captured = capture(&t, &mut raw);
+        writer.write_all(b"x").unwrap();
+        parked.join().unwrap();
+        drop(reader);
+        captured.unwrap();
+        let names: Vec<String> = raw.frames().iter().enumerate().map(|(i, &pc)| {
+            super::super::symbols::host_symbol(if i == 0 { pc } else { pc - 1 }).map_or(format!("{pc:#x}"), |s| s.0)
+        }).collect();
+        assert!(!names.iter().any(|n| n.contains("fake_caller")), "a caller guessed from stack contents: {names:?}");
+        let reached = names.iter().any(|n| n.contains("park_in_poll"));
+        assert!(reached || raw.stop == Some(BLOCKED_NO_FP), "the walk neither reached park_in_poll nor said why it stopped: {names:?} {:?}", raw.stop);
+        assert!(raw.n >= 1);
     }
 }
