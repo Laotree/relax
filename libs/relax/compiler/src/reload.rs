@@ -1945,6 +1945,19 @@ unsafe fn initializer_deps_changed(up: *mut Unit, root: u32, changed: &[DefId], 
     use relax_backend::rir::{Callee, Inst};
     let mut todo = vec![root];
     let mut seen: Vec<u32> = Vec::new();
+    // the slot each one was reached from: an unknown dependency names the way it was reached
+    let mut from: std::collections::HashMap<u32, u32> = Default::default();
+    let path = |from: &std::collections::HashMap<u32, u32>, mut s: u32| -> String {
+        let u = &*up;
+        let mut names = vec![u.fns[s as usize].name.to_string()];
+        while let Some(&p) = from.get(&s) {
+            if names.len() > 12 { names.push("..".into()); break; }
+            names.push(u.fns[p as usize].name.to_string());
+            s = p;
+        }
+        names.reverse();
+        names.join(" -> ")
+    };
     while let Some(s) = todo.pop() {
         if seen.contains(&s) { continue; }
         seen.push(s);
@@ -1964,13 +1977,17 @@ unsafe fn initializer_deps_changed(up: *mut Unit, root: u32, changed: &[DefId], 
         }
         let u = &*up;
         let Some(rir) = u.fns[s as usize].rir.clone() else { return Err(format!("`{}` has no RIR", u.fns[s as usize].name)) };
-        todo.extend_from_slice(&u.fns[s as usize].calls);
+        fn reach(from: &mut std::collections::HashMap<u32, u32>, todo: &mut Vec<u32>, by: u32, c: u32) {
+            from.entry(c).or_insert(by);
+            todo.push(c);
+        }
+        for &c in &u.fns[s as usize].calls { reach(&mut from, &mut todo, s, c); }
         for i in rir.blocks.iter().flat_map(|b| &b.insts) {
             match i {
-                Inst::Call(Callee::Fn(c) | Callee::CFn(c, _), _, _) | Inst::FnAddr(_, c) | Inst::SlotAddr(_, c) => todo.push(*c),
-                Inst::Call(Callee::Indirect(_) | Callee::CIndirect(..), _, _) => return Err(format!("an indirect call in `{}`", u.fns[s as usize].name)),
+                Inst::Call(Callee::Fn(c) | Callee::CFn(c, _), _, _) | Inst::FnAddr(_, c) | Inst::SlotAddr(_, c) => reach(&mut from, &mut todo, s, *c),
+                Inst::Call(Callee::Indirect(_) | Callee::CIndirect(..), _, _) => return Err(format!("an indirect call in `{}`, reached as {}", u.fns[s as usize].name, path(&from, s))),
                 Inst::Addr(_, sym) => match u.syms.kind(sym.id) {
-                    Some(crate::syms::SymKind::Thunk(c)) => todo.push(c),
+                    Some(crate::syms::SymKind::Thunk(c)) => reach(&mut from, &mut todo, s, c),
                     Some(crate::syms::SymKind::Static(d)) if changed.contains(&d) => return Ok(true),
                     _ => {}
                 },
@@ -1984,7 +2001,7 @@ unsafe fn initializer_deps_changed(up: *mut Unit, root: u32, changed: &[DefId], 
                 return Err(format!("`{}` reads a trait's associated constant", u.fns[s as usize].name));
             }
             let keys: Vec<Vec<TyId>> = u.consts.keys().filter(|(x, _)| *x == c).map(|(_, a)| a.clone()).collect();
-            for args in keys { todo.push(u.fn_id(FnKey::Inst(c, args))); }
+            for args in keys { reach(&mut from, &mut todo, s, u.fn_id(FnKey::Inst(c, args))); }
         }
     }
     Ok(false)
