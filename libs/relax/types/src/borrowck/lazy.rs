@@ -571,6 +571,26 @@ fn settle_finished_check() {
 pub(crate) fn panic_message(e: &Box<dyn std::any::Any + Send>) -> String {
     e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default()
 }
+/// Where a checker panic goes beyond the run's log and summary (the compiler: devhub's ledger):
+/// body, message.
+static PANIC_SINK: std::sync::OnceLock<fn(&str, &str)> = std::sync::OnceLock::new();
+pub fn set_panic_sink(sink: fn(&str, &str)) {
+    let _ = PANIC_SINK.set(sink);
+}
+/// A panic in a check of `body`: counted and noted for the run's summary, and sent to the sink (a
+/// cancellation that reached the catch is no panic of the checker). Returns its message.
+fn report_panic(body: String, payload: &Box<dyn std::any::Any + Send>) -> String {
+    let _k = crate::zone_alloc::kept();
+    let message = panic_message(payload);
+    PANICS.fetch_add(1, Ordering::Relaxed);
+    let mut notes = PANIC_NOTES.lock().unwrap_or_else(|e| e.into_inner());
+    if notes.len() < 5 { notes.push(format!("{}: {}", body, message)); }
+    drop(notes);
+    if !crate::preempt::is_cancelled(&**payload) {
+        if let Some(sink) = PANIC_SINK.get() { sink(&body, &message); }
+    }
+    message
+}
 fn finish_verdict(prog: &Program, src: usize, epoch: u64, def: DefId, args: &[TyId], result: Result<Option<super::Verdict>, String>, origin: Origin) -> Vec<GandalfEvent> {
     let key = (src, def, epoch);
     match result {
@@ -684,8 +704,11 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
         let (identity, def, epoch) = &item.key;
         let phase = std::cell::Cell::new("start");
         *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = Some((rank, *def, crate::clock::wall_ns()));
-        // (the catch: this item's steps around the body's own check below)
-        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| item.src.with_front(&mut |prog, tcx, cx| {
+        let ok = item.src.with_front(&mut |prog, tcx, cx| {
+            // A panic in this item's steps around the body's own check below (its stored verdict, its
+            // owner's identity arguments, a discovery batch) ends this item, reported like the
+            // check's own; the worker goes on.
+            let around = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             struct Slow<'a>(std::time::Instant, &'a std::cell::Cell<&'static str>, &'a Program, DefId, usize);
             impl Drop for Slow<'_> {
                 fn drop(&mut self) {
@@ -769,12 +792,7 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
                 preempted = true;
                 return;
             }
-            let result = result.map_err(|e| panic_message(&e));
-            if let Err(msg) = &result {
-                PANICS.fetch_add(1, Ordering::Relaxed);
-                let mut notes = PANIC_NOTES.lock().unwrap_or_else(|e| e.into_inner());
-                if notes.len() < 5 { notes.push(format!("{}: {}", prog.def_path(*def), msg)); }
-            }
+            let result = result.map_err(|e| report_panic(prog.def_path(*def), &e));
             // Re-ranking to a new epoch may have happened during the check.
             let queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
             if queue.as_ref().and_then(|q| q.epoch.get(identity)).is_some_and(|e| *e > *epoch) {
@@ -787,26 +805,18 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
             }
             phase.set("finish");
             finish_verdict(prog, *identity, *epoch, *def, args, result, Origin::Background);
-        })));
+            }));
+            if let Err(p) = around {
+                let body = if *def == crate::program::NO_DEF { "(discovery)".to_string() } else { prog.def_path(*def) };
+                let message = report_panic(body, &p);
+                record(item.key.clone(), FnVerdict::Unchecked(format!("checker failure: {}", message)));
+            }
+        });
         CHECK_NS.fetch_add(relax_backend::cpu_ns() - t0, Ordering::Relaxed);
         *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // An exit cancels the whole attempt, including constant deferrals/discovery.
         // Only a front writer's temporary preemption is queued again below.
         if crate::preempt::is_stopped() { return; }
-        // A panic in the item's other steps (its stored verdict, its owner's identity arguments, a
-        // discovery batch) ends this item, reported like the check's own; the worker goes on.
-        let ok = match ok {
-            Ok(ok) => ok,
-            Err(p) => {
-                let msg = panic_message(&p);
-                PANICS.fetch_add(1, Ordering::Relaxed);
-                let mut notes = PANIC_NOTES.lock().unwrap_or_else(|e| e.into_inner());
-                if notes.len() < 5 { notes.push(format!("{:?} ({}): {}", def, phase.get(), msg)); }
-                drop(notes);
-                record(item.key.clone(), FnVerdict::Unchecked(format!("checker failure: {}", msg)));
-                continue;
-            }
-        };
         if stale {
             STALE.fetch_add(1, Ordering::Relaxed);
             // Epoch-purged entries stay purged; verdict() supplies the stale reason.
@@ -891,14 +901,9 @@ pub fn check_before_run(prog: &Program, tcx: &Tcx, src: &Arc<dyn FrontSource>, d
         let body = tcx.typeck(prog, def);
         if !body.errors.is_empty() { return None; }
         Some(super::check_body(&cx, prog, tcx, &body))
-    })).map_err(|e| panic_message(&e));
+    })).map_err(|e| report_panic(prog.def_path(def), &e));
     CHECK_NS.fetch_add(relax_backend::cpu_ns() - t0, Ordering::Relaxed);
     CHECKED.fetch_add(1, Ordering::Relaxed);
-    if let Err(msg) = &result {
-        PANICS.fetch_add(1, Ordering::Relaxed);
-        let mut notes = PANIC_NOTES.lock().unwrap_or_else(|e| e.into_inner());
-        if notes.len() < 5 { notes.push(format!("{}: {}", prog.def_path(def), msg)); }
-    }
     if let Some(v) = storable(&result) {
         let mut keys = VERDICT_KEYS.lock().unwrap_or_else(|e| e.into_inner());
         keys.extend(cache_key.into_iter().chain(owner_key).map(|k| (k, v.clone())));
@@ -948,7 +953,7 @@ pub fn check_now(prog: &Program, tcx: &Tcx, req: &CheckRequest<'_>) -> GateResul
             let body = tcx.typeck(prog, def);
             if !body.errors.is_empty() { return None; }
             Some(super::check_body_in(&cx, prog, tcx, &body, req.fv))
-        })).map_err(|e| panic_message(&e));
+        })).map_err(|e| report_panic(prog.def_path(def), &e));
         let errors = result.as_ref().ok().and_then(|v| v.as_ref()).map_or(0, |v| v.errors.len());
         let events = finish_verdict(prog, 0, req.epoch, def, &args, result, req.origin);
         out.withheld += errors - events.len();
@@ -998,7 +1003,7 @@ pub fn check_now(prog: &Program, tcx: &Tcx, req: &CheckRequest<'_>) -> GateResul
                 matched
             });
             Some(v)
-        })).map_err(|e| panic_message(&e));
+        })).map_err(|e| report_panic(prog.def_path(d), &e));
         let errors = result.as_ref().ok().and_then(|v| v.as_ref()).map_or(0, |v| v.errors.len());
         let events = finish_verdict(prog, 0, req.epoch, d, &args, result, req.origin);
         out.withheld += errors - events.len();

@@ -3975,6 +3975,7 @@ impl Unit {
     }
 
     pub fn new(prog: Program, tcx: Tcx, core_crate: u32) -> Box<Unit> {
+        crate::borrowck::lazy::set_panic_sink(crate::hot_failure::checker_panic);
         owner::start();
         let query_errors = tcx.dcx.clone();
         let sess = prog.session.clone();

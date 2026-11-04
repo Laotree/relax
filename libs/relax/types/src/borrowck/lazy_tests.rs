@@ -259,7 +259,7 @@ fn a_panic_around_the_check_is_reported_and_the_worker_goes_on() {
     front.ungate();
     assert_eq!(wait_verdict(&front, first), FnVerdict::Unchecked("checker failure: stored verdict lookup panic".into()));
     assert_eq!(PANICS.load(Ordering::Relaxed), 1);
-    assert!(PANIC_NOTES.lock().unwrap()[0].contains("stored verdict lookup panic"));
+    assert!(PANIC_NOTES.lock().unwrap()[0].contains("clean: stored verdict lookup panic"), "{:?}", PANIC_NOTES.lock().unwrap());
     let next = front.enqueue("a", false);
     assert!(matches!(wait_verdict(&front, next), FnVerdict::Errors(_)));
     stop();
