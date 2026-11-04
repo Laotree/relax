@@ -420,6 +420,7 @@ pub(super) fn wake_all() {
 /// This process is a plain fork's child (jit::fork_child): it has no workers, and a parent's worker
 /// may have held the queue's lock or inbox at the fork, held for good there: nothing is queued.
 static FORKED: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
 pub(super) fn fork_child() {
     FORKED.store(true, Ordering::SeqCst);
 }
