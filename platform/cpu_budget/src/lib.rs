@@ -627,7 +627,10 @@ fn os_class(class: u8) -> bool {
         fn GetCurrentThread() -> *mut std::ffi::c_void;
         fn SetThreadPriority(thread: *mut std::ffi::c_void, priority: i32) -> i32;
     }
-    unsafe { SetThreadPriority(GetCurrentThread(), [1, 0, -1, 2][class as usize]) != 0 }
+    // Background at Normal, not below: Windows priority is strict, so below another program's busy threads
+    // it gets almost no time (tier-up all but stopped, the program stayed on its slow code); the budget
+    // decides how much of the machine Background takes
+    unsafe { SetThreadPriority(GetCurrentThread(), [1, 0, 0, 2][class as usize]) != 0 }
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android", windows)))]
 fn os_class(_class: u8) -> bool { false }
