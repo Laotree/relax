@@ -206,7 +206,7 @@ impl Types {
     pub fn collected_writer(&self) -> Option<crate::image::Writer<'_>> {
         self.collected_writer_with(&|| false)
     }
-    /// collected_writer, asking `stop` every 64k rows and bucket heads (None: it said yes)
+    /// collected_writer, asking `stop` every arena chunk of rows and 64k bucket heads (None: it said yes)
     pub fn collected_writer_with(&self, stop: &dyn Fn() -> bool) -> Option<crate::image::Writer<'_>> {
         let n = self.len();
         let mut meta = Vec::new();
@@ -219,12 +219,22 @@ impl Types {
             self.i32_, self.i64_, self.u8_, self.u32_, self.u64_, self.usize_, self.isize_,
             self.f32_, self.f64_, self.str_ref] { t.put(&mut meta); }
         let mapped_rows = self.image.as_ref().map_or(&[][..], |image| image.rows);
-        let mut rows: Vec<Entry> = Vec::with_capacity(n.saturating_sub(mapped_rows.len()));
-        for i in mapped_rows.len()..n {
-            if i % 65536 == 65535 && stop() { return None; }
-            let r = *self.entry(TyId(i as u32));
-            if !(r.next as usize <= n && (r.erased.0 as usize) < n) { return None; }
-            rows.push(r);
+        // the rows past the mapped ones, as the arena chunks hold them (no copy): a row below
+        // `n` is written before `len` publishes it and never changes, and a chunk is freed only
+        // with exclusive access (adopt_collected)
+        let mut runs: Vec<&[Entry]> = Vec::new();
+        let mut i = mapped_rows.len();
+        while i < n {
+            let end = n.min((i | (CHUNK - 1)) + 1);
+            let c = self.chunks[i >> CHUNK_BITS].load(Ordering::Acquire);
+            if c.is_null() { return None; }
+            let run = unsafe { std::slice::from_raw_parts(c.add(i & (CHUNK - 1)) as *const Entry, end - i) };
+            for r in run {
+                if !(r.next as usize <= n && (r.erased.0 as usize) < n) { return None; }
+            }
+            runs.push(run);
+            if stop() { return None; }
+            i = end;
         }
         let mut buckets: Vec<u32> = Vec::new();
         for (i, head) in self.buckets.iter().enumerate() {
@@ -239,10 +249,10 @@ impl Types {
         // published before the words are copied, so the image never holds a head past its words
         let list_buckets = self.lists.bucket_pairs();
         let mapped_words = self.lists.mapped;
-        let words = self.lists.tail_words(mapped_words.len());
+        let words = self.lists.tail_word_bytes(mapped_words.len());
         let mut image = crate::image::Writer::default();
-        image.add_bytes(0, meta); image.add_mapped_prefix(1, mapped_rows, &rows);
-        image.add_mapped_prefix(2, mapped_words, &words);
+        image.add_bytes(0, meta); image.add_parts(1, mapped_rows, runs);
+        image.add_mapped_prefix(2, mapped_words, words);
         image.add_owned(3, &buckets);
         image.add_owned(4, &list_buckets);
         Some(image)
@@ -381,6 +391,12 @@ mod tests {
         assert_eq!(tys.mk_array(u8_ref, tys.const_usize(5)), arrays[5]);
         assert_eq!(tys.mk_array(u8_ref, tys.const_usize(1_000_000)), late);
         assert!(tys.len() >= before && tys.mk_array(u8_ref, tys.const_usize(2_000_000)).0 as usize >= before + 1);
+        // the adopted interner's image (its mapped rows, then the arena's from inside a chunk)
+        // restores to the same types
+        let again: &'static [u8] = Box::leak(tys.collected_image().unwrap().into_boxed_slice());
+        let restored = Types::restore_collected(again).unwrap();
+        assert_eq!(restored.len(), tys.len());
+        for t in arrays.iter().step_by(997).chain([&late]) { assert!(restored.kind(*t) == tys.kind(*t)); }
         // an image of other types at the same ids is refused
         let other = Types::new();
         let _ = other.intern(TyKind::Slice(other.u8_));
