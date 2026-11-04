@@ -19120,6 +19120,13 @@ pub unsafe fn VirtualFree(lpAddress: *mut ::core::ffi::c_void,dwSize: usize,dwFr
 let hr__ = import_VirtualFree::call(lpAddress,dwSize,dwFreeType); hr__.ok()?;
 Ok(())
 }
+mod import_VirtualUnlock { #[link(name = "KERNEL32", kind = "raw-dylib")] extern "system" { #[link_name = "VirtualUnlock"] pub fn call(lpAddress: *const ::core::ffi::c_void,dwSize: usize) -> crate::core::BOOL; } }
+pub use import_VirtualUnlock::call as VirtualUnlock_raw;
+#[inline]
+pub unsafe fn VirtualUnlock(lpAddress: *const ::core::ffi::c_void,dwSize: usize) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_VirtualUnlock::call(lpAddress,dwSize); hr__.ok()?;
+Ok(())
+}
 }
 pub mod Ole {
 #[repr(C)]
