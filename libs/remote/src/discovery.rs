@@ -208,8 +208,13 @@ pub fn registry_dir() -> std::path::PathBuf {
 /// The running endpoints, oldest first by pid (stale discovery files of ended processes are
 /// removed, with the socket each names).
 pub fn apps() -> Vec<App> {
+    apps_in(&registry_dir())
+}
+
+/// [`apps`] announced in `registry` (what a process started with `MAKEPAD_REMOTE_REGISTRY` names).
+pub fn apps_in(registry: &std::path::Path) -> Vec<App> {
     let mut out = Vec::new();
-    let Ok(dir) = std::fs::read_dir(registry_dir()) else { return out };
+    let Ok(dir) = std::fs::read_dir(registry) else { return out };
     for e in dir.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         let Some(pid) = name.strip_prefix("makepad-remote-").and_then(|r| r.strip_suffix(".json")).and_then(|p| p.parse::<u32>().ok()) else { continue };
