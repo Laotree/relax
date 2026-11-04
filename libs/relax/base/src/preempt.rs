@@ -132,8 +132,7 @@ pub struct PublishBail {
 /// Whether a caught unwind payload is work to be redone rather than a failure: a preemption,
 /// a build waiting for the post-boot loader (NeedsLoad), lowering ahead that needs the unit
 /// (NeedsUnit), a request the owner thread could not serve yet (OwnerBusy), or a publish that bailed
-/// (PublishBail). A query it
-/// crosses is cancelled.
+/// (PublishBail). The query engine asks nothing of a payload: any unwind cancels the queries it crosses.
 pub fn is_cancelled(payload: &(dyn std::any::Any + Send)) -> bool {
     payload.is::<Preempted>() || payload.is::<NeedsLoad>() || payload.is::<NeedsUnit>() || payload.is::<OwnerBusy>() || payload.is::<PublishBail>()
 }

@@ -38,6 +38,8 @@ fn named(prog: &Program, name: &str) -> DefId {
 struct TestFront {
     prog: Program, tcx: Tcx, quiet: AtomicU64, calls: AtomicU64,
     block_call: u64, entered: Barrier, release: Barrier,
+    /// the next stored-verdict lookup panics (under the worker, outside the body's own check)
+    panic_stored: AtomicBool,
     /// the front end's lock: checks read under it, a live patch writes (lazy::carry_epoch)
     lock: std::sync::RwLock<()>,
 }
@@ -45,7 +47,7 @@ impl TestFront {
     fn new(block_call: u64) -> Arc<Self> {
         let (prog, tcx) = fixture("app", SOURCE);
         Arc::new(Self { prog, tcx, quiet: AtomicU64::new(0), calls: AtomicU64::new(0), block_call,
-            entered: Barrier::new(2), release: Barrier::new(2), lock: std::sync::RwLock::new(()) })
+            entered: Barrier::new(2), release: Barrier::new(2), panic_stored: AtomicBool::new(false), lock: std::sync::RwLock::new(()) })
     }
     /// A live patch: the next collect epoch, with `keep`'s owners carried, under the front end's
     /// write lock as the driver does it (no check runs meanwhile, none sees the new epoch early).
@@ -74,6 +76,10 @@ impl FrontSource for TestFront {
     fn quiet_ns(&self) -> u64 { self.quiet.load(Ordering::SeqCst) }
     fn lower_priority(&self) {}
     fn identity(&self) -> usize { self as *const Self as usize }
+    fn owner_verdict(&self, _prog: &Program, _def: DefId, _epoch: u64) -> (Option<u128>, Option<StoredVerdict>) {
+        if self.panic_stored.swap(false, Ordering::SeqCst) { panic!("stored verdict lookup panic"); }
+        (None, None)
+    }
 }
 // The waits below have no wall-clock limit: the worker's progress depends on the machine (a
 // JIT-run test binary compiles the checker on first use, and a loaded machine runs it slower);
@@ -240,6 +246,23 @@ fn check_before_run_decides_before_the_background() {
     assert!(check_before_run(&front.prog, &front.tcx, &src, a, front.epoch(), None, Some(StoredVerdict::Clean)).is_empty());
     assert_eq!(verdict(front.identity(), a, &[], front.epoch()), FnVerdict::Clean);
     unsubscribe(id); stop();
+}
+
+/// A panic around the body's check stays in that item and is reported; the worker goes on (a
+/// worker that ended left every later verdict pending for the rest of the run).
+#[test]
+fn a_panic_around_the_check_is_reported_and_the_worker_goes_on() {
+    if child("a_panic_around_the_check_is_reported_and_the_worker_goes_on") { return; }
+    let front = TestFront::new(0);
+    front.panic_stored.store(true, Ordering::SeqCst);
+    let first = front.enqueue("clean", false);
+    front.ungate();
+    assert_eq!(wait_verdict(&front, first), FnVerdict::Unchecked("checker failure: stored verdict lookup panic".into()));
+    assert_eq!(PANICS.load(Ordering::Relaxed), 1);
+    assert!(PANIC_NOTES.lock().unwrap()[0].contains("stored verdict lookup panic"));
+    let next = front.enqueue("a", false);
+    assert!(matches!(wait_verdict(&front, next), FnVerdict::Errors(_)));
+    stop();
 }
 
 #[test]
