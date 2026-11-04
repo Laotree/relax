@@ -4880,7 +4880,7 @@ impl<'a> Gen<'a> {
                 }
                 self.fin_f(d, xd);
             }
-            Inst::VFma(np, na, _, d, a, b, c) => {
+            Inst::VFma(np, na, _, w, d, a, b, c) => {
                 // (a negation here is keep_nan's: expand_fma_negations made the others explicit)
                 let xa = self.use_f(a, XS);
                 let xb = self.use_f(b, XS2);
@@ -4899,18 +4899,18 @@ impl<'a> Gen<'a> {
                     if xd != xc {
                         self.a.vex_l(0, 1, false, true, 0x28, xd, 0, xc);
                     }
-                    self.a.vex_l(1, 2, false, true, 0xb8 + k, xd, xb, xa);
+                    self.a.vex_l(1, 2, w, true, 0xb8 + k, xd, xb, xa);
                 } else if xd != xc {
                     if xd == xa {
                         // d is a: vf..213ps d, b, c (d = b*d +- c)
-                        self.a.vex_l(1, 2, false, true, 0xa8 + k, xd, xb, xc);
+                        self.a.vex_l(1, 2, w, true, 0xa8 + k, xd, xb, xc);
                     } else {
                         // d is b: vf..132ps d, c, a (d = d*a +- c)
-                        self.a.vex_l(1, 2, false, true, 0x98 + k, xd, xc, xa);
+                        self.a.vex_l(1, 2, w, true, 0x98 + k, xd, xc, xa);
                     }
                 } else {
                     self.a.vex_l(0, 1, false, true, 0x28, 0, 0, xc);
-                    self.a.vex_l(1, 2, false, true, 0xb8 + k, 0, xb, xa);
+                    self.a.vex_l(1, 2, w, true, 0xb8 + k, 0, xb, xa);
                     self.a.vex_l(0, 1, false, true, 0x28, xd, 0, 0);
                 }
                 self.fin_f(d, xd);
@@ -5168,7 +5168,7 @@ impl<'a> Gen<'a> {
                 self.a.movf_rr(true, xd, 0);
                 self.fin_f(d, xd);
             }
-            Inst::VFma(np, na, _, d, a, b, c) => {
+            Inst::VFma(np, na, _, w, d, a, b, c) => {
                 // (a negation here is keep_nan's: expand_fma_negations made the others explicit)
                 let xa = self.use_f(a, XS);
                 let xb = self.use_f(b, XS2);
@@ -5185,7 +5185,7 @@ impl<'a> Gen<'a> {
                     };
                     // vf..231ps d, b, a: b the first factor (a NaN lane: b's, a's, then c's;
                     // rir::fma_nan_f32)
-                    self.a.vex_rr(1, 2, false, op, xd0, xb, xa);
+                    self.a.vex_rr(1, 2, w, op, xd0, xb, xa);
                     self.fin_f(d, xd0);
                     return;
                 }
@@ -5196,7 +5196,7 @@ impl<'a> Gen<'a> {
                     (true, false) => 0xbc,
                     (true, true) => 0xbe,
                 };
-                self.a.vex_rr(1, 2, false, op, 0, xb, xa); // vf[n]m{add,sub}231ps xmm0, b, a
+                self.a.vex_rr(1, 2, w, op, 0, xb, xa); // vf[n]m{add,sub}231ps xmm0, b, a
                 let xd = self.def_f(d, XS);
                 self.a.movf_rr(true, xd, 0);
                 self.fin_f(d, xd);
@@ -6548,7 +6548,7 @@ fn y_inst(f: &Func, i: &Inst) -> bool {
     let y = |v: &VReg| f.vregs[v.0 as usize] == Cls::V256;
     match i {
         Inst::VX(VX::Half(_), ..) => true,
-        Inst::VX(_, d, ..) | Inst::VLoad(d, ..) | Inst::VFma(_, _, _, d, ..) | Inst::VSplat(d, _) | Inst::VConst(d, _) | Inst::Mov(d, _) | Inst::VSel(d, ..) => y(d),
+        Inst::VX(_, d, ..) | Inst::VLoad(d, ..) | Inst::VFma(_, _, _, _, d, ..) | Inst::VSplat(d, _) | Inst::VConst(d, _) | Inst::Mov(d, _) | Inst::VSel(d, ..) => y(d),
         Inst::VStore(_, _, v) | Inst::VAny(_, v) => y(v),
         _ => false,
     }

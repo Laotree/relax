@@ -3261,14 +3261,15 @@ impl<'a> Gen<'a> {
                 self.vmov(xd, t);
                 self.fin_f(d, xd);
             }
-            Inst::VFma(np, na, _, d, a, b, c) => {
+            Inst::VFma(np, na, _, w, d, a, b, c) => {
                 // (keep_nan's negations are explicit by now: legal.rs expand_fma_negations)
+                let sz = (w as u32) << 22; // .2d, else .4s
                 // t = c (negated first for the - c forms: exact, and the fused op then
                 // rounds once, with IEEE's sign of an exact zero); fmla / fmls t, a, b
                 let t = self.vtmp(d, &[a, b]);
                 let xc = self.use_f(c, t);
                 if na {
-                    self.v2(VFNEG, t, xc);
+                    self.v2(VFNEG | sz, t, xc);
                 } else {
                     self.vmov(t, xc);
                 }
@@ -3278,7 +3279,7 @@ impl<'a> Gen<'a> {
                     // by element (fold_lane_splats): fmla / fmls t.4s, a.4s, b.s[0]
                     self.v3(if np { 0x4F80_5000 } else { 0x4F80_1000 }, t, xa, xb);
                 } else {
-                    self.v3(if np { 0x4EA0_CC00 } else { 0x4E20_CC00 }, t, xa, xb);
+                    self.v3(if np { 0x4EA0_CC00 } else { 0x4E20_CC00 } | sz, t, xa, xb);
                 }
                 let xd = self.def_f(d, FS2);
                 self.vmov(xd, t);
@@ -5418,7 +5419,7 @@ fn fold_lane_splats(f: &Func) -> Option<Func> {
         for (ii, i) in b.insts.iter().enumerate() {
             let folded = match *i {
                 Inst::VSplat(d, s) => kof(s).map(|k| Inst::VConst(d, k)),
-                Inst::VFma(np, na, keep, d, a, b, c) => of(b).map(|s| Inst::VFma(np, na, keep, d, a, s, c)),
+                Inst::VFma(np, na, keep, false, d, a, b, c) => of(b).map(|s| Inst::VFma(np, na, keep, false, d, a, s, c)),
                 Inst::VX(op @ VX::FMul(VW::S, nb), d, a, b) if a != b => {
                     if let Some(s) = of(b) {
                         Some(Inst::VX(op, d, a, s))
