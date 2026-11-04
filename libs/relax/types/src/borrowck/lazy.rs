@@ -597,8 +597,8 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
     loop {
         if stopping() { return; }
         // The startup's checks wait for the runner; a live edit's do not: the person waits for its
-        // verdict (Fab's first edit after a cold start was patched at once and verified 9 s later,
-        // when the startup released the checker, 11-04).
+        // verdict (a cold Fab releases the checker 1.5 s after its first present; an edit saved
+        // in that time waited for the release, 11-04).
         if !started {
             started = src.started();
             let edit_first = || QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|q| q.order.first()).is_some_and(|a| a.0 == RANK_EDIT);

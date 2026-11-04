@@ -5774,6 +5774,18 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 paths: std::mem::take(&mut host_edit), group, compile_ms: None, restarted: true, changed: None,
             }, &why);
         }
+        // A patch's verdict settles ahead of the gates below: they hold the watch's own work (the
+        // startup scan for the UI thread's first frames, a pending restart), never the verdict
+        // the person waits for. A patch sets the startup scan again when the tree holds files
+        // the program has not loaded (Fab: always), so the first edit after a cold start had its
+        // verdict held until the first-frames window closed, 10 s after the present (11-04).
+        if !pending.is_empty() {
+            for (o, n) in settle_verdicts(up, &mut pending, &mut undos) {
+                for f in files.iter_mut() {
+                    if f.1 == n { f.1 = o; }
+                }
+            }
+        }
         // Once the tree no longer matches this session, later saves must not patch a
         // mixture of revisions into the old process. A fresh run restores live editing.
         if restart_required {
@@ -5844,13 +5856,6 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let t_dr = Instant::now();
         drain_streams(up);
         if live_trace() && t_dr.elapsed().as_millis() > 20 { eprintln!("makepad live: drain_streams took {:.1} ms at t={:.0} ms", t_dr.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start()); }
-        if !pending.is_empty() {
-            for (o, n) in settle_verdicts(up, &mut pending, &mut undos) {
-                for f in files.iter_mut() {
-                    if f.1 == n { f.1 = o; }
-                }
-            }
-        }
         if crate::hot_failure::recovering() { continue; }
         // The landing check: a patch whose old code is still running a while after the install
         // has not reached that call (a loop that never returns): the edit restarts the app.
