@@ -213,17 +213,18 @@ impl Inputs {
 
     /// The inputs whose change needs a new makepad process (not a patch): provided crates,
     /// std, makepad's own sources, the Cargo graph and build scripts.
-    pub(super) fn process_paths(&self) -> Vec<String> {
-        self.paths.iter().filter(|(_, (_, k))| !matches!(k, Kind::Source | Kind::SourceDirectory(_))).map(|(p, _)| p.clone()).collect()
+    pub(super) fn process_paths(&self, keep: &dyn Fn(&str) -> bool) -> Vec<String> {
+        self.paths.iter().filter(|(p, (_, k))| !matches!(k, Kind::Source | Kind::SourceDirectory(_)) && keep(p)).map(|(p, _)| p.clone()).collect()
     }
 
     /// Files that can produce a reload event: unloaded sources are read only when loaded.
     /// Keep absent inputs too (a deleted source or a lockfile that has not been created yet).
-    pub(super) fn source_paths(&self, loaded: impl Iterator<Item = String>) -> Vec<String> {
+    /// `keep` picks paths before any is looked at (a live session asks about its few saves).
+    pub(super) fn source_paths(&self, loaded: impl Iterator<Item = String>, keep: &dyn Fn(&str) -> bool) -> Vec<String> {
         let workspace = self.graph.as_ref().map(|g| g.workspace.clone()).unwrap_or_else(crate::run::workspace_dir);
         let workspace = crate::vfs::normalize_path(&workspace);
         let roots: Vec<_> = Path::new(&workspace).ancestors().map(|p| p.to_string_lossy().into_owned()).collect();
-        let paths = self.process_paths().into_iter().chain(loaded).chain(crate::native_macros::paths());
+        let paths = self.process_paths(keep).into_iter().chain(loaded).chain(crate::native_macros::paths().into_iter().filter(|p| keep(p)));
         paths.filter(|p| !crate::vfs::is_dir(p)).map(|p| {
             // Dependencies outside the workspace use ../; another drive has no relative path.
             roots.iter().enumerate().find_map(|(up, root)| {

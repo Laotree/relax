@@ -6209,10 +6209,35 @@ impl<'a> Lcx<'a> {
     /// `a = v` for a place expression `a`: drops its old value (what of it was not moved out),
     /// then writes.
     fn assign_to(&mut self, a: ExprId, v: Val) {
-                // a local: drop its old value if it holds one, then it owns the new one
+                // a local: drop its old value if it holds one, then it owns the new one. A
+                // capture of an Fn/FnMut closure always holds a value (never moved out, and rustc
+                // rejects capturing an unassigned local): it takes the place path below, its old
+                // value dropped before the write (it leaked: app_main!'s `app_value = ..` kept
+                // every design re-run's app tree)
                 if let ExprKind::Path(_) = &self.ast().expr(strip_paren(self.ast(), a)).kind {
-                    if let Some(Res::Local(li)) = self.b.res.get(&strip_paren(self.ast(), a).0).copied() {
+                    if let Some(Res::Local(li)) = self.b.res.get(&strip_paren(self.ast(), a).0).copied().filter(|r| !matches!(r, Res::Local(li) if self.foreign[*li as usize] && !self.capture_flag.contains_key(li))) {
                         let lt = self.monomorphize(self.b.locals[li as usize].ty);
+                        if self.foreign[li as usize] {
+                            // a by-value capture in a state with drop flags: the old value drops
+                            // if its flag says it is there, and the state owns the new one
+                            let (env, off) = self.capture_flag[&li];
+                            let pl = self.local_place(li);
+                            if self.needs_drop_glue(lt) && self.dead_blk != Some(self.cur) {
+                                let f = self.f.vreg(Cls::I);
+                                self.emit(Inst::Load(Mem::Int(1, false), f, env, off));
+                                let (yes, join) = (self.f.block(), self.f.block());
+                                self.term(Term::Branch(f, yes, join));
+                                self.switch(yes);
+                                let addr = self.place_addr(&pl, lt);
+                                self.drop_at(addr, lt);
+                                self.goto(join);
+                                self.switch(join);
+                            }
+                            self.write_place(&pl, lt, v);
+                            let one = self.iconst(1);
+                            self.emit(Inst::Store(Mem::Int(1, false), env, off, one));
+                            return;
+                        }
                         let dynamic = self.unwind_on() && self.nounwind == 0 && self.needs_drop_glue(lt) && self.drop_flags[li as usize].is_some() && !self.foreign[li as usize] && self.u.drop_may_unwind(lt);
                         if dynamic && self.dead_blk != Some(self.cur) {
                             // rustc's drop-and-replace: if dropping the old value panics, the new
@@ -11314,7 +11339,7 @@ impl<'a> Lcx<'a> {
             "vx_binary" | "vx_unary" | "vx_ternary" => 4,
             "vx_splat" | "vx_store" | "vx_narrow" | "vx_table" | "vx_mask" => 2,
             "vx_load" | "vx_sha1h" => 1,
-            "vx_blend" | "vx_sha1rnds4" => 3,
+            "vx_blend" | "vx_sha1rnds4" | "vx_crc32" => 3,
             _ => {
                 self.err(self.pos, "unknown SIMD intrinsic".into());
                 return self.dummy_val(t);
@@ -11349,6 +11374,25 @@ impl<'a> Lcx<'a> {
             let a = vector(self, 0);
             let b = vector(self, 1);
             self.emit(Inst::VX(VX::X86Sha1Rnds4(func as u8), d, a, b));
+        } else if name == "vx_crc32" {
+            // Arm __crc32{b,h,w,d}(crc, data): crc32{b,h,w,x} of the data's low `bytes` bytes;
+            // std's aarch64 module asks for it only on aarch64 targets
+            let bytes = constant(self, 2);
+            if !matches!(bytes, 1 | 2 | 4 | 8) || !self.u.prog.session.options.target.starts_with("aarch64") {
+                self.err(self.pos, "vx_crc32: (crc, data, bytes 1/2/4/8) on an aarch64 target".into());
+                return self.dummy_val(t);
+            }
+            let crc = scalar(self, 0);
+            let data = scalar(self, 1);
+            let r = self.f.vreg(Cls::I);
+            let op = match bytes {
+                1 => IOp::Crc32B,
+                2 => IOp::Crc32H,
+                4 => IOp::Crc32W,
+                _ => IOp::Crc32X,
+            };
+            self.emit(Inst::IBin(op, IntTy { bits: 64, signed: false }, r, crc, data));
+            return Val::L(vec![r]);
         } else if name == "vx_sha1h" {
             let x = scalar(self, 0);
             let a = self.f.vreg(Cls::V128);
@@ -11514,6 +11558,7 @@ impl<'a> Lcx<'a> {
                         // the SSE float ops: f32 (_ps) and f64 (_pd) lanes
                         40..=51 => matches!(w, VW::S | VW::D),
                         52 | 53 | 60..=63 | 70..=74 | 80 | 81 => w == VW::S,
+                        90..=93 => w == VW::D,
                         _ => false,
                     }
                 } else {
@@ -11568,6 +11613,8 @@ impl<'a> Lcx<'a> {
                         74 => VX::X86Sha256Msg2,
                         80 => VX::ArmSha1Su1,
                         81 => VX::ArmSha256Su0,
+                        // carry-less product of a 64-bit lane of a and one of b (pclmulqdq / pmull)
+                        90..=93 => VX::Clmul((op - 90) as u8),
                         29 => {
                             // Unsigned comparison = signed comparison after sign-bit bias.
                             let k = self.iconst((1u64 << (w.bits() - 1)) as i64);

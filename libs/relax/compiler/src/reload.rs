@@ -1196,8 +1196,8 @@ fn includes_moved(pf: &crate::parser::ParsedFile, path: &str, it: &crate::ast::I
 /// batch edits already.
 pub(crate) fn include_edits(prog: &crate::program::Program, changed: &[String], skip: &[String]) -> Vec<Edit> {
     let mut out = Vec::new();
-    for (path, file) in prog.current_source_files() {
-        if skip.contains(&path) || !own_source_file(prog, file) { continue; }
+    for (path, file) in prog.current_source_files(|p| !skip.iter().any(|s| s == p)) {
+        if !own_source_file(prog, file) { continue; }
         let pf = &prog.files[file as usize];
         let src = &pf.src[..pf.src_len as usize];
         if !src.windows(8).any(|w| w == b"include_") { continue; }
@@ -1945,6 +1945,19 @@ unsafe fn initializer_deps_changed(up: *mut Unit, root: u32, changed: &[DefId], 
     use relax_backend::rir::{Callee, Inst};
     let mut todo = vec![root];
     let mut seen: Vec<u32> = Vec::new();
+    // the slot each one was reached from: an unknown dependency names the way it was reached
+    let mut from: std::collections::HashMap<u32, u32> = Default::default();
+    let path = |from: &std::collections::HashMap<u32, u32>, mut s: u32| -> String {
+        let u = &*up;
+        let mut names = vec![u.fns[s as usize].name.to_string()];
+        while let Some(&p) = from.get(&s) {
+            if names.len() > 12 { names.push("..".into()); break; }
+            names.push(u.fns[p as usize].name.to_string());
+            s = p;
+        }
+        names.reverse();
+        names.join(" -> ")
+    };
     while let Some(s) = todo.pop() {
         if seen.contains(&s) { continue; }
         seen.push(s);
@@ -1964,13 +1977,17 @@ unsafe fn initializer_deps_changed(up: *mut Unit, root: u32, changed: &[DefId], 
         }
         let u = &*up;
         let Some(rir) = u.fns[s as usize].rir.clone() else { return Err(format!("`{}` has no RIR", u.fns[s as usize].name)) };
-        todo.extend_from_slice(&u.fns[s as usize].calls);
+        fn reach(from: &mut std::collections::HashMap<u32, u32>, todo: &mut Vec<u32>, by: u32, c: u32) {
+            from.entry(c).or_insert(by);
+            todo.push(c);
+        }
+        for &c in &u.fns[s as usize].calls { reach(&mut from, &mut todo, s, c); }
         for i in rir.blocks.iter().flat_map(|b| &b.insts) {
             match i {
-                Inst::Call(Callee::Fn(c) | Callee::CFn(c, _), _, _) | Inst::FnAddr(_, c) | Inst::SlotAddr(_, c) => todo.push(*c),
-                Inst::Call(Callee::Indirect(_) | Callee::CIndirect(..), _, _) => return Err(format!("an indirect call in `{}`", u.fns[s as usize].name)),
+                Inst::Call(Callee::Fn(c) | Callee::CFn(c, _), _, _) | Inst::FnAddr(_, c) | Inst::SlotAddr(_, c) => reach(&mut from, &mut todo, s, *c),
+                Inst::Call(Callee::Indirect(_) | Callee::CIndirect(..), _, _) => return Err(format!("an indirect call in `{}`, reached as {}", u.fns[s as usize].name, path(&from, s))),
                 Inst::Addr(_, sym) => match u.syms.kind(sym.id) {
-                    Some(crate::syms::SymKind::Thunk(c)) => todo.push(c),
+                    Some(crate::syms::SymKind::Thunk(c)) => reach(&mut from, &mut todo, s, c),
                     Some(crate::syms::SymKind::Static(d)) if changed.contains(&d) => return Ok(true),
                     _ => {}
                 },
@@ -1984,7 +2001,7 @@ unsafe fn initializer_deps_changed(up: *mut Unit, root: u32, changed: &[DefId], 
                 return Err(format!("`{}` reads a trait's associated constant", u.fns[s as usize].name));
             }
             let keys: Vec<Vec<TyId>> = u.consts.keys().filter(|(x, _)| *x == c).map(|(_, a)| a.clone()).collect();
-            for args in keys { todo.push(u.fn_id(FnKey::Inst(c, args))); }
+            for args in keys { reach(&mut from, &mut todo, s, u.fn_id(FnKey::Inst(c, args))); }
         }
     }
     Ok(false)
@@ -2282,7 +2299,7 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, sources: &[Edit], partial:
             // under the lock, before the parse snapshot and the pairing against the running version.
             let edits: Vec<Edit> = {
                 let prog = &(*up).prog;
-                let current = (!module).then(|| prog.current_source_file_sets());
+                let current = (!module).then(|| prog.current_source_file_sets(|p| edits.iter().any(|e| prog.file_paths[e.file as usize] == p)));
                 // every crate's copy of the file takes the edit: a --lib test root's harness crate
                 // and the plain library its dev-dependencies link (M50). The other copies follow
                 // the edits as given, whose outcome files stay at their positions.
@@ -2300,7 +2317,6 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, sources: &[Edit], partial:
             let cur = snap(&edits);
             (edits, cur)
         });
-        let mut stale = 0;
         loop {
             let (macro_table, epoch, snapshots) = cur;
             // Only owned snapshots are reachable here; never retain a Unit/Program reference
@@ -2316,10 +2332,9 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, sources: &[Edit], partial:
                     drop(macro_table); // allow commit's Arc::make_mut to update an unshared table
                     return Ok(apply_locked(up, edits, pre, t0, partial, 8, module, &base));
                 }
-                stale += 1;
-                if stale == 3 {
-                    return Ok(Outcome { failure: None, kept: 0, pending: false, rung: Rung::Refuse, files: files.clone(), lines: vec!["program context changed while parsing -- retry the edit; running code is unchanged".into()], names: Vec::new(), changed: 0, test_changes: None, group: 0, ms: [ms(t0), 0.0, 0.0, 0.0], undo: None, work: [0; 5] });
-                }
+                // a module load or a rollback moved the program while this parsed: parse again
+                // against it. Each pass follows such a move, and loads end (the parse itself
+                // moves nothing), so the edit applies once they do instead of being refused.
                 let cur = snap(&edits);
                 Err((edits, cur))
             });
@@ -3561,7 +3576,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let u = &mut *up;
     trace_stage("typecheck");
     // D3: the gate is synchronous only under `makepad run --check-first`; otherwise the patched
-    // instances are queued to Gandalf when their new code is installed (jit.rs install, rank 0).
+    // instances are queued to Gandalf when their new code is installed (jit.rs install, RANK_EDIT).
     if errs.is_empty() && crate::borrowck::enabled(options) && crate::jit::CHECK_FIRST.load(std::sync::atomic::Ordering::Relaxed) {
         // Check/report one changed owner at a time: do not hold its diagnostics until
         // another body has finished, compilation has run, or the transaction unwinds.
@@ -4144,16 +4159,36 @@ static RESTART_SAVED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 static DOMAIN_RESTORED: relax_session::sync::Mutex<Option<String>> = relax_session::sync::Mutex::new(None);
 static DOMAIN_LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DOMAIN_INPUTS: relax_session::sync::Mutex<Option<Inputs>> = relax_session::sync::Mutex::new(None);
-/// The watcher's reload inputs, also readable while it waits for a live test verdict.
-static WATCH_INPUTS: relax_session::sync::Mutex<Option<std::sync::Arc<Inputs>>> = relax_session::sync::Mutex::new(None);
+/// What the watcher watches, also readable while it waits for a live test verdict: its reload
+/// inputs and the program's own source files loaded so far (`input_paths`, inspect `inputs`).
+/// Read without the owner: asked for the loaded files, an `inputs` waited behind the program's
+/// requests (a cold Fab's first edit: 0.5 s of its ship, at the first frames, 11-04).
+struct WatchView {
+    inputs: std::sync::Arc<Inputs>,
+    loaded: std::sync::Arc<Vec<String>>,
+}
+static WATCH_INPUTS: relax_session::sync::Mutex<Option<WatchView>> = relax_session::sync::Mutex::new(None);
 /// Told when the watcher's inputs are set, or when it ends without them ([`WATCH_GONE`]).
 static WATCH_READY: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
 /// The live session's watcher could not start, or ended: nothing waits for its inputs.
 static WATCH_GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn set_watch_inputs(snapshot: std::sync::Arc<Inputs>) {
-    *WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(snapshot);
+type WatchFile = (String, u32, Option<(std::time::SystemTime, u64)>);
+
+fn set_watch_inputs(inputs: &Inputs, files: &[WatchFile]) {
+    let inputs = crate::zone_alloc::kept_with(|| std::sync::Arc::new(inputs.clone()));
+    *WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(WatchView { inputs, loaded: loaded_of(files) });
     WATCH_READY.notify_all();
+}
+
+/// The watcher's files changed which of them the program loaded (a rewatch, a patch).
+fn set_watch_loaded(files: &[WatchFile]) {
+    let loaded = loaded_of(files);
+    if let Some(v) = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() { v.loaded = loaded; }
+}
+
+fn loaded_of(files: &[WatchFile]) -> std::sync::Arc<Vec<String>> {
+    crate::zone_alloc::kept_with(|| std::sync::Arc::new(files.iter().filter(|f| f.1 != u32::MAX).map(|f| f.0.clone()).collect()))
 }
 
 fn watch_gone() {
@@ -4346,6 +4381,13 @@ impl Patched {
 
 static PATCHED: relax_session::sync::Mutex<Patched> = relax_session::sync::Mutex::new(Patched::new());
 
+/// SPEC-V: the slots patch `group` installed without a clean verdict (owner thread); their checks
+/// were queued at the install, first in the borrow checker's queue (`RANK_EDIT`).
+unsafe fn unverified_patch(up: *mut Unit, group: u32) -> Vec<u32> {
+    let u = &*up;
+    (0..u.fns.len() as u32).filter(|&id| u.fns[id as usize].patch_gen == group && u.fns[id as usize].unverified.load(Ordering::Relaxed)).collect()
+}
+
 /// The names of the items whose bodies an installed patch changed; None when it changed more (an
 /// item added or removed, a const, a layout).
 unsafe fn changed_items(up: *mut Unit, o: &Outcome) -> Option<Vec<String>> {
@@ -4356,6 +4398,12 @@ unsafe fn changed_items(up: *mut Unit, o: &Outcome) -> Option<Vec<String>> {
 fn patch_landed(paths: impl Iterator<Item = String>, items: Option<Vec<String>>) {
     PATCHED.lock().unwrap_or_else(|e| e.into_inner()).land(paths, items);
     wake_program();
+}
+
+/// How many patches are installed (std::relax::patched's count): a grab's `patch` that is lower
+/// shows a frame drawn before the newest one.
+pub fn patches_installed() -> u64 {
+    PATCHED.lock().unwrap_or_else(|e| e.into_inner()).count
 }
 
 /// What patches changed after count `since` ([`Patched::since`]).
@@ -4477,6 +4525,18 @@ pub(crate) struct PendingPatch {
     pub(crate) event_seq: u64,
 }
 
+/// MAKEPAD_RUN_SPECV_TRACE: the slots a patch group's verdict waits on, printed when they change
+/// (the queue position aside: it moves on every poll).
+fn trace_patch_wait(group: u32, waits: &[String]) {
+    static LAST: relax_session::sync::Mutex<Vec<(u32, String)>> = relax_session::sync::Mutex::new(Vec::new());
+    let stable: String = waits.iter().map(|w| w.split(" queued Some((").next().unwrap_or(w)).collect::<Vec<_>>().join("; ");
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.iter().any(|(g, s)| *g == group && *s == stable) { return; }
+    last.retain(|(g, _)| *g != group);
+    last.push((group, stable));
+    eprintln!("specv @{:.3} patch group {group} waits on {}", crate::jit::wall_ns() as f64 / 1e9, waits.join("; "));
+}
+
 /// SPEC-V: settles the patch groups awaiting verdicts. A group whose every slot is clean is verified
 /// (an inspect event says which observations that makes verified). A group with a failed verdict is
 /// rolled back -- newer groups first, they were made on top of it -- the slots return to their
@@ -4495,15 +4555,20 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
                 let u = &*up;
                 let mut failed = Vec::new();
                 let mut waiting = false;
+                let mut waits: Vec<String> = Vec::new();
                 for &id in &p.ids {
                     match u.verdict_state(id) {
                         Verdict::Clean => {}
                         Verdict::Failed(events) => failed.extend(events),
                         // never verified, never reported: the slots stay unverified (baseline)
                         Verdict::Unverifiable(why) => unchecked.push(format!("{}: {}", u.fns[id as usize].name, why)),
-                        Verdict::Pending => waiting = true,
+                        Verdict::Pending => {
+                            waiting = true;
+                            if crate::jit::specv_trace() { waits.push(format!("#{id} {}", u.pending_why(id))); }
+                        }
                     }
                 }
+                if !waits.is_empty() { trace_patch_wait(p.group, &waits); }
                 if !failed.is_empty() { Some(Some(failed)) }
                 else if waiting { None }
                 else {
@@ -5048,7 +5113,7 @@ fn idle_outcome(file: Option<u32>, line: &str) -> Outcome {
 unsafe fn stream_file(up: *mut Unit, path: &str) -> Option<u32> {
     crate::owner::call(crate::owner::Class::Program, || {
         let prog = &(&*up).prog;
-        prog.current_source_files().get(path).copied()
+        prog.current_source_files(|p| p == path).get(path).copied()
     })
 }
 
@@ -5257,24 +5322,43 @@ pub fn start_watcher(up: *mut Unit, inputs: Inputs) {
     }
 }
 
+/// The files of `removed` (gone from disk) that are running modules whose declaring file is not
+/// among `edited`: the program still declares them, each one's refusal line. A file the program
+/// does not run (its module unbound by an earlier edit) or a crate root is no such module.
+fn undeclared_removals(prog: &crate::program::Program, removed: &[&str], edited: &std::collections::HashSet<&str>) -> Vec<String> {
+    let loaded = prog.current_source_files(|p| removed.contains(&p));
+    removed.iter().filter_map(|&path| {
+        let &file = loaded.get(path)?;
+        let module = prog.mods.iter().find(|m| m.file == file)?;
+        let declares = prog.file_paths.get(prog.mods[module.parent_mod? as usize].file as usize)?;
+        (!edited.contains(declares.as_str())).then(|| removed_module_line(path, declares))
+    }).collect()
+}
+
+/// The refusal of a module whose file `path` was removed while `declares` still declares it:
+/// rustc's E0583 for the module's name (its folder's for a `mod.rs`).
+fn removed_module_line(path: &str, declares: &str) -> String {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let name = match file {
+        "mod.rs" => path.rsplit('/').nth(1).unwrap_or(file),
+        _ => file.strip_suffix(".rs").unwrap_or(file),
+    };
+    format!("error[E0583]: file not found for module `{name}`: {path} was removed and {declares} still declares it")
+}
+
 /// Inspect takes the loaded paths on the owner: tests can load more files while the watcher
 /// waits for their verdict. No inputs lock survives that request or the path formatting.
-pub(crate) fn input_paths() -> Result<Vec<String>, String> {
+/// The run's inputs `keep` takes (an absolute path; `inspect inputs` answers relative ones).
+pub(crate) fn input_paths(keep: &dyn Fn(&str) -> bool) -> Result<Vec<String>, String> {
     // a live session's request that comes before its watcher started (a patch sent right after
     // the launch) waits for it: it was refused "not started" (11-03)
     let mut g = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner());
     while g.is_none() && crate::layout::LIVE_SESSION.load(std::sync::atomic::Ordering::Acquire) && !WATCH_GONE.load(std::sync::atomic::Ordering::Acquire) {
         g = WATCH_READY.wait(g).unwrap_or_else(|e| e.into_inner());
     }
-    let inputs = g.clone().ok_or("this run watches no sources (not a live session, or its watcher ended)")?;
+    let (inputs, loaded) = g.as_ref().map(|v| (v.inputs.clone(), v.loaded.clone())).ok_or("this run watches no sources (not a live session, or its watcher ended)")?;
     drop(g);
-    let up = crate::run::running_unit();
-    if up.is_null() { return Err("no running program".into()); }
-    let std_dir = std::env::var("MAKEPAD_RUN_STD").unwrap_or_default();
-    let loaded = crate::owner::call(crate::owner::Class::Program, || unsafe {
-        (*up).prog.current_source_files().into_keys().filter(|p| own_source(p, &std_dir)).collect::<Vec<_>>()
-    });
-    Ok(inputs.source_paths(loaded.into_iter()))
+    Ok(inputs.source_paths(loaded.iter().filter(|p| keep(p)).cloned(), keep))
 }
 
 /// A source file a live session watches and patches (`own_source`).
@@ -5299,6 +5383,74 @@ pub(crate) fn stamp(path: &str) -> Option<(std::time::SystemTime, u64)> {
     }
     let m = std::fs::metadata(path).ok()?;
     Some((m.modified().ok()?, m.len()))
+}
+
+/// The watcher's rounds while live tracing: its wakeups, the rounds that looked at files and why,
+/// printed once a minute with more than one wakeup (at rest a native watch wakes for nothing).
+struct WatchCost { since: Instant, wakes: u32, rounds: u32, stats: usize, why: [u32; 5] }
+
+impl WatchCost {
+    const WHY: [&'static str; 5] = ["poll (no native watch)", "events lost", "retry", "rescan", "events"];
+
+    fn new() -> WatchCost {
+        WatchCost { since: Instant::now(), wakes: 0, rounds: 0, stats: 0, why: [0; 5] }
+    }
+
+    /// A round that stats `n` files; `why`: its first reason of WHY.
+    fn round(&mut self, n: usize, why: usize) {
+        self.wakes += 1;
+        if n > 0 {
+            self.rounds += 1;
+            self.stats += n;
+            self.why[why] += 1;
+        }
+        if self.since.elapsed() >= std::time::Duration::from_secs(60) {
+            if self.wakes > 1 {
+                let why: Vec<String> = self.why.iter().zip(Self::WHY).filter(|(n, _)| **n > 0).map(|(n, w)| format!("{w} {n}")).collect();
+                eprintln!("makepad live: watch cost: {} wakeup(s), {} round(s) looked at {} file(s) in {:.0} s ({})", self.wakes, self.rounds, self.stats, self.since.elapsed().as_secs_f64(), why.join(", "));
+            }
+            *self = WatchCost::new();
+        }
+    }
+}
+
+/// Which watched files are a mounted store's, and where an edit of each would sit in the edits
+/// folder: asked once per watch set (each answer normalizes the path and walks the mounts).
+#[derive(Default)]
+struct Virtual {
+    is: Vec<bool>,
+    rels: std::collections::HashMap<String, usize>,
+}
+
+impl Virtual {
+    fn of(files: &[(String, u32, Option<(std::time::SystemTime, u64)>)]) -> Virtual {
+        let is: Vec<bool> = files.iter().map(|f| crate::vfs::is_virtual(&f.0)).collect();
+        let rels = files.iter().enumerate().filter(|&(k, _)| is[k]).filter_map(|(k, f)| Some((crate::vfs::edit_rel(&f.0)?, k))).collect();
+        Virtual { is, rels }
+    }
+}
+
+/// One round's look at the watched files, as `stamp` gives them: a disk file's from its stat; the
+/// virtual files' from one walk of the edits folder at the round's first virtual file, matched to
+/// them by their place there. A round over thousands of virtual files costs the few edits, not a
+/// path lookup and a failing stat each (two looks on every edit took 11-29 ms on Fab's 5,500).
+struct Look(std::cell::OnceCell<std::collections::HashMap<usize, (std::time::SystemTime, u64)>>);
+
+impl Look {
+    fn new() -> Look {
+        Look(std::cell::OnceCell::new())
+    }
+
+    /// Watched file `k` (`path`); one added since `virt` was taken is stat'ed on its own.
+    fn stamp(&self, virt: &Virtual, k: usize, path: &str) -> Option<(std::time::SystemTime, u64)> {
+        if !virt.is.get(k).copied().unwrap_or(false) {
+            return stamp(path);
+        }
+        let edits = self.0.get_or_init(|| {
+            crate::vfs::EditsLook::now().map(|l| l.entries().filter_map(|(rel, s)| Some((*virt.rels.get(rel)?, s))).collect()).unwrap_or_default()
+        });
+        Some(edits.get(&k).copied().unwrap_or((std::time::UNIX_EPOCH, 0)))
+    }
 }
 
 /// Whether every changed path is an edit of a mounted store that the edits ledger committed:
@@ -5407,9 +5559,6 @@ impl Ledger {
     }
 }
 
-/// A source that could not be read, or a refused edit's quiet retry, is looked at again this
-/// much later.
-const LIVE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 /// Stillness, not an overall deadline: a busy checkout can take as long as it needs. Also the
 /// stat poll of a watch without native file events.
 const LIVE_QUIET: std::time::Duration = std::time::Duration::from_millis(100);
@@ -5434,10 +5583,7 @@ unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &
     patch_landed(edit.paths.iter().cloned(), changed_items(up, o));
     let mut pending = Vec::new();
     if let Some(undo) = o.undo.take() {
-        let ids = crate::owner::call(crate::owner::Class::Program, || {
-            let u = &*up;
-            (0..u.fns.len() as u32).filter(|&id| u.fns[id as usize].patch_gen == o.group && u.fns[id as usize].unverified.load(Ordering::Relaxed)).collect::<Vec<_>>()
-        });
+        let ids = crate::owner::call(crate::owner::Class::Program, || unverified_patch(up, o.group));
         if !ids.is_empty() {
             UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
             pending.push(PendingPatch { group: o.group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq() });
@@ -5476,18 +5622,14 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     // a body that includes a file for the first time: the watcher watches it from now on
     crate::sip::on_late_new(watch_events::kick);
     inputs.add_runner();
-    let snapshot = crate::zone_alloc::kept_with(|| std::sync::Arc::new(inputs.clone()));
-    set_watch_inputs(snapshot);
     let std_dir = std::env::var("MAKEPAD_RUN_STD").unwrap_or_default();
     // (path, running file index, last stamp)
     // the program's own source files (not std, registry or git dependencies), loaded so far
     let own_files = |u: &Unit| -> Vec<(String, u32)> {
-        u.prog.current_source_files().into_iter().filter(|(p, _)| {
-            own_source(p, &std_dir) && crate::vfs::is_file(p)
-        }).collect()
+        u.prog.current_source_files(|p| own_source(p, &std_dir)).into_iter().filter(|(p, _)| crate::vfs::is_file(p)).collect()
     };
     // (the watcher's holds read the program's files only: lock_unit_quick)
-    let mut files: Vec<(String, u32, Option<(std::time::SystemTime, u64)>)> = {
+    let mut files: Vec<WatchFile> = {
         crate::owner::call(crate::owner::Class::Program, || {
             let loaded: std::collections::HashMap<_, _> = own_files(&*up).into_iter().collect();
             let mut v: Vec<_> = inputs.paths.iter().map(|(p, (stamp, _))| (p.clone(), loaded.get(p).copied().unwrap_or(u32::MAX), *stamp)).collect();
@@ -5502,10 +5644,11 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     for path in crate::native_macros::paths() {
         if !files.iter().any(|f| f.0 == path) { let s = stamp(&path); files.push((path, u32::MAX, s)); }
     }
+    set_watch_inputs(&inputs, &files);
     // the files the program's own code includes (include_str!/include_bytes!): a save of one is
     // an edit of the files that include it (`include_edits`). Bodies read more as they compile:
     // each is watched from its read (late_count moves).
-    let add_included = |files: &mut Vec<(String, u32, Option<(std::time::SystemTime, u64)>)>| -> bool {
+    let add_included = |files: &mut Vec<WatchFile>| -> bool {
         let mut added = false;
         for path in included_files(&std_dir) {
             if !files.iter().any(|f| f.0 == path) { let s = stamp(&path); files.push((path, u32::MAX, s)); added = true; }
@@ -5545,11 +5688,13 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         }
     };
     // Refused texts stay pending until a batch containing them applies, or they
-    // return to their running text. Every tree change retries the entire set.
-    // One quiet retry also handles a save whose last notification preceded its
-    // final write; a persistent source error then waits for the next change.
+    // return to their running text. Every tree change retries the entire set, and
+    // nothing else does: a batch's inputs are its files, so an unchanged tree
+    // compiles the same verdict (no timer; at rest the watch makes no wakeup).
     let mut stalled: std::collections::HashMap<usize, (Vec<u8>, Vec<String>)> = std::collections::HashMap::new();
-    let mut retry_at: Option<Instant> = None;
+    // one more round at once, whatever the events say: a write resumed while the batch was read,
+    // or files moved outside a dock app's sync
+    let mut again = false;
     // installed patches whose landing is checked once LANDING has passed: (when, patch group, the edit)
     let mut landing: Vec<(Instant, u32, String)> = Vec::new();
     let mut last_scan = Instant::now();
@@ -5559,7 +5704,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     // which files are a mounted store's (asked once per watch set: the lookup normalizes the path
     // and walks the mounts)
     let mut ledger = Ledger::now();
-    let mut virt: Vec<bool> = Vec::new();
+    let mut cost = WatchCost::new();
+    let mut virt = Virtual::default();
     let mut startup_scan = true;
     let mut restart_required = false;
     let mut restart_message = String::new();
@@ -5584,19 +5730,22 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // native file events: sleep on them while nothing else is in flight (startup, a domain
         // loading, verdicts pending, an open stream); else the 5 ms poll. Every other input wakes
         // it (watch_events::kick: a streamed edit, a domain's inputs, the post-boot loader's files,
-        // a late include, the startup's end, an unpin, a recovery); a timeout only for what is
-        // due (a retry, a landing check, the startup scan). At rest it makes no system call.
+        // a late include, the startup's end, an unpin, a recovery, a disarmed real-time root); a
+        // timeout only for what is due (a landing check, the startup scan). At rest it makes no
+        // system call.
         let quiet = (crate::harness::live::enabled() || jit::live_startup_done()) && !DOMAIN_LOADING.load(std::sync::atomic::Ordering::Acquire)
             && pending.is_empty() && !streams_busy(up);
+        let t_wait = Instant::now();
         match events.as_mut() {
             Some(w) if quiet => {
-                let next = retry_at.iter().map(|t| t.saturating_duration_since(Instant::now()))
-                    .chain(landing.iter().map(|l| l.0.saturating_duration_since(Instant::now())))
+                let next = again.then_some(std::time::Duration::ZERO)
+                    .into_iter().chain(landing.iter().map(|l| l.0.saturating_duration_since(Instant::now())))
                     .chain(startup_scan.then_some(STARTUP_SCAN_LOOK)).min();
                 w.wait(next.map(|t| t.max(std::time::Duration::from_millis(5))));
             }
             _ => std::thread::sleep(std::time::Duration::from_millis(5)),
         }
+        let woke = Instant::now();
         if DOMAIN_LOADING.load(std::sync::atomic::Ordering::Acquire) { gate_note(1); continue; }
         let latest = DOMAIN_REVISION.load(std::sync::atomic::Ordering::Acquire);
         if latest != revision {
@@ -5604,8 +5753,6 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             if let Some(next) = DOMAIN_INPUTS.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 inputs = next;
                 inputs.add_runner();
-                let snapshot = crate::zone_alloc::kept_with(|| std::sync::Arc::new(inputs.clone()));
-                set_watch_inputs(snapshot);
             }
             let loaded = crate::owner::call(crate::owner::Class::Program, || own_files(&*up));
             files = inputs.paths.iter().map(|(p, (s, _))| (p.clone(), u32::MAX, *s)).collect();
@@ -5613,6 +5760,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 if let Some(f) = files.iter_mut().find(|f| f.0 == path) { f.1 = file; }
                 else { let s = stamp(&path); files.push((path, file, s)); }
             }
+            set_watch_inputs(&inputs, &files);
             late_seen = crate::sip::late_count();
             add_included(&mut files);
             events = LiveWatch::new(files.iter().map(|f| f.0.as_str()));
@@ -5620,7 +5768,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             repositories.include(files.iter().map(|f| f.0.as_str()));
             hot.clear();
             stalled.clear();
-            retry_at = None;
+            again = false;
             undos.clear();
             restart_required = false;
             restart_message.clear();
@@ -5638,6 +5786,18 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 paths: std::mem::take(&mut host_edit), group, compile_ms: None, restarted: true, changed: None,
             }, &why);
         }
+        // A patch's verdict settles ahead of the gates below: they hold the watch's own work (the
+        // startup scan for the UI thread's first frames, a pending restart), never the verdict
+        // the person waits for. A patch sets the startup scan again when the tree holds files
+        // the program has not loaded (Fab: always), so the first edit after a cold start had its
+        // verdict held until the first-frames window closed, 10 s after the present (11-04).
+        if !pending.is_empty() {
+            for (o, n) in settle_verdicts(up, &mut pending, &mut undos) {
+                for f in files.iter_mut() {
+                    if f.1 == n { f.1 = o; }
+                }
+            }
+        }
         // Once the tree no longer matches this session, later saves must not patch a
         // mixture of revisions into the old process. A fresh run restores live editing.
         if restart_required {
@@ -5647,11 +5807,12 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             if lost { events = LiveWatch::new(files.iter().map(|f| f.0.as_str())); }
             let full = lost || (events.is_none() && last_scan.elapsed() >= LIVE_QUIET);
             if full { last_scan = Instant::now(); }
-            if virt.len() != files.len() { virt = files.iter().map(|f| crate::vfs::is_virtual(&f.0)).collect(); }
-            let ids = ledger.round(crate::vfs::edits_ledger_stamp(), full, notifications, &hot, &virt);
+            if virt.is.len() != files.len() { virt = Virtual::of(&files); }
+            let ids = ledger.round(crate::vfs::edits_ledger_stamp(), full, notifications, &hot, &virt.is);
+            let look = Look::new();
             let changed: Vec<_> = ids.into_iter().filter_map(|k| {
                 let f = &files[k];
-                let current = stamp(&f.0);
+                let current = look.stamp(&virt, k, &f.0);
                 (current != f.2).then_some((k, current))
             }).collect();
             if !changed.is_empty() {
@@ -5665,8 +5826,16 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         }
         // the startup's file scan (own_files: an owner request of 10-15 ms on Sandbox) waits until
         // the UI thread's first frames after the present are done: run right at the present, the
-        // UI thread's first lazy links queued behind it (36 ms of a first post-present episode)
-        if startup_scan && crate::postframe::in_first_frames() { continue; }
+        // UI thread's first lazy links queued behind it (36 ms of a first post-present episode).
+        // A save ends the wait: the person waits for that edit, not for the first frames (Fab's
+        // first edit right after its window showed waited 7.6 s here, 11-04). The scan's round
+        // looks at every file, those the taken notifications named among them.
+        if startup_scan && crate::postframe::in_first_frames() {
+            let named = events.as_mut().map(|w| w.changed());
+            // (events lost: the watch starts over)
+            if matches!(named, Some(None)) { events = LiveWatch::new(files.iter().map(|f| f.0.as_str())); }
+            if !named.is_some_and(|n| n.is_none_or(|c| !c.is_empty())) && crate::vfs::edits_ledger_stamp() == ledger.0 { continue; }
+        }
         gate_note(0);
         let loads = jit::DEFERRED_LOADS.load(std::sync::atomic::Ordering::Relaxed);
         // a new watch set drops the events the old one had not delivered yet (a save made
@@ -5690,6 +5859,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 if jit::deferred_trace() { eprintln!("makepad live: watching {} more file(s) the post-boot loader loaded", added.len()); }
                 for (p, i) in added { let st = stamp(&p); files.push((p, i, st)); }
             }
+            set_watch_loaded(&files);
             if add_included(&mut files) || loaded_more {
                 repositories.include(files.iter().map(|f| f.0.as_str()));
                 events = LiveWatch::new(files.iter().map(|f| f.0.as_str()));
@@ -5699,13 +5869,6 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let t_dr = Instant::now();
         drain_streams(up);
         if live_trace() && t_dr.elapsed().as_millis() > 20 { eprintln!("makepad live: drain_streams took {:.1} ms at t={:.0} ms", t_dr.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start()); }
-        if !pending.is_empty() {
-            for (o, n) in settle_verdicts(up, &mut pending, &mut undos) {
-                for f in files.iter_mut() {
-                    if f.1 == n { f.1 = o; }
-                }
-            }
-        }
         if crate::hot_failure::recovering() { continue; }
         // The landing check: a patch whose old code is still running a while after the install
         // has not reached that call (a loop that never returns): the edit restarts the app.
@@ -5714,7 +5877,15 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             let due: Vec<(u32, String)> = landing.iter().filter(|l| l.0 <= now).map(|l| (l.1, l.2.clone())).collect();
             landing.retain(|l| l.0 > now);
             for (gen, what) in due {
-                if let Some(name) = crate::owner::call(crate::owner::Class::Program, || running_old_code(&*up, gen)) {
+                let t_land = Instant::now();
+                let w0 = crate::jit::wall_ns();
+                let old = crate::owner::call(crate::owner::Class::Program, || { let held = t_land.elapsed(); (running_old_code(&*up, gen), held) });
+                if live_trace() {
+                    // a long wait names what the owner served meanwhile
+                    let behind = if old.1.as_millis() >= 20 { format!("; behind {}", crate::owner::served_during(w0, w0 + old.1.as_nanos() as u64)) } else { String::new() };
+                    eprintln!("makepad live: landing check of patch group {gen} at t={:.0} ms: {:.1} ms ({:.1} ms waiting for the owner{behind})", crate::clock::ms_since_start(), t_land.elapsed().as_secs_f64() * 1e3, old.1.as_secs_f64() * 1e3);
+                }
+                if let Some(name) = old.0 {
                     let lines = vec![format!("`{name}` still runs the code from before the edit: a call made before the patch has not returned (a loop) -- restart the app")];
                     log_edit(&what, &Outcome { failure: None, kept: 0, pending: false, rung: Rung::Restart, files: Vec::new(), lines: lines.clone(), names: Vec::new(), changed: 0, test_changes: None, group: gen, ms: [0.0; 4], undo: None, work: [0; 5] }, None, Instant::now());
                     restart_for_edit(&what, &lines);
@@ -5729,20 +5900,36 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let notifications = events.as_mut().and_then(|w| w.changed());
         if t_ev.elapsed().as_millis() > 20 && live_trace() { eprintln!("makepad live: events drain took {:.1} ms", t_ev.elapsed().as_secs_f64() * 1e3); }
         let lost = events.is_some() && notifications.is_none();
+        let t_rewatch = Instant::now();
         if lost { events = LiveWatch::new(files.iter().map(|f| f.0.as_str())); }
+        let rewatch_ms = t_rewatch.elapsed().as_secs_f64() * 1e3;
         // a sync moved the dock app's checkout: every file is compared with what runs
         let synced = dock.as_mut().is_some_and(DockGate::synced);
         let caught_up = CATCH_UP.swap(false, std::sync::atomic::Ordering::AcqRel);
-        let retry_due = retry_at.is_some_and(|t| t <= Instant::now()) || RETRY_NOW.swap(false, std::sync::atomic::Ordering::AcqRel);
+        let retry_due = std::mem::take(&mut again) | RETRY_NOW.swap(false, std::sync::atomic::Ordering::AcqRel);
         let all = lost || rewatched || synced || caught_up || retry_due
             || (events.is_none() && last_scan.elapsed() >= LIVE_QUIET);
-        if rewatched || synced || virt.len() != files.len() { virt = files.iter().map(|f| crate::vfs::is_virtual(&f.0)).collect(); }
+        if rewatched || synced || virt.is.len() != files.len() { virt = Virtual::of(&files); }
         let t_round = std::time::Instant::now();
         if all { last_scan = Instant::now(); }
         // a sync moved the checkout: every file, the virtual ones too
-        let ids = if synced { (0..files.len()).collect() } else { ledger.round(crate::vfs::edits_ledger_stamp(), all, notifications, &hot, &virt) };
+        let named = notifications.as_ref().map(Vec::len);
+        let ledger_was = ledger.0;
+        let ids = if synced { (0..files.len()).collect() } else { ledger.round(crate::vfs::edits_ledger_stamp(), all, notifications, &hot, &virt.is) };
         let mut scanned = ids.len();
-        let mut changed: Vec<usize> = ids.into_iter().filter(|&k| stamp(&files[k].0) != files[k].2).collect();
+        if live_trace() {
+            let why = [events.is_none(), lost, retry_due, rewatched || synced || caught_up].iter().position(|&w| w).unwrap_or(4);
+            cost.round(scanned, why);
+        }
+        let look = Look::new();
+        let mut changed: Vec<usize> = ids.into_iter().filter(|&k| look.stamp(&virt, k, &files[k].0) != files[k].2).collect();
+        // a round that looked at something: when it woke, what woke it and what it found (the
+        // 5 ms polls while a verdict is pending look at nothing and print nothing)
+        if live_trace() && scanned > 0 {
+            eprintln!("makepad live: watch round at t={:.0} ms: woke after {:.1} ms, round {:.1} ms after the wake; {}named {:?}, ledger {}, looked {scanned}, changed {}",
+                crate::clock::ms_since_start(), woke.duration_since(t_wait).as_secs_f64() * 1e3, woke.elapsed().as_secs_f64() * 1e3,
+                if lost { format!("events lost (rewatched in {rewatch_ms:.1} ms), ") } else { String::new() }, named, if ledger.0 != ledger_was { "moved" } else { "still" }, changed.len());
+        }
         if !traced && all {
             traced = true;
             eprintln!("makepad live: one watch round: {} files in {:.2} ms; hot set {} files", files.len(), t_round.elapsed().as_secs_f64() * 1e3, hot.len());
@@ -5751,7 +5938,6 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         if changed.is_empty() && !quiet_retry {
             continue;
         }
-        retry_at = None;
         changed.extend(stalled.keys().copied());
         changed.sort_unstable();
         changed.dedup();
@@ -5760,7 +5946,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             // a hand edit): held, the app keeps running the synced code; the next sync applies
             // whatever the files say then
             // (its revision moved meanwhile: the next round is the sync's, at once)
-            if gate.held(changed.iter().map(|&k| files[k].0.as_str())) { retry_at = Some(Instant::now()); }
+            if gate.held(changed.iter().map(|&k| files[k].0.as_str())) { again = true; }
             continue;
         }
         let seen = std::time::Instant::now();
@@ -5776,7 +5962,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // is a wakeup, not proof that a checkout has finished: index.lock must
         // be gone and HEAD, its ref and every changed file must stay still for
         // a full quiet window. Never give up waiting on a slow writer.
-        let mut last: Vec<_> = files.iter().map(|f| stamp(&f.0)).collect();
+        let look = Look::new();
+        let mut last: Vec<_> = files.iter().enumerate().map(|(k, f)| look.stamp(&virt, k, &f.0)).collect();
         let mut git_state = repositories.snapshot();
         let mut still_since = Instant::now();
         // an overlay edit its ledger committed is whole: one look, no quiet window (100 ms of
@@ -5818,7 +6005,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 repositories.include(files.iter().map(|f| f.0.as_str()));
                 events = LiveWatch::new(files.iter().map(|f| f.0.as_str()));
             }
-            let now: Vec<_> = files.iter().map(|f| stamp(&f.0)).collect();
+            let look = Look::new();
+            let now: Vec<_> = files.iter().enumerate().map(|(k, f)| look.stamp(&virt, k, &f.0)).collect();
             scanned += files.len();
             for (k, f) in files.iter().enumerate() {
                 if now[k] != f.2 { changed.push(k); }
@@ -5872,7 +6060,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 let names: Vec<String> = host_side.iter().take(3).map(|&k| short(&files[k].0)).collect();
                 let why = format!("{} makepad input(s) changed ({}{}): {}", host_side.len(), names.join(", "), if host_side.len() > 3 { ", ..." } else { "" },
                     inputs.restart_reason(host_side.iter().map(|&k| files[k].0.as_str())).unwrap_or("its sources changed"));
-                if let Err(e) = host::request(why.clone(), inputs.process_paths()) {
+                if let Err(e) = host::request(why.clone(), inputs.process_paths(&|_| true)) {
                     let message = format!("{why}; cannot rebuild makepad here ({e}); the app goes on with the makepad it runs");
                     eprintln!("makepad live: {message}");
                     live_log(&format!("{{\"event\":\"host_rebuild\",\"ok\":false,\"message\":{}}}", json_str(&message)));
@@ -5927,7 +6115,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             let what = if changed.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };
             let names: Vec<String> = changed.iter().take(3).map(|&k| short(&files[k].0)).collect();
             let why = format!("{} {what} changed ({}{}): {reason}", changed.len(), names.join(", "), if changed.len() > 3 { ", ..." } else { "" });
-            match host::request(why.clone(), inputs.process_paths()) {
+            match host::request(why.clone(), inputs.process_paths(&|_| true)) {
                 Ok(()) => {
                     // answered at once (a restart follows the build); the build's end answers
                     // again: refused with its errors, no change, or the restart into it
@@ -5969,12 +6157,16 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             }
             continue;
         }
-        let saved = changed.iter().filter_map(|&k| stamp(&files[k].0).map(|s| s.0)).max();
+        // (a store's file whose edit was taken back stamps UNIX_EPOCH: it has no save time, and
+        // watch_ms printed the epoch's age)
+        let saved = changed.iter().filter_map(|&k| stamp(&files[k].0).map(|s| s.0)).filter(|t| *t != std::time::UNIX_EPOCH).max();
         let read_started = Instant::now();
         let watch_ms = saved.and_then(|s| s.elapsed().ok()).map_or_else(|| ms(seen), |d| d.as_secs_f64() * 1000.);
         let mut edits = Vec::new();
         let mut which = Vec::new();
         let mut read_failed = false;
+        // the files gone from disk (a module's file removed, or a store's edit taken back)
+        let mut removed = Vec::new();
         // the included files saved
         let mut moved = Vec::new();
         for &k in &changed {
@@ -5989,12 +6181,18 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             }
             let src = match stalled.get(&k).filter(|_| current == f.2).map(|(src, _)| Ok(src.clone())).unwrap_or_else(|| crate::vfs::read(&f.0)) {
                 Ok(s) => s,
-                Err(_) => {
-                    // A removed module can be unbound by its parent's edit.
-                    // A file that still exists but cannot be read must never
-                    // turn a multi-file batch into a partial transaction.
-                    read_failed |= current.is_some();
-                    if current.is_none() { f.2 = current; }
+                Err(e) => {
+                    // A removed module can be unbound by its parent's edit: a file gone from disk,
+                    // or a mounted store's file whose edit was taken back and that the store
+                    // lacks (its stamp is the store's, its read finds nothing). A file that still
+                    // exists but cannot be read must never turn a multi-file batch into a partial
+                    // transaction: the batch waits for that file's next change (its stamp kept).
+                    if current.is_none() || e.kind() == std::io::ErrorKind::NotFound {
+                        f.2 = current;
+                        removed.push(k);
+                    } else {
+                        read_failed = true;
+                    }
                     continue;
                 }
             };
@@ -6017,7 +6215,29 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             }
         }
         if read_failed {
-            retry_at = Some(Instant::now() + LIVE_RETRY);
+            continue;
+        }
+        // A running module's file removed while the file that declares it is not in this batch:
+        // the program still declares the module and has no file for it (rustc E0583). Nothing of
+        // the batch is installed and the app keeps the module's previous code; the batch's edits
+        // wait for the next change (the file's return, or the declaring file's edit).
+        let undeclared = if removed.is_empty() { Vec::new() } else {
+            let edited: std::collections::HashSet<&str> = edits.iter().map(|e| e.path.as_str()).chain(moved.iter().map(|&k| files[k].0.as_str())).collect();
+            let gone: Vec<&str> = removed.iter().map(|&k| files[k].0.as_str()).collect();
+            crate::owner::call(crate::owner::Class::Program, || undeclared_removals(&(*up).prog, &gone, &edited))
+        };
+        if !undeclared.is_empty() {
+            for (&k, e) in which.iter().zip(&edits) {
+                stalled.insert(k, (e.src.clone(), undeclared.clone()));
+            }
+            for &k in &moved { stalled.insert(k, (Vec::new(), undeclared.clone())); }
+            let what: Vec<String> = removed.iter().chain(&which).map(|&k| files[k].0.rsplit('/').next().unwrap_or("").to_string()).collect();
+            let what = what.join(", ");
+            let o = Outcome { failure: None, kept: 0, pending: false, rung: Rung::Refuse, files: Vec::new(), lines: undeclared.clone(), names: Vec::new(), changed: 0, test_changes: None, group: 0, ms: [0.0; 4], undo: None, work: [0; 5] };
+            log_edit(&what, &o, saved, seen);
+            eprintln!("makepad live: {}: NOT applied (errors below); the app runs the previous code", what);
+            for l in &undeclared { eprintln!("makepad live:   {}", l); }
+            patch_refused_event(&what, true, &undeclared);
             continue;
         }
         if !moved.is_empty() {
@@ -6052,8 +6272,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let originals: Vec<_> = edits.iter().map(|e| e.src.clone()).collect();
         // A writer may have resumed while we read. Keep these texts pending and
         // collect its next batch before compiling or requesting a recovery.
-        if files.iter().map(|f| stamp(&f.0)).ne(settled_stamps.iter().copied()) || repositories.snapshot() != git_state {
-            retry_at = Some(Instant::now());
+        let look = Look::new();
+        if files.iter().enumerate().map(|(k, f)| look.stamp(&virt, k, &f.0)).ne(settled_stamps.iter().copied()) || repositories.snapshot() != git_state {
+            again = true;
             continue;
         }
         trace_input(watch_ms, (read_started - seen).as_secs_f64() * 1000., ms(read_started), scanned);
@@ -6083,8 +6304,12 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             eprintln!("makepad live: {}: NOT applied (errors below); the app runs the previous code", what);
             for l in &o.lines { eprintln!("makepad live:   {}", l); }
             patch_refused_event(&what, true, &o.lines);
-            let unchanged = files.iter().map(|f| stamp(&f.0)).eq(settled_stamps.iter().copied()) && repositories.snapshot() == git_state;
-            if quiet_retry && unchanged {
+            // An unchanged tree compiles the same verdict again: a failure of makepad itself
+            // recovers now, the edit's own errors wait for the tree's next change. A tree that
+            // moved while this compiled has that move's events queued: their round retries it.
+            let look = Look::new();
+            let unchanged = files.iter().enumerate().map(|(k, f)| look.stamp(&virt, k, &f.0)).eq(settled_stamps.iter().copied()) && repositories.snapshot() == git_state;
+            if unchanged {
                 if let Some(failure) = failure {
                     drop(_reloading);
                     if crate::harness::live::enabled() {
@@ -6097,13 +6322,11 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                         }
                     } else { recover_hot_failure(failure, &o.lines, None); }
                 }
-            } else {
-                retry_at = Some(Instant::now() + LIVE_RETRY);
             }
             continue;
         }
         if o.rung == Rung::Patch {
-            let loaded = crate::owner::call(crate::owner::Class::Program, || (*up).prog.current_source_files());
+            let loaded = crate::owner::call(crate::owner::Class::Program, || (*up).prog.current_source_files(|p| own_source(p, &std_dir)));
             for &k in &which {
                 if loaded.contains_key(&files[k].0) {
                     stalled.remove(&k);
@@ -6116,9 +6339,14 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                     f.1 = file;
                 }
             }
-            // Module additions can load files without a post-boot loader turn.
-            // Refresh their file indices before the next save reaches them.
-            if files.iter().any(|f| f.1 == u32::MAX && f.0.ends_with(".rs") && !inputs.process_input(&f.0)) {
+            set_watch_loaded(&files);
+            // Module additions can load files without a post-boot loader turn: a loaded file
+            // the watcher does not know yet is taken in by a rescan before the next save reaches
+            // it (the known ones took their indices above). Asked when any watched file was not
+            // loaded, it rescanned after every Fab patch (an owner request) and held the watch
+            // round for the first frames again.
+            let known: std::collections::HashSet<&str> = files.iter().map(|f| f.0.as_str()).collect();
+            if loaded.keys().any(|p| !known.contains(p.as_str()) && crate::vfs::is_file(p)) {
                 startup_scan = true;
             }
         }
@@ -6164,10 +6392,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             // SPEC-V: the slots this group installed without a clean verdict (all of them, unless
             // --check-first refused what failed before the install)
             let group = u.group;
-            let ids: Vec<u32> = crate::owner::call(crate::owner::Class::Program, || {
-                let up = &*up;
-                (0..up.fns.len() as u32).filter(|&id| up.fns[id as usize].patch_gen == group && up.fns[id as usize].unverified.load(Ordering::Relaxed)).collect()
-            });
+            let ids: Vec<u32> = crate::owner::call(crate::owner::Class::Program, || unverified_patch(up, group));
             if !ids.is_empty() {
                 UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
                 pending.push(PendingPatch { group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq() });
@@ -6332,6 +6557,57 @@ mod use_edit_tests {
         }
         std::mem::forget(unit);
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod removed_module_tests {
+    use super::*;
+
+    /// A running module's file gone from disk while the file that declares it stays as it was is
+    /// refused as rustc's E0583 (the app keeps the module's code; a "patched (0 items)" verdict
+    /// was a silent wrong patch, 11-04). The declaring file's edit in the same batch decides
+    /// instead (the compile unbinds the module or reports it), and a crate root or a file the
+    /// program does not run is no such module.
+    #[test]
+    fn a_removed_module_file_its_parent_still_declares_is_refused() {
+        isolated_test!(a_removed_module_file_its_parent_still_declares_is_refused);
+        std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+        let dir = std::env::temp_dir().join(format!("relax-removed-module-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("zz")).unwrap();
+        std::fs::write(dir.join("main.rs"), "mod zz;\nmod leaf;\nfn main() { let _ = zz::f() + leaf::g(); }\n").unwrap();
+        std::fs::write(dir.join("zz/mod.rs"), "pub fn f() -> u32 { 1 }\n").unwrap();
+        std::fs::write(dir.join("leaf.rs"), "pub fn g() -> u32 { 2 }\n").unwrap();
+        let session = std::sync::Arc::new(crate::Session::default());
+        let (prog, _, _) = crate::load_with_std(&session, dir.join("main.rs").to_str().unwrap(), "removed_module", false).unwrap();
+        let path = |end: &str| prog.file_paths.iter().find(|p| p.ends_with(end)).cloned().unwrap();
+        let (main, zz, leaf) = (path("/main.rs"), path("/zz/mod.rs"), path("/leaf.rs"));
+        let none = std::collections::HashSet::new();
+        let lines = undeclared_removals(&prog, &[zz.as_str(), leaf.as_str()], &none);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("error[E0583]: file not found for module `zz`") && lines[0].contains(&main), "{lines:?}");
+        assert!(lines[1].starts_with("error[E0583]: file not found for module `leaf`"), "{lines:?}");
+        // the declaring file is in the batch: its compile decides
+        let edited: std::collections::HashSet<&str> = [main.as_str()].into_iter().collect();
+        assert!(undeclared_removals(&prog, &[zz.as_str()], &edited).is_empty());
+        // the crate root, and a file the program does not run
+        let other = dir.join("other.rs").to_string_lossy().into_owned();
+        assert!(undeclared_removals(&prog, &[main.as_str(), other.as_str()], &none).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A read of the running code (prof, mem, eval, ..) while a saved edit waits for a restart
+    /// heads its answer with STALE and the edit: it measures the code from before it (a layout
+    /// change measured for hours as if it ran, 11-04). A run that loads the sources clears it.
+    #[test]
+    fn a_read_while_an_edit_waits_for_a_restart_says_stale() {
+        isolated_test!(a_read_while_an_edit_waits_for_a_restart_says_stale);
+        assert_eq!(crate::inspect::stale_line(), None);
+        note_restart_pending("main.rs: the layout of WorkStats changed");
+        let line = crate::inspect::stale_line().unwrap();
+        assert!(line.contains("STALE: 1 edit waits for a restart (main.rs: the layout of WorkStats changed)") && line.contains("\"restart_pending\":1"), "{line}");
+        clear_restart_pending();
+        assert_eq!(crate::inspect::stale_line(), None);
     }
 }
 

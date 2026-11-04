@@ -68,7 +68,7 @@ pub(crate) fn live_app(tag: &str, files: &[(&str, &str)], names: &[&str], run: i
             *text = text.replace(from, to);
         }
         let p = path(file);
-        let index = unsafe { (*up).prog.current_source_files()[&p] };
+        let index = unsafe { (*up).prog.current_source_files(|q| q == p)[&p] };
         unsafe { crate::reload::apply(up, vec![crate::reload::Edit { file: index, path: p, src: text.clone().into_bytes() }]) }
     };
     run(&call, &mut edit);

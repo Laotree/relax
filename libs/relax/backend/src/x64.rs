@@ -1141,6 +1141,9 @@ struct Gen<'a> {
     unwind_tab: Vec<(u32, u32)>,
     /// (instruction position, return offset) of every call: the variable table's sites (dbgloc)
     var_calls: Vec<(u32, u32)>,
+    /// (return offset, bytes) of each call made with its stack arguments below the body's rsp:
+    /// the frame walk's sp-only step adds them (rir::unwind_info_words)
+    staged: Vec<(u32, u32)>,
     /// forward block jumps (jump_to / jcc_to to a block not placed yet), in emission order: where
     /// each started -- the first pass of a two-pass emit records them (short_jumps)
     fwd_at: Vec<usize>,
@@ -2322,6 +2325,7 @@ impl<'a> Gen<'a> {
         self.last_call_ret = self.a.pos();
         self.var_calls.push((self.cur_pos, self.a.pos() as u32));
         if stack_bytes > 0 {
+            self.staged.push((self.a.pos() as u32, stack_bytes));
             // add rsp, imm32
             self.a.byte(0x48);
             self.a.byte(0x81);
@@ -4354,6 +4358,15 @@ impl<'a> Gen<'a> {
         if self.vx_wide(options, op, d, a, b) || self.vx_lanes(op, d, a, b) {
             return;
         }
+        if let VX::Clmul(k) = op {
+            // pclmulqdq (66 0F 3A 44 /r ib): immediate bit 0 picks a's high qword, bit 4 b's
+            let imm = (k & 1) | (k & 2) << 3;
+            self.v2(d, a, b, &move |m, x, y| {
+                m.sse_ext(0x66, 0x3a, 0x44, x, y);
+                m.byte(imm);
+            });
+            return;
+        }
         // SHA-NI has legacy SSE encodings only, with NO mandatory 66 prefix.
         // Do not route these through v3: AVX hosts must still get legacy SHA.
         let sha = match op {
@@ -5522,6 +5535,7 @@ impl<'a> Gen<'a> {
     }
 
     fn ibin(&mut self, options: &relax_session::Options, op: IOp, it: IntTy, d: VReg, a: VReg, b: VReg) {
+        assert!(op.crc32_bits().is_none(), "crc32 is lowered for aarch64 targets only");
         // a spilled first operand of a register result loads straight into it, unless b lives there
         // (uloc covers a spilled b's window; a rematerialised b's window register counts too: b's
         // last read can share d's register, and the load would overwrite b before the operation
@@ -6106,6 +6120,7 @@ impl<'a> Gen<'a> {
         self.last_call_ret = self.a.pos();
         self.var_calls.push((self.cur_pos, self.a.pos() as u32));
         if stack_bytes > 0 {
+            self.staged.push((self.a.pos() as u32, stack_bytes));
             // add rsp, imm32
             self.a.byte(0x48);
             self.a.byte(0x81);
@@ -6712,6 +6727,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         pads: Vec::new(),
         unwind_tab: Vec::new(),
         var_calls: Vec::new(),
+        staged: Vec::new(),
         fwd_at: Vec::new(),
         fwd_hint: None,
         fixups8: Vec::new(),
@@ -6762,7 +6778,8 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     }
     let saved: Vec<u32> = g.al.used_callee_int.iter().map(|r| *r as u32).collect();
     let tab = std::mem::take(&mut g.unwind_tab);
-    for w in crate::rir::unwind_info_words(&saved, &tab, (g.saved + g.frame) as u32) {
+    let staged = std::mem::take(&mut g.staged);
+    for w in crate::rir::unwind_info_words(&saved, &tab, &staged, (g.saved + g.frame) as u32) {
         g.a.u32(w);
     }
     let frame = g.frame as u32;
@@ -6809,6 +6826,7 @@ pub fn jump_with_arg0(arg: u64, target: u64) -> Vec<u8> {
 /// still null `host() -> block`. `tls_addr` calls it after its own fast path found null; a
 /// prologue that needs the domain base calls it directly. Entered with rsp = 8 mod 16.
 pub fn tls_slow(host: u64, key: u64) -> Vec<u8> {
+    const XMM: u32 = TLS_SLOW_FRAME - 7 * 8;
     let mut a = Asm { b: Vec::new(), sib: None };
     // mov r11, seg:[disp32]: modrm 00/011/100 + SIB 0x25 (no base, no index)
     a.b.extend_from_slice(&[TLS_SEG, 0x4c, 0x8b, 0x1c, 0x25]);
@@ -6835,7 +6853,7 @@ pub fn tls_slow(host: u64, key: u64) -> Vec<u8> {
         a.push(r);
     }
     // Full vector arguments survive the first entry mark, including the host allocation.
-    a.sub_rsp(264);
+    a.sub_rsp(XMM);
     for x in 0..16u8 {
         a.sse_rm(0, 0x11, x, RSP, 16 * x as i32);
     }
@@ -6848,7 +6866,7 @@ pub fn tls_slow(host: u64, key: u64) -> Vec<u8> {
     a.byte(0x48);
     a.byte(0x81);
     a.modrm_rr(0, RSP);
-    a.u32(264);
+    a.u32(XMM);
     let mut i = regs.len();
     while i > 0 {
         i -= 1;
@@ -6858,6 +6876,10 @@ pub fn tls_slow(host: u64, key: u64) -> Vec<u8> {
     a.ret();
     a.b
 }
+
+/// `tls_slow`'s frame below its frame record at its host call (fp - sp there): seven saved
+/// argument registers and the xmm0-15 area (frame walks step it from sp alone)
+pub const TLS_SLOW_FRAME: u32 = 7 * 8 + 264;
 
 /// Windows hang watchdog glue: the watching thread redirects a looping JIT thread here as if it
 /// had called it from the interrupted pc ([rsp] = that pc, any stack alignment, every register
@@ -6953,8 +6975,8 @@ pub fn lazy_entry(host_compile: u64) -> Vec<u8> {
     // callbacks), for which xmm6-15 are callee-saved;
     // `host_compile` is a sysv64 fn and may clobber them, so they are kept here too (rsi / rdi,
     // also callee-saved for Win64, are among the argument registers saved above).
-    let xsave = 160;
-    a.sub_rsp(128 + xsave as u32);
+    let xsave = LAZY_ENTRY_FRAME - 128;
+    a.sub_rsp(LAZY_ENTRY_FRAME);
     let regs = [RDI, RSI, RDX, RCX, R8, R9];
     for (i, r) in regs.iter().enumerate() {
         a.store64(RSP, 8 * i as i32, *r);
@@ -6987,6 +7009,10 @@ pub fn lazy_entry(host_compile: u64) -> Vec<u8> {
     a.modrm_rr(4, R11);
     a.b
 }
+
+/// `lazy_entry`'s frame below its frame record at its host call (fp - sp there): the 128-byte
+/// argument area and the 160-byte xmm6-15 save (frame walks step it from sp alone)
+pub const LAZY_ENTRY_FRAME: u32 = 128 + 160;
 
 /// Per-slot thunk (the permanent address of a function, `THUNK_SIZE` bytes, 8-aligned): its
 /// head (`thunk_head`) is `jmp rel32` straight to the slot's code, or, when that is out of reach
@@ -7107,6 +7133,10 @@ pub fn stub(slot: u32, lazy: u64) -> Vec<u8> {
     a.b
 }
 
+/// `enter`'s frame below its frame record at its call of fn (fp - sp there): five callee-saved
+/// registers and the alignment word (frame walks step it from sp alone)
+pub const ENTER_FRAME: u32 = 5 * 8 + 8;
+
 /// enter(fn, arg, ctx): saves callee-saved registers and rsp into *ctx, calls fn(arg).
 /// Returns 0 normally. `leave_with(ctx, code)` restores them and returns `code`
 /// from enter (used by panics, faults and hangs to get back to the host).
@@ -7120,7 +7150,7 @@ pub fn enter_leave() -> (Vec<u8>, usize) {
     a.push(R13);
     a.push(R14);
     a.push(R15);
-    a.sub_rsp(8);
+    a.sub_rsp(ENTER_FRAME - 5 * 8);
     // ctx[0] = rsp
     a.store64(RDX, 0, RSP);
     a.mov_rr(RAX, RDI);
@@ -7132,7 +7162,7 @@ pub fn enter_leave() -> (Vec<u8>, usize) {
     a.byte(0x48);
     a.byte(0x83);
     a.modrm_rr(0, RSP);
-    a.byte(8);
+    a.byte((ENTER_FRAME - 5 * 8) as u8);
     a.pop(R15);
     a.pop(R14);
     a.pop(R13);

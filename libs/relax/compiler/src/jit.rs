@@ -375,6 +375,9 @@ pub struct Unit {
     /// their handle structs' field offsets as rustc lays them out, in declaration order (the
     /// `#[relax_api(handle)]` entry): the fields JIT code may reach there (provided_handle_field)
     pub provided_offsets: HashMap<DefId, &'static [u64]>,
+    /// whether the two stds lay out String / Vec alike (provided::std_same): worked out on the
+    /// first projection into an opaque handle's field that is neither plain data nor a handle
+    provided_std_same: std::sync::OnceLock<Option<crate::provided::StdSame>>,
     /// types whose values cross the provided-crate boundary (provided::crossing_types): worked out
     /// on the first query (`provided_shared`), which only a provided-crate misuse makes
     provided_shared: std::sync::OnceLock<std::collections::HashSet<TyId>>,
@@ -682,6 +685,9 @@ pub struct CodeTables {
     /// unwinds. `image_keep` keeps the image mapped.
     image_unwind: Vec<(u64, u64, u32)>,
     image_keep: Option<std::sync::Arc<PcFiles>>,
+    /// glue that calls out with a frame record (lazy and hot entries, `enter`, the TLS slow path,
+    /// register-block trampolines): (start, len, fp - sp at its call), for walks from sp alone
+    glue: Vec<(u64, u32, u32)>,
 }
 
 impl CodeTables {
@@ -689,7 +695,7 @@ impl CodeTables {
         // identity state (panics and faults walk it): the tables are the program's
         let _k = crate::zone_alloc::kept();
         if let Some(i) = unwind {
-            let own = relax_backend::rir::UnwindInfo { saved: i.saved.clone(), pads: i.pads.clone(), sp_off: i.sp_off };
+            let own = relax_backend::rir::UnwindInfo { saved: i.saved.clone(), pads: i.pads.clone(), sp_off: i.sp_off, staged: i.staged.clone() };
             self.unwind.insert(at, own);
         }
         if self.index.last().map_or(true, |l| l.0 < at) {
@@ -758,6 +764,25 @@ impl CodeTables {
 
     pub fn slot_at(&self, pc: u64) -> Option<u32> {
         self.entry_at(pc).map(|e| e.2)
+    }
+
+    /// The frame pointer of the JIT frame whose call returns to `ret`, from the stack pointer
+    /// it will have there (`sp`: the walk of a thread blocked in a syscall knows its sp and pc
+    /// only): the function's frame size and the call's staged arguments, or the glue's frame.
+    pub fn frame_pointer_at(&self, ret: u64, sp: u64) -> Result<u64, &'static str> {
+        let pc = ret.wrapping_sub(1);
+        if let Some((start, _, _)) = self.entry_at(pc) {
+            let info = match self.unwind.get(&start) {
+                Some(i) => i.fp_from_sp((ret - start) as u32, sp),
+                None => self.image_unwind_at(start).ok_or("its code has no unwind info")?.fp_from_sp((ret - start) as u32, sp),
+            };
+            return Ok(info);
+        }
+        let k = self.glue.partition_point(|g| g.0 <= pc);
+        match self.glue.get(k.wrapping_sub(1)) {
+            Some(&(at, len, frame)) if pc < at + len as u64 => Ok(sp + frame as u64),
+            _ => Err("its code has no frame size (glue without a frame record)"),
+        }
     }
 
     /// The unwind info of the startup image code at `start` (its trailer, parsed now).
@@ -1751,8 +1776,9 @@ pub(crate) extern "C" fn relax_precompile(addr: u64) -> u64 {
 }
 
 /// Builds every function the code at `addr` can reach, on the calling thread (a test's warm-up:
-/// afterwards no lazy compile of that program's code is left to grow the process heap).
-#[cfg(all(test, unix))]
+/// afterwards no lazy compile of that program's code is left to grow the process heap; the
+/// teardown test measures the heap on Linux only).
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn precompile_reachable(up: *mut Unit, addr: u64) -> u64 {
     let prev = CUR_UNIT.with(|c| c.replace(up));
     let root = owner::publish(|| unsafe {
@@ -3364,6 +3390,25 @@ pub(crate) fn in_jit_code(pc: u64) -> bool {
     unsafe { !cur_unit().is_null() && pc >= (*cur_unit()).exec_base && pc - (*cur_unit()).exec_base < (*cur_unit()).exec_size }
 }
 
+/// The frame pointer of the JIT frame whose call returns to `ret`, from its stack pointer there
+/// (CodeTables::frame_pointer_at): the step of a stack walk that knows sp and pc only. Never
+/// waits on the tables' lock (the thread walked may be the one writing them): a writer that
+/// stays past a short spin ends the step, saying so.
+pub fn frame_pointer_at(ret: u64, sp: u64) -> Result<u64, &'static str> {
+    let u = cur_unit();
+    if u.is_null() {
+        return Err("there is no JIT unit");
+    }
+    for _ in 0..1000 {
+        match unsafe { &*u }.code.try_read() {
+            Ok(t) => return t.frame_pointer_at(ret, sp),
+            Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner().frame_pointer_at(ret, sp),
+            Err(std::sync::TryLockError::WouldBlock) => std::thread::yield_now(),
+        }
+    }
+    Err("the JIT's code tables are being written")
+}
+
 /// The name of slot `id` (None: no unit or no such slot; the flight recorder, no lock: names are
 /// kept data of an append-only table).
 pub(crate) fn slot_name(id: u32) -> Option<String> {
@@ -3683,6 +3728,12 @@ fn panic_tramp(target: u64) -> Vec<u8> {
     b
 }
 
+/// `regs_call_tramp`'s frame below its frame record at its call (push 0; push r11)
+#[cfg(not(target_arch = "aarch64"))]
+const REGS_CALL_FRAME: u32 = 16;
+#[cfg(target_arch = "aarch64")]
+const REGS_CALL_FRAME: u32 = x64::REGS_CALL_FRAME;
+
 /// JIT trampoline in front of a host function that returns (makepad inspect's breakpoint):
 /// the register block of `panic_tramp`, made the frame record (rbp = its address: [rbp, return
 /// address] lead it, so frame walks go on into the JIT caller), passed as argument 7 (the first
@@ -3736,7 +3787,7 @@ impl Unit {
         if let Some(x) = m.iter().find(|x| x.0 == me && x.1 == target) {
             return Some(x.2);
         }
-        let at = self.emit_code(&regs_call_tramp(target), "relax::regs_call_tramp");
+        let at = self.emit_glue(&regs_call_tramp(target), "relax::regs_call_tramp", REGS_CALL_FRAME);
         let _k = crate::zone_alloc::kept();
         m.push((me, target, at));
         Some(at)
@@ -4015,6 +4066,7 @@ impl Unit {
             provided,
             provided_types,
             provided_offsets,
+            provided_std_same: std::sync::OnceLock::new(),
             lay: { let mut l = crate::layout::Layouts::new(); l.opaque = opaque_layouts; l },
             fns: crate::conc::AppendVec::new_slots(u32::MAX as usize + 1),
             reload_slots: Default::default(),
@@ -4117,11 +4169,11 @@ impl Unit {
             }
         } else {
             let lazy = x64::lazy_entry(rt_compile as *const () as usize as u64);
-            u.lazy_entry = u.emit_code(&lazy, "relax::lazy_entry");
+            u.lazy_entry = u.emit_glue(&lazy, "relax::lazy_entry", x64::LAZY_ENTRY_FRAME);
             let hot = x64::lazy_entry(rt_hot as *const () as usize as u64);
-            u.hot_entry = u.emit_code(&hot, "relax::hot_entry");
+            u.hot_entry = u.emit_glue(&hot, "relax::hot_entry", x64::LAZY_ENTRY_FRAME);
             let (el, leave_off) = x64::enter_leave();
-            u.enter = u.emit_code(&el, "relax::enter_leave");
+            u.enter = u.emit_glue(&el, "relax::enter_leave", x64::ENTER_FRAME);
             u.leave = u.enter + leave_off as u64;
         }
         let ps = panic_tramp(rt_panic_site as *const () as usize as u64);
@@ -4327,16 +4379,23 @@ impl Unit {
 
     /// Field `fi` (of type `ft`) of a provided crate's opaque handle struct `d`, as JIT-compiled
     /// code may reach it (lower.rs project): rustc's offset of the field (the handle's entry),
-    /// when the field is the same bytes on both sides (provided::trusted: plain data, pointers to
-    /// the crate's values) or is itself a provided handle (a place: what JIT code does with it
-    /// goes through the crate's fns, or through this rule again). None: the field's bytes are
-    /// rustc's alone (its std's HashMap, Vec, ..): only the crate's fns read it. (A handle is
-    /// opaque as a whole when any field differs; compute_program's driver sets two bool fields
-    /// of ScriptVmBase, whose HashMap/Vec fields keep it opaque.)
+    /// when the field is the same bytes on both sides (provided::handle_field_same: plain data,
+    /// pointers to the crate's values, a String or Vec of such data when the two stds lay them
+    /// out alike) or is itself a provided handle (a place: what JIT code does with it goes
+    /// through the crate's fns, or through this rule again). None: the field's bytes are rustc's
+    /// alone (its std's HashMap, ..): only the crate's fns read it. (A handle is opaque as a
+    /// whole when any field differs; compute_program's driver sets two bool fields of
+    /// ScriptVmBase, whose HashMap fields keep it opaque; makepad-script-test reads
+    /// ScriptTokenizer's `tokens`.)
     pub(crate) fn provided_handle_field(&self, d: DefId, fi: u32, ft: TyId) -> Option<u32> {
         let off = *self.provided_offsets.get(&d)?.get(fi as usize)?;
+        let krate = self.prog.def(d).krate;
         let handle = matches!(self.tcx.tys.kind(ft), TyKind::Adt(fd, a, _) if a.is_empty() && self.provided_types.contains_key(fd));
-        (handle || crate::provided::trusted(&self.prog, &self.tcx, self.prog.def(d).krate, ft, 0)).then_some(off as u32)
+        if handle || crate::provided::trusted(&self.prog, &self.tcx, krate, ft, 0) {
+            return Some(off as u32);
+        }
+        let std_same = *self.provided_std_same.get_or_init(|| crate::provided::std_same(&self.prog, &self.tcx));
+        crate::provided::handle_field_same(&self.prog, &self.tcx, krate, ft, std_same, &|x| self.provided_rustc_layout(x), &|x| self.lay.opaque.contains_key(&x)).then_some(off as u32)
     }
 
         /// Does a value of type `t` cross the provided-crate boundary? Worked out for every provided
@@ -4592,6 +4651,18 @@ impl Unit {
         if perf_map_on() {
             perf_map(at, b.len(), what);
         }
+        at
+    }
+
+    /// Glue that calls out with a frame record `frame` bytes above its sp at the call: emitted
+    /// and registered for walks from sp alone (CodeTables::frame_pointer_at).
+    fn emit_glue(&self, b: &[u8], what: &str, frame: u32) -> u64 {
+        let at = self.emit_code(b, what);
+        let mut t = self.code.write().unwrap_or_else(|e| e.into_inner());
+        let _k = crate::zone_alloc::kept();
+        let e = (at, b.len() as u32, frame);
+        let k = t.glue.partition_point(|g| g.0 < at);
+        t.glue.insert(k, e);
         at
     }
 
@@ -4910,7 +4981,7 @@ impl Unit {
         os::tls::static_tls_init(&|b| self.emit_code(b, "relax::static_tls"));
         let off = os::tls::jit_offset(key, &|b| self.emit_code(b, "relax::tls_offset"));
         self.env.tls_key = off;
-        self.env.tls_slow = self.emit_code(&x64::tls_slow(rt_tls_block as *const () as usize as u64, off), "relax::tls_slow");
+        self.env.tls_slow = self.emit_glue(&x64::tls_slow(rt_tls_block as *const () as usize as u64, off), "relax::tls_slow", x64::TLS_SLOW_FRAME);
     }
 
     pub fn site(&self, file: u32, pos: u32, msg: &str) -> u64 {
@@ -6058,8 +6129,8 @@ impl Unit {
         let t = self.code.read().unwrap_or_else(|e| e.into_inner());
         let (start, _, _) = t.entry_at(pc)?;
         match t.unwind.get(&start) {
-            Some(i) => Some((start, i.saved.clone())),
-            None => t.image_unwind_at(start).map(|i| (start, i.saved)),
+            Some(i) => Some((start, i.saved.to_vec())),
+            None => t.image_unwind_at(start).map(|i| (start, i.saved.into_vec())),
         }
     }
 
@@ -7103,9 +7174,10 @@ impl Unit {
         }
         // borrowck lane: a fn instance's first code, and every live-patched version of it, is checked
         // lazily in the background (D3: a patch is never refused synchronously unless --check-first;
-        // its verdict arrives as a Gandalf event, at the front of the queue).
+        // its verdict arrives as a Gandalf event, at the front of the queue: RANK_EDIT, ahead of hot
+        // code's checks too).
         if (first && gen == 0 || gen > 0) && crate::borrowck::lazy::gandalf_enabled(options) {
-            self.note_first_borrowck(id, (gen > 0).then_some(0));
+            self.note_first_borrowck(id, (gen > 0).then_some(crate::borrowck::lazy::RANK_EDIT));
         }
         // (SPEC-V: a slot that ran its twin's code runs its own now)
         if std::mem::take(&mut self.fns[id as usize].borrowed) {
@@ -7193,6 +7265,20 @@ impl Unit {
             FnKey::Closure(_, _, parent) => self.verdict_owner(*parent),
             _ => None,
         }
+    }
+
+    /// MAKEPAD_RUN_SPECV_TRACE: what slot `id`'s pending verdict waits on: the checker's entry for
+    /// its owner, the epoch, and the check's (rank, checks ahead) when it is queued.
+    pub(crate) fn pending_why(&self, id: u32) -> String {
+        let Some(d) = self.verdict_owner(id) else { return "no owner".into() };
+        let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
+        let src = self.front.checker_id;
+        // what the checker runs now (by its start: a new check is a new line of the trace)
+        let worker = match crate::borrowck::lazy::running() {
+            Some((rank, def, since)) => format!("worker runs {} (rank {rank}) since @{:.3}", if def == crate::program::NO_DEF { "discovery".to_string() } else { self.prog.def_path(def) }, since as f64 / 1e9),
+            None => "worker idle".to_string(),
+        };
+        format!("{} {:?} epoch {} {worker} queued {:?}", self.prog.def_path(d), crate::borrowck::lazy::verdict(src, d, &[], epoch), epoch, crate::borrowck::lazy::queue_place(src, d, epoch))
     }
 
     /// SPEC-V: where slot `id`'s body stands with the borrow checker (see `verdict_clean`).
@@ -16328,7 +16414,7 @@ unsafe fn prebuild_callees(up: *mut Unit, relocs: &[relax_backend::rir::RelocAt]
 
 /// MAKEPAD_RUN_SPECV_TRACE=1: SPEC-V verdict sweeps (slots turning verified) and twins tiering up,
 /// with the callers whose lowering still calls them.
-fn specv_trace() -> bool {
+pub(crate) fn specv_trace() -> bool {
     static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *T.get_or_init(|| std::env::var_os("MAKEPAD_RUN_SPECV_TRACE").is_some())
 }
@@ -16487,7 +16573,7 @@ unsafe fn drain_twin_pending(up: *mut Unit) {
 
 /// SPEC-V: brings twin callers below O3 to the base slots (twin_callers; the O3 ones are the
 /// caller's to retier): an O2 build lowers them again; unverified ones have their owners' verdicts
-/// checked first (Gandalf rank 0: it runs them even while compiles go on) and wait for them.
+/// checked first (Gandalf RANK_HOT: it runs them even while compiles go on) and wait for them.
 unsafe fn relower_twin_callers(up: *mut Unit, tc: &TwinCallers) {
     let key = up as usize;
     if !tc.o3.is_empty() || !tc.below.is_empty() {
@@ -16516,17 +16602,18 @@ unsafe fn relower_twin_callers(up: *mut Unit, tc: &TwinCallers) {
     }
 }
 
-/// SPEC-V: the owners of `ids` go first in the background checker's queue (rank 0 runs without
-/// waiting for quiet compiles): hot code waits seconds for its verdict, not the whole backlog. An
+/// SPEC-V: the owners of `ids` go first in the background checker's queue after live edits
+/// (`RANK_HOT` runs without waiting for quiet compiles): hot code waits seconds for its verdict,
+/// not the whole backlog. An
 /// owner the checker never got (a closure's parent with no code of its own, a slot whose first code
 /// took a path that queues nothing: 39 of the city's rank requests) is queued here (owner thread).
 unsafe fn prioritize_verdicts(up: *mut Unit, ids: &[u32]) {
     for &c in ids {
-        (&mut *up).note_first_borrowck(c, Some(0));
+        (&mut *up).note_first_borrowck(c, Some(crate::borrowck::lazy::RANK_HOT));
     }
     let u = &*up;
     let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
-    let ranks: Vec<(DefId, Vec<TyId>, u32)> = ids.iter().filter_map(|&c| Some((u.verdict_owner(c)?, Vec::new(), 0))).collect();
+    let ranks: Vec<(DefId, Vec<TyId>, u32)> = ids.iter().filter_map(|&c| Some((u.verdict_owner(c)?, Vec::new(), crate::borrowck::lazy::RANK_HOT))).collect();
     if !ranks.is_empty() {
         crate::borrowck::lazy::set_ranks(u.front.checker_id, epoch, &ranks);
     }
@@ -21170,6 +21257,7 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"relax_before_first_frame" => Some(relax_before_first_frame as *const () as usize),
         b"relax_first_present" => Some(relax_first_present as *const () as usize),
         b"relax_frame_done" => Some(crate::postframe::relax_frame_done as *const () as usize),
+        b"relax_frame_patch" => Some(crate::postframe::relax_frame_patch as *const () as usize),
         b"relax_quit_requested" => Some(crate::run::relax_quit_requested as *const () as usize),
         b"relax_quit_started" => Some(crate::run::relax_quit_started as *const () as usize),
         b"__relax_main_hosted" => Some(crate::run::relax_main_hosted as *const () as usize),
@@ -24359,10 +24447,8 @@ impl crate::borrowck::lazy::FrontSource for BorrowckFront {
         trace_stored_verdict(prog, def, "owner", found.1.as_ref());
         found
     }
-    fn wait_start(&self) {
-        while STARTUP_PHASE.load(Ordering::Acquire) != 0 && !SPEC_STOP.load(Ordering::SeqCst) {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+    fn started(&self) -> bool {
+        STARTUP_PHASE.load(Ordering::Acquire) == 0 || SPEC_STOP.load(Ordering::SeqCst)
     }
     fn identity(&self) -> usize {
         self.0.checker_id

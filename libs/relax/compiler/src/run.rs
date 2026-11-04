@@ -154,7 +154,9 @@ pub(crate) fn failed_run(why: &str) -> ! {
     report("error", why);
     crate::tui::exit_code(1);
     finish_run("failed run", Some(1));
-    if !crate::preempt::is_stopped() { crate::tui::finish(false); }
+    // finish_run stopped the background checks (preempt::is_stopped holds from there on): the
+    // session log is finished here whether or not the exit worker got to it (finish is once only)
+    crate::tui::finish(false);
     let _ = std::io::stdout().flush();
     crate::os::thread::exit_now(1)
 }
@@ -303,11 +305,89 @@ fn hal_window_pending() -> bool {
     PENDING_WINDOW.lock().unwrap().is_some() && MAIN_HOST.get().is_some_and(|h| !h.domain_zero)
 }
 
+/// The load is done and the run's start waits for its host window to open: its first present
+/// (`finish_window`).
+static WINDOW_AWAITED: AtomicBool = AtomicBool::new(false);
+/// The boot window's first present while it has not happened (`boot_window_waits`).
+static WINDOW_WAIT: relax_session::sync::Mutex<Option<WindowWait>> = relax_session::sync::Mutex::new(None);
+
+#[derive(Clone, Copy)]
+struct WindowWait {
+    /// what the present waits for, as the window's pump says it, and since when
+    waits: &'static str,
+    since: Instant,
+    /// since when the run's start waits for it (its load is done)
+    awaited: Option<Instant>,
+    /// the console was told of this state; any state (the console hears the end too)
+    told: bool,
+    told_any: bool,
+}
+
+/// How long the start waits in one state before the console hears of it: a normal boot's
+/// window presents within a few frames of its load and the console hears nothing.
+const WINDOW_NOTICE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether the run's load is done and its start waits for the host window's first present.
+fn window_awaited() -> bool {
+    WINDOW_AWAITED.load(Ordering::Acquire)
+}
+
+/// The host window's pump, each turn until the window's first present: what that present waits
+/// for (`None` once it presented). While the run's start waits for it, the session log has each
+/// state, the console a state the start still waits in a second later, and `why-hung` and a
+/// first-frame capture lead with it: a start held by its window never waits silently.
+pub fn boot_window_waits(waits: Option<&'static str>) {
+    let awaited = window_awaited();
+    let mut held = WINDOW_WAIT.lock().unwrap();
+    let Some(waits) = waits else {
+        if let Some(w) = held.take() {
+            if let Some(at) = w.awaited {
+                let line = format!("makepad-run: the boot window presented {:.0} ms after the app's load; the app starts", at.elapsed().as_secs_f64() * 1e3);
+                if w.told_any && !silent() { eprintln!("{line}") } else { crate::tui::log_only(&line) }
+            }
+        }
+        return;
+    };
+    let now = Instant::now();
+    let w = held.get_or_insert(WindowWait { waits, since: now, awaited: None, told: false, told_any: false });
+    let changed = w.waits != waits;
+    if changed {
+        *w = WindowWait { waits, since: now, told: false, ..*w };
+    }
+    if !awaited {
+        return;
+    }
+    let line = || format!("makepad-run: the app's start waits for its boot window's first present: {waits}");
+    if w.awaited.is_none() || changed {
+        w.awaited.get_or_insert(now);
+        crate::tui::log_only(&line());
+    }
+    let in_state = w.since.max(w.awaited.unwrap_or(now));
+    if !w.told && now.duration_since(in_state) >= WINDOW_NOTICE {
+        w.told = true;
+        w.told_any = true;
+        if !silent() {
+            eprintln!("{} (for {:.1} s)", line(), now.duration_since(in_state).as_secs_f64());
+        }
+    }
+}
+
+/// The boot window's first present while it has not happened, in words (`why-hung`), and whether
+/// the app's start waits for it (its load is done: a first-frame capture's cause).
+pub(crate) fn boot_window_note() -> Option<(bool, String)> {
+    let w = (*WINDOW_WAIT.lock().unwrap())?;
+    Some(match w.awaited {
+        Some(at) => (true, format!("the app has not started: its load finished {:.1} s ago and its start waits for the boot window's first present: {}", at.elapsed().as_secs_f64(), w.waits)),
+        None => (false, format!("the boot window has not presented ({}); the load goes on beside it", w.waits)),
+    })
+}
+
 /// Waits for the host window the resolve started to open (it opens beside the load, which does not
 /// need it), and says whether the run is hosted (HAL_RUN).
 fn finish_window() -> Result<(), String> {
     let Some(window) = PENDING_WINDOW.lock().unwrap().take() else { return Ok(()) };
     let t_window = Instant::now();
+    WINDOW_AWAITED.store(true, Ordering::Release);
     let opened = window.map_err(|e| format!("opening the host window: {e}"))?.join().map_err(|_| "opening the host window: the thread panicked".to_string())?;
     opened?;
     if crate::preload::trace() { eprintln!("boot-trace: host window open, waited {:.1} ms for it after the load", t_window.elapsed().as_secs_f64() * 1e3); }
@@ -443,9 +523,13 @@ pub(crate) fn resolve_package(
     let window = (boot && HOSTED_RUN.load(Ordering::Acquire) && g.crates.iter().any(|c| c.name == "makepad_hal")).then(|| {
         let (package, dir) = (package.to_string(), g.pkg[g.root].0.clone());
         let _k = crate::zone_alloc::kept();
+        // the start waits for the window's first present: it has the first frame's deadline
+        if !HARNESS_RUN.load(Ordering::Acquire) { crate::first_frame::arm_window(&package); }
         std::thread::Builder::new().name("run-open-window".into()).spawn(move || {
             let _z = crate::zone_alloc::compiler_thread();
-            (MAIN_HOST.get().expect("run host").open)(&package, &dir)
+            let opened = (MAIN_HOST.get().expect("run host").open)(&package, &dir);
+            crate::first_frame::window_opened();
+            opened
         })
     });
     // Keep the window even when resolution ends with an update offer before loading.
@@ -1701,6 +1785,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 // after an earlier run reached main); entries other processes of this launch wrote
                 // (build scripts, the proc-macro host) do not make a first run warm
                 unsafe { std::env::set_var("MAKEPAD_RUN_CACHE_STATE", if c.has_startup_manifest() { "warm" } else { "cold" }) };
+                crate::first_frame::classified(c.has_startup_manifest());
                 u.cache = Some(Box::new(crate::cache::CacheCell::new(c)));
             }
             Err(e) => verbose!("makepad-run cache: off ({})", e),

@@ -210,8 +210,8 @@ impl Hub {
         c.len()
     }
 
-    /// (kept, still open) clients, without pruning (tests).
-    #[cfg(test)]
+    /// (kept, still open) clients, without pruning (the Unix hub tests).
+    #[cfg(all(test, unix))]
     pub(crate) fn kept_clients(&self) -> (usize, usize) {
         let c = self.0.clients.lock().unwrap();
         (c.len(), c.iter().filter(|c| !c.is_closed()).count())

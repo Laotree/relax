@@ -1,5 +1,5 @@
 use std::io::prelude::*;
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 pub const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -7,6 +7,19 @@ const HTTP_ERROR_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) const LOW_LEVEL_SECURITY_HEADERS: &str = "Cross-Origin-Opener-Policy: same-origin\r\n\
 Cross-Origin-Embedder-Policy: require-corp\r\n";
+
+/// Where a connection to a listener bound at `bound` goes, such as the one that wakes its
+/// blocking `accept` on stop: its own address, or its family's loopback for a wildcard bind.
+/// A connect to 0.0.0.0 or :: is no dial on every OS (Windows refuses it at once, so an
+/// accept woken that way never wakes).
+pub(crate) fn dial_addr(bound: SocketAddr) -> SocketAddr {
+    let ip = match bound.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    SocketAddr::new(ip, bound.port())
+}
 
 pub fn write_bytes_to_tcp_stream_no_error(tcp_stream: &mut TcpStream, bytes: &[u8]) -> bool {
     let bytes_total = bytes.len();

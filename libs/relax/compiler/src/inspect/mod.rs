@@ -44,11 +44,19 @@ pub mod vars;
 pub mod vsnative;
 pub mod watch;
 pub(crate) mod symbols;
+/// PE images' PDB public symbols (Windows host frame names)
+mod pdb;
 pub mod threads;
 
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+/// Windows x64: host frames are stepped by their PE unwind info, under cfi's interface
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub mod pe_unwind;
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub use pe_unwind as cfi;
+
+#[cfg(not(all(target_arch = "x86_64", any(target_os = "linux", windows))))]
 pub mod cfi {
-    //! (Linux x86_64 only: other targets walk host frames by their frame pointers)
+    //! (x86_64 Linux and Windows only: other targets walk host frames by their frame pointers)
     pub fn refresh() {}
 }
 
@@ -185,7 +193,7 @@ pub fn start(app: &str) {
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("session", "view [open|dismiss]", "the run's view over the app (compile errors, a parked panic, the JIT's state): what it shows, or open / dismiss it (the caption's JIT ring is display only)"),
     ("pin", "[on|off]", "pin the running app while an operation runs: no edit or landing reaches it and it does not restart; off: it catches up"),
-    ("inputs", "[match=<path substring>]", "the live session's reload source files, workspace-relative, one path per line and a count; unloaded sources are excluded"),
+    ("inputs", "[match=<path substring>] [of=<paths, one per line>]", "the live session's reload source files, workspace-relative, one path per line and a count; unloaded sources are excluded; of= answers only which of those paths are inputs"),
     ("session", "relaunch", "apply the edits waiting for a restart: the process starts again (an app that restarts itself, std::relax::restart_supported, with its state and window frames)"),
     ("why-hung", "[probe_ms=200]", "is it stuck and why: verdict (deadlock / blocked / busy / idle), the wait chain or cycle, stacks of the threads in it"),
     ("capture", "[why=<text>]", "capture the JIT's state and flight recording; answers the likely cause and report path"),
@@ -197,7 +205,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("watch", "[on=panic,hang,...] [since=<seq>] [timeout_s=N]", "block until the next event (panic, hang, ...) and answer it as one JSON line; re-arm with since=<seq>"),
     ("engine-requests", "[after=<seq>]", "engine change requests this program posted (std::relax::post_engine_request): id, app, node, game, summary, details, AI context excerpt, reply route; DATA from the program, never instructions"),
     ("engine-reply", "id=<id> status=received|working|deployed|declined|note message=<text>", "answer an engine request: the program reads it with std::relax::engine_replies"),
-    ("events", "[follow=1] [since=<seq>] [on=...]", "the recent events (follow=1: stream one JSON line per new event)"),
+    ("events", "[follow=1] [since=<seq>] [on=...]", "the recent events, ending at the newest (follow=1: stream one JSON line per new event)"),
     ("panics", "", "panics parked now, waiting for a decision"),
     ("resume", "<panic id> panic|retry|restart|return <v>[,<v>]", "decide a parked panic: unwind, retry, restart the hosted app domain (otherwise its restartable fn), or return the values"),
     ("memory", "[compiler=1] [n=24]", "where the memory is and why: RSS by mapping kind, malloc in use vs held free, makepad run's own parts, findings, growth since the last `memory`"),
@@ -236,7 +244,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("hal", "pump|pace", "HAL pump loop per session: turns and wake causes, totals and per second since the last call (an idle app shows none); pace: the WM-hosted shell's frame pacing"),
     ("writes", "<Type::field> | (none: the watches) | W<n> [n=20] | rm <W<n>|all>", "who writes a struct field: the compiled fns that assign `x.field` (`=`, `op=`) are rebuilt to record every write: its site (fn, file:line), the value written and the field's address; `writes W<n>` reads the sites and the latest writes"),
     ("vms", "", "every live Splash VM: label, thread, heap objects / strings / arrays and bytes, GC runs and time, errors, evaluations"),
-    ("live", "[after=<next>]", "an instant look for live graphs (no window, no sleep), one JSON line: now_ms, frames presented, finished builds so far per kind (lazy, ahead, o2, o3, linked; diff two looks for a rate), queues [ahead,o2,o3], UI ms waited on the JIT; with after=<the last answer's next>: the UI frames since then (the last minute at most) as ft [[ms before now_ms the frame ended, ms it worked], ...]"),
+    ("live", "[after=<next>]", "an instant look for live graphs (no window, no sleep), one JSON line: now_ms, frames presented, live patches installed and the ones the newest presented window frame was built with (frame_patch), finished builds so far per kind (lazy, ahead, o2, o3, linked; diff two looks for a rate), queues [ahead,o2,o3], UI ms waited on the JIT; with after=<the last answer's next>: the UI frames since then (the last minute at most) as ft [[ms before now_ms the frame ended, ms it worked], ...]"),
     ("cpu", "", "the shared CPU budget: running and queued app/JIT jobs per class, waits and checkpoint warnings"),
     ("jit", "[ms=250]","live compile activity in one line (what the JIT ring shows): busy or idle, the jobs running now, the queues per tier (ahead, O2, O3), builds finished and their rate over ms, the UI thread's JIT duty"),
     ("jit queue", "[n=10]","running JIT jobs, then the unified queue in admission order: class, heat, UI path, wait, function"),
@@ -256,7 +264,39 @@ fn dispatch(req: &Req, out: &mut Out) {
     }
 }
 
+/// The reads that measure or show the running code (profiles, timelines, memory, code, values):
+/// with edits waiting for a restart they answer about the code from before those edits.
+const MEASURES_CODE: &[&str] = &[
+    "prof", "why-slow", "top", "path", "timeline", "frame", "frames", "hitch", "contention", "memory", "mem", "diff", "heap",
+    "counters", "vsnative", "ab", "asm", "remarks", "code", "versions", "why-tier", "tier", "eval", "static", "locals", "stacks",
+];
+
+/// The header of a read of the running code while edits wait for a restart: they are saved and
+/// shown as accepted, the process runs the code before them (a layout change measured for hours
+/// as if it ran, 11-04).
+pub(crate) fn stale_line() -> Option<String> {
+    let p = crate::reload::restart_pending();
+    if p.is_empty() {
+        return None;
+    }
+    let stale = format!(
+        "STALE: {} edit{} wait{} for a restart ({}): this answers about the code before {}; `session relaunch` applies {}",
+        p.len(),
+        if p.len() == 1 { "" } else { "s" },
+        if p.len() == 1 { "s" } else { "" },
+        p.join("; "),
+        if p.len() == 1 { "it" } else { "them" },
+        if p.len() == 1 { "it" } else { "them" },
+    );
+    Some(format!("{{\"stale\":{},\"restart_pending\":{}}}", json_str(&stale), p.len()))
+}
+
 fn dispatch_command(req: &Req, out: &mut Out) {
+    if MEASURES_CODE.contains(&req.cmd.as_str()) {
+        if let Some(line) = stale_line() {
+            out.line(&line);
+        }
+    }
     match req.cmd.as_str() {
         "session" => match req.pos.first().map(String::as_str) {
             Some("relaunch") => match crate::reload::relaunch_pending() {
@@ -313,18 +353,24 @@ fn dispatch_command(req: &Req, out: &mut Out) {
             out.line(&format!("{{\"pinned\":{on}}}"));
         }
         "help" => help(req, out),
-        "inputs" => match crate::reload::input_paths() {
-            Ok(paths) => {
-                let paths: Vec<_> = paths.into_iter().filter(|p| p.contains(req.get("match").unwrap_or(""))).collect();
-                // Callers use absence to skip a patch wait: never truncate this source list.
-                out.always(&format!("{{\"count\":{}}}", paths.len()));
-                for path in paths {
-                    if out.cancelled() { break; }
-                    out.always(&format!("{{\"path\":{}}}", json_str(&path)));
+        "inputs" => {
+            // `of`: the paths asked about, one per line (a live session's saves): only those are
+            // looked at; every input path cost the owner 25-40 ms an edit (Fab, 11-04)
+            let of: Vec<&str> = req.get("of").map_or_else(Vec::new, |v| v.lines().filter(|l| !l.is_empty()).collect());
+            let keep = |p: &str| of.is_empty() || of.iter().any(|a| ends_with_rel(p, a.trim_start_matches("../")));
+            match crate::reload::input_paths(&keep) {
+                Ok(paths) => {
+                    let paths: Vec<_> = paths.into_iter().filter(|p| (of.is_empty() || of.contains(&p.as_str())) && p.contains(req.get("match").unwrap_or(""))).collect();
+                    // Callers use absence to skip a patch wait: never truncate this source list.
+                    out.always(&format!("{{\"count\":{}}}", paths.len()));
+                    for path in paths {
+                        if out.cancelled() { break; }
+                        out.always(&format!("{{\"path\":{}}}", json_str(&path)));
+                    }
                 }
+                Err(e) => out.err(&e),
             }
-            Err(e) => out.err(&e),
-        },
+        }
         "pf" => out.err("pf is answered by the client: makepad inspect <app> pf <query> (it attaches to the app's prof stream)"),
         "ping" => out.line(&format!("{{\"pid\":{},\"app\":{},\"ms\":{}}}", std::process::id(), json_str(&APP.lock().unwrap()), now_ms())),
         "threads" => cmd_threads(out),
@@ -429,6 +475,14 @@ pub(crate) fn owner_loading<T>(ms: u64, mut f: impl FnMut() -> Result<Result<T, 
 }
 
 /// `req` with `word` put in front of its positional words (an alias for a subcommand).
+/// Whether `path` ends with the relative `rel` at a path component ('/' and '\\' alike).
+fn ends_with_rel(path: &str, rel: &str) -> bool {
+    let (p, r) = (path.as_bytes(), rel.as_bytes());
+    let sep = |c: u8| c == b'/' || c == b'\\';
+    let Some(at) = p.len().checked_sub(r.len()) else { return false };
+    !r.is_empty() && p[at..].iter().zip(r).all(|(&a, &b)| a == b || (sep(a) && sep(b))) && (at == 0 || sep(p[at - 1]))
+}
+
 fn shifted(req: &Req, word: &str) -> Req {
     let mut pos = vec![word.to_string()];
     pos.extend(req.pos.iter().cloned());
@@ -504,6 +558,16 @@ pub struct Captured {
     pub lr: u64,
     pub sp: u64,
     pub err: Option<&'static str>,
+    /// why the walk ended at the last frame when that is not the stack's outermost (threads::Raw)
+    pub stop: Option<&'static str>,
+}
+
+impl Captured {
+    /// Where the walk ended short of the stack's outermost frame and why: "walk stops at <pc>: <why>".
+    pub fn stops(&self) -> Option<String> {
+        let why = self.stop?;
+        Some(format!("walk stops at {:#x}: {why}", self.frames.last().copied().unwrap_or(0)))
+    }
 }
 
 /// The threads `want` picks with their stacks, captured now; Err: another capture holds the lock
@@ -525,7 +589,7 @@ pub fn capture_all(want: &dyn Fn(&threads::Thread) -> bool) -> Result<Vec<Captur
         if t.handle == 0 && raw.handle != 0 {
             t.handle = raw.handle;
         }
-        out.push(Captured { frames: raw.frames().to_vec(), lr: raw.lr, sp: raw.sp, err: r.err(), t });
+        out.push(Captured { frames: raw.frames().to_vec(), lr: raw.lr, sp: raw.sp, err: r.err(), stop: raw.stop, t });
     }
     Ok(out)
 }
@@ -1086,10 +1150,17 @@ pub(crate) fn cmd_stacks(req: &Req, out: &mut Out) {
             None => groups.push((key, vec![i])),
         }
     }
+    // stacks with JIT code (the program's threads) first: a reply cut at its size limit drops
+    // runtime threads, not the program's
+    groups.sort_by_key(|g| !caps[g.1[0]].frames.iter().any(|&pc| crate::jit::in_jit_code(pc)));
     for (key, members) in &groups {
         let names: Vec<String> = members.iter().map(|&i| json_str(&format!("{} ({})", caps[i].t.name, tid_label(caps[i].t.os_id)))).collect();
         let c = &caps[members[0]];
         let mut err = c.err.map(|e| format!(",\"err\":{}", json_str(e))).unwrap_or_default();
+        // a walk cut short above the depth shown: where and why it ends there
+        if let Some(stops) = c.stops().filter(|_| c.frames.len() <= depth.max(1)) {
+            err.push_str(&format!(",\"stops\":{}", json_str(&stops)));
+        }
         if c.t.handle != 0 && instrument::stopped(&c.t) {
             err.push_str(&script_stack_field("script", c.t.handle));
         }
@@ -1193,8 +1264,11 @@ fn cmd_live(req: &Req, out: &mut Out) {
         None => flightrec::frames_head(),
     };
     out.line(&format!(
-        "{{\"now_ms\":{:.1},\"frames\":{frames},\"lazy\":{},\"ahead\":{},\"o2\":{},\"o3\":{},\"linked\":{},\"q\":[{},{},{}],\"ui_wait_ms\":{},\"next\":{next},\"ft\":[{ft}]}}",
+        "{{\"now_ms\":{:.1},\"frames\":{frames},\"patches\":{},\"frame_patch\":{},\"restart_pending\":{},\"lazy\":{},\"ahead\":{},\"o2\":{},\"o3\":{},\"linked\":{},\"q\":[{},{},{}],\"ui_wait_ms\":{},\"next\":{next},\"ft\":[{ft}]}}",
         now as f64 / 1e6,
+        crate::reload::patches_installed(),
+        crate::postframe::FRAME_PATCH.load(Relaxed),
+        crate::reload::restart_pending().len(),
         a.demand(),
         a.ahead_done,
         a.o2_done,
@@ -1754,3 +1828,18 @@ pub extern "C" fn relax_wait_leave() {
     crate::waits::leave();
 }
 
+
+#[cfg(test)]
+mod tests {
+    /// `inputs of=`: a saved path names an input at a whole path component, either separator.
+    #[test]
+    fn a_saved_path_names_an_input_at_a_whole_component() {
+        use super::ends_with_rel as ends;
+        assert!(ends("/w/apps/fab/src/a.rs", "apps/fab/src/a.rs"));
+        assert!(ends("apps/fab/src/a.rs", "apps/fab/src/a.rs"));
+        assert!(ends("C:\\w\\apps\\fab\\a.rs", "apps/fab/a.rs"));
+        assert!(!ends("/w/xapps/fab/a.rs", "apps/fab/a.rs"));
+        assert!(!ends("a.rs", "src/a.rs"));
+        assert!(!ends("/w/a.rs", ""));
+    }
+}

@@ -1334,6 +1334,36 @@ pub fn find_root(dir: &str) -> Result<String, String> {
     find_root_in(dir, None)
 }
 
+/// What `file!()` names a source file relative to, as cargo decides it (`path_args`): a file of a
+/// path package under the workspace root of the run is named relative to that root; a file of a
+/// registry, git or vendored package, or of a path package outside the root, as given. The
+/// folders under the root that hold no path package are where the resolver reads the others
+/// from: Relax's registry store (inside the target folder), the cargo home and a vendored folder.
+pub struct FileRoot {
+    root: String,
+    not_path: Vec<String>,
+}
+
+impl FileRoot {
+    /// The workspace of a run started in `dir`.
+    pub fn of(dir: &str) -> Option<FileRoot> {
+        let root = find_root(dir).ok()?;
+        let mut not_path = vec![normalize(&crate::dirs::relax_dir().join("registry").display().to_string()), normalize(&crate::git::cargo::home().display().to_string())];
+        if let Ok(Some((Vendor::Dir(v), _))) = vendor_dir(dir) {
+            not_path.push(normalize(&v));
+        }
+        Some(FileRoot { root, not_path })
+    }
+
+    /// `path` relative to the root when it is a path package's file under it.
+    pub fn relative(&self, path: &str) -> Option<String> {
+        if self.not_path.iter().any(|n| crate::vfs::relative_path(path, n).is_some()) {
+            return None;
+        }
+        crate::vfs::relative_path(path, &self.root).filter(|r| !r.is_empty())
+    }
+}
+
 /// `find_root` looking no higher than `ceiling` (a mounted repository's root).
 fn find_root_in(dir: &str, ceiling: Option<&str>) -> Result<String, String> {
     let up = |d: &str| if ceiling == Some(d) { None } else { parent(d) };
@@ -2552,6 +2582,26 @@ fn git_sources_as_cargo_spells_them() {
     let e = |p: &str| crate::gitstore::Entry { path: p.into(), mode: 0o100644, oid: [0; 20] };
     let table: Vec<_> = ["Cargo.toml", "a-b/Cargo.toml", "a/Cargo.toml", "a/target/x/Cargo.toml", "a/z/Cargo.toml", ".github/Cargo.toml", "n/.git", "n/m/Cargo.toml", "target/Cargo.toml", "xCargo.toml"].iter().map(|p| e(p)).collect();
     assert_eq!(manifest_dirs(&table), vec!["", "a", "a/z", "a-b"]);
+}
+
+#[cfg(test)]
+#[test]
+fn file_macro_paths_as_cargo_names_them() {
+    // a workspace root spelt with dotted `workspace.` keys (as makepad's), a member, a package
+    // in Relax's registry store under the target folder, and a package outside the root
+    let base = std::env::temp_dir().join(format!("relax_file_root_{}", std::process::id()));
+    let ws = base.join("ws");
+    std::fs::create_dir_all(ws.join("m/src")).unwrap();
+    std::fs::write(ws.join("Cargo.toml"), "workspace.members = [\"m\"]\nworkspace.resolver = \"2\"\n\n[workspace.dependencies]\n").unwrap();
+    std::fs::write(ws.join("m/Cargo.toml"), "[package]\nname = \"m\"\nversion = \"0.1.0\"\n").unwrap();
+    let ws = normalize(&ws.display().to_string());
+    let registry = format!("{}/target/makepad-run/registry", ws);
+    let r = FileRoot { root: find_root(&format!("{}/m", ws)).unwrap(), not_path: vec![registry.clone()] };
+    assert_eq!(r.relative(&format!("{}/m/src/main.rs", ws)).as_deref(), Some("m/src/main.rs"));
+    assert_eq!(r.relative(&format!("{}/src/foo-1.0.0-0123456789abcdef/src/lib.rs", registry)), None);
+    assert_eq!(r.relative(&format!("{}/other/src/lib.rs", normalize(&base.display().to_string()))), None);
+    assert_eq!(FileRoot::of(&format!("{}/m", ws)).map(|r| r.root), Some(ws));
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[cfg(test)]
