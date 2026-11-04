@@ -6421,6 +6421,11 @@ impl Unit {
                 unsafe { std::slice::from_raw_parts(buf as *const u8, l.size as usize) }.to_vec()
             }
         };
+        // A value without pointers: one copy per content (rustc interns allocations by bytes +
+        // align, so `&0u8` at two sites is one address).
+        if crate::syms::value_pointer_offsets(self, t, &bytes).is_some_and(|words| words.is_empty()) {
+            return Ok(self.data_dedup(&bytes, l.align.max(1) as u64));
+        }
         // Typed data preserves function-entry relocations in cached code, as for const items.
         Ok(self.data(&bytes, l.align.max(1) as u64, crate::syms::DataKind::Typed(t)))
     }
