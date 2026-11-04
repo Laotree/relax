@@ -192,6 +192,9 @@ mod native {
         appears: std::collections::HashSet<Vec<u8>>,
         /// delivered indices; true once events may have been lost
         pending: Mutex<(Vec<usize>, bool)>,
+        /// `flush`'s marker file (canonical) and whether its event was delivered
+        #[cfg(test)]
+        marker: Mutex<Option<(Vec<u8>, bool)>>,
     }
     pub struct Watch {
         stream: Stream,
@@ -218,6 +221,10 @@ mod native {
             // MustScanSubDirs, UserDropped, KernelDropped, or an event on a watched directory
             // itself (moved or removed): the caller stats everything and rebuilds the watch.
             pending.1 |= flags & (0x1 | 0x2 | 0x4) != 0 || shared.roots.contains(path.to_bytes()) || shared.appears.contains(path.to_bytes());
+            #[cfg(test)]
+            if let Some(m) = shared.marker.lock().unwrap_or_else(|e| e.into_inner()).as_mut().filter(|m| m.0 == path.to_bytes()) {
+                m.1 = true;
+            }
             if let Some(&i) = shared.names.get(path.to_bytes()) { pending.0.push(i); }
             if let Some(slash) = path.to_bytes().iter().rposition(|&b| b == b'/') {
                 if let Some(&i) = shared.names.get(&path.to_bytes()[..slash]) { pending.0.push(i); }
@@ -271,7 +278,7 @@ mod native {
                 let array = CFArrayCreate(std::ptr::null(), strings.as_ptr(), strings.len() as isize, (&raw const kCFTypeArrayCallBacks).cast());
                 for s in strings { CFRelease(s); }
                 if array.is_null() { return None; }
-                let shared = Box::into_raw(Box::new(Shared { names, roots: root_set, appears, pending: Mutex::new((Vec::new(), false)) }));
+                let shared = Box::into_raw(Box::new(Shared { names, roots: root_set, appears, pending: Mutex::new((Vec::new(), false)), #[cfg(test)] marker: Mutex::new(None) }));
                 let mut context = Context { version: 0, info: shared.cast(), retain: std::ptr::null(), release: std::ptr::null(), describe: std::ptr::null() };
                 // UseCFTypes off (paths arrive as C strings), NoDefer 0x2, FileEvents 0x10;
                 // since now, latency 0.
@@ -297,11 +304,34 @@ mod native {
             };
             *g = false;
         }
-        /// Every event of the file operations made so far delivered (FSEvents reports them a
-        /// moment later): what a test asserts on is the state after them, not a wait.
+        /// Every event of the file operations made so far delivered: what a test asserts on is
+        /// the state after them. FSEventStreamFlushSync hands over only what fseventsd holds, and
+        /// the kernel passes it a write a moment later (a write just made was not in the flush).
+        /// A marker file made now in a watched folder is reported after every earlier operation:
+        /// this returns once its event is delivered. With every watched folder gone, a folder's
+        /// own event (a loss) is the one still coming.
         #[cfg(test)]
         pub fn flush(&mut self) {
-            unsafe { FSEventStreamFlushSync(self.stream) }
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let shared = unsafe { &*self.shared };
+            let root = shared.roots.iter().find(|r| Path::new(std::ffi::OsStr::from_bytes(r)).is_dir()).cloned();
+            let Some(mut marker) = root else {
+                while !shared.pending.lock().unwrap_or_else(|e| e.into_inner()).1 {
+                    self.wait(None);
+                }
+                return;
+            };
+            marker.extend_from_slice(format!("/.relax-flush-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)).as_bytes());
+            *shared.marker.lock().unwrap_or_else(|e| e.into_inner()) = Some((marker.clone(), false));
+            let path = Path::new(std::ffi::OsStr::from_bytes(&marker)).to_path_buf();
+            std::fs::write(&path, b"").unwrap();
+            loop {
+                unsafe { FSEventStreamFlushSync(self.stream) }
+                if shared.marker.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.1) { break; }
+                self.wait(None);
+            }
+            *shared.marker.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            std::fs::remove_file(&path).unwrap();
         }
         /// None means events may have been lost: stat every source this round.
         pub fn changed(&mut self) -> Option<Vec<usize>> {
@@ -555,7 +585,8 @@ mod tests {
     /// What the watch reports for the file operations made so far (None: events lost). inotify
     /// and ReadDirectoryChangesW report an operation before it returns (on Windows a read's
     /// completion reaches it once its packet is taken: `settled`); FSEvents a moment later, all
-    /// of it once flushed. An empty answer is the state "no event after the write", not a wait.
+    /// of it once a marker made after it is delivered (`flush`). An empty answer is the state
+    /// "no event after the write", not a wait.
     fn next(watch: &mut super::Watch) -> Option<Vec<usize>> {
         #[cfg(windows)]
         return watch.settled();

@@ -1753,8 +1753,9 @@ pub(crate) extern "C" fn relax_precompile(addr: u64) -> u64 {
 }
 
 /// Builds every function the code at `addr` can reach, on the calling thread (a test's warm-up:
-/// afterwards no lazy compile of that program's code is left to grow the process heap).
-#[cfg(all(test, unix))]
+/// afterwards no lazy compile of that program's code is left to grow the process heap; the
+/// teardown test measures the heap on Linux only).
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn precompile_reachable(up: *mut Unit, addr: u64) -> u64 {
     let prev = CUR_UNIT.with(|c| c.replace(up));
     let root = owner::publish(|| unsafe {
