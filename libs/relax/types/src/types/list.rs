@@ -259,12 +259,22 @@ impl Lists {
     }
 
     /// The words from position `from` to the end (image tail), skipped words as 0.
+    fn word_at(&self, p: usize) -> u32 {
+        if p < self.mapped.len() { return self.mapped[p]; }
+        let c = self.chunks[p >> LIST_CHUNK_BITS].load(Ordering::Acquire);
+        if c.is_null() { 0 } else { unsafe { *c.add(p & (LIST_CHUNK - 1)) } }
+    }
+
     pub(super) fn tail_words(&self, from: usize) -> Vec<u32> {
-        (from..self.end()).map(|p| {
-            if p < self.mapped.len() { return self.mapped[p]; }
-            let c = self.chunks[p >> LIST_CHUNK_BITS].load(Ordering::Acquire);
-            if c.is_null() { 0 } else { unsafe { *c.add(p & (LIST_CHUNK - 1)) } }
-        }).collect()
+        (from..self.end()).map(|p| self.word_at(p)).collect()
+    }
+
+    /// tail_words as the bytes of the words (an image section's tail, taken once)
+    pub(super) fn tail_word_bytes(&self, from: usize) -> Vec<u8> {
+        let end = self.end();
+        let mut b = Vec::with_capacity(end.saturating_sub(from) * 4);
+        for p in from..end { b.extend_from_slice(&self.word_at(p).to_ne_bytes()); }
+        b
     }
 
     pub(super) fn bucket_pairs(&self) -> Vec<u32> {

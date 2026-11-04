@@ -635,7 +635,7 @@ pub struct Cache {
     def_keys: HashMap<DefId, u128>,
     mapped_definitions: Option<collected::MappedDefinitions>,
     /// Frozen before the first run-time crate mutates the boot's front end.
-    collected_boot: Option<collected::CollectedBoot>,
+    collected_boot: Option<collected::CollectedBoot<'static>>,
     collected_committed: bool,
     file_ids: HashMap<u128, u32>,
     file_ids_n: usize,
