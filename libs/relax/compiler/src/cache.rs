@@ -2241,19 +2241,23 @@ impl Cache {
         Some((k, bytes))
     }
 
-    /// Whether the slot identity `b` (enc_fnkey bytes) names only crates unchanged since the
-    /// loaded manifest was recorded (`manifest_key_crates`): its code key is then the recorded
-    /// one, as for every slot of those crates (a closure, named by its file: no).
-    pub(super) fn identity_unchanged(&self, b: &[u8]) -> bool {
-        if self.manifest_keys.is_empty() || !crate::reload::edited_crates().is_empty() { return false; }
-        let Some(ok) = &self.manifest_key_crates else { return true };
-        let mut all = true;
-        let mut d = D { b, p: 0 };
-        let read = image::skip_fnkey(&mut d, 0, &mut |a| all &= match a {
-            image::Atom::Crate(ident) => self.crate_by_ident.get(&ident).is_some_and(|&c| ok.get(c as usize) == Some(&true)),
-            image::Atom::File(_) => false,
-        });
-        read.is_some() && d.p == b.len() && all
+    /// The code key the slot identity `b` (enc_fnkey bytes) has this run without making it: the
+    /// loaded manifest's, when it holds the identity and `b` names only crates unchanged since it
+    /// was recorded (`manifest_key_crates`; a closure, named by its file: no). A certificate
+    /// compares this with the key it holds: an unchanged identity says the key is the manifest's,
+    /// not the certificate's, whose entry can be older than the manifest.
+    pub(super) fn recorded_key(&self, b: &[u8]) -> Option<u128> {
+        if self.manifest_keys.is_empty() || !crate::reload::edited_crates().is_empty() { return None; }
+        if let Some(ok) = &self.manifest_key_crates {
+            let mut all = true;
+            let mut d = D { b, p: 0 };
+            let read = image::skip_fnkey(&mut d, 0, &mut |a| all &= match a {
+                image::Atom::Crate(ident) => self.crate_by_ident.get(&ident).is_some_and(|&c| ok.get(c as usize) == Some(&true)),
+                image::Atom::File(_) => false,
+            });
+            if read.is_none() || d.p != b.len() || !all { return None; }
+        }
+        self.manifest_keys.get(&identity_hash(b)).copied()
     }
 
     fn code_key_bytes(&mut self, u: &Unit, key: &FnKey) -> Option<(u128, Vec<u32>, Vec<u8>)> {
@@ -8357,7 +8361,10 @@ impl Linker {
             let b = d.bytes()?;
             let want = d.u128()?;
             // (a slot of the crates unchanged since the manifest keeps its recorded key)
-            if self.cache().identity_unchanged(b) { continue; }
+            if let Some(k) = self.cache().recorded_key(b) {
+                if k != want { return Some(false); }
+                continue;
+            }
             let Some(s) = self.slot_of_bytes(u, b) else { return Some(false) };
             if self.cache().slot_key(u, s) != Some(want) {
                 return Some(false);
@@ -8631,9 +8638,15 @@ impl Cache {
         for _ in 0..n {
             let b = d.bytes()?;
             let want = d.u128()?;
-            if !fast && !self.identity_unchanged(b) {
-                let key = unsafe { Linker::new(self) }.dec_fnkey(u, &mut D { b, p: 0 }, 0)?;
-                if self.const_body_key(u, &key).map(|k| k.0) != Some(want) { return None; }
+            if !fast {
+                let now = match self.recorded_key(b) {
+                    Some(k) => k,
+                    None => {
+                        let key = unsafe { Linker::new(self) }.dec_fnkey(u, &mut D { b, p: 0 }, 0)?;
+                        self.const_body_key(u, &key)?.0
+                    }
+                };
+                if now != want { return None; }
             }
             items.push((b.to_vec(), want));
         }

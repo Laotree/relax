@@ -14,6 +14,9 @@ warm: one edit, and within 20 s either
             brings the new value,
 and in both a fresh run of the edited sources (read-only on the cache) prints the new value.
 A probe that reads late first calls its reader after the edit: that code comes from the store then.
+A stored entry can be older than the manifest of the run that reads it: the edited text's first run,
+reaching none of the late readers, writes its own manifest (its keys are "unchanged" from then on),
+and the next run's first late reads must still see that the entries they find are of the old text.
 --cold: the same sessions with the disk cache off, for comparison.
 Prints a row per probe and exits 1 on any stale one.
 """
@@ -68,6 +71,7 @@ PROBES = [
     ("const_late", V, "CONST_LATE: u64 = 1;", "CONST_LATE: u64 = 2;", 2),
     ("body_inlined", V, "pub fn tiny() -> u64 {\n    1\n", "pub fn tiny() -> u64 {\n    2\n", 2),
     ("body_late", V, "pub fn late_tiny() -> u64 {\n    1\n", "pub fn late_tiny() -> u64 {\n    2\n", 2),
+    ("always_late", V, "pub fn late_always() -> u64 {\n    1\n", "pub fn late_always() -> u64 {\n    2\n", 2),
     ("static_direct", V, "STATIC_DIRECT: u64 = 1;", "STATIC_DIRECT: u64 = 2;", 2),
     ("static_through", V, "STATIC_THROUGH: u64 = 1;", "STATIC_THROUGH: u64 = 2;", 2),
     ("static_late", V, "STATIC_LATE: u64 = 1;", "STATIC_LATE: u64 = 2;", 2),
@@ -187,6 +191,36 @@ if not cold:
     p = once("warm", "1")
     if p.returncode != 0 or "prelinked" not in p.stderr:
         sys.exit("warm run did not prelink: " + p.stderr[-2000:])
+
+
+def older_than_manifest():
+    """The late readers' entries are stored by the fill; the edited text's manifest comes after them."""
+    probes = [p for p in PROBES if p[0] in ("const_late", "static_late", "body_late", "always_late")]
+    path = os.path.join(pkg, V)
+    base = open(path).read()
+    text = base
+    for _, _, old, new, _ in probes:
+        assert text.count(old) == 1, old
+        text = text.replace(old, new)
+    save(path, text)
+    try:
+        p = once("manifest", "many")
+        if "startup manifest rewritten" not in p.stderr or "startup manifest kept" in p.stderr:
+            return "the edited text's run wrote no manifest of its own"
+        late = os.path.join(tmp, "late-older")
+        open(late, "w").close()
+        p = once("older", "1", WARM_EDIT_LATE=late)
+        line = next((l for l in p.stdout.splitlines() if l.startswith("out tick ")), "")
+        wrong = ["%s=%s want %d" % (n, value(line, n), w) for n, _, _, _, w in probes if value(line, n) != w]
+        return ", ".join(wrong)
+    finally:
+        save(path, base)
+
+
+if not cold and (not only or "older_than_manifest" in only):
+    why = older_than_manifest()
+    print("%-23s %s" % ("older_than_manifest", why or "ok"))
+    fails += 1 if why else 0
 for probe, rel, old, new, want in PROBES:
     if only and probe not in only:
         continue

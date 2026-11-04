@@ -162,3 +162,8 @@ pub fn tiny() -> u64 {
 pub fn late_tiny() -> u64 {
     1
 }
+
+#[inline(always)]
+pub fn late_always() -> u64 {
+    1
+}
