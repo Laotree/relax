@@ -153,6 +153,10 @@ pub enum VX {
     PackUsS,
     /// d[i] = b[i] & 0x80 ? 0 : a[b[i] & 15] (pshufb)
     ByteShuffle,
+    /// carry-less product of one 64-bit lane of a and one of b, 128 bits (x64 `pclmulqdq`, Arm
+    /// `pmull` .1q): bit 0 of the selector picks a's high lane, bit 1 b's high lane (the x86
+    /// immediate's bits 0 and 4)
+    Clmul(u8),
     // SHA instruction semantics are architecture-specific (not interchangeable lane orders).
     X86Sha1Rnds4(u8),
     X86Sha1NextE,
@@ -298,6 +302,28 @@ pub enum IOp {
     /// optimiser from that mask idiom (bit readers' `bitbuf & bitmask(n)`): x64 BMI2 `bzhi`,
     /// arm64 `lsl` of all ones + `bic`
     Bzhi,
+    /// CRC-32 (IEEE 802.3, reflected polynomial 0xEDB88320) of the low 8 / 16 / 32 / 64 bits of
+    /// b folded into the 32-bit crc in a, no pre/post inversion: Arm's `__crc32b/h/w/d`
+    /// (`crc32b/h/w/x`); the result is the u32, zero-extended. IntTy is U64, so no pass takes
+    /// either operand for a narrow one (crc32x reads all of b). Arm only: x64 has no instruction
+    /// for this polynomial (std's aarch64 module computes it in software elsewhere)
+    Crc32B,
+    Crc32H,
+    Crc32W,
+    Crc32X,
+}
+
+impl IOp {
+    /// the payload bits of a Crc32 op (8, 16, 32, 64)
+    pub fn crc32_bits(self) -> Option<u8> {
+        match self {
+            IOp::Crc32B => Some(8),
+            IOp::Crc32H => Some(16),
+            IOp::Crc32W => Some(32),
+            IOp::Crc32X => Some(64),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

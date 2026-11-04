@@ -2832,6 +2832,17 @@ impl<'a> Gen<'a> {
         if self.vx_lanes(op, d, a, b) {
             return;
         }
+        if let VX::Clmul(k) = op {
+            // the selected 64-bit lanes into lane 0 of v4 / v5 (dup .2d), then pmull v.1q
+            let xa = self.use_f(a, FS0);
+            let xb = self.use_f(b, FS1);
+            self.v2(0x4E08_0400 | (k as u32 & 1) << 20, 4, xa);
+            self.v2(0x4E08_0400 | (k as u32 >> 1 & 1) << 20, 5, xb);
+            let xd = self.def_f(d, FS0);
+            self.v3(0x0EE0_E000, xd, 4, 5);
+            self.fin_f(d, xd);
+            return;
+        }
         // core::arch exposes Intel semantics on Arm too (check_arch's cross-ISA
         // fixtures exercise them). Keep these in hardware, with lane conversion.
         if matches!(op, VX::X86Sha1Rnds4(_) | VX::X86Sha1NextE | VX::X86Sha1Msg1
@@ -4509,6 +4520,17 @@ impl<'a> Gen<'a> {
     }
     /// `ext`: re-extend a narrow result (false: nobody reads its upper bits, passes::low_bits_only)
     fn ibin_rr(&mut self, op: IOp, it: IntTy, rd: u8, ra: u8, rb: u8, ext: bool) {
+        if let Some(n) = op.crc32_bits() {
+            // crc32b/h/w wd, wn, wm and crc32x wd, wn, xm: the W result zero-extends
+            let base = match n {
+                8 => 0x1AC0_4000u32,
+                16 => 0x1AC0_4400,
+                32 => 0x1AC0_4800,
+                _ => 0x9AC0_4C00,
+            };
+            self.a.rrr(base, rd, ra, rb);
+            return;
+        }
         if op == IOp::Bzhi {
             // ip0 = -1 << (b mod 64); rd = a & !ip0 (movn, lslv, bic)
             self.a.e(0x9280_0000 | IP0 as u32);
@@ -4553,7 +4575,7 @@ impl<'a> Gen<'a> {
             // smulh / umulh
             IOp::MulHi => self.a.rrr(if it.signed { 0x9B40_7C00 } else { 0x9BC0_7C00 }, rd, ra, rb),
             // handled at the top
-            IOp::Rotl | IOp::Bzhi => {}
+            IOp::Rotl | IOp::Bzhi | IOp::Crc32B | IOp::Crc32H | IOp::Crc32W | IOp::Crc32X => {}
             IOp::Rem => {
                 // q = a / b; d = a - q * b  (rd may alias ra or rb: compute q in IP0)
                 self.a.rrr(if it.signed { 0x9AC0_0C00 } else { 0x9AC0_0800 }, IP0, ra, rb);

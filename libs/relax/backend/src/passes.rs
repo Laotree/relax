@@ -165,8 +165,21 @@ pub fn rotl(bits: u8, a: u64, b: u64) -> u64 {
     if k == 0 { x } else { ((x << k) | (x >> (w - k))) & mask }
 }
 
+/// IOp::Crc32B/H/W/X (the semantics every backend implements): the low `bits` (8, 16, 32 or 64)
+/// of `data` folded bit by bit, least significant first, into the 32-bit crc in the low bits of
+/// `crc` with the reflected IEEE polynomial (0xEDB88320); no inversions. The result is the u32.
+pub fn crc32(bits: u8, crc: u64, data: u64) -> u64 {
+    let mut r = crc as u32;
+    for i in 0..bits.min(64) as u32 {
+        r ^= ((data >> i) & 1) as u32;
+        r = (r >> 1) ^ (0xEDB8_8320 & 0u32.wrapping_sub(r & 1));
+    }
+    r as u64
+}
+
 pub fn fold_ibin(op: IOp, it: IntTy, a: i64, b: i64) -> Option<i64> {
     let r = match op {
+        IOp::Crc32B | IOp::Crc32H | IOp::Crc32W | IOp::Crc32X => crc32(op.crc32_bits()?, a as u64, b as u64) as i64,
         IOp::Add => a.wrapping_add(b),
         IOp::Sub => a.wrapping_sub(b),
         IOp::Mul => a.wrapping_mul(b),

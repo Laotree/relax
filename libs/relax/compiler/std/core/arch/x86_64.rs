@@ -1093,21 +1093,7 @@ pub unsafe fn _mm_blendv_epi8(a: __m128i, b: __m128i, mask: __m128i) -> __m128i 
 
 #[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
 pub unsafe fn _mm_clmulepi64_si128<const IMM8: i32>(a: __m128i, b: __m128i) -> __m128i {
-    let x = a.0[(IMM8 & 1) as usize] as u64;
-    let y = b.0[((IMM8 >> 4) & 1) as usize] as u64;
-    let mut lo = 0u64;
-    let mut hi = 0u64;
-    let mut i = 0;
-    while i < 64 {
-        if (y >> i) & 1 != 0 {
-            lo ^= x << i;
-            if i != 0 {
-                hi ^= x >> (64 - i);
-            }
-        }
-        i += 1;
-    }
-    __m128i([lo as i64, hi as i64])
+    vx::vx_binary(a, b, 90 + ((IMM8 & 1) | ((IMM8 >> 3) & 2)) as u32, 64)
 }
 
 #[inline(always)]
