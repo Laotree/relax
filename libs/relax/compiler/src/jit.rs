@@ -8083,7 +8083,9 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
     main_rec(|r| r.ns[0] += wall_ns() - t);
     loop {
         let t = wall_ns();
-        let front = owner::call(class, || {
+        // (None: the front gave the owner back to waiting program requests, and the build it would
+        // have waited for there has ended since: owner::may_yield)
+        let Some(front) = owner::call_or_yield(class, || {
             main_rec(|r| r.ns[1] += wall_ns() - t);
             let w0 = wall_ns();
             COMPILE_LAST.store(w0, Ordering::Relaxed);
@@ -8101,7 +8103,9 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
                 compile_note(up, id, w0);
             }
             (r, w0)
-        });
+        }) else {
+            continue;
+        };
         let (work, w0) = match front {
             (Compiled::Code(a), _) => return a,
             (Compiled::Back(w), w0) => (w, w0),
@@ -8130,6 +8134,7 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
                     for &x in &in_flight {
                         u.fns[x as usize].inflight = false;
                     }
+                    INFLIGHT_GEN.fetch_add(1, Ordering::Release);
                 });
                 std::panic::resume_unwind(p)
             }
@@ -10846,7 +10851,25 @@ unsafe fn wait_inflight(up: *mut Unit, id: u32) {
     }
     let _priority = main_discovery().then(|| queue::promote(up as usize, id));
     owner::busy_if_nested();
-    owner::pump_wait(&|| !(&*up).fns[id as usize].inflight);
+    // a program thread's front gives the owner back rather than wait here while program requests
+    // queue (owner::may_yield): it asks again once a build ended. The generation is read before the
+    // flag, so a build that ends in between is not missed.
+    let gen = std::cell::Cell::new(0);
+    owner::pump_wait(&|| {
+        gen.set(INFLIGHT_GEN.load(Ordering::Acquire));
+        !(&*up).fns[id as usize].inflight || owner::may_yield()
+    });
+    if (&*up).fns[id as usize].inflight {
+        owner::yield_for_build(gen.get())
+    }
+}
+
+/// Bumped whenever slots stop being in flight (a back end's finish, a batch's end, a failed
+/// finish): a front that gave the owner back waits for it to move (owner::yield_for_build).
+static INFLIGHT_GEN: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn inflight_gen() -> u64 {
+    INFLIGHT_GEN.load(Ordering::Acquire)
 }
 
 crate::memo_local! {
@@ -21767,6 +21790,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
         for &x in &flight {
             u.fns[x as usize].inflight = false;
         }
+        INFLIGHT_GEN.fetch_add(1, Ordering::Release);
     }
     out
 }
@@ -22130,6 +22154,7 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
         for &x in &slots {
             u.fns[x as usize].inflight = false;
         }
+        INFLIGHT_GEN.fetch_add(1, Ordering::Release);
     }
     if stale {
         // a live patch landed while this back end ran: start over from the new source
@@ -24917,6 +24942,64 @@ mod own_work_tests {
         // asked again, it evaluates
         let a = crate::owner::call(crate::owner::Class::Job, || unsafe { (&mut *(up as *mut Unit)).const_addr(b, Vec::new()) }).expect("B has a value");
         assert_eq!(unsafe { *(a as *const u32) }, 6);
+        // (the isolated process owns the runtime globals)
+        std::mem::forget(u);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod front_yield_tests {
+    use super::*;
+
+    /// A live session's landing checks (program requests) waited 374-583 ms behind an app thread's
+    /// lazy compile whose front, on the owner, waited for back ends other threads ran (2026-11-04).
+    /// The front gives the owner back: a program request asked meanwhile is served while that build
+    /// is still in flight, and the front is asked again once the build ended.
+    #[test]
+    fn a_program_request_is_not_held_behind_a_front_waiting_for_a_build() {
+        isolated_test!(a_program_request_is_not_held_behind_a_front_waiting_for_a_build);
+        crate::borrowck::lazy::disable_gandalf();
+        let source = "#![no_std]\npub fn triple(x: u32) -> u32 { x * 3 }\n";
+        let path = std::env::temp_dir().join(format!("relax-front-yield-{}.rs", std::process::id()));
+        std::fs::write(&path, source).unwrap();
+        let session = std::sync::Arc::new(crate::Session::default());
+        let mut prog = Program::new(&session);
+        prog.load_crate("front_yield", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+        let triple = prog.defs.iter().enumerate().find_map(|(i, _)| (prog.name(DefId(i as u32)) == "triple").then_some(DefId(i as u32))).unwrap();
+        let mut tcx = Tcx::new();
+        tcx.collect(&prog);
+        let mut u = Unit::new(prog, tcx, 0);
+        let f = u.fn_id(FnKey::Inst(triple, Vec::new()));
+        let up = &mut *u as *mut Unit as usize;
+        // another thread's back end of `triple` runs off the unit
+        crate::owner::call(crate::owner::Class::Program, || unsafe { (&mut *(up as *mut Unit)).fns[f as usize].inflight = true });
+        // an app thread calls it: its front waits on the owner for that build
+        let app = std::thread::spawn(move || rt_compile_in(up, f as u64));
+        let owner = crate::owner::owner_tid();
+        while !crate::waits::of(owner).is_some_and(|w| w.kind == crate::waits::Kind::Pump) {
+            std::thread::yield_now();
+        }
+        // a program request meanwhile (a landing check): served while the build is in flight
+        let served = std::sync::Arc::new(AtomicBool::new(false));
+        let s = served.clone();
+        let check = std::thread::spawn(move || crate::owner::call(crate::owner::Class::Program, || unsafe {
+            s.store(true, Ordering::SeqCst);
+            (&*(up as *mut Unit)).fns[f as usize].inflight
+        }));
+        let t0 = std::time::Instant::now();
+        while !served.load(Ordering::SeqCst) {
+            assert!(t0.elapsed().as_secs() < 30, "the program request waited behind the front's wait for the build");
+            std::thread::yield_now();
+        }
+        assert!(check.join().unwrap(), "served before the build ended");
+        // the build ends (its finish): the front is asked again and builds `triple` itself
+        crate::owner::publish(|| unsafe {
+            (&mut *(up as *mut Unit)).fns[f as usize].inflight = false;
+            INFLIGHT_GEN.fetch_add(1, Ordering::Release);
+        });
+        assert_ne!(app.join().unwrap(), 0);
+        assert!(u.fns[f as usize].build_err.is_none(), "{:?}", u.fns[f as usize].build_err);
         // (the isolated process owns the runtime globals)
         std::mem::forget(u);
         let _ = std::fs::remove_file(&path);
