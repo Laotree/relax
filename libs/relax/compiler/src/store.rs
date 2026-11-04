@@ -1061,6 +1061,14 @@ pub fn lock_builds(dir: &Path) -> Vec<u64> {
         .collect()
 }
 
+/// Whether a process of `build` is running here (its live lock in `dir` is held).
+pub fn build_runs(dir: &Path, build: u64) -> bool {
+    let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).open(live_lock(dir, build)) else { return false };
+    let held = f.try_lock().is_err();
+    let _ = f.unlock();
+    held
+}
+
 /// When no process of `build` is running (its live lock in `dir` is free), runs `retire` under
 /// that lock held exclusively, then removes the lock file; false: the build is running.
 pub fn retire_build(dir: &Path, build: u64, retire: impl FnOnce()) -> bool {
