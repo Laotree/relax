@@ -826,7 +826,7 @@ impl<'a> OpenFrom<'a> {
     /// `u`'s settings with program `prog` and types `tcx` (the same program: a settle rebuild's
     /// new state)
     pub fn with(u: &Unit, prog: &'a crate::program::Program, tcx: &'a crate::tcx::Tcx) -> Self {
-        OpenFrom { prog, tcx, opt: u.opt.clone(), tier1: u.tier1.is_some(), global_allocator: crate::jit::global_allocator_static_of(prog),
+        OpenFrom { prog, tcx, opt: u.opt.clone(), tier1: u.tier1.is_some(), global_allocator: crate::jit::global_allocator_static_of(prog, u.aux),
             provided: u.provided.iter().map(|(k, pc)| (*k, pc.binding)).collect() }
     }
 }

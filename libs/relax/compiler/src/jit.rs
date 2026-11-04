@@ -5097,7 +5097,7 @@ impl Unit {
 
     /// The `#[global_allocator]` static (global_allocator without its type).
     pub fn global_allocator_static(&self) -> Option<DefId> {
-        global_allocator_static_of(&self.prog)
+        global_allocator_static_of(&self.prog, self.aux)
     }
 
     /// Whether `d` is one of the fns whose bodies call the allocator shim (core::heap's alloc,
@@ -26541,15 +26541,14 @@ pub fn global_allocator_linked_by(prog: &crate::program::Program, krate: u32) ->
     })
 }
 
-/// The `#[global_allocator]` static of program `prog`
-pub fn global_allocator_static_of(prog: &crate::program::Program) -> Option<DefId> {
-    (0..prog.defs.len() as u32).map(DefId).find(|&d| {
-        let def = prog.def(d);
-        def.kind == DefKind::Static && prog.item_defs.get(&(def.file, def.item.0)) == Some(&d) && {
-            let ast = &prog.files[def.file as usize].ast;
-            crate::lang_items::has_attr(prog, def.file, ast.list(ast.item(def.item).attrs), "global_allocator")
-        }
-    })
+/// The `#[global_allocator]` static of program `prog`: the one its binary links, the root crate
+/// (its main's, or the one test target a `makepad test` process runs out of its package's test
+/// graph, run.rs --subject: each target links its own, as each is a binary of its own under
+/// cargo). An auxiliary unit's program (`aux`, the proc-macro world) links none: its macros run
+/// on the host's allocator, as they run inside rustc.
+pub fn global_allocator_static_of(prog: &crate::program::Program, aux: bool) -> Option<DefId> {
+    if aux { return None; }
+    global_allocator_linked_by(prog, crate::layout::root_crate())
 }
 
 /// A job the worker was admitted for a moment ago (its admission was its checkpoint).

@@ -580,7 +580,9 @@ pub(crate) fn resolve_package(
         // resolve and a failing hash all end here.
         let later = bind && boot && !check_only;
         let pkgs = std::sync::Arc::new(pkgs);
-        if !bind { crate::provided::read_identity_files(&pkgs); }
+        // a run that binds nothing reads the identity files only for the read log (`pack-src`): a
+        // test harness or a check would hash every provided crate's closure for nothing
+        if !bind && crate::vfs::recording() { crate::provided::read_identity_files(&pkgs); }
         if later { crate::provided::check_sources_later(pkgs.clone()); }
         let (sources, scripts, scripts_ms, wait_ms) = std::thread::scope(|scope| {
             let sources = (bind && !later).then(|| scope.spawn(|| {
@@ -719,7 +721,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mut self_exec = false;
     let mut live_tests = false;
     let mut test_restart = None;
-    let mut plain_test: Option<String> = None;
+    let mut plain_test = false;
+    let mut subject: Option<String> = None;
     let mut cargo_flags = Vec::new();
     let mut i = 0;
     while i < args.len() && args[i].starts_with("--") {
@@ -754,13 +757,19 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 test_restart = Some(args[i].as_str());
             }
             "--no-fail-fast" => {}
-            // `makepad test`'s run of one `harness = false` target (test_pkg.rs): cargo builds it
-            // with `--cfg test` but no `--test` and runs it as a plain program, its exit status
-            // the verdict; the value is the target's source path
-            "--plain-test" if i + 1 < args.len() => {
-                plain_test = Some(args[i + 1].clone());
-                i += 1;
+            // `makepad test`'s run of one `harness = false` target (test_pkg.rs, its --subject):
+            // cargo builds it with `--cfg test` but no `--test` and runs it as a plain program,
+            // its exit status the verdict
+            "--plain-test" => {
+                plain_test = true;
                 HARNESS_RUN.store(true, Ordering::Release);
+            }
+            // `makepad test`: the one target this process runs out of the package's test graph
+            // (its bins' unit tests and integration tests are one program, test_pkg.rs), by its
+            // source path
+            "--subject" if i + 1 < args.len() => {
+                subject = Some(args[i + 1].clone());
+                i += 1;
             }
             // `makepad selftest --root-only`: the root crate's fns and what they reach
             "--root-only" => root_only = true,
@@ -873,7 +882,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         jit::FAULTS_FATAL.store(false, Ordering::Relaxed);
     }
     // a test harness is a terminal program: no progress line
-    let hosted = !entries.is_empty() || !export_names.is_empty() || harness || plain_test.is_some();
+    let hosted = !entries.is_empty() || !export_names.is_empty() || harness || plain_test;
     // the `unused_macros` lints need the macro uses of the whole load
     if check { relax_types::macros::uses::record(true); relax_front::program::set_record_import_uses(true); }
     // Android: stderr is the embedder's pipe into logcat, line by line; the session-log tee in
@@ -888,14 +897,14 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // A store run whose embedder writes pushed sources into its edits folder (the Android host's
     // devhub store applier) asks for a live session with MAKEPAD_RUN_STORE_LIVE=1.
     let store_live = std::env::var_os("MAKEPAD_RUN_STORE_LIVE").is_some_and(|v| v == "1") && crate::vfs::edits_enabled();
-    if live_tests || !check && !harness && plain_test.is_none() && !no_live && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none() && !SILENT.load(Ordering::Relaxed)
+    if live_tests || !check && !harness && !plain_test && !no_live && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none() && !SILENT.load(Ordering::Relaxed)
         && (store_live || !crate::vfs::is_virtual(&workspace_dir())) {
         driver_options.live = true;
     }
     LIVE_SESSION.store(driver_options.live, Ordering::Release);
     // a live run parks a call of code that does not compile until a live edit fixes it (jit.rs
     // PARK_COMPILE_ERRORS); a test, a check and a run nothing can patch keep the error fatal
-    jit::PARK_COMPILE_ERRORS.store(driver_options.live && !live_tests && !check && !harness && plain_test.is_none(), Ordering::Relaxed);
+    jit::PARK_COMPILE_ERRORS.store(driver_options.live && !live_tests && !check && !harness && !plain_test, Ordering::Relaxed);
     // `--cfg <name>` / `--cfg=<name>` among the cargo flags (`makepad run <pkg> --cfg custom`) or
     // before the package: extra cfgs for the program's crates, not cargo flags
     let mut cargo_flags_in: Vec<String> = Vec::new();
@@ -966,7 +975,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let package = args[i].clone();
     // makepad inspect: the program answers questions from now on (compiles included)
     if !check && session.is_none() && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none() {
-        if harness || plain_test.is_some() {
+        if harness || plain_test {
             // a run that hangs answers `devhub inspect <node>/<pid> why-hung`
             crate::inspect::start_for_test(&package);
         } else if !hosted {
@@ -979,7 +988,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         cargo_flags.push(args[k].clone());
         k += 1;
     }
-    if (harness || plain_test.is_some()) && cargo_flags.iter().any(|f| f == "--bin" || f.starts_with("--bin=")) && !cargo_flags.iter().any(|f| f == "--bins") {
+    if (harness || plain_test) && cargo_flags.iter().any(|f| f == "--bin" || f.starts_with("--bin=")) && !cargo_flags.iter().any(|f| f == "--bins") {
         cargo_flags.push("--bins".to_string());
     }
     if k < args.len() {
@@ -1033,7 +1042,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             }
         }
         // Re-runs made by std::process share the parent's dependency check.
-        if (harness || plain_test.is_some()) && !pre.iter().any(|a| a == "--self-exec") {
+        if (harness || plain_test) && !pre.iter().any(|a| a == "--self-exec") {
             let at = if pre.get(2).is_some_and(|a| a == "--silent") { 3 } else { 2 };
             pre.insert(at, "--self-exec".to_string());
         }
@@ -1078,6 +1087,28 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             report_failed(&e, 1);
             return 1;
         }
+    };
+    // a test process's target (test_subjects): its --subject in a graph of several test targets
+    // (test_pkg.rs), else the graph's one (the lib's unit tests); the graph's other targets are
+    // loaded with it (one program, one collected image) and never run here
+    let subject_ci = if harness || plain_test {
+        let canon = |p: &str| std::fs::canonicalize(p).map(|c| c.display().to_string()).unwrap_or_else(|_| p.to_string());
+        match &subject {
+            Some(path) => match g.bins.iter().copied().find(|&ci| canon(&g.crates[ci].src_path) == canon(path)) {
+                Some(ci) => ci,
+                None => {
+                    eprintln!("makepad-run: --subject {path}: no test target of {package}'s graph has that source");
+                    return 101;
+                }
+            },
+            None if g.bins.len() > 1 => {
+                eprintln!("makepad-run: {package}'s test graph has {} targets: name the one to run with --subject <its source path> (`makepad test` runs each)", g.bins.len());
+                return 2;
+            }
+            None => g.root,
+        }
+    } else {
+        g.root
     };
     let mut also_graph = Vec::new();
     for name in &also {
@@ -1173,7 +1204,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     crate::borrowck::event::set_app_scope(app_roots);
     // `makepad check` and `makepad test`'s up-front check borrow-check crates outside the app
     // scope (a package under libs/): they keep their user-written types
-    if check || harness || plain_test.is_some() { crate::borrowck::event::set_check_scope(); }
+    if check || harness || plain_test { crate::borrowck::event::set_check_scope(); }
     jit::settle_rebuild::remember_boot(&pre);
     prog.record_front = front_images.is_some();
     prog.front_sink = front_images.as_ref().and_then(|images| images.sink());
@@ -1415,7 +1446,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
     }
     if load_errors > 0 && !watch {
-        return 1;
+        // a test target's program: its other targets (test_pkg.rs) would end the same way
+        return if harness || plain_test { makepad_remote::hot::LOAD_ERROR_EXIT } else { 1 };
     }
     {
         // what the unit holds, by identity: a domain started later shares these crates (domain.rs)
@@ -1426,7 +1458,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             }
         }
     }
-    let root = crate_of[g.root];
+    let root = crate_of[subject_ci];
     if root == u32::MAX {
         eprintln!("makepad-run: the package root did not load");
         return 1;
@@ -1485,28 +1517,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     // `makepad test`: the crates under test are checked as `cargo test` compiles them before any
     // test runs (test_subjects); marked before declaration collection, as a check marks its crates
-    let test_subjects: Vec<u32> = if (harness || plain_test.is_some()) && !check {
-        let mut v = vec![root];
-        v.extend(g.bins.iter().map(|&b| crate_of[b]).filter(|&k| k != u32::MAX && k != root));
-        v.sort_unstable();
-        v.dedup();
-        v
-    } else {
-        Vec::new()
-    };
-    if live_tests && test_subjects.len() != 1 {
-        eprintln!("makepad test --live: select exactly one target (--lib, --bin <name> or --test <name>)");
-        return 2;
-    }
-    // Every test target is a binary of its own (cargo builds and runs each apart), and a process
-    // has one global allocator: targets that link different `#[global_allocator]`s cannot share
-    // this program, so each runs as a `makepad test` run of its own
-    if harness && test_subjects.len() > 1 {
-        let first = jit::global_allocator_linked_by(&prog, test_subjects[0]);
-        if test_subjects.iter().any(|&k| jit::global_allocator_linked_by(&prog, k) != first) {
-            return run_targets_apart(&g, &units, &crate_of, root);
-        }
-    }
+    let test_subjects: Vec<u32> = if (harness || plain_test) && !check { vec![root] } else { Vec::new() };
     if !test_subjects.is_empty() {
         let mut own = vec![false; prog.crates.len()];
         for &k in &test_subjects { prog.crates[k as usize].validate = true; own[k as usize] = true; }
@@ -1653,18 +1664,11 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     let main_def = if exports_mode || harness {
         None
-    } else if let Some(path) = &plain_test {
-        let canon = |p: &str| std::fs::canonicalize(p).map(|c| c.display().to_string()).unwrap_or_else(|_| p.to_string());
-        let want = canon(path);
-        let Some(ci) = (0..g.crates.len()).find(|&ci| crate_of[ci] != u32::MAX && canon(&g.crates[ci].src_path) == want) else {
-            // not in the graph: its `required-features` are off (cargo builds and runs nothing)
-            verbose!("makepad-run: {path}: not built (its required features are off)");
-            return 0;
-        };
-        match find_main(&prog, crate_of[ci]) {
+    } else if plain_test {
+        match find_main(&prog, root) {
             Some(d) => Some(d),
             None => {
-                eprintln!("makepad-run: the `harness = false` target {path} has no `fn main` at its root");
+                eprintln!("makepad-run: the `harness = false` target {} has no `fn main` at its root", g.crates[subject_ci].src_path);
                 return 101;
             }
         }
@@ -1818,9 +1822,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                     std::fs::canonicalize(p).map(|c| c.display().to_string()).unwrap_or_else(|_| p.to_string())
                 }
                 let std_dir = format!("{}/", canon(&crate::std_dir()).trim_end_matches('/'));
+                // the subject's dependencies (a test graph's other targets are not its)
                 let mut crates: Vec<u32> = candidates.into_iter().filter(|k| {
                     let c = &prog.crates[*k as usize];
-                    !subjects.contains(k) && !c.proc_macro
+                    !subjects.contains(k) && subjects.iter().any(|&s| prog.crate_sees(s, *k)) && !c.proc_macro
                         && !matches!(prog.syms.str(c.name), "core" | "alloc" | "std" | "proc_macro")
                         && !canon(c.root_path()).starts_with(&std_dir)
                 }).collect();
@@ -1830,7 +1835,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             }, names, runtime);
         }
         // a `harness = false` target is a program: a compile error it reaches ends it (rustc rejects it)
-        if plain_test.is_some() {
+        if plain_test {
             jit::COMPILE_ERRORS_FATAL.store(true, Ordering::Relaxed);
         }
     } else if !harness && !exports_mode && hal_window_pending() {
@@ -2012,7 +2017,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     jit::start_completion(up);
     // the dependencies' bodies no build asked for are type-checked after the first frame
-    if !harness && plain_test.is_none() { crate::typeck_bg::start(up, root, main_def); }
+    if !harness && !plain_test { crate::typeck_bg::start(up, root, main_def); }
     let platform = u.prog.crates.iter().any(|c| u.prog.syms.str(c.name) == "makepad_platform");
     jit::live_needs_present(!live_tests && platform);
     // a test harness never presents, nor does a program without the platform: no startup to wait out
@@ -2142,14 +2147,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             let is_test_target = units.units.iter().any(|u| &u.src_path == p && u.kind.iter().any(|k| k == "test"));
             if is_test_target { rel.to_string() } else { format!("unittests {rel}") }
         };
-        let mut groups = vec![(label(g.root), root)];
-        for &b in &g.bins {
-            if b != g.root && crate_of[b] != u32::MAX {
-                groups.push((label(b), crate_of[b]));
-            }
-        }
-        groups.sort();
-        let code = crate::harness::run(&mut u, up, &groups);
+        let code = crate::harness::run(&mut u, up, &[(label(subject_ci), root)]);
         let code = crate::check::finish_test_deps(code);
         flush_errors(true);
         std::mem::forget(u);
@@ -2324,61 +2322,6 @@ static HARNESS_RUN: AtomicBool = AtomicBool::new(false);
 /// target of the graph again in a run of its own (this command line with that one target
 /// selected), one after the other; their combined verdict. The root lib (an integration test
 /// graph's plain lib) has no tests of its own and is not run.
-fn run_targets_apart(g: &unitgraph::Graph, units: &unitgraph::Units, crate_of: &[u32], root: u32) -> i32 {
-    let raw: Vec<String> = crate::os::proc::args_bytes().iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
-    let dash = raw.iter().position(|a| a == "--").unwrap_or(raw.len());
-    // the command line without its target selection
-    let mut base: Vec<String> = Vec::new();
-    let mut i = 1;
-    while i < dash {
-        let a = raw[i].as_str();
-        if matches!(a, "--lib" | "--bins" | "--tests") || a.starts_with("--test=") || a.starts_with("--bin=") {
-        } else if matches!(a, "--test" | "--bin") {
-            i += 1;
-        } else {
-            base.push(raw[i].clone());
-        }
-        i += 1;
-    }
-    let Ok(exe) = std::env::current_exe() else {
-        eprintln!("makepad test: the loader's own path is unknown");
-        return 101;
-    };
-    let mut code = 0;
-    let mut cis: Vec<usize> = std::iter::once(g.root).chain(g.bins.iter().copied()).collect();
-    cis.dedup();
-    for ci in cis {
-        let k = crate_of[ci];
-        let p = &g.crates[ci].src_path;
-        let Some(unit) = units.units.iter().find(|u| &u.src_path == p && u.kind.iter().any(|t| t == "test" || t == "bin")) else {
-            // the lib: a run of its unit tests is its own `--lib` selection
-            if k != root || !raw[1..dash].iter().any(|a| a == "--lib") { continue }
-            code = code.max(run_apart(&exe, &base, &["--lib".to_string()], &raw[dash..]));
-            continue;
-        };
-        let sel = if unit.kind.iter().any(|t| t == "test") {
-            vec!["--test".to_string(), unit.name.clone()]
-        } else {
-            vec!["--bins".to_string(), "--bin".to_string(), unit.name.clone()]
-        };
-        code = code.max(run_apart(&exe, &base, &sel, &raw[dash..]));
-    }
-    code
-}
-
-fn run_apart(exe: &std::path::Path, base: &[String], sel: &[String], tail: &[String]) -> i32 {
-    let status = std::process::Command::new(exe).args(base).args(sel).args(tail)
-        .env_remove("MAKEPAD_RUN_SELF_EXEC").env_remove("MAKEPAD_RUN_SELF_EXEC_SILENT_ADDED").status();
-    match status {
-        Ok(s) if s.success() => 0,
-        Ok(_) => 101,
-        Err(e) => {
-            eprintln!("makepad test: starting {}: {e}", exe.display());
-            101
-        }
-    }
-}
-
 /// `makepad test`: the crates under test (the lib or bins built cfg(test), the integration test
 /// targets) are type- and borrow-checked whole before any test runs, as `cargo test` compiles
 /// them first: an unresolved import or a type error anywhere in them fails the run, not only the

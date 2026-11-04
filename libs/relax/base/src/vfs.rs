@@ -62,6 +62,12 @@ pub fn record_from_env() -> Result<(), String> {
     Ok(())
 }
 
+/// Whether this process records its reads (MAKEPAD_RUN_READ_LOG): reads made only for the log
+/// (provided::read_identity_files) are skipped when it does not.
+pub fn recording() -> bool {
+    RECORDING.load(Ordering::Acquire)
+}
+
 fn note(kind: u8, path: &std::path::Path) {
     if !RECORDING.load(Ordering::Relaxed) {
         return;

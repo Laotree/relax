@@ -160,6 +160,10 @@ pub const JIT_ERROR_EXIT: i32 = 86;
 /// all its targets).
 pub const NO_TESTS_EXIT: i32 = 87;
 
+/// A test target whose program did not load (a file that does not parse): `makepad test` stops,
+/// as the package's other targets of that program would end the same way.
+pub const LOAD_ERROR_EXIT: i32 = 88;
+
 /// `makepad test` tells each target's harness it sums the verdict over the targets: one of
 /// several may match no test.
 pub const TEST_PACKAGE_ENV: &str = "MAKEPAD_TEST_PACKAGE";
