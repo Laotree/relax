@@ -5446,6 +5446,77 @@ pub fn sink_branch_compares(options: &relax_session::Options, f: &Func) -> Optio
     g
 }
 
+/// Selects on one condition next to each other: a later `Sel` on c moves up to right after the
+/// first one in its block when nothing it passes defines its operands or touches its result, and
+/// no call is passed. `x.min(y)` and `x.max(y)` (one compare, two selects) with arithmetic between
+/// them otherwise made x64 materialise the condition (setcc + movzx) and test it again for the
+/// second cmov (the arithmetic sets the flags); adjacent, both cmovs read the compare's flags.
+pub fn pair_selects(f: &Func) -> Option<Func> {
+    let mut g: Option<Func> = None;
+    for bi in 0..f.blocks.len() {
+        let mut i = 0;
+        loop {
+            let b = g.as_ref().map_or(&f.blocks[bi], |x| &x.blocks[bi]);
+            let n = b.insts.len();
+            if i >= n {
+                break;
+            }
+            let Inst::Sel(_, c, _, _) = b.insts[i] else {
+                i += 1;
+                continue;
+            };
+            // the run of selects on c that starts here
+            let mut end = i + 1;
+            while end < n && matches!(b.insts[end], Inst::Sel(_, c2, _, _) if c2 == c) {
+                end += 1;
+            }
+            let mut k = end;
+            let mut moved = None;
+            while k < n {
+                let inst = &b.insts[k];
+                if matches!(inst, Inst::Call(..)) {
+                    break;
+                }
+                let mut redef_c = false;
+                for_defs(inst, |d| redef_c |= d == c);
+                if redef_c {
+                    break;
+                }
+                if let Inst::Sel(d, c2, x, y) = *inst {
+                    if c2 == c {
+                        let blocked = (end..k).any(|j| {
+                            let mut bad = false;
+                            for_defs(&b.insts[j], |w| bad |= w == x || w == y || w == d);
+                            for_uses(&b.insts[j], |u| bad |= u == d);
+                            bad
+                        });
+                        if !blocked {
+                            moved = Some(k);
+                            break;
+                        }
+                    }
+                }
+                k += 1;
+            }
+            match moved {
+                Some(k) => {
+                    let gf = g.get_or_insert_with(|| f.clone());
+                    let blk = &mut gf.blocks[bi];
+                    let inst = blk.insts.remove(k);
+                    blk.insts.insert(end, inst);
+                    if blk.pos.len() == n {
+                        let p = blk.pos.remove(k);
+                        blk.pos.insert(end, p);
+                    }
+                    // look at the grown run again
+                }
+                None => i = end,
+            }
+        }
+    }
+    g
+}
+
 pub fn sink_compares(f: &Func) -> Option<Func> {
     let mut g: Option<Func> = None;
     for bi in 0..f.blocks.len() {
