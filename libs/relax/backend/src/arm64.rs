@@ -126,6 +126,21 @@ pub fn reg_config() -> RegConfig {
     }
 }
 
+/// Instructions whose code leaves the condition flags alone (no compare, test or flag-setting
+/// form in any of their lowerings): a compare's selects read its flags across them. Plain integer
+/// add / sub / mul / logic / shifts (W and X forms), int conversions, float add / sub / mul / div,
+/// constants and copies.
+/// (`m = min(a, b); t = m - p; n = max(a, b)` was `cmp; cset; csel; sub; cmp #0; csel`.)
+fn keeps_flags(i: &Inst) -> bool {
+    match i {
+        Inst::IBin(op, it, ..) | Inst::IBinI(op, it, ..) => (it.bits == 64 || *it == U32) && matches!(op, IOp::Add | IOp::Sub | IOp::Mul | IOp::And | IOp::Or | IOp::Xor | IOp::Shl | IOp::Shr),
+        Inst::Conv(Conv::IntToF(..) | Conv::IntToInt(_), ..) => true,
+        Inst::FBin(FOp::Add | FOp::Sub | FOp::Mul | FOp::Div, ..) => true,
+        Inst::Iconst(..) | Inst::Mov(..) => true,
+        _ => false,
+    }
+}
+
 /// RegConfig::defers: the pairs the block loop emits at the second instruction's position --
 /// a constant shift into the next add / sub / and / orr / eor (shifted_operand), a 64-bit multiply
 /// into the next add / sub or indexed access (mul_add), a byte / bit reverse into the next
@@ -1411,9 +1426,10 @@ impl<'a> Gen<'a> {
                         }
                     }
                 }
-                // only selects continue a chain; checked before any instruction is skipped or
-                // fused into the terminator (a fused compare rewrites the flags)
-                if !matches!(inst, Inst::Sel(..)) {
+                // only selects (and what leaves the flags alone) continue a chain; checked before
+                // any instruction is skipped or fused into the terminator (a fused compare
+                // rewrites the flags)
+                if !matches!(inst, Inst::Sel(..)) && !keeps_flags(inst) {
                     self.sel_chain = None;
                 }
                 if fused && ii == n - 1 {
@@ -1481,16 +1497,27 @@ impl<'a> Gen<'a> {
                     }
                     continue;
                 }
-                // a compare feeding the selects right after it: they read its flags (nothing between
-                // them sets flags); when they are all its uses, the bool is never materialised
-                // (`cmp; cset; cmp #0; csel` was `cmp; csel`: Paeth's lo / hi / thresh selects)
+                // a compare feeding the selects after it: they read its flags (nothing between them
+                // sets flags: other selects of it, keeps_flags instructions); when they are all its
+                // uses, the bool is never materialised (`cmp; cset; cmp #0; csel` was `cmp; csel`:
+                // Paeth's lo / hi / thresh selects, a min and max of one compare)
                 if let Inst::ICmp(_, _, d, ..) | Inst::ICmpI(_, _, d, ..) | Inst::FCmp(_, _, d, ..) = inst {
-                    let mut k = 0;
-                    while ii + 1 + k < n && !(fused && ii + 1 + k == n - 1) {
-                        match &b.insts[ii + 1 + k] {
+                    let (mut k, mut span) = (0, 0);
+                    while ii + 1 + span < n && !(fused && ii + 1 + span == n - 1) {
+                        let next = &b.insts[ii + 1 + span];
+                        match next {
                             Inst::Sel(sd, c, x, y) if c == d && x != d && y != d && sd != d => k += 1,
+                            _ if keeps_flags(next) => {
+                                let (mut reads, mut sets) = (false, false);
+                                regalloc::for_uses(next, |u| reads |= u == *d);
+                                regalloc::for_defs(next, |v| sets |= v == *d);
+                                if reads || sets {
+                                    break;
+                                }
+                            }
                             _ => break,
                         }
+                        span += 1;
                     }
                     if k > 0 {
                         if self.al.uses[d.0 as usize] as usize == k {
@@ -4465,8 +4492,9 @@ impl<'a> Gen<'a> {
                     }
                 };
                 if self.cls(*d) == Cls::I {
-                    let ra = self.use_i(*a, S0);
-                    let rb = self.use_i(*b, S1);
+                    // (a 0 is xzr: register 31 in csel's operands)
+                    let ra = if self.zero_val[a.0 as usize] { ZR } else { self.use_stored(*a, S0) };
+                    let rb = if self.zero_val[b.0 as usize] { ZR } else { self.use_stored(*b, S1) };
                     let rd = self.def_i(*d, S0);
                     self.a.csel(rd, ra, rb, cond);
                     self.fin_i(*d, rd);
