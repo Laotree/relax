@@ -3133,6 +3133,12 @@ pub fn forward_slot_loads(f: &mut Func) -> bool {
     let may_write = |i: &Inst, a: &At, k: i64| -> bool {
         let tgt = |b: VReg, off: i64, n: i64| -> bool {
             let (s, o) = vs[b.0 as usize];
+            if s != NONE && s == a.slot {
+                // the same slot at known offsets: the bytes decide, escaped or not (an array
+                // also read at a runtime index: its element stores, then the reads of
+                // elements 0 and 1, each behind the stores of the others)
+                return o + off < a.soff + k && a.soff < o + off + n;
+            }
             if a.slot != NONE && !esc[a.slot as usize] {
                 // a non-escaping slot: only its own address writes it
                 return s == a.slot && o + off < a.soff + k && a.soff < o + off + n;
@@ -3147,7 +3153,8 @@ pub fn forward_slot_loads(f: &mut Func) -> bool {
             Inst::Store(m, b, off, _) => tgt(*b, *off as i64, mem_size(*m) as i64),
             Inst::VStore(b, off, _) => tgt(*b, *off as i64, 16),
             Inst::Copy(d, _, n) => tgt(*d, 0, *n as i64),
-            Inst::StoreX(_, b, ..) => tgt(*b, 0, i64::MAX / 4) || vs[b.0 as usize].0 == NONE,
+            // (a runtime index may reach below its base too)
+            Inst::StoreX(_, b, ..) => tgt(*b, i64::MIN / 4, i64::MAX / 2) || vs[b.0 as usize].0 == NONE,
             _ if is_mem_effect(i) => !(a.slot != NONE && !esc[a.slot as usize]),
             _ => false,
         }
