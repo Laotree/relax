@@ -2608,8 +2608,10 @@ fn region_windows_alloc(
             }
         }
     }
-    // blocks the emitters may skip (only moves, then a jump: x64 / arm64 jump threading sends
-    // their predecessors straight on) or that start no code are never in a region
+    // blocks the emitters may skip (only moves, then a jump: x64 jump threading sends their
+    // predecessors straight on) or that start no code never load at their start: they are in a
+    // region only where every predecessor holds the value or loads it at its end (a hot loop's
+    // move-only latch left out broke the region at the header: one load per iteration)
     let skippable: Vec<bool> = f.blocks.iter().map(|b| b.insts.is_empty() || (matches!(b.term, Term::Jump(_)) && b.insts.iter().all(|i| matches!(i, Inst::Mov(..))))).collect();
     let preds = preds_of(f, reach);
     // a predecessor ending in an invoke reaches its successors (the landing pad) after a call
@@ -2653,7 +2655,6 @@ fn region_windows_alloc(
             .iter()
             .filter(|(b, ps)| {
                 reach[*b as usize]
-                    && !skippable[*b as usize]
                     && match def_in.get(&(v, *b)) {
                         None => live_in(*b, ps),
                         Some(ok) => *ok,
@@ -2720,12 +2721,12 @@ fn region_windows_alloc(
                 Some(at_end)
             };
             // drop blocks that only load for nothing (no use, no definition, and a load of their
-            // own needed) until stable. Dropping a block only makes its successors' loads more
-            // needed (more predecessors outside), so a worklist over the successors of dropped
-            // blocks reaches the same fixpoint (a round-by-round rescan cascaded one block per
-            // round along chains)
+            // own needed), and skippable blocks that would load at their start, until stable.
+            // Dropping a block only makes its successors' loads more needed (more predecessors
+            // outside), so a worklist over the successors of dropped blocks reaches the same
+            // fixpoint (a round-by-round rescan cascaded one block per round along chains)
             {
-                let idle = |b: u32| !used.contains_key(&b) && !def_in.contains_key(&(v, b));
+                let idle = |b: u32| skippable[b as usize] || (!used.contains_key(&b) && !def_in.contains_key(&(v, b)));
                 let mut inset_h: std::collections::HashSet<u32> = set.iter().copied().collect();
                 let mut queue: Vec<u32> = set.iter().copied().filter(|b| idle(*b)).collect();
                 while let Some(b) = queue.pop() {
