@@ -372,6 +372,9 @@ pub struct Unit {
     /// their handle structs' field offsets as rustc lays them out, in declaration order (the
     /// `#[relax_api(handle)]` entry): the fields JIT code may reach there (provided_handle_field)
     pub provided_offsets: HashMap<DefId, &'static [u64]>,
+    /// whether the two stds lay out String / Vec alike (provided::std_same): worked out on the
+    /// first projection into an opaque handle's field that is neither plain data nor a handle
+    provided_std_same: std::sync::OnceLock<Option<crate::provided::StdSame>>,
     /// types whose values cross the provided-crate boundary (provided::crossing_types): worked out
     /// on the first query (`provided_shared`), which only a provided-crate misuse makes
     provided_shared: std::sync::OnceLock<std::collections::HashSet<TyId>>,
@@ -4018,6 +4021,7 @@ impl Unit {
             provided,
             provided_types,
             provided_offsets,
+            provided_std_same: std::sync::OnceLock::new(),
             lay: { let mut l = crate::layout::Layouts::new(); l.opaque = opaque_layouts; l },
             fns: crate::conc::AppendVec::new_slots(u32::MAX as usize + 1),
             reload_slots: Default::default(),
@@ -4330,16 +4334,23 @@ impl Unit {
 
     /// Field `fi` (of type `ft`) of a provided crate's opaque handle struct `d`, as JIT-compiled
     /// code may reach it (lower.rs project): rustc's offset of the field (the handle's entry),
-    /// when the field is the same bytes on both sides (provided::trusted: plain data, pointers to
-    /// the crate's values) or is itself a provided handle (a place: what JIT code does with it
-    /// goes through the crate's fns, or through this rule again). None: the field's bytes are
-    /// rustc's alone (its std's HashMap, Vec, ..): only the crate's fns read it. (A handle is
-    /// opaque as a whole when any field differs; compute_program's driver sets two bool fields
-    /// of ScriptVmBase, whose HashMap/Vec fields keep it opaque.)
+    /// when the field is the same bytes on both sides (provided::handle_field_same: plain data,
+    /// pointers to the crate's values, a String or Vec of such data when the two stds lay them
+    /// out alike) or is itself a provided handle (a place: what JIT code does with it goes
+    /// through the crate's fns, or through this rule again). None: the field's bytes are rustc's
+    /// alone (its std's HashMap, ..): only the crate's fns read it. (A handle is opaque as a
+    /// whole when any field differs; compute_program's driver sets two bool fields of
+    /// ScriptVmBase, whose HashMap fields keep it opaque; makepad-script-test reads
+    /// ScriptTokenizer's `tokens`.)
     pub(crate) fn provided_handle_field(&self, d: DefId, fi: u32, ft: TyId) -> Option<u32> {
         let off = *self.provided_offsets.get(&d)?.get(fi as usize)?;
+        let krate = self.prog.def(d).krate;
         let handle = matches!(self.tcx.tys.kind(ft), TyKind::Adt(fd, a, _) if a.is_empty() && self.provided_types.contains_key(fd));
-        (handle || crate::provided::trusted(&self.prog, &self.tcx, self.prog.def(d).krate, ft, 0)).then_some(off as u32)
+        if handle || crate::provided::trusted(&self.prog, &self.tcx, krate, ft, 0) {
+            return Some(off as u32);
+        }
+        let std_same = *self.provided_std_same.get_or_init(|| crate::provided::std_same(&self.prog, &self.tcx));
+        crate::provided::handle_field_same(&self.prog, &self.tcx, krate, ft, std_same, &|x| self.provided_rustc_layout(x), &|x| self.lay.opaque.contains_key(&x)).then_some(off as u32)
     }
 
         /// Does a value of type `t` cross the provided-crate boundary? Worked out for every provided
