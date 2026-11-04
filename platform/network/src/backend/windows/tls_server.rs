@@ -172,7 +172,7 @@ extern "system" {
     fn CertSetCertificateContextProperty(cert: *const c_void, prop: u32, flags: u32, data: *const c_void) -> i32;
 }
 
-#[link(name = "ncrypt")]
+#[link(name = "ncrypt", kind = "raw-dylib")]
 extern "system" {
     fn NCryptOpenStorageProvider(provider: *mut usize, name: *const u16, flags: u32) -> SecurityStatus;
     fn NCryptImportKey(
