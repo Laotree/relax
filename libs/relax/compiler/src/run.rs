@@ -2306,6 +2306,13 @@ pub struct MainHost {
     pub run: fn(Box<dyn FnMut() -> i32 + Send>) -> i32,
     pub open: fn(&str, &str) -> Result<(), String>,
     pub start: fn(crate::domain::AppSpec) -> Result<(), String>,
+    /// The program turned out to draw nothing (first_frame): its load screen closes, the run goes on.
+    pub batch: fn(),
+}
+
+/// The host's half of a batch program (`MainHost::batch`).
+pub(crate) fn batch_program() {
+    if let Some(host) = MAIN_HOST.get() { (host.batch)(); }
 }
 
 static MAIN_HOST: std::sync::OnceLock<MainHost> = std::sync::OnceLock::new();

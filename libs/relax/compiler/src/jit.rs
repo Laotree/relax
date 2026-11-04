@@ -19493,7 +19493,8 @@ pub static FIRST_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FIRST_PRESENT: AtomicBool = AtomicBool::new(false);
 /// A program that never presents a frame (a test harness, a program without makepad-platform: tests,
 /// benches, CLI tools): its startup ends where its main starts (startup_main), and from there on it
-/// tiers as an app does after its first present.
+/// tiers as an app does after its first present. A batch program that links the platform joins them
+/// when it goes quiet without starting an app (`batch_program`).
 static HEADLESS: AtomicBool = AtomicBool::new(false);
 
 /// Past startup: the first present, or the main of a headless program. Tier-up (O3 burst workers, O2
@@ -19510,8 +19511,9 @@ pub(crate) fn live_needs_present(needs_present: bool) {
     LIVE_NEEDS_PRESENT.store(needs_present, Ordering::Release);
 }
 
-/// A program that links makepad_platform takes live edits only after its first present; the
-/// quiet release of a headless start (startup_main) admits them only for other programs.
+/// A program that links makepad_platform takes live edits only after its first present, or once it
+/// is a batch program; the quiet release of a headless start (startup_main) admits them only for
+/// other programs.
 pub(crate) fn live_startup_done() -> bool {
     FIRST_PRESENT.load(Ordering::Acquire)
         || LIVE_STARTUP_DONE.load(Ordering::Acquire) && !LIVE_NEEDS_PRESENT.load(Ordering::Acquire)
@@ -19519,6 +19521,24 @@ pub(crate) fn live_startup_done() -> bool {
 /// A program that has not presented and made no demand compile for this long is headless:
 /// its startup phase ends (startup_main).
 const STARTUP_QUIET_NS: u64 = 2_000_000_000;
+
+/// What is left (ns) of the quiet that counts from `from` (a `wall_ns`): 0 once no demand compile
+/// has run for STARTUP_QUIET_NS.
+pub(crate) fn quiet_left(from: u64) -> u64 {
+    if DEMAND_COMPILES.load(Ordering::SeqCst) != 0 {
+        return STARTUP_QUIET_NS;
+    }
+    STARTUP_QUIET_NS.saturating_sub(wall_ns().saturating_sub(DEMAND_LAST.load(Ordering::SeqCst).max(from)))
+}
+
+/// The program links the platform and its main went quiet without starting an app
+/// (first_frame::watch_app): a batch program. No present will come: it tiers as a program without
+/// the platform does, and takes live edits as one.
+pub(crate) fn batch_program() {
+    HEADLESS.store(true, Ordering::Release);
+    live_needs_present(false);
+    tier_wake_all();
+}
 static STARTUP_THREAD: std::sync::OnceLock<std::thread::Thread> = std::sync::OnceLock::new();
 
 pub fn begin_startup_phase() {
@@ -19583,6 +19603,12 @@ pub(crate) fn solver_work_report_at_exit() {
 /// run before the frame.
 pub extern "C" fn relax_before_first_frame() {
     crate::jit::host_boundary("relax_before_first_frame", crate::check::wait_app_check)
+}
+
+/// The program enters `app_main!`'s entry (platform): it is an app, whose first frame has a
+/// deadline from here.
+pub extern "C" fn relax_app_main() {
+    crate::jit::host_boundary("relax_app_main", crate::first_frame::app_started)
 }
 
 /// Notify the loader that the application or its embedder presented a frame.
@@ -19654,18 +19680,14 @@ pub fn startup_main(presents: bool) {
         makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
         let _ = STARTUP_THREAD.set(std::thread::current());
         while !FIRST_PRESENT.load(Ordering::Acquire) {
-            let quiet = if DEMAND_COMPILES.load(Ordering::SeqCst) == 0 {
-                wall_ns().saturating_sub(DEMAND_LAST.load(Ordering::SeqCst).max(main_at))
-            } else {
-                0
-            };
+            let left = quiet_left(main_at);
             // the live-edit gate (live_startup_done) waits for a present on its own: a
             // platform program that never presents (a headless bench, a hidden tool) still
             // releases speculation and O3 on quiet
-            if quiet >= STARTUP_QUIET_NS {
+            if left == 0 {
                 break;
             }
-            std::thread::park_timeout(std::time::Duration::from_nanos(STARTUP_QUIET_NS.saturating_sub(quiet).max(50_000_000)));
+            std::thread::park_timeout(std::time::Duration::from_nanos(left.max(50_000_000)));
         }
         LIVE_STARTUP_DONE.store(true, Ordering::Release);
         if !startup_phase() { return; }
@@ -21363,6 +21385,7 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"relax_allocator_swap" => Some(relax_allocator_swap as *const () as usize),
         b"relax_set_panic_hook" => Some(relax_set_panic_hook as *const () as usize),
         b"relax_before_first_frame" => Some(relax_before_first_frame as *const () as usize),
+        b"relax_app_main" => Some(relax_app_main as *const () as usize),
         b"relax_first_present" => Some(relax_first_present as *const () as usize),
         b"relax_frame_done" => Some(crate::postframe::relax_frame_done as *const () as usize),
         b"relax_frame_patch" => Some(crate::postframe::relax_frame_patch as *const () as usize),
