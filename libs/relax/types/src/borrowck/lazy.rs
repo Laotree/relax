@@ -466,6 +466,12 @@ fn enqueue(options: &crate::options::Options, src: &Arc<dyn FrontSource>, def: D
     WAKE.notify_one();
 }
 /// (trace) Where `def`'s check stands: its rank and the checks queued ahead of it; None: not queued.
+/// What the worker checks now: (rank, definition (NO_DEF: discovery), since wall ns).
+static RUNNING: Mutex<Option<(u32, DefId, u64)>> = Mutex::new(None);
+/// The check the worker runs now (a verdict wait's trace names what it waits behind).
+pub fn running() -> Option<(u32, DefId, u64)> {
+    *RUNNING.lock().unwrap_or_else(|e| e.into_inner())
+}
 pub fn queue_place(src: usize, def: DefId, epoch: u64) -> Option<(u32, usize)> {
     let guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     let q = guard.as_ref()?;
@@ -667,6 +673,7 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
         let mut preempted = false;
         let (identity, def, epoch) = &item.key;
         let phase = std::cell::Cell::new("start");
+        *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = Some((rank, *def, crate::clock::wall_ns()));
         let ok = item.src.with_front(&mut |prog, tcx, cx| {
             struct Slow<'a>(std::time::Instant, &'a std::cell::Cell<&'static str>, &'a Program, DefId, usize);
             impl Drop for Slow<'_> {
@@ -729,10 +736,10 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
             };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _p = crate::preempt::Preemptible::on();
-                // a background check gives way to a live edit's: the edit's verdict waited at the
-                // front of the queue for the check running, 133-480 ms in a session's first
-                // edits (Fab, 11-04)
-                let _y = (rank > RANK_HOT).then(crate::preempt::Yields::on);
+                // every other check gives way to a live edit's (hot code's too: RANK_EDIT is ahead
+                // of it): the edit's verdict waited at the front of the queue for the check
+                // running, 133-480 ms in a session's first edits (Fab, 11-04)
+                let _y = (rank > RANK_EDIT).then(crate::preempt::Yields::on);
                 crate::preempt::point();
                 let _origin = crate::clock::origin("gandalf");
                 phase.set("typeck");
@@ -771,6 +778,7 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
             finish_verdict(prog, *identity, *epoch, *def, args, result, Origin::Background);
         });
         CHECK_NS.fetch_add(relax_backend::cpu_ns() - t0, Ordering::Relaxed);
+        *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // An exit cancels the whole attempt, including constant deferrals/discovery.
         // Only a front writer's temporary preemption is queued again below.
         if crate::preempt::is_stopped() { return; }

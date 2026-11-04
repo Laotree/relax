@@ -7219,7 +7219,12 @@ impl Unit {
         let Some(d) = self.verdict_owner(id) else { return "no owner".into() };
         let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
         let src = self.front.checker_id;
-        format!("{} {:?} epoch {} queued {:?}", self.prog.def_path(d), crate::borrowck::lazy::verdict(src, d, &[], epoch), epoch, crate::borrowck::lazy::queue_place(src, d, epoch))
+        // what the checker runs now (by its start: a new check is a new line of the trace)
+        let worker = match crate::borrowck::lazy::running() {
+            Some((rank, def, since)) => format!("worker runs {} (rank {rank}) since @{:.3}", if def == crate::program::NO_DEF { "discovery".to_string() } else { self.prog.def_path(def) }, since as f64 / 1e9),
+            None => "worker idle".to_string(),
+        };
+        format!("{} {:?} epoch {} {worker} queued {:?}", self.prog.def_path(d), crate::borrowck::lazy::verdict(src, d, &[], epoch), epoch, crate::borrowck::lazy::queue_place(src, d, epoch))
     }
 
     /// SPEC-V: where slot `id`'s body stands with the borrow checker (see `verdict_clean`).
