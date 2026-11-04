@@ -966,7 +966,7 @@ pub fn connect_capture(mut tcp: TcpStream, host: &str, resume: Option<&ServerStr
     let target = wide(host);
     // The stream owns ctx (and a share of cred) from here; its Drop frees them.
     let mut stream = ServerStream {
-        tcp: tcp.try_clone()?,
+        tcp: crate::clone_tcp(&tcp)?,
         cred: cred.0,
         ctx: SecHandle::default(),
         client: Some(ClientSide { target: target.clone(), cred }),

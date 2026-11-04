@@ -664,7 +664,7 @@ fn handle_web_socket(
     let _ = tcp_stream.set_read_timeout(None);
     let _ = tcp_stream.set_write_timeout(None);
 
-    let mut write_tcp_stream = tcp_stream.try_clone().unwrap();
+    let mut write_tcp_stream = crate::clone_tcp(&tcp_stream).unwrap();
     let _ = write_tcp_stream.set_nodelay(true);
     let (tx_socket, rx_socket) = mpsc::channel::<Vec<u8>>();
 

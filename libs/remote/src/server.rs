@@ -411,7 +411,6 @@ pub fn run_server(opts: ServerOptions) -> io::Result<()> {
                 continue;
             }
         };
-        makepad_remote::carrier::keep_from_runs(&tcp);
         let Ok(peer) = tcp.peer_addr() else { continue };
         let now = Instant::now();
         if !is_lan(peer.ip()) {

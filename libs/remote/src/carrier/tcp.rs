@@ -388,7 +388,6 @@ pub fn listen(endpoint: &Endpoint, bind: &str, identity: TlsIdentity, keys: KeyS
         (hooks.enter)();
         for tcp in listener.incoming() {
             let Ok(tcp) = tcp else { continue };
-            super::keep_from_runs(&tcp);
             let (ep, tls, keys, bound) = (ep.clone(), tls.clone(), keys.clone(), bound.clone());
             let _ = std::thread::Builder::new().name("makepad-remote-hello".into()).spawn(move || {
                 let hooks = ep.hooks();
