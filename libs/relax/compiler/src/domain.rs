@@ -1305,6 +1305,7 @@ fn launch_main(upn: usize, id: DomainId, base: u64, target: u64, arg: u64, packa
                 d.info.state = DomainState::Running;
             }
             notify_state(id, &DomainState::Running);
+            if crate::run::app_domain() == Some(id) { crate::first_frame::main_entered(); }
             match unsafe { crate::jit::call_jit_in(up, base, target, arg) } {
                 Ok(_) => end(id, DomainState::Exited(0)),
                 // `process::exit` on the domain's thread (exit_current) already ended it
