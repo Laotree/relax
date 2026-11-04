@@ -3261,7 +3261,8 @@ impl<'a> Gen<'a> {
                 self.vmov(xd, t);
                 self.fin_f(d, xd);
             }
-            Inst::VFma(np, na, d, a, b, c) => {
+            Inst::VFma(np, na, _, d, a, b, c) => {
+                // (keep_nan's negations are explicit by now: legal.rs expand_fma_negations)
                 // t = c (negated first for the - c forms: exact, and the fused op then
                 // rounds once, with IEEE's sign of an exact zero); fmla / fmls t, a, b
                 let t = self.vtmp(d, &[a, b]);
@@ -5417,7 +5418,7 @@ fn fold_lane_splats(f: &Func) -> Option<Func> {
         for (ii, i) in b.insts.iter().enumerate() {
             let folded = match *i {
                 Inst::VSplat(d, s) => kof(s).map(|k| Inst::VConst(d, k)),
-                Inst::VFma(np, na, d, a, b, c) => of(b).map(|s| Inst::VFma(np, na, d, a, s, c)),
+                Inst::VFma(np, na, keep, d, a, b, c) => of(b).map(|s| Inst::VFma(np, na, keep, d, a, s, c)),
                 Inst::VX(op @ VX::FMul(VW::S, nb), d, a, b) if a != b => {
                     if let Some(s) = of(b) {
                         Some(Inst::VX(op, d, a, s))
@@ -5504,6 +5505,17 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
             }
         }
     }
+    // the x86 rule's negated fused multiply-add operands (keep_nan): negations of the non-NaN
+    // lanes, as fmla/fmls negate NaNs too (legal.rs)
+    let unfused;
+    let f = if crate::legal::has_fma_negations(f, false) {
+        let mut g = f.clone();
+        crate::legal::expand_fma_negations(&mut g, false);
+        unfused = g;
+        &unfused
+    } else {
+        f
+    };
     // vector ops without an instruction sequence here: per-lane scalar code
     let legal;
     // (MAKEPAD_RUN_OPT=-vxnative: every expandable op, the legaliser's reference meaning)

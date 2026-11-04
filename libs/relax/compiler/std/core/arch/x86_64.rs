@@ -562,29 +562,25 @@ pub unsafe fn _mm256_andnot_ps(a: __m256, b: __m256) -> __m256 {
 }
 
 // Fused multiply-add, one rounding: a*b + c (fmadd), a*b - c (fmsub), -(a*b) + c (fnmadd),
-// -(a*b) - c (fnmsub). With hardware FMA each is the packed fused op (c +- a*b) and, for
-// fmsub / fnmsub, a sign flip of the exact result (negation commutes with round-to-nearest);
-// without it, one libm fmaf per lane.
+// -(a*b) - c (fnmsub). A NaN operand passes on with its own sign: the negations act on the
+// product and the addend inside the fused op. With hardware FMA each is the packed instruction;
+// without it, one libm fmaf per lane of the operands, a NaN not negated.
 #[inline(always)]
 unsafe fn fma_ps(a: __m128, b: __m128, c: __m128, neg_prod: bool, neg_add: bool) -> __m128 {
     if crate::intrinsics::fma_native() {
-        // c' + a*b (selector 8) or c' - a*b (selector 9), c' = c or -c. The addend is negated
-        // before the fused op (so a*b - c has one rounding, signed zeros included), on non-NaN
-        // lanes only: hardware leaves a NaN operand's sign alone.
-        let c = if neg_add {
-            let is_nan: __m128 = vx::vx_binary(c, c, 47, 32);
-            _mm_xor_ps(c, _mm_andnot_ps(is_nan, _mm_set1_ps(-0.0)))
-        } else {
-            c
-        };
-        if neg_prod { vx::vx_ternary(c, a, b, 9) } else { vx::vx_ternary(c, a, b, 8) }
+        match (neg_prod, neg_add) {
+            (false, false) => vx::vx_ternary(a, b, c, 11),
+            (false, true) => vx::vx_ternary(a, b, c, 12),
+            (true, false) => vx::vx_ternary(a, b, c, 13),
+            (true, true) => vx::vx_ternary(a, b, c, 14),
+        }
     } else {
         let (x, y, z) = (a.0, b.0, c.0);
         let mut r = [0f32; 4];
         let mut i = 0;
         while i < 4 {
-            let p = if neg_prod { -x[i] } else { x[i] };
-            let q = if neg_add { -z[i] } else { z[i] };
+            let p = if neg_prod && !x[i].is_nan() { -x[i] } else { x[i] };
+            let q = if neg_add && !z[i].is_nan() { -z[i] } else { z[i] };
             r[i] = p.mul_add(y[i], q);
             i += 1;
         }

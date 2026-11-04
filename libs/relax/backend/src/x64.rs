@@ -4837,7 +4837,8 @@ impl<'a> Gen<'a> {
                 }
                 self.fin_f(d, xd);
             }
-            Inst::VFma(np, na, d, a, b, c) => {
+            Inst::VFma(np, na, _, d, a, b, c) => {
+                // (a negation here is keep_nan's: expand_fma_negations made the others explicit)
                 let xa = self.use_f(a, XS);
                 let xb = self.use_f(b, XS2);
                 let xc = self.use_f(c, 1);
@@ -5124,7 +5125,8 @@ impl<'a> Gen<'a> {
                 self.a.movf_rr(true, xd, 0);
                 self.fin_f(d, xd);
             }
-            Inst::VFma(np, na, d, a, b, c) => {
+            Inst::VFma(np, na, _, d, a, b, c) => {
+                // (a negation here is keep_nan's: expand_fma_negations made the others explicit)
                 let xa = self.use_f(a, XS);
                 let xb = self.use_f(b, XS2);
                 let xc = self.use_f(c, 1);
@@ -6503,7 +6505,7 @@ fn y_inst(f: &Func, i: &Inst) -> bool {
     let y = |v: &VReg| f.vregs[v.0 as usize] == Cls::V256;
     match i {
         Inst::VX(VX::Half(_), ..) => true,
-        Inst::VX(_, d, ..) | Inst::VLoad(d, ..) | Inst::VFma(_, _, d, ..) | Inst::VSplat(d, _) | Inst::VConst(d, _) | Inst::Mov(d, _) | Inst::VSel(d, ..) => y(d),
+        Inst::VX(_, d, ..) | Inst::VLoad(d, ..) | Inst::VFma(_, _, _, d, ..) | Inst::VSplat(d, _) | Inst::VConst(d, _) | Inst::Mov(d, _) | Inst::VSel(d, ..) => y(d),
         Inst::VStore(_, _, v) | Inst::VAny(_, v) => y(v),
         _ => false,
     }
@@ -6589,11 +6591,12 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     } else {
         f
     };
-    // negated fused multiply-add operands as explicit negations (NaN signs, see legal.rs)
+    // negated fused multiply-add operands as explicit negations, except the x86 forms (NaN signs,
+    // see legal.rs)
     let unfused;
-    let f = if f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::FMulAdd(np, na, ..) | Inst::VFma(np, na, ..) if *np || *na))) {
+    let f = if crate::legal::has_fma_negations(f, true) {
         let mut g = f.clone();
-        crate::legal::expand_fma_negations(&mut g);
+        crate::legal::expand_fma_negations(&mut g, true);
         unfused = g;
         &unfused
     } else {

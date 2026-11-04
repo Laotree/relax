@@ -245,7 +245,7 @@ pub fn uses_defs(i: &Inst, uses: &mut Vec<VReg>, defs: &mut Vec<VReg>) {
             uses.push(*a);
             defs.push(*d);
         }
-        Inst::VX3(_, d, m, a, b) | Inst::VSel(d, m, a, b) | Inst::VFma(_, _, d, m, a, b) => {
+        Inst::VX3(_, d, m, a, b) | Inst::VSel(d, m, a, b) | Inst::VFma(_, _, _, d, m, a, b) => {
             uses.push(*m);
             uses.push(*a);
             uses.push(*b);
@@ -351,7 +351,7 @@ pub fn for_uses(i: &Inst, mut uses: impl FnMut(VReg)) {
         Inst::VSplat(d, a) | Inst::VExtract(d, a, _) | Inst::VLoad(d, a, _) | Inst::VAny(d, a) => {
             uses(*a);
         }
-        Inst::VX3(_, d, m, a, b) | Inst::VSel(d, m, a, b) | Inst::VFma(_, _, d, m, a, b) => {
+        Inst::VX3(_, d, m, a, b) | Inst::VSel(d, m, a, b) | Inst::VFma(_, _, _, d, m, a, b) => {
             uses(*m);
             uses(*a);
             uses(*b);
@@ -435,7 +435,7 @@ pub fn for_defs(i: &Inst, mut defs: impl FnMut(VReg)) {
         | Inst::VLoad(d, _, _)
         | Inst::VAny(d, _)
         | Inst::VSel(d, _, _, _)
-        | Inst::VFma(_, _, d, _, _, _)
+        | Inst::VFma(_, _, _, d, _, _, _)
         | Inst::VInsert(d, _, _, _)
         | Inst::Sel(d, _, _, _)
         | Inst::FMulAdd(_, _, _, d, _, _, _)
@@ -3675,7 +3675,7 @@ fn affinities(f: &Func, reach: &[bool], block_start: &[u32], ranges: &Ranges, wt
                 }
                 // fused multiply-add accumulates in place on both targets (arm64 fmla/fmls
                 // vd += vn*vm, x64 vfmadd231 d += a*b): the result prefers the addend's register
-                Inst::VFma(_, _, d, _, _, c) => {
+                Inst::VFma(_, _, _, d, _, _, c) => {
                     if d != c && dies_at(ranges, c.0, p) {
                         edges.push((d.0, c.0, w));
                         edges.push((c.0, d.0, w));

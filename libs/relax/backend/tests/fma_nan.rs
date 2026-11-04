@@ -78,7 +78,7 @@ fn build(p: Place, np: bool, na: bool, w: bool, vector: bool) -> Code {
     let (a, b, c, d) = (f.vreg(cls), f.vreg(cls), f.vreg(cls), f.vreg(cls));
     let load = |v: VReg, k: i32| if vector { Inst::VLoad(v, ps, k * sz) } else { Inst::Load(mem, v, ps, k * sz) };
     let store = |v: VReg, k: i32| if vector { Inst::VStore(pd, k * sz, v) } else { Inst::Store(mem, pd, k * sz, v) };
-    let op = if vector { Inst::VFma(np, na, d, a, b, c) } else { Inst::FMulAdd(np, na, w, d, a, b, c) };
+    let op = if vector { Inst::VFma(np, na, false, d, a, b, c) } else { Inst::FMulAdd(np, na, w, d, a, b, c) };
     let mut insts = match p {
         Place::MemC => vec![load(a, 0), load(b, 1), load(c, 2)],
         Place::MemA => vec![load(b, 1), load(c, 2), load(a, 0)],
@@ -238,8 +238,8 @@ fn build_splat(np: bool, na: bool) -> Code {
         Inst::VSplat(x, s),
         Inst::VLoad(a, ps, 0),
         Inst::VLoad(c, ps, 32),
-        Inst::VFma(np, na, d0, a, x, c),
-        Inst::VFma(np, na, d1, x, a, c),
+        Inst::VFma(np, na, false, d0, a, x, c),
+        Inst::VFma(np, na, false, d1, x, a, c),
         Inst::VStore(pd, 0, d0),
         Inst::VStore(pd, 16, d1),
     ];
