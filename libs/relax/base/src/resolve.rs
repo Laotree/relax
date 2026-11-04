@@ -1540,10 +1540,10 @@ pub struct Options {
     pub all_features: bool,
     pub features: Vec<String>,
     pub bin: Option<String>,
-    /// `--lib`, `--tests`, `--test <name>` (cargo test's target selection): the graph of the
-    /// package's test harness. The lib's unit tests and the integration tests are separate
-    /// programs (the lib is cfg(test) in the first and plain in the second), so one graph holds
-    /// either the lib test or the integration tests.
+    /// `--lib`, `--bins`, `--bin <name>`, `--tests`, `--test <name>` (cargo test's target
+    /// selection): the graph of the package's test harness. The lib's unit tests are a program of
+    /// their own (the lib is cfg(test) there and plain beside the bins' unit tests and the
+    /// integration tests), so one graph holds either the lib test or bin and integration tests.
     pub test: Option<TestSel>,
 }
 
@@ -1551,10 +1551,11 @@ pub struct Options {
 pub enum TestSel {
     /// the lib target built with `--test`
     Lib,
-    /// these bin targets built with `--test` (empty: all of them)
-    Bins(Vec<String>),
-    /// these integration test targets (empty: all of them)
-    Integration(Vec<String>),
+    /// these bin targets built with `--test` and these integration test targets, beside the plain
+    /// lib: one graph, as `cargo test` builds them in one go with one feature resolution (`makepad
+    /// test` runs each target out of it in a process of its own, run.rs `--subject`). None: no
+    /// target of that kind; empty: all of them.
+    Targets { bins: Option<Vec<String>>, tests: Option<Vec<String>> },
 }
 
 pub fn parse_flags(flags: &[String]) -> Result<Options, String> {
@@ -1611,10 +1612,9 @@ pub fn parse_flags(flags: &[String]) -> Result<Options, String> {
     };
     o.test = match (lib, bins, tests) {
         (true, None, None) => Some(TestSel::Lib),
-        (false, Some(b), None) => Some(TestSel::Bins(b)),
-        (false, None, Some(t)) => Some(TestSel::Integration(t)),
         (false, None, None) => None,
-        _ => return Err("unit graph: --lib, --bins and integration tests are separate test programs; select one".to_string()),
+        (false, bins, tests) => Some(TestSel::Targets { bins, tests }),
+        _ => return Err("unit graph: the lib's unit tests (--lib) are a test program of their own; select them alone".to_string()),
     };
     Ok(o)
 }
@@ -2148,49 +2148,51 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
     let rm = &r.manifests[root];
     match &o.test {
         Some(TestSel::Lib) if rm.lib.is_none() => return Err(format!("no library targets found in package `{}`", rm.name)),
-        Some(TestSel::Bins(names)) => {
-            if rm.bins.is_empty() {
-                return Err(format!("no bin targets found in package `{}`", rm.name));
-            }
-            for n in names {
-                if !rm.bins.iter().any(|t| &t.name == n) {
-                    return Err(format!("no bin target named `{}` in package `{}`", n, rm.name));
+        Some(TestSel::Targets { bins, tests }) => {
+            if let Some(names) = bins {
+                if rm.bins.is_empty() {
+                    return Err(format!("no bin targets found in package `{}`", rm.name));
+                }
+                for n in names {
+                    if !rm.bins.iter().any(|t| &t.name == n) {
+                        return Err(format!("no bin target named `{}` in package `{}`", n, rm.name));
+                    }
+                }
+                for (bi, bt) in rm.bins.iter().enumerate() {
+                    if !names.is_empty() && !names.contains(&bt.name) {
+                        continue;
+                    }
+                    if !bt.enabled(&rn.features, !names.is_empty())? {
+                        continue;
+                    }
+                    // `harness = false` bins (no libtest main): `--bins` builds the harness ones;
+                    // `makepad test` names the targets it runs (test_pkg.rs), these included
+                    if !bt.harness && names.is_empty() {
+                        continue;
+                    }
+                    roots.push(add((root, false), UKind::BinTest(bi), &mut units));
                 }
             }
-            for (bi, bt) in rm.bins.iter().enumerate() {
-                if !names.is_empty() && !names.contains(&bt.name) {
-                    continue;
+            if let Some(names) = tests {
+                for n in names {
+                    if !rm.tests.iter().any(|t| &t.name == n) {
+                        return Err(format!("no test target named `{}` in package `{}`", n, rm.name));
+                    }
                 }
-                if !bt.enabled(&rn.features, !names.is_empty())? {
-                    continue;
+                for (ti, tt) in rm.tests.iter().enumerate() {
+                    if !names.is_empty() && !names.contains(&tt.name) {
+                        continue;
+                    }
+                    if !tt.enabled(&rn.features, !names.is_empty())? {
+                        continue;
+                    }
+                    // `harness = false` (cargo: `--cfg test`, no `--test`, run as a plain program):
+                    // `--tests` builds the harness ones; `makepad test` names the targets it runs
+                    if !tt.harness && names.is_empty() {
+                        continue;
+                    }
+                    roots.push(add((root, false), UKind::Test(ti), &mut units));
                 }
-                // `harness = false` bins (no libtest main): `--bins` builds the harness ones; `makepad
-                // test` runs each of the others as a program of its own (`--bin <name>`, test_targets)
-                if !bt.harness && names.is_empty() {
-                    continue;
-                }
-                roots.push(add((root, false), UKind::BinTest(bi), &mut units));
-            }
-        }
-        Some(TestSel::Integration(names)) => {
-            for n in names {
-                if !rm.tests.iter().any(|t| &t.name == n) {
-                    return Err(format!("no test target named `{}` in package `{}`", n, rm.name));
-                }
-            }
-            for (ti, tt) in rm.tests.iter().enumerate() {
-                if !names.is_empty() && !names.contains(&tt.name) {
-                    continue;
-                }
-                if !tt.enabled(&rn.features, !names.is_empty())? {
-                    continue;
-                }
-                // `harness = false` (cargo: `--cfg test`, no `--test`, run as a plain program): `--tests`
-                // builds the harness ones; `makepad test` runs each of the others alone (`--test <name>`)
-                if !tt.harness && names.is_empty() {
-                    continue;
-                }
-                roots.push(add((root, false), UKind::Test(ti), &mut units));
             }
         }
         _ => {}
@@ -2201,7 +2203,7 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
             continue;
         }
         if o.test.is_some() {
-            if matches!(o.test, Some(TestSel::Integration(_))) {
+            if matches!(o.test, Some(TestSel::Targets { tests: Some(_), .. })) {
                 bins.push(bt.name.clone());
             }
             continue;
