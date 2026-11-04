@@ -6509,6 +6509,20 @@ mod removed_module_tests {
         assert!(undeclared_removals(&prog, &[main.as_str(), other.as_str()], &none).is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    /// A read of the running code (prof, mem, eval, ..) while a saved edit waits for a restart
+    /// heads its answer with STALE and the edit: it measures the code from before it (a layout
+    /// change measured for hours as if it ran, 11-04). A run that loads the sources clears it.
+    #[test]
+    fn a_read_while_an_edit_waits_for_a_restart_says_stale() {
+        isolated_test!(a_read_while_an_edit_waits_for_a_restart_says_stale);
+        assert_eq!(crate::inspect::stale_line(), None);
+        note_restart_pending("main.rs: the layout of WorkStats changed");
+        let line = crate::inspect::stale_line().unwrap();
+        assert!(line.contains("STALE: 1 edit waits for a restart (main.rs: the layout of WorkStats changed)") && line.contains("\"restart_pending\":1"), "{line}");
+        clear_restart_pending();
+        assert_eq!(crate::inspect::stale_line(), None);
+    }
 }
 
 #[cfg(test)]

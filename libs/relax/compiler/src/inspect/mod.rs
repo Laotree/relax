@@ -255,7 +255,39 @@ fn dispatch(req: &Req, out: &mut Out) {
     }
 }
 
+/// The reads that measure or show the running code (profiles, timelines, memory, code, values):
+/// with edits waiting for a restart they answer about the code from before those edits.
+const MEASURES_CODE: &[&str] = &[
+    "prof", "why-slow", "top", "path", "timeline", "frame", "frames", "hitch", "contention", "memory", "mem", "diff", "heap",
+    "counters", "vsnative", "ab", "asm", "remarks", "code", "versions", "why-tier", "tier", "eval", "static", "locals", "stacks",
+];
+
+/// The header of a read of the running code while edits wait for a restart: they are saved and
+/// shown as accepted, the process runs the code before them (a layout change measured for hours
+/// as if it ran, 11-04).
+pub(crate) fn stale_line() -> Option<String> {
+    let p = crate::reload::restart_pending();
+    if p.is_empty() {
+        return None;
+    }
+    let stale = format!(
+        "STALE: {} edit{} wait{} for a restart ({}): this answers about the code before {}; `session relaunch` applies {}",
+        p.len(),
+        if p.len() == 1 { "" } else { "s" },
+        if p.len() == 1 { "s" } else { "" },
+        p.join("; "),
+        if p.len() == 1 { "it" } else { "them" },
+        if p.len() == 1 { "it" } else { "them" },
+    );
+    Some(format!("{{\"stale\":{},\"restart_pending\":{}}}", json_str(&stale), p.len()))
+}
+
 fn dispatch_command(req: &Req, out: &mut Out) {
+    if MEASURES_CODE.contains(&req.cmd.as_str()) {
+        if let Some(line) = stale_line() {
+            out.line(&line);
+        }
+    }
     match req.cmd.as_str() {
         "session" => match req.pos.first().map(String::as_str) {
             Some("relaunch") => match crate::reload::relaunch_pending() {
@@ -1191,9 +1223,10 @@ fn cmd_live(req: &Req, out: &mut Out) {
         None => flightrec::frames_head(),
     };
     out.line(&format!(
-        "{{\"now_ms\":{:.1},\"frames\":{frames},\"patches\":{},\"lazy\":{},\"ahead\":{},\"o2\":{},\"o3\":{},\"linked\":{},\"q\":[{},{},{}],\"ui_wait_ms\":{},\"next\":{next},\"ft\":[{ft}]}}",
+        "{{\"now_ms\":{:.1},\"frames\":{frames},\"patches\":{},\"restart_pending\":{},\"lazy\":{},\"ahead\":{},\"o2\":{},\"o3\":{},\"linked\":{},\"q\":[{},{},{}],\"ui_wait_ms\":{},\"next\":{next},\"ft\":[{ft}]}}",
         now as f64 / 1e6,
         crate::reload::patches_installed(),
+        crate::reload::restart_pending().len(),
         a.demand(),
         a.ahead_done,
         a.o2_done,
