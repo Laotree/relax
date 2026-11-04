@@ -205,12 +205,15 @@ fn a_background_check_panic_leaves_the_query_to_the_apps_compile() {
     const CHILD: &str = "MAKEPAD_RUN_CHECK_PANIC_TEST";
     let Ok(case) = std::env::var(CHILD) else {
         for (case, panics_in) in [("check", "target:gandalf"), ("both", "target")] {
+            // (its own home: the injected panics are no record for this machine's ledger)
+            let home = std::env::temp_dir().join(format!("relax-check-panic-home-{}-{case}", std::process::id()));
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "lazy_reload_tests::a_background_check_panic_leaves_the_query_to_the_apps_compile", "--nocapture", "--test-threads=1"])
-                .env(CHILD, case).env("MAKEPAD_RUN_TEST_TYPECK_PANIC", panics_in).env("MAKEPAD_RUN_PANIC_PARK", "0")
+                .env(CHILD, case).env("MAKEPAD_RUN_TEST_TYPECK_PANIC", panics_in).env("MAKEPAD_RUN_PANIC_PARK", "0").env("MAKEPAD_HOME", &home)
                 .output().unwrap();
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(output.status.success(), "{case}: {}\n{stderr}", String::from_utf8_lossy(&output.stdout));
+            std::fs::remove_dir_all(&home).unwrap();
             // the check's panic is on the run's log when it happens
             assert!(stderr.contains("thread 'gandalf'") && stderr.contains("forced panic type-checking `target`"), "{case}: {stderr}");
         }
@@ -251,6 +254,13 @@ fn a_background_check_panic_leaves_the_query_to_the_apps_compile() {
     assert!(why.contains("forced panic type-checking `target`"), "{why}");
     assert_eq!(crate::borrowck::lazy::PANICS.load(std::sync::atomic::Ordering::Relaxed), 1);
     assert!(crate::borrowck::lazy::PANIC_NOTES.lock().unwrap()[0].contains("target"));
+    // devhub's ledger gets it, naming the body and what panicked, with no hot load counted
+    let records: Vec<_> = std::fs::read_dir(makepad_remote::hot::outbox()).unwrap().map(|f| std::fs::read_to_string(f.unwrap().path()).unwrap()).collect();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = makepad_remote::hot::Record::parse(&records[0]).unwrap();
+    assert_eq!(record.outcome, makepad_remote::hot::Outcome::CheckerPanic);
+    assert_eq!(record.reason, "checker panic in `check_panic::target`: MAKEPAD_RUN_TEST_TYPECK_PANIC: forced panic type-checking `target`");
+    assert!(!record.outcome.failure());
     // call_jit returns a recovery status, so the function's output comes back via its argument.
     let call = |entry| {
         let mut result = 0u32;

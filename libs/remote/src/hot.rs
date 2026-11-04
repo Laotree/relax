@@ -16,6 +16,9 @@ pub enum Outcome {
     RestartFailed,
     FirstFrameTimeout,
     NoWindow,
+    /// A panic in a background or gate check of a body: no hot load failed, no restart follows and
+    /// the app runs on, so it stays out of the hot-load statistics, with its own count.
+    CheckerPanic,
 }
 
 impl Outcome {
@@ -30,6 +33,7 @@ impl Outcome {
             Self::RestartFailed => "restart_failed",
             Self::FirstFrameTimeout => "first_frame_timeout",
             Self::NoWindow => "no_window",
+            Self::CheckerPanic => "checker_panic",
         }
     }
 
@@ -44,6 +48,7 @@ impl Outcome {
             "restart_failed" => Self::RestartFailed,
             "first_frame_timeout" => Self::FirstFrameTimeout,
             "no_window" => Self::NoWindow,
+            "checker_panic" => Self::CheckerPanic,
             _ => return None,
         })
     }
