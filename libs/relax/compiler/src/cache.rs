@@ -2310,7 +2310,8 @@ impl Cache {
                 let mut defs = named.clone();
                 defs.sort_unstable_by_key(|d| d.0);
                 defs.dedup();
-                for d in defs {
+                let kd = key_defs(u, key);
+                for &d in &defs {
                     match g.def_closure(&u.prog, d) {
                         Some(x) => h.u128(x),
                         None if g.in_graph(&u.prog, d) => {
@@ -2319,10 +2320,19 @@ impl Cache {
                         }
                         None => {}
                     }
+                    // A type argument: its impls are found under its name, not from its own item,
+                    // and the code's text may name only a parameter (`T::K` folds `impl Kind for
+                    // A`'s value, `T::Out` lays out its type). An impl lives in its trait's crate
+                    // or its type's, and those are what the crates named here can see.
+                    if !kd.contains(&d) {
+                        let n = deps::name_of(u.prog.name(d).as_bytes());
+                        for &c in &crates {
+                            h.u128(self.name_closure(&g, c, n));
+                        }
+                    }
                 }
                 // the bodies the code is made from: the definition's, a closure's enclosing fns'
                 // -- their text and position, and what the names in them find
-                let kd = key_defs(u, key);
                 for &d in &kd {
                     h.u128(self.def_body(u, d));
                     h.u128(self.body_names_of(u, d, &g));
@@ -8469,6 +8479,12 @@ impl Linker {
         self.cache().last_base = tier == TIER_BASE;
         Some((code, pc, relocs))
     }
+}
+
+/// Whether any of this run's code came from the disk cache, by a lookup or the startup image (on
+/// the owner thread).
+pub(crate) unsafe fn linked_code(up: *mut Unit) -> bool {
+    (&*up).cache.as_ref().is_some_and(|c| !(&*c.get()).linked.is_empty())
 }
 
 /// Re-entrant cache lookup; the caller is on the owner thread.

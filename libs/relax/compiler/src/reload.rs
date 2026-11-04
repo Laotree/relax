@@ -2467,6 +2467,17 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             }
         }
     }
+    // Code linked from the disk cache was lowered by an earlier run, and what it read (const_readers,
+    // const_was_evaluated) is known only for code this run lowered: a const's readers among it would
+    // keep the old value, folded in, under a "patched" with nothing installed. The new run's keys
+    // tell them apart.
+    if crate::cache::linked_code(up) {
+        for c in &changes {
+            if let Change::Const(d) = c {
+                restart.push(format!("const `{}` changed, and this run's code comes from the disk cache: its readers there are known only to a new run -- restart the app", def_name(&u.prog, *d)));
+            }
+        }
+    }
     // an initializer runs once: a static (or the storage a `thread_local!` key keeps) that holds
     // its running value never sees the new initializer, so the edit lands by a restart
     for c in &changes {
@@ -3372,12 +3383,16 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // -- the drop glue of every type holding it, the generic instances over it (`Vec<T>`'s
     // drop_in_place) and every fn naming the type are rebuilt; values made before the edit are
     // dropped by the new glue. A removed one: the same code, which no longer drops it (also
-    // where a caller inlined the glue).
+    // where a caller inlined the glue). A marker impl (a trait impl with no items, `Copy`): no
+    // code calls it, but it picks which specializing impl an instance takes (std's `to_vec` for
+    // `T: Copy`), so the same code is rebuilt.
     {
         let drop_trait = u.tcx.lang_items.get(LangItem::Drop);
         let mut dtypes: Vec<DefId> = Vec::new();
         for &imp in added_impls.iter().chain(&gone_impls) {
-            if drop_trait.is_some() && u.tcx.impl_trait.get(&imp).copied() == drop_trait {
+            let trait_of = u.tcx.impl_trait.get(&imp).copied();
+            let marker = trait_of.is_some() && u.prog.impls[u.prog.def(imp).sub as usize].items.is_empty();
+            if marker || (drop_trait.is_some() && trait_of == drop_trait) {
                 if let Some(&st) = u.tcx.impl_self.get(&imp) {
                     if let crate::types::TyKind::Adt(d, _, _) = u.tcx.tys.kind(st) {
                         dtypes.push(*d);
@@ -5361,7 +5376,11 @@ pub(crate) fn input_paths(keep: &dyn Fn(&str) -> bool) -> Result<Vec<String>, St
     }
     let (inputs, loaded) = g.as_ref().map(|v| (v.inputs.clone(), v.loaded.clone())).ok_or("this run watches no sources (not a live session, or its watcher ended)")?;
     drop(g);
-    Ok(inputs.source_paths(loaded.iter().filter(|p| keep(p)).cloned(), keep))
+    // (and what its code included: the watcher patches those files' includers, so a save of one
+    // is an edit the process reads)
+    let std_dir = std::env::var("MAKEPAD_RUN_STD").unwrap_or_default();
+    let included = included_files(&std_dir).into_iter().filter(|p| keep(p));
+    Ok(inputs.source_paths(loaded.iter().filter(|p| keep(p)).cloned().chain(included), keep))
 }
 
 /// A source file a live session watches and patches (`own_source`).
@@ -5572,7 +5591,7 @@ const STARTUP_SCAN_LOOK: std::time::Duration = std::time::Duration::from_millis(
 unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &mut Vec<Undo>) -> Vec<(u32, u32)> {
     use crate::harness::live;
     let what = paths.join(", ");
-    let mut edit = live::Edit { paths, group: o.group, compile_ms: Some(o.ms[2]), restarted: false, changed: o.test_changes.clone() };
+    let mut edit = live::Edit { paths, group: o.group, compile_ms: Some(o.ms[2]), restarted: false, changed: o.test_changes.clone(), patch: Some((o.changed, o.names.len())) };
     for line in &o.lines { eprintln!("makepad live:   {line}"); }
     if o.rung != Rung::Patch {
         patch_refused_event(&what, o.rung == Rung::Refuse, &o.lines);
@@ -5786,7 +5805,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         if let Some(why) = host::take_harness_restart() {
             let group = crate::owner::call(crate::owner::Class::Program, || (*up).begin_patch());
             crate::harness::live::restart(crate::harness::live::Edit {
-                paths: std::mem::take(&mut host_edit), group, compile_ms: None, restarted: true, changed: None,
+                paths: std::mem::take(&mut host_edit), group, compile_ms: None, restarted: true, changed: None, patch: None,
             }, &why);
         }
         // A patch's verdict settles ahead of the gates below: they hold the watch's own work (the
@@ -6107,7 +6126,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 if crate::harness::live::enabled() {
                     let group = crate::owner::call(crate::owner::Class::Program, || (*up).begin_patch());
                     crate::harness::live::restart(crate::harness::live::Edit {
-                        paths: changed.iter().map(|&k| files[k].0.clone()).collect(), group, compile_ms: None, restarted: true, changed: None,
+                        paths: changed.iter().map(|&k| files[k].0.clone()).collect(), group, compile_ms: None, restarted: true, changed: None, patch: None,
                     }, &why);
                 } else { offer_restart(&why); }
                 for &k in &changed { files[k].2 = settled_stamps[k]; stalled.remove(&k); }
@@ -6322,7 +6341,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                             let group = crate::owner::call(crate::owner::Class::Program, || (*up).begin_patch());
                             crate::harness::live::restart(crate::harness::live::Edit {
                                 paths: which.iter().map(|&k| files[k].0.clone()).collect(), group,
-                                compile_ms: Some(o.ms[2]), restarted: true, changed: None,
+                                compile_ms: Some(o.ms[2]), restarted: true, changed: None, patch: None,
                             }, &o.lines.join("; "));
                         }
                     } else { recover_hot_failure(failure, &o.lines, None); }
