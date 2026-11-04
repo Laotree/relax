@@ -23,6 +23,24 @@ thread_local! {
     static PROGRAM_STACK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
+/// The return address of the stack switch's call (`imp::call_on_segment`: the same in every
+/// switch; 0 before the first). Each switch stores it before it switches.
+static SWITCH_RETURN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The stack switch as a stack walker sees it: a frame whose pc is this return address is
+/// `call_on_segment`'s, which runs on the thread's own stack while its callee runs on the segment.
+/// Its caller is not above it: x86_64 walkers take its sp from the switch record
+/// (`SWITCH_RECORD`); arm64's frame records chain across the switch by fp. 0 before the first
+/// switch.
+pub fn switch_return_pc() -> u64 {
+    SWITCH_RETURN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// x86_64: the switch record, the sp `call_on_segment` has on the thread's own stack, sits at the
+/// segment's sp at `switch_return_pc` plus this (above the callee's shadow space on Windows).
+#[cfg(target_arch = "x86_64")]
+pub const SWITCH_RECORD: u64 = if cfg!(windows) { 32 } else { 0 };
+
 /// The program stack the calling thread runs on now (`on_program_stack`): usable (lo, hi).
 /// Stack walkers and the fault reports bound their reads by it instead of the OS thread's stack.
 pub fn program_stack_bounds() -> Option<(usize, usize)> {
@@ -362,29 +380,42 @@ mod imp {
     }
 
     /// Calls `f(data)` with the stack pointer at the segment's top, back on this stack after.
+    /// The call's return address goes to `SWITCH_RETURN` first (stack walkers recognise this
+    /// frame by it); x86_64 keeps this function's own sp at the call's sp on the segment (the
+    /// switch record, `SWITCH_RECORD`), where a walk finds this frame's caller.
     #[inline(never)]
     pub(super) unsafe fn call_on_segment(s: &Segment, f: extern "C" fn(*mut u8), data: *mut u8) {
         let sp = s.top;
         #[cfg(target_arch = "aarch64")]
         std::arch::asm!(
+            "adr x20, 3f",
+            "str x20, [{ret}]",
             "mov x20, sp",
             "mov sp, {sp}",
             "blr {f}",
+            "3:",
             "mov sp, x20",
             sp = in(reg) sp,
             f = in(reg) f,
+            ret = in(reg) super::SWITCH_RETURN.as_ptr(),
             in("x0") data,
             out("x20") _,
             clobber_abi("C"),
         );
         #[cfg(target_arch = "x86_64")]
         std::arch::asm!(
+            "lea r12, [rip + 3f]",
+            "mov qword ptr [{ret}], r12",
             "mov r12, rsp",
             "mov rsp, {sp}",
+            "sub rsp, 16",
+            "mov qword ptr [rsp], r12",
             "call {f}",
+            "3:",
             "mov rsp, r12",
             sp = in(reg) sp,
             f = in(reg) f,
+            ret = in(reg) super::SWITCH_RETURN.as_ptr(),
             in("rdi") data,
             out("r12") _,
             clobber_abi("C"),
@@ -480,9 +511,13 @@ mod imp {
     /// stack bounds (NT_TIB StackBase gs:[8], StackLimit gs:[16], DeallocationStack gs:[0x1478])
     /// describe the segment for the call: the exception dispatcher and RtlUnwindEx check frames
     /// against them (a Rust panic caught inside `f` unwinds there), as for a fiber's stack.
+    /// The call's return address goes to `SWITCH_RETURN` first; this function's own sp (before
+    /// the pushes) is the switch record, above the callee's shadow space (`SWITCH_RECORD`).
     #[inline(never)]
     pub(super) unsafe fn call_on_segment(s: &Segment, f: extern "C" fn(*mut u8), data: *mut u8) {
         std::arch::asm!(
+            "lea r12, [rip + 3f]",
+            "mov qword ptr [{ret}], r12",
             "push qword ptr gs:[8]",
             "push qword ptr gs:[16]",
             "push qword ptr gs:[0x1478]",
@@ -491,8 +526,11 @@ mod imp {
             "mov gs:[16], {lo}",
             "mov gs:[0x1478], {base}",
             "mov rsp, {top}",
-            "sub rsp, 32",
+            "sub rsp, 48",
+            "mov qword ptr [rsp + 32], r12",
+            "add qword ptr [rsp + 32], 24",
             "call {f}",
+            "3:",
             "mov rsp, r12",
             "pop qword ptr gs:[0x1478]",
             "pop qword ptr gs:[16]",
@@ -501,6 +539,7 @@ mod imp {
             lo = in(reg) s.lo,
             base = in(reg) s.base,
             f = in(reg) f,
+            ret = in(reg) super::SWITCH_RETURN.as_ptr(),
             in("rcx") data,
             out("r12") _,
             clobber_abi("C"),
