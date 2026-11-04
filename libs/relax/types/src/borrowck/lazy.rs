@@ -256,6 +256,8 @@ impl Queue {
     /// The epoch `src`'s keys use for collect epoch `epoch`.
     fn canon(&self, src: usize, epoch: u64) -> u64 { self.alias.get(&(src, epoch)).copied().unwrap_or(epoch) }
     fn insert(&mut self, item: Item, rank: u32) {
+        // a live edit's check: the background check running now gives way (worker)
+        if rank == RANK_EDIT { crate::preempt::set_urgent(true); }
         let at = (rank, self.seq); self.seq += 1;
         self.rank_of.insert(item.key.clone(), at);
         self.order.insert(at); self.items.insert(at, item);
@@ -303,6 +305,7 @@ pub fn set_ranks(src: usize, epoch: u64, ranks: &[(DefId, Vec<TyId>, u32)]) {
             q.order.remove(&at);
             let item = q.items.remove(&at).unwrap();
             let next = ((*rank).min(at.0), at.1);
+            if next.0 == RANK_EDIT { crate::preempt::set_urgent(true); }
             q.order.insert(next); q.items.insert(next, item); q.rank_of.insert(key, next);
         } else if !q.seen.contains_key(&key) {
             let key = (src, *def);
@@ -623,7 +626,11 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
             loop {
                 if stopping() { return; }
                 settle_finished_check();
-                if let Some(item) = guard.as_mut().and_then(Queue::pop) { break item; }
+                if let Some(item) = guard.as_mut().and_then(Queue::pop) {
+                    // urgent while a live edit's check is still queued
+                    crate::preempt::set_urgent(guard.as_ref().and_then(|q| q.order.first()).is_some_and(|a| a.0 == RANK_EDIT));
+                    break item;
+                }
                 if verbose && std::env::var_os("MAKEPAD_RUN_GANDALF_STATS").is_some() && CHECKED.load(Ordering::Relaxed) > 0 && !IDLE_REPORTED.swap(true, Ordering::Relaxed) {
                     eprintln!("gandalf: idle at t={:.0} ms: {} fns checked, {} violations, cpu {:.1} ms ({:.1} us/fn), {} clean from the cache",
                         crate::clock::wall_ns() as f64 / 1e6, CHECKED.load(Ordering::Relaxed), VIOLATIONS.load(Ordering::Relaxed),
@@ -722,6 +729,10 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
             };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _p = crate::preempt::Preemptible::on();
+                // a background check gives way to a live edit's: the edit's verdict waited at the
+                // front of the queue for the check running, 133-480 ms in a session's first
+                // edits (Fab, 11-04)
+                let _y = (rank > RANK_HOT).then(crate::preempt::Yields::on);
                 crate::preempt::point();
                 let _origin = crate::clock::origin("gandalf");
                 phase.set("typeck");
@@ -780,9 +791,11 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
             if let Some(q) = guard.as_mut() {
                 if !q.epoch.get(identity).is_some_and(|e| *e > *epoch) { q.insert(item, rank); }
             }
+            let edit_next = guard.as_ref().and_then(|q| q.order.first()).is_some_and(|a| a.0 == RANK_EDIT);
             drop(guard);
-            // the writer runs; checking again at once would only meet it again
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            // the writer runs; checking again at once would only meet it again (a live edit's
+            // check, which preempted this one, runs at once)
+            if !edit_next { std::thread::sleep(std::time::Duration::from_millis(50)); }
             continue;
         }
         if !ok {
