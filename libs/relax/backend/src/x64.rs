@@ -4354,6 +4354,15 @@ impl<'a> Gen<'a> {
         if self.vx_wide(options, op, d, a, b) || self.vx_lanes(op, d, a, b) {
             return;
         }
+        if let VX::Clmul(k) = op {
+            // pclmulqdq (66 0F 3A 44 /r ib): immediate bit 0 picks a's high qword, bit 4 b's
+            let imm = (k & 1) | (k & 2) << 3;
+            self.v2(d, a, b, &move |m, x, y| {
+                m.sse_ext(0x66, 0x3a, 0x44, x, y);
+                m.byte(imm);
+            });
+            return;
+        }
         // SHA-NI has legacy SSE encodings only, with NO mandatory 66 prefix.
         // Do not route these through v3: AVX hosts must still get legacy SHA.
         let sha = match op {
@@ -5522,6 +5531,7 @@ impl<'a> Gen<'a> {
     }
 
     fn ibin(&mut self, options: &relax_session::Options, op: IOp, it: IntTy, d: VReg, a: VReg, b: VReg) {
+        assert!(op.crc32_bits().is_none(), "crc32 is lowered for aarch64 targets only");
         // a spilled first operand of a register result loads straight into it, unless b lives there
         // (uloc covers a spilled b's window; a rematerialised b's window register counts too: b's
         // last read can share d's register, and the load would overwrite b before the operation
