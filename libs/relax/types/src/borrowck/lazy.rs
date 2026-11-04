@@ -188,8 +188,9 @@ pub fn carry_whole(src: usize, from: u64, to: u64) {
 
 /// A source of the program / type context for the worker (the unit's shared front end).
 pub trait FrontSource: Send + Sync {
-    /// Wait for the runner to admit background checking (once, before any work).
-    fn wait_start(&self) {}
+    /// Whether the runner admits background checking (its startup is over). Before that the
+    /// worker checks a live edit's owners only.
+    fn started(&self) -> bool { true }
     /// Runs `f` with the program and type context if the unit is alive (under the front
     /// end's read lock); None when it is gone or not checkable right now.
     fn with_front(&self, f: &mut dyn FnMut(&Program, &Tcx, &crate::tcx::EvalCx<'_>)) -> bool;
@@ -584,9 +585,21 @@ impl FrontSource for Parked {
 
 fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
     let _mem = crate::memstat::tag(crate::memstat::Tag::Borrowck);
-    src.lower_priority(); src.wait_start();
+    src.lower_priority();
+    let mut started = false;
     loop {
         if stopping() { return; }
+        // The startup's checks wait for the runner; a live edit's do not: the person waits for its
+        // verdict (Fab's first edit after a cold start was patched at once and verified 9 s later,
+        // when the startup released the checker, 11-04).
+        if !started {
+            started = src.started();
+            let edit_first = || QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|q| q.order.first()).is_some_and(|a| a.0 == RANK_EDIT);
+            if !started && !edit_first() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
+        }
         // (the source the worker started with must not keep a replaced front state alive)
         if !src.alive() {
             if let Some(n) = rehomed(&src) { src = n; }

@@ -24806,10 +24806,8 @@ impl crate::borrowck::lazy::FrontSource for BorrowckFront {
         trace_stored_verdict(prog, def, "owner", found.1.as_ref());
         found
     }
-    fn wait_start(&self) {
-        while STARTUP_PHASE.load(Ordering::Acquire) != 0 && !SPEC_STOP.load(Ordering::SeqCst) {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+    fn started(&self) -> bool {
+        STARTUP_PHASE.load(Ordering::Acquire) == 0 || SPEC_STOP.load(Ordering::SeqCst)
     }
     fn identity(&self) -> usize {
         self.0.checker_id
