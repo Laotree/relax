@@ -417,7 +417,14 @@ pub(super) fn wake_all() {
         }
     }
 }
+/// This process is a plain fork's child (jit::fork_child): it has no workers, and a parent's worker
+/// may have held the queue's lock or inbox at the fork, held for good there: nothing is queued.
+static FORKED: AtomicBool = AtomicBool::new(false);
+pub(super) fn fork_child() {
+    FORKED.store(true, Ordering::SeqCst);
+}
 pub(super) fn push(job: Job, at: u64) {
+    if FORKED.load(Ordering::Relaxed) { return; }
     let runnable = crate::zone_alloc::kept_with(|| { let mut q = lock(); q.push(job, at) || q.runnable() });
     start();
     if runnable { wake(); }
@@ -446,6 +453,7 @@ static AHEAD_PENDING: AtomicBool = AtomicBool::new(false);
 /// width (STARTUP_AHEAD; a running check takes the next itself when it ends). Ahead work blocked
 /// otherwise starts when the startup's phases change (they wake the workers).
 fn push_ahead(front: &Arc<FrontShared>, work: impl Iterator<Item = AheadWork>) {
+    if FORKED.load(Ordering::Relaxed) { return; }
     // A producer can finish discovering work after the settle rebuild retired its front.
     if !front.alive.load(Ordering::Acquire) { return; }
     let at = wall_ns();

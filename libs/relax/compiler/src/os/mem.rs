@@ -328,8 +328,9 @@ mod imp {
     /// Before a program's fork (every code writer paused: jit.rs fork_prepare): each code region
     /// is copied into a memfd of its own for the child. MAP_SHARED views would otherwise share
     /// the parent's code pages with the child, which compiles on (a lazy compile in the child)
-    /// and would write into the parent's code. A fork of the loader's own native code execs at
-    /// once and never writes code: it shares the pages, nothing is copied.
+    /// and would write into the parent's code. A fork for an exec (the program's pre_exec spawn,
+    /// forkexec.rs; the loader's own native code's) never writes code: it shares the pages,
+    /// nothing is copied.
     pub fn fork_prepare() {
         let n = REGIONS_N.load(Ordering::Acquire);
         for (k, (r, fd)) in REGIONS[..n].iter().zip(&REGION_FD[..n]).enumerate() {

@@ -176,12 +176,21 @@ pub fn why_hung(req: &Req, out: &mut Out) {
     for f in crate::forkexec::in_flight().iter().filter(|f| f.age_ns >= 2_000_000_000) {
         let by = caps.iter().find(|c| c.t.handle == f.thread).map(|c| c.t.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| thread_label(f.thread, &list));
         let what = match f.state {
-            crate::forkexec::STATE_FORKING => "the fork itself has not returned (the loader's fork waits for compile jobs to park)".to_string(),
+            crate::forkexec::STATE_FORKING => "the fork itself has not returned (fork() blocks in the kernel or in the C library's fork handlers)".to_string(),
             crate::forkexec::STATE_UNBUILT => format!("it reached `{}`, which was not built before the fork, and ended (exit 127)", crate::jit::slot_name(f.slot).unwrap_or_default()),
             _ => "it runs its pre_exec closures or blocks in them (a closure waits, or reached a lock another thread held at the fork)".to_string(),
         };
         let pid = if f.pid == 0 { "(no pid yet)".to_string() } else { f.pid.to_string() };
         findings.push(("fork without exec", format!("forked child {} of thread {} has not reached exec after {:.1} s: {} -- the spawn in that thread waits for it", pid, by, f.age_ns as f64 / 1e9, what)));
+    }
+    // compile jobs paused (an allocator swap, a plain fork, a unit's retirement): the pause waits
+    // for every job counted running, named here with how long it has been
+    let pauser = crate::jit::paused_for();
+    if pauser != 0 {
+        let now = crate::clock::wall_ns();
+        for (t, since) in crate::jit::job_rows::snapshot().into_iter().filter(|j| j.0 != pauser) {
+            findings.push(("paused for a job", format!("compile jobs are paused for thread {}, which waits for the compile job thread {} has run for {:.1} s", thread_label(pauser, &list), thread_label(t, &list), now.saturating_sub(since) as f64 / 1e9)));
+        }
     }
     let parked = super::events::parked_now();
     for (id, os_id, thread, message, location) in &parked {
