@@ -20,8 +20,9 @@ pub(super) enum Job {
     O3(TierEntry),
     Spec(usize, u32),
     Tick,
-    /// a slice of `makepad test`'s dependency check (check.rs DepBatch): below every build
-    Check(Arc<crate::check::DepBatch>),
+    /// a slice of a check beside the program (check.rs CheckBatch): below every build until
+    /// something waits for it
+    Check(Arc<crate::check::CheckBatch>),
 }
 impl Job {
     fn slot(&self) -> Option<(usize, u32)> {
@@ -33,7 +34,7 @@ impl Job {
         }
     }
     fn label(&self) -> &'static str {
-        match self { Self::Ahead(..) => "JIT ahead", Self::O2(..) => "JIT O2", Self::O3(..) => "JIT O3", Self::Spec(..) => "JIT spec", Self::Tick => "JIT tick", Self::Check(..) => "JIT dep check" }
+        match self { Self::Ahead(..) => "JIT ahead", Self::O2(..) => "JIT O2", Self::O3(..) => "JIT O3", Self::Spec(..) => "JIT spec", Self::Tick => "JIT tick", Self::Check(..) => "JIT check" }
     }
     fn tier(&self) -> usize {
         match self { Self::Ahead(..) => 0, Self::O2(..) => 1, Self::O3(..) => 2, Self::Spec(..) => 3, Self::Tick => 4, Self::Check(..) => 5 }
@@ -58,7 +59,7 @@ impl Serials {
 struct Policy {
     /// the burst gate: one build at a time below Interactive while the startup or the UI runs
     burst: bool,
-    /// running builds below Interactive (the burst gate's count: the dependency check is none)
+    /// running builds below Interactive (the burst gate's count: a check beside the program is none)
     builds: usize,
     noninteractive: usize,
     background: usize,
@@ -228,7 +229,7 @@ impl Queue {
         policy.ahead_full = startup_phase() && ahead >= startup_ahead();
         policy
     }
-    /// (the dependency check is no build: the budget alone decides how much of it runs beside them)
+    /// (a check beside the program is no build: the budget alone decides how much of it runs beside them)
     fn class_blocked(&self, class: u8, tier: usize, policy: &Policy) -> Option<&'static str> {
         if tier < 4 && !eligible(class, policy.burst, policy.builds) { return Some("UI burst"); }
         if class != budget::INTERACTIVE {
@@ -324,11 +325,11 @@ fn eligible(class: u8, burst: bool, noninteractive: usize) -> bool {
 /// ahead of the main thread's lazy compiles serve the startup and the UI's bursts; a tier-up (O2,
 /// O3) or a speculative build only speeds code up, so it runs in the background class, below the
 /// app's visible work, however hot its slot (its heat orders it among the background builds).
-/// The dependency check runs in the background class until the run's exit waits for it.
+/// A check beside the program runs in the background class until something waits for it.
 fn job_class(job: &Job, _now: &HeatNow) -> u8 {
     match job {
         Job::Ahead(..) if startup_phase() || ui_burst() => budget::INTERACTIVE,
-        Job::Check(..) if crate::check::dep_check_waited() => budget::INTERACTIVE,
+        Job::Check(..) if crate::check::check_waited() => budget::INTERACTIVE,
         _ => budget::BACKGROUND,
     }
 }
@@ -336,10 +337,13 @@ pub(super) fn heat_key(heat: u64, ui: bool, waited_ns: u64) -> u64 {
     let lg = if heat == 0 { 0 } else { ((heat as f64).log2() * 1024.0) as u64 };
     lg.saturating_add(waited_ns.saturating_mul(1024) / 4_000_000_000).saturating_add(if ui { 1024 } else { 0 })
 }
+/// A check that something waits for goes before every build of its class: the first frame and the
+/// run's exit wait for nothing else.
+const CHECK_WAITED_KEY: i64 = i64::MAX - 1;
 fn key(e: &Entry, now: &HeatNow) -> i64 {
     if matches!(e.job, Job::Tick) { return i64::MAX; }
-    // (the dependency check goes behind every build of its class)
-    if matches!(e.job, Job::Check(..)) { return i64::MIN; }
+    // (a check beside the program goes behind every build of its class, until it is waited for)
+    if matches!(e.job, Job::Check(..)) { return if crate::check::check_waited() { CHECK_WAITED_KEY } else { i64::MIN }; }
     let (heat, ui) = match &e.job {
         Job::O2(u, id, _) => now.heat(*u, *id),
         Job::O3(t) => now.heat(0, t.0),
@@ -365,7 +369,7 @@ fn epoch_key(heat: u64, ui: bool, at: u64) -> i64 {
     bucket + if ui { 1024 } else { 0 } - age_key(at)
 }
 static QUEUE: OnceLock<relax_session::sync::Mutex<Queue>> = OnceLock::new();
-/// The queue's tiers: ahead, O2, O3, spec, tick, dependency check.
+/// The queue's tiers: ahead, O2, O3, spec, tick, check beside the program.
 const TIERS: usize = 6;
 static COUNTS: [AtomicUsize; TIERS] = [const { AtomicUsize::new(0) }; TIERS];
 static RUNNING: [AtomicUsize; TIERS] = [const { AtomicUsize::new(0) }; TIERS];
@@ -596,8 +600,8 @@ pub(super) fn promote(unit: usize, id: u32) -> WaitPriority {
     WaitPriority { unit, id }
 }
 
-/// The run's exit waits for the dependency check: its queued and running jobs take the waiter's
-/// class (job_class gives the jobs it queues from now on the same).
+/// Something waits for the check beside the program: its queued and running jobs take the waiter's
+/// class and go first in it (job_class and key give the jobs it queues from now on the same).
 pub(super) fn promote_checks() {
     if FORKED.load(Ordering::Relaxed) { return; }
     let _kept = crate::zone_alloc::kept();
@@ -609,7 +613,8 @@ pub(super) fn promote_checks() {
         q.plan[5][class as usize].remove(&order(key, serial));
         budget::queued(class, budget::JIT, -1);
         q.entries[i].class = budget::INTERACTIVE;
-        q.plan[5][budget::INTERACTIVE as usize].insert(order(key, serial));
+        q.entries[i].key = CHECK_WAITED_KEY;
+        q.plan[5][budget::INTERACTIVE as usize].insert(order(CHECK_WAITED_KEY, serial));
         budget::queued(budget::INTERACTIVE, budget::JIT, 1);
     }
     for r in q.running.iter().filter(|r| r.tier == 5) { r.class.reclass(budget::INTERACTIVE); }
