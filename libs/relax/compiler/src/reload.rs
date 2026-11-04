@@ -5764,8 +5764,16 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         }
         // the startup's file scan (own_files: an owner request of 10-15 ms on Sandbox) waits until
         // the UI thread's first frames after the present are done: run right at the present, the
-        // UI thread's first lazy links queued behind it (36 ms of a first post-present episode)
-        if startup_scan && crate::postframe::in_first_frames() { continue; }
+        // UI thread's first lazy links queued behind it (36 ms of a first post-present episode).
+        // A save ends the wait: the person waits for that edit, not for the first frames (Fab's
+        // first edit right after its window showed waited 7.6 s here, 11-04). The scan's round
+        // looks at every file, those the taken notifications named among them.
+        if startup_scan && crate::postframe::in_first_frames() {
+            let named = events.as_mut().map(|w| w.changed());
+            // (events lost: the watch starts over)
+            if matches!(named, Some(None)) { events = LiveWatch::new(files.iter().map(|f| f.0.as_str())); }
+            if !named.is_some_and(|n| n.is_none_or(|c| !c.is_empty())) && crate::vfs::edits_ledger_stamp() == ledger.0 { continue; }
+        }
         gate_note(0);
         let loads = jit::DEFERRED_LOADS.load(std::sync::atomic::Ordering::Relaxed);
         // a new watch set drops the events the old one had not delivered yet (a save made
