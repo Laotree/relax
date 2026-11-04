@@ -462,6 +462,13 @@ fn enqueue(options: &crate::options::Options, src: &Arc<dyn FrontSource>, def: D
     }
     WAKE.notify_one();
 }
+/// (trace) Where `def`'s check stands: its rank and the checks queued ahead of it; None: not queued.
+pub fn queue_place(src: usize, def: DefId, epoch: u64) -> Option<(u32, usize)> {
+    let guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let q = guard.as_ref()?;
+    let at = *q.rank_of.get(&(src, def, q.canon(src, epoch)))?;
+    Some((at.0, q.order.range(..at).count()))
+}
 /// Checks queued (0 also before the worker started); the aot levels' completion line reads it.
 pub fn queued() -> usize {
     QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |q| q.order.len())

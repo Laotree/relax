@@ -4505,6 +4505,18 @@ pub(crate) struct PendingPatch {
     pub(crate) event_seq: u64,
 }
 
+/// MAKEPAD_RUN_SPECV_TRACE: the slots a patch group's verdict waits on, printed when they change
+/// (the queue position aside: it moves on every poll).
+fn trace_patch_wait(group: u32, waits: &[String]) {
+    static LAST: relax_session::sync::Mutex<Vec<(u32, String)>> = relax_session::sync::Mutex::new(Vec::new());
+    let stable: String = waits.iter().map(|w| w.split(" queued Some((").next().unwrap_or(w)).collect::<Vec<_>>().join("; ");
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.iter().any(|(g, s)| *g == group && *s == stable) { return; }
+    last.retain(|(g, _)| *g != group);
+    last.push((group, stable));
+    eprintln!("specv @{:.3} patch group {group} waits on {}", crate::jit::wall_ns() as f64 / 1e9, waits.join("; "));
+}
+
 /// SPEC-V: settles the patch groups awaiting verdicts. A group whose every slot is clean is verified
 /// (an inspect event says which observations that makes verified). A group with a failed verdict is
 /// rolled back -- newer groups first, they were made on top of it -- the slots return to their
@@ -4523,15 +4535,20 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
                 let u = &*up;
                 let mut failed = Vec::new();
                 let mut waiting = false;
+                let mut waits: Vec<String> = Vec::new();
                 for &id in &p.ids {
                     match u.verdict_state(id) {
                         Verdict::Clean => {}
                         Verdict::Failed(events) => failed.extend(events),
                         // never verified, never reported: the slots stay unverified (baseline)
                         Verdict::Unverifiable(why) => unchecked.push(format!("{}: {}", u.fns[id as usize].name, why)),
-                        Verdict::Pending => waiting = true,
+                        Verdict::Pending => {
+                            waiting = true;
+                            if crate::jit::specv_trace() { waits.push(format!("#{id} {}", u.pending_why(id))); }
+                        }
                     }
                 }
+                if !waits.is_empty() { trace_patch_wait(p.group, &waits); }
                 if !failed.is_empty() { Some(Some(failed)) }
                 else if waiting { None }
                 else {

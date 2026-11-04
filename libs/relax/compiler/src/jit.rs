@@ -7213,6 +7213,15 @@ impl Unit {
         }
     }
 
+    /// MAKEPAD_RUN_SPECV_TRACE: what slot `id`'s pending verdict waits on: the checker's entry for
+    /// its owner, the epoch, and the check's (rank, checks ahead) when it is queued.
+    pub(crate) fn pending_why(&self, id: u32) -> String {
+        let Some(d) = self.verdict_owner(id) else { return "no owner".into() };
+        let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
+        let src = self.front.checker_id;
+        format!("{} {:?} epoch {} queued {:?}", self.prog.def_path(d), crate::borrowck::lazy::verdict(src, d, &[], epoch), epoch, crate::borrowck::lazy::queue_place(src, d, epoch))
+    }
+
     /// SPEC-V: where slot `id`'s body stands with the borrow checker (see `verdict_clean`).
     pub(crate) fn verdict_state(&self, id: u32) -> Verdict {
         use crate::borrowck::lazy::FnVerdict;
@@ -16440,7 +16449,7 @@ unsafe fn prebuild_callees(up: *mut Unit, relocs: &[relax_backend::rir::RelocAt]
 
 /// MAKEPAD_RUN_SPECV_TRACE=1: SPEC-V verdict sweeps (slots turning verified) and twins tiering up,
 /// with the callers whose lowering still calls them.
-fn specv_trace() -> bool {
+pub(crate) fn specv_trace() -> bool {
     static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *T.get_or_init(|| std::env::var_os("MAKEPAD_RUN_SPECV_TRACE").is_some())
 }
