@@ -24,6 +24,8 @@ pub mod experiments;
 pub mod flightrec;
 pub mod gpuprof;
 mod hang;
+#[cfg(test)]
+pub(crate) use hang::budget_deadlock;
 pub mod heap;
 pub mod instrument;
 pub mod patches;
@@ -245,7 +247,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("writes", "<Type::field> | (none: the watches) | W<n> [n=20] | rm <W<n>|all>", "who writes a struct field: the compiled fns that assign `x.field` (`=`, `op=`) are rebuilt to record every write: its site (fn, file:line), the value written and the field's address; `writes W<n>` reads the sites and the latest writes"),
     ("vms", "", "every live Splash VM: label, thread, heap objects / strings / arrays and bytes, GC runs and time, errors, evaluations"),
     ("live", "[after=<next>]", "an instant look for live graphs (no window, no sleep), one JSON line: now_ms, frames presented, live patches installed and the ones the newest presented window frame was built with (frame_patch), finished builds so far per kind (lazy, ahead, o2, o3, linked; diff two looks for a rate), queues [ahead,o2,o3], UI ms waited on the JIT; with after=<the last answer's next>: the UI frames since then (the last minute at most) as ft [[ms before now_ms the frame ended, ms it worked], ...]"),
-    ("cpu", "", "the shared CPU budget: running and queued app/JIT jobs per class, waits and checkpoint warnings"),
+    ("cpu", "", "the shared CPU budget: running and queued app/JIT jobs per class, waits and checkpoint warnings, who holds and waits for the tokens"),
     ("jit", "[ms=250]","live compile activity in one line (what the JIT ring shows): busy or idle, the jobs running now, the queues per tier (ahead, O2, O3), builds finished and their rate over ms, the UI thread's JIT duty"),
     ("jit queue", "[n=10]","running JIT jobs, then the unified queue in admission order: class, heat, UI path, wait, function"),
     ("threads", "", "every thread: name, role, state, CPU time, what it waits on; JIT threads: alive/restarting/dead, panics, heartbeat"),
@@ -378,7 +380,7 @@ fn dispatch_command(req: &Req, out: &mut Out) {
         "ping" => out.line(&format!("{{\"pid\":{},\"app\":{},\"ms\":{}}}", std::process::id(), json_str(&APP.lock().unwrap()), now_ms())),
         "threads" => cmd_threads(out),
         "jit" => cmd_jit(req, out),
-        "cpu" => { for line in makepad_cpu_budget::report_string().lines() { out.line(line); } },
+        "cpu" => cmd_cpu(out),
         "live" => cmd_live(req, out),
         "stacks" => cmd_stacks(req, out),
         "waits" => cmd_waits(out),
@@ -1092,6 +1094,25 @@ fn lifeline_fields(r: &crate::lifeline::Row) -> String {
     f
 }
 
+/// The budget's report, and who has its tokens (and what those threads wait for).
+fn cmd_cpu(out: &mut Out) {
+    for line in makepad_cpu_budget::report_string().lines() {
+        out.line(line);
+    }
+    let mut list = threads::list();
+    name_handles(&mut list);
+    let tokens = makepad_cpu_budget::tokens();
+    const CLASSES: [&str; 3] = ["interactive", "visible", "background"];
+    const CLIENTS: [&str; 3] = ["app", "jit", "hal"];
+    for h in &tokens.holders {
+        let wait = crate::waits::of(h.thread).map(|w| format!(" -- waits: {}", wait_text(&w, &list))).unwrap_or_default();
+        out.line(&format!("{} {} {} {:?} on {} for {:.1} s{}", if h.lent { "lent" } else if h.above { "above" } else { "token" }, CLASSES[h.class as usize], CLIENTS[h.client as usize], h.label, thread_label(h.thread, &list), h.held_ns as f64 / 1e9, wait));
+    }
+    for w in &tokens.waiting {
+        out.line(&format!("wanted {} {} by {}", CLASSES[w.class as usize], CLIENTS[w.client as usize], thread_label(w.thread, &list)));
+    }
+}
+
 pub fn wait_text(w: &crate::waits::Wait, list: &[threads::Thread]) -> String {
     let ms_n = crate::clock::wall_ns().saturating_sub(w.since_ns) / 1_000_000;
     // "for 812 ms", "for 40.9 s"
@@ -1109,6 +1130,8 @@ pub fn wait_text(w: &crate::waits::Wait, list: &[threads::Thread]) -> String {
             format!("{} {:#x}{} for {}", if w.label.is_empty() { "futex" } else { w.label }, w.object, held, ms)
         }
         crate::waits::Kind::Owner => format!("owner ({} request) for {}; owner serves {}", w.label, ms, crate::owner::serving_note()),
+        crate::waits::Kind::Build => format!("build #{} {} held by {} for {}", w.object, w.label, thread_label(w.holder, list), ms),
+        crate::waits::Kind::Token => format!("a {} CPU token for {}", w.label, ms),
         _ => format!("{} held by {} for {}", kind, thread_label(w.holder, list), ms),
     }
 }
@@ -1813,6 +1836,11 @@ fn cmd_vms(out: &mut Out) {
 /// condvar, 3 read lock, 4 write lock, 5 park, 6 once; holder: a mutex holder's tag) or joins a
 /// thread (kind 7; holder: its pthread handle).
 pub extern "C" fn relax_wait_enter(kind: u32, addr: usize, holder: usize) {
+    // asleep a program thread keeps no CPU token: what it sleeps on (another job, a lock its holder
+    // keeps while it waits for a build) may need one
+    if !crate::owner::in_fork_child() {
+        makepad_cpu_budget::lend();
+    }
     if kind == 7 {
         // a join: the holder is the joined thread's pthread handle
         crate::waits::enter(crate::waits::Kind::Join, 0, holder as u64, "join");
@@ -1827,6 +1855,9 @@ pub extern "C" fn relax_wait_enter(kind: u32, addr: usize, holder: usize) {
 }
 
 pub extern "C" fn relax_wait_leave() {
+    if !crate::owner::in_fork_child() {
+        makepad_cpu_budget::take_back();
+    }
     crate::zone_alloc::domain::after_wait();
     crate::waits::leave();
 }
