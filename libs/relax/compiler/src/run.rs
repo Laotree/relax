@@ -461,7 +461,7 @@ pub(crate) fn take_boot_resolved() -> Option<Resolved> {
 /// `proc_macro::is_available()` is false (no macro call on the thread) and it takes its fallback.
 fn with_sysroot_proc_macro(mut units: unitgraph::Units, std_dir: &str) -> unitgraph::Units {
     let pm_root = format!("{}/proc_macro/lib.rs", std_dir);
-    if units.units.iter().any(|u| u.name == "proc_macro") || !crate::vfs::exists(&pm_root) { return units; }
+    if units.units.iter().any(|u| u.sysroot) || !crate::vfs::exists(&pm_root) { return units; }
     let wants = |u: &unitgraph::GraphUnit| crate::vfs::read_shared(&u.src_path).is_ok_and(|src| {
         // the crate root's `extern crate proc_macro` (not `proc_macro2`): a cheap byte scan, where
         // the item is in practice; a declaration in a submodule is not seen
@@ -474,7 +474,7 @@ fn with_sysroot_proc_macro(mut units: unitgraph::Units, std_dir: &str) -> unitgr
     units.units.push(unitgraph::GraphUnit {
         pkg_id: format!("path+file://{}/proc_macro#proc_macro@0.0.0", std_dir),
         kind: vec!["lib".to_string()], name: "proc_macro".to_string(), src_path: pm_root, edition: "2021".to_string(),
-        host: false, mode: "build".to_string(), harness: false, features: Vec::new(), deps: Vec::new(),
+        host: false, mode: "build".to_string(), harness: false, sysroot: true, features: Vec::new(), deps: Vec::new(),
     });
     for r in roots { units.units[r].deps.push((pm, "proc_macro".to_string())); }
     units

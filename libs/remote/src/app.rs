@@ -449,11 +449,11 @@ fn gseq(client: &Client, kv: &[(String, String)]) -> Result<String, String> {
     Ok(format!("{{\"png\":[{}],\"n\":{n},\"every_ms\":{every_ms},\"frames\":[{}]}}", paths.join(","), frame_json.join(",")))
 }
 
-/// The window ids of a `status` answer (`"w":[{"i":ID,...},...]`).
-pub fn window_ids(status: &str) -> Vec<usize> {
+/// The windows of a `status` answer (`"w":[{"i":ID,"pass_dpi":N,...},...]`): (id, pass dpi).
+fn windows_of(status: &str) -> Vec<(usize, f64)> {
     let Some(start) = status.find("\"w\":[") else { return Vec::new() };
     let b = status.as_bytes();
-    let (mut i, mut depth, mut ids) = (start + 5, 1i32, Vec::new());
+    let (mut i, mut depth, mut windows) = (start + 5, 1i32, Vec::new());
     while i < b.len() && depth > 0 {
         match b[i] {
             b'"' => {
@@ -463,11 +463,21 @@ pub fn window_ids(status: &str) -> Vec<usize> {
                 while i < b.len() && b[i] != b'"' {
                     i += if b[i] == b'\\' { 2 } else { 1 };
                 }
-                // `"i":` directly inside a window object (depth 2)
-                if depth == 2 && &status[begin..=i.min(b.len() - 1)] == "\"i\"" && b.get(i + 1) == Some(&b':') {
-                    let digits: String = status[i + 2..].chars().take_while(char::is_ascii_digit).collect();
-                    if let Ok(id) = digits.parse() {
-                        ids.push(id);
+                // a key directly inside a window object (depth 2)
+                if depth == 2 && b.get(i + 1) == Some(&b':') {
+                    let number: String = status[i + 2..].chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+                    match &status[begin..=i.min(b.len() - 1)] {
+                        "\"i\"" => {
+                            if let Ok(id) = number.parse() {
+                                windows.push((id, 0.0));
+                            }
+                        }
+                        "\"pass_dpi\"" => {
+                            if let (Some(window), Ok(dpi)) = (windows.last_mut(), number.parse()) {
+                                window.1 = dpi;
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -477,7 +487,13 @@ pub fn window_ids(status: &str) -> Vec<usize> {
         }
         i += 1;
     }
-    ids
+    windows
+}
+
+/// The ids of the windows of a `status` answer that have drawn: one that never did (a window
+/// only a headset's frames go to) has no frame to grab.
+pub fn drawn_window_ids(status: &str) -> Vec<usize> {
+    windows_of(status).into_iter().filter(|(_, dpi)| *dpi > 0.0).map(|(id, _)| id).collect()
 }
 
 /// A frame of every window (or `w=`), then `quit`: the last call of a session.
@@ -485,7 +501,7 @@ fn gq(client: &Client, kv: &[(String, String)]) -> Result<String, String> {
     let scale = scale_of(kv);
     let targets = match window_of(kv) {
         Some(w) => vec![w],
-        None => window_ids(&ask_one(client, "status").unwrap_or_default()),
+        None => drawn_window_ids(&ask_one(client, "status").unwrap_or_default()),
     };
     let (mut paths, mut problems) = (Vec::new(), Vec::new());
     for window in targets {

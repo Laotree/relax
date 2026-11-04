@@ -160,7 +160,7 @@ pub(crate) fn restart(mut edit: Edit, why: &str) {
 }
 
 /// Replace the previous exec marker before the package, preserving the libtest argv verbatim.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn restart_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
     let Some((state, _)) = LIVE.get() else { return args };
     let mut out = Vec::new();

@@ -4,7 +4,7 @@
 //! attribute on a `let`. After a patch the next call runs the new code; an edit the running
 //! code cannot take restarts, and a program that no longer compiles is refused.
 use crate::reload::Rung;
-use crate::reload_async_tests::{in_child, live_app};
+use crate::reload_async_tests::{in_child, live_app, LIVE_UNIT};
 
 const LIB: &str = r#"mod other;
 pub use other::*;
@@ -95,6 +95,71 @@ pub fn talk(out: &mut u64) {
     *out = d.say();
 }
 "#;
+
+const HOLDER: &str = r#"pub enum Note { Thickness(u64), Other }
+
+static mut STORED: Option<Box<dyn Fn() -> u64>> = None;
+
+pub fn store(out: &mut u64) {
+    let k = 3u64;
+    let closure: Box<dyn Fn() -> u64> = Box::new(move || k + 1);
+    unsafe { STORED = Some(closure); }
+    *out = 1;
+}
+
+pub fn run_stored(out: &mut u64) {
+    *out = unsafe { (*std::ptr::addr_of!(STORED)).as_ref().unwrap()() };
+}
+
+pub fn other(out: &mut u64) {
+    let note = Note::Thickness(5);
+    *out = match note { Note::Thickness(n) => n, Note::Other => 0 };
+}
+"#;
+
+/// A closure's first call after a refused edit: it is lowered from the checked body of the
+/// version that made it, an older one than the running text when an edit of another fn of its
+/// file was applied before. A refused edit drops what was built from its own text, not that.
+#[test]
+fn a_refused_enum_edit_keeps_the_older_body_a_closure_needs() {
+    in_child("reload_items_tests::a_refused_enum_edit_keeps_the_older_body_a_closure_needs", &["only"], |_| {
+        live_app("refused-keeps-body", &[("lib.rs", HOLDER)], &["store", "run_stored", "other"], |call, edit| {
+            assert_eq!(call("store"), 1, "the closure is made, not called");
+            assert_eq!(call("other"), 5);
+            let applied = edit("lib.rs", &[("Note::Thickness(5)", "Note::Thickness(6)")]);
+            assert_eq!(applied.rung, Rung::Patch, "{:?}", applied.lines);
+            assert_eq!(call("other"), 6);
+            // a variant of the enum changes (running values could hold it) and the closure's
+            // owner is edited with it
+            let refused = edit("lib.rs", &[("Thickness", "Width"), ("k + 1", "k + 2")]);
+            assert_eq!(refused.rung, Rung::Restart, "{:?}", refused.lines);
+            assert_eq!(call("run_stored"), 4, "the closure runs the code of the version that made it");
+            assert_eq!(call("other"), 6, "nothing of the refused edit installed");
+        });
+    });
+}
+
+/// A closure of a replaced version whose body is gone is no error of the program, so no edit of
+/// it can resume the call: it is an internal compiler error, a failed hot load (jit.rs compile_ice,
+/// tools/run/fixture/hot_fail.py), which never parks.
+#[test]
+fn a_closure_of_a_replaced_version_without_its_body_is_an_internal_error() {
+    in_child("reload_items_tests::a_closure_of_a_replaced_version_without_its_body_is_an_internal_error", &["only"], |_| {
+        live_app("closure-no-body", &[("lib.rs", HOLDER)], &["store", "run_stored", "other"], |call, edit| {
+            assert_eq!(call("store"), 1);
+            let applied = edit("lib.rs", &[("Note::Thickness(5)", "Note::Thickness(6)")]);
+            assert_eq!(applied.rung, Rung::Patch, "{:?}", applied.lines);
+            let up = LIVE_UNIT.load(std::sync::atomic::Ordering::Relaxed) as *mut crate::jit::Unit;
+            crate::owner::call(crate::owner::Class::Program, || unsafe {
+                (*up).bodies.clear();
+                (*up).old_bodies.clear();
+            });
+            let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call("run_stored"))).unwrap_err();
+            let message = failed.downcast_ref::<String>().cloned().unwrap_or_default();
+            assert!(message.contains("closure parent body missing") && crate::jit::is_ice_stub_message(message.trim_start_matches("JIT call panicked: ")), "{message}");
+        });
+    });
+}
 
 #[test]
 fn edits_of_items_apply_live() {

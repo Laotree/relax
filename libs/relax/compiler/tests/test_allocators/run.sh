@@ -1,6 +1,7 @@
 #!/bin/bash
 # usage: run.sh <makepad binary>: `makepad test ta-app` runs tests/first.rs and tests/second.rs, each
-# with its own `#[global_allocator]`, and tests/plain_alloc.rs with none, out of the package's one
+# with its own `#[global_allocator]`, tests/alloc.rs too under a sysroot crate's name, tests/core.rs,
+# std.rs, test.rs and proc_macro.rs named likewise, and tests/plain_alloc.rs with none, out of the package's one
 # test program: each target's allocations go through its own allocator only. Twice on one fresh
 # cache (cold, then restored), so cached code never carries one target's allocator into another.
 # Prints "test_allocators: ok" or "test_allocators: FAILED".
@@ -11,7 +12,7 @@ for pass in cold warm; do
     rc=$?
     echo "$OUT"
     ok=$(echo "$OUT" | grep -c "^test result: ok. 1 passed")
-    if [ $rc != 0 ] || [ "$ok" != 3 ]; then
+    if [ $rc != 0 ] || [ "$ok" != 8 ]; then
         echo "test_allocators: FAILED ($pass: rc $rc, results $ok)"
         rm -rf -- "$C"
         exit 1

@@ -21,6 +21,9 @@ pub(crate) fn in_child(test: &str, cases: &[&str], body: impl FnOnce(&str)) {
     body(&case)
 }
 
+/// The unit of the running `live_app` (a test that looks into it).
+pub(crate) static LIVE_UNIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// A live session (M10 layouts, an app-scope crate) over crate `app` of `files` (paths under
 /// src/ with their text; lib.rs first), then `run(call, edit)`: `call(name)` runs the crate's
 /// fn `name(out: &mut u64)` (one of `names`, found at load) and returns `*out`; `edit(file,
@@ -51,6 +54,7 @@ pub(crate) fn live_app(tag: &str, files: &[(&str, &str)], names: &[&str], run: i
     tcx.collect(&prog);
     let mut u = crate::jit::Unit::new(prog, tcx, core);
     let up = &mut *u as *mut crate::jit::Unit;
+    LIVE_UNIT.store(up as usize, std::sync::atomic::Ordering::Relaxed);
     let entries: Vec<u64> = crate::owner::call(crate::owner::Class::Program, || {
         entries_of.iter().map(|&d| { let id = u.fn_id(crate::jit::FnKey::Inst(d, vec![])); u.entry(id) }).collect()
     });

@@ -663,11 +663,17 @@ mod imp {
     /// callbacks in JIT code) would run after Relax dropped the unit, and unix's exit() does not
     /// run the main thread's key destructors either.
     pub fn exit(code: i32) -> ! {
+        super::run_program_atexit();
+        end_process(code)
+    }
+
+    /// The process's own exit work and its end, without the program's handlers (a restart, which
+    /// stands in for an exec: restart_parent.rs).
+    pub fn end_process(code: i32) -> ! {
         use std::io::Write;
         extern "C" {
             fn _cexit();
         }
-        super::run_program_atexit();
         unsafe { _cexit() };
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();

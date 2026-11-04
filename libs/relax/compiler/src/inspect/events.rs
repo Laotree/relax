@@ -376,6 +376,12 @@ pub fn on_panic(info: &crate::jit::PanicInfo, regs: *const u64) {
         crate::hot_failure::restart_failed(&format!("{}: {} at {}", info.kind, info.message, info.location));
         return;
     }
+    // a call of a stub whose build hit an internal compiler error, built off this thread or
+    // panicking in its compile: a failed hot load like a call's own (jit.rs compile_ice), no panic
+    // of the program to park. It parks only when no fresh process took over.
+    if crate::jit::is_ice_stub_message(&info.message) && !crate::hot_failure::has_error() {
+        crate::jit::ice_at_call(&info.message);
+    }
     // the run window shows the app's parked panic (resume, restart) in a live session; a run that
     // is none (a test's child) ends as its panic ends it
     let watched = WATCHERS.load(SeqCst) > 0 || super::AGENT.load(Relaxed)

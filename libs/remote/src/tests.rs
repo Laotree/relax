@@ -432,7 +432,7 @@ fn tcp_both_ends_send_8mb_at_once() {
 fn app_dispatch(req: &Req, out: &mut Out) {
     match req.cmd.as_str() {
         "ping" => out.line(&format!("{{\"pong\":1,\"pid\":{},\"app\":\"makepad-remote-test\"}}", std::process::id())),
-        "status" => out.line("{\"app\":\"x\",\"pid\":1,\"w\":[{\"i\":0,\"t\":\"say \\\"i\\\":9\",\"sz\":[4,3]},{\"i\":2,\"t\":\"b\"}],\"closed\":[{\"i\":7}]}"),
+        "status" => out.line("{\"app\":\"x\",\"pid\":1,\"w\":[{\"i\":0,\"t\":\"say \\\"i\\\":9\",\"sz\":[4,3],\"pass_dpi\":2},{\"i\":1,\"t\":\"never drew\",\"pass_dpi\":0},{\"i\":2,\"t\":\"b\",\"pass_dpi\":1.5}],\"closed\":[{\"i\":7}]}"),
         "quit" => out.line("{\"ok\":1}"),
         "echo" => out.line(&format!("{{\"cmd\":{},\"pos\":{},\"t\":{}}}", crate::json_str(&req.cmd), req.pos.len(), crate::json_str(req.get("t").unwrap_or("")))),
         _ => dispatch(req, out),
@@ -525,8 +525,8 @@ fn app_commands_split_words_from_arguments_and_keep_spaces() {
     let req = Req::parse(&crate::app::request_line(&["text".to_string()], &[("t".to_string(), "a\tb\u{1b}c \"q\"".to_string())]));
     assert_eq!(req.get("t"), Some("a\tb\u{1b}c \"q\""));
     // a window id is told from a window title that mentions one
-    assert_eq!(crate::app::window_ids("{\"app\":\"x\",\"w\":[{\"i\":0,\"t\":\"say \\\"i\\\":9\"},{\"i\":12}],\"closed\":[{\"i\":7}]}"), [0, 12]);
-    assert!(crate::app::window_ids("{\"err\":\"x\"}").is_empty());
+    assert_eq!(crate::app::drawn_window_ids("{\"app\":\"x\",\"w\":[{\"i\":0,\"t\":\"say \\\"i\\\":9\",\"pass_dpi\":1.5},{\"i\":7,\"pass_dpi\":0},{\"i\":12,\"pass_dpi\":2}],\"closed\":[{\"i\":3,\"pass_dpi\":2}]}"), vec![0, 12]);
+    assert!(crate::app::drawn_window_ids("{\"err\":\"x\"}").is_empty());
 }
 
 #[test]
@@ -590,7 +590,7 @@ fn gq_grabs_every_window_then_quits() {
     let (lines, err) = run_app(&["gq"]);
     assert!(!err, "{lines:?}");
     assert!(lines[0].starts_with("{\"png\":[") && lines[0].ends_with("],\"quit\":1}"), "{lines:?}");
-    // the two windows of `status` (0 and 2), not the title or the closed one
+    // the two windows of `status` that drew (0 and 2), not the title, the one that never drew or the closed one
     assert_eq!(lines[0].matches("grab-w").count(), 2, "{lines:?}");
     let files: Vec<String> = lines[0].split('"').filter(|s| s.contains("grab-w")).map(str::to_string).collect();
     assert!(files[0].contains("grab-w0-") && files[1].contains("grab-w2-"));
