@@ -312,13 +312,7 @@ pub fn start_http_server(http_server: HttpServer) -> Option<HttpServerThread> {
         println!("Cannot bind http server port");
         return None;
     };
-    let mut wake = listener.local_addr().ok()?;
-    if wake.ip().is_unspecified() {
-        wake.set_ip(match wake.ip() {
-            IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
-        });
-    }
+    let wake = dial_addr(listener.local_addr().ok()?);
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = stop.clone();
 
