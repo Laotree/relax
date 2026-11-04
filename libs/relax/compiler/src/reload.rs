@@ -5737,6 +5737,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // system call.
         let quiet = (crate::harness::live::enabled() || jit::live_startup_done()) && !DOMAIN_LOADING.load(std::sync::atomic::Ordering::Acquire)
             && pending.is_empty() && !streams_busy(up);
+        let t_wait = Instant::now();
         match events.as_mut() {
             Some(w) if quiet => {
                 let next = again.then_some(std::time::Duration::ZERO)
@@ -5746,6 +5747,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             }
             _ => std::thread::sleep(std::time::Duration::from_millis(5)),
         }
+        let woke = Instant::now();
         if DOMAIN_LOADING.load(std::sync::atomic::Ordering::Acquire) { gate_note(1); continue; }
         let latest = DOMAIN_REVISION.load(std::sync::atomic::Ordering::Acquire);
         if latest != revision {
@@ -5877,7 +5879,15 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             let due: Vec<(u32, String)> = landing.iter().filter(|l| l.0 <= now).map(|l| (l.1, l.2.clone())).collect();
             landing.retain(|l| l.0 > now);
             for (gen, what) in due {
-                if let Some(name) = crate::owner::call(crate::owner::Class::Program, || running_old_code(&*up, gen)) {
+                let t_land = Instant::now();
+                let w0 = crate::jit::wall_ns();
+                let old = crate::owner::call(crate::owner::Class::Program, || { let held = t_land.elapsed(); (running_old_code(&*up, gen), held) });
+                if live_trace() {
+                    // a long wait names what the owner served meanwhile
+                    let behind = if old.1.as_millis() >= 20 { format!("; behind {}", crate::owner::served_during(w0, w0 + old.1.as_nanos() as u64)) } else { String::new() };
+                    eprintln!("makepad live: landing check of patch group {gen} at t={:.0} ms: {:.1} ms ({:.1} ms waiting for the owner{behind})", crate::clock::ms_since_start(), t_land.elapsed().as_secs_f64() * 1e3, old.1.as_secs_f64() * 1e3);
+                }
+                if let Some(name) = old.0 {
                     let lines = vec![format!("`{name}` still runs the code from before the edit: a call made before the patch has not returned (a loop) -- restart the app")];
                     log_edit(&what, &Outcome { failure: None, kept: 0, pending: false, rung: Rung::Restart, files: Vec::new(), lines: lines.clone(), names: Vec::new(), changed: 0, test_changes: None, group: gen, ms: [0.0; 4], undo: None, work: [0; 5] }, None, Instant::now());
                     restart_for_edit(&what, &lines);
@@ -5892,7 +5902,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let notifications = events.as_mut().and_then(|w| w.changed());
         if t_ev.elapsed().as_millis() > 20 && live_trace() { eprintln!("makepad live: events drain took {:.1} ms", t_ev.elapsed().as_secs_f64() * 1e3); }
         let lost = events.is_some() && notifications.is_none();
+        let t_rewatch = Instant::now();
         if lost { events = LiveWatch::new(files.iter().map(|f| f.0.as_str())); }
+        let rewatch_ms = t_rewatch.elapsed().as_secs_f64() * 1e3;
         // a sync moved the dock app's checkout: every file is compared with what runs
         let synced = dock.as_mut().is_some_and(DockGate::synced);
         let caught_up = CATCH_UP.swap(false, std::sync::atomic::Ordering::AcqRel);
@@ -5903,6 +5915,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let t_round = std::time::Instant::now();
         if all { last_scan = Instant::now(); }
         // a sync moved the checkout: every file, the virtual ones too
+        let named = notifications.as_ref().map(Vec::len);
+        let ledger_was = ledger.0;
         let ids = if synced { (0..files.len()).collect() } else { ledger.round(crate::vfs::edits_ledger_stamp(), all, notifications, &hot, &virt.is) };
         let mut scanned = ids.len();
         if live_trace() {
@@ -5911,6 +5925,13 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         }
         let look = Look::new();
         let mut changed: Vec<usize> = ids.into_iter().filter(|&k| look.stamp(&virt, k, &files[k].0) != files[k].2).collect();
+        // a round that looked at something: when it woke, what woke it and what it found (the
+        // 5 ms polls while a verdict is pending look at nothing and print nothing)
+        if live_trace() && scanned > 0 {
+            eprintln!("makepad live: watch round at t={:.0} ms: woke after {:.1} ms, round {:.1} ms after the wake; {}named {:?}, ledger {}, looked {scanned}, changed {}",
+                crate::clock::ms_since_start(), woke.duration_since(t_wait).as_secs_f64() * 1e3, woke.elapsed().as_secs_f64() * 1e3,
+                if lost { format!("events lost (rewatched in {rewatch_ms:.1} ms), ") } else { String::new() }, named, if ledger.0 != ledger_was { "moved" } else { "still" }, changed.len());
+        }
         if !traced && all {
             traced = true;
             eprintln!("makepad live: one watch round: {} files in {:.2} ms; hot set {} files", files.len(), t_round.elapsed().as_secs_f64() * 1e3, hot.len());
