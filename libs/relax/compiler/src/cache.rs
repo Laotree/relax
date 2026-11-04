@@ -5094,11 +5094,12 @@ fn write_front_graph(job: &FrontGraphWrite) -> Option<()> {
         // the changed crates' parts are encoded in parallel, each opening its crate's front-image
         // store (the part references sources/tokens there); unchanged ones keep their row
         let indices: Vec<usize> = (0..recorded.len()).collect();
+        let runs = demand::OpenStores::new();
         let encoded = par_map(&indices, |&ci| -> Option<Option<(u128, Vec<u8>)>> {
             let part = &recorded[ci];
             if part.key != 0 { return Some(None); }
             let name = &recipe.crates[ci].0;
-            let mut images = demand::Images::open(dir, front_store_name(&job.options, name, fps[ci]?))?;
+            let mut images = demand::Images::open(dir, front_store_name(&job.options, name, fps[ci]?), &runs)?;
             let body = part.encode_body(&mut images, job.profile, name)?;
             images.finish(job.profile, name)?;
             Some(Some(body))
@@ -5731,16 +5732,18 @@ impl crate::crate_image::CrateImages for FrontImages {
         Some(crate::crate_image::DemandParts { valid, last_selected, load: std::sync::Arc::new(move || {
             let _profile = crate::load_profile::span(crates_profile, "rust-demand-parts", "load");
             let store = Store::open(&path);
+            let opened = demand::OpenStores::new();
             let chunk = keys.len().div_ceil(crate::preload::jobs().max(1)).max(1);
             crate::pool::scope(|scope| {
                 let handles = keys.chunks(chunk).zip(crate_names.chunks(chunk)).enumerate().map(|(n, (keys, names))| {
                     let store = &store;
                     let image_dir = &image_dir;
+                    let opened = &opened;
                     scope.spawn(move || { keys.iter().zip(names).enumerate().map(|(i, (key, name))| {
                         let key = (*key)?;
                         let (kind, bytes) = store.as_ref()?.get(key)?;
                         if kind != KIND_DEMAND_PART { return None; }
-                        let mut images = demand::ReadImages::default();
+                        let mut images = demand::ReadImages::new(opened);
                         let part = crate::preload::DemandPart::read(key, bytes, n * chunk + i, &mut |name, key| images.get(image_dir, name, key));
                         if crates_profile && part.is_none() { eprintln!("rust-demand-part-invalid: {name} payload decode"); }
                         part.map(std::sync::Arc::new)
