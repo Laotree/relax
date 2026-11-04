@@ -309,6 +309,16 @@ fn dispatch_command(req: &Req, out: &mut Out) {
             None | Some("pending") => {
                 let p = crate::reload::restart_pending();
                 out.line(&format!("{{\"restart_pending\":{},\"note\":\"edits that cannot apply live wait here; the app runs the code before them until `session relaunch`\"}}", p.len()));
+                {
+                    use crate::reload::host;
+                    let (phase, since) = host::status();
+                    let b = host::build_progress();
+                    out.line(&format!(
+                        "{{\"restart\":{{\"click\":\"{:?}\",\"phase\":\"{:?}\",\"asked\":{},\"secs\":{},\"done\":{},\"total\":{},\"building\":{},\"waiting\":{},\"failed\":{},\"dot\":{}}}}}",
+                        host::route(), phase, host::restart_asked(), since.as_secs(), b.done, b.total, json_str(&b.building), json_str(&b.waiting), json_str(&host::failure()),
+                        host::dot().map_or("null".to_string(), |[x, y, w, h]| format!("[{x},{y},{w},{h}]")),
+                    ));
+                }
                 for w in p {
                     out.line(&format!("{{\"waits\":{}}}", json_str(&w)));
                 }
