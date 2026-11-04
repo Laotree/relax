@@ -3732,6 +3732,9 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         // the main thread waits for the owner thread (a frame's lazy compile) and a later pass
         // tries again; the store write runs after the owner thread releases it.
         let cprobe = YieldProbe::new();
+        // the cache files' pages the run has resident go first (a settle's trim drops them too):
+        // the record's copy of the program comes on top of what the process holds
+        crate::pack::release_resident();
         if let Some((ready, retired_boot, t)) = unit_call(wait, || {
             cprobe.start();
             yield_section("collected");
@@ -3774,7 +3777,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
             verbose!("makepad-run cache: collected record held the owner {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
             drop(retired_boot);
             if let Some((report, dest, payload)) = ready {
-                if let Some(written) = crate::cache::Cache::commit_collected(report, dest, payload) {
+                if let Some(written) = crate::cache::Cache::commit_collected(report, dest, payload, &|| false) {
                     COLLECTED_CURRENT.store(true, Ordering::Relaxed);
                     crate::zone_alloc::kept_with(|| *COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(written.clone())));
                     let retired_boot = crate::owner::call(crate::owner::Class::Program, || unsafe { &mut *up }.cache.as_mut().map(|c| c.finish_collected()));

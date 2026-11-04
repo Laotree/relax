@@ -198,7 +198,8 @@ fn not_now() -> Option<String> {
 fn trace(what: &str) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_SETTLE_TRACE").is_some()) {
-        eprintln!("makepad-run settle rebuild: {what} (t={:.0} ms)", crate::clock::ms_since_start());
+        let (rss, peak, extra) = crate::memstat::process_rss();
+        eprintln!("makepad-run settle rebuild: {what} (t={:.0} ms; rss {} MB, peak {} MB, {})", crate::clock::ms_since_start(), rss >> 20, peak >> 20, extra.split(';').next().unwrap_or(""));
     }
 }
 
@@ -289,35 +290,47 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
     }
     // 1. the collected image of the program now, under a front read (compiles go on); none when
     // the store holds one of this program and only the interners grew since (the replace tops
-    // them up)
+    // them up). The image borrows the program's arrays, so it goes into the store under the same
+    // read: nothing of the program is copied for it.
     let t = Instant::now();
     let Some(inputs) = owner::publish(|| unsafe { (*up).cache.as_ref().map(|c| c.collected_inputs()) }) else {
         return Outcome::Retry("the cache is not in the unit".into());
     };
     let stored = *STORED.lock().unwrap_or_else(|e| e.into_inner());
-    let (before, record) = {
+    // the run's resident cache file pages go first: the encode adds its image to what the old
+    // state holds
+    crate::pack::release_resident();
+    let (before, encoded) = {
         let _c = crate::zone_alloc::compiler();
         let r = front_read("settle rebuild encode");
         let (prog, tcx) = r.unit(up);
         let before = Counts::of(prog, tcx);
         trace(&format!("the program {before:?}, the stored image {stored:?}"));
         let stop = || crate::preempt::writer_waiting() || crate::preempt::is_stopped();
-        (before, (!stored.is_some_and(|s| s.same_program(&before))).then(|| inputs.encode_now(prog, tcx, &stop)))
-    };
-    let encoded = record.is_some();
-    if let Some(record) = record {
-        let (dest, payload) = match record {
-            crate::cache::CollectedRecord::Ready(dest, payload) => (dest, payload),
-            crate::cache::CollectedRecord::Current => return Outcome::Retry("the store already holds the image".into()),
-            crate::cache::CollectedRecord::Yielded => return Outcome::Retry("the encode yielded to a front writer".into()),
-            crate::cache::CollectedRecord::Failed => return Outcome::Refused("the program is not recordable".into()),
-        };
-        if crate::cache::Cache::commit_collected(None, dest, payload).is_none() {
-            return Outcome::Retry("the collected image could not be written".into());
+        if stored.is_some_and(|s| s.same_program(&before)) {
+            (before, false)
+        } else {
+            let (dest, payload) = match inputs.encode_now(prog, tcx, &stop) {
+                crate::cache::CollectedRecord::Ready(dest, payload) => (dest, payload),
+                crate::cache::CollectedRecord::Current => return Outcome::Retry("the store already holds the image".into()),
+                crate::cache::CollectedRecord::Yielded => return Outcome::Retry("the encode yielded to a front writer".into()),
+                crate::cache::CollectedRecord::Failed => return Outcome::Refused("the program is not recordable".into()),
+            };
+            trace("encoded, before the store write");
+            if crate::cache::Cache::commit_collected(None, dest, payload, &stop).is_none() {
+                return Outcome::Retry(if stop() { "the image write yielded to a front writer" } else { "the collected image could not be written" }.into());
+            }
+            (before, true)
         }
+    };
+    if encoded {
         *STORED.lock().unwrap_or_else(|e| e.into_inner()) = Some(before);
         ENCODES.fetch_add(1, Ordering::Relaxed);
     }
+    // the cache files' pages this process has resident (the old state's images, read by the
+    // encode) go before the new state maps its own: never both at once (they are read-only file
+    // pages; a later read faults one back from the page cache)
+    crate::pack::release_resident();
     let encode_ms = ms(t);
     let encode = if encoded { format!("encode {encode_ms:.1} ms") } else { "no encode (the store holds the program's image)".to_string() };
     trace(&encode);
@@ -350,6 +363,9 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
     }
     let restore_ms = ms(t);
     trace(&format!("restored in {restore_ms:.1} ms"));
+    // the new image's pages the restore read go again: the new state faults back what it uses,
+    // as a warm start does
+    crate::pack::release_resident();
 
     // 3. the replace, on the owner under a front write; what the cache recorded so far is
     // written first, off the owner (the replace writes only what comes after this)
@@ -377,6 +393,8 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
         fresh.cache = Some(cache);
     }
     trace(&format!("cache opened in {:.1} ms", ms(t_open)));
+    // and the pages the open read once (indexes, ledgers), before the replace
+    crate::pack::release_resident();
     let t = Instant::now();
     let replaced = owner::call(owner::Class::Program, || unsafe { replace(up, &sess, mode, fresh, before) });
     let old = match replaced {
@@ -397,6 +415,7 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
     crate::memstat::trim();
     crate::pack::release_resident();
     let rss1 = crate::memstat::resident();
+    trace("the old state dropped");
     REBUILDS.fetch_add(1, Ordering::Relaxed);
     if crate::run::VERBOSE.load(Ordering::Relaxed) || crate::memstat::enabled() { eprintln!("makepad-run settle rebuild at t={:.0} ms: {}, restore {:.1} ms, replace on the owner {:.1} ms, old state dropped in {:.1} ms; total {:.1} ms; rss {:.0} -> {:.0} MB",
         crate::clock::ms_since_start(), encode, restore_ms, replace_ms, drop_ms, ms(t_all), rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0); }
