@@ -6138,7 +6138,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             }
             continue;
         }
-        let saved = changed.iter().filter_map(|&k| stamp(&files[k].0).map(|s| s.0)).max();
+        // (a store's file whose edit was taken back stamps UNIX_EPOCH: it has no save time, and
+        // watch_ms printed the epoch's age)
+        let saved = changed.iter().filter_map(|&k| stamp(&files[k].0).map(|s| s.0)).filter(|t| *t != std::time::UNIX_EPOCH).max();
         let read_started = Instant::now();
         let watch_ms = saved.and_then(|s| s.elapsed().ok()).map_or_else(|| ms(seen), |d| d.as_secs_f64() * 1000.);
         let mut edits = Vec::new();
