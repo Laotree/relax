@@ -1366,7 +1366,6 @@ pub(crate) fn current_app_domain() -> Option<DomainId> {
 /// exits the process.
 pub(crate) fn exit_current(code: i32) -> bool {
     let Some(id) = current_app_domain() else { return false };
-    #[cfg(unix)]
     if crate::run::app_domain() == Some(id) {
         crate::os::proc::run_program_atexit();
     }

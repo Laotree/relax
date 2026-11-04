@@ -1929,7 +1929,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     start_exit_summary();
     *RUN_DIAGNOSTICS.lock().unwrap() = Some(u.tcx.dcx.clone());
     unsafe { atexit(at_exit) };
-    crate::jit::set_exit_hook(at_exit);
     start_monitor(runtime, options);
     // MAKEPAD_RUN_MEM_AT_MS=n[,m..]: the memory report (MAKEPAD_RUN_MEM_REPORT=1) n ms after main starts,
     // without ending the run's summary (programs that never reach their exit summary: Stage)

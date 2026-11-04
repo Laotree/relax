@@ -21326,28 +21326,14 @@ extern "C" fn relax_allocator_swap(phase: u32) {
     })
 }
 
-/// What `makepad run` does at exit (its summary: background compilers stopped, cache written);
-/// set by run.rs, called by __relax_exit.
-static EXIT_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-pub fn set_exit_hook(f: extern "C" fn()) {
-    EXIT_HOOK.store(f as usize, Ordering::SeqCst);
-}
-
-/// The program's std::process::exit on Windows (Relax std process_windows.rs): what unix's
-/// exit() does for a Relax program -- the at-exit hook -- then the end of the process without
-/// the exiting thread's fiber-local destructors: ExitProcess ran them into JIT code whose lazy
-/// compile waited forever for the unit lock of a thread ExitProcess had already ended (Amp never
-/// exited after its window closed).
+/// The program's std::process::exit on Windows (Relax std process_windows.rs): the end of the
+/// process without the exiting thread's fiber-local destructors (os::proc::exit): ExitProcess ran
+/// them into JIT code whose lazy compile waited forever for the unit lock of a thread ExitProcess
+/// had already ended (Amp never exited after its window closed).
 pub extern "C" fn __relax_exit(code: i32) {
     crate::domain::exit_current(code);
     let code = crate::check::finish_test_deps(code);
     crate::tui::exit_code(code);
-    let h = EXIT_HOOK.load(Ordering::SeqCst);
-    if h != 0 {
-        let f: extern "C" fn() = unsafe { std::mem::transmute(h) };
-        f();
-    }
     os::proc::exit(code)
 }
 
@@ -21372,9 +21358,8 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         // (rand 0.8's ReseedingRng registers its fork handler at its first use)
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         b"pthread_atfork" => Some(host_pthread_atfork as *const () as usize),
-        // (glibc's atexit is there too; and a handler in libc's list would run after this thread's
-        // locals are gone, where a lazy compile of it cannot run: makepad-remote's socket cleanup)
-        #[cfg(unix)]
+        // (the C library's atexit is there too; and a handler in its list would run after this
+        // thread's locals are gone, where a lazy compile of it cannot run: makepad-remote's cleanup)
         b"atexit" => Some(os::proc::program_atexit as *const () as usize),
         #[cfg(unix)]
         b"__relax_precompile" => Some(relax_precompile as *const () as usize),
