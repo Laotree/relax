@@ -4168,14 +4168,17 @@ const IN_USE_BY_OTHERS: std::time::Duration = std::time::Duration::from_secs(10 
 /// Keeps the cache: first every store's older generations go (store.rs: a rewrite leaves the
 /// generation it replaced for readers that still have it open), except one this process
 /// itself opened; a delete that fails (open elsewhere, on Windows) is retried by the next
-/// start. Then other Relax builds' stores go, unless a process of that build is running right
-/// now (store::retire_build: every running process holds its build's live lock): store names
-/// hash the codegen identity (codegen_id.rs), so no other build ever reads them. Then, while `<root>/cache` holds more
-/// than the cap (MAKEPAD_RUN_CACHE_MAX megabytes, else twice what this run uses (its live
-/// stores), at least CAP_FLOOR_MB), whole store files go, least recently used first (a run
-/// stamps the files it uses; other crate versions' files are never stamped again) -- never one
-/// this process opened or wrote, nor one another run stamped in the last IN_USE_BY_OTHERS.
-/// Only checked store files are ever deleted. Returns (bytes before, after).
+/// start. Other Relax builds' stores stay for when that build runs again: store names hash the
+/// codegen identity (codegen_id.rs), so no other build ever reads them, and a box whose lanes run
+/// several builds went cold each time one of them pruned (the Windows node lost a stopped Fab's
+/// 109 code stores to a test of another build, 11-04). While `<root>/cache` holds more than the
+/// cap (MAKEPAD_RUN_CACHE_MAX megabytes, else twice what this run uses (its live stores), at least
+/// CAP_FLOOR_MB), whole store files go, least recently used first, whichever build wrote them (a
+/// run stamps the files it uses; other crate versions' files are never stamped again) -- never
+/// one this process opened or wrote, nor one another run stamped in the last IN_USE_BY_OTHERS,
+/// nor one of a build running right now (every running process holds its build's live lock). A
+/// build with no store left loses its sets and its lock file. Only checked store files are ever
+/// deleted. Returns (bytes before, after).
 pub fn prune_root(root: &std::path::Path) -> (u64, u64) {
     let cap = std::env::var("MAKEPAD_RUN_CACHE_MAX").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20);
     prune(root, &crate::store::live(), &crate::store::open_files(), &crate::store::programs(), cap)
@@ -4241,42 +4244,16 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
         let stale = g < newest[&base] && !open.contains(&f.1);
         !(stale && crate::store::delete_checked(&f.1))
     });
-    // other builds' stores, by build (a store being written right now, or unreadable, has no
-    // build here and is left to the cap)
+    // whose stores these are (a store being written right now, or unreadable, has no build here);
+    // what a running build uses stays (the live lock)
     let me = crate::store::this_build();
     let builds: HashMap<PathBuf, Option<u64>> = files.iter().map(|f| (f.1.clone(), crate::store::build_of(&f.1))).collect();
-    let mut other: HashMap<u64, Vec<PathBuf>> = HashMap::new();
-    for f in &files {
-        if let Some(b) = builds[&f.1].filter(|b| *b != me) {
-            other.entry(b).or_default().push(f.1.clone());
-        }
-    }
     let sets = dir.join("sets");
-    // ended builds whose stores are gone leave only their lock file
-    for b in crate::store::lock_builds(&dir) {
-        if b != me {
-            other.entry(b).or_default();
-        }
-    }
-    let mut retired: HashSet<PathBuf> = HashSet::new();
-    let mut running: HashSet<PathBuf> = HashSet::new();
-    for (b, paths) in &other {
-        let idle = crate::store::retire_build(&dir, *b, || {
-            for p in paths {
-                if crate::store::delete_checked(p) {
-                    retired.insert(p.clone());
-                }
-            }
-            for n in set_files(&sets, *b) {
-                let _ = std::fs::remove_file(sets.join(n));
-            }
-            let _ = std::fs::remove_file(retiring_path(&sets, *b));
-        });
-        if !idle {
-            running.extend(paths.iter().cloned());
-        }
-    }
-    files.retain(|f| !retired.contains(&f.1));
+    let mut runs: HashMap<u64, bool> = HashMap::new();
+    let running: HashSet<PathBuf> = files.iter()
+        .filter(|f| builds[&f.1].is_some_and(|b| b != me && *runs.entry(b).or_insert_with(|| crate::store::build_runs(&dir, b))))
+        .map(|f| f.1.clone())
+        .collect();
     let now = std::time::SystemTime::now();
     let recent = |t: &std::time::SystemTime| now.duration_since(*t).map_or(true, |age| age < IN_USE_BY_OTHERS);
     // this build's replaced crate stores (store sets, write_sets): one a program's set named and
@@ -4289,7 +4266,8 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
     let mut part_named: HashSet<String> = HashSet::new();
     // the front stores demand parts take images from (each graph store lists them); a graph
     // store that cannot be read right now (being written) may name any of them
-    let parts_known = files.iter().filter(|f| family(&name(&f.1)) == "front_graph").all(|f| match crate::store::peek(&f.1, KIND_DEMAND_STORES) {
+    let mine = |f: &(std::time::SystemTime, PathBuf, u64)| builds.get(&f.1).copied().flatten() == Some(me);
+    let parts_known = files.iter().filter(|f| mine(f) && family(&name(&f.1)) == "front_graph").all(|f| match crate::store::peek(&f.1, KIND_DEMAND_STORES) {
         Some(lists) => {
             part_named.extend(lists.iter().flat_map(|b| String::from_utf8_lossy(b).lines().map(str::to_string).collect::<Vec<_>>()));
             true
@@ -4313,7 +4291,7 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
     static RUNS_CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if files.iter().any(|f| family(&name(&f.1)) == RUN_STORE_FAMILY && !keep(f)) && !RUNS_CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         // a store that cannot be read right now (a writer has it) may refer to any of them
-        let referenced: Option<HashSet<String>> = files.iter().filter(|f| family(&name(&f.1)) != RUN_STORE_FAMILY)
+        let referenced: Option<HashSet<String>> = files.iter().filter(|f| mine(f) && family(&name(&f.1)) != RUN_STORE_FAMILY)
             .map(|f| crate::store::peek(&f.1, KIND_FRONT_REF)).collect::<Option<Vec<_>>>()
             .map(|v| v.iter().flatten().filter_map(|b| front_run::decode_ref(b).map(|(n, _)| n.to_string())).collect());
         if let Some(referenced) = referenced { files.retain(|f| {
@@ -4330,10 +4308,22 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
         if total <= cap {
             break;
         }
-        let in_use = live.contains(&crate::store::base_path(p)) || recent(t);
+        let in_use = live.contains(&crate::store::base_path(p)) || recent(t) || running.contains(p);
         if !in_use && crate::store::delete_checked(p) {
             total -= len;
             evicted.insert(p);
+        }
+    }
+    // a build the cap took the last store of (or that left only its lock file)
+    let holding: HashSet<u64> = files.iter().filter(|f| !evicted.contains(&f.1)).filter_map(|f| builds[&f.1]).collect();
+    for b in crate::store::lock_builds(&dir) {
+        if b != me && !holding.contains(&b) {
+            crate::store::retire_build(&dir, b, || {
+                for n in set_files(&sets, b) {
+                    let _ = std::fs::remove_file(sets.join(n));
+                }
+                let _ = std::fs::remove_file(retiring_path(&sets, b));
+            });
         }
     }
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -8871,13 +8861,12 @@ mod prune_tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// Another build's stores go at the next prune (no build but their own ever reads them),
-    /// stamped recently or not and under any cap, unless a process of that build is running:
-    /// it holds that build's live lock (store::hold_build). This build's stores keep the cap's
-    /// LRU rule.
+    /// Another build's stores stay until the cap needs their room, as this build's do: least
+    /// recently used first, never while a process of that build runs (it holds that build's live
+    /// lock, store::hold_build). A build with no store left loses its sets and lock file.
     #[test]
-    fn other_builds_stores_retire_unless_that_build_runs() {
-        isolated_test!(other_builds_stores_retire_unless_that_build_runs);
+    fn other_builds_stores_stay_until_the_cap_needs_their_room() {
+        isolated_test!(other_builds_stores_stay_until_the_cap_needs_their_room);
         let root = std::env::temp_dir().join(format!("relax-retire-{}-{}", std::process::id(), crate::clock::wall_ns()));
         let dir = root.join("cache");
         std::fs::create_dir_all(&dir).unwrap();
@@ -8892,42 +8881,56 @@ mod prune_tests {
             p
         };
         let me = crate::store::this_build();
-        let (gone, alive) = (me ^ 0x1111, me ^ 0x2222);
-        let mine_old = store("core-0000000000000001.rcs", 3600, None);
+        let (idle, alive) = (me ^ 0x1111, me ^ 0x2222);
+        let mine_old = store("core-0000000000000001.rcs", 3000, None);
         let mine_used = store("alloc-0000000000000002.rcs", 3600, None);
-        // stamped a minute ago: the old mtime window would have kept it
-        let other_recent = store("core-00000000000000a1.rcs", 60, Some(gone));
-        let other_gen = crate::store::gen_path(&other_recent, 1);
-        std::fs::copy(&other_recent, &other_gen).unwrap();
+        let other_old = store("core-00000000000000a1.rcs", 3600, Some(idle));
         // written before headers named their build
-        let unnamed = store("std-00000000000000a2.rcs", 3600, Some(0));
-        let other_running = store("core-00000000000000b1.rcs", 3600, Some(alive));
+        let unnamed = store("std-00000000000000a2.rcs", 4000, Some(0));
+        let other_running = store("core-00000000000000b1.rcs", 5000, Some(alive));
+        let other_stamped = store("core-00000000000000c1.rcs", 60, Some(me ^ 0x4444));
         assert_eq!(crate::store::build_of(&mine_old), Some(me));
         assert_eq!(crate::store::build_of(&other_running), Some(alive));
         // a process of build `alive` (its lock, as hold_build takes it)
         std::fs::create_dir_all(dir.join("live")).unwrap();
         let lock = std::fs::File::create(dir.join("live").join(format!("{alive:016x}"))).unwrap();
         lock.lock_shared().unwrap();
-        // an ended build's lock file with no stores left
+        // an ended build's lock file and sets with no stores left; one with stores keeps them
         let ended = dir.join("live").join(format!("{:016x}", me ^ 0x3333));
         std::fs::File::create(&ended).unwrap();
+        std::fs::File::create(dir.join("live").join(format!("{idle:016x}"))).unwrap();
+        let sets = dir.join("sets");
+        std::fs::create_dir_all(&sets).unwrap();
+        let (ended_set, idle_set) = (sets.join(format!("{:016x}-{:016x}", me ^ 0x3333, 1)), sets.join(format!("{idle:016x}-{:016x}", 1)));
+        std::fs::write(&ended_set, "").unwrap();
+        std::fs::write(&idle_set, "").unwrap();
         let live: HashSet<PathBuf> = [mine_used.clone()].into_iter().collect();
         prune(&root, &live, &HashSet::new(), &[], Some(u64::MAX));
-        assert!(!other_recent.exists() && !other_gen.exists() && !unnamed.exists());
-        assert!(other_running.exists(), "a running build's stores stay");
-        assert!(mine_old.exists() && mine_used.exists(), "this build's stores are the cap's business");
+        assert!(other_old.exists() && unnamed.exists() && other_running.exists() && other_stamped.exists(), "under the cap every build's stores stay");
+        assert!(idle_set.exists(), "and what names them");
+        assert!(mine_old.exists() && mine_used.exists());
         assert!(dir.join("live").join(format!("{me:016x}")).exists(), "this process holds its build's lock");
+        assert!(!ended_set.exists(), "an ended build's sets go with its last store");
         #[cfg(unix)]
-        assert!(!ended.exists(), "an ended build's lock file goes");
-        // that build's process ends: its stores go at the next prune
+        assert!(!ended.exists(), "and its lock file");
+        // the cap takes the least recently used first, whichever build wrote them
+        let size = |p: &PathBuf| std::fs::metadata(p).unwrap().len();
+        let all = [&mine_old, &mine_used, &other_old, &unnamed, &other_running, &other_stamped].iter().map(|p| size(p)).sum::<u64>();
+        prune(&root, &live, &HashSet::new(), &[], Some(all - 1));
+        assert!(!unnamed.exists(), "the oldest not running goes first");
+        assert!(other_old.exists() && mine_old.exists());
+        assert!(other_running.exists(), "older, but its build runs");
+        // down to what is in use: this run's, another run's stamped just now, a running build's
+        prune(&root, &live, &HashSet::new(), &[], Some(1));
+        assert!(!other_old.exists() && !mine_old.exists());
+        assert!(!idle_set.exists(), "the cap took that build's last store: its sets go");
+        assert!(mine_used.exists() && other_stamped.exists() && other_running.exists());
+        // that build's process ends: the cap may take its stores now
         drop(lock);
-        prune(&root, &live, &HashSet::new(), &[], Some(u64::MAX));
+        prune(&root, &live, &HashSet::new(), &[], Some(1));
         assert!(!other_running.exists());
         #[cfg(unix)]
         assert!(!dir.join("live").join(format!("{alive:016x}")).exists());
-        // this build's stores: unchanged LRU under the cap (the run's own stay)
-        prune(&root, &live, &HashSet::new(), &[], Some(1));
-        assert!(!mine_old.exists() && mine_used.exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
