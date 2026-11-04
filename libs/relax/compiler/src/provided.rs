@@ -841,11 +841,16 @@ fn rustc_vec_words() -> Option<([usize; 3], usize)> {
 /// the other's (both allocate through the loader's allocator; zone_alloc dealloc_layout frees a
 /// block of any heap).
 #[derive(Clone, Copy)]
-struct StdSame {
+pub struct StdSame {
     /// `Vec` (the ADT of `String`'s one field), with `String`
     vec: DefId,
     /// `Option<String>` / `Option<Vec<T>>`: rustc's niche (None in the capacity word)
     option: bool,
+}
+
+/// The String / Vec agreement of the two stds (`StdSame`), probed on a layout table of its own.
+pub fn std_same(prog: &Program, tcx: &Tcx) -> Option<StdSame> {
+    std_vec_same(prog, tcx, &crate::layout::Layouts::new())
 }
 
 fn std_vec_same(prog: &Program, tcx: &Tcx, probe: &crate::layout::Layouts) -> Option<StdSame> {
@@ -949,6 +954,16 @@ pub fn same_layout_handles(prog: &Program, tcx: &Tcx, cands: &[(DefId, u32, u32,
     let mut v: Vec<DefId> = ok.into_iter().collect();
     v.sort_by_key(|d| d.0);
     v
+}
+
+/// Is field `t` of an opaque handle of provided crate `krate` the same bytes on both sides, so
+/// JIT-compiled code reaches it at rustc's offset (Unit::provided_handle_field)? The rule of
+/// `same_layout_handles` for one field: `trusted` data, a handle laid out as rustc does (`laid`),
+/// or a `String` / `Vec<T>` of such data (and `Option` of one) when the two stds agree
+/// (`std_same`): ScriptTokenizer's `tokens: Vec<ScriptTokenPos>` in a handle that its `State` keeps
+/// opaque. A HashMap (rustc's std's own table) or an opaque handle's elements stay rustc's alone.
+pub fn handle_field_same(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, std_same: Option<StdSame>, laid: &dyn Fn(DefId) -> bool, opaque: &dyn Fn(DefId) -> bool) -> bool {
+    same_bytes(prog, tcx, krate, t, laid, std_same, opaque, 0)
 }
 
 /// Is a field of type `t` (in a handle of provided crate `krate`) the same bytes on both sides
