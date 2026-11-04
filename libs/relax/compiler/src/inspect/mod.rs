@@ -44,11 +44,19 @@ pub mod vars;
 pub mod vsnative;
 pub mod watch;
 pub(crate) mod symbols;
+/// PE images' PDB public symbols (Windows host frame names)
+mod pdb;
 pub mod threads;
 
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+/// Windows x64: host frames are stepped by their PE unwind info, under cfi's interface
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub mod pe_unwind;
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub use pe_unwind as cfi;
+
+#[cfg(not(all(target_arch = "x86_64", any(target_os = "linux", windows))))]
 pub mod cfi {
-    //! (Linux x86_64 only: other targets walk host frames by their frame pointers)
+    //! (x86_64 Linux and Windows only: other targets walk host frames by their frame pointers)
     pub fn refresh() {}
 }
 
