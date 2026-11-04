@@ -4159,16 +4159,36 @@ static RESTART_SAVED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 static DOMAIN_RESTORED: relax_session::sync::Mutex<Option<String>> = relax_session::sync::Mutex::new(None);
 static DOMAIN_LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DOMAIN_INPUTS: relax_session::sync::Mutex<Option<Inputs>> = relax_session::sync::Mutex::new(None);
-/// The watcher's reload inputs, also readable while it waits for a live test verdict.
-static WATCH_INPUTS: relax_session::sync::Mutex<Option<std::sync::Arc<Inputs>>> = relax_session::sync::Mutex::new(None);
+/// What the watcher watches, also readable while it waits for a live test verdict: its reload
+/// inputs and the program's own source files loaded so far (`input_paths`, inspect `inputs`).
+/// Read without the owner: asked for the loaded files, an `inputs` waited behind the program's
+/// requests (a cold Fab's first edit: 0.5 s of its ship, at the first frames, 11-04).
+struct WatchView {
+    inputs: std::sync::Arc<Inputs>,
+    loaded: std::sync::Arc<Vec<String>>,
+}
+static WATCH_INPUTS: relax_session::sync::Mutex<Option<WatchView>> = relax_session::sync::Mutex::new(None);
 /// Told when the watcher's inputs are set, or when it ends without them ([`WATCH_GONE`]).
 static WATCH_READY: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
 /// The live session's watcher could not start, or ended: nothing waits for its inputs.
 static WATCH_GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn set_watch_inputs(snapshot: std::sync::Arc<Inputs>) {
-    *WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(snapshot);
+type WatchFile = (String, u32, Option<(std::time::SystemTime, u64)>);
+
+fn set_watch_inputs(inputs: &Inputs, files: &[WatchFile]) {
+    let inputs = crate::zone_alloc::kept_with(|| std::sync::Arc::new(inputs.clone()));
+    *WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(WatchView { inputs, loaded: loaded_of(files) });
     WATCH_READY.notify_all();
+}
+
+/// The watcher's files changed which of them the program loaded (a rewatch, a patch).
+fn set_watch_loaded(files: &[WatchFile]) {
+    let loaded = loaded_of(files);
+    if let Some(v) = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() { v.loaded = loaded; }
+}
+
+fn loaded_of(files: &[WatchFile]) -> std::sync::Arc<Vec<String>> {
+    crate::zone_alloc::kept_with(|| std::sync::Arc::new(files.iter().filter(|f| f.1 != u32::MAX).map(|f| f.0.clone()).collect()))
 }
 
 fn watch_gone() {
@@ -5338,15 +5358,9 @@ pub(crate) fn input_paths(keep: &dyn Fn(&str) -> bool) -> Result<Vec<String>, St
     while g.is_none() && crate::layout::LIVE_SESSION.load(std::sync::atomic::Ordering::Acquire) && !WATCH_GONE.load(std::sync::atomic::Ordering::Acquire) {
         g = WATCH_READY.wait(g).unwrap_or_else(|e| e.into_inner());
     }
-    let inputs = g.clone().ok_or("this run watches no sources (not a live session, or its watcher ended)")?;
+    let (inputs, loaded) = g.as_ref().map(|v| (v.inputs.clone(), v.loaded.clone())).ok_or("this run watches no sources (not a live session, or its watcher ended)")?;
     drop(g);
-    let up = crate::run::running_unit();
-    if up.is_null() { return Err("no running program".into()); }
-    let std_dir = std::env::var("MAKEPAD_RUN_STD").unwrap_or_default();
-    let loaded = crate::owner::call(crate::owner::Class::Program, || unsafe {
-        (*up).prog.current_source_files(|p| keep(p) && own_source(p, &std_dir)).into_keys().collect::<Vec<_>>()
-    });
-    Ok(inputs.source_paths(loaded.into_iter(), keep))
+    Ok(inputs.source_paths(loaded.iter().filter(|p| keep(p)).cloned(), keep))
 }
 
 /// A source file a live session watches and patches (`own_source`).
@@ -5610,8 +5624,6 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     // a body that includes a file for the first time: the watcher watches it from now on
     crate::sip::on_late_new(watch_events::kick);
     inputs.add_runner();
-    let snapshot = crate::zone_alloc::kept_with(|| std::sync::Arc::new(inputs.clone()));
-    set_watch_inputs(snapshot);
     let std_dir = std::env::var("MAKEPAD_RUN_STD").unwrap_or_default();
     // (path, running file index, last stamp)
     // the program's own source files (not std, registry or git dependencies), loaded so far
@@ -5619,7 +5631,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         u.prog.current_source_files(|p| own_source(p, &std_dir)).into_iter().filter(|(p, _)| crate::vfs::is_file(p)).collect()
     };
     // (the watcher's holds read the program's files only: lock_unit_quick)
-    let mut files: Vec<(String, u32, Option<(std::time::SystemTime, u64)>)> = {
+    let mut files: Vec<WatchFile> = {
         crate::owner::call(crate::owner::Class::Program, || {
             let loaded: std::collections::HashMap<_, _> = own_files(&*up).into_iter().collect();
             let mut v: Vec<_> = inputs.paths.iter().map(|(p, (stamp, _))| (p.clone(), loaded.get(p).copied().unwrap_or(u32::MAX), *stamp)).collect();
@@ -5634,10 +5646,11 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     for path in crate::native_macros::paths() {
         if !files.iter().any(|f| f.0 == path) { let s = stamp(&path); files.push((path, u32::MAX, s)); }
     }
+    set_watch_inputs(&inputs, &files);
     // the files the program's own code includes (include_str!/include_bytes!): a save of one is
     // an edit of the files that include it (`include_edits`). Bodies read more as they compile:
     // each is watched from its read (late_count moves).
-    let add_included = |files: &mut Vec<(String, u32, Option<(std::time::SystemTime, u64)>)>| -> bool {
+    let add_included = |files: &mut Vec<WatchFile>| -> bool {
         let mut added = false;
         for path in included_files(&std_dir) {
             if !files.iter().any(|f| f.0 == path) { let s = stamp(&path); files.push((path, u32::MAX, s)); added = true; }
@@ -5740,8 +5753,6 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             if let Some(next) = DOMAIN_INPUTS.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 inputs = next;
                 inputs.add_runner();
-                let snapshot = crate::zone_alloc::kept_with(|| std::sync::Arc::new(inputs.clone()));
-                set_watch_inputs(snapshot);
             }
             let loaded = crate::owner::call(crate::owner::Class::Program, || own_files(&*up));
             files = inputs.paths.iter().map(|(p, (s, _))| (p.clone(), u32::MAX, *s)).collect();
@@ -5749,6 +5760,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 if let Some(f) = files.iter_mut().find(|f| f.0 == path) { f.1 = file; }
                 else { let s = stamp(&path); files.push((path, file, s)); }
             }
+            set_watch_inputs(&inputs, &files);
             late_seen = crate::sip::late_count();
             add_included(&mut files);
             events = LiveWatch::new(files.iter().map(|f| f.0.as_str()));
@@ -5847,6 +5859,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 if jit::deferred_trace() { eprintln!("makepad live: watching {} more file(s) the post-boot loader loaded", added.len()); }
                 for (p, i) in added { let st = stamp(&p); files.push((p, i, st)); }
             }
+            set_watch_loaded(&files);
             if add_included(&mut files) || loaded_more {
                 repositories.include(files.iter().map(|f| f.0.as_str()));
                 events = LiveWatch::new(files.iter().map(|f| f.0.as_str()));
@@ -6125,7 +6138,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             }
             continue;
         }
-        let saved = changed.iter().filter_map(|&k| stamp(&files[k].0).map(|s| s.0)).max();
+        // (a store's file whose edit was taken back stamps UNIX_EPOCH: it has no save time, and
+        // watch_ms printed the epoch's age)
+        let saved = changed.iter().filter_map(|&k| stamp(&files[k].0).map(|s| s.0)).filter(|t| *t != std::time::UNIX_EPOCH).max();
         let read_started = Instant::now();
         let watch_ms = saved.and_then(|s| s.elapsed().ok()).map_or_else(|| ms(seen), |d| d.as_secs_f64() * 1000.);
         let mut edits = Vec::new();
@@ -6305,9 +6320,14 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                     f.1 = file;
                 }
             }
-            // Module additions can load files without a post-boot loader turn.
-            // Refresh their file indices before the next save reaches them.
-            if files.iter().any(|f| f.1 == u32::MAX && f.0.ends_with(".rs") && !inputs.process_input(&f.0)) {
+            set_watch_loaded(&files);
+            // Module additions can load files without a post-boot loader turn: a loaded file
+            // the watcher does not know yet is taken in by a rescan before the next save reaches
+            // it (the known ones took their indices above). Asked when any watched file was not
+            // loaded, it rescanned after every Fab patch (an owner request) and held the watch
+            // round for the first frames again.
+            let known: std::collections::HashSet<&str> = files.iter().map(|f| f.0.as_str()).collect();
+            if loaded.keys().any(|p| !known.contains(p.as_str()) && crate::vfs::is_file(p)) {
                 startup_scan = true;
             }
         }
