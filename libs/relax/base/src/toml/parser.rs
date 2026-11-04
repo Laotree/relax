@@ -1353,7 +1353,7 @@ mod tests {
         let text = "[package]\nname = \"p\"\n\n[dev-dependencies]\na = { path = \"../a\" }\nmakepad-core-util = { path = \"x\" }\n  makepad-core-util = { path = \"y\" }\n";
         let err = parse_toml(text).unwrap_err();
         assert_eq!((err.line, err.col), (7, 3));
-        assert_eq!(err.in_file("fab/slice/Cargo.toml"), "fab/slice/Cargo.toml:7:3: duplicate key `makepad-core-util`");
+        assert_eq!(err.in_file("libs/thing/Cargo.toml"), "libs/thing/Cargo.toml:7:3: duplicate key `makepad-core-util`");
         assert_eq!(err.to_string(), "duplicate key `makepad-core-util` at line 7 column 3");
         // columns count characters, not bytes
         let err = parse_toml("x = 1\na = { \"\u{e9}\" = 1, \"\u{e9}\" = 2 }\n").unwrap_err();

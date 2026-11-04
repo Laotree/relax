@@ -15424,7 +15424,7 @@ pub(crate) const PATCH_FLAG_OFF: i64 = (TIER_PATCH - TIER_LOOP) as i64;
 const O3_CALL_UNITS: u64 = 20;
 const CALL_COST: u64 = 10;
 /// a call's weight grows by one unit per this many bytes of the counted code beyond CALL_COST's
-/// (an estimate of its straight-line work: bigger bodies cost more per call). Race A/B (165, warm,
+/// (an estimate of its straight-line work: bigger bodies cost more per call). Race A/B (a Linux node, warm,
 /// 1 s half-life, tier-up installs vs 1404 at the old call windows): 8 -> 2153, 32 -> 1986
 /// (Hud::draw_walk, 14 KB at 60 calls/s, right at the threshold), 128 -> 1530 (it stays below O3).
 /// At 16 and the ln 2 s half-life Hud::draw_walk clears the threshold by 1.36x.
