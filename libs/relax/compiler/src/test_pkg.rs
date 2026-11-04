@@ -147,7 +147,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         }
     };
     if live_default {
-        if has_lib.is_some() {
+        if has_lib.as_ref().is_some_and(|l| l.test) {
             lib = true;
         } else {
             let harness: Vec<_> = bin_targets.iter().filter(|t| t.2).map(|t| ("--bin", &t.0))
@@ -165,7 +165,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
     if live && lib && has_lib.is_none() { return live_usage(); }
     let default_selection = !lib && bins.is_none() && tests.is_none();
     if default_selection {
-        lib = has_lib.is_some();
+        lib = has_lib.as_ref().is_some_and(|l| l.test);
         bins = (!bin_targets.is_empty()).then(Vec::new);
         tests = (!targets.is_empty()).then(Vec::new);
     }
@@ -271,8 +271,8 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
     // cargo test's default selection also runs the lib's doc tests; makepad test does not: say
     // how many there are, so the counts compare honestly
     if default_selection {
-        if let Some(lib_root) = &has_lib {
-            let n = count_doctests(lib_root);
+        if let Some(lib_target) = has_lib.as_ref().filter(|l| l.doctest) {
+            let n = count_doctests(&lib_target.path);
             if n > 0 {
                 eprintln!("makepad test: {n} doc test{} not run (makepad test runs no doc tests; `cargo test --doc` does)", if n == 1 { "" } else { "s" });
             }

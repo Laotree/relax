@@ -3184,6 +3184,17 @@ fn park_compile_error(up: usize, slot: u32) -> u64 {
 #[inline(never)]
 fn compile_ice(up: usize, message: &str) -> u64 {
     eprintln!("makepad-run: {message} -- makepad run bug, report it");
+    ice_at_call(message);
+    owner::call(owner::Class::Program, || unsafe {
+        let u = &mut *(up as *mut Unit);
+        let (code, relocs) = error_stub(u, message);
+        u.emit_or_redirect(&code, &relocs, "error stub").unwrap_or_else(|e| panic!("{}; and its error stub was not emitted: {}", message, e))
+    })
+}
+
+/// compile_ice's recovery, on the program thread that met the internal compiler error `message`.
+/// Returns when no fresh process takes over: the call then fails as the error's panic.
+pub(crate) fn ice_at_call(message: &str) {
     let on_main = os::thread::current() == MAIN_TID.load(Ordering::Relaxed);
     // (a recovery this process asked for already: its restart is this call's end too)
     let restarting = crate::reload::recover_compile_ice(message, on_main) || crate::reload::unit_suspect().is_some() && crate::hot_failure::recovering();
@@ -3201,11 +3212,12 @@ fn compile_ice(up: usize, message: &str) -> u64 {
         // the warm restart's own process failed the same way: the JIT error devhub reports
         crate::hot_failure::restart_failed(message);
     }
-    owner::call(owner::Class::Program, || unsafe {
-        let u = &mut *(up as *mut Unit);
-        let (code, relocs) = error_stub(u, message);
-        u.emit_or_redirect(&code, &relocs, "error stub").unwrap_or_else(|e| panic!("{}; and its error stub was not emitted: {}", message, e))
-    })
+}
+
+/// Whether a panic's message is an error stub's for a build that hit an internal compiler error
+/// (install_error's, compile_failed_stub's): no error of the program.
+pub(crate) fn is_ice_stub_message(message: &str) -> bool {
+    message.starts_with("internal compiler error compiling ") || message.starts_with("compile error in ") && message.contains(": internal compiler error")
 }
 
 fn fatal_compile_error(p: &PanicInfo, report: &str) {
@@ -3316,6 +3328,7 @@ fn rt_compile_in(up: usize, slot: u64) -> u64 {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let _exec_call = profile_path().map(|_| crate::exec_profile::call(up, slot as u32));
             if profile_path().is_some() { (&*(up as *mut Unit)).exec_event(slot as u32, "call"); }
+            test_hot_compile_panic(up as *mut Unit, slot as u32);
             compile_slot(up as *mut Unit, slot as u32)
         }));
         match r {
@@ -8156,6 +8169,33 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
 /// MAKEPAD_RUN_TEST_COMPILE_PANIC=<name part>: the owner panics while it finishes the lazy compile
 /// of a fn whose name contains it (tools/run/fixture/compile_panic.sh: a native panic in the
 /// compile a JIT call started reaches rt_compile, which must not unwind into JIT frames).
+/// MAKEPAD_RUN_TEST_HOT_BUILD_ERROR=<name part>: in a process a live edit ran in, the build of a fn
+/// whose name contains it fails with an internal compiler error, as a closure whose owner's body
+/// is gone does (tools/run/fixture/hot_fail.py).
+unsafe fn test_hot_build_error(up: *mut Unit, id: u32) -> Result<(), String> {
+    static WANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    if let Some(w) = WANT.get_or_init(|| std::env::var("MAKEPAD_RUN_TEST_HOT_BUILD_ERROR").ok().filter(|w| !w.is_empty())) {
+        if (&*up).fns[id as usize].name.contains(w.as_str()) && crate::hot_failure::edit_ran() {
+            return Err(format!("internal compiler error: MAKEPAD_RUN_TEST_HOT_BUILD_ERROR: forced for `{w}`"));
+        }
+    }
+    Ok(())
+}
+
+/// MAKEPAD_RUN_TEST_HOT_COMPILE_PANIC=<name part>: in a process a live edit ran in, a program thread's
+/// lazy call of a fn whose name contains it panics in the compiler, so the call gets a stub that
+/// panics (compile_failed_stub): a failed hot load, and its warm restart (a fresh process, no edit)
+/// gets past it (tools/run/fixture/hot_fail.py).
+unsafe fn test_hot_compile_panic(up: *mut Unit, id: u32) {
+    static WANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    if let Some(w) = WANT.get_or_init(|| std::env::var("MAKEPAD_RUN_TEST_HOT_COMPILE_PANIC").ok().filter(|w| !w.is_empty())) {
+        let name = owner::call(owner::Class::Program, || (&*up).fns[id as usize].name.to_string());
+        if name.contains(w.as_str()) && crate::hot_failure::edit_ran() {
+            panic!("MAKEPAD_RUN_TEST_HOT_COMPILE_PANIC: forced compiler panic in the lazy call of `{name}`");
+        }
+    }
+}
+
 unsafe fn test_compile_panic(up: *mut Unit, id: u32) {
     static WANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     if let Some(w) = WANT.get_or_init(|| std::env::var("MAKEPAD_RUN_TEST_COMPILE_PANIC").ok().filter(|w| !w.is_empty())) {
@@ -13281,6 +13321,7 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<relax_backend::rir
 }
 
 unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::rir::Func, String> {
+    test_hot_build_error(up, id)?;
     let twin = PLAIN_LOWER.with(|c| c.get()).filter(|p| p.0 == id).map(|p| p.1);
     let plain = twin.is_some();
     // (the preparation's own lowering only, not lowerings nested in it)
@@ -13439,7 +13480,7 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::
             }
             match u.body_of(*parent, *cfile) {
                 Some(b) => b.clone(),
-                None => return Err("closure parent body missing".to_string()),
+                None => return Err("internal compiler error: closure parent body missing".to_string()),
             }
         }
         FnKey::Shim(_) | FnKey::Glue(..) => return Err("glue".to_string()),
@@ -24475,7 +24516,7 @@ pub(crate) unsafe fn ensure_parent_body(up: *mut Unit, id: u32, file: u32, depth
         FnKey::Inst(d, args) => {
             let u = &mut *up;
             if file != u32::MAX && u.prog.def(d).file != file {
-                return Err("closure parent body missing (its file version was replaced)".to_string());
+                return Err("internal compiler error: closure parent body missing (its file version was replaced)".to_string());
             }
             let _o = crate::clock::origin("closure-owner");
             match take_ahead(&u.prog, &u.front, &u.tcx, d, &args) {
@@ -24492,15 +24533,15 @@ pub(crate) unsafe fn ensure_parent_body(up: *mut Unit, id: u32, file: u32, depth
                 }
             }
         }
-        FnKey::Sandbox(_) | FnKey::Plain(_) => return Err("closure parent is a twin".to_string()),
+        FnKey::Sandbox(_) | FnKey::Plain(_) => return Err("internal compiler error: closure parent is a twin".to_string()),
         FnKey::Closure(_, _, grand) => {
             ensure_parent_body(up, grand, file, depth + 1)?;
             match (&*up).body_of(grand, file) {
                 Some(b) => b.clone(),
-                None => return Err("closure parent body missing".to_string()),
+                None => return Err("internal compiler error: closure parent body missing".to_string()),
             }
         }
-        FnKey::Shim(_) | FnKey::Glue(..) => return Err("closure parent is glue".to_string()),
+        FnKey::Shim(_) | FnKey::Glue(..) => return Err("internal compiler error: closure parent is glue".to_string()),
     };
     if !body.errors.is_empty() {
         return Err(body.errors[0].clone());

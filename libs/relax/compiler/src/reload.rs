@@ -3906,7 +3906,11 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             f.spec = None;
             u.reload_errors.remove(&id);
             u.reload_specs.remove(&id);
-            u.bodies.remove(&id);
+            // (a body of the refused text; one of an older version stays: that version's closures
+            // are lowered from it, and only it can give them their bodies)
+            if u.bodies.get(&id).is_some_and(|b| news.iter().any(|&(_, n)| n == b.file)) {
+                u.bodies.remove(&id);
+            }
         }
         if full_inputs {
             let (prog, sc) = (&u.prog, scope.as_deref());
@@ -4747,7 +4751,7 @@ pub fn recover_hot_failure(kind: makepad_remote::hot::Outcome, lines: &[String],
 /// restarts the process itself). False: no recovery started (no edit ran in this process, or a
 /// recovery runs already) or asking for the restart failed.
 pub(crate) fn recover_compile_ice(message: &str, on_main: bool) -> bool {
-    if !crate::hot_failure::failed(makepad_remote::hot::Outcome::Panic, &[message.to_string()], None) { return false; }
+    if !crate::hot_failure::edit_ran() || !crate::hot_failure::failed(makepad_remote::hot::Outcome::Panic, &[message.to_string()], None) { return false; }
     mark_unit_suspect(message);
     note_restart_pending(message);
     if on_main { return true; }

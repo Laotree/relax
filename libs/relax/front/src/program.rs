@@ -4326,7 +4326,7 @@ impl Program {
             let mut bits = vec![0u64; n.div_ceil(64)];
             let mut todo = vec![view as usize];
             for (c, k) in self.crates.iter().enumerate() {
-                if matches!(crate::crates::base_crate_name(self.syms.str(k.name)), "core" | "alloc" | "std") { todo.push(c); }
+                if matches!(self.syms.str(k.name), "core" | "alloc" | "std") { todo.push(c); }
             }
             while let Some(c) = todo.pop() {
                 if c >= n || bits[c / 64] & (1 << (c % 64)) != 0 { continue; }

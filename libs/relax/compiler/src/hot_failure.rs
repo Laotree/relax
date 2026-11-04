@@ -148,6 +148,8 @@ pub fn checker_panic(body: &str, message: &str) {
 }
 
 pub fn recovering() -> bool { ACTIVE.load(Ordering::Acquire) }
+/// Whether a live edit was attempted in this process.
+pub(crate) fn edit_ran() -> bool { state().current.is_some() }
 pub(crate) fn enable() { REPORTING.store(true, Ordering::Release); }
 pub fn has_error() -> bool { ERROR.load(Ordering::Acquire) }
 pub(crate) fn replacement_loaded() {
