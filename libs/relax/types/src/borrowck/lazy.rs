@@ -238,6 +238,12 @@ struct Queue {
     /// (src, epoch) -> the earlier epoch it stands for (carry_epoch): keys hold that one
     alias: HashMap<(usize, u64), u64>,
 }
+/// A live edit's checks: the person waits for its verdict. Ahead of hot code's: those are
+/// promoted keeping their place among the startup's checks, so a first edit after a cold start,
+/// at rank 0 with them, waited 9 s behind 362 promoted after it (Fab, 11-04).
+pub const RANK_EDIT: u32 = 0;
+/// Hot code waiting for its verdict (SPEC-V twins and callers).
+pub const RANK_HOT: u32 = 1;
 pub const RANK_DEFAULT: u32 = 1 << 31;
 const RANK_DISCOVER: u32 = u32::MAX - 1;
 const RANK_OWNER: u32 = u32::MAX;
@@ -586,8 +592,8 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
             if let Some(n) = rehomed(&src) { src = n; }
         }
         let quiet = src.quiet_ns();
-        // rank 0 (hot code waiting for its verdict, set_ranks) runs while compiles go on
-        let urgent = || QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|q| q.order.first()).is_some_and(|a| a.0 == 0);
+        // a live edit's checks and hot code waiting for its verdict (set_ranks) run while compiles go on
+        let urgent = || QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|q| q.order.first()).is_some_and(|a| a.0 <= RANK_HOT);
         if quiet < QUIET_NS && !urgent() {
             std::thread::sleep(std::time::Duration::from_millis(((QUIET_NS - quiet) / 1_000_000).clamp(20, 500)));
             continue;

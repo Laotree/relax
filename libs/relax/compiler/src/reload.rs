@@ -3559,7 +3559,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let u = &mut *up;
     trace_stage("typecheck");
     // D3: the gate is synchronous only under `makepad run --check-first`; otherwise the patched
-    // instances are queued to Gandalf when their new code is installed (jit.rs install, rank 0).
+    // instances are queued to Gandalf when their new code is installed (jit.rs install, RANK_EDIT).
     if errs.is_empty() && crate::borrowck::enabled(options) && crate::jit::CHECK_FIRST.load(std::sync::atomic::Ordering::Relaxed) {
         // Check/report one changed owner at a time: do not hold its diagnostics until
         // another body has finished, compilation has run, or the transaction unwinds.
@@ -4344,17 +4344,11 @@ impl Patched {
 
 static PATCHED: relax_session::sync::Mutex<Patched> = relax_session::sync::Mutex::new(Patched::new());
 
-/// SPEC-V: the slots patch `group` installed without a clean verdict (owner thread). Their owners go
-/// first in the borrow checker's queue: the edit's verdict is what the person waits for. Queued at
-/// the default rank, the first edit after a start waited 7.7 s behind the startup's checks (Fab,
-/// 11-04).
+/// SPEC-V: the slots patch `group` installed without a clean verdict (owner thread); their checks
+/// were queued at the install, first in the borrow checker's queue (`RANK_EDIT`).
 unsafe fn unverified_patch(up: *mut Unit, group: u32) -> Vec<u32> {
-    let ids: Vec<u32> = {
-        let u = &*up;
-        (0..u.fns.len() as u32).filter(|&id| u.fns[id as usize].patch_gen == group && u.fns[id as usize].unverified.load(Ordering::Relaxed)).collect()
-    };
-    if !ids.is_empty() { jit::prioritize_verdicts(up, &ids); }
-    ids
+    let u = &*up;
+    (0..u.fns.len() as u32).filter(|&id| u.fns[id as usize].patch_gen == group && u.fns[id as usize].unverified.load(Ordering::Relaxed)).collect()
 }
 
 /// The names of the items whose bodies an installed patch changed; None when it changed more (an

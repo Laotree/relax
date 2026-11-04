@@ -7109,9 +7109,10 @@ impl Unit {
         }
         // borrowck lane: a fn instance's first code, and every live-patched version of it, is checked
         // lazily in the background (D3: a patch is never refused synchronously unless --check-first;
-        // its verdict arrives as a Gandalf event, at the front of the queue).
+        // its verdict arrives as a Gandalf event, at the front of the queue: RANK_EDIT, ahead of hot
+        // code's checks too).
         if (first && gen == 0 || gen > 0) && crate::borrowck::lazy::gandalf_enabled(options) {
-            self.note_first_borrowck(id, (gen > 0).then_some(0));
+            self.note_first_borrowck(id, (gen > 0).then_some(crate::borrowck::lazy::RANK_EDIT));
         }
         // (SPEC-V: a slot that ran its twin's code runs its own now)
         if std::mem::take(&mut self.fns[id as usize].borrowed) {
@@ -16587,7 +16588,7 @@ unsafe fn drain_twin_pending(up: *mut Unit) {
 
 /// SPEC-V: brings twin callers below O3 to the base slots (twin_callers; the O3 ones are the
 /// caller's to retier): an O2 build lowers them again; unverified ones have their owners' verdicts
-/// checked first (Gandalf rank 0: it runs them even while compiles go on) and wait for them.
+/// checked first (Gandalf RANK_HOT: it runs them even while compiles go on) and wait for them.
 unsafe fn relower_twin_callers(up: *mut Unit, tc: &TwinCallers) {
     let key = up as usize;
     if !tc.o3.is_empty() || !tc.below.is_empty() {
@@ -16616,17 +16617,18 @@ unsafe fn relower_twin_callers(up: *mut Unit, tc: &TwinCallers) {
     }
 }
 
-/// SPEC-V: the owners of `ids` go first in the background checker's queue (rank 0 runs without
-/// waiting for quiet compiles): hot code waits seconds for its verdict, not the whole backlog. An
+/// SPEC-V: the owners of `ids` go first in the background checker's queue after live edits
+/// (`RANK_HOT` runs without waiting for quiet compiles): hot code waits seconds for its verdict,
+/// not the whole backlog. An
 /// owner the checker never got (a closure's parent with no code of its own, a slot whose first code
 /// took a path that queues nothing: 39 of the city's rank requests) is queued here (owner thread).
-pub(crate) unsafe fn prioritize_verdicts(up: *mut Unit, ids: &[u32]) {
+unsafe fn prioritize_verdicts(up: *mut Unit, ids: &[u32]) {
     for &c in ids {
-        (&mut *up).note_first_borrowck(c, Some(0));
+        (&mut *up).note_first_borrowck(c, Some(crate::borrowck::lazy::RANK_HOT));
     }
     let u = &*up;
     let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
-    let ranks: Vec<(DefId, Vec<TyId>, u32)> = ids.iter().filter_map(|&c| Some((u.verdict_owner(c)?, Vec::new(), 0))).collect();
+    let ranks: Vec<(DefId, Vec<TyId>, u32)> = ids.iter().filter_map(|&c| Some((u.verdict_owner(c)?, Vec::new(), crate::borrowck::lazy::RANK_HOT))).collect();
     if !ranks.is_empty() {
         crate::borrowck::lazy::set_ranks(u.front.checker_id, epoch, &ranks);
     }
