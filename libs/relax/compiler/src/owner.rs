@@ -154,7 +154,7 @@ static Q: Mutex<Queue> = Mutex::new(Queue { lanes: [const { VecDeque::new() }; C
 
 static WAKE: Condvar = Condvar::new();
 static STARTED: std::sync::Once = std::sync::Once::new();
-/// Program requests queued (diagnostics)
+/// Program requests queued: long work on the owner stops for them (program_waiting)
 static FOREGROUND: AtomicU32 = AtomicU32::new(0);
 /// the main thread's requests queued
 static MAIN_QUEUED: AtomicU32 = AtomicU32::new(0);
@@ -856,10 +856,13 @@ pub fn for_main() -> bool {
     main != 0 && if is_owner() { serving().1 == main } else { me() == main }
 }
 
-/// The main thread waits for a request now: a program request, or the publish that finishes its
-/// lazy compile (long work on the owner stops for either).
-pub fn main_waiting() -> bool {
-    MAIN_QUEUED.load(Ordering::Relaxed) + MAIN_PUBLISH.load(Ordering::Relaxed) > 0
+/// A program request waits now (a program thread's, a live patch's or its landing check, a structural
+/// step, inspect), or the publish that finishes the main thread's lazy compile: long work on the
+/// owner (the cache's mid-run writes, the settle rebuild) stops for either. (Stopping for the main
+/// thread's alone, a live session's landing checks waited 565-747 ms behind a mid-run write, whose
+/// startup manifest held the owner 1-6 s.)
+pub fn program_waiting() -> bool {
+    FOREGROUND.load(Ordering::Relaxed) + MAIN_PUBLISH.load(Ordering::Relaxed) > 0
 }
 
 /// What the owner serves now (diagnostics): "idle", or the class and its requester's name.

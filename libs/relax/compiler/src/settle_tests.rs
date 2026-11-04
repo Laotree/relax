@@ -1332,7 +1332,7 @@ fn a_settle_sweep_lets_main_through_between_steps() {
                 // main asks while this step runs on the owner
                 ASK.store(true, Ordering::SeqCst);
                 let t = std::time::Instant::now();
-                while !crate::owner::main_waiting() {
+                while !crate::owner::program_waiting() {
                     assert!(t.elapsed().as_secs() < 10, "main's request never queued");
                     std::hint::spin_loop();
                 }

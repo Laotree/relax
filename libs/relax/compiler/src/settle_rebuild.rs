@@ -180,8 +180,8 @@ fn refuse(up: *mut Unit) -> Option<String> {
 
 /// Reasons not to start now.
 fn not_now() -> Option<String> {
-    if owner::main_waiting() {
-        return Some("the main thread waits for the owner".into());
+    if owner::program_waiting() {
+        return Some("a program request waits for the owner".into());
     }
     if !FIRST_PRESENT.load(Ordering::Acquire) || startup_phase() {
         return Some("still starting".into());
@@ -464,9 +464,9 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
     tcx.tys.top_up_from(&u.tcx.tys).ok_or("the image holds more types than the program")?;
     compare((&u.prog, &u.tcx), (&prog, &tcx))?;
     lap("compare", &mut laps);
-    // (the steps up to the swap give way to the main thread: the rebuild is tried again later)
-    let yielded = || owner::main_waiting() && !crate::jit::QUIT_SEEN.load(Ordering::Relaxed);
-    if yielded() { return Err("yielded to the main thread".into()); }
+    // (the steps up to the swap give way to a waiting program request: the rebuild is tried again later)
+    let yielded = || owner::program_waiting() && !crate::jit::QUIT_SEEN.load(Ordering::Relaxed);
+    if yielded() { return Err("yielded to a program request".into()); }
     // what was recorded since the spill before the encode (a few entries) is written before the
     // new cache opens the stores: a rebuild never waits for spills
     u.flush_cache_records();
@@ -478,7 +478,7 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
     let _ = mode;
     let mut cache = fresh_cache.ok_or("no cache")?;
     lap("cache open", &mut laps);
-    if yielded() { return Err("yielded to the main thread".into()); }
+    if yielded() { return Err("yielded to a program request".into()); }
     if let Some(old) = u.cache.as_ref() {
         cache.inherit_run_state(old);
     }
@@ -495,7 +495,7 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
     let query_errors = tcx.dcx.clone();
     let checked_epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
     lap("front state", &mut laps);
-    if yielded() { return Err("yielded to the main thread".into()); }
+    if yielded() { return Err("yielded to a program request".into()); }
     // the replace: nothing can fail from here
     u.front.retire_memos();
     // the old front state names the old program: no reader may reach it after the replace (a

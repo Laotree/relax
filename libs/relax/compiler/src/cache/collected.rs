@@ -647,9 +647,9 @@ impl Cache {
     }
 
     /// The collected program's image, encoded under the unit and front-end locks (the caller's).
-    /// `stop` is asked between parts and every 1024 definitions: when it says yes (the main
-    /// thread waits for the unit lock) the encode is dropped and Yielded comes back, so the
-    /// record never holds a frame up; the caller retries later. The image owns its arrays: the
+    /// `stop` is asked between parts and every 1024 definitions: when it says yes (a program
+    /// request waits for the owner) the encode is dropped and Yielded comes back, so the record
+    /// never holds a frame or a live edit up; the caller retries later. The image owns its arrays: the
     /// store write (commit_collected) needs no lock.
     pub fn encode_collected(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool) -> CollectedRecord<'static> {
         self.encoder().encode_as(prog, tcx, stop, false, CollectedBoot::into_owned)
@@ -835,7 +835,7 @@ pub enum CollectedRecord<'p> {
     Ready(CollectedDest, crate::image::Writer<'p>),
     /// the store already holds this exact image
     Current,
-    /// stopped for the main thread: try again later
+    /// stopped for a program request: try again later
     Yielded,
     Failed,
 }

@@ -3626,7 +3626,7 @@ impl Cache {
     /// in order, the first `present` of them before the first present; per slot its stable key
     /// encoding and the code entry it maps to, 0 when its code has none) unless the loaded one
     /// already covers it (on the owner thread).
-    /// `stop` (a mid-run write: the main thread waits for the owner thread) is asked every 256
+    /// `stop` (a mid-run write: a program request waits for the owner thread) is asked every 64
     /// slots; yes drops this record (false comes back) and a later write makes it again.
     pub fn record_manifest(&mut self, u: &Unit, root: u32, order: &[u32], present: usize, stop: &dyn Fn() -> bool) -> bool {
         let t0 = std::time::Instant::now();
@@ -5781,12 +5781,20 @@ impl Cache {
     /// Certify complete boot inputs even when the crate must be parsed again. Ordinary files
     /// shared with the proc-macro host need images in this world's own crate store as well.
     pub fn record_front_crates(&mut self, prog: &crate::program::Program) {
+        self.record_front_crates_until(prog, &|| false);
+    }
+
+    /// record_front_crates in a mid-run write: `stop` is asked before each crate still to record;
+    /// yes leaves the rest to a later write (false comes back). (A cold Fab's first mid-run write
+    /// held the owner 100-400 ms here, after its first frame: where a live session's first edits come.)
+    pub fn record_front_crates_until(&mut self, prog: &crate::program::Program, stop: &dyn Fn() -> bool) -> bool {
         for ci in 0..self.crate_path.len() {
             let Some(c) = prog.crates.get(ci) else { continue };
             let key = front_crate_key(prog.syms.str(c.name), c.root_path());
             if self.mode == Mode::ReadOnly || self.has_index(&key) || self.pending_keys.contains(&key) {
                 continue;
             }
+            if stop() { return false; }
             if let Some(rec) = front_record(prog, ci, |k| self.fps.get(k).copied()) {
                 for (_, i, _) in prog.front_files.iter().filter(|(k, _, _)| *k as usize == ci) {
                     let f = &prog.files[*i];
@@ -5798,6 +5806,7 @@ impl Cache {
                 self.push_pending(ci as u32, NewEntry { key, kind: KIND_FRONT_CRATE, payload: crate::crate_image::encode(&rec) });
             }
         }
+        true
     }
 }
 

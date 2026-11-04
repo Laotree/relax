@@ -3733,6 +3733,8 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     // the files whose front images this write holds: the collected program below is recorded
     // only if no file was loaded since (its restore maps every file from these images)
     let mut imaged_files = usize::MAX;
+    // the crate records stopped for a program request (record_front_crates_until)
+    let mut crates_left = false;
     let probe = YieldProbe::new();
     let Some(Some((held, spill))) = unit_call(wait, || {
     let held = Instant::now();
@@ -3755,11 +3757,12 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
             let (order, present) = jit::manifest_order(u.start_order.clone(), jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed));
             let mut cache = u.cache.take();
             if let Some(c) = cache.as_mut() {
-                // a frame's lazy compile goes first: the manifest is made again by a later write
-                let stop = || { probe.tick("manifest"); crate::owner::main_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed) };
+                // a waiting program request (a frame's lazy compile, a live patch) goes first: the
+                // manifest is made again by a later write
+                let stop = || { probe.tick("manifest"); crate::owner::program_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed) };
                 if !c.record_manifest(u, crate::layout::root_crate(), &order, present, &stop) {
                     MID_MANIFEST_DONE.store(false, Ordering::Relaxed);
-                    verbose!("makepad-run cache: startup manifest yielded to the main thread; retried later");
+                    verbose!("makepad-run cache: startup manifest yielded to a program request; retried later");
                 }
             }
             u.cache = cache;
@@ -3780,11 +3783,14 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
             parts[1] = held.elapsed().as_secs_f64() * 1e3;
             yield_section("crate records");
             probe.tick("front images");
-            c.record_front_crates(&u.prog);
+            let stop = || { probe.tick("crate records"); crate::owner::program_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed) };
+            let complete = c.record_front_crates_until(&u.prog, &stop);
             parts[2] = held.elapsed().as_secs_f64() * 1e3;
             yield_section("spill take");
             probe.tick("crate records");
-            imaged_files = u.prog.files.len();
+            // (the collected program is recorded once every crate's record is: a later write
+            // records the rest)
+            if complete { imaged_files = u.prog.files.len(); } else { crates_left = true; }
         }
         let s = c.spill_take();
         probe.tick("spill take");
@@ -3803,6 +3809,12 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     static FRONT_REPORTED: AtomicBool = AtomicBool::new(false);
     if jit::FIRST_PRESENT.load(Ordering::Acquire) && !FRONT_REPORTED.swap(true, Ordering::Relaxed) {
         if let Some(s) = crate::front::summary() { verbose!("{} (after the first present)", s); }
+    }
+    // a session edited live holds reloaded files its stores are not named after: no collected
+    // program this run (the quit write retried it every 100 ms until the exit, and remade the
+    // startup manifest each time: 1.1-1.6 s on the owner per pass)
+    if !front_recordable() && !MID_COLLECTED_TRIED.swap(true, Ordering::Relaxed) {
+        collected_skip("the session was edited live");
     }
     let graph_ready = jit::FIRST_PRESENT.load(Ordering::Acquire)
         && crate::cache::Cache::flush_front_graphs().is_ok();
@@ -3835,21 +3847,24 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
                 if wait && u.prog.files.len() != imaged_files && front_recordable() {
                     if let Some(c) = u.cache.as_mut() {
                         push_front_images(&u.prog, c);
-                        c.record_front_crates(&u.prog);
+                        let stop = || crate::owner::program_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed);
+                        crates_left = !c.record_front_crates_until(&u.prog, &stop);
                         let written = match c.spill_take() {
                             Some(s) => s.write().is_ok(),
                             None => true,
                         };
-                        if written { imaged_files = u.prog.files.len(); }
+                        if written && !crates_left { imaged_files = u.prog.files.len(); }
                     }
                 }
-                if u.prog.files.len() != imaged_files { collected_skip("files were loaded since the front images were taken"); }
+                if u.prog.files.len() != imaged_files {
+                    collected_skip(if crates_left { "the crate records stopped for a program request" } else { "files were loaded since the front images were taken" });
+                }
                 if let Some(c) = u.cache.as_mut().filter(|_| u.prog.files.len() == imaged_files) {
-                    let stop = || { cprobe.tick("collected"); crate::owner::main_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed) };
+                    let stop = || { cprobe.tick("collected"); crate::owner::program_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed) };
                     match c.encode_collected(&u.prog, &u.tcx, &stop) {
                         crate::cache::CollectedRecord::Ready(dest, payload) => { MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); ready = Some((u.prog.session.options.verbose.then_some(c.collected_crates(&u.prog)), dest, payload)); }
                         crate::cache::CollectedRecord::Current => { MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); COLLECTED_CURRENT.store(true, Ordering::Relaxed); retired_boot = Some(c.finish_collected()); }
-                        crate::cache::CollectedRecord::Yielded => verbose!("makepad-run collected: record yielded to the main thread after {:.1} ms; retried later", t.elapsed().as_secs_f64() * 1e3),
+                        crate::cache::CollectedRecord::Yielded => verbose!("makepad-run collected: record yielded to a program request after {:.1} ms; retried later", t.elapsed().as_secs_f64() * 1e3),
                         crate::cache::CollectedRecord::Failed => MID_COLLECTED_TRIED.store(true, Ordering::Relaxed),
                     }
                 }
