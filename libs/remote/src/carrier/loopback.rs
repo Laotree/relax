@@ -60,6 +60,7 @@ pub fn serve(ep: &Endpoint, token: &str) -> io::Result<SocketAddr> {
         (hooks.enter)();
         for conn in listener.incoming() {
             let Ok(conn) = conn else { continue };
+            super::keep_from_runs(&conn);
             let (ep, token) = (ep.clone(), token.clone());
             let _ = std::thread::Builder::new().name("makepad-remote-hello".into()).spawn(move || {
                 let (hooks, keep) = (ep.hooks(), conn.try_clone());
