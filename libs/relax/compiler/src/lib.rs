@@ -118,6 +118,8 @@ include!(concat!(env!("OUT_DIR"), "/src_stamp.rs"));
 pub mod run;
 mod first_frame;
 pub mod hot_failure;
+#[cfg(any(windows, test))]
+pub mod restart_parent;
 mod harness;
 mod test_pkg;
 pub mod tui;

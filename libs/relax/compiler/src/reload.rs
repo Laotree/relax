@@ -4778,8 +4778,7 @@ pub fn set_before_exec(prepare: fn() -> Vec<(String, String)>, undo: fn()) {
 }
 
 /// Readies the host's handover for `cmd`, which execs next (its environment is added).
-/// (live-rebuild handover is unix-only: the restart is an exec in place)
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn hand_over(cmd: &mut std::process::Command) {
     let f = *BEFORE_EXEC.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((prepare, _)) = f {
@@ -4790,7 +4789,7 @@ pub(crate) fn hand_over(cmd: &mut std::process::Command) {
 }
 
 /// The exec after [`hand_over`] failed: the host takes its handover back.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn hand_back() {
     let f = *BEFORE_EXEC.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, undo)) = f {
@@ -4799,20 +4798,20 @@ pub(crate) fn hand_back() {
 }
 
 /// The process starts again: the loader binary with the same command line, `state` handed to the
-/// new run (MAKEPAD_RUN_RESTORE). Returns only on failure.
+/// new run (MAKEPAD_RUN_RESTORE). An exec in place; Windows has none, there its parent process starts
+/// the next run (restart_parent.rs). Returns only on failure.
 fn exec_restart(state: Option<&[u8]>) -> Result<(), String> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
-        use std::os::unix::process::CommandExt;
         let exe = host::loader().ok_or("the makepad binary's path is unknown")?;
         let mut cmd = std::process::Command::new(exe);
         cmd.args(crate::harness::live::restart_args(std::env::args_os().skip(1).collect()));
         crate::hot_failure::prepare_exec(&mut cmd)?;
         match state {
             Some(st) => {
-                let dir = std::env::temp_dir().join(format!("relax-restart-{}", std::process::id()));
-                let path = dir.join("state");
-                std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, st)).map_err(|e| format!("cannot write the state: {e}"))?;
+                // (one file, which the next run removes when it reads it: on Windows that run has another pid)
+                let path = std::env::temp_dir().join(format!("relax-restart-state-{}", std::process::id()));
+                std::fs::write(&path, st).map_err(|e| format!("cannot write the state: {e}"))?;
                 cmd.env("MAKEPAD_RUN_RESTORE", &path);
             }
             None => { cmd.env_remove("MAKEPAD_RUN_RESTORE"); }
@@ -4826,11 +4825,14 @@ fn exec_restart(state: Option<&[u8]>) -> Result<(), String> {
         crate::tui::finish(false);
         eprintln!("makepad live: restarting ({})", RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()));
         hand_over(&mut cmd);
-        let e = cmd.exec();
+        #[cfg(unix)]
+        let e = std::os::unix::process::CommandExt::exec(&mut cmd);
+        #[cfg(windows)]
+        let e = crate::restart_parent::request(&cmd);
         hand_back();
         Err(format!("restart failed: {e}"))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = state;
         Err("this platform cannot start the process again in place".into())
