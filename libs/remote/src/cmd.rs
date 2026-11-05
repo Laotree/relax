@@ -106,6 +106,11 @@ impl<'a> Out<'a> {
     pub fn cancelled(&self) -> bool {
         !self.ok || self.gone.as_ref().is_some_and(|g| g())
     }
+    /// A long command also stops once `also` says so (the host's reason: what it asks about ended).
+    pub fn stop_also(&mut self, also: fn() -> bool) {
+        let gone = self.gone.take();
+        self.gone = Some(Arc::new(move || also() || gone.as_ref().is_some_and(|g| g())));
+    }
     /// The client-gone check, detached from `self` (for loops that also write).
     pub fn gone(&self) -> Gone {
         self.gone.clone().unwrap_or_else(|| Arc::new(|| false))

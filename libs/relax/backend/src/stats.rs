@@ -74,3 +74,9 @@ pub fn pass_time(i: usize, t0: u64) {
 }
 
 pub const PASS_NAMES: [&str; 16] = ["fold", "cse", "lcopy", "dce", "jumps", "inline", "sink", "layout", "sroa", "live_dce", "licm", "regalloc", "emit", "verify", "compact", "thread_known"];
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&PASS_NS, [const { std::sync::atomic::AtomicU64::new(0) }; 16]);
+}

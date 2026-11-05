@@ -96,6 +96,8 @@ struct Ring {
     handle: u64,
     /// the capture this ring's records belong to (rings are reused across captures)
     epoch: AtomicU64,
+    /// its thread has ended: a run's end frees it (`reset_statics`)
+    ended: AtomicBool,
 }
 
 // a ring is written by its own thread only and read after the capture stopped
@@ -106,8 +108,17 @@ static EPOCH: AtomicU64 = AtomicU64::new(0);
 static STARTED_NS: AtomicU64 = AtomicU64::new(0);
 static STOPPED_NS: AtomicU64 = AtomicU64::new(0);
 
+struct RingEnds(&'static Ring);
+
+impl Drop for RingEnds {
+    fn drop(&mut self) {
+        self.0.ended.store(true, Relaxed);
+    }
+}
+
 thread_local! {
     static MY: Cell<*const Ring> = const { Cell::new(std::ptr::null()) };
+    static ENDS: Cell<Option<RingEnds>> = const { Cell::new(None) };
 }
 
 fn ring() -> Option<&'static Ring> {
@@ -123,9 +134,11 @@ fn ring() -> Option<&'static Ring> {
         os_id: super::threads::self_os_id(),
         handle: crate::waits::me(),
         epoch: AtomicU64::new(EPOCH.load(Relaxed)),
+        ended: AtomicBool::new(false),
     }));
     RINGS.lock().unwrap_or_else(|e| e.into_inner()).push(r);
     let _ = MY.try_with(|m| m.set(r));
+    let _ = ENDS.try_with(|e| e.set(Some(RingEnds(r))));
     Some(r)
 }
 
@@ -785,6 +798,7 @@ fn raw_now_ns() -> u64 {
 /// makepad's GPU backends: a pass (`name`, static) ran on the GPU from `begin` to `end` (raw
 /// monotonic ns). Recorded only while the timeline records.
 pub extern "C" fn relax_gpu_span(name: *const u8, len: usize, begin: u64, end: u64) {
+    let _kept = crate::zone_alloc::kept();
     if !recording() || end < begin {
         return;
     }
@@ -943,10 +957,9 @@ pub fn cmd_timeline(req: &Req, out: &mut Out) {
             let e = EPOCH.load(Relaxed);
             // a forgotten recording stops itself
             { let _k = crate::zone_alloc::kept();
-            let _ = std::thread::Builder::new().name("run-inspect-tl".into()).spawn(move || {
+            let _ = crate::run_threads::spawn("run-inspect-tl", move || {
                 super::heap::exclude_this_thread();
-                std::thread::sleep(std::time::Duration::from_secs(max));
-                if EPOCH.load(Relaxed) == e && RINGS_ON.load(Relaxed) {
+                if crate::run_threads::sleep(std::time::Duration::from_secs(max)) && EPOCH.load(Relaxed) == e && RINGS_ON.load(Relaxed) {
                     stop();
                 }
             });
@@ -1545,4 +1558,18 @@ mod tests {
             assert!(cp.iter().any(|p| p.0 == 0 && p.3 == "run"), "{steps:?}");
         }
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    // the rings of the threads that stay go on with them; no one reads these rings outside a capture
+    RINGS.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| {
+        let ended = r.ended.load(Relaxed);
+        if ended {
+            drop(Box::from_raw(*r as *const Ring as *mut Ring));
+        }
+        !ended
+    });
+    reset(&GPU, Mutex::new(Vec::new()));
 }

@@ -390,6 +390,27 @@ impl Budget {
         set_thread_class(class);
         permit
     }
+    /// A run of the app ended in place (`makepad run`): the threads of the app's and the JIT's rows
+    /// are gone and never release them. The HAL's stay, its threads with them.
+    fn end_run(&self) {
+        let mut s = self.lock();
+        let now = self.now();
+        for i in 0..s.slots.len() {
+            if s.slots[i].is_some_and(|j| j.client != HAL) {
+                self.remove(&mut s, i as u32, now);
+            }
+        }
+        s.waiters.retain(|w| w.client == HAL);
+        for class in &self.queued {
+            for (client, queued) in class.iter().enumerate() {
+                if client != HAL as usize {
+                    queued.store(0, Relaxed);
+                }
+            }
+        }
+        self.warmup.store(0, Relaxed);
+        self.refresh(&mut s);
+    }
     fn release(&self, permit: u32) {
         let mut s = self.lock();
         self.remove(&mut s, permit, self.now());
@@ -700,6 +721,8 @@ pub fn contended(permit: u32) -> bool { global().contended(permit) }
 pub fn checkpoint(permit: u32, held_locks: u32, lock_site: &str) -> u32 { global().checkpoint(permit, held_locks, lock_site) }
 #[relax_api]
 pub fn release(permit: u32) { global().release(permit); }
+/// `Budget::end_run`
+pub fn end_run() { global().end_run(); }
 #[relax_api]
 pub fn reclass(permit: u32, class: u8) { global().reclass(permit, class); }
 /// `Budget::lend`, for the JIT: a thread asleep on JIT work or a program lock keeps no token.

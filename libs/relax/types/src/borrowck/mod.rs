@@ -259,3 +259,13 @@ mod root_cx_tests;
 mod mir_source_tests;
 #[cfg(test)]
 mod lint_scope_tests;
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    event::reset_statics();
+    lazy::reset_statics();
+    reset(&FV_ONLY, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&FV_RECORDS, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&RELAXED_RECORDS, relax_session::sync::Mutex::new(Vec::new()));
+}

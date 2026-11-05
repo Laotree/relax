@@ -263,8 +263,14 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 ];
 
 fn dispatch(req: &Req, out: &mut Out) {
+    let _at_the_run = crate::run_threads::request();
+    // (a wait of a long command ends when the run does: `gone` says so, and so does the answer)
+    out.stop_also(crate::run_threads::ending);
     let _act = activity::begin(req);
     dispatch_command(req, out);
+    if crate::run_threads::ending() {
+        out.always("{\"run_ended\":true,\"why\":\"the run this answers about ended while it was asked\"}");
+    }
     // SPEC-V: the client prints the answer's rows, not its end line (which says `verified` too)
     if !crate::reload::observations_verified() && !matches!(req.cmd.as_str(), "help" | "ping" | "events" | "watch") {
         out.always("{\"verified\":false,\"why\":\"a patched fn runs before its borrow-check verdict; a failed verdict reverts it and the patchreverted event lists the observations it invalidates\"}");
@@ -1253,7 +1259,7 @@ fn cmd_jit(req: &Req, out: &mut Out) {
     let t0 = std::time::Instant::now();
     let a = activity();
     let f0 = crate::postframe::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
-    std::thread::sleep(std::time::Duration::from_millis(ms));
+    crate::run_threads::sleep(std::time::Duration::from_millis(ms));
     let b = activity();
     let f1 = crate::postframe::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
     // the window as it was (a loaded machine oversleeps)
@@ -1626,6 +1632,7 @@ static PROVIDERS: relax_session::sync::Mutex<Vec<(String, ProgramQuery, crate::d
 /// registers the same commands: the process answers with its first domain's (the root: the window
 /// manager hosting app domains, or the one app), never with whichever domain started last.
 pub extern "C" fn relax_register_inspect(name: *const u8, len: usize, query: ProgramQuery) {
+    let _kept = crate::zone_alloc::kept();
     let Some(scope) = crate::domain::callback() else { return };
     let name = unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(name, len)).into_owned() };
     let mut p = PROVIDERS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1810,6 +1817,7 @@ fn serve_program_service(endpoint: &makepad_remote::Endpoint, name: &str, versio
 /// its endpoint, each channel a producer the program runs. The same mechanism as
 /// [`relax_register_inspect`], for streams.
 pub extern "C" fn relax_register_remote_service(name: *const u8, len: usize, version: u32, open: ServiceOpen, close: ServiceClose) {
+    let _kept = crate::zone_alloc::kept();
     let Some(scope) = crate::domain::callback() else { return };
     let name = unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(name, len)).into_owned() };
     let mut services = SERVICES.lock().unwrap_or_else(|e| e.into_inner());
@@ -1891,4 +1899,26 @@ mod tests {
         assert!(!ends("a.rs", "src/a.rs"));
         assert!(!ends("/w/a.rs", ""));
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    codever::reset_statics();
+    events::reset_statics();
+    experiments::reset_statics();
+    flightrec::reset_statics();
+    heap::reset_statics();
+    instrument::reset_statics();
+    patches::reset_statics();
+    probes::reset_statics();
+    pstream::reset_statics();
+    remarks::reset_statics();
+    tierlog::reset_statics();
+    timeline::reset_statics();
+    watch::reset_statics();
+    reset(&OWNER_SNAPS, Mutex::new(Vec::new()));
+    reset(&PROVIDERS, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&SERVICES, Mutex::new(Vec::new()));
+    reset(&ACTIVE_SERVICES, Mutex::new(Vec::new()));
 }

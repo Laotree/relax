@@ -791,7 +791,7 @@ fn off_cpu_stacks(os_id: u64) -> (Vec<(String, usize)>, usize) {
                 }
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(15));
+        crate::run_threads::sleep(std::time::Duration::from_millis(15));
     }
     seen.sort_by(|a, b| b.1.cmp(&a.1));
     (seen, caps_n)

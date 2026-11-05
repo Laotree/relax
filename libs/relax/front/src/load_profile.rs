@@ -109,3 +109,9 @@ pub fn flush_current() {
             e.start_us, e.dur_us, thread, worker, e.phase, e.subject);
     }
 }
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&BUFFERS, Mutex::new(Vec::new()));
+}

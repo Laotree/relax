@@ -2381,6 +2381,23 @@ pub mod uses {
     pub fn take() -> (Vec<Defined>, HashSet<(String, u32, u32)>) {
         (std::mem::take(&mut *DEFS.lock().unwrap_or_else(|e| e.into_inner())), USED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default())
     }
+
+    /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+    pub(crate) unsafe fn reset_statics() {
+        use relax_session::reset_static as reset;
+        reset(&ON, AtomicBool::new(false));
+        reset(&DEFS, Mutex::new(Vec::new()));
+        reset(&USED, Mutex::new(None));
+        reset(&SYNTH, Mutex::new(None));
+        reset(&ABS_PATH_MACRO_CALLS, Mutex::new(Vec::new()));
+        reset(&PLAIN_MACRO_CALLS, Mutex::new(Vec::new()));
+        reset(&NAMED_POSITIONAL, Mutex::new(Vec::new()));
+        reset(&INCOMPLETE_INCLUDE, Mutex::new(Vec::new()));
+        reset(&VARARGS_WITHOUT_PATTERN, Mutex::new(Vec::new()));
+        reset(&MAC_CALL_ATTRS, Mutex::new(Vec::new()));
+        reset(&CFG_ATTR_EMPTY, Mutex::new(Vec::new()));
+        reset(&SEMIS, Mutex::new(Vec::new()));
+    }
 }
 
 pub(crate) fn is_open(k: T) -> bool {
@@ -3433,4 +3450,11 @@ mod replay_tests {
         let s1 = def("c::m::sib", 32);
         assert!(!cm.in_textual_scope(&s1, "c::m", None) && !cm.in_textual_scope(&s1, "c", None));
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    uses::reset_statics();
+    reset(&SCOPE_NS, std::sync::atomic::AtomicU64::new(0));
 }

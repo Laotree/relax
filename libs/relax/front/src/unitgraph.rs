@@ -1264,3 +1264,10 @@ mod platform_script_tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&TO_REMOVE, Mutex::new(Vec::new()));
+    reset(&SCRIPT_RUNNING, Mutex::new(0));
+}

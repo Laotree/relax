@@ -264,7 +264,7 @@ impl QueryCx {
         // (lead decision 52 R1); nothing reads the retired cache, so it is freed off the
         // edit's critical path. (rustc starts each incremental session with an empty cache.)
         if retired.len() > 4096 {
-            let _ = std::thread::Builder::new().name("run-solver-free".into()).spawn(move || drop(retired));
+            let _ = crate::run_threads::spawn("run-solver-free", move || drop(retired));
         }
     }
 
@@ -283,7 +283,7 @@ impl QueryCx {
         values += self.codegen_select.retire(&|_, _| false);
         let retired = std::mem::take(&mut self.solver);
         let entries = retired.cached_len();
-        let _ = std::thread::Builder::new().name("run-solver-free".into()).spawn(move || drop(retired));
+        let _ = crate::run_threads::spawn("run-solver-free", move || drop(retired));
         (values, entries)
     }
 
@@ -1332,4 +1332,11 @@ impl Tcx {
             providers.crate_inherent_impls_overlap_check(DefId(krate)).expect("inherent coherence query");
         }
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&TYPECK_READS, relax_session::sync::Mutex::new(None));
+    reset(&BODIES_CHECKED, std::sync::atomic::AtomicU64::new(0));
 }

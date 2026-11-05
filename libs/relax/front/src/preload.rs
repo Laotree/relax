@@ -1508,7 +1508,7 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
         let weak = Arc::downgrade(&pool);
         let plan = pool.demand_plan.clone().expect("a planning pool has a plan");
         let in_world = crate::macro_reg::in_world();
-        let _ = std::thread::Builder::new().name("run-demand-select".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
+        let _ = relax_base::run_threads::spawn("run-demand-select", move || { let _z = crate::zone_alloc::compiler_thread();
             crate::macro_reg::set_in_world(in_world);
             plan.complete();
             if let Some(pool) = weak.upgrade() {
@@ -1526,7 +1526,7 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
         for worker in 0..jobs {
             let p = pool.clone();
             let sess = sess.clone();
-            if let Ok(h) = std::thread::Builder::new().name(format!("run-parse-{worker}")).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
+            if let Ok(h) = relax_base::run_threads::spawn(&format!("run-parse-{worker}"), move || { let _z = crate::zone_alloc::compiler_thread();
                 crate::macro_reg::set_in_world(in_world);
                 let _mem = crate::memstat::tag(if in_world { crate::memstat::Tag::PmHost } else { crate::memstat::Tag::Parse });
                 p.work(&sess, worker)
@@ -1881,4 +1881,15 @@ mod lowered_scope_tests {
     }
 
 
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&PREVIOUS_FILES, std::sync::atomic::AtomicU64::new(0));
+    reset(&PHASE_NS, [const { std::sync::atomic::AtomicU64::new(0) }; 5]);
+    reset(&BY_NAME, Mutex::new(Vec::new()));
+    reset(&WAIT_NS, std::sync::atomic::AtomicU64::new(0));
+    reset(&PUBLISH_NS, std::sync::atomic::AtomicU64::new(0));
+    reset(&PARSE_NS, std::sync::atomic::AtomicU64::new(0));
 }

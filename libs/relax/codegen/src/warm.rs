@@ -33,11 +33,12 @@ struct State {
     reasons: HashMap<u32, String>,
     events: Vec<Event>,
 }
+static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+
 /// The accounting is process-wide, filled from compiler threads: everything State owns is
 /// allocated in the kept heap (process state, not compile state). The
 /// guard is held for every access that may allocate or free (keys, names, table growth, events).
 fn state() -> (relax_session::phase::PhaseGuard, relax_session::sync::MutexGuard<'static, State>) {
-    static STATE: OnceLock<Mutex<State>> = OnceLock::new();
     let k = relax_session::phase::kept();
     let s = STATE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
     (k, s)
@@ -264,4 +265,10 @@ fn report(present: bool) {
         );
     }
     s.events.clear();
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&STATE, OnceLock::new());
 }

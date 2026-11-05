@@ -158,6 +158,23 @@ mod fixed {
         }
     }
 
+    /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+    pub(crate) unsafe fn reset_statics() {
+        use relax_session::reset_static as reset;
+        // (the reader is code of the ended run; the offsets start over, jit.rs `fresh_thread` gives a thread that stays a clean reserve)
+        reset(&FS_BASE, AtomicU64::new(0));
+        reset(&BASE, std::sync::OnceLock::new());
+        reset(&NEXT, AtomicU32::new(0));
+    }
+
+    /// The calling thread's words are the ended run's: they go.
+    pub fn static_tls_clear() {
+        let r = reserve();
+        for k in 0..RESERVE / 8 {
+            unsafe { (*r.add(k)).set(0) };
+        }
+    }
+
     /// Exchanges the calling thread's static TLS words in use with `saved` (empty: zeros), so a
     /// scoped thread-local block (jit.rs domain_callback) starts from fresh values and the
     /// thread's own come back after it.
@@ -183,9 +200,12 @@ mod fixed {
         None
     }
     pub fn static_tls_swap(_saved: &mut Vec<u64>) {}
+    pub fn static_tls_clear() {}
     pub extern "C" fn relax_tls_fixed(_addr: u64) -> u32 {
         0
     }
+
+    pub(crate) unsafe fn reset_statics() {}
 }
 pub use fixed::*;
 
@@ -316,4 +336,9 @@ mod imp {
         }
         off
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    fixed::reset_statics();
 }

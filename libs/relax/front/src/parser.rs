@@ -6449,3 +6449,13 @@ mod diagnostic_tests {
         match result { Err((pos,_)) => assert_eq!(pos,call), Ok(_) => panic!("expected a parse error") }
     }
 }
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&LAZY_STATS, [const { std::sync::atomic::AtomicU64::new(0) }; 16]);
+    reset(&LAZY_MACROS, relax_session::sync::Mutex::new(std::collections::BTreeMap::new()));
+    reset(&LAZY_WHY_PARSED, relax_session::sync::Mutex::new(std::collections::BTreeMap::new()));
+    reset(&LAZY_AUTO, std::sync::atomic::AtomicBool::new(false));
+    reset(&LAZY_PARSED, [const { std::sync::atomic::AtomicU64::new(0) }; 2]);
+}
