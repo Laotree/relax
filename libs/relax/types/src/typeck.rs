@@ -6345,6 +6345,21 @@ impl<'a> Fcx<'a> {
         }
     }
 
+    /// The hint a binary operator's left operand gets: the operator's expected type, which
+    /// rustc does not pass on (op.rs check_overloaded_binop checks the operand with none). A
+    /// `match`, an `if` or a block coerces its value to an expected type, so it gets none: in
+    /// `(if c { &a } else { &b }) * 2` the arms stay `&u16` and `&u16: Mul<u16>` applies.
+    fn operand_hint(&self, a: ExprId, hint: Option<TyId>) -> Option<TyId> {
+        let mut x = a;
+        loop {
+            match self.ast().expr(x).kind {
+                ExprKind::Paren(i) => x = i,
+                ExprKind::Match(..) | ExprKind::If(..) | ExprKind::Block(..) | ExprKind::Unsafe(_) => return None,
+                _ => return hint,
+            }
+        }
+    }
+
     fn check_binary(&mut self, e: ExprId, op: BinOp, a: ExprId, b: ExprId, expected: Option<TyId>, lo: u32) -> TyId {
         let bool_ = self.tcx.tys.bool_;
         match op {
@@ -6437,7 +6452,8 @@ impl<'a> Fcx<'a> {
                 bool_
             }
             BinOp::Shl | BinOp::Shr => {
-                let ta = self.check_expr(a, expected);
+                let hint = self.operand_hint(a, expected);
+                let ta = self.check_expr(a, hint);
                 // `&x >> k` on primitives: core's forward-ref Shl/Shr impls, Output = the
                 // primitive (rustc op.rs: only primitive operands are built in); a non-primitive
                 // left operand is an operator trait call
@@ -6466,7 +6482,7 @@ impl<'a> Fcx<'a> {
                     }
                     None => None,
                 };
-                let ta = self.check_expr(a, exp);
+                let ta = self.check_expr(a, self.operand_hint(a, exp));
                 let sa0 = self.shallow(ta);
                 // `&x op y` on primitives: built in, through the references (core's
                 // forward-ref operator impls, without dispatch)

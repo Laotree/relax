@@ -67,10 +67,29 @@ fn sliced(v: &[[u8; 2]]) -> Option<usize> {
     Some(r.len())
 }
 
+// A `match`, `if` or block left operand gets no expected type either: its value stays a reference.
+fn matched(v: &[u8]) -> u8 {
+    (match v.first() { Some(x) => x, None => &0 } ^ 1) & 1
+}
+
+fn chosen(v: &[u16], c: bool) -> u16 {
+    (if c { &v[0] } else { &v[1] } * 2) + 1
+}
+
+fn blocked(v: &[u16]) -> u16 {
+    ({ &v[0] } * 2) + 1
+}
+
+fn shifted_arm(v: &[u32], c: bool) -> u32 {
+    let k: u32 = (if c { &v[0] } else { &v[1] }) << 1;
+    k
+}
+
 #[test]
 fn try_operands_of_operators_keep_their_reference() {
     println!("| {:?} {:?} {:?} {:?} {:?}", flipped(&[4]), flipped(&[]), weighted(&[1.0, 2.0], &[0.5, 0.25]), weighted(&[1.0], &[0.5, 0.25]), solved(&[1.0, 2.0], &[3.0, 4.0]));
-    println!("| {:?} {:?}", shifted(&[3]), sliced(&[[1, 2]]));
+    println!("| {:?} {:?} {} {} {} {}", shifted(&[3]), sliced(&[[1, 2]]), matched(&[4]), matched(&[]), chosen(&[3, 5], true), chosen(&[3, 5], false));
+    println!("| {} {}", shifted_arm(&[3, 5], false), blocked(&[3]));
 }
 
 #[derive(Debug, Clone, Copy)]
