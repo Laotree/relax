@@ -2337,7 +2337,8 @@ pub(crate) fn exported_fns(prog: &crate::program::Program, prefixes: &[String]) 
 }
 
 /// native::Resolvable for this process: the libraries loaded, which of the symbols the
-/// dynamic loader binds (what a native library's import resolves to without the program).
+/// dynamic loader binds (what a native library's import resolves to without the program),
+/// searched as the program's own foreign calls are (proc::find_any).
 fn native_resolvable(names: &[String], dylibs: &[String], frameworks: &[String]) -> Vec<bool> {
     for l in dylibs {
         let _ = crate::os::proc::load_library(l, false) || crate::os::proc::load_library_versioned(l);
@@ -2347,8 +2348,18 @@ fn native_resolvable(names: &[String], dylibs: &[String], frameworks: &[String])
     }
     names.iter().map(|n| {
         let Ok(c) = std::ffi::CString::new(n.as_str()) else { return false };
-        unsafe { !crate::os::proc::lookup(std::ptr::null_mut(), c.as_ptr().cast()).is_null() || !crate::os::proc::find_system(c.as_ptr().cast()).is_null() }
+        unsafe { !crate::os::proc::find_any(c.as_ptr().cast()).is_null() }
     }).collect()
+}
+
+#[cfg(test)]
+mod native_tests {
+    /// A symbol the process provides (libc's) is no callback of the program; an unknown one is.
+    #[test]
+    fn native_resolvable_finds_process_symbols() {
+        let names = ["strlen", "malloc", "relax_native_no_such_symbol"].map(String::from);
+        assert_eq!(super::native_resolvable(&names, &[], &[]), [true, true, false]);
+    }
 }
 
 /// The callback stubs of an `--allow-c` native library (front native_stub.rs): per symbol its
