@@ -7935,6 +7935,14 @@ unsafe fn call_jit_inner(u: *mut Unit, entry: u64, arg: u64) -> Result<u64, Pani
     let ctx = ctx_ptr();
     let saved_ctx = [*ctx, *ctx.add(1)];
     let enter: rt_fn_ty!(fn(u64, u64, *mut u64) -> u64) = std::mem::transmute((&*u).enter as usize);
+    // Hosted under the JIT, `catch_unwind` is the outer runtime's recovery point: only its return
+    // puts the thread's outer recovery context back. A panic of the code `enter` runs leaves
+    // through `Unit::leave`, past its runtime entry's `host_boundary`, so that context stays on
+    // frames the jump cut away and the next panic of this crate's own code lands there (pc 0).
+    // This recovery point returns normally after any such jump, which puts the context back.
+    #[cfg(relax)]
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| enter(entry, arg, ctx))).unwrap_or_else(|p| std::panic::resume_unwind(p));
+    #[cfg(not(relax))]
     let r = enter(entry, arg, ctx);
     *ctx = saved_ctx[0];
     *ctx.add(1) = saved_ctx[1];
@@ -25699,10 +25707,31 @@ mod front_yield_tests {
     fn a_compile_job_runs_beside_jobs_on_every_token() {
         isolated_test!(a_compile_job_runs_beside_jobs_on_every_token);
         use makepad_cpu_budget as budget;
+        use std::sync::Arc;
         let (u, f, _, path) = two_fn_unit("budget_full");
         let up = &*u as *const Unit as usize;
-        let tokens = budget::limit() as usize;
-        let permits: Vec<u32> = (0..tokens).map(|_| budget::admit(budget::VISIBLE, budget::APP, "a busy pool job")).collect();
+        // On a thread that runs no new code and does not sleep while it holds them: under the JIT a
+        // thread waiting for a compile of its own or sleeping lends its tokens, and the build would
+        // be let in on one.
+        let (full, done) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let holder = {
+            let (full, done) = (full.clone(), done.clone());
+            std::thread::spawn(move || {
+                full.store(done.load(Ordering::SeqCst), Ordering::SeqCst);
+                std::thread::yield_now();
+                let permits: Vec<u32> = (0..budget::limit()).map(|_| budget::admit(budget::VISIBLE, budget::APP, "a busy pool job")).collect();
+                full.store(true, Ordering::SeqCst);
+                while !done.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                for permit in permits {
+                    budget::release(permit);
+                }
+            })
+        };
+        while !full.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
         BACK_END_GATE.store(1, Ordering::SeqCst);
         queue::spec(up, f);
         // (held back it stands still with no compile job in the budget: a plain failure after 10 s)
@@ -25716,15 +25745,16 @@ mod front_yield_tests {
         }
         // (its own row: under the JIT the loader's compile jobs share this budget)
         let building = BACK_END_THREAD.load(Ordering::SeqCst);
-        assert!(budget::tokens().holders.iter().any(|h| h.thread == building && h.client == budget::JIT && h.above), "it runs above the budget, taking no token from the app");
+        let held = budget::tokens();
+        let rows: Vec<String> = held.holders.iter().map(|h| format!("{} client {} class {} lent {} above {} {}", h.thread, h.client, h.class, h.lent, h.above, h.label)).collect();
+        assert!(held.holders.iter().any(|h| h.thread == building && h.client == budget::JIT && h.above), "it runs above the budget, taking no token from the app: thread {building}, running {}, {rows:#?}", held.running);
         BACK_END_GATE.store(0, Ordering::SeqCst);
         while queue::running_class(up, f).is_some() {
             std::thread::yield_now();
         }
         assert!(u.fns[f as usize].build_err.is_none(), "{:?}", u.fns[f as usize].build_err);
-        for permit in permits {
-            budget::release(permit);
-        }
+        done.store(true, Ordering::SeqCst);
+        holder.join().unwrap();
         // (the isolated process owns the runtime globals)
         std::mem::forget(u);
         let _ = std::fs::remove_file(&path);
