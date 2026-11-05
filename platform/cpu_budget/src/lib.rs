@@ -83,6 +83,10 @@ struct State {
     /// the JIT's jobs among the rows that run, `above` ones too
     jit_running: usize,
     background: usize,
+    visible: usize,
+    /// The JIT's Background jobs: running, and waiting for a permit.
+    jit_background: usize,
+    jit_waiting: usize,
     waiting: u8,
     parked: [u64; 3],
     admitted: [u64; 3],
@@ -93,6 +97,10 @@ struct State {
     #[cfg(test)]
     changed: Option<std::sync::mpsc::Sender<()>>,
 }
+/// The JIT's Background jobs Visible work makes room for while they wait, counting the one JIT job that always runs:
+/// two permits. A cold slice runs on the code those jobs compile: starved of them it stays on slow code, and takes
+/// longer at more CPU.
+const JIT_FLOOR: usize = 3;
 struct Budget {
     origin: Instant,
     cores: usize,
@@ -102,6 +110,8 @@ struct Budget {
     /// 8 cores / 16 threads: the same 990 O3 builds took 31.6 CPU-s 8 wide, 58.5 CPU-s 13 wide)
     /// and gets the work done little sooner.
     background_limit: usize,
+    /// JIT_FLOOR, within a quarter of the limit: on a small machine it would leave Visible nothing.
+    jit_floor: usize,
     state: Mutex<State>,
     classes: Box<[AtomicU8]>,
     // A precomputed bit per yielding class: should_yield needs just two relaxed loads.
@@ -122,9 +132,10 @@ impl Budget {
         Self {
             origin: Instant::now(), cores, limit,
             background_limit: limit.saturating_sub(2).min(physical.saturating_sub(1)).max(1),
+            jit_floor: JIT_FLOOR.min(limit / 4),
             state: Mutex::new(State {
                 slots: vec![None; cores], waiters: Vec::new(), ticket: 0,
-                running: 0, jit_running: 0, background: 0, waiting: 0, parked: [0; 3], admitted: [0; 3],
+                running: 0, jit_running: 0, background: 0, visible: 0, jit_background: 0, jit_waiting: 0, waiting: 0, parked: [0; 3], admitted: [0; 3],
                 runtime: [0; 3], spans: [Span::default(); 3], warnings: HashMap::new(),
                 worst: VecDeque::new(),
                 #[cfg(test)]
@@ -138,23 +149,30 @@ impl Budget {
         }
     }
     fn now(&self) -> u64 { self.origin.elapsed().as_nanos().min(u64::MAX as u128) as u64 }
-    fn class_limit(&self, class: u8) -> usize {
+    /// How far the JIT's Background jobs are below their floor: it holds only against Visible work.
+    fn jit_short(&self, s: &State) -> usize {
+        if s.visible == 0 && s.waiting & (1 << VISIBLE) == 0 { return 0; }
+        self.jit_floor.saturating_sub(s.jit_background)
+    }
+    fn class_limit(&self, s: &State, class: u8, client: u8) -> usize {
         match class {
             INTERACTIVE => self.cores,
-            VISIBLE => self.limit,
+            VISIBLE => self.limit - self.jit_short(s).min(s.jit_waiting),
+            BACKGROUND if client == JIT && self.jit_short(s) > 0 => self.limit,
             BACKGROUND => self.background_limit,
             _ => unreachable!(),
         }
     }
     fn room(&self, s: &State, class: u8, client: u8) -> bool {
         client == JIT && s.jit_running == 0
-            || s.running < self.class_limit(class) && (class != BACKGROUND || client != APP || !self.warming() || s.background == 0)
+            || s.running < self.class_limit(s, class, client) && (class != BACKGROUND || client != APP || !self.warming() || s.background == 0)
     }
     fn first(&self, s: &State) -> Option<usize> {
         s.waiters.iter().enumerate().filter(|(_, w)| self.room(s, w.class, w.client)).min_by_key(|(_, w)| (w.class, w.ticket)).map(|(i, _)| i)
     }
     fn refresh(&self, s: &mut State) {
         s.waiting = s.waiters.iter().fold(0, |bits, w| bits | (1 << w.class));
+        s.jit_waiting = s.waiters.iter().filter(|w| w.class == BACKGROUND && w.client == JIT).count();
         let (mut bits, mut contended) = (0, 0);
         for class in 0..3 {
             if s.waiting & ((1 << class) - 1) != 0 || s.running > self.cores
@@ -162,6 +180,7 @@ impl Budget {
             if s.waiting & ((2 << class) - 1) != 0 || s.running > self.cores
             { contended |= 1 << class; }
         }
+        if s.running >= self.limit && self.jit_short(s).min(s.jit_waiting) > 0 { bits |= 1 << VISIBLE; }
         self.yield_classes.store(bits, Relaxed);
         self.contended_classes.store(contended, Relaxed);
         for (index, job) in s.slots.iter().enumerate() {
@@ -218,7 +237,7 @@ impl Budget {
         job.admitted_at = now;
         job.checkpoint_at = now;
         job.thread = me();
-        job.above = job.client == JIT && s.running >= self.class_limit(job.class);
+        job.above = job.client == JIT && s.running >= self.class_limit(&s, job.class, job.client);
         ADMITTED.with(|admitted| admitted.set(true));
         s.slots[index] = Some(job);
         Self::start_counting(&mut s, &job);
@@ -261,11 +280,15 @@ impl Budget {
         s.running += usize::from(!job.above);
         s.jit_running += usize::from(job.client == JIT);
         s.background += usize::from(job.class == BACKGROUND && job.client == APP);
+        s.visible += usize::from(job.class == VISIBLE);
+        s.jit_background += usize::from(job.class == BACKGROUND && job.client == JIT);
     }
     fn stop_counting(s: &mut State, job: &Job, now: u64) {
         s.running -= usize::from(!job.above);
         s.jit_running -= usize::from(job.client == JIT);
         s.background -= usize::from(job.class == BACKGROUND && job.client == APP);
+        s.visible -= usize::from(job.class == VISIBLE);
+        s.jit_background -= usize::from(job.class == BACKGROUND && job.client == JIT);
         s.runtime[job.class as usize] += now.saturating_sub(job.admitted_at);
         Self::span(s, job.label, now.saturating_sub(job.checkpoint_at));
     }
@@ -379,12 +402,17 @@ impl Budget {
         let job = s.slots[permit as usize].as_mut().expect("released CPU permit");
         let old = job.class;
         let elapsed = now.saturating_sub(job.admitted_at);
-        let app = job.client == APP;
+        let client = job.client;
+        let app = client == APP;
         job.class = class;
         job.admitted_at = now;
         s.runtime[old as usize] += elapsed;
         s.background -= usize::from(old == BACKGROUND && app);
         s.background += usize::from(class == BACKGROUND && app);
+        s.visible -= usize::from(old == VISIBLE);
+        s.visible += usize::from(class == VISIBLE);
+        s.jit_background -= usize::from(old == BACKGROUND && client == JIT);
+        s.jit_background += usize::from(class == BACKGROUND && client == JIT);
         self.classes[permit as usize].store(class, Relaxed);
         self.refresh(&mut s);
     }
