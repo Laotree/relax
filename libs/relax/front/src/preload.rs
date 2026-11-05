@@ -99,6 +99,16 @@ pub(crate) fn publish_macros(table: &mut MacroTable, name: &str, defs: &[MacroRe
         // std / core / alloc are in every extern prelude already.
         if !matches!(n.as_str(), "std" | "core" | "alloc") { externs.insert(n.clone(), dep.clone()); }
     }
+    // A single-crate prescan does not know the dependency names yet. Retry extern aliases
+    // (`use ::dep as alias`) now that they are available, while leaving unavailable crates
+    // named in discarded macro input out of the extern prelude.
+    for u in mods.uses.values().flatten() {
+        if let Some(bind) = &u.bind {
+            if u.module == mods.root && u.path.len() == 2 && u.path[0].is_empty() {
+                if let Some(target) = crate::macros::extern_target(&externs, &u.path[1]) { externs.insert(bind.clone(), target); }
+            }
+        }
+    }
     let mods = Arc::new(crate::macros::CrateMods { root: mods.root.clone(), src: mods.src.clone(), mods: mods.mods.clone(), items: mods.items.clone(), uses: mods.uses.clone(), externs, renames: mods.renames.clone(), recursion_limit: mods.recursion_limit, ..Default::default() });
     table.add_crate(name.to_string(), mods);
     if !macro_use.is_empty() {
@@ -238,6 +248,9 @@ enum Work {
 }
 
 impl Pool {
+    pub(crate) fn publish_macros(&self, ci: u32, table: &mut MacroTable) -> bool {
+        self.demand_plan.as_ref().is_some_and(|plan| plan.publish_macros(ci as usize + self.plan_offset, table))
+    }
     /// Set queued jobs' scope; entering the crate replaces an early snapshot with the loader's.
     pub fn start_parsing(&self, ci: u32, table: Arc<MacroTable>) {
         let mut st = self.st.lock().unwrap();
@@ -577,8 +590,7 @@ impl Pool {
                         if u.path.len() == 1 && u.path[0] == "crate" {
                             cmods.externs.insert(b.clone(), c.name.clone());
                         } else if u.path.len() == 2 && u.path[0].is_empty() {
-                            let target = cmods.externs.get(&u.path[1]).cloned().unwrap_or_else(|| u.path[1].clone());
-                            cmods.externs.insert(b.clone(), target);
+                            if let Some(target) = crate::macros::extern_target(&cmods.externs, &u.path[1]) { cmods.externs.insert(b.clone(), target); }
                         }
                     }
                 }
@@ -1290,17 +1302,14 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
                 T::Ident
                     if i + 2 < toks.len()
                         && toks[i + 1].kind == T::Not
-                        && toks[i + 2].kind == T::OpenParen
+                        && matches!(toks[i + 2].kind, T::OpenParen | T::OpenBracket | T::OpenBrace)
                         && dirs.last().map_or(false, |l| l.0 == depth && l.3)
                         && crate::builtins::prescan_hosted(&String::from_utf8_lossy(text(i))) =>
                 {
                     // item macros that may define macro_rules!: function-like proc macros of
                     // the JIT host called at item position (run here, their macro_rules! kept;
                     // builtins.rs prescan_defs)
-                    let mut close = i + 2;
-                    while close < toks.len() && toks[close].kind != T::CloseParen {
-                        close += 1;
-                    }
+                    let close = lazy::demand::close(&toks, i + 2);
                     if close < toks.len() && surface == ScanSurface::Macros && decl_attrs(&src, &toks, i, cfg).active {
                         let arg = &src[toks[i + 2].hi as usize..toks[close].lo as usize];
                         defs.extend(crate::builtins::prescan_defs(cfg, &String::from_utf8_lossy(text(i)), arg, krate));

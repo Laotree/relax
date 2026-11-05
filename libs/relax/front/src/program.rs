@@ -1337,8 +1337,16 @@ impl Program {
             let externs: Vec<_> = self.crates[krate as usize].deps.iter().filter_map(|(s, ci)| {
                 self.crates.get(*ci as usize).map(|c| (self.syms.str(*s).to_string(), self.syms.str(c.name).to_string()))
             }).collect();
-            crate::preload::publish_macros(std::sync::Arc::make_mut(&mut self.macros), &ahead.name,
-                &ahead.defs, &ahead.aliases, &ahead.mods, &ahead.macro_use, &externs);
+            let table = std::sync::Arc::make_mut(&mut self.macros);
+            crate::preload::publish_macros(table, &ahead.name, &ahead.defs, &ahead.aliases, &ahead.mods, &ahead.macro_use, &externs);
+            // The parser needs this crate's complete macro namespace (its outline, with the
+            // definitions and imports macro expansions made), not just the raw scan: wait only
+            // for this crate's outline, and resolve its scopes against the loader's imports.
+            if self.pool.as_ref().is_some_and(|pool| pool.publish_macros(ci, table)) {
+                if let Some(namespace) = table.crates.get(&kname).cloned() {
+                    crate::preload::publish_macros(table, &ahead.name, &[], &[], &namespace, &ahead.macro_use, &externs);
+                }
+            }
         }
         if let Some(pool) = &self.pool { pool.start_parsing(ci, self.macros.clone()); }
         if !ahead.prelexed.is_empty() {
@@ -1760,7 +1768,7 @@ impl Program {
                 eprintln!("boot-trace-reparse: {path} ({why}) speculative_module={:?} published_module={:?}", x.mod_path, self.cur_mod_path);
             }
         }
-        let (mut pf, used, prep) = match ahead {
+        let (mut pf, mut used, mut prep) = match ahead {
             Some(x) => x,
             None => {
                 // the macro prescan read and lexed most files already
@@ -1782,6 +1790,32 @@ impl Program {
                 (pf, used.unwrap(), None)
             }
         };
+        // Attribute/item expansions can export macros used by an earlier signature.
+        // Revisit that parse only when publishing its own macro surface changes a
+        // recorded lookup. Rebuild from the incoming table so discarded expansions
+        // cannot leave stale definitions behind.
+        let mut parse_table = self.macros.clone();
+        while pf.ast.tys.iter().any(|t| matches!(t, Ty::Mac(_))) {
+            let mut table = self.macros.clone();
+            let next = std::sync::Arc::make_mut(&mut table);
+            for d in &used.local {
+                if !next.defs.get(&d.name).is_some_and(|defs| defs.iter().any(|known| std::sync::Arc::ptr_eq(known, d))) {
+                    next.push(d.clone());
+                }
+            }
+            if !used.uses.is_empty() { next.add_exp_uses(&kname, used.uses.clone()); }
+            if used.replays(&table, &kname, path) { break; }
+            let bctx = std::rc::Rc::new(crate::builtins::FileCtx::new(&kname, path, &self.cur_mod_path, &self.crates[krate as usize].cfg));
+            let (fresh, uses) = self.crates[krate as usize].context.parse_input(
+                pf.src[..pf.src_len as usize].to_vec(), None, edition,
+                Some(crate::macros::MacroScope::new(table.clone())), bctx, crate::parser::lazy_auto(),
+            )?;
+            parse_table = table;
+            pf = fresh;
+            used = uses.unwrap();
+            prep = None;
+            PARSE_AGAIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if tr && tl.elapsed().as_secs_f64() > 0.002 {
             eprintln!("boot-trace-file: {:.1} ms {} ({})", tl.elapsed().as_secs_f64() * 1e3, path, why);
         }
@@ -1797,7 +1831,7 @@ impl Program {
             let bctx = std::rc::Rc::new(crate::builtins::FileCtx::new(&kname, path, &self.cur_mod_path, &self.crates[krate as usize].cfg));
             let (mut fresh, fused) = self.crates[krate as usize].context.parse_input(
                 pf.src[..pf.src_len as usize].to_vec(), None, edition,
-                Some(crate::macros::MacroScope::new(self.macros.clone())), bctx, crate::parser::lazy_auto(),
+                Some(crate::macros::MacroScope::new(parse_table.clone())), bctx, crate::parser::lazy_auto(),
             ).unwrap_or_else(|e| panic!("front verify parse {}: {:?}", path, e));
             fresh.bind_sources(path, &self.sources).expect("front verify sources");
             let fprep = prepare_file(&mut fresh, &self.crates[krate as usize].cfg);
@@ -4051,7 +4085,7 @@ impl Program {
         let mut tdef = None;
         let mut vdef = None;
         let mut src_mod: Option<u32> = None;
-        if segs.len() == 1 && (global || (edition >= 2018 && last_kind == SegKind::Ident)) {
+        if segs.len() == 1 && ((global && (edition >= 2018 || self.imports[i].ext)) || (edition >= 2018 && last_kind == SegKind::Ident)) {
             // `use foo;` / `extern crate foo` / `use ::foo` -> extern crate, else item in scope
             if let Some(c) = self.extern_crate(module, last) {
                 tdef = Some(self.mods[self.crates[c as usize].root_mod as usize].def);
@@ -4066,7 +4100,7 @@ impl Program {
             };
             tdef = Some(m);
         } else if segs.len() == 1 {
-            // 2015 edition: `use x;` / `use {x, y};` name items of the crate root (Reference
+            // 2015 edition: `use x;` / `use ::x;` / `use {x, y};` name items of the crate root (Reference
             // items/use-declarations.md: "In the 2015 edition, `use` paths are relative to the crate
             // root"); extern crates are reached there too (2015 has them in the root)
             let root = self.mods[self.crates[my_crate as usize].root_mod as usize].def;
