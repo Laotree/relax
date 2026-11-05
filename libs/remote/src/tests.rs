@@ -322,7 +322,7 @@ fn a_feed_from_a_record_gets_what_came_before_it() {
     let _turn = WATCH_TURN.lock().unwrap_or_else(|e| e.into_inner());
     let (_, watch) = shared();
     let early = watch.emit("{\"event\":\"early\"}");
-    let client = Client::connect("makepad-remote-test").unwrap();
+    let client = Client::connect(&std::process::id().to_string()).unwrap();
     let mut now = client.watch();
     assert!(now.next(Duration::from_millis(100), 3).unwrap().is_none());
     let mut from = client.feed_from("watch", early - 1);
@@ -337,11 +337,11 @@ fn unix_end_to_end_with_discovery_and_reconnect() {
     let _turn = WATCH_TURN.lock().unwrap_or_else(|e| e.into_inner());
     let (_, watch) = shared();
     let me = std::process::id();
-    let app = crate::discovery::find(&me.to_string()).expect("discovery file");
+    let app = crate::discovery::by_pid(me).expect("discovery file");
     assert_eq!(app.app, "makepad-remote-test");
     assert!(app.serves("cmd") && app.serves("watch") && app.serves("stream"));
     assert_eq!(app.text("extra").as_deref(), Some("x"));
-    let client = Client::connect("makepad-remote-test").unwrap();
+    let client = Client::connect(&std::process::id().to_string()).unwrap();
     assert!(client.caps().contains(&"cmd/1".to_string()));
     let mut lines = client.cmd("ping").unwrap();
     assert!(lines.next().unwrap().unwrap().starts_with("{\"pong\":1"));
@@ -502,7 +502,7 @@ fn fake_frames() -> Factory {
 
 fn run_app(argv: &[&str]) -> (Vec<String>, bool) {
     shared();
-    let client = Client::connect("makepad-remote-test").unwrap();
+    let client = Client::connect(&std::process::id().to_string()).unwrap();
     let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
     let mut lines = Vec::new();
     let err = crate::app::run(&client, &argv, &mut |l| {
