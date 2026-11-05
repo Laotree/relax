@@ -292,6 +292,8 @@ pub struct Undo {
     variants: Vec<(DefId, usize)>,
     const_failed: Vec<(DefId, Vec<TyId>)>,
     full_inputs: bool,
+    /// a const edit moved the code keys: they follow the rollback's text
+    rekeyed: bool,
     // Lead decision 52 (R1): the crates a declaration publication reached (None: all).
     scope: Option<Vec<bool>>,
 }
@@ -323,6 +325,43 @@ fn placed_storage(u: &Unit, d: DefId) -> Option<DefId> {
     u.statics.keys().chain(u.tls_places.keys()).copied().find(|&s| changed_body_owner(&u.prog, s, &[d]))
 }
 
+/// Every constant-evaluated context that reads one of `hit` by name, directly or through the consts
+/// and const fns it names (`const_contexts_reading`, so aliases and macro text count). None: it
+/// cannot say. Same-named items count: a false restart, never stale code.
+fn consts_read_through(prog: &Program, hit: &[DefId]) -> Option<crate::fxhash::HashSet<DefId>> {
+    let mut found = crate::fxhash::HashSet::default();
+    let mut next = hit.to_vec();
+    while !next.is_empty() {
+        let reads = const_contexts_reading(prog, &next)?;
+        next = reads.into_iter().filter(|d| found.insert(*d) && matches!(prog.def(*d).kind, DefKind::Const | DefKind::AssocConst | DefKind::Fn | DefKind::AssocFn)).collect();
+    }
+    Some(found)
+}
+
+/// Whether a type reads `hit`: an array length, repeat count, const argument or discriminant, or a
+/// type or impl header naming it as a generic argument. A body naming it lands: its keys show it.
+fn read_in_a_type(prog: &Program, hit: &[DefId]) -> bool {
+    consts_read_through(prog, hit).is_none_or(|found| found.iter().any(|c| matches!(prog.def(*c).kind,
+        DefKind::AnonConst | DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::TypeAlias | DefKind::AssocTy | DefKind::Impl)))
+}
+
+/// One of `hit` a type reads: it was evaluated, or `read_in_a_type`. Types have no key of their own,
+/// and a warm run evaluated only what it checked.
+fn const_read_by_a_type(u: &Unit, hit: &[DefId]) -> Option<DefId> {
+    let prog = &u.prog;
+    if let Some(&d) = hit.iter().find(|d| u.tcx.const_was_evaluated(**d)) { return Some(d); }
+    if !read_in_a_type(prog, hit) { return None; }
+    hit.iter().copied().find(|d| read_in_a_type(prog, &[*d])).or(hit.first().copied())
+}
+
+/// A static with storage whose initializer reads one of `hit`: its running value is the old text's.
+fn static_of_changed_consts(u: &Unit, hit: &[DefId]) -> Option<DefId> {
+    let mut live = u.statics.iter().filter(|(_, &a)| a != 0).map(|(d, _)| *d).peekable();
+    live.peek()?;
+    let found = consts_read_through(&u.prog, hit)?;
+    live.find(|d| found.contains(d))
+}
+
 fn changed_body_owner(prog: &Program, mut def: DefId, changed: &[DefId]) -> bool {
     while def != crate::program::NO_DEF {
         if changed.contains(&def) { return true; }
@@ -350,7 +389,35 @@ fn in_scope(prog: &Program, scope: Option<&[bool]>, d: DefId) -> bool {
 /// generated body). Text no definition holds (a cfg-disabled generated item) is never
 /// evaluated, and a generated body never materialized was never evaluated either.
 fn const_contexts_mention(prog: &Program, items: &[DefId]) -> bool {
+    const_contexts_reading(prog, items).is_none_or(|found| !found.is_empty())
+}
+
+/// `names` and what else can call those items: a `use` renaming one, a type alias whose text names one.
+fn renames_of(prog: &Program, mut names: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let aliases: Vec<DefId> = (0..prog.defs.len()).map(|i| DefId(i as u32)).filter(|d| prog.def(*d).kind == DefKind::TypeAlias).collect();
+    let mut idents: Vec<Vec<u8>> = names.iter().filter(|n| n.first().is_some_and(|b| *b == b'_' || b.is_ascii_alphabetic())).cloned().collect();
+    loop {
+        let refs: Vec<&[u8]> = idents.iter().map(|n| n.as_slice()).collect();
+        let mut more: Vec<Vec<u8>> = prog.imports.iter().filter(|im| !im.glob).filter_map(|im| {
+            let (bind, last) = (im.bind?, im.segs.last()?.1);
+            (bind != last && refs.contains(&prog.syms.str(last).as_bytes())).then(|| prog.syms.str(bind).as_bytes().to_vec())
+        }).collect();
+        more.extend(aliases.iter().filter(|a| item_mentions(prog, **a, &refs)).map(|a| def_name(prog, *a).into_bytes()));
+        more.retain(|n| !names.contains(n));
+        more.sort_unstable();
+        more.dedup();
+        if more.is_empty() {
+            return names;
+        }
+        names.extend(more.iter().cloned());
+        idents.extend(more);
+    }
+}
+
+/// The definitions of the contexts `const_contexts_mention` counts; None: it cannot say.
+fn const_contexts_reading(prog: &Program, items: &[DefId]) -> Option<crate::fxhash::HashSet<DefId>> {
     use crate::def_collector::NodeId;
+    let mut found = crate::fxhash::HashSet::default();
     let visible = prog.crates_seeing_files(items.iter().map(|d| prog.def(*d).file));
     let alias_closure = |mut names: Vec<Vec<u8>>| -> Vec<Vec<u8>> {
         loop {
@@ -365,11 +432,11 @@ fn const_contexts_mention(prog: &Program, items: &[DefId]) -> bool {
         }
     };
     let all = alias_closure(items.iter().map(|d| def_name(prog, *d).into_bytes()).collect());
-    let consts = alias_closure(items.iter().filter(|d| matches!(prog.def(**d).kind, DefKind::Const | DefKind::AssocConst)).map(|d| def_name(prog, *d).into_bytes()).collect());
-    // the constant-evaluated contexts, per file: (lo, hi, whether static names count); and the
+    let consts = alias_closure(items.iter().filter(|d| matches!(prog.def(**d).kind, DefKind::Const | DefKind::AssocConst | DefKind::Fn | DefKind::AssocFn)).map(|d| def_name(prog, *d).into_bytes()).collect());
+    // the constant-evaluated contexts, per file: (lo, hi, whether static names count, whose); and the
     // ranges of every other item of those files (text there is not a context's, unless a
     // context range inside it holds it)
-    let mut contexts: crate::fxhash::HashMap<u32, Vec<(u32, u32, bool)>> = Default::default();
+    let mut contexts: crate::fxhash::HashMap<u32, Vec<(u32, u32, bool, DefId)>> = Default::default();
     let mut others: crate::fxhash::HashMap<u32, Vec<(u32, u32)>> = Default::default();
     for i in 0..prog.defs.len() {
         let d = DefId(i as u32);
@@ -381,6 +448,17 @@ fn const_contexts_mention(prog: &Program, items: &[DefId]) -> bool {
             others.entry(def.file).or_default().push((it.lo, it.hi));
         }
         if items.contains(&d) { continue; }
+        // a type's own text names a const only as a generic argument, an array length or a
+        // discriminant; an impl's only in its header
+        if matches!(def.kind, DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::TypeAlias | DefKind::AssocTy | DefKind::Impl) {
+            let pf = &prog.files[def.file as usize];
+            let it = pf.ast.item(def.item);
+            let hi = if def.kind != DefKind::Impl { it.hi } else {
+                pf.src.get(it.lo as usize..it.hi as usize).and_then(|t| t.iter().position(|b| *b == b'{')).map_or(it.hi, |at| it.lo + at as u32)
+            };
+            contexts.entry(def.file).or_default().push((it.lo, hi, true, d));
+            continue;
+        }
         let statics_count = match def.kind {
             DefKind::Const | DefKind::AssocConst | DefKind::AnonConst => true,
             DefKind::Static => false,
@@ -394,38 +472,68 @@ fn const_contexts_mention(prog: &Program, items: &[DefId]) -> bool {
             match prog.def_id_to_node_id.get(&d) {
                 Some(&(file, NodeId::AnonConst(e) | NodeId::InlineConst(e))) => {
                     let x = prog.files[file as usize].ast.expr(e);
-                    contexts.entry(file).or_default().push((x.lo, x.hi, true));
+                    contexts.entry(file).or_default().push((x.lo, x.hi, true, d));
                 }
-                _ => return true,
+                _ => return None,
             }
             continue;
         }
         let pf = &prog.files[def.file as usize];
         let it = pf.ast.item(def.item);
-        contexts.entry(def.file).or_default().push((it.lo, it.hi, statics_count));
+        contexts.entry(def.file).or_default().push((it.lo, it.hi, statics_count, d));
     }
     let ident = |b: u8| b == b'_' || b.is_ascii_alphanumeric();
+    // A const fn of an inherent impl goes by its type: `OnceLock::new` is not this `new`. What may
+    // name its type (its impl's header, `Self`, a renaming of those) counts; None: any mention counts.
+    // (No path reaches a const fn through a generic parameter: const trait calls are unstable.)
+    let owners = |name: &str| -> Option<Vec<Vec<u8>>> {
+        let mut named = items.iter().filter(|d| prog.syms.str(prog.def(**d).name) == name).peekable();
+        named.peek()?;
+        let mut owners = vec![b"Self".to_vec()];
+        for d in named {
+            let parent = prog.def(*d).parent;
+            if prog.def(*d).kind != DefKind::AssocFn || parent == crate::program::NO_DEF || prog.def(parent).kind != DefKind::Impl { return None; }
+            let pf = &prog.files[prog.def(parent).file as usize];
+            let it = pf.ast.item(prog.def(parent).item);
+            let hi = pf.src.get(it.lo as usize..it.hi as usize).and_then(|t| t.iter().position(|b| *b == b'{')).map_or(it.hi, |at| it.lo + at as u32);
+            owners.extend(toks(pf, it.lo, hi, &[]).into_iter().map(|t| t.to_vec()));
+        }
+        Some(renames_of(prog, owners))
+    };
     for (&file, ranges) in &contexts {
         let pf = &prog.files[file as usize];
         let other: &[(u32, u32)] = others.get(&file).map_or(&[], |v| v.as_slice());
         let src: &[u8] = &pf.src[..];
         // (source text is UTF-8; text that is not counts as a mention)
-        let Ok(text) = std::str::from_utf8(src) else { return true };
+        let Ok(text) = std::str::from_utf8(src) else { return None };
         let mut calls: Vec<(u32, u32, u32)> = pf.exp_map.iter().collect();
         calls.sort_unstable();
         for name in &all {
-            let Ok(name) = std::str::from_utf8(name) else { return true };
+            let Ok(name) = std::str::from_utf8(name) else { return None };
             let is_const = consts.iter().any(|n| n.as_slice() == name.as_bytes());
+            let owners = owners(name);
             for (start, _) in text.match_indices(name) {
                 let end = start + name.len();
                 if (start > 0 && ident(src[start - 1])) || (end < src.len() && ident(src[end])) { continue; }
+                // another item's definition under this name reads nothing
+                let before = src[..start].trim_ascii_end();
+                if [&b"fn"[..], b"const", b"static"].iter().any(|k| before.ends_with(k) && before.len() < start && !before[..before.len() - k.len()].last().is_some_and(|b| ident(*b))) { continue; }
+                if let Some(owners) = owners.as_ref().filter(|_| start >= 2 && &src[start - 2..start] == b"::") {
+                    let path = src[..start - 2].iter().rposition(|b| !ident(*b)).map_or(0, |at| at + 1);
+                    let q = &src[path..start - 2];
+                    if !q.is_empty() && !owners.iter().any(|o| o.as_slice() == q) { continue; }
+                }
                 // a context holds it, or another item, or it is expansion text followed back to
                 // its call site; text no context, item or call site holds is no definition's
                 // (a cfg-disabled generated item, module-level text) and is never evaluated
                 let mut at = start as u32;
                 let mut steps = 0;
                 loop {
-                    if ranges.iter().any(|&(lo, hi, statics_count)| at >= lo && at < hi && (statics_count || is_const)) { return true; }
+                    let mut held = false;
+                    for &(lo, hi, statics_count, d) in ranges {
+                        if at >= lo && at < hi && (statics_count || is_const) { held = true; found.insert(d); }
+                    }
+                    if held { break; }
                     if at < pf.src_len || other.iter().any(|&(lo, hi)| at >= lo && at < hi) { break; }
                     let j = calls.partition_point(|c| c.0 <= at);
                     match j.checked_sub(1).map(|j| calls[j]) {
@@ -436,7 +544,7 @@ fn const_contexts_mention(prog: &Program, items: &[DefId]) -> bool {
             }
         }
     }
-    false
+    Some(found)
 }
 
 /// Lead decision 52 (R2 (a)): an initializer made only of literals -- arrays, repeats with a
@@ -523,6 +631,7 @@ pub unsafe fn rollback(up: *mut Unit, undo: Undo, why: &str) -> Vec<String> {
             u.prog.reclaim_caches();
             drop(fw);
         }
+        if undo.rekeyed { crate::cache::rekey_after_revert(up); }
         if undo.full_inputs {
             let (prog, scope) = (&u.prog, undo.scope.as_deref());
             u.consts.retain(|(d, _), _| !in_scope(prog, scope, *d));
@@ -2468,13 +2577,17 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
     }
     // Code linked from the disk cache was lowered by an earlier run, and what it read (const_readers,
-    // const_was_evaluated) is known only for code this run lowered: a const's readers among it would
-    // keep the old value, folded in, under a "patched" with nothing installed. The new run's keys
-    // tell them apart.
-    if crate::cache::linked_code(up) {
-        for c in &changes {
-            if let Change::Const(d) = c {
-                restart.push(format!("const `{}` changed, and this run's code comes from the disk cache: its readers there are known only to a new run -- restart the app", def_name(&u.prog, *d)));
+    // const_was_evaluated) is known only for code this run lowered. The keys show its readers: each
+    // changed const's closure before the edit, to compare after it (a const with no node has no key).
+    let linked_process = crate::cache::linked_code(up);
+    let const_before = {
+        let consts: Vec<DefId> = changes.iter().filter_map(|c| if let Change::Const(d) = c { Some(*d) } else { None }).collect();
+        if consts.is_empty() { Vec::new() } else { crate::cache::const_closures(up, &consts) }
+    };
+    if linked_process {
+        for (d, closure) in &const_before {
+            if closure.is_none() {
+                restart.push(format!("const `{}` changed, and this run's code comes from the disk cache: no key shows its readers there -- restart the app", def_name(&u.prog, *d)));
             }
         }
     }
@@ -2848,7 +2961,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             if via_slot || item_mentions(&u.prog, c, &names) {
                 if u.tcx.const_was_evaluated(c) {
                     out.rung = Rung::Restart;
-                    out.lines.push(format!("const `{}` depends on a changed const and is used in a type -- restart the app", def_name(&u.prog, c)));
+                    let named = if u.prog.def(c).kind == DefKind::AnonConst { consts_hit[0] } else { c };
+                    out.lines.push(format!("const `{}` depends on a changed const and is used in a type -- restart the app", def_name(&u.prog, named)));
                     out.ms[0] = ms(t0);
                     return out;
                 }
@@ -2859,6 +2973,18 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         if !grew {
             break;
         }
+    }
+    if let Some(d) = const_read_by_a_type(u, &consts_hit) {
+        out.rung = Rung::Restart;
+        out.lines.push(format!("const `{}` is used in a type (an array length or const generic argument): its users' types change -- restart the app", def_name(&u.prog, d)));
+        out.ms[0] = ms(t0);
+        return out;
+    }
+    if let Some(st) = static_of_changed_consts(u, &consts_hit) {
+        out.rung = Rung::Restart;
+        out.lines.push(format!("the initializer of `{}` reads a changed const, and `{}` already holds the value the old one made (an initializer runs once) -- restart the app", def_name(&u.prog, st), def_name(&u.prog, st)));
+        out.ms[0] = ms(t0);
+        return out;
     }
     // the slots to rebuild: every instance of a changed fn or const initializer, the readers of
     // every affected const, and (transitively) the callers that inlined any of them
@@ -3489,6 +3615,53 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             }
         }
     }
+    // The keys follow the text. What a new run of this text would not link is rebuilt with the
+    // edit's slots, by the same walk as const_readers' readers before the commit.
+    let rekeyed = !const_before.is_empty();
+    if rekeyed {
+        let found = crate::cache::rekey_after_const_edit(up, &const_before);
+        trace_count("rekey_readers", found.readers.len());
+        if linked_process {
+            for d in &found.blind {
+                errs.push(format!("const `{}` changed outside the text the keys are made from (an included file): no key shows its readers in this run's code from the disk cache -- restart the app", def_name(&u.prog, *d)));
+                as_restart = true;
+            }
+        }
+        let mut seen: std::collections::HashSet<u32> = slots.iter().chain(fresh.iter()).copied().collect();
+        let mut marked: std::collections::HashSet<u32> = flagged.iter().copied().collect();
+        let mut work: Vec<u32> = Vec::new();
+        for s in found.readers {
+            // an initializer that ran does not run again. Whether it read the edit was asked of its
+            // text before the commit (static_of_changed_consts): a key also moves with its fn's names
+            if matches!(&u.fns[s as usize].key, FnKey::Inst(d, _) if u.prog.def(*d).kind == DefKind::Static && u.statics.get(d).is_some_and(|&a| a != 0)) { continue; }
+            if marked.insert(s) { flagged.push(s); }
+            if seen.insert(s) {
+                if u.fns[s as usize].compiled { slots.push(s); } else { fresh.push(s); }
+                work.push(s);
+            }
+        }
+        while let Some(s) = work.pop() {
+            let inl = u.fns[s as usize].history().inlined_into.len();
+            let mut deps = u.fns[s as usize].history().inlined_into.clone();
+            deps.extend(crate::sandbox::twin_of(s));
+            for (k, d) in deps.into_iter().enumerate() {
+                if k >= inl && marked.contains(&s) && marked.insert(d) { flagged.push(d); }
+                if !seen.insert(d) { continue; }
+                if u.fns[d as usize].compiled {
+                    if k < inl { inlining_callers.push(d); }
+                    slots.push(d);
+                } else {
+                    fresh.push(d);
+                }
+                work.push(d);
+            }
+        }
+        // an armed real-time root's code is not replaced under it (as before the commit)
+        if let Some(line) = jit::realtime_frozen(u, &slots.iter().chain(fresh.iter()).copied().collect::<Vec<u32>>()) {
+            errs.push(line);
+        }
+        trace_count("selected_slots_rekey", slots.len() + fresh.len());
+    }
     trace_sub("consts_errs");
     trace_stage("commit_collect");
     let mut checked_bodies = Vec::new();
@@ -3690,6 +3863,16 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     errs.push(format!("{}: {}", u.fns[id as usize].name, e));
                 }
             }
+        }
+    }
+    // Linked code's type-level uses show here, as its readers lower: an evaluation of the new text
+    // (publish_reload dropped the evaluations of the old; a const no constant context names is not
+    // read by one). The types of the code around them changed: none of it installs.
+    if linked_process && ctfe_relevant {
+        let u = &*up;
+        if let Some(d) = const_read_by_a_type(u, &consts_hit) {
+            errs = vec![format!("const `{}` is used in a type (an array length or const generic argument): its users' types change -- restart the app", def_name(&u.prog, d))];
+            as_restart = true;
         }
     }
     if errs.is_empty() {
@@ -3910,6 +4093,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             out.lines.retain(|l| !l.starts_with("field `"));
         }
         drop(fw);
+        if rekeyed { crate::cache::rekey_after_revert(up); }
         jit::bump_patch_epoch();
         let mut invalidated = u.reload_rir.take().unwrap_or_default();
         invalidated.extend(slots.iter().chain(&fresh).copied());
@@ -4102,7 +4286,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
     }
     out.files = olds.iter().map(|o| news.iter().find(|(x, _)| x == o).map_or(*o, |(_, n)| *n)).collect();
-    out.undo = Some(Undo { group: gen, versions: news.clone(), pairs: news_pairs.clone(), added: added_defs.clone(), removed: removed_defs.clone(), consts: saved_consts, consts_hit: consts_hit.clone(), adts: saved_adts, variants: saved_variants, const_failed: saved_failed, full_inputs, scope: scope.clone() });
+    out.undo = Some(Undo { rekeyed, group: gen, versions: news.clone(), pairs: news_pairs.clone(), added: added_defs.clone(), removed: removed_defs.clone(), consts: saved_consts, consts_hit: consts_hit.clone(), adts: saved_adts, variants: saved_variants, const_failed: saved_failed, full_inputs, scope: scope.clone() });
     out.rung = Rung::Patch;
     if let Some(fv_cx) = fv_cx { fv_session_keep(transaction, fv_cx); }
     trace_count("inlining_callers", inlining_callers.len());
@@ -7016,6 +7200,15 @@ pub const C_ALIAS: u32 = 7; mod m { pub use super::C_ALIAS as RENAMED; } const E
 pub const C_INLINE: u32 = 8; fn uses_inline() -> u32 { const { C_INLINE } }
 macro_rules! get { () => { C_MACRO } }
 pub const C_MACRO: u32 = 9; const F: u32 = get!();
+pub const C_FIELD: usize = 10; struct Ga<const N: usize>; struct UsesField { _f: Ga<C_FIELD> }
+pub const C_ALIAS_TY: usize = 11; type UsesAlias = Ga<C_ALIAS_TY>;
+pub const C_IMPL: usize = 12; trait Tr {} impl Tr for Ga<C_IMPL> { }
+pub const C_BODY_ONLY: usize = 13; impl Ga<0> { fn body_only() -> usize { C_BODY_ONLY } }
+pub const C_THROUGH: usize = 14; const fn through() -> usize { C_THROUGH } struct UsesThrough { _a: [u8; through()] }
+pub const C_VALUE: u32 = 15; const VALUE_READ: u32 = C_VALUE + 1; const fn value_read() -> u32 { VALUE_READ } fn reads_value() -> u32 { value_read() }
+pub const C_NEW_OTHER: usize = 16; struct ViaOther(usize); impl ViaOther { const fn new() -> Self { ViaOther(C_NEW_OTHER) } } struct Unrelated; impl Unrelated { const fn new() -> Self { Unrelated } } struct UsesUnrelated { _a: [u8; { let _ = Unrelated::new(); 1 }] }
+pub const C_NEW_VIA: usize = 17; struct ViaIt(usize); impl ViaIt { const fn make() -> Self { ViaIt(C_NEW_VIA) } } struct UsesViaIt { _a: [u8; { let _ = ViaIt::make(); 1 }] }
+pub const C_NEW_RENAMED: usize = 18; struct ViaRen(usize); impl ViaRen { const fn build() -> Self { ViaRen(C_NEW_RENAMED) } } use ViaRen as Ren; struct UsesRen { _a: [u8; { let _ = Ren::build(); 1 }] }
 pub static S_FN: [u32; 2] = [1, 2];
 pub static S_ADDR: [u32; 2] = [3, 4]; static HOLDER: &[u32; 2] = &S_ADDR;
 pub static S_READ: [u32; 2] = [5, 6]; const fn cf2() -> u32 { S_READ[0] }
@@ -7035,6 +7228,11 @@ fn ordinary() -> u32 { let _a = S_FN[0]; C_FN + S_FN[1] }
             assert_eq!(const_contexts_mention(&prog, &[named(name)]), expected, "{name}");
         }
         assert!(const_contexts_mention(&prog, &[named("C_FN"), named("C_LEN")]), "any item of the transaction");
+        for (name, expected) in [("C_FN", false), ("C_CONST", false), ("C_LEN", true), ("C_REPEAT", true), ("C_BODY", false), ("C_STATIC", false),
+            ("C_FIELD", true), ("C_ALIAS_TY", true), ("C_IMPL", true), ("C_BODY_ONLY", false), ("C_THROUGH", true), ("C_VALUE", false),
+            ("C_NEW_OTHER", false), ("C_NEW_VIA", true), ("C_NEW_RENAMED", true)] {
+            assert_eq!(read_in_a_type(&prog, &[named(name)]), expected, "{name}: read by a type");
+        }
         std::fs::remove_file(path).unwrap();
     }
 
