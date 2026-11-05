@@ -1779,6 +1779,17 @@ fn const_code_using(u: &Unit, d: DefId, gone: &[u32], names: &[&[u8]], visible: 
         if !text_names || changes.iter().any(|x| matches!(x, Change::Const(y) | Change::StaticInit(y) if *y == c)) {
             continue;
         }
+        // an inline const of a fn this edit rebuilds (an `offset_of!` in it) is evaluated again
+        // with the fn's new text
+        if def.kind == DefKind::AnonConst {
+            let mut owner = def.parent;
+            while owner != crate::program::NO_DEF && matches!(prog.def(owner).kind, DefKind::AnonConst | DefKind::Closure) {
+                owner = prog.def(owner).parent;
+            }
+            if changes.iter().any(|x| matches!(x, Change::Body(y) if *y == owner)) {
+                continue;
+            }
+        }
         let body = u.tcx.typeck(prog, c);
         let Some((_, k)) = body.field_uses.iter().find(|(ud, k)| *ud == d && gone.contains(k)) else { continue };
         if konst_fn && !const_contexts_mention(prog, &[c]) {
@@ -1864,11 +1875,16 @@ fn layout_edit(u: &Unit, d: DefId, fresh: &crate::tcx::AdtT, running_discriminan
             return Err(format!("struct `{}`: field `{}` was removed or retyped, and it holds the niche an outer type (e.g. `Option<{}>`) may keep its tag in; values built after the edit leave it unset -- restart the app", name, u.prog.syms.str(fields[k].name), name));
         }
         // a dead slot that owns memory is dropped with the values built before the edit (their ext
-        // word's flag bit is clear; lower.rs ext_drop_fn); values built after it leave it unset.
+        // word says they set it; lower.rs ext_drop_fn); values built after it leave it unset.
         // In the extension block a running value may set it after the edit (its block grows
         // later): that needs its type's Default (the declared default went with the field)
         if adt_ext_field(old, k) && u.needs_drop_glue(fields[k].ty) && !u.has_default(fields[k].ty) {
             return Err(format!("struct `{}`: field `{}` (added live earlier) removed, and its type owns memory without a Default -- restart the app", name, u.prog.syms.str(fields[k].name)));
+        }
+        // a value built by raw writes at computed offsets leaves its ext word as the memory had
+        // it (a moved-out value's, maybe): whether it set the dead slot is unknown
+        if !adt_ext_field(old, k) && u.needs_drop_glue(fields[k].ty) && u.offsets_computed.lock().unwrap_or_else(|e| e.into_inner()).contains(&d) {
+            return Err(format!("struct `{}`: the program computes its fields' offsets (offset_of!) and may build values by raw writes, so whether a value set removed field `{}`, which needs dropping, is unknown -- restart the app", name, u.prog.syms.str(fields[k].name)));
         }
         let hidden = format!("__relax_dead_{}_{}", k, u.prog.syms.str(fields[k].name));
         if !notes.iter().any(|n| n.contains(&format!("field `{}` of `{}` changed its type", u.prog.syms.str(fields[k].name), name))) {
@@ -1918,6 +1934,13 @@ fn layout_edit(u: &Unit, d: DefId, fresh: &crate::tcx::AdtT, running_discriminan
             }
             fields.push(nf.clone());
         }
+    }
+    // code that builds the struct by raw writes at the offsets it computed (offset_of!, as
+    // reflection crates do) has none for a field in the extension block: the running layout
+    // cannot follow
+    if fields.len() > n_old && u.offsets_computed.lock().unwrap_or_else(|e| e.into_inner()).contains(&d) {
+        let added = u.prog.syms.str(fields[n_old].name);
+        return Err(format!("struct `{}`: the program computes its fields' offsets (offset_of!), and field `{}` added by this edit has no offset in the running layout -- restart the app", name, added));
     }
     adt.variants[0].fields = fields;
     Ok((adt, notes))
