@@ -132,7 +132,7 @@ mod imp {
     }
 
     #[repr(C)]
-    struct SigAction {
+    pub(crate) struct SigAction {
         handler: usize,
         mask: [u64; 16],
         flags: i32,
@@ -316,7 +316,7 @@ mod imp {
     }
 
     #[repr(C)]
-    struct SigAction {
+    pub(crate) struct SigAction {
         flags: i32,
         pad: i32,
         handler: usize,
@@ -501,7 +501,7 @@ mod imp {
 
     /// Darwin `struct sigaction` (user side): handler, sa_mask (u32), sa_flags.
     #[repr(C)]
-    struct SigAction {
+    pub(crate) struct SigAction {
         handler: usize,
         mask: u32,
         flags: i32,
@@ -789,7 +789,9 @@ mod imp {
         if trace() {
             trace_fault(rec.code, pc, chained);
         }
-        if chained && !crate::jit::in_jit_code(pc) {
+        // (the code of a run that ended and a thread of an ending run are this runtime's whatever
+        // unit is current: the normal search cannot walk their frames)
+        if chained && !crate::jit::in_jit_code(pc) && !crate::stale::in_ended_run(pc) && !crate::domain::current_is_ending() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         // the data address of an access violation / in-page error (ExceptionInformation[1]);
@@ -869,6 +871,20 @@ mod imp {
     pub fn reassert() {}
 
     /// Suspends thread `t` and reads its context. MAKEPAD_RUN_COMPILE_WATCH: prints where it is. Hang
+    /// A run's end (domain.rs end_run): no signal ends a wait here. A synchronous I/O call is
+    /// cancelled, and the program's waits end by themselves (domain_threads.rs `waits`). Back in JIT
+    /// code the thread faults and ends as on unix.
+    pub fn end_interrupt(t: u64, waiting: usize) {
+        crate::domain_threads::waits::wake(waiting);
+        unsafe {
+            let h = OpenThread(THREAD_TERMINATE, 0, t as u32);
+            if h != 0 {
+                CancelSynchronousIo(h);
+                CloseHandle(h);
+            }
+        }
+    }
+
     /// watchdog: a thread running JIT code continues in jit::HANG_TRAMP as if the interrupted pc
     /// had called it (the return address pushed on its stack); there, on the thread itself, the
     /// policy decides as a watchdog signal's handler does.

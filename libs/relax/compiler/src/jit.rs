@@ -477,6 +477,14 @@ pub struct Unit {
     pub(crate) lazy_entry: u64,
     pub enter: u64,
     pub leave: u64,
+    /// Code before this stays executable when the run ends (`end_code`): `enter` and `leave`, how a
+    /// thread found in the ended code gets out. (0: no code of its own: no-codegen mode)
+    pub(crate) glue_end: u64,
+    /// `end_code` ran
+    pub(crate) code_ended: AtomicBool,
+    /// Set once its code ended: the program's waits end with it (domain_threads.rs `waits`).
+    #[cfg(windows)]
+    pub(crate) end_event: os::win32::HANDLE,
     /// bump allocators of code / read-only data / static memory (lock-free: lowering threads
     /// allocate too)
     code_next: AtomicU64,
@@ -1277,13 +1285,6 @@ pub(crate) fn program_stack_changed() {
     crate::inspect::heap::stack_changed();
 }
 
-/// Runs `f(arg)` (a program thread's body: Relax std's thread start) on a program stack: a large
-/// lazily committed reservation with a guard (relax_base::stack::on_program_stack), so deep
-/// recursion and big stack buffers fit, and an overrun faults on the guard as a stack overflow.
-extern "C" fn relax_on_program_stack(f: extern "C" fn(*mut u8), arg: *mut u8) {
-    crate::stack::on_program_stack(program_stack_changed, || f(arg));
-}
-
 /// Gives the calling thread its fault stack (once), so a stack overflow in JIT code on a thread
 /// the program started is still reported. Called on the thread's first lazy compile /
 /// thread-local block and from the fault handler.
@@ -1383,6 +1384,10 @@ unsafe fn adopt_runtime_unit(u: *mut Unit) {
     }
     if UNIT.is_null() || !(*u).aux || (*UNIT).aux {
         UNIT = u;
+    }
+    if !(*u).aux {
+        APP_LEAVE.store((*u).leave, Ordering::Release);
+        APP_ENTER.store((*u).enter, Ordering::Release);
     }
 }
 /// Tokens identify calls, never a process-wide arm/disarm generation.
@@ -1669,12 +1674,6 @@ fn optimize_tree_panicked(up: *mut Unit, id: u32, p: Box<dyn std::any::Any + Sen
     (id, Err(format!("optimize_tree panicked: {}", msg)))
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-extern "C" {
-    #[link_name = "pthread_atfork"]
-    fn host_pthread_atfork(prepare: Option<unsafe extern "C" fn()>, parent: Option<unsafe extern "C" fn()>, child: Option<unsafe extern "C" fn()>) -> i32;
-}
-
 /// fork() in a program run by Relax: the child has only the forking thread, and may go on
 /// running JIT code (a lazy compile in the child). The loader hands programs its own `fork`
 /// (loader_symbol): before the fork every compile job finishes or waits at its start, and the
@@ -1691,13 +1690,18 @@ extern "C" {
 /// app not yet running hung at 'compiling: build scripts' on a cold cache).
 #[cfg(unix)]
 extern "C" fn relax_fork() -> i32 {
+    let handlers = crate::domain_res::atfork_prepare();
     fork_prepare();
     let pid = os::thread::fork();
     let err = os::proc::last_error();
     if pid == 0 {
+        crate::domain_res::fork_child();
         fork_child();
+        crate::domain_res::atfork_child(&handlers);
     } else {
         fork_parent();
+        crate::domain_res::atfork_parent(&handlers);
+        crate::domain_res::note_child(pid);
     }
     os::proc::set_last_error(err);
     pid
@@ -2094,6 +2098,212 @@ unsafe fn fatal_report(f: &os::fault::Fault) -> ! {
 /// This thread's recovery context (stable address for the thread's lifetime).
 fn ctx_ptr() -> *mut u64 {
     CTX.with(|c| c.get() as *mut u64)
+}
+
+/// What `leave` returns when the run ended under the thread (`end_on_fault`).
+const LEAVE_RUN_ENDED: u64 = 4;
+/// The kind of the `PanicInfo` a `call_jit` returns with when the run ended under it: no failure,
+/// nothing to report, the thread is on its way out.
+pub(crate) const RUN_ENDED_KIND: &str = "run ended";
+
+thread_local! {
+    /// A program thread's outermost recovery point (`run_thread_body`): where it goes when the run
+    /// ends under it and no `call_jit` is left around it. (const, no destructor: readable in the
+    /// fault handler at every point of the thread's life)
+    static END_CTX: std::cell::UnsafeCell<[u64; 2]> = const { std::cell::UnsafeCell::new([0; 2]) };
+    /// The return addresses between the fault that ended the run on this thread and the recovery
+    /// point it went to (written in the handler, read at that point: `note_abandoned_frames`).
+    static END_WALK: std::cell::UnsafeCell<([u64; 16], usize)> = const { std::cell::UnsafeCell::new(([0; 16], 0)) };
+}
+
+/// Host functions a run's end left without returning: a frame of native code between JIT frames.
+/// Empty is what keeps the next run safe from a lock such a frame held; the end's report names them.
+static ABANDONED_FRAMES: relax_session::sync::Mutex<Vec<(String, u32)>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// The native frames runs' ends abandoned so far, by name, and how many times.
+pub(crate) fn abandoned_frames() -> Vec<(String, u32)> {
+    ABANDONED_FRAMES.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The run ended under this thread (back at a recovery point, in normal context): names any native
+/// frame the fault's walk found among the ones left behind. `app_call`: the frames next to its
+/// recovery point are its own, on the way to the callback.
+fn note_abandoned_frames(app_call: bool) {
+    let (raw, mut n) = END_WALK.with(|w| unsafe { let w = &mut *w.get(); let v = (w.0, w.1); w.1 = 0; v });
+    while app_call && n > 0 && !crate::stale::in_ended_run(raw[n - 1]) {
+        n -= 1;
+    }
+    for &ret in &raw[..n] {
+        if crate::stale::in_ended_run(ret) {
+            continue;
+        }
+        let name = match os::proc::image_at_raw(ret) {
+            Some((_, base, sym, _)) => format!("{} (image+{:#x})", String::from_utf8_lossy(sym), ret - base),
+            None => format!("{ret:#x}"),
+        };
+        let _k = crate::zone_alloc::kept();
+        let mut a = ABANDONED_FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+        match a.iter_mut().find(|x| x.0 == name) {
+            Some(x) => x.1 += 1,
+            None => a.push((name, 1)),
+        }
+    }
+}
+
+/// A program's `enter`, for the calls native code makes into it (`app_call`). A program unit's entry
+/// glue stays mapped for the life of the process, any of them does.
+static APP_ENTER: AtomicU64 = AtomicU64::new(0);
+static APP_LEAVE: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// In an `app_call` on this thread: the thread's recovery point as that call found it (a newer
+    /// one is nearer, this one is further than the call's own).
+    static APP_CALL_OVER: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+}
+
+rt_fn! {
+leaf fn app_call_body(call: *mut (unsafe extern "C" fn(*mut u8), *mut u8)) {
+    unsafe { ((*call).0)((*call).1) }
+}
+}
+
+/// The threads that came in through `app_call`, for a run's end to reach a wait they are in.
+struct AppCaller {
+    /// its `os::thread::kick` handle; 0: a free place
+    thread: AtomicU64,
+    waiting: std::sync::atomic::AtomicUsize,
+    /// In a call: the domain block it is in + 1 (0: not in a call).
+    in_call: AtomicU64,
+}
+static APP_CALLERS: [AppCaller; 256] = [const { AppCaller { thread: AtomicU64::new(0), waiting: std::sync::atomic::AtomicUsize::new(0), in_call: AtomicU64::new(0) } }; 256];
+/// A kick needs the thread alive: its place goes under this lock.
+static APP_CALLERS_KICK: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
+
+struct AppCallerPlace(std::cell::Cell<*const AppCaller>);
+impl Drop for AppCallerPlace {
+    fn drop(&mut self) {
+        let place = self.0.get();
+        if !place.is_null() {
+            let _g = APP_CALLERS_KICK.lock().unwrap_or_else(|e| e.into_inner());
+            unsafe { &*place }.thread.store(0, Ordering::Release);
+        }
+    }
+}
+thread_local! {
+    static APP_CALLER: AppCallerPlace = const { AppCallerPlace(std::cell::Cell::new(std::ptr::null())) };
+}
+
+/// The calling thread's place (null: the table is full, a run's end will not reach its waits).
+fn app_caller() -> *const AppCaller {
+    APP_CALLER.try_with(|p| {
+        if p.0.get().is_null() {
+            let me = os::thread::current();
+            if let Some(c) = APP_CALLERS.iter().find(|c| c.thread.compare_exchange(0, me, Ordering::AcqRel, Ordering::Relaxed).is_ok()) {
+                c.waiting.store(os::thread::waiting_cell(), Ordering::Release);
+                p.0.set(c);
+            }
+        }
+        p.0.get()
+    }).unwrap_or(std::ptr::null())
+}
+
+/// A run's end: kicks the threads in an `app_call`. Whether one of them is in a domain of `bases`.
+pub(crate) fn kick_app_callers(bases: &[u64]) -> bool {
+    let me = os::thread::current();
+    let _g = APP_CALLERS_KICK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut any = false;
+    for c in APP_CALLERS.iter() {
+        let at = c.in_call.load(Ordering::Acquire);
+        let t = c.thread.load(Ordering::Acquire);
+        if at != 0 && t != 0 && t != me {
+            os::thread::end_kick(t, c.waiting.load(Ordering::Acquire));
+            any |= bases.contains(&(at - 1));
+        }
+    }
+    any
+}
+
+/// Native code calls JIT code through this, whatever thread it is on (`makepad_relax_api::app_call`).
+/// `thunk(data)` runs under a recovery point of its own: false when the run ended under it, and all
+/// the caller's frames go on from here with what they hold. Realtime safe: no lock, no allocation.
+/// A panic in the callback is the abort of any `extern "C"` callback.
+pub fn app_call(thunk: unsafe extern "C" fn(*mut u8), data: *mut u8) -> bool {
+    let enter = APP_ENTER.load(Ordering::Acquire);
+    unsafe {
+        if enter == 0 {
+            thunk(data);
+            return true;
+        }
+        let e = END_CTX.with(|c| c.get() as *mut u64);
+        let saved = [*e, *e.add(1)];
+        let over = APP_CALL_OVER.with(|o| o.replace(*ctx_ptr()));
+        let place = app_caller();
+        let was = if place.is_null() { 0 } else { (*place).in_call.swap(*(tls_block() as *const u64) + 1, Ordering::AcqRel) };
+        let mut call = (thunk, data);
+        let enter: rt_fn_ty!(fn(u64, u64, *mut u64) -> u64) = std::mem::transmute(enter as usize);
+        let r = enter(app_call_body as *const () as usize as u64, &mut call as *mut _ as u64, e);
+        if !place.is_null() {
+            (*place).in_call.store(was, Ordering::Release);
+        }
+        APP_CALL_OVER.with(|o| o.set(over));
+        *e = saved[0];
+        *e.add(1) = saved[1];
+        if r == LEAVE_RUN_ENDED {
+            note_abandoned_frames(true);
+        }
+        r != LEAVE_RUN_ENDED
+    }
+}
+
+/// Runs a program thread's body `f(arg)`, Relax's ABI, under the thread's last recovery point. It
+/// comes back when the body returned or the run ended under the thread: its JIT frames are gone
+/// either way and it can leave through the native frames around it.
+pub(crate) fn run_thread_body(enter: u64, f: u64, arg: u64) {
+    let e = END_CTX.with(|c| c.get() as *mut u64);
+    let r = unsafe {
+        let enter: rt_fn_ty!(fn(u64, u64, *mut u64) -> u64) = std::mem::transmute(enter as usize);
+        let r = enter(f, arg, e);
+        *e = 0;
+        *e.add(1) = 0;
+        r
+    };
+    if r == LEAVE_RUN_ENDED {
+        note_abandoned_frames(false);
+    }
+}
+
+/// A fetch from the code of a run that ended, on this thread: it leaves for its nearest recovery
+/// point through that run's `leave`. No report, no policy, nothing of the program runs. A thread
+/// with none (native code called into the ended run) stays here for good: no frame of a caller this
+/// runtime does not know can be left, and the host must stop such a caller before a run ends. Its
+/// stack stays intact, the run's end names it as a thread that called in.
+unsafe fn end_on_fault(f: &os::fault::Fault, leave: u64) -> os::fault::Action {
+    let ctx = ctx_ptr();
+    let target = if *ctx != 0 && *ctx != APP_CALL_OVER.with(|o| o.get()) { ctx } else { END_CTX.with(|c| c.get() as *mut u64) };
+    if *target == 0 {
+        crate::domain::note_called_into_ended_run(f.pc);
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+    let limit = *target;
+    let _ = END_WALK.try_with(|w| {
+        let w = &mut *w.get();
+        // (where it stopped, when that is native code: a fault in a native call)
+        w.0[0] = f.pc;
+        let (mut fp, mut n) = (f.fp, 1);
+        while n < w.0.len() && fp & 7 == 0 && fp >= f.sp && fp + 16 <= limit {
+            w.0[n] = *((fp + 8) as *const u64);
+            n += 1;
+            let next = *(fp as *const u64);
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
+        w.1 = n;
+    });
+    os::fault::Action::Resume { pc: leave, a0: target as u64, a1: LEAVE_RUN_ENDED }
 }
 
 #[derive(Clone)]
@@ -2744,10 +2954,15 @@ pub(crate) fn leave_pending_panic() -> ! {
 
 /// Ends the run of the calling thread's `call_jit_in` without a panic report: it returns
 /// `Err(PanicInfo { kind, message })` to its caller (a domain's `process::exit`, domain.rs). The
-/// frames in between run no cleanups. A thread with no recovery point (native code called into
-/// JIT code) cannot leave: it parks for good.
+/// frames in between run no cleanups. A program thread with no `call_jit_in` left goes to its last
+/// point (`run_thread_body`). A thread with neither (native code called into JIT code) cannot
+/// leave: it parks for good.
 pub(crate) fn leave_thread(kind: &str, message: String) -> ! {
-    if unsafe { *ctx_ptr() } == 0 {
+    let mut ctx = ctx_ptr();
+    if unsafe { *ctx } == 0 {
+        ctx = END_CTX.with(|c| c.get() as *mut u64);
+    }
+    if unsafe { *ctx } == 0 {
         loop {
             std::thread::park();
         }
@@ -2758,7 +2973,7 @@ pub(crate) fn leave_thread(kind: &str, message: String) -> ! {
     UNWINDING.with(|c| c.set(false));
     unsafe {
         let leave: rt_fn_ty!(fn(*mut u64, u64) -> !) = std::mem::transmute((&*cur_unit()).leave as usize);
-        leave(ctx_ptr(), 1)
+        leave(ctx, 1)
     }
 }
 
@@ -3248,6 +3463,8 @@ pub(crate) fn rt_thread_run(entry: u64, arg: u64) -> u64 {
         Ok(_) => 0,
         // `process::exit` on a thread of an app domain: it ended the domain (domain.rs), this thread ends quietly
         Err(p) if p.kind == crate::domain::EXIT_KIND => 0,
+        // the run ended: the code this returns to faults, on to the next recovery point
+        Err(p) if p.kind == RUN_ENDED_KIND => 0,
         Err(p) => {
             let r = owner::call(owner::Class::Job, || unsafe { (&*u).report(&p) });
             fatal_compile_error(&p, &r);
@@ -3271,6 +3488,8 @@ pub(crate) fn rt_catch_panic(f: u64, data: u64) -> u64 {
         // does not stop it, it leaves for the next recovery point out to the thread's start
         // (the exiting thread of a rustc build never comes back either)
         Err(p) if p.kind == crate::domain::EXIT_KIND => leave_thread(crate::domain::EXIT_KIND, p.message),
+        // the run ended: the code this returns to faults, on to the next recovery point
+        Err(p) if p.kind == RUN_ENDED_KIND => 1,
         Err(p) => {
             let r = owner::call(owner::Class::Job, || unsafe { (&*u).report(&p) });
             fatal_compile_error(&p, &r);
@@ -3315,6 +3534,12 @@ fn rt_compile_global(g: u64) -> u64 {
 /// rt_compile for the unit at `up`.
 fn rt_compile_in(up: usize, slot: u64) -> u64 {
     let _keep = os::proc::KeepLastError::new();
+    // the run ended: nothing to build, the stub's jump to this address ends the thread
+    unsafe {
+        if (&*(up as *mut Unit)).code_ended.load(Ordering::Acquire) {
+            return (&*(up as *mut Unit)).glue_end;
+        }
+    }
     if in_thread_exit() && !owner::is_owner() {
         return owner::call(owner::Class::Program, || unsafe { compile_slot(up as *mut Unit, slot as u32) });
     }
@@ -3527,6 +3752,17 @@ unsafe fn on_fault_locked(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os:
         }
         record_fault(f, 3);
         return Action::Resume { pc: (*cur_unit()).leave, a0: ctx_ptr() as u64, a1: 3 };
+    }
+    // the code of a run that ended: told by the address alone, whichever unit is current now
+    if matches!(f.kind, Kind::Segv | Kind::Bus) {
+        if let Some(leave) = crate::stale::run_end_leave(pc) {
+            return end_on_fault(f, leave);
+        }
+    }
+    // any other fault on a thread of a run that is ending (a native call it was in, with what it was
+    // given): the thread ends here, the frames it leaves are named on the ledger
+    if crate::domain::current_is_ending() {
+        return end_on_fault(f, APP_LEAVE.load(Ordering::Acquire));
     }
     let jit = in_jit_code(pc);
     let has_unit = !cur_unit().is_null();
@@ -4132,6 +4368,10 @@ impl Unit {
             lazy_entry: 0,
             enter: 0,
             leave: 0,
+            glue_end: 0,
+            code_ended: AtomicBool::new(false),
+            #[cfg(windows)]
+            end_event: unsafe { os::win32::CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) },
             code_next: AtomicU64::new(misc),
             veneers: Default::default(),
             code_groups: Default::default(),
@@ -4192,6 +4432,10 @@ impl Unit {
             let (el, leave_off) = x64::enter_leave();
             u.enter = u.emit_glue(&el, "relax::enter_leave", x64::ENTER_FRAME);
             u.leave = u.enter + leave_off as u64;
+            // the entry glue has its pages to itself: they outlive the run's code (`end_code`)
+            let page = os::mem::page_size();
+            u.glue_end = (u.code_next.load(Ordering::Relaxed) + page - 1) & !(page - 1);
+            u.code_next.store(u.glue_end, Ordering::Relaxed);
         }
         let ps = panic_tramp(rt_panic_site as *const () as usize as u64);
         let pb = panic_tramp(rt_panic_bounds as *const () as usize as u64);
@@ -7691,6 +7935,10 @@ unsafe fn call_jit_inner(u: *mut Unit, entry: u64, arg: u64) -> Result<u64, Pani
     let r = enter(entry, arg, ctx);
     *ctx = saved_ctx[0];
     *ctx.add(1) = saved_ctx[1];
+    if r == LEAVE_RUN_ENDED {
+        note_abandoned_frames(false);
+        return Err(PanicInfo { kind: RUN_ENDED_KIND.to_string(), message: String::new(), site: u64::MAX, frames: Vec::new(), fault_addr: 0, location: String::new() });
+    }
     if r != 0 {
         // a fault or watchdog hang the handler contained: its report and policy run here
         materialize_fault();
@@ -15037,8 +15285,35 @@ fn sampler_thread() {
 /// The unit is going away (end of `makepad test` / run): the background O3 and sampler
 /// threads must not touch it again. They take the unit lock for every access to it, so
 /// holding the lock from here on (never released: the process is ending) stops them.
+impl Unit {
+    /// Ends the run's code: nothing executes it from here on, so every thread in it leaves at its
+    /// next instruction (`end_on_fault`, whichever native call it is in now returns first). Compiles
+    /// in flight finish and their code is never reached. Its addresses are never reused. The flag
+    /// goes up only once the code no longer executes: a lazy call that sees it jumps into that code
+    /// to fault there, and until the flip is done that address would run. One caller, once.
+    pub(crate) fn end_code(&self) {
+        if self.glue_end == 0 || self.code_ended.load(Ordering::Acquire) {
+            return;
+        }
+        let page = os::mem::page_size();
+        let hi = (self.exec_base + self.exec_size - os::mem::CODE_TAIL) & !(page - 1);
+        // (its entry glue is of the ended run too, it just keeps running)
+        crate::stale::register_run_end(self.exec_base, hi, format!("unit {:#x}", self.exec_base), self.leave);
+        os::mem::end_code(self.glue_end, (hi - self.glue_end) as usize);
+        self.code_ended.store(true, Ordering::Release);
+        #[cfg(windows)]
+        unsafe {
+            os::win32::SetEvent(self.end_event);
+        }
+    }
+}
+
 impl Drop for Unit {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        unsafe {
+            os::win32::CloseHandle(self.end_event);
+        }
         crate::domain::forget_tls_keys(self.syms.dom0());
         if !self.retired {
             crate::borrowck::lazy::stop();
@@ -15079,6 +15354,11 @@ impl Drop for Unit {
                     }
                 });
             }
+        }
+        // A unit that never tiered has no tier thread or sampler on it, and may still be the
+        // runtime's: a thread that starts later must not read a freed one.
+        if self.tier1.is_none() && unsafe { UNIT } == me {
+            unsafe { UNIT = std::ptr::null_mut() };
         }
         // a retired unit's code and data go with it (nothing calls into it any more); the
         // program's own unit lives to process exit
@@ -21395,11 +21675,10 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"exit" => Some(recorded_exit as *const () as usize),
         #[cfg(unix)]
         b"fork" => Some(relax_fork as *const () as usize),
-        // glibc keeps pthread_atfork in libc_nonshared.a (a static wrapper of __register_atfork that
-        // every C program links): dlsym never finds it, so the loader's own linked copy answers
-        // (rand 0.8's ReseedingRng registers its fork handler at its first use)
-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        b"pthread_atfork" => Some(host_pthread_atfork as *const () as usize),
+        // the loader keeps these itself (rand 0.8's ReseedingRng registers its fork handler at its
+        // first use): libc would call them after the run's end
+        #[cfg(unix)]
+        b"pthread_atfork" => Some(crate::domain_res::pthread_atfork as *const () as usize),
         // (the C library's atexit is there too; and a handler in its list would run after this
         // thread's locals are gone, where a lazy compile of it cannot run: makepad-remote's cleanup)
         b"atexit" => Some(os::proc::program_atexit as *const () as usize),
@@ -21472,15 +21751,12 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         // the domain a thread runs in (domain.rs): a thread std starts inherits its parent's
         b"__relax_domain_base" => Some(crate::domain::relax_domain_base as *const () as usize),
         b"__relax_domain_id" => Some(crate::domain::relax_domain_id as *const () as usize),
-        b"__relax_domain_enter" => Some(crate::domain::relax_domain_enter as *const () as usize),
-        b"__relax_domain_reserve" => Some(crate::domain::relax_domain_reserve as *const () as usize),
-        b"__relax_domain_failed" => Some(crate::domain::thread_finished as *const () as usize),
+        b"__relax_thread_spawn" => Some(crate::domain_threads::spawn as *const () as usize),
         b"__relax_domain_name" => Some(crate::domain::relax_domain_name as *const () as usize),
         b"__relax_test_inherit" => Some(crate::harness::reach::inherit as *const () as usize),
         b"__relax_test_adopt" => Some(crate::harness::reach::adopt as *const () as usize),
         b"__relax_test_cancel" => Some(crate::harness::reach::cancel as *const () as usize),
         b"__relax_tls_fixed" => Some(os::tls::relax_tls_fixed as *const () as usize),
-        b"__relax_on_program_stack" => Some(relax_on_program_stack as *const () as usize),
         b"__relax_sstack" => Some(crate::sstack::relax_sstack as *const () as usize),
         b"__relax_sstack_grow" => Some(crate::sstack::relax_sstack_grow as *const () as usize),
         b"__relax_sstack_trim" => Some(crate::sstack::relax_sstack_trim as *const () as usize),
@@ -21664,7 +21940,28 @@ fn lookup_interposer(link: &str) -> Option<u64> {
         "dlsym" => Some(relax_dlsym as *const () as usize as u64),
         #[cfg(windows)]
         "GetProcAddress" => Some(relax_get_proc_address as *const () as usize as u64),
-        _ => None,
+        // threads the program starts itself are the run's as well (domain_threads.rs)
+        #[cfg(unix)]
+        "pthread_create" => Some(crate::domain_threads::pthread_create as *const () as usize as u64),
+        #[cfg(windows)]
+        "CreateThread" => Some(crate::domain_threads::create_thread as *const () as usize as u64),
+        // the waits a run's end has to reach there
+        #[cfg(windows)]
+        "WaitOnAddress" => Some(crate::domain_threads::waits::wait_on_address as *const () as usize as u64),
+        #[cfg(windows)]
+        "WaitForSingleObject" => Some(crate::domain_threads::waits::wait_for_single_object as *const () as usize as u64),
+        #[cfg(windows)]
+        "WaitForSingleObjectEx" => Some(crate::domain_threads::waits::wait_for_single_object_ex as *const () as usize as u64),
+        #[cfg(windows)]
+        "WaitForMultipleObjects" => Some(crate::domain_threads::waits::wait_for_multiple_objects as *const () as usize as u64),
+        #[cfg(windows)]
+        "WaitForMultipleObjectsEx" => Some(crate::domain_threads::waits::wait_for_multiple_objects_ex as *const () as usize as u64),
+        #[cfg(windows)]
+        "Sleep" => Some(crate::domain_threads::waits::sleep as *const () as usize as u64),
+        #[cfg(windows)]
+        "SleepEx" => Some(crate::domain_threads::waits::sleep_ex as *const () as usize as u64),
+        // what a run opens, so that its end gives it back
+        _ => crate::domain_res::interposer(link),
     }
 }
 
@@ -21684,6 +21981,9 @@ extern "C" fn relax_dlsym(handle: *mut u8, name: *const u8) -> *mut u8 {
     crate::jit::host_boundary("relax_dlsym", move || {
         if !name.is_null() {
             let n = unsafe { std::ffi::CStr::from_ptr(name as *const std::ffi::c_char) }.to_bytes();
+            if let Some(a) = std::str::from_utf8(n).ok().and_then(lookup_interposer) {
+                return a as *mut u8;
+            }
             if let Some(a) = loader_symbol(n) {
                 return a as *mut u8;
             }
