@@ -666,15 +666,22 @@ pub fn release(permit: u32) { global().release(permit); }
 #[relax_api]
 pub fn reclass(permit: u32, class: u8) { global().reclass(permit, class); }
 /// `Budget::lend`, for the JIT: a thread asleep on JIT work or a program lock keeps no token.
+/// Waits nest (a thread in a futex wait's entry compiles the futex call and waits for that build, a
+/// job back from a wait holds for a pause under the wait's own guard): the outermost lends, the
+/// inner ones count. True: a `take_back` ends this one.
 pub fn lend() -> bool {
     if !ADMITTED.with(Cell::get) { return false; }
-    let lent = global().lend();
-    LENT.with(|flag| flag.set(lent));
+    let lends = LENDS.with(Cell::get);
+    let lent = lends > 0 || global().lend();
+    LENDS.with(|count| count.set(lends + u32::from(lent)));
     lent
 }
-/// `Budget::take_back`.
+/// `Budget::take_back`, when the outermost `lend` ends.
 pub fn take_back() {
-    if LENT.with(|flag| flag.replace(false)) { global().take_back(); }
+    let lends = LENDS.with(Cell::get);
+    if lends == 0 { return; }
+    LENDS.with(|count| count.set(lends - 1));
+    if lends == 1 { global().take_back(); }
 }
 /// `Budget::lend_permit`.
 pub fn lend_permit(permit: u32) { global().lend_permit(permit); }
@@ -746,8 +753,8 @@ thread_local! {
     static THREAD_CLASS: Cell<Option<u8>> = const { Cell::new(None) };
     /// this thread was admitted once: a thread that never was skips the budget's lock when it sleeps
     static ADMITTED: Cell<bool> = const { Cell::new(false) };
-    /// this thread's tokens are lent
-    static LENT: Cell<bool> = const { Cell::new(false) };
+    /// the lends in progress on this thread: above 0 its tokens are lent
+    static LENDS: Cell<u32> = const { Cell::new(0) };
     /// set_ui_thread's thread: its OS class stays the UI's
     static UI_THREAD: Cell<bool> = const { Cell::new(false) };
 }
