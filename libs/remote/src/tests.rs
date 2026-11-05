@@ -295,6 +295,27 @@ pub(crate) fn shared() -> &'static (Endpoint, crate::watch::WatchSink) {
     })
 }
 
+/// A handler that waits long can see that its client has gone.
+#[test]
+fn a_request_sees_its_client_go() {
+    let ep = Endpoint::new("makepad-remote-client-gone");
+    let (told, gone) = std::sync::mpsc::channel();
+    let told = std::sync::Mutex::new(told);
+    ep.register("slow", 1, crate::lines::service("slow", std::sync::Arc::new(move |_, _| {
+        while !crate::lines::client_gone() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        told.lock().unwrap().send(()).unwrap();
+    })));
+    let conn = pair(&ep);
+    let ch = conn.open("slow", "").unwrap();
+    ch.send(b"wait\n".to_vec()).unwrap();
+    assert!(gone.recv_timeout(Duration::from_millis(100)).is_err(), "the client is still there");
+    conn.close("client ended");
+    gone.recv_timeout(WAIT).unwrap();
+    assert!(!crate::lines::client_gone(), "no request on this thread");
+}
+
 /// A late follower gets what came before it only when it asks from there, and once.
 #[test]
 fn a_feed_from_a_record_gets_what_came_before_it() {
