@@ -97,7 +97,7 @@ fn run(up: *mut Unit, root: u32, main: Option<DefId>) {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
-    let (t0, w0) = (relax_backend::cpu_ns(), jit::wall_ns());
+    let (t0, w0) = (relax_session::clock::cpu_ns(), jit::wall_ns());
     let f = unsafe { (*up).front.clone() };
     // the crates' skipped files read here, the keys made on the owner (the cache is the owner's)
     let n = { let r = jit::front_read("typeck bg crates"); r.of(&f).0.crates.len() as u32 };
@@ -164,7 +164,7 @@ fn run(up: *mut Unit, root: u32, main: Option<DefId>) {
 }
 
 fn finish(t0: u64, w0: u64) {
-    STATS[3].store(relax_backend::cpu_ns() - t0, Ordering::Relaxed);
+    STATS[3].store(relax_session::clock::cpu_ns() - t0, Ordering::Relaxed);
     STATS[4].store((jit::wall_ns() - w0).max(1), Ordering::Relaxed);
     if crate::run::VERBOSE.load(Ordering::Relaxed) {
         eprintln!("makepad-run: background type check done: {} body owners checked, {} with errors, {} crates' clean verdicts stored, cpu {:.0} ms over {:.1} s",

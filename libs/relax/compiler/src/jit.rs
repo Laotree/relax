@@ -808,7 +808,7 @@ impl CodeTables {
 
 // ------------------------------------------------------------ OS memory
 
-use relax_backend::cpu_ns;
+use relax_session::clock::cpu_ns;
 pub use crate::clock::wall_ns;
 
 /// Lowering runs on `&Unit` (phase B2): every Unit state it changes is behind interior
@@ -13213,12 +13213,12 @@ impl CoroTrace {
         let (depth, child) = CORO_TRACE.with(|c| c.get());
         CORO_TRACE.with(|c| c.set((depth + 1, child)));
         let parent = match &u.fns[id as usize].key { FnKey::Closure(_, _, p) => u.fns[*p as usize].name.to_string(), _ => String::new() };
-        Some(CoroTrace { t0: relax_backend::cpu_ns(), child0: child, depth, name: format!("{} in {}", u.fns[id as usize].name, parent) })
+        Some(CoroTrace { t0: relax_session::clock::cpu_ns(), child0: child, depth, name: format!("{} in {}", u.fns[id as usize].name, parent) })
     }
 }
 impl Drop for CoroTrace {
     fn drop(&mut self) {
-        let incl = relax_backend::cpu_ns() - self.t0;
+        let incl = relax_session::clock::cpu_ns() - self.t0;
         let (_, child) = CORO_TRACE.with(|c| c.get());
         let excl = incl.saturating_sub(child - self.child0);
         CORO_TRACE.with(|c| c.set((self.depth, self.child0 + incl)));

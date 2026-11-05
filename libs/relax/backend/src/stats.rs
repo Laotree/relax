@@ -32,7 +32,7 @@ pub fn pass_clock() -> u64 {
             static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
             T0.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64 + 1
         } else {
-            crate::cpu_ns()
+            relax_session::clock::cpu_ns()
         }
     } else {
         0

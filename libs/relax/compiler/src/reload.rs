@@ -89,7 +89,7 @@ fn trace_stage(name: &'static str) {
             *s.stages.entry(name).or_default() += (now - last).as_secs_f64() * 1000.;
             s.last = Some(now);
             s.sub_last = Some(now);
-            let cpu = relax_backend::cpu_ns();
+            let cpu = relax_session::clock::cpu_ns();
             let elapsed = cpu.saturating_sub(s.cpu_last) as f64 / 1e6;
             *s.cpu.entry(name).or_default() += elapsed;
             s.cpu_last = cpu;
@@ -137,7 +137,7 @@ impl TraceTransaction {
         if reload_trace() {
             let now = Instant::now();
             let (watch, look, read, scanned) = TRACE_INPUT.with(|s| s.replace((0.0, 0.0, 0.0, 0)));
-            let mut state = ReloadTrace { started: Some(now), last: Some(now), cpu_last: relax_backend::cpu_ns(), ..Default::default() };
+            let mut state = ReloadTrace { started: Some(now), last: Some(now), cpu_last: relax_session::clock::cpu_ns(), ..Default::default() };
             state.stages.insert("watch", watch);
             state.subs.insert("look", look);
             state.stages.insert("read", read);

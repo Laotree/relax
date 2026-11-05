@@ -110,6 +110,7 @@ pub mod postframe;
 mod nounwind;
 pub mod os;
 pub mod lower;
+pub mod simd;
 pub mod cabi;
 pub use relax_types::*;
 // This crate's own source stamp (build.rs, libs/relax/self_stamp.rs), the codegen identity's

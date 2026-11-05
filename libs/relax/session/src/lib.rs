@@ -1,4 +1,5 @@
 //! Compilation inputs shared by every compiler layer.
+pub mod clock;
 pub mod options;
 pub mod phase;
 pub mod sip;

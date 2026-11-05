@@ -66,7 +66,6 @@ pub mod zone_alloc;
 pub mod clock;
 pub mod relaxed;
 pub mod srchash;
-pub mod simd;
 pub mod thread_local_mac;
 pub mod tokbuf;
 pub mod cfg;

@@ -1641,7 +1641,7 @@ impl Cache {
             }
         }
         if !self.def_maps.contains_key(&c) {
-            let t0 = relax_backend::cpu_ns();
+            let t0 = relax_session::clock::cpu_ns();
             if self.crate_defs.is_empty() {
                 let mut by = vec![Vec::new(); u.prog.crates.len()];
                 for i in 0..u.prog.defs.len() {
@@ -1667,7 +1667,7 @@ impl Cache {
                 self.stats.def_collisions += 1;
             }
             if self.verbose && trace_on() {
-                eprintln!("makepad-run cache: def map of crate {} ({} defs) in {:.2} ms", u.prog.syms.str(u.prog.crates[c as usize].name), m.len(), (relax_backend::cpu_ns() - t0) as f64 / 1e6);
+                eprintln!("makepad-run cache: def map of crate {} ({} defs) in {:.2} ms", u.prog.syms.str(u.prog.crates[c as usize].name), m.len(), (relax_session::clock::cpu_ns() - t0) as f64 / 1e6);
             }
             self.def_maps.insert(c, m);
         }
@@ -2619,7 +2619,7 @@ impl Cache {
         if let Some(&k) = self.def_bodies.get(&d) {
             return k;
         }
-        let t0 = relax_backend::cpu_ns();
+        let t0 = relax_session::clock::cpu_ns();
         let def = u.prog.def(d);
         let f = def.file as usize;
         let mut h = Sip128::new();
@@ -2638,7 +2638,7 @@ impl Cache {
         }
         let k = h.finish128();
         self.def_bodies.insert(d, k);
-        self.stats.body_ns += relax_backend::cpu_ns() - t0;
+        self.stats.body_ns += relax_session::clock::cpu_ns() - t0;
         k
     }
 
@@ -3281,9 +3281,9 @@ impl Cache {
     /// now. The entry links only while each still has that key (its body, position and
     /// interface unchanged). None: one has no key (the entry cannot be stored).
     fn cert_bytes(&mut self, u: &Unit, deps: &[u32]) -> Option<Vec<u8>> {
-        let t0 = relax_backend::cpu_ns();
+        let t0 = relax_session::clock::cpu_ns();
         let r = self.cert_bytes_inner(u, deps);
-        self.stats.cert_write_ns += relax_backend::cpu_ns() - t0;
+        self.stats.cert_write_ns += relax_session::clock::cpu_ns() - t0;
         r
     }
 
@@ -8378,18 +8378,18 @@ impl Linker {
         let pack = self.cache().stores[p as usize].clone();
         let (kind, payload) = pack.get_checked_at(i as usize, key)?;
         if kind != KIND_CODE || payload.is_empty() { return None; }
-        let t0 = relax_backend::cpu_ns();
+        let t0 = relax_session::clock::cpu_ns();
         let r = self.cert_valid_inner(u, payload);
-        self.cache().stats.cert_check_ns += relax_backend::cpu_ns() - t0;
+        self.cache().stats.cert_check_ns += relax_session::clock::cpu_ns() - t0;
         r
     }
 
     /// Whether every slot a code entry's certificate names still has the recorded key. None:
     /// the payload does not decode.
     fn cert_valid(&mut self, u: &mut Unit, payload: &[u8]) -> Option<bool> {
-        let t0 = relax_backend::cpu_ns();
+        let t0 = relax_session::clock::cpu_ns();
         let r = self.cert_valid_inner(u, payload);
-        self.cache().stats.cert_check_ns += relax_backend::cpu_ns() - t0;
+        self.cache().stats.cert_check_ns += relax_session::clock::cpu_ns() - t0;
         r
     }
 

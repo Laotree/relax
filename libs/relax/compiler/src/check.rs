@@ -229,7 +229,7 @@ impl BodyCheck {
     fn check(&self, d: crate::program::DefId, impl_check: bool) -> Option<Vec<String>> {
         struct Cpu<'a>(&'a std::sync::atomic::AtomicU64, u64);
         impl Drop for Cpu<'_> {
-            fn drop(&mut self) { self.0.fetch_add(relax_backend::cpu_ns() - self.1, std::sync::atomic::Ordering::Relaxed); }
+            fn drop(&mut self) { self.0.fetch_add(relax_session::clock::cpu_ns() - self.1, std::sync::atomic::Ordering::Relaxed); }
         }
         let ice = |prog: &crate::program::Program, d: crate::program::DefId| -> Option<Vec<String>> {
             let def = prog.def(d);
@@ -238,7 +238,7 @@ impl BodyCheck {
         };
         let retry = |p: &(dyn std::any::Any + Send)| crate::preempt::is_preempted(p) || p.is::<crate::preempt::NeedsLoad>() || p.is::<crate::preempt::OwnerBusy>();
         let (strict, beside) = (self.strict, self.beside);
-        let _cpu = strict.then(|| Cpu(&self.cpu, relax_backend::cpu_ns()));
+        let _cpu = strict.then(|| Cpu(&self.cpu, relax_session::clock::cpu_ns()));
         let _quiet = strict.then(crate::lint::Suppress::new);
         let uu = unsafe { &*(self.upn as *const Unit) };
         let mut tries = 0;
@@ -459,7 +459,7 @@ pub fn start_test_deps(up: *mut Unit, select: impl FnOnce(&crate::program::Progr
     let worker = crate::run_threads::spawn_sized("test-deps-check", 256 << 20, move || {
         let _z = crate::zone_alloc::compiler_thread();
         makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
-        let (t0, cpu0) = (jit::wall_ns(), relax_backend::cpu_ns());
+        let (t0, cpu0) = (jit::wall_ns(), relax_session::clock::cpu_ns());
         let up = upn as *mut Unit;
         let front = unsafe { (*up).front.clone() };
         // per crate: its own text (the boot's files) and its dependency closure
@@ -502,7 +502,7 @@ pub fn start_test_deps(up: *mut Unit, select: impl FnOnce(&crate::program::Progr
         TestDepsResult {
             errors: crate::zone_alloc::kept_clone(&checked.errors), names,
             selected: crates.len(), stored, owners: count,
-            cpu_ns: checked.cpu_ns + relax_backend::cpu_ns() - cpu0, wall_ns: jit::wall_ns() - t0,
+            cpu_ns: checked.cpu_ns + relax_session::clock::cpu_ns() - cpu0, wall_ns: jit::wall_ns() - t0,
         }
     }).expect("test dependency check thread");
     assert!(TEST_DEPS.set(TestDeps { worker: relax_session::sync::Mutex::new(Some(worker)), failed: std::sync::OnceLock::new() }).is_ok(), "test dependency check already started");

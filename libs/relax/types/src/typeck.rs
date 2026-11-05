@@ -626,7 +626,7 @@ pub(crate) fn try_instantiate_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, 
             }
         }));
     let _cost_typeck = relax_codegen::fncost::phase(1);
-    let cost_start = if relax_codegen::fncost::enabled() { (relax_codegen::fncost::mono(), relax_backend::cpu_ns()) } else { (0, 0) };
+    let cost_start = if relax_codegen::fncost::enabled() { (relax_codegen::fncost::mono(), relax_session::clock::cpu_ns()) } else { (0, 0) };
     let _mem = crate::memstat::tag(crate::memstat::Tag::Typeck);
     let body = tcx.typeck(prog, def);
     // Analysis uses the supplied environment; codegen supplies a monomorphic one.
@@ -645,7 +645,7 @@ pub(crate) fn check_fn(prog: &Program, tcx: &Tcx, def: DefId) -> Body {
     let cx = crate::tcx::EvalCx::new(prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
     static ST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let st = *ST.get_or_init(|| std::env::var("MAKEPAD_RUN_TYSTATS").is_ok());
-    let t0 = if st { relax_backend::cpu_ns() } else { 0 };
+    let t0 = if st { relax_session::clock::cpu_ns() } else { 0 };
     thread_local! { static NEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
     let child0 = if st { NEST.with(|c| c.get()) } else { 0 };
     let _warm = relax_codegen::warm::enabled().then(|| relax_codegen::warm::Scope::body(def.0, &args.iter().map(|t| t.0).collect::<Vec<_>>(), crate::clock::TYS_ORIGIN.with(|o| o.get()) == "gandalf", || {
@@ -654,7 +654,7 @@ pub(crate) fn check_fn(prog: &Program, tcx: &Tcx, def: DefId) -> Body {
     }));
     let b = check_fn_body(&cx, prog, tcx, def, &args);
     if st {
-        let incl = relax_backend::cpu_ns() - t0;
+        let incl = relax_session::clock::cpu_ns() - t0;
         let excl = incl.saturating_sub(NEST.with(|c| c.get()) - child0);
         NEST.with(|c| c.set(child0 + incl));
         eprintln!("TYS\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{:.0}", def.0, args.len(), incl, b.expr_ty.len(), prog.def_path(def), args.iter().map(|a| a.0).collect::<Vec<u32>>(), crate::clock::TYS_ORIGIN.with(|o| o.get()),

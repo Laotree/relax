@@ -1,4 +1,4 @@
-//! The front end's process-wide monotonic wall clock (thread CPU time is relax_backend::cpu_ns,
+//! The front end's process-wide monotonic wall clock (thread CPU time is relax_session::clock::cpu_ns,
 //! shared with the optimiser so build and pass totals use one calibration).
 
 /// Wall time in ns since the first call of it in this process.
