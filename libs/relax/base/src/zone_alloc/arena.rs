@@ -2476,7 +2476,17 @@ pub fn heap_check_on() -> bool {
                 }
                 !getenv(c"MAKEPAD_RUN_HEAP_CHECK".as_ptr().cast()).is_null()
             };
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            let on = unsafe {
+                use relax_session::win32::{GetEnvironmentVariableW, GetLastError, SetLastError};
+                // Presence enables the check, including an empty value, just like getenv.
+                // Stay allocation-free: this is called while creating an allocator.
+                let name = b"MAKEPAD_RUN_HEAP_CHECK\0".map(u16::from);
+                let mut value = 0u16;
+                SetLastError(0);
+                GetEnvironmentVariableW(name.as_ptr(), &mut value, 1) != 0 || GetLastError() == 0
+            };
+            #[cfg(not(any(unix, windows)))]
             let on = false;
             HEAP_CHECK.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
@@ -2487,7 +2497,7 @@ pub fn heap_check_on() -> bool {
 /// The live-bit map of one program heap: RESERVE / 16 bits, mapped readable and writable (the OS
 /// backs only the pages that are touched). 0 when the mapping is refused (the check stays off).
 fn os_bits_map() -> usize {
-    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
     unsafe {
         let b = os::reserve(RESERVE / 128, GRANULE, c"makepad-run heap check");
         if b != 0 && !os::commit(b as *mut u8, RESERVE / 128) {
@@ -2496,11 +2506,11 @@ fn os_bits_map() -> usize {
         }
         b
     }
-    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows)))]
     0
 }
 
-/// A MAKEPAD_RUN_HEAP_CHECK failure: one line with `write(2)` (no allocation: this runs inside
+/// A MAKEPAD_RUN_HEAP_CHECK failure: one line on stderr (no allocation: this runs inside
 /// the allocator, under its locks), then abort.
 #[cold]
 #[inline(never)]
@@ -2549,6 +2559,12 @@ fn heap_check_fail(what: &[u8], p: usize, index: usize, stride: usize) -> ! {
         }
         write(2, buf.as_ptr().cast(), n);
         abort();
+    }
+    #[cfg(windows)]
+    unsafe {
+        use relax_session::win32::{GetStdHandle, WriteFile};
+        let mut done = 0u32;
+        WriteFile(GetStdHandle(-12i32 as u32), buf.as_ptr(), n as u32, &mut done, std::ptr::null_mut());
     }
     #[cfg(not(unix))]
     {
