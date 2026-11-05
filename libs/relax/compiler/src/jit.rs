@@ -7935,6 +7935,14 @@ unsafe fn call_jit_inner(u: *mut Unit, entry: u64, arg: u64) -> Result<u64, Pani
     let ctx = ctx_ptr();
     let saved_ctx = [*ctx, *ctx.add(1)];
     let enter: rt_fn_ty!(fn(u64, u64, *mut u64) -> u64) = std::mem::transmute((&*u).enter as usize);
+    // Hosted under the JIT, `catch_unwind` is the outer runtime's recovery point: only its return
+    // puts the thread's outer recovery context back. A panic of the code `enter` runs leaves
+    // through `Unit::leave`, past its runtime entry's `host_boundary`, so that context stays on
+    // frames the jump cut away and the next panic of this crate's own code lands there (pc 0).
+    // This recovery point returns normally after any such jump, which puts the context back.
+    #[cfg(relax)]
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| enter(entry, arg, ctx))).unwrap_or_else(|p| std::panic::resume_unwind(p));
+    #[cfg(not(relax))]
     let r = enter(entry, arg, ctx);
     *ctx = saved_ctx[0];
     *ctx.add(1) = saved_ctx[1];
