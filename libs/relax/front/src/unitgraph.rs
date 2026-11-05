@@ -1239,16 +1239,20 @@ fn platform_answer(sess: &std::sync::Arc<crate::Session>, out_dir: &str) -> Resu
 #[cfg(test)]
 mod platform_script_tests {
     use super::platform_gen;
-    use std::path::Path;
     use std::process::Command;
 
     /// platform/build.rs, compiled and run for real, writes the bytes `makepad run` answers with
     /// natively (both call platform/build_gen.rs): app_meta_gen.rs, app_icon_gen.rs and the cfg lines.
+    /// The script is this crate's build input, not a file read beside its sources: under the JIT
+    /// those are a virtual tree, and rustc, another process, reads only files on disk.
     #[test]
     fn native_answer_is_byte_identical_to_the_build_script() {
-        let platform = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../platform");
         let tmp = std::env::temp_dir().join(format!("relax-platform-script-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
+        let platform = tmp.join("platform");
+        std::fs::create_dir_all(&platform).unwrap();
+        std::fs::write(platform.join("build.rs"), include_str!("../../../../platform/build.rs")).unwrap();
+        std::fs::write(platform.join("build_gen.rs"), include_str!("../../../../platform/build_gen.rs")).unwrap();
         let root = tmp.join("some app");
         std::fs::create_dir_all(root.join("resources")).unwrap();
         std::fs::write(root.join("resources/icon_64.png"), b"png").unwrap();
