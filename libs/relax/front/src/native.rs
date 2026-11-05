@@ -3,7 +3,7 @@
 //! Without the flag nothing native from a third party runs. With it, the packages whose build
 //! script compiles or links native code (`links =`, a build-dependency on cc / cmake / pkg-config /
 //! bindgen / vcpkg, or a script that reads `DEP_*` metadata of those) are built by cargo itself, so
-//! their build scripts run verbatim: `cargo check --release -p <package> --message-format=json`
+//! their build scripts run verbatim: `cargo check --release --locked -p <package> --message-format=json`
 //! in the run's workspace, same Cargo.lock, same cargo flags. Cargo's `RUSTC_WRAPPER` is this
 //! executable (`wrapper`): it compiles with the real rustc only what the native scripts need (the
 //! scripts of the native packages and their build-dependency closure) and answers every other
@@ -16,7 +16,7 @@
 //! which the run loads by path before the program starts.
 //!
 //! The cargo step and the link are cached under `<relax dir>/native/<key>/`: the key covers the
-//! cargo flags, Cargo.lock, the native packages (versions, features, sources), the C compiler and
+//! cargo flags, the resolved packages (versions, features, sources), the C compiler and
 //! the target. A run with an unchanged key starts no cargo.
 //!
 //! Two tiers, as for the Rust code: the first build compiles the C at opt-level 0 (a cold start
@@ -107,7 +107,7 @@ fn hash_dir(dir: &std::path::Path, h: &mut u64) {
     for e in entries {
         let n = e.file_name();
         let n = n.to_string_lossy();
-        if n == "target" || n == ".git" {
+        if n == "target" || n == ".git" || n == "Cargo.lock" {
             continue;
         }
         let p = e.path();
@@ -124,16 +124,18 @@ fn hash_dir(dir: &std::path::Path, h: &mut u64) {
     }
 }
 
-fn lockfile(workspace: &str) -> Vec<u8> {
-    let mut p = std::path::Path::new(workspace).to_path_buf();
-    loop {
-        if let Ok(d) = std::fs::read(p.join("Cargo.lock")) {
-            return d;
-        }
-        if !p.pop() {
-            return Vec::new();
-        }
-    }
+/// The resolved package identities and feature sets, independent of lockfile formatting,
+/// unused patches, and the traversal order of Cargo's units. Include build dependencies.
+fn resolved_packages_key(raw: &[crate::unitgraph::RawUnit]) -> u64 {
+    let mut packages: Vec<_> = raw.iter().map(|unit| {
+        let mut features = unit.features.clone();
+        features.sort();
+        features.dedup();
+        (unit.pkg.clone(), features)
+    }).collect();
+    packages.sort();
+    packages.dedup();
+    fnv(format!("{packages:?}").as_bytes(), 0xcbf29ce484222325)
 }
 
 fn cc() -> String {
@@ -180,7 +182,7 @@ pub fn build(g: &Graph, seeds: &[usize], req: &Request) -> Result<Built, String>
     let flags: Vec<&String> = req.cargo_flags.iter().filter(|f| f.as_str() != "--release").collect();
 
     // ---- the key
-    let mut h = fnv(b"native-link-v9", 0xcbf29ce484222325);
+    let mut h = fnv(b"native-link-v10", 0xcbf29ce484222325);
     h = fnv(req.triple.as_bytes(), h);
     h = fnv(&selection_key(&script_pkgs, &lib_pkgs).to_le_bytes(), h);
     for f in &flags {
@@ -188,7 +190,7 @@ pub fn build(g: &Graph, seeds: &[usize], req: &Request) -> Result<Built, String>
         h = fnv(b"\0", h);
     }
     h = fnv(req.package.as_bytes(), h);
-    h = fnv(&lockfile(req.workspace), h);
+    h = fnv(&resolved_packages_key(&g.raw).to_le_bytes(), h);
     let mut native_env: Vec<_> = std::env::vars().filter(|(k, _)| {
         ["CC", "CXX", "AR", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS", "PKG_CONFIG"]
             .iter().any(|prefix| k == prefix || k.starts_with(&format!("{prefix}_")))
@@ -202,15 +204,23 @@ pub fn build(g: &Graph, seeds: &[usize], req: &Request) -> Result<Built, String>
     }
     let cc_version = Command::new(cc()).arg("--version").output().map(|o| o.stdout).unwrap_or_default();
     h = fnv(cc_version.split(|&b| b == b'\n').next().unwrap_or(&[]), h);
-    let mut names: Vec<String> = Vec::new();
-    for &s in seeds {
+    let mut native_packages: Vec<_> = seeds.iter().map(|&s| {
         let bs = &g.build_scripts[s];
-        let (dir, name, ver) = pk(bs);
+        let mut features = bs.features.clone();
+        features.sort();
+        features.dedup();
+        (pk(bs), features)
+    }).collect();
+    native_packages.sort();
+    native_packages.dedup();
+    let mut names: Vec<String> = Vec::new();
+    for ((dir, name, ver), features) in native_packages {
         names.push(format!("{} {}", name, ver));
-        h = fnv(format!("{} {} {:?}", name, ver, bs.features).as_bytes(), h);
+        h = fnv(format!("{} {} {:?}", name, ver, features).as_bytes(), h);
         hash_dir(std::path::Path::new(&dir), &mut h);
     }
     names.sort();
+    names.dedup();
     let dir = format!("{}/native/{:016x}", req.relax_dir, h);
     let messages_path = format!("{}/messages.jsonl", dir);
     let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
@@ -429,7 +439,7 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
     // Otherwise OUT_DIR no longer identifies target probes, and Cargo can
     // reuse stubs or nightly cfgs from a different native selection.
     let metadata = Command::new("cargo")
-        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .args(["metadata", "--locked", "--format-version", "1", "--no-deps"])
         .current_dir(workspace)
         .env("CARGO_TARGET_DIR", &target)
         .output().map_err(|e| format!("native build directory: {e}"))?;
@@ -451,7 +461,7 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
         // beside the program: two jobs
         Tier::Optimized => { cmd.env("CARGO_BUILD_JOBS", "2"); }
     }
-    cmd.args(["check", "--release", "--message-format=json", "-p", package]);
+    cmd.args(["check", "--release", "--locked", "--message-format=json", "-p", package]);
     let cargo_flags = cargo_selection(flags);
     if !cargo_flags.iter().any(|f| f == "--target" || f.starts_with("--target=")) {
         cmd.args(["--target", triple]);
@@ -603,9 +613,8 @@ fn link(lib_path: &str, archives: &[String], search: &[String], fw_search: &[Str
             // ELF links, keep the stack non-executable instead of inheriting an
             // executable-stack request that modern loaders reject for dlopen.
             cmd.arg("-Wl,-z,noexecstack");
-            // Resolve archive function relocations when called by the JIT,
-            // including under compiler wrappers that default to -z now.
-            cmd.arg("-Wl,-z,lazy");
+            // All imports must be bound before the program starts.
+            cmd.arg("-Wl,-z,now");
         }
         // Force each exported symbol through normal archive extraction. A merged
         // archive may contain the same object twice; --whole-archive would load
@@ -840,6 +849,30 @@ fn script_selection_follows_every_unit_of_a_package() {
     assert!(!is_target_out_dir("/w/build/release/build/a-1/out", build, "x86_64-unknown-linux-gnu"));
     assert!(!is_target_out_dir("/elsewhere/x86_64-unknown-linux-gnu/out", build, "x86_64-unknown-linux-gnu"));
     assert_ne!(selection_key(&["a".into()], &["b".into()]), selection_key(&["a".into(), "b".into()], &[]));
+}
+
+#[cfg(test)]
+#[test]
+fn native_key_uses_sorted_resolved_packages() {
+    let unit = |name: &str, version: &str, features: &[&str]| crate::unitgraph::RawUnit {
+        name: name.into(), src_path: String::new(), edition: 2021,
+        features: features.iter().map(|f| f.to_string()).collect(), proc_macro: false,
+        deps: Vec::new(), run_script: false,
+        pkg: (format!("packages/{name}"), name.into(), version.into()),
+    };
+    let a = unit("a", "1.0.0", &["fast", "std"]);
+    let b = unit("b", "2.0.0", &[]);
+    let key = resolved_packages_key(&[a.clone(), b.clone()]);
+    assert_eq!(key, resolved_packages_key(&[b.clone(), unit("a", "1.0.0", &["std", "fast"]), a.clone()]),
+        "unit order, duplicate targets and feature order must not change the key");
+    assert_ne!(key, resolved_packages_key(&[a.clone(), unit("b", "2.0.1", &[])]),
+        "a resolved version change must invalidate native artifacts");
+    assert_ne!(key, resolved_packages_key(&[unit("a", "1.0.0", &["std"]), b.clone()]),
+        "a resolved feature change must invalidate native artifacts");
+    let mut other_source = a;
+    other_source.pkg.0 = "other/a".into();
+    assert_ne!(key, resolved_packages_key(&[other_source, b]),
+        "a resolved source change must invalidate native artifacts");
 }
 
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
