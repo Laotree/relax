@@ -25275,6 +25275,16 @@ mod front_yield_tests {
         (job, thread)
     }
 
+    /// Waits for a state these tests' threads reach by themselves: one that does not come is a plain
+    /// failure, not a test that spins for good.
+    fn reached(what: &str, state: impl Fn() -> bool) {
+        let t0 = std::time::Instant::now();
+        while !state() {
+            assert!(t0.elapsed().as_secs() < 60, "{what} did not come: {}", makepad_cpu_budget::report_string());
+            std::thread::yield_now();
+        }
+    }
+
     /// As many jobs as CPU tokens, each with its token, all calling one fn whose speculative build
     /// (Background, in flight) sits out a checkpoint for them: the build needs a token and they wait
     /// for the build. Budget::acquire held it for good on a plate's slice (2026-11-04): nothing moved
@@ -25287,9 +25297,7 @@ mod front_yield_tests {
         use std::sync::Arc;
         BACK_END_GATE.store(1, Ordering::SeqCst);
         queue::spec(up, slot);
-        while BACK_END_GATE.load(Ordering::SeqCst) != 2 {
-            std::thread::yield_now();
-        }
+        reached("the build at its gate", || BACK_END_GATE.load(Ordering::SeqCst) == 2);
         let (admitted, go, left) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(callers)));
         let handles = (0..jobs).map(|i| {
             let (admitted, go, left) = (admitted.clone(), go.clone(), left.clone());
@@ -25314,19 +25322,16 @@ mod front_yield_tests {
             })
         }).collect();
         // the build's token is the one the last job waits for: its first checkpoint yields it
-        while !budget::tokens().waiting.iter().any(|w| w.class == budget::VISIBLE && w.client == budget::APP) {
-            std::thread::yield_now();
-        }
+        reached("the last job waiting for a token", || budget::tokens().waiting.iter().any(|w| w.class == budget::VISIBLE && w.client == budget::APP));
         BACK_END_GATE.store(0, Ordering::SeqCst);
-        while admitted.load(Ordering::SeqCst) < jobs {
-            std::thread::yield_now();
-        }
-        // (a build that no longer stops here would pass without showing anything)
+        reached("every job admitted", || admitted.load(Ordering::SeqCst) >= jobs);
+        // (a build that no longer stops here would pass without showing anything; asked of the budget,
+        // which every JIT in the process shares: under the JIT the wait hook is the loader's)
         let building = BACK_END_THREAD.load(Ordering::SeqCst);
-        while !crate::waits::of(building).is_some_and(|w| w.kind == crate::waits::Kind::Token) {
+        reached("the build waiting for a token", || {
             assert!(queue::running_class(up, slot).is_some(), "the build sits out its checkpoint for the last job");
-            std::thread::yield_now();
-        }
+            budget::tokens().waiting.iter().any(|w| w.thread == building)
+        });
         go.store(true, Ordering::SeqCst);
         (handles, left)
     }
@@ -25409,9 +25414,9 @@ mod front_yield_tests {
             assert!(since.elapsed().as_secs() < 10, "no compile job runs beside a full budget: {}", budget::report_string());
             std::thread::yield_now();
         }
-        let now = budget::tokens();
-        assert_eq!(now.running, tokens, "it takes no token from the app");
-        assert!(now.holders.iter().any(|h| h.client == budget::JIT && h.above), "it runs above the budget");
+        // (its own row: under the JIT the loader's compile jobs share this budget)
+        let building = BACK_END_THREAD.load(Ordering::SeqCst);
+        assert!(budget::tokens().holders.iter().any(|h| h.thread == building && h.client == budget::JIT && h.above), "it runs above the budget, taking no token from the app");
         BACK_END_GATE.store(0, Ordering::SeqCst);
         while queue::running_class(up, f).is_some() {
             std::thread::yield_now();
