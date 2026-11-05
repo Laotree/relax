@@ -4305,16 +4305,54 @@ impl<'a> Fcx<'a> {
         }
     }
 
+    /// A call with the wrong number of arguments (fn_ctxt/checks.rs check_argument_types): each
+    /// argument is checked with its position's input as a hint only, and nothing is demanded of
+    /// it: report_arg_errors reports the call once, as E0061, not an E0308 per shifted argument.
+    /// Their types, for [`Self::arg_count_help`].
+    fn check_args_of_wrong_count(&mut self, params: &[TyId], args: &[ExprId]) -> Vec<TyId> {
+        let mut given = vec![self.tcx.tys.error; args.len()];
+        for check_closures in [false, true] {
+            if check_closures {
+                self.select_before_closures();
+            }
+            for (i, a) in args.iter().enumerate() {
+                if matches!(self.ast().expr(*a).kind, ExprKind::Closure { .. }) == check_closures {
+                    let hint = params.get(i).map(|&p| self.normalize_signature(p));
+                    given[i] = self.check_expr(*a, hint);
+                }
+            }
+        }
+        given
+    }
+
     /// Help for E0061 (too few / too many arguments): which parameters are missing, by name and
     /// type (matched against the given arguments' types in order: the first parameter each
     /// argument fits), or which arguments are extra.
-    fn arg_count_help(&mut self, callee: Option<DefId>, params: &[TyId], args: &[ExprId], skip: usize) -> String {
+    fn arg_count_help(&mut self, callee: Option<DefId>, params: &[TyId], given: &[TyId], skip: usize) -> String {
         let names = callee.map(|d| self.param_names(d)).unwrap_or_default();
         let name_of = |i: usize| names.get(i + skip).cloned().unwrap_or_else(|| format!("#{}", i + 1));
-        if args.len() > params.len() {
-            return format!(" -- remove the extra argument{}", if args.len() - params.len() == 1 { "" } else { "s" });
+        if given.len() > params.len() {
+            return format!(" -- remove the extra argument{}", if given.len() - params.len() == 1 { "" } else { "s" });
         }
-        let missing: Vec<usize> = (args.len()..params.len()).collect();
+        let mut filled = vec![false; params.len()];
+        let mut next = 0;
+        for &t in given {
+            for j in next..params.len() {
+                let (snap, dyns) = (self.start_snapshot(), self.deferred_dyn.len());
+                let formal = self.normalize_signature(params[j]);
+                let fits = self.try_coerce(t, formal, None);
+                self.rollback_to(snap);
+                self.deferred_dyn.truncate(dyns);
+                if fits {
+                    filled[j] = true;
+                    next = j + 1;
+                    break;
+                }
+            }
+        }
+        // (an argument that fits no parameter leaves one more open: the last ones are the missing)
+        let open: Vec<usize> = (0..params.len()).filter(|&j| !filled[j]).collect();
+        let missing = &open[open.len() - (params.len() - given.len())..];
         let list: Vec<String> = missing.iter().map(|&i| format!("`{}: {}`", name_of(i), self.ty_str(params[i]))).collect();
         match list.len() {
             0 => String::new(),
@@ -6716,8 +6754,10 @@ impl<'a> Fcx<'a> {
                 TyKind::FnDef(d, _, _) => Some(d),
                 _ => None,
             };
-            let help = self.arg_count_help(callee, &params, args, 0);
+            let given = self.check_args_of_wrong_count(&params, args);
+            let help = self.arg_count_help(callee, &params, &given, 0);
             self.err(lo, format!("E0061: this function takes {} argument{} but {} {} supplied{}", params.len(), if params.len() == 1 { "" } else { "s" }, args.len(), if args.len() == 1 { "was" } else { "were" }, help));
+            return self.normalize_signature(ret);
         }
         for (&ty, &arg) in params.iter().zip(args) {
             self.register_wf(ty, self.ast().expr(arg).lo);
@@ -7120,9 +7160,12 @@ impl<'a> Fcx<'a> {
         self.apply_fn_bounds(item, &full, lo);
         let extra = self.extra_arg.take();
         let n_extra = extra.is_some() as usize;
-        if ps.len() != args.len() + 1 + n_extra {
+        let wrong_count = ps.len() != args.len() + 1 + n_extra;
+        if wrong_count {
             let want = ps.len().saturating_sub(1);
-            let help = if n_extra == 0 { let rest: Vec<TyId> = ps.iter().skip(1).copied().collect(); self.arg_count_help(Some(item), &rest, args, 0) } else { String::new() };
+            let rest: Vec<TyId> = ps.iter().skip(1).copied().collect();
+            let given = self.check_args_of_wrong_count(&rest, args);
+            let help = if n_extra == 0 { self.arg_count_help(Some(item), &rest, &given, 0) } else { String::new() };
             self.err(lo, format!("E0061: this method takes {} argument{} but {} {} supplied{}", want, if want == 1 { "" } else { "s" }, args.len() + n_extra, if args.len() + n_extra == 1 { "was" } else { "were" }, help));
         }
         if let (Some(x), Some(&pt)) = (extra, ps.get(args.len() + 1)) {
@@ -7137,8 +7180,10 @@ impl<'a> Fcx<'a> {
         // `&[String]` checks `&[]` against `&[String]`, then unsizes `&[String; 0]`. The formal
         // output may be the method's own parameter (`U` of map_or) when the expectation is a
         // known type.
-        let exp_inputs = self.method_expected_inputs(ret, &ps, method_expected);
-        self.check_method_args(item, &ps, args, exp_inputs);
+        if !wrong_count {
+            let exp_inputs = self.method_expected_inputs(ret, &ps, method_expected);
+            self.check_method_args(item, &ps, args, exp_inputs);
+        }
         // projections in the result normalize now that the call fixed the args (rustc
         // normalizes a method's output: `opt.as_deref()` is Option<&str>, not
         // Option<&<String as Deref>::Target>, so a pattern binding gets `&str`)
@@ -7437,9 +7482,12 @@ impl<'a> Fcx<'a> {
         let ps: Vec<_> = ps.into_iter().map(|t| self.normalize_signature(t)).collect();
         let extra = self.extra_arg.take();
         let n_extra = extra.is_some() as usize;
-        if ps.len() != args.len() + 1 + n_extra {
+        let wrong_count = ps.len() != args.len() + 1 + n_extra;
+        if wrong_count {
             let want = ps.len().saturating_sub(1);
-            let help = if n_extra == 0 { let rest: Vec<TyId> = ps.iter().skip(1).copied().collect(); self.arg_count_help(Some(item), &rest, args, 0) } else { String::new() };
+            let rest: Vec<TyId> = ps.iter().skip(1).copied().collect();
+            let given = self.check_args_of_wrong_count(&rest, args);
+            let help = if n_extra == 0 { self.arg_count_help(Some(item), &rest, &given, 0) } else { String::new() };
             self.err(lo, format!("E0061: this method takes {} argument{} but {} {} supplied{}", want, if want == 1 { "" } else { "s" }, args.len() + n_extra, if args.len() + n_extra == 1 { "was" } else { "were" }, help));
         }
         if let (Some(x), Some(&pt)) = (extra, ps.get(args.len() + 1)) {
@@ -7448,8 +7496,10 @@ impl<'a> Fcx<'a> {
         // the probe reads the formal result as written: normalizing it before the arguments are
         // checked would select an impl for a projection whose trait args are still open
         // (`allocs.index(heading_ix)` with several Index impls)
-        let exp_inputs = if method_expected.is_some() { self.method_expected_inputs(r, &ps, method_expected) } else { None };
-        self.check_method_args(item, &ps, args, exp_inputs);
+        if !wrong_count {
+            let exp_inputs = if method_expected.is_some() { self.method_expected_inputs(r, &ps, method_expected) } else { None };
+            self.check_method_args(item, &ps, args, exp_inputs);
+        }
         // several impls of the trait for the self type and its args still open (`v.extend(it)`
         // on Vec<String>: Extend<String> and Extend<&String>): the impls whose where-clauses
         // can hold (`T: Copy` rules out the second) -- one left fixes the args (rustc selects
