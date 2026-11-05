@@ -331,8 +331,22 @@ fn a_wait_inside_a_wait_ends_with_the_outer_one_and_the_token_comes_back() {
     take_back();
     assert!(!lent(), "the outer leave brings the token back");
     assert_eq!(tokens().running, 1);
+    assert!(tokens().holders.iter().any(|h| h.label == "nested waits"), "a label's spaces come through");
     release(permit);
     assert_eq!(tokens().running, 0);
+}
+
+/// A permit that names no row is a bug of whoever passed it, and its thread panics. The other threads
+/// go on: their tokens don't depend on it.
+#[test]
+fn a_panic_under_the_budgets_lock_stays_that_threads_panic() {
+    let (b, _changed) = budget(2);
+    let p = b.admit(VISIBLE, APP, "released twice");
+    b.release(p);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| b.release(p))).is_err());
+    let next = b.admit(VISIBLE, APP, "next");
+    b.release(next);
+    assert_eq!(b.tokens().running, 0);
 }
 
 /// The owner waits for a build for a compile job it serves: that job's token goes to the build, on
