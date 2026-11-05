@@ -105,8 +105,9 @@ const OPENSSL_INIT_NO_ATEXIT: u64 = 0x0008_0000;
 /// other threads still run, and it frees the library under them. A devhub node exiting for its
 /// self-update had a sync order's signature check fail mid-exit as `not a credential of this
 /// fleet` (11-05). The process's end frees what OpenSSL holds. The first initialisation decides
-/// it for the process, so every entry into OpenSSL comes through this one.
-pub(crate) fn init_openssl() -> io::Result<()> {
+/// it for the process, so every entry into OpenSSL in the tree comes through this one (crates that
+/// call OpenSSL themselves through [`crate::tls::init_openssl`]).
+pub fn init_openssl() -> io::Result<()> {
     static INIT: OnceLock<Result<(), String>> = OnceLock::new();
     match INIT.get_or_init(|| unsafe {
         if OPENSSL_init_ssl(OPENSSL_INIT_NO_ATEXIT, ptr::null()) == 1 {
