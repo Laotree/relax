@@ -2416,7 +2416,10 @@ fn native_callbacks(prog: &crate::program::Program, n: &crate::native::NativeLib
 }
 
 /// Who bound each callback slot of the process's native libraries: (slot, the run (None) or a
-/// domain, the fn).
+/// domain, the fn). The run's (`reset_statics`): its binders end with the run and its fns are the
+/// ended program's, so to the next run an entry names a domain id that may be another app's and
+/// a fn of no program it has. The slots themselves stay with the library (loaded for the process),
+/// and the next run binds them again before its first call into it.
 static SLOT_OWNERS: relax_session::sync::Mutex<Vec<(usize, Option<crate::domain::DomainId>, DefId)>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// The first of `slots` (slot, fn) that `owner` must not take: one another binder that is still
@@ -4660,6 +4663,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&EXPORTS, relax_session::sync::Mutex::new(Vec::new()));
     reset(&HAL_RUN, AtomicBool::new(false));
     reset(&APP_DOMAIN, std::sync::atomic::AtomicU32::new(0));
+    reset(&SLOT_OWNERS, relax_session::sync::Mutex::new(Vec::new()));
     reset(&SETTLE_REQUESTED, AtomicBool::new(false));
     reset(&FIRST_PRESENT_WALL, AtomicU64::new(0));
     reset(&DOMAIN_PRESENT_WALL, AtomicU64::new(0));
