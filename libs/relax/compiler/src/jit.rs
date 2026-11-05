@@ -399,11 +399,6 @@ pub struct Unit {
     /// hot reload: const -> the slots whose build read its value (folded into their code), so an
     /// edit of the const recompiles them (reload.rs)
     pub const_readers: relax_session::sync::Mutex<crate::fxhash::HashMap<DefId, Vec<u32>>>,
-    /// live sessions (M10): the structs whose field offsets the program computed (`offset_of!`),
-    /// as code that builds a value by raw writes at them does. A field an edit adds goes to the
-    /// extension block, with no offset to give that code, and whether such a value set a removed
-    /// field that needs dropping is unknown: those edits restart (reload.rs layout_edit)
-    pub offsets_computed: relax_session::sync::Mutex<crate::fxhash::HashSet<DefId>>,
     /// per slot: the slots whose optimised RIR its RIR took in this run -- inlined bodies and
     /// callees answering nounwind true (a false answer assumes nothing of the body). Grows
     /// over rebuilds, never shrinks: code made from an earlier RIR names them too. The disk
@@ -4442,7 +4437,6 @@ impl Unit {
             fn_create: Default::default(),
             consts: Default::default(),
             const_readers: Default::default(),
-            offsets_computed: Default::default(),
             body_deps: Default::default(),
             statics: Default::default(),
             const_certs: Default::default(),
