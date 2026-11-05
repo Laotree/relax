@@ -1495,13 +1495,12 @@ impl<'a> Lcx<'a> {
         crate::jit::field_note(site);
     }
 
-    /// A new value of a live-editable struct (M10) has no extension block yet: its ext word is
-    /// zeroed where the value is built.
+    /// A new value of a live-editable struct (M10) has no extension block yet: its ext word
+    /// says so where the value is built ([`EXT_BUILT`]; 0 when the struct has dead slots,
+    /// which code built now does not set -- the drop glue then leaves them alone, ext_drop_fn).
     fn zero_ext(&mut self, a: VReg, off: i32, t: TyId) {
         if let Some(e) = self.layout(t).ext {
-            // bit 0: built by code that knows dead slots (removed or retyped fields) and does
-            // not set them -- the drop glue then leaves them alone (lower.rs ext_drop_fn)
-            let z = self.iconst(has_dead_slots(self.u, t) as i64);
+            let z = self.iconst(if has_dead_slots(self.u, t) { 0 } else { EXT_BUILT as i64 });
             let pm = self.pmem();
             self.emit(Inst::Store(pm, a, off + e as i32, z));
         }
@@ -7107,6 +7106,18 @@ impl<'a> Lcx<'a> {
                 if let Some(v) = self.simd_const_block(*b, t) {
                     return v;
                 }
+                // offset_of!: the offset in the layout the JIT runs (live layouts: an edit keeps
+                // it, a field in the extension block has none), never a projection run on
+                // uninitialized memory (ctfe.rs Ctx::offset_of)
+                if matches!(self.kind(t), TyKind::Int(Prim::Usize)) && crate::ctfe::in_offset_of(&self.u.prog, self.b.file, self.u.prog.files[self.b.file as usize].ast.block(*b).lo) {
+                    if let Some(Ok(v)) = self.u.const_block_shared(self.b, *b, t, self.cur_fn).map(|v| <[u8; 8]>::try_from(&v[..])) {
+                        if u64::from_le_bytes(v) == crate::ctfe::NO_OFFSET {
+                            self.panic_here("offset_of! names a field a live edit added: it lives in the value's extension block and has no offset in the running layout -- restart the app");
+                            self.dead();
+                        }
+                        return Val::L(vec![self.iconst(i64::from_le_bytes(v))]);
+                    }
+                }
                 let previous = self.overflow_checks;
                 let previous_const = self.const_init;
                 self.overflow_checks = true;
@@ -7982,10 +7993,6 @@ impl<'a> Lcx<'a> {
                 let blk = self.f.vreg(Cls::I);
                 let pm = self.pmem();
                 self.emit(Inst::Load(pm, blk, ba, e as i32));
-                let blk = {
-                    let m = self.iconst(!1i64);
-                    self.ibin(IOp::And, false, blk, m)
-                };
                 let f: rt_fn_ty!(fn(u64)) = rt_ext_free;
                 let fs = self.u.syms.intern(crate::syms::SymKind::Rt("ext_free"), f as usize as u64);
                 self.emit(Inst::Call(Callee::Host(fs), vec![blk], Vec::new()));
@@ -13237,8 +13244,10 @@ fn has_dead_slots(u: &Unit, t: TyId) -> bool {
     }
 }
 
-/// Drop of a live-editable struct's extension block (GLUE_EXT_DROP; its argument is the ext
-/// word's address): the fields it holds, then the block.
+/// Drop of a live-editable struct's extension (GLUE_EXT_DROP; its argument is the ext word's
+/// address): the dead slots the value set, then its block's fields and the block. The word is
+/// read as [`ext_word_block`] reads it, so a value whose word nothing wrote (built by raw writes
+/// at `offset_of!` offsets) drops as one with no block that set no dead slot.
 fn ext_drop_fn(u: &mut Unit, t: TyId) -> Func {
     let name = fn_name(u, &FnKey::Glue(crate::jit::GLUE_EXT_DROP, t));
     let mut f = Func::new(name, 0);
@@ -13249,40 +13258,65 @@ fn ext_drop_fn(u: &mut Unit, t: TyId) -> Func {
     push(&mut f, entry, Inst::Load(Mem::Int(8, false), word, p, 0));
     let zero = f.vreg(Cls::I);
     push(&mut f, entry, Inst::Iconst(zero, 0));
-    let mut cur = entry;
-    // dead slots (removed / retyped fields) of a value built before they died: dropped here
-    if let (Some(ext_off), TyKind::Adt(d, args, _)) = (u.layout_of(t).ext, u.tcx.tys.kind(t).clone()) {
-        let l = u.layout_of(t);
-        let dead: Vec<(u32, TyId)> = u.tcx.adts.get(&d).map(|a| a.variants[0].fields.iter().enumerate().filter(|(i, fd)| is_dead_field(u, fd.name) && l.fields.get(*i).map_or(false, |o| *o != u32::MAX)).map(|(i, _)| (l.fields[i], u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, 0, i as u32, u.tcx.tys.list(args)))).collect()).unwrap_or_default();
-        let dead: Vec<(u32, TyId)> = dead.into_iter().filter(|(_, ft)| u.needs_drop_glue(*ft)).collect();
-        if !dead.is_empty() {
-            let one = f.vreg(Cls::I);
-            push(&mut f, cur, Inst::Iconst(one, 1));
-            let bit = f.vreg(Cls::I);
-            push(&mut f, cur, Inst::IBin(IOp::And, U64, bit, word, one));
-            let set = f.vreg(Cls::I);
-            push(&mut f, cur, Inst::ICmp(Cond::Eq, false, set, bit, zero));
-            let dr = f.block();
-            let next = f.block();
-            f.blocks[cur as usize].term = Term::Branch(set, dr, next);
-            let base = f.vreg(Cls::I);
-            push(&mut f, dr, Inst::IBinI(IOp::Add, U64, base, p, -(ext_off as i64)));
-            for (off, ft) in dead {
-                let a = addr_off(&mut f, dr, base, off);
-                call_drop(u, &mut f, dr, a, ft);
-            }
-            f.blocks[dr as usize].term = Term::Jump(next);
-            cur = next;
+    let built = f.vreg(Cls::I);
+    push(&mut f, entry, Inst::Iconst(built, EXT_BUILT as i64));
+    // the usual words, decided here: none written by a struct literal of a version without dead
+    // slots (EXT_BUILT) or of one with them (0); anything else asks the runtime
+    let plain = f.vreg(Cls::I);
+    push(&mut f, entry, Inst::ICmp(Cond::Eq, false, plain, word, built));
+    let ask = f.block();
+    let fast = f.block();
+    let out = f.block();
+    f.blocks[entry as usize].term = Term::Branch(plain, fast, ask);
+    let is_zero = f.vreg(Cls::I);
+    push(&mut f, ask, Inst::ICmp(Cond::Eq, false, is_zero, word, zero));
+    let slow = f.block();
+    f.blocks[ask as usize].term = Term::Branch(is_zero, out, slow);
+    // dead slots (removed / retyped fields) of a value built before they died
+    let dead: Vec<(u32, TyId)> = match (u.layout_of(t).ext, u.tcx.tys.kind(t).clone()) {
+        (Some(_), TyKind::Adt(d, args, _)) => {
+            let l = u.layout_of(t);
+            let dead: Vec<(u32, TyId)> = u.tcx.adts.get(&d).map(|a| a.variants[0].fields.iter().enumerate().filter(|(i, fd)| is_dead_field(u, fd.name) && l.fields.get(*i).map_or(false, |o| *o != u32::MAX)).map(|(i, _)| (l.fields[i], u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, 0, i as u32, u.tcx.tys.list(args)))).collect()).unwrap_or_default();
+            dead.into_iter().filter(|(_, ft)| u.needs_drop_glue(*ft)).collect()
         }
+        _ => Vec::new(),
+    };
+    let ext_off = u.layout_of(t).ext.unwrap_or(0);
+    let drop_dead = |u: &mut Unit, f: &mut Func, b: u32| {
+        let base = f.vreg(Cls::I);
+        push(f, b, Inst::IBinI(IOp::Add, U64, base, p, -(ext_off as i64)));
+        for &(off, ft) in &dead {
+            let a = addr_off(f, b, base, off);
+            call_drop(u, f, b, a, ft);
+        }
+    };
+    // EXT_BUILT: every slot set, no block
+    drop_dead(u, &mut f, fast);
+    f.blocks[fast as usize].term = Term::Jump(out);
+    // another word: a block this runtime made (its header says whether the value set its dead
+    // slots), or nothing the value's code wrote
+    let mut cur = slow;
+    if !dead.is_empty() {
+        let df: rt_fn_ty!(fn(u64) -> u64) = rt_ext_dead_set;
+        let dfs = u.syms.intern(crate::syms::SymKind::Rt("ext_dead_set"), df as usize as u64);
+        let set = f.vreg(Cls::I);
+        push(&mut f, cur, Inst::Call(Callee::Host(dfs), vec![word], vec![set]));
+        let unset = f.vreg(Cls::I);
+        push(&mut f, cur, Inst::ICmp(Cond::Eq, false, unset, set, zero));
+        let dr = f.block();
+        let next = f.block();
+        f.blocks[cur as usize].term = Term::Branch(unset, next, dr);
+        drop_dead(u, &mut f, dr);
+        f.blocks[dr as usize].term = Term::Jump(next);
+        cur = next;
     }
-    let mask = f.vreg(Cls::I);
-    push(&mut f, cur, Inst::Iconst(mask, !1i64));
+    let bf: rt_fn_ty!(fn(u64) -> u64) = rt_ext_block;
+    let bfs = u.syms.intern(crate::syms::SymKind::Rt("ext_block"), bf as usize as u64);
     let blk = f.vreg(Cls::I);
-    push(&mut f, cur, Inst::IBin(IOp::And, U64, blk, word, mask));
+    push(&mut f, cur, Inst::Call(Callee::Host(bfs), vec![word], vec![blk]));
     let isnull = f.vreg(Cls::I);
     push(&mut f, cur, Inst::ICmp(Cond::Eq, false, isnull, blk, zero));
     let body = f.block();
-    let out = f.block();
     f.blocks[cur as usize].term = Term::Branch(isnull, out, body);
     let mut cur = body;
     let cnt = f.vreg(Cls::I);
@@ -13319,15 +13353,46 @@ fn ext_drop_fn(u: &mut Unit, t: TyId) -> Func {
     f
 }
 
+/// The ext word (M10) of a value built by the program's own code (a struct literal) of a
+/// version without dead slots: no extension block, every slot set. Odd, so no block (16-byte
+/// aligned) has this address. A struct literal of a version with dead slots writes 0 (no block,
+/// its dead slots unset).
+pub(crate) const EXT_BUILT: u64 = 0x4c69_7665_4c61_7901;
+
+/// The extension blocks this runtime made and has not freed (M10). An ext word is a block only
+/// when it names one of them: a value built by raw writes at `offset_of!` offsets (reflection
+/// crates, MaybeUninit) never wrote its word, and whatever bytes are there -- a pattern, zero,
+/// what the memory held before -- mean no block and no dead slot set.
+static EXT_BLOCKS: relax_session::sync::Mutex<Option<crate::fxhash::HashSet<u64>>> = relax_session::sync::Mutex::new(None);
+
+/// The block ext word `word` names, or 0 when it names none.
+fn ext_word_block(word: u64) -> u64 {
+    if word == 0 || word & 15 != 0 {
+        return 0;
+    }
+    let blocks = EXT_BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    if blocks.as_ref().is_some_and(|b| b.contains(&word)) { word } else { 0 }
+}
+
+fn ext_block_made(blk: u64) {
+    EXT_BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(blk);
+}
+
+/// Forgets block `blk`; false when it is no block of this runtime's.
+fn ext_block_gone(blk: u64) -> bool {
+    EXT_BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().is_some_and(|b| b.remove(&blk))
+}
+
 rt_fn! {
     /// The extension block behind ext word `slot` (M10), allocated (zeroed) or grown to `size`
     /// (the fields it held keep their offsets); the caller sets the fields beyond its count.
+    /// The header: fields set (u32), capacity (u32), alignment (u32), whether the value set its
+    /// dead slots (u32: its word was EXT_BUILT when the block was made).
     pub fn rt_ext_get(slot: u64, size: u64, align: u64) -> u64 {
         unsafe {
             let slot = slot as *mut u64;
-            // bit 0 of the ext word is the value's dead-slot flag (lower.rs zero_ext)
-            let flag = *slot & 1;
-            let cur = *slot & !1;
+            let word = *slot;
+            let cur = ext_word_block(word);
             let align = align.max(16) as usize;
             if cur == 0 {
                 let lay = std::alloc::Layout::from_size_align_unchecked(size as usize, align);
@@ -13337,7 +13402,9 @@ rt_fn! {
                 }
                 *(b as *mut u32).add(1) = size as u32;
                 *(b as *mut u32).add(2) = align as u32;
-                *slot = b as u64 | flag;
+                *(b as *mut u32).add(3) = (word == EXT_BUILT) as u32;
+                ext_block_made(b as u64);
+                *slot = b as u64;
                 return b as u64;
             }
             let b = cur as *mut u8;
@@ -13354,17 +13421,41 @@ rt_fn! {
             std::ptr::copy_nonoverlapping(b, n, cap as usize);
             *(n as *mut u32).add(1) = size as u32;
             *(n as *mut u32).add(2) = align.max(old_align) as u32;
+            ext_block_gone(cur);
             std::alloc::dealloc(b, std::alloc::Layout::from_size_align_unchecked(cap as usize, old_align));
-            *slot = n as u64 | flag;
+            ext_block_made(n as u64);
+            *slot = n as u64;
             n as u64
         }
     }
 }
 
 rt_fn! {
-    /// Frees an extension block (its fields were dropped or moved out); null is a no-op.
+    /// The block ext word `word` names (M10), or 0 (ext_word_block).
+    pub fn rt_ext_block(word: u64) -> u64 {
+        ext_word_block(word)
+    }
+}
+
+rt_fn! {
+    /// Whether the value whose ext word is `word` set its dead slots: built as EXT_BUILT, or its
+    /// block says so. A word nothing wrote: no.
+    pub fn rt_ext_dead_set(word: u64) -> u64 {
+        if word == EXT_BUILT {
+            return 1;
+        }
+        match ext_word_block(word) {
+            0 => 0,
+            b => unsafe { *(b as *const u32).add(3) as u64 },
+        }
+    }
+}
+
+rt_fn! {
+    /// Frees the extension block ext word `blk` names (its fields were dropped or moved out);
+    /// a word that names none is a no-op.
     pub fn rt_ext_free(blk: u64) {
-        if blk == 0 {
+        if blk == 0 || blk & 15 != 0 || !ext_block_gone(blk) {
             return;
         }
         unsafe {
@@ -15388,12 +15479,19 @@ mod query_drop_tests {
             assert!(!u.tcx.needs_drop(&u.prog, env, ty));
             assert!(u.needs_drop_glue(ty));
             let layout = u.layout_of(ty);
-            let mut value = vec![0u64; (layout.size as usize + 7) / 8];
+            // built by raw writes (offset_of! offsets, MaybeUninit): the ext word holds whatever
+            // the memory held, here a fill pattern; it is no block, and its drop frees nothing
+            let mut value = vec![0xABAB_ABAB_ABAB_ABABu64; (layout.size as usize + 7) / 8];
             let base = value.as_mut_ptr() as u64;
             let offsets = if ty == plain { vec![ext] } else { vec![layout.fields[0] + ext, layout.fields[1] + ext] };
-            for &off in &offsets { assert_ne!(rt_ext_get(base + off as u64, 16, 16), 0); }
             let id = u.fn_id(FnKey::Glue(crate::jit::GLUE_DROP, ty));
             let entry = u.entry(id);
+            assert!(unsafe { crate::jit::call_jit(&mut *u, entry, base) }.is_ok());
+            assert_eq!(FREES.load(Ordering::SeqCst), total, "a word nothing wrote frees nothing");
+            for &off in &offsets {
+                let blk = rt_ext_get(base + off as u64, 16, 16);
+                assert!(blk != 0 && blk != 0xABAB_ABAB_ABAB_ABAB, "a block of its own");
+            }
             let result = unsafe { crate::jit::call_jit(&mut *u, entry, base) };
             assert!(result.is_ok());
             assert!(u.errors.is_empty(), "{:?}", u.errors);
@@ -15678,6 +15776,8 @@ pub(crate) fn intern_lazy_rt(u: &mut Unit, name: &str) -> Option<relax_backend::
         "web_memory_base" => ("web_memory_base", crate::web::BASE),
         "ext_free" => { let f: rt_fn_ty!(fn(u64)) = rt_ext_free; ("ext_free", f as usize as u64) }
         "ext_get" => { let f: rt_fn_ty!(fn(u64, u64, u64) -> u64) = rt_ext_get; ("ext_get", f as usize as u64) }
+        "ext_block" => { let f: rt_fn_ty!(fn(u64) -> u64) = rt_ext_block; ("ext_block", f as usize as u64) }
+        "ext_dead_set" => { let f: rt_fn_ty!(fn(u64) -> u64) = rt_ext_dead_set; ("ext_dead_set", f as usize as u64) }
         "divrem128" => { let f: rt_fn_ty!(fn(u64, u64, u64, u64, u64) -> WideRet) = rt_divrem128; ("divrem128", f as usize as u64) }
         // the loop counters' helper (a trampoline in the code area)
         "loop_hot" => return Some(crate::jit::loop_hot_sym(u)),

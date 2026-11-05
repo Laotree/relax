@@ -396,7 +396,10 @@ pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
     if args.get(1).map(String::as_str) == Some("fix") {
         options.relaxed = Some("all".to_string());
     }
-    options.cpu = relax_backend::x64::detect_cpu(&options);
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        options.cpu = relax_backend::x64::detect_cpu(&options);
+    }
     options.spec_hot = Some(options.spec_hot.unwrap_or_else(crate::jit::on_battery));
     let mut session = crate::Session { options, runtime: crate::options::RuntimeOptions::from_env() };
     session.options.target = match session.options.check_target {

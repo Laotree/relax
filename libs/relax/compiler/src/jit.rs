@@ -399,6 +399,11 @@ pub struct Unit {
     /// hot reload: const -> the slots whose build read its value (folded into their code), so an
     /// edit of the const recompiles them (reload.rs)
     pub const_readers: relax_session::sync::Mutex<crate::fxhash::HashMap<DefId, Vec<u32>>>,
+    /// live sessions (M10): the structs whose field offsets the program computed (`offset_of!`),
+    /// as code that builds a value by raw writes at them does. A field an edit adds goes to the
+    /// extension block, with no offset to give that code, and whether such a value set a removed
+    /// field that needs dropping is unknown: those edits restart (reload.rs layout_edit)
+    pub offsets_computed: relax_session::sync::Mutex<crate::fxhash::HashSet<DefId>>,
     /// per slot: the slots whose optimised RIR its RIR took in this run -- inlined bodies and
     /// callees answering nounwind true (a false answer assumes nothing of the body). Grows
     /// over rebuilds, never shrinks: code made from an earlier RIR names them too. The disk
@@ -3694,6 +3699,7 @@ use crate::stack::ensure_sufficient_stack;
 /// thread redirects it into this glue (x64::hang_tramp in front of rt_hang); 0 = none.
 pub(crate) static HANG_TRAMP: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(not(target_arch = "aarch64"))]
 rt_fn! {
     /// The hang watchdog's interrupt, run on the interrupted thread through HANG_TRAMP: the same
     /// decision as a watchdog signal; when it acts, the call unwinds to its recovery point
@@ -4437,6 +4443,7 @@ impl Unit {
             fn_create: Default::default(),
             consts: Default::default(),
             const_readers: Default::default(),
+            offsets_computed: Default::default(),
             body_deps: Default::default(),
             statics: Default::default(),
             const_certs: Default::default(),
@@ -4607,8 +4614,9 @@ impl Unit {
             u.rt.panic_impl = u.emit_code(&panic_tramp(crate::web32::w32_panic_impl as *const () as usize as u64), "relax::panic_impl");
         }
         u.env.resume = u.rt.resume;
+        #[cfg(not(target_arch = "aarch64"))]
         if os::fault::NEEDS_HANG_TRAMP {
-            HANG_TRAMP.store(u.emit_code(&relax_backend::x64::hang_tramp(rt_hang as *const () as usize as u64), "relax::hang_tramp"), Ordering::Relaxed);
+            HANG_TRAMP.store(u.emit_code(&x64::hang_tramp(rt_hang as *const () as usize as u64), "relax::hang_tramp"), Ordering::Relaxed);
         }
         u.env.syms = u.syms.vals;
         u.env.sym_class = u.syms.classes;

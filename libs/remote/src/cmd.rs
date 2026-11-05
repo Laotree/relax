@@ -160,6 +160,10 @@ impl Req {
     pub fn get(&self, k: &str) -> Option<&str> {
         self.kv.iter().rev().find(|x| x.0 == k).map(|x| x.1.as_str())
     }
+    /// Refuse unknown keys before executing a command, using its manifest schema.
+    pub fn validate_params(&self, params: &str) -> Result<(), String> {
+        crate::params::validate(self.kv.iter().map(|(key, _)| key.as_str()), params)
+    }
     pub fn num(&self, k: &str, d: u64) -> u64 {
         self.get(k).and_then(|v| v.parse().ok()).unwrap_or(d)
     }
