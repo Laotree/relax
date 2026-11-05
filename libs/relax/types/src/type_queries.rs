@@ -392,20 +392,12 @@ impl QueryCx {
 
     // Lead design rounds 47-48. Nightly resolve_bound_vars.rs:253-285,430-442
     // traverses whole owners. File-relative nodes require the entire edited file
-    // to change, including unchanged siblings; declarations keep their own input.
+    // to change, including unchanged siblings: an owner without a body too (a struct,
+    // an impl, a trait), whose lifetime uses are keyed by its file's nodes and positions,
+    // which an edit of any body in the file renumbers (an edited version is parsed whole).
     fn read_owner(&self, prog: &Program, owner: DefId) -> Result<(), QueryError> {
         self.read_def_declarations(prog, owner)?;
-        let def = prog.def(owner);
-        let pf = &prog.files[def.file as usize];
-        let has_body = match def.kind {
-            crate::program::DefKind::AnonConst | crate::program::DefKind::Closure => true,
-            _ => match pf.ast.item(def.item).kind {
-                crate::ast::ItemKind::Fn(sig, body, _) => body.is_some() || pf.ast.fn_sig(sig).lazy_body.is_some(),
-                crate::ast::ItemKind::Const(_, body) | crate::ast::ItemKind::Static(_, _, body) => body.is_some(),
-                _ => false,
-            },
-        };
-        if has_body { self.engine.input(FILE_BODIES, def.file)?; }
+        self.engine.input(FILE_BODIES, prog.def(owner).file)?;
         Ok(())
     }
 
