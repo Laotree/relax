@@ -15801,6 +15801,17 @@ pub const FILE_ACTION_REMOVED: crate::Win32::Storage::FileSystem::FILE_ACTION = 
 pub const FILE_ACTION_RENAMED_NEW_NAME: crate::Win32::Storage::FileSystem::FILE_ACTION = crate::Win32::Storage::FileSystem::FILE_ACTION(5u64 as _);
 pub const FILE_ACTION_RENAMED_OLD_NAME: crate::Win32::Storage::FileSystem::FILE_ACTION = crate::Win32::Storage::FileSystem::FILE_ACTION(4u64 as _);
 pub const FILE_ATTRIBUTE_REPARSE_POINT: crate::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES = crate::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(1024u64 as _);
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FILE_BASIC_INFO {
+pub CreationTime: i64,
+pub LastAccessTime: i64,
+pub LastWriteTime: i64,
+pub ChangeTime: i64,
+pub FileAttributes: u32,
+}
+impl FILE_BASIC_INFO { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for FILE_BASIC_INFO { fn default() -> Self {Self::default()} }
 pub const FILE_BEGIN: crate::Win32::Storage::FileSystem::SET_FILE_POINTER_MOVE_METHOD = crate::Win32::Storage::FileSystem::SET_FILE_POINTER_MOVE_METHOD(0u64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -15831,6 +15842,18 @@ pub const FILE_FLAG_NO_BUFFERING: crate::Win32::Storage::FileSystem::FILE_FLAGS_
 pub const FILE_FLAG_OPEN_REPARSE_POINT: crate::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES = crate::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(2097152u64 as _);
 pub const FILE_FLAG_OVERLAPPED: crate::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES = crate::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(1073741824u64 as _);
 pub const FILE_FLAG_SEQUENTIAL_SCAN: crate::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES = crate::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(134217728u64 as _);
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct FILE_INFO_BY_HANDLE_CLASS(pub i32);
+impl FILE_INFO_BY_HANDLE_CLASS { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for FILE_INFO_BY_HANDLE_CLASS { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for FILE_INFO_BY_HANDLE_CLASS { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for FILE_INFO_BY_HANDLE_CLASS {}
+impl ::core::fmt::Debug for FILE_INFO_BY_HANDLE_CLASS { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for FILE_INFO_BY_HANDLE_CLASS { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for FILE_INFO_BY_HANDLE_CLASS { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for FILE_INFO_BY_HANDLE_CLASS { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for FILE_INFO_BY_HANDLE_CLASS { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 pub const FILE_LIST_DIRECTORY: crate::Win32::Storage::FileSystem::FILE_ACCESS_RIGHTS = crate::Win32::Storage::FileSystem::FILE_ACCESS_RIGHTS(1u64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -15865,6 +15888,7 @@ impl ::core::ops::BitXor for FILE_SHARE_MODE { type Output = Self; fn bitxor(sel
 impl ::core::ops::Not for FILE_SHARE_MODE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 pub const FILE_SHARE_READ: crate::Win32::Storage::FileSystem::FILE_SHARE_MODE = crate::Win32::Storage::FileSystem::FILE_SHARE_MODE(1u64 as _);
 pub const FILE_SHARE_WRITE: crate::Win32::Storage::FileSystem::FILE_SHARE_MODE = crate::Win32::Storage::FileSystem::FILE_SHARE_MODE(2u64 as _);
+pub const FileBasicInfo: crate::Win32::Storage::FileSystem::FILE_INFO_BY_HANDLE_CLASS = crate::Win32::Storage::FileSystem::FILE_INFO_BY_HANDLE_CLASS(0i64 as _);
 mod import_GetDiskFreeSpaceExW { #[link(name = "KERNEL32", kind = "raw-dylib")] extern "system" { #[link_name = "GetDiskFreeSpaceExW"] pub fn call(lpDirectoryName: crate::core::PCWSTR,lpFreeBytesAvailableToCaller: *mut u64,lpTotalNumberOfBytes: *mut u64,lpTotalNumberOfFreeBytes: *mut u64) -> crate::core::BOOL; } }
 pub use import_GetDiskFreeSpaceExW::call as GetDiskFreeSpaceExW_raw;
 #[inline]
@@ -15877,6 +15901,13 @@ pub use import_GetFileInformationByHandle::call as GetFileInformationByHandle_ra
 #[inline]
 pub unsafe fn GetFileInformationByHandle(hFile: crate::Win32::Foundation::HANDLE,lpFileInformation: *mut crate::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION) -> Result<(), crate::core::HRESULT> {
 let hr__ = import_GetFileInformationByHandle::call(hFile,lpFileInformation); hr__.ok()?;
+Ok(())
+}
+mod import_GetFileInformationByHandleEx { #[link(name = "KERNEL32", kind = "raw-dylib")] extern "system" { #[link_name = "GetFileInformationByHandleEx"] pub fn call(hFile: crate::Win32::Foundation::HANDLE,FileInformationClass: crate::Win32::Storage::FileSystem::FILE_INFO_BY_HANDLE_CLASS,lpFileInformation: *mut ::core::ffi::c_void,dwBufferSize: u32) -> crate::core::BOOL; } }
+pub use import_GetFileInformationByHandleEx::call as GetFileInformationByHandleEx_raw;
+#[inline]
+pub unsafe fn GetFileInformationByHandleEx(hFile: crate::Win32::Foundation::HANDLE,FileInformationClass: crate::Win32::Storage::FileSystem::FILE_INFO_BY_HANDLE_CLASS,lpFileInformation: *mut ::core::ffi::c_void,dwBufferSize: u32) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_GetFileInformationByHandleEx::call(hFile,FileInformationClass,lpFileInformation,dwBufferSize); hr__.ok()?;
 Ok(())
 }
 mod import_GetVolumePathNameW { #[link(name = "KERNEL32", kind = "raw-dylib")] extern "system" { #[link_name = "GetVolumePathNameW"] pub fn call(lpszFileName: crate::core::PCWSTR,lpszVolumePathName: crate::core::PWSTR,cchBufferLength: u32) -> crate::core::BOOL; } }
@@ -19118,6 +19149,13 @@ pub use import_VirtualFree::call as VirtualFree_raw;
 #[inline]
 pub unsafe fn VirtualFree(lpAddress: *mut ::core::ffi::c_void,dwSize: usize,dwFreeType: crate::Win32::System::Memory::VIRTUAL_FREE_TYPE) -> Result<(), crate::core::HRESULT> {
 let hr__ = import_VirtualFree::call(lpAddress,dwSize,dwFreeType); hr__.ok()?;
+Ok(())
+}
+mod import_VirtualUnlock { #[link(name = "KERNEL32", kind = "raw-dylib")] extern "system" { #[link_name = "VirtualUnlock"] pub fn call(lpAddress: *const ::core::ffi::c_void,dwSize: usize) -> crate::core::BOOL; } }
+pub use import_VirtualUnlock::call as VirtualUnlock_raw;
+#[inline]
+pub unsafe fn VirtualUnlock(lpAddress: *const ::core::ffi::c_void,dwSize: usize) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_VirtualUnlock::call(lpAddress,dwSize); hr__.ok()?;
 Ok(())
 }
 }

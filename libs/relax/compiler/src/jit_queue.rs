@@ -86,7 +86,9 @@ pub(super) struct Queue {
     entries: Vec<Entry>,
     running: Vec<Running>,
     serial: u64,
-    waiters: HashMap<(usize, u32), usize>,
+    /// the threads waiting for a slot's job, per class they wait at (Interactive, Visible:
+    /// owner::waiter_class)
+    waiters: HashMap<(usize, u32), [u32; 2]>,
     /// the queued entries per tier and stored class, hottest first: a pick reads the buckets that
     /// hold any, each from its front
     plan: [[BTreeSet<(std::cmp::Reverse<i64>, u64)>; 3]; TIERS],
@@ -116,8 +118,10 @@ impl Queue {
         self.sync_ahead();
         let now = HeatNow::take();
         let slot = job.slot();
-        let promoted = slot.is_some_and(|slot| self.waiters.contains_key(&slot));
-        let class = if promoted { budget::INTERACTIVE } else if job.tier() == 0 { budget::BACKGROUND } else { job_class(&job, &now) };
+        let wanted = slot.and_then(|slot| self.wanted(slot));
+        let promoted = wanted.is_some();
+        let class = if job.tier() == 0 { budget::BACKGROUND } else { job_class(&job, &now) };
+        let class = wanted.map_or(class, |w| w.min(self.bucket_class(job.tier(), class)));
         self.serial += 1;
         let urgent = at == O2_FRONT_AT && matches!(job, Job::O2(..));
         let at = if urgent { wall_ns() } else { at };
@@ -133,6 +137,10 @@ impl Queue {
         budget::queued(class, budget::JIT, 1);
         let policy = self.policy();
         self.blocked(&self.entries[self.entries.len() - 1], &policy).is_none()
+    }
+    /// The class the waiters of `slot` ask for.
+    fn wanted(&self, slot: (usize, u32)) -> Option<u8> {
+        self.waiters.get(&slot)?.iter().position(|&n| n != 0).map(|class| class as u8)
     }
     fn sync_ahead(&mut self) {
         self.set_ahead_class(if startup_phase() || ui_burst() { budget::INTERACTIVE } else { budget::BACKGROUND });
@@ -163,7 +171,7 @@ impl Queue {
         self.refresh_cursor += 1;
         if entry.job.tier() == 0 { return; }
         self.plan[entry.job.tier()][entry.class as usize].remove(&order(entry.key, entry.serial));
-        let class = if entry.promoted { budget::INTERACTIVE } else { job_class(&entry.job, now) };
+        let class = if entry.promoted { entry.class } else { job_class(&entry.job, now) };
         if class != entry.class {
             budget::queued(entry.class, budget::JIT, -1);
             budget::queued(class, budget::JIT, 1);
@@ -522,10 +530,11 @@ pub(super) fn retain(mut keep: impl FnMut(&Job) -> bool) {
     }
 }
 impl Queue {
-    /// Promotes slot `id`'s queued and running jobs (Interactive); returns whether a queued one can
-    /// start now.
+    /// Promotes slot `id`'s queued and running jobs to their waiters' class; returns whether a
+    /// queued one can start now.
     fn promote(&mut self, unit: usize, id: u32) -> bool {
         self.sync_ahead();
+        let Some(wanted) = self.wanted((unit, id)) else { return false };
         let serials = self.by_slot.remove(&(unit, id)).unwrap_or_default();
         for serial in serials.iter() {
             let e = &mut self.entries[self.indices[&serial]];
@@ -533,12 +542,12 @@ impl Queue {
             let old = if e.job.tier() == 0 && !e.promoted { self.ahead_len -= 1; self.ahead_class } else { e.class };
             budget::queued(old, budget::JIT, -1);
             e.promoted = true;
-            e.class = budget::INTERACTIVE;
+            e.class = wanted.min(old);
             self.plan[e.job.tier()][e.class as usize].insert(order(e.key, e.serial));
             budget::queued(e.class, budget::JIT, 1);
         }
         for r in &self.running {
-            if r.waits_for(unit, id) { r.class.reclass(budget::INTERACTIVE); }
+            if r.waits_for(unit, id) && wanted < r.class.class() { r.class.reclass(wanted); }
         }
         let policy = self.policy();
         let runnable = serials.iter().any(|serial| self.blocked(&self.entries[self.indices[&serial]], &policy).is_none());
@@ -546,22 +555,23 @@ impl Queue {
         runnable
     }
 }
-/// Promotion lives exactly as long as the UI waits, including unwinding/cancellation.
-pub(super) struct WaitPriority { unit: usize, id: u32 }
+/// Promotion lives exactly as long as its waiter waits, including unwinding/cancellation (a lower
+/// class than the job's asks for nothing, and its last waiter ends it).
+pub(super) struct WaitPriority { unit: usize, id: u32, class: u8 }
 impl Drop for WaitPriority {
     fn drop(&mut self) {
         let _kept = crate::zone_alloc::kept();
         // (a wait's end only lowers classes: nothing becomes runnable)
-        lock().end_wait(self.unit, self.id);
+        lock().end_wait(self.unit, self.id, self.class);
     }
 }
 impl Queue {
-    fn end_wait(&mut self, unit: usize, id: u32) {
+    fn end_wait(&mut self, unit: usize, id: u32, class: u8) {
         self.sync_ahead();
         let key = (unit, id);
-        let count = self.waiters.get_mut(&key).unwrap();
-        *count -= 1;
-        if *count != 0 { return; }
+        let counts = self.waiters.get_mut(&key).unwrap();
+        counts[class as usize] -= 1;
+        if counts.iter().any(|&n| n != 0) { return; }
         self.waiters.remove(&key);
         let now = HeatNow::take();
         let serials = self.by_slot.remove(&key).unwrap_or_default();
@@ -579,9 +589,9 @@ impl Queue {
         let mut restore: Vec<(Arc<JobClass>, u8)> = Vec::new();
         for r in &self.running {
             if !r.waits_for(unit, id) || restore.iter().any(|(c, _)| Arc::ptr_eq(c, &r.class)) { continue; }
-            let wanted = self.running.iter().any(|other| Arc::ptr_eq(&r.class, &other.class)
-                && other.slot.is_some_and(|slot| self.waiters.contains_key(&slot)));
-            restore.push((r.class.clone(), if wanted { budget::INTERACTIVE } else { r.base_class }));
+            let wanted = self.running.iter().filter(|other| Arc::ptr_eq(&r.class, &other.class))
+                .filter_map(|other| other.slot.and_then(|slot| self.wanted(slot))).min();
+            restore.push((r.class.clone(), wanted.unwrap_or(r.base_class)));
         }
         // Serialize restoration with a new waiter's promotion of the same job.
         for (class, priority) in restore { class.reclass(priority); }
@@ -590,14 +600,22 @@ impl Queue {
 impl Running {
     fn waits_for(&self, unit: usize, id: u32) -> bool { self.slot == Some((unit, id)) }
 }
-pub(super) fn promote(unit: usize, id: u32) -> WaitPriority {
+/// A thread of `class` waits for slot `id`'s job (owner::waiter_class) until this is dropped.
+pub(super) fn promote(unit: usize, id: u32, class: u8) -> WaitPriority {
     let _kept = crate::zone_alloc::kept();
     let mut q = lock();
-    *q.waiters.entry((unit, id)).or_default() += 1;
+    q.waiters.entry((unit, id)).or_default()[class as usize] += 1;
     let runnable = q.promote(unit, id);
     drop(q);
     if runnable { wake(); }
-    WaitPriority { unit, id }
+    WaitPriority { unit, id, class }
+}
+
+/// (tests) The class of slot `id`'s running job.
+#[cfg(test)]
+pub(super) fn running_class(unit: usize, id: u32) -> Option<u8> {
+    let _kept = crate::zone_alloc::kept();
+    lock().running.iter().find(|r| r.waits_for(unit, id)).map(|r| r.class.class())
 }
 
 /// Something waits for the check beside the program: its queued and running jobs take the waiter's
@@ -809,12 +827,18 @@ mod tests {
         let mut q = Queue::new();
         q.push(Job::Spec(1, 10), 1);
         q.push(Job::Spec(1, 11), 2);
-        q.waiters.insert((1, 11), 2);
+        q.waiters.insert((1, 11), [0, 2]);
         q.promote(1, 11);
-        q.end_wait(1, 11);
+        assert_eq!(q.entries[1].class, budget::VISIBLE, "a job takes its waiters' class, not more");
+        q.waiters.get_mut(&(1, 11)).unwrap()[0] += 1;
+        q.promote(1, 11);
+        assert_eq!(q.entries[1].class, budget::INTERACTIVE, "the highest waiter's class");
+        q.end_wait(1, 11, 0);
+        q.end_wait(1, 11, 1);
         assert_eq!(q.entries[1].class, budget::INTERACTIVE, "another waiter retains promotion");
-        q.end_wait(1, 11);
+        q.end_wait(1, 11, 1);
         assert_eq!(q.entries[1].class, budget::BACKGROUND, "last waiter restores the queued class");
+        q.waiters.insert((1, 11), [1, 0]);
         q.promote(1, 11);
         let now = HeatNow { hu: None, wall: 100, tier: 0 };
         assert_eq!(job_class(&Job::O2(1, 7, O2Kind::Normal), &now), budget::BACKGROUND, "a tier-up runs below the app's visible work");
