@@ -28,9 +28,13 @@ pub fn spills_of(id: u32) -> Vec<relax_backend::remark::SpillRemark> {
 /// Usable registers per class on this target (int, float) for the spill remarks' wording.
 pub fn usable_regs(flt: bool) -> u32 {
     match (relax_backend::asm::Arch::host(), flt) {
+        #[cfg(not(target_arch = "aarch64"))]
         (relax_backend::asm::Arch::X64, false) => 14,
+        #[cfg(not(target_arch = "aarch64"))]
         (relax_backend::asm::Arch::X64, true) => 16,
+        #[cfg(target_arch = "aarch64")]
         (relax_backend::asm::Arch::Arm64, false) => 27,
+        #[cfg(target_arch = "aarch64")]
         (relax_backend::asm::Arch::Arm64, true) => 32,
     }
 }
