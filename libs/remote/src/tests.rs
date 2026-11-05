@@ -288,6 +288,7 @@ pub(crate) fn shared() -> &'static (Endpoint, crate::watch::WatchSink) {
         let ep = Endpoint::new("makepad-remote-test");
         ep.register_cmd(app_dispatch);
         ep.register("frames", 1, fake_frames());
+        ep.register("app", 1, fake_app());
         let w = ep.register_watch();
         ep.register_stream();
         ep.listen_unix(",\"extra\":\"x\"").unwrap();
@@ -498,6 +499,32 @@ fn fake_frames() -> Factory {
         });
         Ok(())
     })
+}
+
+/// An `app` service that answers each request with the request it was asked, then ends.
+fn fake_app() -> Factory {
+    Arc::new(|_, open| {
+        std::thread::spawn(move || {
+            let _ = open.channel.send(format!("{{\"asked\":{}}}\n", crate::json_str(&open.args)).into_bytes());
+            open.channel.close(crate::conn::CLOSE_NORMAL, "");
+        });
+        Ok(())
+    })
+}
+
+/// `call` and `tools` are the app's AI tools (its `app` service), not `cmd` commands: a JSON
+/// argument keeps its spaces, and a `call` without its tool says how it goes.
+#[test]
+fn call_and_tools_ask_the_app_service() {
+    let (lines, err) = run_app(&["call", "fab.support", "plate", "{\"at\": [1, 2]}"]);
+    assert_eq!((lines, err), (vec![r#"{"asked":"call fab.support plate\n{\"at\": [1, 2]}"}"#.to_string()], false));
+    assert_eq!(run_app(&["tools"]).0, vec![r#"{"asked":"list"}"#.to_string()]);
+    assert_eq!(run_app(&["call"]), (vec![r#"{"err":"call <service>.<tool> [<instance>] [<json args>]"}"#.to_string()], true));
+    assert_eq!(crate::app::app_request_of("call fab.x {\"a\": \"b c\"}"), Some(Ok("call fab.x\n{\"a\": \"b c\"}".to_string())));
+    assert_eq!(crate::app::app_request_of("call fab.x"), Some(Ok("call fab.x\n{}".to_string())));
+    assert_eq!(crate::app::app_request_of("ui tree"), None);
+    let typed: Vec<String> = ["call", "fab.x", "{\"t\": \"a = b\"}"].map(String::from).into();
+    assert_eq!(crate::app::typed_line(&typed), "call fab.x {\"t\": \"a = b\"}");
 }
 
 fn run_app(argv: &[&str]) -> (Vec<String>, bool) {
