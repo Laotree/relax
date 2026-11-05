@@ -183,12 +183,34 @@ pub fn checkpoint(extra_locks: u32, extra_site: &str) {
     }
 }
 
-/// Return the CPU while waiting for another task. Drop only after releasing the wait's
-/// mutex: readmission may wait for a producer that needs that mutex.
-pub struct BudgetWait(Option<Arc<JobClass>>);
+/// Return the CPU while waiting for another task. A compile job gives its permit up: drop only
+/// after releasing the wait's mutex, readmission may wait for a producer that needs that mutex.
+/// Any other thread (a program thread, under its own permit) lends its token (budget::lend), which
+/// comes back without a wait.
+pub struct BudgetWait { job: Option<Arc<JobClass>>, lent: bool }
+/// The token of the job the owner serves, back in the budget meanwhile (see `lend_served`).
+pub struct LentJob(Option<u32>);
+/// The owner is about to wait for a build for the job it serves: the job sleeps, and with one token
+/// in the machine that build could get no other. The owner never waits to take it back.
+pub fn lend_served() -> LentJob {
+    let permit = current_job().and_then(|job| *job.permit.lock().unwrap_or_else(|e| e.into_inner()));
+    if let Some(permit) = permit { budget::lend_permit(permit); }
+    LentJob(permit)
+}
+impl Drop for LentJob {
+    fn drop(&mut self) {
+        if let Some(permit) = self.0 { budget::take_back_permit(permit); }
+    }
+}
+/// `suspend` for a wait a compile job sits out with its permit (its readmission could keep what the
+/// waited-for work needs waiting): only another thread's token goes back.
+pub fn suspend_program() -> BudgetWait {
+    if current_job().is_some() { return BudgetWait { job: None, lent: false }; }
+    suspend()
+}
 pub fn suspend() -> BudgetWait {
     let job = CURRENT.try_with(|c| c.borrow().clone()).ok().flatten();
-    if job.is_none() { return BudgetWait(None); }
+    if job.is_none() { return BudgetWait { job: None, lent: budget::lend() }; }
     let _kept = zone_alloc::kept();
     let job = job.filter(|j| {
         if let Some(p) = j.permit.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -196,11 +218,12 @@ pub fn suspend() -> BudgetWait {
             true
         } else { false }
     });
-    BudgetWait(job)
+    BudgetWait { job, lent: false }
 }
 impl Drop for BudgetWait {
     fn drop(&mut self) {
-        if let Some(job) = &self.0 {
+        if self.lent { budget::take_back(); }
+        if let Some(job) = &self.job {
             let _kept = zone_alloc::kept();
             let p = budget::admit_following(&job.desired, budget::JIT, job.label);
             let mut slot = job.permit.lock().unwrap_or_else(|e| e.into_inner());

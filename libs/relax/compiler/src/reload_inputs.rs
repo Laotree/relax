@@ -30,6 +30,8 @@ struct ResolvedGraph {
 pub struct Inputs {
     pub(super) paths: BTreeMap<String, (Stamp, Kind)>,
     graph: Option<ResolvedGraph>,
+    /// the folders of the graph's packages, downloaded ones aside
+    packages: BTreeSet<String>,
 }
 
 /// Whether `path` lies in another OS's source tree (`src/backend/linux/..`, `src/os/windows/..`):
@@ -112,6 +114,7 @@ impl Inputs {
                 inputs.discover_source_dir(Path::new(dir), dir, &mut Vec::new());
             }
         }
+        inputs.packages = dirs.into_iter().cloned().collect();
         for script in &graph.build_scripts {
             inputs.insert(Path::new(&script.src_path), Kind::Build);
         }
@@ -231,6 +234,14 @@ impl Inputs {
                 crate::vfs::relative_path(&p, root).map(|rel| format!("{}{rel}", "../".repeat(up)))
             }).unwrap_or_else(|| crate::vfs::normalize_path(&p))
         }).collect::<BTreeSet<_>>().into_iter().collect()
+    }
+
+    /// Whether a workspace-relative path lies in no package of the app's graph, nor in std: no
+    /// crate's own folder holds it (a lane's scratch file in its worktree).
+    pub(super) fn outside_packages(&self, rel: &str, std_dir: &str) -> bool {
+        let workspace = self.graph.as_ref().map(|g| g.workspace.clone()).unwrap_or_else(crate::run::workspace_dir);
+        let path = format!("{workspace}/{rel}");
+        !self.packages.iter().map(String::as_str).chain([std_dir]).any(|dir| crate::vfs::relative_path(&path, dir).is_some())
     }
 
     /// Native bindings and the compile unit's std are shared by every domain. A fresh app

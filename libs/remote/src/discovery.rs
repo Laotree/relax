@@ -9,11 +9,19 @@ pub struct App {
     pub socket: String,
     pub started_ms: u64,
     pub caps: Vec<String>,
+    /// Windows: the thin parent this run stands behind (restart_parent.rs in the JIT), whose pid is
+    /// the one whoever started the run holds, and the one that stays when the run restarts
+    pub restart_parent: Option<u32>,
     /// every top-level field as (key, raw JSON value), the host's extra fields included
     pub fields: Vec<(String, String)>,
 }
 
 impl App {
+    /// Whether `pid` means this endpoint: its process, or the parent that process stands behind.
+    pub fn answers_to(&self, pid: u32) -> bool {
+        self.pid == pid || self.restart_parent == Some(pid)
+    }
+
     /// A string field (the host's extras such as `session_log`), unescaped.
     pub fn text(&self, key: &str) -> Option<String> {
         let raw = &self.fields.iter().find(|f| f.0 == key)?.1;
@@ -168,6 +176,7 @@ pub fn parse(text: &str) -> Option<App> {
         socket: text_of("socket"),
         started_ms: get("started_ms").and_then(|v| v.parse().ok()).unwrap_or(0),
         caps: get("caps").map(|r| list_of_strings(&r)).unwrap_or_default(),
+        restart_parent: get("restart_parent").and_then(|v| v.parse().ok()),
         fields,
     })
 }
@@ -235,7 +244,7 @@ pub fn apps_in(registry: &std::path::Path) -> Vec<App> {
     out
 }
 
-/// `spec` is a pid, an app name (of several with that name the most recent: highest pid) or a
+/// `spec` is a pid (of the process or the parent it stands behind: [`App::answers_to`]), an app name (of several with that name the most recent: highest pid) or a
 /// `tcp:` socket a discovery file names.
 pub fn find(spec: &str) -> Option<App> {
     let list = apps();
@@ -244,13 +253,21 @@ pub fn find(spec: &str) -> Option<App> {
         return list.into_iter().rfind(|a| a.socket == spec);
     }
     match spec.parse::<u32>() {
-        Ok(pid) => list.into_iter().find(|a| a.pid == pid),
+        Ok(pid) => list.into_iter().find(|a| a.answers_to(pid)),
         Err(_) => list.into_iter().rfind(|a| a.app == spec),
     }
 }
 
 #[cfg(test)]
 mod rewrite_tests {
+    #[test]
+    fn a_run_answers_to_the_parent_it_stands_behind() {
+        let run = super::parse("{\"pid\":7,\"app\":\"x\",\"socket\":\"/s\",\"caps\":[],\"restart_parent\":3}\n").unwrap();
+        assert!(run.answers_to(7) && run.answers_to(3) && !run.answers_to(4));
+        let plain = super::parse("{\"pid\":7,\"app\":\"x\",\"socket\":\"/s\",\"caps\":[]}\n").unwrap();
+        assert!(plain.answers_to(7) && !plain.answers_to(3));
+    }
+
     #[test]
     fn caps_follow_a_later_registration() {
         let file = std::env::temp_dir().join(format!("makepad-remote-caps-test-{}.json", std::process::id()));

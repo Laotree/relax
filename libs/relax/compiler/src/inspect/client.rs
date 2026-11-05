@@ -8,15 +8,11 @@
 
 use std::io::Write;
 
-pub struct App {
-    pub pid: u32,
-    pub app: String,
-    pub socket: String,
-}
+pub use makepad_remote::discovery::App;
 
 /// The running apps (discovery files `makepad-remote-<pid>.json`; stale ones of ended processes are removed).
 pub fn apps() -> Vec<App> {
-    makepad_remote::discovery::apps().into_iter().map(|a| App { pid: a.pid, app: a.app, socket: a.socket }).collect()
+    makepad_remote::discovery::apps()
 }
 
 fn usage() -> i32 {
@@ -75,7 +71,7 @@ pub fn main(args: &[String]) -> i32 {
     }
     let list = apps();
     let chosen: Vec<&App> = match target.parse::<u32>() {
-        Ok(pid) => list.iter().filter(|a| a.pid == pid).collect(),
+        Ok(pid) => list.iter().filter(|a| a.answers_to(pid)).collect(),
         Err(_) => list.iter().filter(|a| &a.app == target).collect(),
     };
     let app = match chosen.as_slice() {

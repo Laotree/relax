@@ -3,7 +3,9 @@
 //! the child of a thin parent, the first `makepad.exe`: that one starts the run, waits for it and
 //! passes on its exit code. To restart, the run writes the next run's command to a file and exits
 //! with [`RESTART_EXIT`]; the parent starts it. The old process is gone before the new one opens the
-//! disk cache, the waiters see one process, and the run's pid changes with each restart.
+//! disk cache, the waiters see one process, and the run's pid changes with each restart. The parent's
+//! pid is the one that stays, and the one whoever started the run holds: the run's discovery file
+//! names it, so that pid finds the run (`makepad_remote::discovery::App::answers_to`).
 use std::ffi::{OsStr, OsString};
 
 /// The exit code with which a run asks its parent to start the next one.
@@ -15,8 +17,21 @@ const RESTART_EXIT: u32 = 0x4D50_5253;
 #[cfg(windows)]
 const FILE_ENV: &str = "MAKEPAD_RUN_RESTART_FILE";
 
+/// The parent's pid, set and taken out with [`FILE_ENV`].
+#[cfg(windows)]
+const PARENT_ENV: &str = "MAKEPAD_RUN_RESTART_PARENT";
+
 #[cfg(windows)]
 static FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
+static PARENT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// The pid of the parent this run stands behind; None for a process without one.
+#[cfg(windows)]
+pub(crate) fn parent_pid() -> Option<u32> {
+    PARENT.get().copied()
+}
 
 /// Whether the command line `args` (with the program's name first) is a run that can restart: the
 /// same runs as `driver_options.live` in run.rs, as far as a command line tells.
@@ -142,6 +157,10 @@ pub fn enter(args: &[Vec<u8>]) {
     if let Some(file) = std::env::var_os(FILE_ENV) {
         std::env::remove_var(FILE_ENV);
         let _ = FILE.set(std::path::PathBuf::from(file));
+        if let Some(pid) = std::env::var_os(PARENT_ENV).and_then(|p| p.to_str()?.parse().ok()) {
+            let _ = PARENT.set(pid);
+        }
+        std::env::remove_var(PARENT_ENV);
         return;
     }
     if can_restart(args) {
@@ -172,7 +191,7 @@ fn parent(args: &[Vec<u8>]) -> ! {
     let mut next = Next { program: exe.into_os_string(), args: words, dir, envs: std::env::vars_os().collect() };
     loop {
         let mut cmd = std::process::Command::new(&next.program);
-        cmd.args(&next.args).env_clear().envs(next.envs.iter().map(|(k, v)| (k, v))).env(FILE_ENV, &file);
+        cmd.args(&next.args).env_clear().envs(next.envs.iter().map(|(k, v)| (k, v))).env(FILE_ENV, &file).env(PARENT_ENV, std::process::id().to_string());
         if !next.dir.is_empty() {
             cmd.current_dir(&next.dir);
         }

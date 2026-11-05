@@ -119,13 +119,17 @@ impl<const N: usize> Kind for G<N> {
 pub struct Buf {
     pub data: [u8; CONST_ARR],
 }
+// Its own name: a same-named const that only values read would restart too (by name).
+pub trait LenKind {
+    const LK: u64;
+}
 pub struct D1;
-impl Kind for D1 {
-    const K: u64 = 1;
+impl LenKind for D1 {
+    const LK: u64 = 1;
 }
 #[repr(C)]
 pub struct BufK {
-    pub data: [u8; <D1 as Kind>::K as usize],
+    pub data: [u8; <D1 as LenKind>::LK as usize],
 }
 
 // An impl comes or goes. A type's Drop decides what generic code folds and which glue it runs, and
@@ -162,3 +166,80 @@ pub fn tiny() -> u64 {
 pub fn late_tiny() -> u64 {
     1
 }
+
+#[inline(always)]
+pub fn late_always() -> u64 {
+    1
+}
+
+pub const CONST_NONLIT: u64 = 1 + 0;
+
+pub const CONST_DISCR: isize = 1;
+#[repr(isize)]
+pub enum Dsc {
+    One = CONST_DISCR,
+}
+
+pub const CONST_ARR_BASE: usize = 1;
+pub const CONST_ARR_DER: usize = CONST_ARR_BASE * 2;
+
+pub const CONST_FOR_STATIC: u64 = 1;
+pub static STATIC_FROM_CONST: u64 = CONST_FOR_STATIC;
+
+pub const CONST_FOR_FN: u64 = 1;
+pub const fn through_fn() -> u64 {
+    CONST_FOR_FN
+}
+pub static STATIC_THROUGH_FN: u64 = through_fn();
+
+// Array lengths whose text does not name the const.
+pub const CONST_LEN_FN: usize = 1;
+pub const fn len_fn() -> usize {
+    CONST_LEN_FN
+}
+#[repr(C)]
+pub struct BufFn {
+    pub data: [u8; len_fn()],
+}
+pub const CONST_LEN_MAC: usize = 1;
+macro_rules! len_mac {
+    () => {
+        CONST_LEN_MAC
+    };
+}
+#[repr(C)]
+pub struct BufMac {
+    pub data: [u8; len_mac!()],
+}
+pub const CONST_LEN_AL: usize = 1;
+mod al {
+    pub use super::CONST_LEN_AL as RENAMED_LEN;
+}
+#[repr(C)]
+pub struct BufAl {
+    pub data: [u8; al::RENAMED_LEN],
+}
+
+// A static's initializer names another type's `new`; and one that does read the edit through its own.
+pub const CONST_FOR_NEW: u64 = 1;
+pub struct ForNew(pub u64);
+impl ForNew {
+    pub const fn new() -> Self {
+        ForNew(CONST_FOR_NEW)
+    }
+}
+pub struct OtherNew(pub u64);
+impl OtherNew {
+    pub const fn new() -> Self {
+        OtherNew(7)
+    }
+}
+pub static STATIC_OTHER_NEW: OtherNew = OtherNew::new();
+pub const CONST_THROUGH_NEW: u64 = 1;
+pub struct ViaNew(pub u64);
+impl ViaNew {
+    pub const fn new() -> Self {
+        ViaNew(CONST_THROUGH_NEW)
+    }
+}
+pub static STATIC_THROUGH_NEW: ViaNew = ViaNew::new();

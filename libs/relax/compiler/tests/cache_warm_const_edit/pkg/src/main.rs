@@ -1,6 +1,8 @@
 // Prints "out tick <n> <probe>=<value> .." every 20 ms; tests/cache_warm_const_edit/run.py edits the
 // values while it runs. WARM_EDIT_ONCE=1: one line, then exit; =fill: past the startup window it
 // first calls the late readers, so their code is stored but not part of the startup image.
+// =many: the startup has slots no other run has, and stays past the mid-run write: this text gets a
+// startup manifest of its own.
 // Otherwise the late readers run once the file WARM_EDIT_LATE names exists: their stored code is
 // first linked after the edit.
 mod values;
@@ -193,6 +195,11 @@ fn body_late() -> u64 {
 }
 
 #[inline(never)]
+fn always_late() -> u64 {
+    values::late_always()
+}
+
+#[inline(never)]
 fn const_late() -> u64 {
     values::CONST_LATE
 }
@@ -202,8 +209,88 @@ fn static_late() -> u64 {
     values::STATIC_LATE
 }
 
+#[inline(never)]
+fn every_direct() -> u64 {
+    warm_const_dep::EVERY
+}
+
+#[inline(never)]
+fn every_fn() -> u64 {
+    warm_const_dep::every_fn()
+}
+
+#[inline(never)]
+fn every_inlined() -> u64 {
+    warm_const_dep::every_small()
+}
+
+#[inline(never)]
+fn every_generic() -> u64 {
+    warm_const_dep::every_generic::<u32>()
+}
+
+#[inline(never)]
+fn every_closure() -> u64 {
+    let f = || warm_const_dep::EVERY;
+    black_box(f)()
+}
+
+#[inline(never)]
+fn every_assoc() -> u64 {
+    <warm_const_dep::EveryT as warm_const_dep::EveryK>::E
+}
+
+#[inline(never)]
+fn every_derived() -> u64 {
+    warm_const_dep::EVERY_DERIVED
+}
+
+#[inline(never)]
+fn const_nonliteral() -> u64 {
+    values::CONST_NONLIT
+}
+
+#[inline(never)]
+fn const_discr() -> u64 {
+    values::Dsc::One as isize as u64
+}
+
+#[inline(never)]
+fn static_from_const() -> u64 {
+    *black_box(&values::STATIC_FROM_CONST)
+}
+
+#[inline(never)]
+fn static_through_fn() -> u64 {
+    *black_box(&values::STATIC_THROUGH_FN)
+}
+
+extern "C" {
+    fn relax_first_present();
+}
+
+#[inline(never)]
+fn many_one<const N: usize>() -> u64 {
+    black_box(N as u64)
+}
+
+macro_rules! many {
+    ($($n:literal)*) => { 0 $(+ many_one::<{ $n }>() + many_one::<{ 100 + $n }>() + many_one::<{ 200 + $n }>() + many_one::<{ 300 + $n }>())* };
+}
+
+#[inline(never)]
+fn many() -> u64 {
+    many!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49)
+}
+
 fn main() {
     let once = std::env::var("WARM_EDIT_ONCE").ok();
+    if once.as_deref() == Some("many") {
+        black_box(many());
+        // what a window's first present tells the JIT: the mid-run write then makes the manifest
+        unsafe { relax_first_present() };
+        std::thread::sleep(std::time::Duration::from_millis(5500));
+    }
     let late_file = std::env::var("WARM_EDIT_LATE").unwrap_or_default();
     let mut n: u64 = 0;
     loop {
@@ -212,7 +299,8 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_millis(5500));
         }
         let late = once.as_deref() == Some("fill") || (!late_file.is_empty() && std::path::Path::new(&late_file).exists());
-        let (const_late, static_late, body_late) = if late { (const_late(), static_late(), body_late()) } else { (0, 0, 0) };
+        let every_late = if late { warm_const_dep::every_late() } else { 0 };
+        let (const_late, static_late, body_late, always_late) = if late { (const_late(), static_late(), body_late(), always_late()) } else { (0, 0, 0, 0) };
         let row = [
             ("const_direct", const_direct()),
             ("const_through", const_through()),
@@ -253,9 +341,33 @@ fn main() {
             ("static_direct", static_direct()),
             ("static_through", static_through()),
             ("body_inlined", body_inlined()),
+            ("const_nonliteral", const_nonliteral()),
+            ("const_discr", const_discr()),
+            ("const_array_derived", size_arg::<[u8; values::CONST_ARR_DER]>()),
+            ("static_from_const", static_from_const()),
+            ("static_through_fn", static_through_fn()),
+            ("const_other_new", values::ForNew::new().0 + values::STATIC_OTHER_NEW.0 - 7),
+            ("static_through_new", values::STATIC_THROUGH_NEW.0),
+            ("const_array_fn", size_arg::<values::BufFn>()),
+            ("const_array_macro", size_arg::<values::BufMac>()),
+            ("const_array_alias", size_arg::<values::BufAl>()),
+            ("const_dep_array", size_arg::<warm_const_dep::DepBuf>()),
+            ("const_dep_generic", warm_const_dep::dep_generic()),
+            ("const_dep_generic_field", size_arg::<warm_const_dep::DepHolder>()),
+            ("const_dep_generic_alias", size_arg::<warm_const_dep::DepAl>()),
+            ("const_dep_in_main_type", size_arg::<[u8; warm_const_dep::DEP_FOR_MAIN]>()),
+            ("every_direct", every_direct()),
+            ("every_fn", every_fn()),
+            ("every_inlined", every_inlined()),
+            ("every_generic", every_generic()),
+            ("every_closure", every_closure()),
+            ("every_assoc", every_assoc()),
+            ("every_derived", every_derived()),
+            ("every_late", every_late),
             ("const_late", const_late),
             ("static_late", static_late),
             ("body_late", body_late),
+            ("always_late", always_late),
         ];
         let mut line = format!("out tick {n}");
         for (name, v) in row {
