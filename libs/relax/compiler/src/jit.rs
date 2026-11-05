@@ -25277,8 +25277,8 @@ mod front_yield_tests {
 
     /// As many jobs as CPU tokens, each with its token, all calling one fn whose speculative build
     /// (Background, in flight) sits out a checkpoint for them: the build needs a token and they wait
-    /// for the build. Budget::acquire held it for good on a plate's slice (2026-11-04): nothing moved
-    /// until the process died. `callers` of the jobs call; the others keep their tokens, running.
+    /// for the build. Budget::acquire held it for good: nothing moved until the process died.
+    /// `callers` of the jobs call; the others keep their tokens, running.
     /// `jobs` is the tokens left beside the other compile job and the build.
     /// Returns once the callers are on their way: the jobs, and the callers still to end.
     fn jobs_on_every_token(up: usize, slot: u32, jobs: usize, callers: usize) -> (Vec<std::thread::JoinHandle<u64>>, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
@@ -25388,8 +25388,8 @@ mod front_yield_tests {
     }
 
     /// The app's jobs hold every token and run on, waiting for nothing: a speculative build queued
-    /// behind them still runs, beside them and taking no token. (Tier-ups waited 240 s behind a
-    /// slicer's plan on a 16-core machine, so the slice ran on slow code the whole way.)
+    /// behind them still runs, beside them and taking no token: a tier-up does not wait for a busy
+    /// pool, which would leave its work on slow code.
     #[test]
     fn a_compile_job_runs_beside_jobs_on_every_token() {
         isolated_test!(a_compile_job_runs_beside_jobs_on_every_token);
