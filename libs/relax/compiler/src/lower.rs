@@ -13383,8 +13383,8 @@ fn ext_block_made(blk: u64) {
 }
 
 /// What this module holds of a run, as a fresh process has it (`run_end`): the blocks of a run
-/// that ended went with its values, and a word of the next run's that holds one's address
-/// (what its memory held) names no block.
+/// that ended went with its heap (rt_ext_get), and a word of the next run's that holds one's
+/// address (what its memory held) names no block.
 pub(crate) unsafe fn reset_statics() {
     relax_session::reset_static(&EXT_BLOCKS, relax_session::sync::Mutex::new(None));
 }
@@ -13398,9 +13398,12 @@ rt_fn! {
     /// The extension block behind ext word `slot` (M10), allocated (zeroed) or grown to `size`
     /// (the fields it held keep their offsets); the caller sets the fields beyond its count.
     /// The header: fields set (u32), capacity (u32), alignment (u32), whether the value set its
-    /// dead slots (u32: its word was EXT_BUILT when the block was made).
+    /// dead slots (u32: its word was EXT_BUILT when the block was made). A block is the run's
+    /// (the run phase: the calling thread's domain heap), so one whose value died without its
+    /// drop goes with the run's heap, as the value's memory does.
     pub fn rt_ext_get(slot: u64, size: u64, align: u64) -> u64 {
         unsafe {
+            let _run = relax_session::phase::run();
             let slot = slot as *mut u64;
             let word = *slot;
             let cur = ext_word_block(word);
@@ -15454,6 +15457,40 @@ mod query_drop_tests {
         assert_eq!(ext_word_block(word), 0, "a block of a run that ended is no block of the next one");
         rt_ext_free(word);
         assert_eq!(ext_word_block(word), 0);
+    }
+
+    /// A run's extension blocks are in its heap, made and grown there by its threads: a value that
+    /// dies without its drop leaves no block behind, and the next run's heap holds none of them.
+    #[test]
+    fn the_next_runs_heap_holds_no_extension_blocks_of_the_run_before() {
+        isolated_test!(the_next_runs_heap_holds_no_extension_blocks_of_the_run_before);
+        use crate::zone_alloc::domain::{self, DomainHeap};
+        // (decided at the first compile; this process has not compiled)
+        assert!(crate::zone_alloc::compiler_arena_enabled(), "premise: heaps are routed");
+        let run = DomainHeap::new().expect("a domain heap");
+        let (base, size) = run.range();
+        let held = run.stats().0;
+        let at = &*run as *const DomainHeap as usize;
+        // a thread of the run: a value gets its block, which grows, and the value dies undropped
+        let (made, grown, word) = std::thread::spawn(move || unsafe {
+            domain::enter(at as *const DomainHeap);
+            let mut word = 0u64;
+            let made = rt_ext_get(&mut word as *mut u64 as u64, 32, 16);
+            let grown = rt_ext_get(&mut word as *mut u64 as u64, 4096, 16);
+            domain::enter(std::ptr::null());
+            (made, grown, word)
+        }).join().unwrap();
+        let in_run = |b: u64| (b as usize).wrapping_sub(base) < size;
+        assert!(in_run(made) && in_run(grown), "blocks {made:#x} {grown:#x} outside the run's heap {base:#x}+{size:#x}");
+        assert!(made != grown && ext_word_block(word) == grown);
+        assert!(run.stats().0 >= held + 4096, "the run's heap holds the grown block: {} -> {}", held, run.stats().0);
+        // the run ends: its blocks go with its heap
+        unsafe { reset_statics() };
+        drop(run);
+        let next = DomainHeap::new().expect("the next run's heap");
+        assert_eq!(next.stats().0, 0, "the next run's heap starts empty");
+        assert_eq!(ext_word_block(word), 0, "the old block's address names no block of the next run");
+        rt_ext_free(word);
     }
     #[test]
     fn extension_blocks_are_freed_once_for_trivial_values_and_aggregates() {
