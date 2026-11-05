@@ -285,7 +285,7 @@ fn a_lent_token_runs_a_waiter_and_comes_back_at_once_on_the_same_permit() {
     until(&b, &changed, |s| s.waiters.len() == 1);
     assert!(b.should_yield(p), "the waiter wants the sleeper's token");
     assert!(b.lend());
-    assert!(!b.lend(), "a nested wait has nothing to lend, and so ends nothing");
+    assert!(!b.lend(), "nothing more to lend");
     assert_eq!(rx.recv().unwrap(), 1, "the waiter was admitted on the lent token");
     assert!(b.report().contains("1 lent"), "{}", b.report());
     {
@@ -306,6 +306,33 @@ fn a_lent_token_runs_a_waiter_and_comes_back_at_once_on_the_same_permit() {
     assert!(!b.should_yield(p));
     b.release(p);
     assert_eq!(b.state.lock().unwrap().running, 0);
+}
+
+/// Waits nest on a thread: a program thread in `relax_wait_enter` compiles the futex call it is about
+/// to make and that build's wait lends again, and a job back from a wait holds for a pause under the
+/// wait's own guard. The token stays lent until the outermost wait ends, and comes back then.
+#[test]
+fn a_wait_inside_a_wait_ends_with_the_outer_one_and_the_token_comes_back() {
+    let permit = admit(VISIBLE, APP, "nested waits");
+    let lent = || tokens().holders.iter().find(|h| h.thread == me()).unwrap().lent;
+    // as BudgetWait: a take_back only for a lend that said so
+    let outer = lend();
+    assert!(outer && lent());
+    let inner = lend();
+    if inner { take_back(); }
+    assert!(lent(), "the inner wait's end does not end the outer wait");
+    take_back();
+    assert!(!lent(), "the outer wait's end brings the token back");
+    // as relax_wait_enter and relax_wait_leave: every enter has its leave
+    lend();
+    lend();
+    take_back();
+    assert!(lent(), "the inner leave does not end the outer wait");
+    take_back();
+    assert!(!lent(), "the outer leave brings the token back");
+    assert_eq!(tokens().running, 1);
+    release(permit);
+    assert_eq!(tokens().running, 0);
 }
 
 /// The owner waits for a build for a compile job it serves: that job's token goes to the build, on
