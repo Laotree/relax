@@ -20223,6 +20223,16 @@ pub(crate) fn live_startup_done() -> bool {
     FIRST_PRESENT.load(Ordering::Acquire)
         || LIVE_STARTUP_DONE.load(Ordering::Acquire) && !LIVE_NEEDS_PRESENT.load(Ordering::Acquire)
 }
+
+/// A program that never presents (no makepad_platform, or a batch program) reached the point a
+/// present marks for an app: its startup went quiet (live_startup_done). Its warm record (crate
+/// records and front graph, then the collected program: run.rs's mid-run writer) is written from
+/// here, on the writers' threads, as an app's is after its first present, not only at its exit.
+fn headless_started() {
+    if !FIRST_PRESENT.load(Ordering::Acquire) && live_startup_done() {
+        crate::cache::start_deferred_front();
+    }
+}
 /// A program that has not presented and made no demand compile for this long is headless:
 /// its startup phase ends (startup_main).
 const STARTUP_QUIET_NS: u64 = 2_000_000_000;
@@ -20243,6 +20253,7 @@ pub(crate) fn batch_program() {
     HEADLESS.store(true, Ordering::Release);
     live_needs_present(false);
     tier_wake_all();
+    headless_started();
 }
 static STARTUP_THREAD: std::sync::OnceLock<std::thread::Thread> = std::sync::OnceLock::new();
 
@@ -20389,6 +20400,7 @@ pub fn startup_main(presents: bool) {
             std::thread::park_timeout(std::time::Duration::from_nanos(left.max(50_000_000)));
         }
         LIVE_STARTUP_DONE.store(true, Ordering::Release);
+        headless_started();
         if !startup_phase() { return; }
         relax_codegen::fncost::mark(if FIRST_PRESENT.load(Ordering::Acquire) {
             "startup released: present"

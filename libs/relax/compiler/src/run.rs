@@ -3041,6 +3041,13 @@ fn try_settle(drops: &mut jit::SettleDrops, trim: bool) -> bool {
     retired.is_some()
 }
 
+/// The warm record's pass (start_monitor) goes once the UI thread waited on the JIT for at most
+/// RECORD_UI_WAIT_NS in the last RECORD_UI_WINDOW_NS, and does not wait now: a page's first visit
+/// waits for seconds in a row; after it a frame reaches a new fn now and then (Fab: one or two
+/// sub-ms waits a second, for seconds after its burst).
+const RECORD_UI_WINDOW_NS: u64 = 500_000_000;
+const RECORD_UI_WAIT_NS: u64 = 5_000_000;
+
 /// The background loop's reclamation pass (jit::settle_drop) runs at most this often after the
 /// first present.
 const SETTLE_DROP_EVERY_NS: u64 = 2_000_000_000;
@@ -3091,6 +3098,9 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         // compiles (5 s after the last write), or every 10 s while compiles go on
         let (mut mid_quiet, mut mid_seen, mut mid_flushed, mut mid_last) = (0u32, u64::MAX, 0u64, 0u64);
         let mid_busy = std::sync::Arc::new(AtomicBool::new(false));
+        // (wall ns, the UI thread's JIT wait ns so far) per tick: its waits over the last
+        // RECORD_UI_WINDOW_NS, which the warm record's pass waits on
+        let mut ui_marks: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
         let mut teardown_started = false;
         let _ = MONITOR.set(std::thread::current());
         crate::run_threads::on_end(monitor_wake);
@@ -3153,20 +3163,29 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             // also with no new code: the manifest whose window closed, the collected program
             let left = !MID_MANIFEST_DONE.load(Ordering::Relaxed) && jit::FIRST_PRESENT.load(Ordering::Acquire) && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed)
                 || !COLLECTED_CURRENT.load(Ordering::Relaxed) && !MID_COLLECTED_TRIED.load(Ordering::Relaxed)
-                || jit::FIRST_PRESENT.load(Ordering::Acquire) && crate::cache::front_graph_pending();
+                || jit::live_startup_done() && crate::cache::front_graph_pending();
             // the warm record (manifest, front graph, collected program) is written as soon
-            // as its pieces are ready after the first present, not after seconds of quiet
+            // as its pieces are ready after the first present (a program that never presents:
+            // once its startup went quiet, jit::live_startup_done), not after seconds of quiet
             // (a cold run compiles O2 code for long after it): users close apps quickly, and
             // a killed run that wrote nothing left every relaunch unrestored. At most once a
             // second; the collected program's encode makes a unit call only when free.
-            let record = left && jit::FIRST_PRESENT.load(Ordering::Acquire) && since >= 1_000;
+            let record = left && jit::live_startup_done() && since >= 1_000;
+            let (wall, ui_waited) = (jit::wall_ns(), crate::postframe::ui_wait_ns());
+            ui_marks.push_back((wall, ui_waited));
+            while ui_marks.len() > 1 && ui_marks[1].0 + RECORD_UI_WINDOW_NS <= wall { ui_marks.pop_front(); }
+            let ui_light = ui_marks.front().is_some_and(|&(t, w)| t + RECORD_UI_WINDOW_NS <= wall && ui_waited.saturating_sub(w) <= RECORD_UI_WAIT_NS)
+                && crate::postframe::ui_idle_ns() != 0;
             // a trickle of first compiles counts as quiet (SettleWatch: a game keeps reaching code)
             let mid_still = mid_quiet >= 20 || settle_watch.slow(jit::demand_compiled());
             let due = n != mid_flushed && ((mid_still && since >= 5_000) || since >= 10_000) || left && mid_still && since >= 5_000;
-            // not while the UI thread is in a burst of lazy compiles after the present: the
-            // write's unit calls cannot be interrupted once served (one held the owner 620 ms
-            // in front of a tab's first visit); it goes in the next pause
-            if start != 0 && (record || main_ms >= 3000 && due) && !jit::ui_burst() && !mid_busy.swap(true, Ordering::SeqCst) {
+            // not while the UI thread is in a burst of lazy compiles after the present (one write
+            // held the owner 620 ms in front of a tab's first visit): it goes in the next pause.
+            // The warm record's pass does not wait for 2 s without a UI wait (jit::ui_burst), only
+            // for the burst's end (ui_light): its owner requests stop at their checks for a
+            // waiting program request, and a frame now and then reaching a new fn held it for
+            // seconds (Fab: 10 s after the present)
+            if start != 0 && (record || main_ms >= 3000 && due) && (if record { ui_light } else { !jit::ui_burst() }) && !mid_busy.swap(true, Ordering::SeqCst) {
                 mid_flushed = n;
                 mid_last = main_ms;
                 let busy = mid_busy.clone();
@@ -3998,7 +4017,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     if !front_recordable() && !MID_COLLECTED_TRIED.swap(true, Ordering::Relaxed) {
         collected_skip("the session was edited live");
     }
-    let graph_ready = jit::FIRST_PRESENT.load(Ordering::Acquire)
+    let graph_ready = jit::live_startup_done()
         && crate::cache::Cache::flush_front_graphs().is_ok();
     // the collected program, once per run and only when the program is quiet (it is encoded
     // under the unit and front-end locks): not at the exit
@@ -4013,36 +4032,44 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         // the cache files' pages the run has resident go first (a settle's trim drops them too):
         // the record's copy of the program comes on top of what the process holds
         crate::pack::release_resident();
-        if let Some((ready, retired_boot, t)) = unit_call(wait, || {
+        if let Some((ready, retired_boot, late_spill, t)) = unit_call(wait, || {
             cprobe.start();
             yield_section("collected");
             let mut ready = None;
             let mut retired_boot = None;
+            let mut late_spill = None;
             let t = Instant::now();
-            let front = jit::front_write_within(if jit::QUIT_SEEN.load(Ordering::Relaxed) { 1000 } else { 50 });
+            // asked at each step and through the encode: a waiting program request (a frame's lazy
+            // compile, a live patch) goes first, and a later pass tries again
+            let stop = || { cprobe.tick("collected"); crate::owner::program_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed) };
+            // the front-end lock: for at most 50 ms, and not while a program request waits for
+            // the owner thread this holds
+            let front = if jit::QUIT_SEEN.load(Ordering::Relaxed) { jit::front_write_within(1000) } else {
+                let t = Instant::now();
+                loop {
+                    if let Some(g) = jit::front_write_within(1) { break Some(g); }
+                    if stop() || t.elapsed() >= std::time::Duration::from_millis(50) { break None; }
+                }
+            };
             if front.is_none() { collected_skip("the front-end lock is busy"); }
             if let Some(_front) = front {
                 let u = unsafe { &mut *up };
                 // files the post-boot loader loaded since this write took its front images (a
                 // run that did not restore loads for seconds after present): their images are
-                // written now, under the locks, so the record can be made in this pass
+                // taken now, under the locks, so the record can be made in this pass (their store
+                // write runs after the owner thread is released, before the record's commit)
                 if wait && u.prog.files.len() != imaged_files && front_recordable() {
-                    if let Some(c) = u.cache.as_mut() {
+                    if stop() { crates_left = true; } else if let Some(c) = u.cache.as_mut() {
                         push_front_images(&u.prog, c);
-                        let stop = || crate::owner::program_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed);
                         crates_left = !c.record_front_crates_until(&u.prog, &stop);
-                        let written = match c.spill_take() {
-                            Some(s) => s.write().is_ok(),
-                            None => true,
-                        };
-                        if written && !crates_left { imaged_files = u.prog.files.len(); }
+                        late_spill = c.spill_take();
+                        if !crates_left { imaged_files = u.prog.files.len(); }
                     }
                 }
                 if u.prog.files.len() != imaged_files {
                     collected_skip(if crates_left { "the crate records stopped for a program request" } else { "files were loaded since the front images were taken" });
                 }
                 if let Some(c) = u.cache.as_mut().filter(|_| u.prog.files.len() == imaged_files) {
-                    let stop = || { cprobe.tick("collected"); crate::owner::program_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed) };
                     match c.encode_collected(&u.prog, &u.tcx, &stop) {
                         crate::cache::CollectedRecord::Ready(dest, payload) => { MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); ready = Some((u.prog.session.options.verbose.then_some(c.collected_crates(&u.prog)), dest, payload)); }
                         crate::cache::CollectedRecord::Current => { MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); COLLECTED_CURRENT.store(true, Ordering::Relaxed); retired_boot = Some(c.finish_collected()); }
@@ -4052,12 +4079,18 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
                 }
             }
             cprobe.tick("collected end");
-            (ready, retired_boot, t)
+            (ready, retired_boot, late_spill, t)
         }) {
             cprobe.report("collected record");
             verbose!("makepad-run cache: collected record held the owner {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
             drop(retired_boot);
-            if let Some((report, dest, payload)) = ready {
+            // the late files' images are in the store before the record that maps them
+            let late_written = late_spill.map_or(true, |s| s.write().is_ok());
+            if !late_written && ready.is_some() {
+                MID_COLLECTED_TRIED.store(false, Ordering::Relaxed);
+                collected_skip("the late files' front images were not written");
+            }
+            if let Some((report, dest, payload)) = ready.filter(|_| late_written) {
                 if let Some(written) = crate::cache::Cache::commit_collected(report, dest, payload, &|| false) {
                     COLLECTED_CURRENT.store(true, Ordering::Relaxed);
                     crate::zone_alloc::kept_with(|| *COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(written.clone())));
