@@ -696,6 +696,10 @@ impl Cache {
 
 impl Encoder<'_> {
     fn capture_boot<'p>(&self, prog: &'p Program, tcx: &'p Tcx, stop: &dyn Fn() -> bool, why: &mut &'static str) -> Option<CollectedBoot<'p>> {
+        // a live edit's versions (a refused or undone one's too, with their definitions) are in
+        // the tables: they are no boot's (a boot captured before them still is: preserve_collected_boot)
+        *why = "the program holds a live edit's file versions";
+        if prog.has_edit_versions() { return None; }
         *why = "recipe";
         let recipe = self.recipe.or(prog.front_graph.as_ref())?;
         if recipe.crates.len() != prog.crates.len() || recipe.crates.iter().zip(&prog.crates)

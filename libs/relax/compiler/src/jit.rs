@@ -25387,8 +25387,9 @@ pub fn start_background_coherence(u: &Unit) {
             match r {
                 Ok(()) => {
                     if let Some(k) = key {
-                        // a live edit meanwhile: the key names the text this run started with
-                        if crate::infer::diagnostics::DiagCtxt::thread_emitted() == emitted && crate::reload::edited_crates().is_empty() {
+                        // no live edit's versions in the tables it read (a refused or undone
+                        // one's too): the key names the text this run started with
+                        if crate::infer::diagnostics::DiagCtxt::thread_emitted() == emitted && crate::reload::program_edits() == 0 {
                             crate::borrowck::lazy::push_verdict_key(k, crate::borrowck::lazy::StoredVerdict::Clean);
                         }
                     }

@@ -657,6 +657,8 @@ pub unsafe fn rollback(up: *mut Unit, undo: Undo, why: &str) -> Vec<String> {
                 }
             }
         }
+        // (the versions before the patch's: the boot text again, for a first edit)
+        settle_edited_crates(up);
         names
     })
 }
@@ -1934,12 +1936,28 @@ fn layout_edit(u: &Unit, d: DefId, fresh: &crate::tcx::AdtT, running_discriminan
     Ok((adt, notes))
 }
 
-/// The crates of the files this session's edits changed (their code must never come from the
-/// disk cache, whose keys predate the edits).
+/// The crates whose text differs from the text the run booted from: the files of a transaction
+/// in flight, and a kept edit's (a current version of other text, an included file read anew).
+/// Their code must never come from the disk cache, whose keys predate the edits, and the run's
+/// front records wait for them (run::front_recordable). A refused edit leaves no crate edited,
+/// nor does one that puts the boot text back (settle_edited_crates).
 static EDITED_CRATES: relax_session::sync::Mutex<Vec<u32>> = relax_session::sync::Mutex::new(Vec::new());
+/// The crates a kept edit read an included file of anew: a version's text does not show what
+/// its includes held, so they stay edited.
+static INCLUDES_EDITED: relax_session::sync::Mutex<Vec<u32>> = relax_session::sync::Mutex::new(Vec::new());
+/// Live edit transactions that changed the program's tables (committed a file version, kept or
+/// not). From the first one on the tables are not the boot's, with every edit refused or undone
+/// too (the versions and definitions stay loaded): what a check began before one, or found
+/// after one, does not describe the boot.
+static PROGRAM_EDITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn edited_crates() -> Vec<u32> {
     EDITED_CRATES.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// PROGRAM_EDITS.
+pub(crate) fn program_edits() -> u64 {
+    PROGRAM_EDITS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 fn note_edited_crates(u: &Unit, files: &[u32]) {
@@ -1950,6 +1968,31 @@ fn note_edited_crates(u: &Unit, files: &[u32]) {
                 g.push(c);
             }
         }
+    }
+}
+
+/// A transaction ended, or a patch was rolled back: a crate stays edited while a file of it has
+/// a current version whose text is not its boot version's, or a kept edit read its includes
+/// anew. Before a crate stops being edited the keys follow the text back if a const edit moved
+/// them (its walk covers the crate while it still is edited): an interface its item edit had
+/// would stay in them. On the owner thread.
+unsafe fn settle_edited_crates(up: *mut Unit) {
+    let prog = &(*up).prog;
+    let mut differ = INCLUDES_EDITED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for (&boot, &now) in prog.current_versions() {
+        let path = &prog.file_paths[boot as usize];
+        if prog.files[now as usize].source_hash(path) != prog.files[boot as usize].source_hash(path) {
+            differ.push(prog.file_crate[boot as usize]);
+        }
+    }
+    let clean: Vec<u32> = edited_crates().into_iter().filter(|c| !differ.contains(c)).collect();
+    if clean.is_empty() { return; }
+    crate::cache::rekey_if_moved(up);
+    EDITED_CRATES.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| !clean.contains(c));
+    if live_trace() {
+        let prog = &(*up).prog;
+        let names = |cs: &[u32]| cs.iter().map(|&c| prog.syms.str(prog.crates[c as usize].name).to_string()).collect::<Vec<String>>().join(", ");
+        eprintln!("makepad live: not edited (the text the run booted from): {}; edited: [{}]", names(&clean), names(&edited_crates()));
     }
 }
 
@@ -3136,11 +3179,19 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, sources: &[Edit], partial:
             Outcome { failure: Some(makepad_remote::hot::Outcome::Panic), kept: 0, pending: false, rung: Rung::Restart, files, lines: vec![format!("internal compiler error applying the edit: {} -- makepad run bug, report it; the app restarts (a fresh process)", msg)], names: Vec::new(), changed: 0, test_changes: None, group: 0, ms: [0.0; 4], undo: None, work: [0; 5] }
         }
     };
+    if r.rung != Rung::Patch { crate::sip::restore_late_files(&late); }
+    // a kept edit that read an included file anew (its versions' text does not show it)
+    let read_anew = r.rung == Rung::Patch && (!sources.is_empty() || crate::sip::late_file_records().iter().any(|(c, n, h)| late.iter().any(|(c0, n0, h0)| c0 == c && n0 == n && h0 != h)));
+    if read_anew {
+        let mut g = INCLUDES_EDITED.lock().unwrap_or_else(|e| e.into_inner());
+        for c in edited_crates() { if !g.contains(&c) { g.push(c); } }
+    }
     crate::owner::call(crate::owner::Class::Program, || {
         (*up).reload_rir = None;
         jit::close_patch();
+        // (a panic's transaction left the tables half-made: its crates stay edited)
+        if !matches!(r.failure, Some(makepad_remote::hot::Outcome::Panic)) { settle_edited_crates(up); }
     });
-    if r.rung != Rung::Patch { crate::sip::restore_late_files(&late); }
     transaction.finish(&r);
     r
 }
@@ -3995,6 +4046,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             eprintln!("reload-front-wait: {:.1} ms (t={:.0}..{:.0} ms)", (now - wait_from) as f64 / 1e6, wait_from as f64 / 1e6, now as f64 / 1e6);
         }
         trace_stage("front_write_wait");
+        // (the tables are not the boot's from here on, kept or refused: PROGRAM_EDITS)
+        if !versions.is_empty() { PROGRAM_EDITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
         let from = u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst);
         trace_stage("gandalf_carry");
         for (v, plan) in versions {
@@ -8412,6 +8465,8 @@ pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     host::reset_statics();
     reset(&EDITED_CRATES, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&INCLUDES_EDITED, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&PROGRAM_EDITS, std::sync::atomic::AtomicU64::new(0));
     reset(&RESTART_SUPPORTED, std::sync::atomic::AtomicBool::new(false));
     reset(&LAYOUT_GROUP, std::sync::atomic::AtomicU32::new(0));
     reset(&UNIT_SUSPECT, relax_session::sync::Mutex::new(None));

@@ -3671,8 +3671,10 @@ pub(crate) fn main_start_wall() -> u64 {
 }
 
 /// Front images, crate records and the collected graph describe the sources the run booted
-/// from. A live session records them too, until its first edit: from then on the Program holds
-/// reloaded file versions that are not the crate versions its stores are named after.
+/// from. A live session records them too while no crate is edited: a kept edit's Program holds
+/// reloaded file versions that are not the crate versions its stores are named after. (A refused
+/// edit, or one that puts the boot text back, leaves no crate edited. Its versions stay in the
+/// tables: the collected program is not recorded from them, cache capture_boot.)
 pub(crate) fn front_recordable() -> bool {
     crate::reload::edited_crates().is_empty()
 }
@@ -3839,6 +3841,8 @@ static CHECK_RECORDS_COLLECTED: AtomicBool = AtomicBool::new(false);
 pub(crate) fn push_front_images(prog: &crate::program::Program, c: &mut crate::cache::Cache) -> usize {
     let mut n = 0;
     for i in 0..prog.files.len() {
+        // (a live edit's version: an eager parse, whose ids are not a boot parse's -- cache enc_file)
+        if prog.is_edit_version(i as u32) { continue; }
         let f = &prog.files[i];
         let (Some(path), Some(&krate)) = (prog.file_paths.get(i), prog.file_crate.get(i)) else { continue };
         let part = f.part.get().and_then(|p| p.image.as_ref());
