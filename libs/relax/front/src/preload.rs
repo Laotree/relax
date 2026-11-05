@@ -248,6 +248,10 @@ enum Work {
 }
 
 impl Pool {
+    /// The demand plan's outline macro definitions of crate `ci` (PendingPlan::outline_macros).
+    pub(crate) fn outline_macros(&self, ci: u32) -> Option<Vec<MacroRef>> {
+        self.demand_plan.as_ref()?.outline_macros(ci as usize + self.plan_offset)
+    }
     /// Set queued jobs' scope; entering the crate replaces an early snapshot with the loader's.
     pub fn start_parsing(&self, ci: u32, table: Arc<MacroTable>) {
         let mut st = self.st.lock().unwrap();

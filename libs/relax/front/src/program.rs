@@ -1782,13 +1782,55 @@ impl Program {
                 (pf, used.unwrap(), None)
             }
         };
+        // A lookup that found no definition of the table may name one an expansion writes in a
+        // file the load reaches later or defers (`#[macro_use] mod defs;` before the call, its
+        // macro_rules! written by a macro): the crate's outline (the demand plan's expansion of
+        // its module tree) has it. Parse again with the outline's definitions of those names
+        // when one changes a lookup this parse made. They are this file's parse table only:
+        // the load publishes each definition when it reaches its file.
+        let mut parse_table = self.macros.clone();
+        let mut outline = None;
+        while !self.cur_image {
+            // (a name the crate defines already is one its textual scope does not reach here, one
+            // a `use .. as` of the crate binds resolves through that import, and a built-in's is
+            // no macro_rules!: no outline changes those, and the load does not wait for the plan)
+            let mut missing = used.failed_lookups();
+            missing.retain(|n| !parse_table.defs.get(n).is_some_and(|defs| defs.iter().any(|d| d.krate == kname)) && !used.local.iter().any(|d| &d.name == n)
+                && !parse_table.aliases.get(&kname).is_some_and(|a| a.contains_key(n))
+                && !BUILTIN_MACROS.contains(&n.as_str()) && crate::builtins::macro_def_for(&kname, n).is_none());
+            if missing.is_empty() { break; }
+            let defs = outline.get_or_insert_with(|| self.pool.as_ref().and_then(|p| p.outline_macros(self.cur_ahead)));
+            if tr { eprintln!("boot-trace-outline: {path} unresolved {missing:?}, outline {:?}", defs.as_ref().map(|d| d.iter().filter(|d| missing.contains(&d.name)).map(|d| format!("{}@{}:{}", d.name, d.def_file, d.def_pos)).collect::<Vec<_>>())); }
+            let Some(defs) = defs else { break };
+            let mut table = parse_table.clone();
+            let next = std::sync::Arc::make_mut(&mut table);
+            let mut added = false;
+            for d in defs.iter().filter(|d| missing.contains(&d.name) && d.def_file != path) {
+                if !next.defs.get(&d.name).is_some_and(|known| known.iter().any(|k| k.krate == d.krate && k.def_file == d.def_file && k.def_pos == d.def_pos)) {
+                    next.push(d.clone());
+                    added = true;
+                }
+            }
+            if !added || used.replays(&table, &kname, path) { break; }
+            let bctx = std::rc::Rc::new(crate::builtins::FileCtx::new(&kname, path, &self.cur_mod_path, &self.crates[krate as usize].cfg));
+            let (fresh, uses) = self.crates[krate as usize].context.parse_input(
+                pf.src[..pf.src_len as usize].to_vec(), None, edition,
+                Some(crate::macros::MacroScope::new(table.clone())), bctx, crate::parser::lazy_auto(),
+            )?;
+            parse_table = table;
+            pf = fresh;
+            used = uses.unwrap();
+            prep = None;
+            PARSE_AGAIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if tr { eprintln!("boot-trace-reparse: {path} (outline macros) {missing:?}"); }
+        }
         // Attribute/item expansions can export macros used by an earlier signature.
         // Revisit that parse only when publishing its own macro surface changes a
         // recorded lookup. Rebuild from the incoming table so discarded expansions
         // cannot leave stale definitions behind.
-        let mut parse_table = self.macros.clone();
+        let incoming = parse_table.clone();
         while pf.ast.tys.iter().any(|t| matches!(t, Ty::Mac(_))) {
-            let mut table = self.macros.clone();
+            let mut table = incoming.clone();
             let next = std::sync::Arc::make_mut(&mut table);
             for d in &used.local {
                 if !next.defs.get(&d.name).is_some_and(|defs| defs.iter().any(|known| std::sync::Arc::ptr_eq(known, d))) {
