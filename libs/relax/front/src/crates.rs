@@ -540,9 +540,32 @@ pub fn set_crate_env(name: &str, env: Vec<(String, String)>) {
     t.push((name.to_string(), env));
 }
 
+/// cargo's `[env]` configuration as it applies to the run (resolve::cargo_env): every crate's
+/// compile-time environment and every build script's take it after the variables cargo sets
+/// itself (cargo apply_env_config: a crate's cargo variables and build-script rustc-env win).
+/// Set by `makepad run` / `check` for its workspace; a build script's own run has it in its
+/// process environment.
+static CONFIG_ENV: relax_session::sync::Mutex<Vec<(String, String)>> = relax_session::sync::Mutex::new(Vec::new());
+
+pub fn set_config_env(env: Vec<(String, String)>) {
+    // the table lives for the run: filled in the kept phase
+    let _k = crate::zone_alloc::kept();
+    *CONFIG_ENV.lock().unwrap() = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+}
+
+/// The `[env]` entries that apply (set_config_env).
+pub fn config_env() -> Vec<(String, String)> {
+    CONFIG_ENV.lock().unwrap().clone()
+}
+
+/// `key`'s `[env]` value (set_config_env).
+pub fn config_env_value(key: &str) -> Option<String> {
+    CONFIG_ENV.lock().unwrap().iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+}
+
 /// Value of `env!(key)` / `option_env!(key)` in crate `krate`.
 pub fn crate_env_named(krate: &str, key: &str) -> Option<String> {
-    crate_env_registered(krate, key).or_else(|| std::env::var(key).ok())
+    crate_env_registered(krate, key).or_else(|| config_env_value(key)).or_else(|| std::env::var(key).ok())
 }
 
 /// The value `makepad run` registered for the crate (cargo's per-crate vars, build-script
@@ -576,4 +599,5 @@ fn a_package_crate_never_keeps_a_sysroot_name() {
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     reset(&CRATE_ENV, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&CONFIG_ENV, relax_session::sync::Mutex::new(Vec::new()));
 }

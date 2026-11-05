@@ -306,7 +306,9 @@ pub fn call_krate_env(key: &str) -> Option<String> {
     if let Some(v) = crate::crates::crate_env_registered(&krate, key) {
         return Some(v);
     }
-    REG.with(|r| {
+    // the crate's cargo variables, then cargo's `[env]` configuration (rustc, which runs the
+    // macro, has both); the caller falls back to the process environment
+    let own = REG.with(|r| {
         let b = r.borrow();
         let reg = b.as_ref()?;
         let u = reg.units.iter().find(|u| u.name == krate)?;
@@ -327,7 +329,8 @@ pub fn call_krate_env(key: &str) -> Option<String> {
             "CARGO_PKG_NAME" => Some(crate::crates::base_crate_name(&krate).replace('_', "-")),
             _ => None,
         }
-    })
+    });
+    own.or_else(|| crate::crates::config_env_value(key))
 }
 
 /// The registry and the stats are process-wide: files parse on worker threads too.

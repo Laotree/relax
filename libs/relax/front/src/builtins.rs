@@ -1293,7 +1293,8 @@ fn env_value(ctx: Option<&FileCtx>, name: &str) -> Option<String> {
 
 fn env_value_inner(ctx: Option<&FileCtx>, name: &str) -> Option<String> {
     // cargo's per-crate environment as `makepad run` registered it (unitgraph.rs), then what Relax
-    // knows from the crate's Cargo.toml, then the process environment
+    // knows from the crate's Cargo.toml, then cargo's `[env]` configuration, then the process
+    // environment
     if let Some(c) = ctx {
         if let Some(v) = crate::crates::crate_env_registered(&c.krate, name) {
             return Some(v);
@@ -1306,7 +1307,7 @@ fn env_value_inner(ctx: Option<&FileCtx>, name: &str) -> Option<String> {
             _ => {}
         }
     }
-    std::env::var(name).ok()
+    crate::crates::config_env_value(name).or_else(|| std::env::var(name).ok())
 }
 
 /// The value of tokens [a, z) when they are a literal or a literal-producing built-in call
