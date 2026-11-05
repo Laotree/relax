@@ -1429,15 +1429,27 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     if crate::preload::trace() { eprintln!("boot-trace: domain {id} loaded ({load_ms:.1} ms) at t={:.1} ms", crate::clock::ms_since_start()); }
     if compile_phase(id, "link").is_err() { return Ok(id); }
     let t2 = std::time::Instant::now();
-    // the libraries the new crates link
-    let (_, missing, callbacks) = match crate::run::link_libraries(unsafe { &(*up).prog }, &g.link_libs, g.native.as_ref(), first_file) {
+    // the libraries the new crates link; the native library's callbacks are the fns of the
+    // domain's crates (its root and what that depends on)
+    let crates = {
+        let prog = unsafe { &(*up).prog };
+        let mut seen = std::collections::HashSet::from([root]);
+        let mut todo = vec![root];
+        while let Some(k) = todo.pop() {
+            for &(_, d) in &prog.crates[k as usize].deps {
+                if seen.insert(d) { todo.push(d); }
+            }
+        }
+        seen
+    };
+    let (_, missing, callbacks) = match crate::run::link_libraries(unsafe { &(*up).prog }, &g.link_libs, g.native.as_ref(), first_file, Some(&crates)) {
         Ok(linked) => linked,
         Err(error) => {
             eprintln!("makepad-run domain: {error}");
             return fail(id, vec![error]);
         }
     };
-    if let Err(error) = crate::owner::call(crate::owner::Class::Program, || crate::run::bind_native_callbacks(unsafe { &*(upn as *const Unit) }, &callbacks)) {
+    if let Err(error) = crate::owner::call(crate::owner::Class::Program, || crate::run::bind_native_callbacks(unsafe { &*(upn as *const Unit) }, &callbacks, Some(id))) {
         eprintln!("makepad-run domain: {error}");
         return fail(id, vec![error]);
     }
