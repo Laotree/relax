@@ -1357,7 +1357,10 @@ impl Layouts {
                         if !self.decl_maybe_unsized(lcx, tcx, d2, depth + 1) {
                             return false;
                         }
-                        let s = self.field_ty(lcx, tcx, d2, 0, adt2.variants[0].fields.len() as u32 - 1, tcx.tys.list(a2));
+                        // This is the declaration's generic sizedness, not a concrete layout.
+                        // Substitute its tail without normalizing projections in unrelated
+                        // generic arguments (e.g. RefCell<Vec<Rc<C::Node>>> is always Sized).
+                        let s = tcx.tys.subst(lt, tcx.tys.list(a2));
                         self.ty_maybe_unsized(lcx, tcx, s, params, depth + 1)
                     }
                 }
