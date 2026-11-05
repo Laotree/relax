@@ -455,7 +455,6 @@ pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
         // nothing; `--watch`: the warm session (type/borrow check only unless --deep), re-checking
         // what each edit invalidates
         "check" => {
-            crate::lexer::set_validation(true);
             // rustc_interface util.rs `init_stack_size`: a batch compiler rejects a RUST_MIN_STACK that
             // is set (not blank) but no number of bytes, before it reads any input
             if let Some(v) = std::env::var_os("RUST_MIN_STACK") {

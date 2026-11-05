@@ -2926,7 +2926,7 @@ impl Program {
                                 }
                                 if exists {
                                     // rustc_expand module.rs `default_submod_path`: both `x.rs` and `x/mod.rs` exist
-                                    if path_attr.is_empty() && cands.len() == 2 && *c == cands[0] && crate::lexer::validation_enabled() {
+                                    if path_attr.is_empty() && cands.len() == 2 && *c == cands[0] {
                                         let other = &cands[1];
                                         let other_exists = self.check_files.as_ref().map_or(false, |m| m.contains_key(other)) || self.crates[krate as usize].context.exists(other);
                                         self.module_probes.push((other.clone(), other_exists));
