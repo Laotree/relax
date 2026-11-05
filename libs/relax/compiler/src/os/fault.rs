@@ -845,8 +845,17 @@ mod imp {
         unsafe { handle(ep, true) }
     }
 
+    /// The end of every search, on a thread's own stack and on a program stack (its last frame):
+    /// what the runtime does not resume ends the process here, with its code. The system's way on
+    /// is an error report, and with no one to answer it (no desktop, a dialog) the process stays.
     extern "system" fn unhandled(ep: *mut ExceptionPointers) -> i32 {
-        unsafe { handle(ep, false) }
+        unsafe {
+            let r = handle(ep, false);
+            if r != EXCEPTION_CONTINUE_EXECUTION {
+                TerminateProcess(GetCurrentProcess(), (*(*ep).record).code);
+            }
+            r
+        }
     }
 
     /// The stack-overflow handler runs in the thread's guaranteed stack area (64 KB).

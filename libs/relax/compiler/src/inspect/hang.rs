@@ -412,7 +412,7 @@ mod tests {
     }
     /// `holders` hold the budget's tokens (the first is a compile job), `BUILD` waits for one.
     fn tokens(holders: &[u64], lent: bool) -> Tokens {
-        let holder = |(i, &thread): (usize, &u64)| Holder { thread, class: VISIBLE, client: if i == 0 { JIT } else { APP }, label: "plan".into(), lent, above: false, held_ns: 0 };
+        let holder = |(i, &thread): (usize, &u64)| Holder { thread, class: VISIBLE, client: if i == 0 { JIT } else { APP }, label: "job".into(), lent, above: false, held_ns: 0 };
         let waiting = vec![Waiting { thread: BUILD, class: BACKGROUND, client: JIT }];
         Tokens { running: if lent { 0 } else { 2 }, limits: [3, 2, 1], holders: holders.iter().enumerate().map(holder).collect(), waiting }
     }
@@ -420,12 +420,12 @@ mod tests {
     const BUILD: u64 = 8;
     const NOW: u64 = 5_000_000_000;
 
-    /// The plate's hang as the registry shows it: jobs wait for a build (one on the owner, which pumps
-    /// for it), the build for a token, and those jobs hold all of them. `why-hung` said idle.
+    /// A hang as the registry shows it: jobs wait for a build (one on the owner, which pumps
+    /// for it), the build for a token, and those jobs hold all of them. `why-hung` must not say idle.
     #[test]
     fn a_deadlock_through_the_budget_reads_as_a_chain() {
         let waits = [
-            wait(1, Kind::Build, 193545, BUILD, "support_paths"),
+            wait(1, Kind::Build, 1234, BUILD, "some_fn"),
             wait(2, Kind::Owner, 2, OWNER, "program"),
             wait(OWNER, Kind::Pump, 0, BUILD, "pump"),
             wait(BUILD, Kind::Token, BACKGROUND as u64, 0, "background"),
@@ -434,7 +434,7 @@ mod tests {
         let stuck = stuck_threads(&waits, &e, &tokens(&[1, 2], false), 1_000_000_000, NOW);
         assert_eq!(stuck.len(), 4, "every thread of the knot: {stuck:?}");
         let chain = budget_chain(&stuck, &waits, &tokens(&[1, 2], false), &[]).expect("it goes through a token");
-        for part in ["build #193545 support_paths held by thread 0x8", "waits for a background CPU token (2 of 1 running)", "the tokens are held by thread 0x1 \"plan\", thread 0x2 \"plan\""] {
+        for part in ["build #1234 some_fn held by thread 0x8", "waits for a background CPU token (2 of 1 running)", "the tokens are held by thread 0x1 \"job\", thread 0x2 \"job\""] {
             assert!(chain.contains(part), "{part:?} in {chain}");
         }
         // one holder runs: it gives its token back, so nothing is stuck

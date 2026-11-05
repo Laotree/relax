@@ -654,7 +654,6 @@ fn process_exit_in_a_caught_handler_ends_the_domain_with_its_code() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-
 // ---- a run's end: every thread ends wherever it is, nothing of the program runs, nothing is left
 
 const ENDED_RUN: &str = r#"
@@ -1163,4 +1162,103 @@ fn a_run_ends_with_what_it_held_given_back() {
     eprintln!("left open by each round: {counts:?}");
     // (the first round's lazy compiles open what stays open for the whole process)
     assert_eq!(&counts[1..], &[0, 0], "left open: {counts:?}");
+}
+
+const NATIVE_FAULT: &str = r#"
+use std::sync::atomic::{AtomicU64, Ordering};
+extern "C" { fn strlen(s: *const u8) -> usize; }
+fn fixture(p: *mut u64) {
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    let deep = a[2].load(Ordering::SeqCst);
+    if deep == 0 {
+        unsafe { strlen(8 as *const u8) };
+    } else {
+        let native: extern "C" fn() = unsafe { std::mem::transmute(deep as usize) };
+        native();
+    }
+    a[0].store(1, Ordering::SeqCst);
+}
+"#;
+
+#[inline(never)]
+extern "C" fn native_faults_a_call_down() {
+    #[inline(never)]
+    fn down() {
+        unsafe { std::ptr::write_volatile(8 as *mut u64, 1) };
+    }
+    down();
+    std::hint::black_box(());
+}
+
+/// A native call the program made faults, on the program stack, in the function it called: the
+/// run's failure, as a fault in JIT code is. On Windows that takes the system's whole search, and
+/// the search has to end on the program stack.
+#[test]
+fn a_fault_in_a_native_function_a_program_called_fails_the_run() {
+    isolated_test!(a_fault_in_a_native_function_a_program_called_fails_the_run);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut u, entry, _root) = fixture_of(NATIVE_FAULT, "fixture");
+    u.tier1 = None;
+    let flags: [AtomicU64; 4] = Default::default();
+    let (domain, _base, main) = launch(&mut u, entry, None, &flags);
+    main.join().unwrap();
+    wait_thread_done(domain);
+    assert_eq!(flags[0].load(Ordering::SeqCst), 0, "the program went on after the fault");
+    assert!(matches!(info(domain).unwrap().state, DomainState::Crashed(_)), "{:?}", info(domain).unwrap().state);
+    std::mem::forget(u);
+}
+
+/// A fault deeper in native code, on the program stack: no recovery point can be trusted past
+/// those frames, so the process ends with a report and the fault's code, and at once. It never
+/// stays up in the system's search or its error report, which nothing would come back from: a
+/// process that is gone is one a restart can follow.
+#[test]
+fn a_fault_deeper_in_native_code_ends_the_process_at_once() {
+    const CHILD: &str = "RELAX_NATIVE_FAULT_CHILD";
+    const THIS: &str = "domain::teardown_tests::a_fault_deeper_in_native_code_ends_the_process_at_once";
+    if std::env::var_os(CHILD).is_some() {
+        // (no core file: writing one is most of the time this takes)
+        #[cfg(unix)]
+        unsafe {
+            extern "C" {
+                fn setrlimit(resource: i32, limit: *const [u64; 2]) -> i32;
+            }
+            const RLIMIT_CORE: i32 = 4;
+            setrlimit(RLIMIT_CORE, &[0, 0]);
+        }
+        let (mut u, entry, _root) = fixture_of(NATIVE_FAULT, "fixture");
+        u.tier1 = None;
+        let flags: [AtomicU64; 4] = Default::default();
+        flags[2].store(native_faults_a_call_down as *const () as usize as u64, Ordering::SeqCst);
+        let (_domain, _base, main) = launch(&mut u, entry, None, &flags);
+        main.join().unwrap();
+        return;
+    }
+    let log = std::env::temp_dir().join(format!("relax-native-fault-{}.log", std::process::id()));
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", THIS, "--test-threads=1", "--nocapture"])
+        .env(CHILD, "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let since = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        // (the fixture's compile comes first, on a loaded machine; the end is what is bounded)
+        if since.elapsed().as_secs() >= 300 {
+            child.kill().unwrap();
+            panic!("the process stayed up after its fault:\n{}", std::fs::read_to_string(&log).unwrap_or_default());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let told = std::fs::read_to_string(&log).unwrap();
+    std::fs::remove_file(&log).unwrap();
+    assert!(told.contains("the process ends"), "{status:?}\n{told}");
+    #[cfg(windows)]
+    assert_eq!(status.code(), Some(0xc000_0005u32 as i32), "{told}");
+    #[cfg(unix)]
+    assert!(std::os::unix::process::ExitStatusExt::signal(&status).is_some(), "{status:?}\n{told}");
 }
