@@ -1156,15 +1156,27 @@ impl<'a> Dead<'a> {
 }
 
 /// The checked crates are done: run the analysis and report.
+/// MAKEPAD_RUN_CHECK_TIMES: finish's parts of 50 ms or more
+struct PartTimes(bool, std::time::Instant);
+impl PartTimes {
+    fn mark(&mut self, part: &str) {
+        let dt = self.1.elapsed();
+        if self.0 && dt.as_millis() >= 50 { eprintln!("makepad check: lint_dead::finish {} {:.2} s", part, dt.as_secs_f64()); }
+        self.1 = std::time::Instant::now();
+    }
+}
 pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32) {
     if !lint::enabled() { return; }
+    let mut pt = PartTimes(std::env::var_os("MAKEPAD_RUN_CHECK_TIMES").is_some(), std::time::Instant::now());
     let refs = BODY_REFS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     let mut children: HashMap<DefId, Vec<DefId>> = HashMap::new();
     for i in 0..prog.defs.len() {
         let p = prog.defs[i].parent;
         if p != NO_DEF { children.entry(p).or_default().push(DefId(i as u32)); }
     }
+    pt.mark("children");
     let reach = Reach::compute(prog, tcx, own);
+    pt.mark("Reach::compute");
     let mut s = Dead { prog, tcx, own, refs, live: HashSet::new(), live_fields: HashSet::new(), worklist: Vec::new(), scanned: HashSet::new(), propagated: false, ignored_derived: HashMap::new(), children };
     // seeds
     let executable = is_executable(prog, root);
@@ -1235,22 +1247,32 @@ pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32) {
             _ => {}
         }
     }
+    pt.mark("seeds");
     s.mark_with_unsolved(&mut unsolved);
+    pt.mark("mark 1");
     let pre_live = s.live.clone();
     let pre_derived = s.ignored_derived.clone();
     s.worklist.extend(deferred);
     s.mark_with_unsolved(&mut unsolved);
+    pt.mark("mark 2");
     let _ = pre_derived;
     // report
     let rep = Reporter { s: &s, reach: &reach };
     if executable { rep.run(&DEAD_CODE_PUB_IN_BINARY, &pre_live, true, &all); }
     rep.run(&DEAD_CODE, &s.live, false, &all);
+    pt.mark("report");
     crate::lint_late::missing_copy_implementations(prog, tcx, own, &reach);
+    pt.mark("missing_copy_implementations");
     crate::lint_late::variant_size_differences(prog, tcx, own);
+    pt.mark("variant_size_differences");
     crate::lint_late::async_fn_in_trait(prog, own, &reach);
+    pt.mark("async_fn_in_trait");
     crate::lint_late::repr_transparent_fields(prog, tcx, own);
+    pt.mark("repr_transparent_fields");
     unnameable_types(prog, own, &reach);
+    pt.mark("unnameable_types");
     crate::lint_imports::check(prog, tcx, own, &reach);
+    pt.mark("lint_imports::check");
 }
 
 fn is_executable(prog: &Program, root: u32) -> bool {
