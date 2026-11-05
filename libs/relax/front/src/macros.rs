@@ -1751,7 +1751,8 @@ impl MacroScope {
         let r = Res { table: &self.table };
         let (k, m) = if prefix.is_empty() { (cur, module) } else { r.resolve_mod(cur, module, prefix)? };
         if !seen.insert((k.into(), m.into(), name.clone())) { return None; }
-        if matches!(k, "core" | "std" | "alloc") && m == k && crate::program::BUILTIN_MACROS.contains(&name.as_str()) {
+        // std's `dbg!` is expanded with the format macros, not listed in BUILTIN_MACROS
+        if matches!(k, "core" | "std" | "alloc") && m == k && (crate::program::BUILTIN_MACROS.contains(&name.as_str()) || (k == "std" && name == "dbg")) {
             return Some(name.clone());
         }
         let uses = self.table.crates.get(k)?.uses.get(m)?;

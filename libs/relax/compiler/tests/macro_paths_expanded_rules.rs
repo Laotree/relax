@@ -1,5 +1,5 @@
 // Macro paths and macro-made macros as rustc resolves them: path-qualified built-in macros
-// (`core::assert!`, `std::debug_assert_eq!`, through an `extern crate` alias), built-in derives
+// (`core::assert!`, `std::debug_assert_eq!`, `::std::dbg!`, through an `extern crate` alias), built-in derives
 // written as paths, `macro_rules!` definitions that an expansion makes (in textual scope from the
 // invocation on, and shadowed by a later definition of the same name),
 // `.await` inside a macro's format arguments, and a negative const argument in derive input.
@@ -41,7 +41,8 @@ fn path_qualified_builtin_macros() {
     core::debug_assert!(true, "on {}", 1);
     kore::assert!(kore::cfg!(any()) == false);
     let s = std::format!("{}-{}", 1, 2);
-    println!("| {} {}", s, std::stringify!(a + b));
+    let d = ::std::dbg!(std::dbg!(2) + 1);
+    println!("| {} {} {}", s, std::stringify!(a + b), d);
 }
 
 #[test]

@@ -4,7 +4,9 @@
 // struct literal through a projection (`Self::Out { .. }`, `T::Out { .. }`, an alias to one), a
 // precise closure capture of a nested field (the uncaptured siblings drop with their owner),
 // temporaries extended through `if` and `match` arms, constant promotion (`&(1 + 2)`,
-// `&CONST.field`), a constant pattern of several scalars and a single-variant enum's discriminant.
+// `&CONST.field`), a constant pattern of several scalars, a single-variant enum's discriminant, and
+// a where-clause on a rigid projection that is no inherent candidate (rustc probe.rs: only a type
+// parameter's bounds are; the projection's method comes from the traits in scope).
 // Run with `makepad test` and rustc --test; lines "| " are compared.
 use std::cell::RefCell;
 
@@ -157,6 +159,37 @@ fn constants_promoted_to_static_memory() {
     let t: &'static u16 = &T.1;
     let b: &'static i32 = &PAIR.b;
     println!("| {} {:?} {} {}", promoted(), field_of_const(), t, b);
+}
+
+mod hidden {
+    pub trait Trait1 {
+        fn method(&self) -> u8 {
+            1
+        }
+    }
+}
+trait Trait2 {
+    fn method(&self) -> u8 {
+        2
+    }
+}
+trait Other {}
+impl<T: Other + ?Sized> Trait2 for T {}
+struct S;
+impl hidden::Trait1 for S {}
+impl Other for S {}
+
+fn through_target<T>(x: T) -> u8
+where
+    T: std::ops::Deref,
+    <T as std::ops::Deref>::Target: hidden::Trait1 + Other,
+{
+    x.method()
+}
+
+#[test]
+fn projection_bounds_are_not_inherent() {
+    println!("| {} {}", through_target(Box::new(S)), through_target(&S));
 }
 
 #[derive(PartialEq, Eq)]
