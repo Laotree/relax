@@ -3699,6 +3699,7 @@ use crate::stack::ensure_sufficient_stack;
 /// thread redirects it into this glue (x64::hang_tramp in front of rt_hang); 0 = none.
 pub(crate) static HANG_TRAMP: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(not(target_arch = "aarch64"))]
 rt_fn! {
     /// The hang watchdog's interrupt, run on the interrupted thread through HANG_TRAMP: the same
     /// decision as a watchdog signal; when it acts, the call unwinds to its recovery point
@@ -4613,8 +4614,9 @@ impl Unit {
             u.rt.panic_impl = u.emit_code(&panic_tramp(crate::web32::w32_panic_impl as *const () as usize as u64), "relax::panic_impl");
         }
         u.env.resume = u.rt.resume;
+        #[cfg(not(target_arch = "aarch64"))]
         if os::fault::NEEDS_HANG_TRAMP {
-            HANG_TRAMP.store(u.emit_code(&relax_backend::x64::hang_tramp(rt_hang as *const () as usize as u64), "relax::hang_tramp"), Ordering::Relaxed);
+            HANG_TRAMP.store(u.emit_code(&x64::hang_tramp(rt_hang as *const () as usize as u64), "relax::hang_tramp"), Ordering::Relaxed);
         }
         u.env.syms = u.syms.vals;
         u.env.sym_class = u.syms.classes;
@@ -6566,7 +6568,13 @@ impl Unit {
         let f = &self.prog.files[def.file as usize];
         for a in f.ast.list(f.ast.item(def.item).attrs) {
             if a.toks.hi >= a.toks.lo + 3 && f.tok_text(a.toks.lo) == "link_name" && f.tok_text(a.toks.lo + 1) == "=" {
-                return f.tok_text(a.toks.lo + 2).trim_matches('"').to_string();
+                let name = crate::lit::unescape_str(f.tok_text(a.toks.lo + 2));
+                // LLVM's leading SOH requests an exact object-file symbol. Our lookups use
+                // C names, so undo Mach-O's ABI prefix only for these exact names.
+                if let Some(exact) = name.strip_prefix('\u{1}') {
+                    return crate::global_asm::c_name(exact).to_string();
+                }
+                return name;
             }
         }
         self.prog.name(d).to_string()

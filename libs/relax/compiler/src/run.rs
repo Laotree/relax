@@ -2296,7 +2296,7 @@ pub(crate) fn exported_fns(prog: &crate::program::Program, prefixes: &[String]) 
                 symbol = Some(prog.name(DefId(di as u32)).to_string());
             } else if let Some(k) = toks.iter().position(|t| *t == "export_name") {
                 if let (Some(&"="), Some(lit)) = (toks.get(k + 1), toks.get(k + 2)) {
-                    symbol = Some(lit.trim_matches('"').to_string());
+                    symbol = Some(crate::lit::unescape_str(lit));
                 }
             }
         }
