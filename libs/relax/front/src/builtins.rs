@@ -1926,8 +1926,10 @@ fn scoped_proc_macro_entry(p: &crate::parser::Parser, at: usize, name: &str, kin
     if crate::macro_reg::in_world() { return None; }
     let scope = p.macros.as_ref()?;
     let module = p.cur_module();
-    for uses in scoped_imports(p, at)? {
-        if let Some(entry) = scope.proc_macro_import(&p.krate, &module, &uses, name, kind) { return entry; }
+    if p.may_import(name, &module, kind) {
+        for uses in scoped_imports(p, at)? {
+            if let Some(entry) = scope.proc_macro_import(&p.krate, &module, &uses, name, kind) { return entry; }
+        }
     }
     scope.proc_macro_use(&p.krate, name, kind)
 }

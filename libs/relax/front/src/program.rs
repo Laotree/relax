@@ -1337,16 +1337,8 @@ impl Program {
             let externs: Vec<_> = self.crates[krate as usize].deps.iter().filter_map(|(s, ci)| {
                 self.crates.get(*ci as usize).map(|c| (self.syms.str(*s).to_string(), self.syms.str(c.name).to_string()))
             }).collect();
-            let table = std::sync::Arc::make_mut(&mut self.macros);
-            crate::preload::publish_macros(table, &ahead.name, &ahead.defs, &ahead.aliases, &ahead.mods, &ahead.macro_use, &externs);
-            // The parser needs this crate's complete macro namespace (its outline, with the
-            // definitions and imports macro expansions made), not just the raw scan: wait only
-            // for this crate's outline, and resolve its scopes against the loader's imports.
-            if self.pool.as_ref().is_some_and(|pool| pool.publish_macros(ci, table)) {
-                if let Some(namespace) = table.crates.get(&kname).cloned() {
-                    crate::preload::publish_macros(table, &ahead.name, &[], &[], &namespace, &ahead.macro_use, &externs);
-                }
-            }
+            crate::preload::publish_macros(std::sync::Arc::make_mut(&mut self.macros), &ahead.name,
+                &ahead.defs, &ahead.aliases, &ahead.mods, &ahead.macro_use, &externs);
         }
         if let Some(pool) = &self.pool { pool.start_parsing(ci, self.macros.clone()); }
         if !ahead.prelexed.is_empty() {

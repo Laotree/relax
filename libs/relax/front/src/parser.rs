@@ -107,6 +107,8 @@ pub struct Parser<'a> {
     exp_depth: u32,
     /// the file's written `#![recursion_limit]`, read on the first macro call
     rec_limit: std::cell::Cell<Option<Option<u32>>>,
+    /// every `use` of the tokens so far, for `name_imported`'s quick answer
+    import_summary: std::cell::RefCell<ImportSummary>,
     /// macro_rules expansions: (text lo, text hi, the macro's definition position in this
     /// file; 0 when defined elsewhere) -- the hygiene marks (ParsedFile::hyg_ctxt)
     pub rules_exp: OSeg<'a, Rules>,
@@ -208,6 +210,7 @@ impl<'a> Parser<'a> {
             sources: None,
             exp_depth: 0,
             rec_limit: std::cell::Cell::new(None),
+            import_summary: Default::default(),
             rules_exp: Default::default(),
             body_origin: Default::default(),
             tok_undo: Vec::new(),
@@ -1417,10 +1420,54 @@ impl<'a> Parser<'a> {
 
     /// Is `name` bound by an import in an enclosing item scope?
     fn name_imported(&self, name: &str, at: usize) -> bool {
-        let Some(scopes) = crate::builtins::scoped_imports(self, at) else { return false };
         let module = self.cur_module();
+        if !self.may_import(name, &module, crate::macro_reg::Kind::Bang) { return false; }
+        let Some(scopes) = crate::builtins::scoped_imports(self, at) else { return false };
         scopes.iter().any(|uses| uses.iter().any(|u| u.bind.as_deref() == Some(name))
             || self.macros.as_ref().is_some_and(|m| m.proc_macro_import(&self.krate, &module, uses, name, crate::macro_reg::Kind::Bang).is_some()))
+    }
+
+    /// Can any `use` of this parser's tokens (the file and its expansions so far, active or
+    /// not) bind `name`, by name or through a glob that names a proc macro `name` of `kind`?
+    /// The imports in scope anywhere are a subset of these, so `false` is exact and spares the
+    /// scope walk (`builtins::scoped_imports`) of every macro call and attribute.
+    pub(crate) fn may_import(&self, name: &str, module: &str, kind: crate::macro_reg::Kind) -> bool {
+        let mut summary = self.import_summary.borrow_mut();
+        let s = &mut *summary;
+        let n = self.toks.len();
+        if s.scanned < n {
+            let mut uses = Vec::new();
+            let mut i = s.scanned;
+            while i < n {
+                if self.toks.at(i).kind == T::KwUse {
+                    if let Some(stop) = (i + 1..n).find(|&j| self.toks.at(j).kind == T::Semi) {
+                        let toks = self.toks.range(i + 1, stop);
+                        let text = |k: usize| String::from_utf8_lossy(self.tok_text(toks[k])).trim_start_matches("r#").to_string();
+                        crate::preload::use_tree(&text, &toks, 0, toks.len(), &[], module, false, &mut uses);
+                        i = stop;
+                    }
+                }
+                i += 1;
+            }
+            s.scanned = n;
+            for u in uses {
+                match u.bind {
+                    Some(b) => { s.binds.insert(b); }
+                    None if !s.globs.contains(&u.path) => { s.globs.push(u.path); s.glob_hits.clear(); }
+                    None => {}
+                }
+            }
+        }
+        if s.binds.contains(name) { return true; }
+        if s.globs.is_empty() { return false; }
+        let key = (module.to_string(), name.to_string(), kind as u8);
+        if let Some(&hit) = s.glob_hits.get(&key) { return hit; }
+        let hit = self.macros.as_ref().is_some_and(|m| {
+            let globs: Vec<_> = s.globs.iter().map(|path| crate::macros::UseItem { module: module.to_string(), path: path.clone(), bind: None, is_pub: false }).collect();
+            m.proc_macro_import(&self.krate, module, &globs, name, kind).is_some()
+        });
+        s.glob_hits.insert(key, hit);
+        hit
     }
 
     /// rustc_resolve: the positions that take only non-macro attributes (struct-pattern fields,
@@ -5516,6 +5563,16 @@ fn origin_of<'t>(tok_origin: impl Into<OSegRef<'t, Maps>>, pos: u32) -> Option<u
         Some((_, (t, o, n))) if pos < t + n => Some(o + (pos - t)),
         _ => None,
     }
+}
+
+/// The `use` items of a parser's tokens, scanned as they grow (`Parser::may_import`).
+#[derive(Default)]
+struct ImportSummary {
+    scanned: usize,
+    binds: crate::fxhash::HashSet<String>,
+    globs: Vec<Vec<String>>,
+    /// (module, name, kind): does a glob of `globs` name a proc macro `name` of that kind
+    glob_hits: crate::fxhash::HashMap<(String, String, u8), bool>,
 }
 
 /// The edition of the token at `pos` (rustc `Span::edition`: the ExpnData edition of its

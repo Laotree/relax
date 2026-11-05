@@ -248,9 +248,6 @@ enum Work {
 }
 
 impl Pool {
-    pub(crate) fn publish_macros(&self, ci: u32, table: &mut MacroTable) -> bool {
-        self.demand_plan.as_ref().is_some_and(|plan| plan.publish_macros(ci as usize + self.plan_offset, table))
-    }
     /// Set queued jobs' scope; entering the crate replaces an early snapshot with the loader's.
     pub fn start_parsing(&self, ci: u32, table: Arc<MacroTable>) {
         let mut st = self.st.lock().unwrap();

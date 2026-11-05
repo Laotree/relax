@@ -44,17 +44,11 @@ pub struct DemandImage {
 #[derive(Default)]
 struct EarlyCrates {
     prefix: std::sync::atomic::AtomicUsize,
-    /// Finished expansion declarations, available before the global demand closure.
-    macros: relax_session::sync::Mutex<BTreeMap<usize, part::MacroPart>>,
     notify: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// wakes `PendingPlan::wait_progress` (a publication or the plan's completion)
     wake: (relax_session::sync::Mutex<()>, relax_session::sync::Condvar),
 }
 impl EarlyCrates {
-    fn publish_macros(&self, ci: usize, macros: &part::MacroPart) {
-        self.macros.lock().unwrap_or_else(|e| e.into_inner()).insert(ci, macros.clone());
-        self.wake_all();
-    }
     fn publish(&self, prefix: usize) {
         self.prefix.fetch_max(prefix, std::sync::atomic::Ordering::Release);
         if let Some(notify) = self.notify.get() { notify(); }
@@ -114,29 +108,6 @@ impl PendingPlan {
         self.early.wake_all();
     }
     pub fn ready(&self) -> Option<&Plan> { self.plan.get() }
-    /// A parser needs this crate's complete macro namespace, not just the raw
-    /// scan. Wait only for its outline, allowing later crates to keep planning.
-    pub(crate) fn publish_macros(&self, ci: usize, table: &mut crate::macros::MacroTable) -> bool {
-        let mut guard = self.early.wake.0.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            let macros = self.early.macros.lock().unwrap_or_else(|e| e.into_inner()).get(&ci).cloned();
-            if let Some(macros) = macros {
-                drop(guard);
-                macros.publish(table, &self.pending_crates[ci].name);
-                return true;
-            }
-            if let Some(plan) = self.ready() {
-                if let Some(part) = plan.image.parts.get(ci) {
-                    drop(guard);
-                    part.macros.publish(table, &self.pending_crates[ci].name);
-                    return true;
-                }
-                return false;
-            }
-            guard = self.early.wake.1.wait_timeout(guard, std::time::Duration::from_millis(20))
-                .unwrap_or_else(|e| e.into_inner()).0;
-        }
-    }
     /// The crates' source contexts (the plan's own, without waiting for it).
     pub fn contexts(&self) -> &[Arc<crate::source_context::Context>] { &self.pending_contexts }
     /// The crates the plan is for (without waiting for it).
@@ -378,7 +349,6 @@ impl Plan {
                     for ((path, module), bodies) in &part.eager { eager_bodies.insert((*ci, path.clone(), module.clone()), bodies.clone()); }
                     for ((path, module), failed) in &part.failures { expansion_failures.insert((*ci, path.clone(), module.clone()), *failed); }
                     parts[*ci] = (**part).clone();
-                    early.publish_macros(*ci, &part.macros);
                     identities.push(part.surface_id);
                     reused_outline.insert(*ci);
                     restored_surfaces.extend(part.outlined.iter().map(|(p, m)| (*ci, p.clone(), m.clone())));
@@ -586,7 +556,6 @@ impl Plan {
                     }
                 }
                 part.macros.finish_capture(&table, &c.name);
-                early.publish_macros(*ci, &part.macros);
                 part.files = prepared_files[files_start..].to_vec();
                 part.unindexed = unindexed_files[files_start..].to_vec();
                 let range = (*ci, String::new(), String::new())..(*ci + 1, String::new(), String::new());
