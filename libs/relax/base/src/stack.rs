@@ -507,6 +507,48 @@ mod imp {
         if unsafe { GlobalMemoryStatusEx(&mut m) } != 0 { m.total_phys as usize } else { 16 << 30 }
     }
 
+    // The stack's last frame, what `RtlUserThreadStart` is to a thread's stack and `BaseFiberStart`
+    // to a fiber's: `relax_stack_last_frame(data, f)` calls `f(data)`, and what no frame below it
+    // handles goes to `last_frame`. The system's search never reaches the switch's frame: it
+    // cannot unwind that one, it reads above the segment, that fault is dispatched and searched
+    // the same way, deeper each time, and the thread never comes back. (Its frame record is the
+    // usual one: walkers go on through its return address, `SWITCH_RETURN`.)
+    std::arch::global_asm!(
+        ".globl relax_stack_last_frame",
+        "relax_stack_last_frame:",
+        ".seh_proc relax_stack_last_frame",
+        ".seh_handler {handler}, @except",
+        "push rbp",
+        ".seh_pushreg rbp",
+        "sub rsp, 32",
+        ".seh_stackalloc 32",
+        "lea rbp, [rsp + 32]",
+        ".seh_setframe rbp, 32",
+        ".seh_endprologue",
+        "call rdx",
+        "nop",
+        "add rsp, 32",
+        "pop rbp",
+        "ret",
+        ".seh_endproc",
+        handler = sym last_frame,
+    );
+    extern "C" {
+        fn relax_stack_last_frame(data: *mut u8, f: extern "C" fn(*mut u8));
+    }
+
+    /// As the system's frame at the end of a thread: the process's unhandled exception filter
+    /// (`SetUnhandledExceptionFilter`), and the process ends with the code unless it resumes.
+    unsafe extern "system" fn last_frame(record: *mut ExceptionRecord, _frame: *mut u8, context: *mut Context, _dispatch: *mut u8) -> u32 {
+        const CONTINUE_EXECUTION: u32 = 0;
+        let mut pointers = ExceptionPointers { record, context };
+        if UnhandledExceptionFilter(&mut pointers) == EXCEPTION_CONTINUE_EXECUTION {
+            return CONTINUE_EXECUTION;
+        }
+        TerminateProcess(GetCurrentProcess(), (*record).code);
+        unreachable!()
+    }
+
     /// Calls `f(data)` (Win64: data in rcx, 32 bytes of shadow space) on the segment. The TEB's
     /// stack bounds (NT_TIB StackBase gs:[8], StackLimit gs:[16], DeallocationStack gs:[0x1478])
     /// describe the segment for the call: the exception dispatcher and RtlUnwindEx check frames
@@ -529,7 +571,7 @@ mod imp {
             "sub rsp, 48",
             "mov qword ptr [rsp + 32], r12",
             "add qword ptr [rsp + 32], 24",
-            "call {f}",
+            "call {last_frame}",
             "3:",
             "mov rsp, r12",
             "pop qword ptr gs:[0x1478]",
@@ -538,9 +580,10 @@ mod imp {
             top = in(reg) s.top,
             lo = in(reg) s.lo,
             base = in(reg) s.base,
-            f = in(reg) f,
+            last_frame = in(reg) relax_stack_last_frame as unsafe extern "C" fn(*mut u8, extern "C" fn(*mut u8)),
             ret = in(reg) super::SWITCH_RETURN.as_ptr(),
             in("rcx") data,
+            in("rdx") f,
             out("r12") _,
             clobber_abi("C"),
         );
@@ -597,11 +640,28 @@ mod tests {
     /// Where `peek` reads
     static AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-    /// The word at AT, read on the program stack it is on (usize::MAX: AT is not on this one)
+    /// Whether reading `at` on a program stack is a read at all. On Windows a page the stack has
+    /// not committed faults; elsewhere one a new mapping left reads as zero.
+    #[cfg(windows)]
+    fn readable(at: usize) -> bool {
+        use relax_session::win32::{MemoryBasicInformation, VirtualQuery};
+        const MEM_COMMIT: u32 = 0x1000;
+        const PAGE_GUARD: u32 = 0x100;
+        let mut m: MemoryBasicInformation = unsafe { std::mem::zeroed() };
+        let n = unsafe { VirtualQuery(at as *const u8, &mut m, std::mem::size_of::<MemoryBasicInformation>()) };
+        n != 0 && m.state == MEM_COMMIT && m.protect & PAGE_GUARD == 0
+    }
+    #[cfg(not(windows))]
+    fn readable(_at: usize) -> bool {
+        true
+    }
+
+    /// The word at AT, read on the program stack it is on (usize::MAX: AT is not on this one, or
+    /// that page is not committed)
     fn peek() -> usize {
         let at = AT.load(std::sync::atomic::Ordering::Relaxed);
         let (lo, hi) = super::program_stack_bounds().unwrap();
-        if at > lo && at < hi { unsafe { std::ptr::read_volatile(at as *const usize) } } else { usize::MAX }
+        if at > lo && at < hi && readable(at) { unsafe { std::ptr::read_volatile(at as *const usize) } } else { usize::MAX }
     }
 
     /// Runs on a program stack: its bounds and what `f` returns.
@@ -629,5 +689,67 @@ mod tests {
         AT.store(at, std::sync::atomic::Ordering::Relaxed);
         let (_, seen) = on_program_stack(peek);
         assert_ne!(seen, MAGIC, "kept with its deep pages");
+    }
+
+    /// A panic on a program stack comes back to the caller, on the thread's own stack.
+    #[test]
+    fn a_panic_on_a_program_stack_comes_back() {
+        let r = std::panic::catch_unwind(|| super::on_program_stack(|| {}, || panic!("on the program stack")));
+        assert_eq!(r.unwrap_err().downcast_ref::<&str>(), Some(&"on the program stack"));
+        assert_eq!(super::program_stack_bounds(), None);
+    }
+
+    /// A fault nothing handles on a program stack goes to the process's unhandled exception
+    /// filter, as on a thread's own stack, and resumes if that says so. Before the stack had a
+    /// last frame the system's search never came back from the stack switch.
+    #[cfg(windows)]
+    #[test]
+    fn a_fault_on_a_program_stack_reaches_the_process_filter() {
+        use relax_session::win32::*;
+        const CHILD: &str = "RELAX_BASE_STACK_FAULT";
+        const RESUMED: u32 = 0x5e5;
+        /// resumes past the faulting read (`mov rax, [rax]`: 3 bytes, the asm below) once, ends the
+        /// process with RESUMED the second time
+        extern "system" fn filter(ep: *mut ExceptionPointers) -> i32 {
+            static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            unsafe {
+                if SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    TerminateProcess(GetCurrentProcess(), RESUMED);
+                }
+                let c = &mut *(*ep).context;
+                c.set(CTX_RIP, c.get(CTX_RIP) + 3);
+            }
+            EXCEPTION_CONTINUE_EXECUTION
+        }
+        fn fault() {
+            unsafe { std::arch::asm!("mov rax, [rax]", inout("rax") 8u64 => _) };
+        }
+        if std::env::var_os(CHILD).is_some() {
+            unsafe { SetUnhandledExceptionFilter(Some(filter)) };
+            super::on_program_stack(|| {}, || {
+                fault();
+                fault();
+            });
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "stack::tests::a_fault_on_a_program_stack_reaches_the_process_filter", "--test-threads=1"])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let since = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if since.elapsed().as_secs() >= 30 {
+                child.kill().unwrap();
+                panic!("the fault's search did not come back");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(status.code(), Some(RESUMED as i32));
     }
 }
