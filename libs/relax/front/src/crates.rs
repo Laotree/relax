@@ -99,9 +99,10 @@ pub fn disambiguate_multi_version_crates(units: &mut [CrateUnit]) {
 
 /// Crates Relax provides itself (std/substitutes.txt: `<name> <version prefix> <root>`):
 /// a unit of that crate at a matching version loads the provided root instead of its sources
-/// (same name; deps become core/alloc/std only; features ignored). The rustc build keeps the
-/// real crates. Also hands the graph to the proc-macro host (macro_reg::register_and_strip);
-/// `additive`: the graph of a program started into a running one joins the registered graph.
+/// (same name; deps become core/alloc/std only; features ignored); one at another version is
+/// compiled from its own source, and the load says so. The rustc build keeps the real crates.
+/// Also hands the graph to the proc-macro host (macro_reg::register_and_strip); `additive`: the
+/// graph of a program started into a running one joins the registered graph.
 pub fn apply_substitutes(sess: &std::sync::Arc<crate::Session>, units: &mut [CrateUnit], std_dir: &str, additive: bool) -> Result<(), String> {
     let table = match crate::vfs::read_to_string(format!("{}/substitutes.txt", std_dir)) {
         Ok(t) => t,
@@ -110,13 +111,18 @@ pub fn apply_substitutes(sess: &std::sync::Arc<crate::Session>, units: &mut [Cra
             return Ok(());
         }
     };
-    apply_substitute_table(units, std_dir, &table);
+    for line in apply_substitute_table(units, std_dir, &table) {
+        eprintln!("makepad-run: {line}");
+    }
     // proc-macro crates run in the JIT proc-macro host; the app graph sees them empty
     crate::macro_reg::register_and_strip(sess, units, std_dir, additive)?;
     Ok(())
 }
 
-fn apply_substitute_table(units: &mut [CrateUnit], std_dir: &str, table: &str) {
+/// The table's substitutions made in `units`; returns a line for each unit of a provided crate at
+/// another version (its own source is compiled).
+fn apply_substitute_table(units: &mut [CrateUnit], std_dir: &str, table: &str) -> Vec<String> {
+    let mut own = Vec::new();
     for line in table.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -133,6 +139,7 @@ fn apply_substitute_table(units: &mut [CrateUnit], std_dir: &str, table: &str) {
             }
             let matches = u.version == ver || u.version.starts_with(&format!("{}.", ver));
             if !matches {
+                own.push(format!("crate `{}` is version {}, substitutes.txt provides {}: its own source is compiled", name, u.version, ver));
                 continue;
             }
             u.src_path = format!("{}/{}", std_dir, root);
@@ -142,6 +149,33 @@ fn apply_substitute_table(units: &mut [CrateUnit], std_dir: &str, table: &str) {
             u.host = None;
         }
     }
+    own
+}
+
+#[cfg(test)]
+#[test]
+fn a_provided_crate_at_another_version_compiles_its_own_source_and_says_so() {
+    let unit = |version: &str| CrateUnit {
+        name: "smallvec".to_string(),
+        src_path: format!("/registry/smallvec-{version}/src/lib.rs"),
+        edition: 2018,
+        features: vec!["union".to_string()],
+        deps: Vec::new(),
+        host: None,
+        proc_macro: false,
+        bin: false,
+        harness: false,
+        build_script: false,
+        version: version.to_string(),
+        registry: true,
+    };
+    let mut units = vec![unit("1.13.2"), unit("0.6.14")];
+    let said = apply_substitute_table(&mut units, "/std", "# comment\nsmallvec 1 smallvec/lib.rs\n");
+    assert_eq!(units[0].src_path, "/std/smallvec/lib.rs");
+    assert!(units[0].features.is_empty());
+    assert_eq!(units[1].src_path, "/registry/smallvec-0.6.14/src/lib.rs");
+    assert_eq!(units[1].features, ["union"]);
+    assert_eq!(said, ["crate `smallvec` is version 0.6.14, substitutes.txt provides 1: its own source is compiled"]);
 }
 
 /// Unit indices with every crate after its dependencies.
