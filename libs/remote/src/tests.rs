@@ -295,6 +295,22 @@ pub(crate) fn shared() -> &'static (Endpoint, crate::watch::WatchSink) {
     })
 }
 
+/// A late follower gets what came before it only when it asks from there, and once.
+#[test]
+fn a_feed_from_a_record_gets_what_came_before_it() {
+    let _turn = WATCH_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, watch) = shared();
+    let early = watch.emit("{\"event\":\"early\"}");
+    let client = Client::connect("makepad-remote-test").unwrap();
+    let mut now = client.watch();
+    assert!(now.next(Duration::from_millis(100), 3).unwrap().is_none());
+    let mut from = client.feed_from("watch", early - 1);
+    assert_eq!(from.next(WAIT, 3).unwrap().unwrap().1, b"{\"event\":\"early\"}");
+    client.conn().unwrap().close("test drop");
+    watch.emit("{\"event\":\"later\"}");
+    assert_eq!(from.next(WAIT, 20).unwrap().unwrap().1, b"{\"event\":\"later\"}");
+}
+
 #[test]
 fn unix_end_to_end_with_discovery_and_reconnect() {
     let _turn = WATCH_TURN.lock().unwrap_or_else(|e| e.into_inner());
