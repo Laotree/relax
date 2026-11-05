@@ -618,6 +618,36 @@ impl Command {
                 });
             }
         }
+        if exec {
+            // CommandExt::exec is real std's do_exec on every Unix: this process gets the child's
+            // stdio, folder and process group and SIGPIPE back to its default, then execvp with the
+            // new program's environment in place, whose PATH it searches (exec_path_env); it
+            // returns only on failure. (An exec by Darwin's posix_spawn with POSIX_SPAWN_SETEXEC
+            // failed EBADF with a `Stdio::null()` or a file for stdio: os_exec.rs a02.)
+            unsafe {
+                for (fd, to) in [(&stdin_child, 0), (&stdout_child, 1), (&stderr_child, 2)] {
+                    if let Some(fd) = fd {
+                        if dup2(fd.as_raw_fd(), to) < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                }
+                if let Some(c) = &cwd {
+                    if chdir(c.as_ptr()) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                if let Some(pgroup) = self.pgroup {
+                    if setpgid(0, pgroup) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                signal(SIGPIPE, 0);
+                let _env = crate::env::env_read_lock();
+                exec_path_env(prog.as_ptr(), argv.as_ptr(), envp_ptr);
+                return Err(io::Error::last_os_error());
+            }
+        }
         let mut actions = SpawnFileActions { storage: [0; 32] };
         let mut attr = SpawnAttr { storage: [0; 64] };
         let mut pid: sys::pid_t = 0;
@@ -654,52 +684,8 @@ impl Command {
             sigaddset(&mut default_set as *mut SigSet, SIGPIPE);
             posix_spawnattr_setsigdefault(&mut attr as *mut SpawnAttr, &default_set as *const SigSet);
             flags |= POSIX_SPAWN_SETSIGDEF;
-            if exec {
-                // Darwin: posix_spawn with POSIX_SPAWN_SETEXEC is execve with the file actions
-                // and attributes applied to this process; it returns only on failure
-                #[cfg(target_vendor = "apple")]
-                {
-                    flags |= POSIX_SPAWN_SETEXEC;
-                }
-                #[cfg(not(target_vendor = "apple"))]
-                {
-                    posix_spawn_file_actions_destroy(&mut actions as *mut SpawnFileActions);
-                    posix_spawnattr_destroy(&mut attr as *mut SpawnAttr);
-                    for (fd, to) in [(&stdin_child, 0), (&stdout_child, 1), (&stderr_child, 2)] {
-                        if let Some(fd) = fd {
-                            if dup2(fd.as_raw_fd(), to) < 0 {
-                                return Err(io::Error::last_os_error());
-                            }
-                        }
-                    }
-                    if let Some(c) = &cwd {
-                        if chdir(c.as_ptr()) != 0 {
-                            return Err(io::Error::last_os_error());
-                        }
-                    }
-                    if let Some(pgroup) = self.pgroup {
-                        if setpgid(0, pgroup) != 0 {
-                            return Err(io::Error::last_os_error());
-                        }
-                    }
-                    signal(SIGPIPE, 0);
-                    let _env = crate::env::env_read_lock();
-                    exec_path_env(prog.as_ptr(), argv.as_ptr(), envp_ptr);
-                    return Err(io::Error::last_os_error());
-                }
-            }
             posix_spawnattr_setflags(&mut attr as *mut SpawnAttr, flags);
-            // an exec (Darwin's SETEXEC) searches the new program's PATH, as real std's execvp
-            // with its environment in place does (exec_path_env); a failed one puts ours back
-            let _env = exec.then(crate::env::env_read_lock);
-            let was = sys::os::environ();
-            if exec {
-                sys::os::set_environ(envp_ptr);
-            }
             let r = posix_spawnp(&mut pid as *mut sys::pid_t, prog.as_ptr(), &actions as *const SpawnFileActions, &attr as *const SpawnAttr, argv.as_ptr(), envp_ptr);
-            if exec {
-                sys::os::set_environ(was);
-            }
             posix_spawn_file_actions_destroy(&mut actions as *mut SpawnFileActions);
             posix_spawnattr_destroy(&mut attr as *mut SpawnAttr);
             if r != 0 {
@@ -1053,8 +1039,6 @@ struct SigSet {
 
 const POSIX_SPAWN_SETPGROUP: c_short = 0x02;
 const POSIX_SPAWN_SETSIGDEF: c_short = 0x04;
-#[cfg(target_vendor = "apple")]
-const POSIX_SPAWN_SETEXEC: c_short = 0x40;
 const SIGPIPE: c_int = 13;
 
 #[repr(C)]
@@ -1079,13 +1063,9 @@ extern "C" {
     fn posix_spawnattr_setpgroup(a: *mut SpawnAttr, pgroup: sys::pid_t) -> c_int;
     fn posix_spawnattr_setsigdefault(a: *mut SpawnAttr, set: *const SigSet) -> c_int;
     fn sigemptyset(set: *mut SigSet) -> c_int;
-    #[cfg(not(target_vendor = "apple"))]
     fn dup2(fd: c_int, to: c_int) -> c_int;
-    #[cfg(not(target_vendor = "apple"))]
     fn chdir(path: *const c_char) -> c_int;
-    #[cfg(not(target_vendor = "apple"))]
     fn setpgid(pid: sys::pid_t, pgid: sys::pid_t) -> c_int;
-    #[cfg(not(target_vendor = "apple"))]
     fn signal(sig: c_int, handler: usize) -> usize;
     fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
     fn sigaddset(set: *mut SigSet, sig: c_int) -> c_int;
