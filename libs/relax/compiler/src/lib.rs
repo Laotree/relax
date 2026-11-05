@@ -490,7 +490,7 @@ pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
             let mut a = vec!["--check".to_string()];
             a.extend_from_slice(&args[3..]);
             let code = run::cmd_run(sess, &a);
-            std::process::exit(code);
+            os::proc::exit(code);
         }
         // `makepad test <file.rs>`: one file's tests; `makepad test <package>`: the package's
         // lib and integration tests, each a harness program (run.rs `--harness`)
