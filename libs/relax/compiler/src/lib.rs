@@ -1328,6 +1328,7 @@ pub unsafe fn reset_statics() {
     inspect::reset_statics();
     invalid::reset_statics();
     jit::reset_statics();
+    lower::reset_statics();
     mainprof::reset_statics();
     modules::reset_statics();
     native_macros::reset_statics();
