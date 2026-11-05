@@ -6747,6 +6747,10 @@ impl<'a> Lcx<'a> {
             Some(Coerce::Upcast(sd, dd)) => {
                 let sd = self.monomorphize(sd);
                 let dd = self.monomorphize(dd);
+                // The same principal trait (`dyn Any + 'static` to `dyn Any`, an auto trait
+                // dropped) keeps its vtable (rustc codegen unsized_info): the value is unchanged,
+                // whatever holds the pointer (`Ref<'_, dyn Any>` passed on as `Ref<'_, T>`).
+                let Some(slot) = self.u.tcx.supertrait_vtable_slot(&self.u.prog, sd, dd) else { return v };
                 // (data, vtable of Sub) -> (data, Sub's stored vtable for Super)
                 let st = self.body_ty(e);
                 let p = self.to_leaves(v, st);
@@ -6754,7 +6758,6 @@ impl<'a> Lcx<'a> {
                     self.err(self.pos, "internal: trait object upcast of a value without a vtable -- makepad run bug, report it".to_string());
                     return self.unit();
                 }
-                let Some(slot) = self.u.tcx.supertrait_vtable_slot(&self.u.prog, sd, dd) else { return Val::L(p) };
                 let vt = self.f.vreg(Cls::I);
                 let pm = self.pmem();
                 self.emit(Inst::Load(pm, vt, p[1], (slot * self.pb() as usize) as i32));
