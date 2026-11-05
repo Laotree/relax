@@ -3221,6 +3221,14 @@ pub(crate) fn set_diagnostics(dcx: relax_types::infer::diagnostics::DiagCtxt) {
 
 
 extern "C" fn at_exit() {
+    // Windows: a native std::process::exit is ExitProcess, which ends every other thread and only
+    // then, in the C runtime's DLL detach, calls this. The exit worker is gone, so the wait for it
+    // could only run into its hang guard (a closed app's process stayed 30 s on a GNU build).
+    // os::proc::exit comes here with the threads alive.
+    #[cfg(windows)]
+    if unsafe { crate::os::win32::RtlDllShutdownInProgress() } != 0 {
+        return;
+    }
     if jit::QUIT_SEEN.load(Ordering::Relaxed) {
         verbose!("makepad-run quit: {} lazy compiles after the quit request, {:.0} ms",
             jit::QUIT_COMPILES[0].load(Ordering::Relaxed), jit::QUIT_COMPILES[1].load(Ordering::Relaxed) as f64 / 1e6);
