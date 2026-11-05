@@ -824,6 +824,24 @@ fn test_selections_check_with_dev_dependencies() {
     assert_eq!(s(&["--test", "it", "--test=two", "--no-default-features"]), ["--no-default-features", "--tests"]);
 }
 
+#[cfg(test)]
+#[test]
+fn script_selection_follows_every_unit_of_a_package() {
+    // two units of `a` (host and target feature sets): the second one's dependency is a real build too
+    let unit = |name: &str, deps: &[usize]| crate::unitgraph::RawUnit {
+        name: name.to_string(), src_path: String::new(), edition: 2021, features: Vec::new(), proc_macro: false,
+        deps: deps.iter().map(|&d| (d, String::new())).collect(), run_script: false,
+        pkg: (String::new(), name.to_string(), "1.0.0".to_string()),
+    };
+    let raw = [unit("a", &[1]), unit("b", &[]), unit("a", &[3]), unit("c", &[]), unit("d", &[])];
+    assert_eq!(dependency_packages(&raw, vec![0]), ["a", "b", "c"]);
+    let build = std::path::Path::new("/w/build");
+    assert!(is_target_out_dir("/w/build/x86_64-unknown-linux-gnu/release/build/a-1/out", build, "x86_64-unknown-linux-gnu"));
+    assert!(!is_target_out_dir("/w/build/release/build/a-1/out", build, "x86_64-unknown-linux-gnu"));
+    assert!(!is_target_out_dir("/elsewhere/x86_64-unknown-linux-gnu/out", build, "x86_64-unknown-linux-gnu"));
+    assert_ne!(selection_key(&["a".into()], &["b".into()]), selection_key(&["a".into(), "b".into()], &[]));
+}
+
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;

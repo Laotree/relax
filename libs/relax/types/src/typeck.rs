@@ -3238,6 +3238,12 @@ impl<'a> Fcx<'a> {
                     if let TyKind::Adt(ad, _, _) = self.tcx.tys.kind(t) {
                         return Res::Def(*ad);
                     }
+                    // an alias to a projection (`type Made = <() as Make>::Out;`), normalized
+                    if let Some(t) = self.assoc_struct_path(path) {
+                        if let TyKind::Adt(ad, _, _) = self.tcx.tys.kind(t) {
+                            return Res::Def(*ad);
+                        }
+                    }
                 }
             }
             if let Some(d) = prog.lookup_in_scope(self.module, segs[0].1, false) {

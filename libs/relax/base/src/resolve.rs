@@ -2639,6 +2639,28 @@ fn file_macro_paths_as_cargo_names_them() {
 
 #[cfg(test)]
 #[test]
+fn unit_graph_host_side_follows_proc_macro_and_build_script_edges() {
+    // A profile that optimizes build dependencies and leaves a target dependency unoptimized:
+    // the side of a unit comes from the proc-macro and build-script edges, not from opt_level.
+    let unit = |kind: &str, opt: &str, deps: &[usize]| {
+        let deps = deps.iter().map(|d| format!("{{\"index\":{d},\"extern_crate_name\":\"d{d}\"}}")).collect::<Vec<_>>().join(",");
+        format!("{{\"pkg_id\":\"p\",\"target\":{{\"kind\":[\"{kind}\"],\"name\":\"n\",\"src_path\":\"s.rs\",\"edition\":\"2021\"}},\"profile\":{{\"opt_level\":\"{opt}\"}},\"mode\":\"build\",\"features\":[],\"dependencies\":[{deps}]}}")
+    };
+    let units = [
+        unit("bin", "0", &[1, 2]),
+        unit("lib", "0", &[]),
+        unit("proc-macro", "3", &[3]),
+        unit("lib", "3", &[]),
+        unit("custom-build", "3", &[5]),
+        unit("lib", "0", &[]),
+    ];
+    let json = format!("{{\"units\":[{}],\"roots\":[0]}}", units.join(","));
+    let graph = Units::from_json(json.as_bytes()).unwrap();
+    assert_eq!(graph.units.iter().map(|u| u.host).collect::<Vec<_>>(), [false, false, true, true, true, true]);
+}
+
+#[cfg(test)]
+#[test]
 fn run_env_reads_the_packages_table() {
     let m = "[package]\nname = \"makepad-amp\"\n\n[package.metadata.makepad.run-env]\n# why\nMAKEPAD_LOG = \"0\"\nbad key = \"x\"\n\n[dependencies]\nX = \"1\"\n";
     assert_eq!(run_env(m), vec![("MAKEPAD_LOG".to_string(), "0".to_string())]);
