@@ -1694,7 +1694,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // the parsed files go to the cache's front images as a run's do (one store shared with
         // `makepad run`): the next check (or run) of the package maps them instead of parsing
         // every file again (Stage: 6 s of a warm check was parsing)
+        let t = Instant::now();
         if !selftest { record_check_front(&mut u, options); }
+        phase("record check front", t);
         if crate::memstat::enabled() {
             crate::memstat::print("check complete", &crate::memreport::unit_sizes(&u));
         }
