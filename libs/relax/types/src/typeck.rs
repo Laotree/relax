@@ -149,6 +149,8 @@ pub struct Body {
     /// every struct field the body names, resolved: (ADT, field index) -- a live layout edit's
     /// dependents (reload.rs: the fns using a removed or renamed field, not its name)
     pub field_uses: ThinVec<(DefId, u32)>,
+    /// every struct a `..base` of the body takes fields of without naming them (reload.rs, too)
+    pub struct_updates: ThinVec<DefId>,
     /// every `.await` of the body: (the enclosing coroutine's expression, the awaited operand's
     /// type, position) -- the by-value edges of async recursion (E0733)
     pub awaits: ThinVec<(u32, TyId, u32)>,
@@ -246,6 +248,7 @@ impl Body {
             hidden_types: SideTable::new(),
             field_idx: SideTable::new(),
             field_uses: ThinVec::new(),
+            struct_updates: ThinVec::new(),
             awaits: ThinVec::new(),
             dependencies: ThinVec::new(),
             ov_index: SideTable::new(),
@@ -334,7 +337,7 @@ impl Body {
             field_idx, ov_index, mutable_index, std_index, for_next, for_into, call_traits, legacy_args,
             pat_derefs, pat_bind_ref, pat_discriminant_reads, try_branch, try_from_residual, fmt_named, closure_locals,
             closure_expected_kinds, closure_sigs, inline_const_types, struct_defaults,
-            args, expr_ty, expr_typed, pat_ty, pat_typed, field_uses, awaits, dependencies, locals, param_pats, closures, errors);
+            args, expr_ty, expr_typed, pat_ty, pat_typed, field_uses, struct_updates, awaits, dependencies, locals, param_pats, closures, errors);
     }
 
     /// Memory report (MAKEPAD_RUN_MEM_REPORT): per table (entries, heap bytes incl. nested vectors),
@@ -372,7 +375,7 @@ impl Body {
         n += self.legacy_args.values().map(v).sum::<usize>() + self.closure_locals.values().map(v).sum::<usize>() + self.struct_defaults.values().map(v).sum::<usize>();
         n += self.min_captures.values().map(|c| v(&c.captures) + v(&c.fake_reads) + v(&c.errors) + c.captures.iter().map(|x| v(&x.place.projections)).sum::<usize>() + c.fake_reads.iter().map(|x| v(&x.0.projections)).sum::<usize>()).sum::<usize>();
         n += (self.args.len() + self.expr_ty.len() + self.pat_ty.len()) * 4 + self.expr_typed.len() + self.pat_typed.len();
-        n += grown(&self.field_uses) + grown(&self.dependencies) + grown(&self.locals) + grown(&self.param_pats) + grown(&self.closures) + grown(&self.errors) + grown(&self.deferred_misses);
+        n += grown(&self.field_uses) + grown(&self.struct_updates) + grown(&self.dependencies) + grown(&self.locals) + grown(&self.param_pats) + grown(&self.closures) + grown(&self.errors) + grown(&self.deferred_misses);
         n += self.errors.iter().map(|e| e.capacity()).sum::<usize>();
         n
     }
@@ -410,6 +413,7 @@ impl Body {
         add("struct_defaults", self.struct_defaults.len(), m(&self.struct_defaults) + self.struct_defaults.values().map(v).sum::<usize>());
         add("min_captures", self.min_captures.len(), m(&self.min_captures) + self.min_captures.values().map(|c| v(&c.captures) + v(&c.fake_reads) + v(&c.errors) + c.captures.iter().map(|x| v(&x.place.projections)).sum::<usize>() + c.fake_reads.iter().map(|x| v(&x.0.projections)).sum::<usize>()).sum::<usize>());
         add("field_uses", self.field_uses.len(), t(&self.field_uses));
+        add("struct_updates", self.struct_updates.len(), t(&self.struct_updates));
         add("dependencies", self.dependencies.len(), t(&self.dependencies));
         add("locals", self.locals.len(), t(&self.locals));
         add("param_pats", self.param_pats.len(), t(&self.param_pats));
@@ -742,6 +746,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             hidden_types: SideTable::new(),
             field_idx: SideTable::new(),
             field_uses: ThinVec::new(),
+            struct_updates: ThinVec::new(),
             awaits: ThinVec::new(),
             dependencies: ThinVec::new(),
             ov_index: SideTable::new(),
@@ -6024,6 +6029,9 @@ impl<'a> Fcx<'a> {
                     // the fields taken from the base must be visible too (rustc_hir_typeck
                     // check_expr_struct_fields: private fields of a functional update)
                     if let TyKind::Adt(ad, _, _) = self.tcx.tys.kind(self.shallow(adt_ty)).clone() {
+                        if !self.b.struct_updates.contains(&ad) {
+                            self.b.struct_updates.push(ad);
+                        }
                         if let Some(n) = self.tcx.adts.get(&ad).and_then(|a| a.variants.get(vi as usize)).map(|v| v.fields.len()) {
                             for fi in 0..n as u32 {
                                 if !given.contains(&fi) {
