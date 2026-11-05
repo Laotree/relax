@@ -439,15 +439,6 @@ pub fn validate_quoted(text: &[u8]) -> Result<(), String> {
     crate::validate::cooked_quoted(text)
 }
 
-pub fn validation_enabled() -> bool {
-    crate::validate::enabled()
-}
-
-/// Turns the parser's further diagnostics on (`makepad check`).
-pub fn set_validation(on: bool) {
-    crate::validate::set_enabled(on);
-}
-
 pub fn lex(src: &[u8], edition: u16, out: &mut Vec<Tok>) -> Result<(), LexError> {
     scan::<false>(src, edition, out, true)
 }
