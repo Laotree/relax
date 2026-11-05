@@ -34,6 +34,45 @@ fn try_passes_the_expected_type_back() {
     println!("| {:?} {:?}", negated("5"), negated("x").is_err());
 }
 
+// A binary operator's left operand has no expected type (rustc op.rs check_overloaded_binop): a
+// reference out of `?` stays one and `&T: Op<T>` applies, in an operator, a compound assignment and
+// a shift alike. A coercion the expected type asks for still happens at the `?`.
+fn flipped(v: &[u8]) -> Option<Vec<u8>> {
+    Some(vec![(v.first()? ^ 1) & 1])
+}
+
+fn weighted(input: &[f32], taps: &[f32]) -> Option<f32> {
+    let mut sum = 0.0f32;
+    for i in 0..taps.len() {
+        sum += input.get(i)? * taps[i];
+    }
+    Some(sum)
+}
+
+fn solved(row: &[f64], x: &[f64]) -> Option<f64> {
+    let mut s = 10.0;
+    for j in 0..row.len() {
+        s -= row.get(j)? * x.get(j)?;
+    }
+    Some(s)
+}
+
+fn shifted(v: &[u32]) -> Option<u32> {
+    let k: u32 = v.first()? << 2;
+    Some(k)
+}
+
+fn sliced(v: &[[u8; 2]]) -> Option<usize> {
+    let r: &[u8] = v.first()?;
+    Some(r.len())
+}
+
+#[test]
+fn try_operands_of_operators_keep_their_reference() {
+    println!("| {:?} {:?} {:?} {:?} {:?}", flipped(&[4]), flipped(&[]), weighted(&[1.0, 2.0], &[0.5, 0.25]), weighted(&[1.0], &[0.5, 0.25]), solved(&[1.0, 2.0], &[3.0, 4.0]));
+    println!("| {:?} {:?}", shifted(&[3]), sliced(&[[1, 2]]));
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Code(u16);
 impl PartialEq<Code> for u16 {

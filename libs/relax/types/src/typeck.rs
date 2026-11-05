@@ -6236,9 +6236,18 @@ impl<'a> Fcx<'a> {
         // rustc checks the desugared match's Continue arm against the expected
         // type. Feed that constraint back before operator lookup or fallback,
         // as in `let n: i64 = -text.parse()?`.
-        // An unsized rvalue expectation is only a hint, as for calls and
-        // blocks; the enclosing pointer performs the eventual unsizing.
-        if let Some(expected) = expected.filter(|t| !self.is_unsized_ty(*t)) { self.coerce_or_unify(output, expected, Some(e), lo); }
+        // Only as a hint: relax hands a binary operator's left operand the
+        // operator's expected type, which rustc does not (op.rs
+        // check_overloaded_binop), so `v.first()? ^ 1` with `&u8: BitXor<u8>`
+        // must keep its `&u8`. A coercion that fails leaves no trace; the
+        // enclosing coercion site reports a real mismatch. As for match arms,
+        // an unresolved, unit or unsized expectation constrains nothing.
+        if let Some(expected) = expected {
+            let s = self.shallow(expected);
+            if !matches!(self.tcx.tys.kind(s), TyKind::Infer(_) | TyKind::Error) && s != self.tcx.tys.unit && !self.is_unsized_ty(s) {
+                self.try_coerce_inner(output, expected, Some(e), lo, false);
+            }
+        }
         output
     }
 
