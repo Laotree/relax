@@ -148,11 +148,22 @@ mod imp {
 
     /// Listens on the socket at `path` (0600, same-uid peers) without a discovery file: for a
     /// service with a fixed address such as the hub. The caller has made sure no live process
-    /// serves the path; a stale socket file is replaced.
-    pub fn listen_at(ep: &Endpoint, path: &Path) -> io::Result<()> {
+    /// serves the path; a stale socket file is replaced. Returns the listener's descriptor, which
+    /// a process that execs a new image of itself can keep open for it ([`serve_listener`]).
+    pub fn listen_at(ep: &Endpoint, path: &Path) -> io::Result<std::os::unix::io::RawFd> {
+        use std::os::unix::io::AsRawFd;
         let _ = std::fs::remove_file(path);
-        accept_loop(ep, bind(path)?);
-        Ok(())
+        let listener = bind(path)?;
+        let fd = listener.as_raw_fd();
+        accept_loop(ep, listener);
+        Ok(fd)
+    }
+
+    /// Serves `ep` on a listener this process holds already: one its previous image bound with
+    /// [`listen_at`] and kept open over an exec. The socket file stays, and the dials that queued
+    /// on it while the new image started are served now.
+    pub fn serve_listener(ep: &Endpoint, listener: UnixListener) {
+        accept_loop(ep, listener);
     }
 }
 
