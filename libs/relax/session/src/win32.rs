@@ -14,6 +14,8 @@ extern "system" {
     pub fn VirtualAlloc(addr: *mut u8, size: usize, kind: u32, protect: u32) -> *mut u8;
     pub fn VirtualFree(addr: *mut u8, size: usize, kind: u32) -> i32;
     pub fn VirtualProtect(addr: *mut u8, size: usize, protect: u32, old: *mut u32) -> i32;
+    pub fn DiscardVirtualMemory(addr: *mut u8, size: usize) -> u32;
+    pub fn K32QueryWorkingSetEx(process: HANDLE, info: *mut WorkingSetExInformation, bytes: u32) -> i32;
     pub fn FlushInstructionCache(process: HANDLE, addr: *const u8, size: usize) -> i32;
     // errors
     pub fn GetLastError() -> u32;
@@ -50,6 +52,7 @@ extern "system" {
     // exceptions
     pub fn AddVectoredExceptionHandler(first: u32, handler: extern "system" fn(*mut ExceptionPointers) -> i32) -> *mut u8;
     pub fn SetUnhandledExceptionFilter(filter: Option<extern "system" fn(*mut ExceptionPointers) -> i32>) -> usize;
+    pub fn UnhandledExceptionFilter(ep: *mut ExceptionPointers) -> i32;
     // modules
     pub fn LoadLibraryA(name: *const u8) -> HANDLE;
     pub fn GetModuleHandleExW(flags: u32, name: *const u16, module: *mut HANDLE) -> i32;
@@ -140,6 +143,14 @@ pub struct MemoryBasicInformation {
     pub state: u32,
     pub protect: u32,
     pub kind: u32,
+}
+
+/// psapi.h PSAPI_WORKING_SET_EX_INFORMATION (x64); `attributes` bit 0: the page is in the working set
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct WorkingSetExInformation {
+    pub addr: *mut u8,
+    pub attributes: usize,
 }
 
 /// minwinbase.h OVERLAPPED

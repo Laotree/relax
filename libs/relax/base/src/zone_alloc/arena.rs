@@ -806,12 +806,27 @@ mod os {
 
 #[cfg(windows)]
 mod os {
-    use relax_session::win32::{MemoryBasicInformation, VirtualAlloc, VirtualFree, VirtualQuery};
+    use relax_session::win32::{DiscardVirtualMemory, GetCurrentProcess, K32QueryWorkingSetEx, MemoryBasicInformation, VirtualAlloc, VirtualFree, VirtualQuery, WorkingSetExInformation};
     pub unsafe fn no_huge_pages(_base: usize, _size: usize) {}
     pub const THP: bool = false;
     pub unsafe fn huge_pages(_base: usize, _size: usize, _on: bool) {}
-    pub unsafe fn resident(_at: usize, _size: usize) -> usize {
-        0
+    /// Resident bytes of `[at, at + size)`: the pages in the working set (diagnostics only).
+    pub unsafe fn resident(at: usize, size: usize) -> usize {
+        const P: usize = 4096;
+        let mut v = [WorkingSetExInformation { addr: std::ptr::null_mut(), attributes: 0 }; 512];
+        let (mut n, mut off) = (0, 0);
+        while off < size {
+            let pages = ((size - off + P - 1) / P).min(512);
+            for (i, e) in v[..pages].iter_mut().enumerate() {
+                e.addr = (at + off + i * P) as *mut u8;
+            }
+            if K32QueryWorkingSetEx(GetCurrentProcess(), v.as_mut_ptr(), (pages * std::mem::size_of::<WorkingSetExInformation>()) as u32) == 0 {
+                return n;
+            }
+            n += v[..pages].iter().filter(|e| e.attributes & 1 != 0).count() * P;
+            off += pages * P;
+        }
+        n
     }
     pub unsafe fn reserve(size: usize, align: usize, _label: &'static std::ffi::CStr) -> usize {
         let raw = VirtualAlloc(std::ptr::null_mut(), size + align, 0x2000, 1) as usize;
@@ -834,8 +849,9 @@ mod os {
     pub unsafe fn commit(p: *mut u8, size: usize) -> bool {
         !VirtualAlloc(p.cast(), size, 0x1000, 4).is_null()
     }
+    /// The pages leave the working set now (MEM_RESET only marks them, for later); still committed.
     pub unsafe fn release(p: *mut u8, size: usize) -> bool {
-        !VirtualAlloc(p.cast(), size, 0x80000, 4).is_null() // MEM_RESET
+        DiscardVirtualMemory(p, size) == 0
     }
     pub unsafe fn decommit(p: *mut u8, size: usize, _zero: bool) -> bool {
         VirtualFree(p.cast(), size, 0x4000) != 0
