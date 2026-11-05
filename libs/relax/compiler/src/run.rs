@@ -245,7 +245,7 @@ pub fn cmd_run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         cmd_run_inner(sess, args, None)
     };
     if crate::harness::live::enabled() && crate::hot_failure::recovering() {
-        crate::hot_failure::restart_failed(&format!("the replacement test harness ended before a verdict (exit {code})"));
+        crate::hot_failure::restart_failed(&format!("the replacement test harness ended before it started (exit {code})"));
         crate::hot_failure::pump();
     }
     let code = crate::hot_failure::verdict(code).code();
@@ -2094,6 +2094,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }));
     }
     relax_codegen::fncost::mark("boot done, calling main");
+    // a restarted run's program is in and its main is called next: the restart completed (a hosted
+    // app's, at its domain's load)
+    if !HAL_RUN.load(Ordering::Acquire) { crate::hot_failure::restored(); }
     let main_ms = crate::clock::ms_since_start();
     MAIN_START_MS.store(main_ms as u64, Ordering::Relaxed);
     crate::boot_stats::main_called();
@@ -2296,7 +2299,7 @@ pub(crate) fn exported_fns(prog: &crate::program::Program, prefixes: &[String]) 
                 symbol = Some(prog.name(DefId(di as u32)).to_string());
             } else if let Some(k) = toks.iter().position(|t| *t == "export_name") {
                 if let (Some(&"="), Some(lit)) = (toks.get(k + 1), toks.get(k + 2)) {
-                    symbol = Some(lit.trim_matches('"').to_string());
+                    symbol = Some(crate::lit::unescape_str(lit));
                 }
             }
         }

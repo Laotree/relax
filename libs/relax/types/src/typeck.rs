@@ -2899,19 +2899,21 @@ impl<'a> Fcx<'a> {
     /// The type a struct literal / struct pattern path names: explicit generic args
     /// (`S::<u16> { .. }`) and type aliases (`type S4<U> = S3<U, char>; S4::<u8> { .. }`) fix
     /// args; the rest are fresh (rustc instantiates the path's type, alias substituted).
-    /// `T::A { a, b }` / `Self::Out { .. }`: a struct named through an associated type of a
-    /// param (rustc resolves the path as a type, then takes its ADT and args).
+    /// `T::A { a, b }`, `Self::Out { .. }` or a type alias to a projection: resolve the
+    /// written path as a type, normalize it, then take its ADT and arguments.
     fn assoc_struct_path(&mut self, path: &Path) -> Option<TyId> {
         let n = path.segs.len();
-        if n < 2 || path.has_qself() {
+        if n == 0 || path.has_qself() {
             return None;
         }
         let s0 = self.ast().segs(path.segs)[0].clone();
-        if s0.kind() != SegKind::SelfType && !self.env.names.contains(&self.sym(s0.name)) {
-            return None;
-        }
-        if let Some(d) = self.tcx.resolve_type_path_def(self.prog, self.file, self.module, path) {
-            if matches!(self.prog.def(d).kind, DefKind::Struct | DefKind::Union | DefKind::Variant | DefKind::TypeAlias) {
+        let resolved = self.tcx.resolve_type_path_def(self.prog, self.file, self.module, path);
+        let alias = resolved.is_some_and(|d| self.prog.def(d).kind == DefKind::TypeAlias);
+        if !alias {
+            if n < 2 || (s0.kind() != SegKind::SelfType && !self.env.names.contains(&self.sym(s0.name))) {
+                return None;
+            }
+            if resolved.is_some_and(|d| matches!(self.prog.def(d).kind, DefKind::Struct | DefKind::Union | DefKind::Variant)) {
                 return None;
             }
         }
@@ -3235,6 +3237,12 @@ impl<'a> Fcx<'a> {
                     let t = self.tcx.alias_ty(&self.cx.with_infcx(&self.infcx), prog, d);
                     if let TyKind::Adt(ad, _, _) = self.tcx.tys.kind(t) {
                         return Res::Def(*ad);
+                    }
+                    // an alias to a projection (`type Made = <() as Make>::Out;`), normalized
+                    if let Some(t) = self.assoc_struct_path(path) {
+                        if let TyKind::Adt(ad, _, _) = self.tcx.tys.kind(t) {
+                            return Res::Def(*ad);
+                        }
                     }
                 }
             }
@@ -4278,7 +4286,7 @@ impl<'a> Fcx<'a> {
             // `D: DerefMut<Target = DrawVars>`)
             // (an opaque type derefs through its item bounds: `impl Deref<Target = Path>`,
             // rustc autoderef.rs overloaded_deref_ty selects the bound's candidate)
-            TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, .. }) => {
+            TyKind::Dyn(..) | TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, .. }) => {
                 let td = self.tcx.lang_items.get(crate::lang_items::LangItem::Deref)?;
                 let dt = self.infcx.deeply_resolve_ignoring_regions(t);
                 match self.select_trait(td, dt, &[]) {
@@ -6082,7 +6090,7 @@ impl<'a> Fcx<'a> {
             }
             ExprKind::Closure(row) => { let crate::ast::ClosureRow { params, ret, body, .. } = self.ast().row(*row); self.check_closure(e, self.ast().list(*params), *ret, *body, expected) }
             ExprKind::Mac(m) => self.check_mac(e, self.ast().row(*m), expected, lo),
-            ExprKind::Try(x) => self.check_try(e, *x, lo),
+            ExprKind::Try(x) => self.check_try(e, *x, expected, lo),
             ExprKind::Async(mode, b) => self.check_async_block(e, *mode, *b),
             ExprKind::Await(x) => {
                 let out = self.check_await(*x, lo);
@@ -6188,7 +6196,7 @@ impl<'a> Fcx<'a> {
     /// rustc_ast_lowering/src/expr.rs:1945-2033 @8d1a764: call Try::branch,
     /// match the ControlFlow lang-item variants, and return FromResidual on Break.
     /// The typed AST records the two desugared calls for its lowering consumers.
-    fn check_try(&mut self, e: ExprId, x: ExprId, lo: u32) -> TyId {
+    fn check_try(&mut self, e: ExprId, x: ExprId, expected: Option<TyId>, lo: u32) -> TyId {
         use crate::lang_items::LangItem;
         let t = self.check_expr(x, None);
         let Some(branch) = self.tcx.lang_items.get(LangItem::TryTraitBranch) else {
@@ -6225,6 +6233,21 @@ impl<'a> Fcx<'a> {
         self.b.dependencies.push(from_residual);
         self.b.try_branch.insert(e.0, (branch, self.tcx.tys.mk_list(&[t]), flow));
         self.b.try_from_residual.insert(e.0, (from_residual, self.tcx.tys.mk_list(&[ret, residual])));
+        // rustc checks the desugared match's Continue arm against the expected
+        // type. Feed that constraint back before operator lookup or fallback,
+        // as in `let n: i64 = -text.parse()?`.
+        // Only as a hint: relax hands a binary operator's left operand the
+        // operator's expected type, which rustc does not (op.rs
+        // check_overloaded_binop), so `v.first()? ^ 1` with `&u8: BitXor<u8>`
+        // must keep its `&u8`. A coercion that fails leaves no trace; the
+        // enclosing coercion site reports a real mismatch. As for match arms,
+        // an unresolved, unit or unsized expectation constrains nothing.
+        if let Some(expected) = expected {
+            let s = self.shallow(expected);
+            if !matches!(self.tcx.tys.kind(s), TyKind::Infer(_) | TyKind::Error) && s != self.tcx.tys.unit && !self.is_unsized_ty(s) {
+                self.try_coerce_inner(output, expected, Some(e), lo, false);
+            }
+        }
         output
     }
 
@@ -6322,6 +6345,21 @@ impl<'a> Fcx<'a> {
         }
     }
 
+    /// The hint a binary operator's left operand gets: the operator's expected type, which
+    /// rustc does not pass on (op.rs check_overloaded_binop checks the operand with none). A
+    /// `match`, an `if` or a block coerces its value to an expected type, so it gets none: in
+    /// `(if c { &a } else { &b }) * 2` the arms stay `&u16` and `&u16: Mul<u16>` applies.
+    fn operand_hint(&self, a: ExprId, hint: Option<TyId>) -> Option<TyId> {
+        let mut x = a;
+        loop {
+            match self.ast().expr(x).kind {
+                ExprKind::Paren(i) => x = i,
+                ExprKind::Match(..) | ExprKind::If(..) | ExprKind::Block(..) | ExprKind::Unsafe(_) => return None,
+                _ => return hint,
+            }
+        }
+    }
+
     fn check_binary(&mut self, e: ExprId, op: BinOp, a: ExprId, b: ExprId, expected: Option<TyId>, lo: u32) -> TyId {
         let bool_ = self.tcx.tys.bool_;
         match op {
@@ -6342,12 +6380,12 @@ impl<'a> Fcx<'a> {
                 // non-primitive operands compare through PartialEq / PartialOrd (`v == w` on
                 // Vecs calls Vec's eq, `s == "x"` with s: String uses PartialEq<&str>)
                 let sa = self.shallow(ta);
-                // (`&str` orders through str's PartialOrd: only its equality is built in)
-                let ordering = !matches!(op, BinOp::Eq | BinOp::Ne);
+                // References to scalar primitives retain the built-in path.
+                // String slices compare through their potentially heterogeneous traits.
                 let prim_ref = match self.tcx.tys.kind(sa).clone() {
                     TyKind::Ref(_, i, _) => {
                         let i = self.shallow(i);
-                        self.is_numeric(i) || matches!(self.tcx.tys.kind(i), TyKind::Bool | TyKind::Char | TyKind::FnPtr(..)) || (!ordering && matches!(self.tcx.tys.kind(i), TyKind::Str))
+                        self.is_numeric(i) || matches!(self.tcx.tys.kind(i), TyKind::Bool | TyKind::Char | TyKind::FnPtr(..))
                     }
                     _ => false,
                 };
@@ -6369,6 +6407,16 @@ impl<'a> Fcx<'a> {
                     }
                 }
                 let tb = self.check_expr(b, Some(ta));
+                // A scalar left operand can implement a comparison against a local
+                // non-scalar right operand (for example `impl PartialEq<Code> for u16`).
+                // Built-in scalar comparison requires scalar operands on both sides.
+                let sb = self.shallow(tb);
+                if matches!(self.tcx.tys.kind(sa), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char)
+                    && !matches!(self.tcx.tys.kind(sb), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Infer(_) | TyKind::Never | TyKind::Error) {
+                    if let Some(r) = self.check_cmp_trait(e, op, sa, b, lo, Some(tb)) {
+                        return r;
+                    }
+                }
                 // `&str != String`, `&u8 == u8`: not the built-in comparison of equal types but
                 // `<&str as PartialEq<String>>` (rustc op.rs: an operator trait lookup with the
                 // operand types as written)
@@ -6404,7 +6452,8 @@ impl<'a> Fcx<'a> {
                 bool_
             }
             BinOp::Shl | BinOp::Shr => {
-                let ta = self.check_expr(a, expected);
+                let hint = self.operand_hint(a, expected);
+                let ta = self.check_expr(a, hint);
                 // `&x >> k` on primitives: core's forward-ref Shl/Shr impls, Output = the
                 // primitive (rustc op.rs: only primitive operands are built in); a non-primitive
                 // left operand is an operator trait call
@@ -6433,7 +6482,7 @@ impl<'a> Fcx<'a> {
                     }
                     None => None,
                 };
-                let ta = self.check_expr(a, exp);
+                let ta = self.check_expr(a, self.operand_hint(a, exp));
                 let sa0 = self.shallow(ta);
                 // `&x op y` on primitives: built in, through the references (core's
                 // forward-ref operator impls, without dispatch)

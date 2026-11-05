@@ -3487,7 +3487,8 @@ fn park_compile_error(up: usize, slot: u32) -> u64 {
 /// live edits it is a failed hot load (reload.rs recover_compile_ice): recorded, and a fresh
 /// process replaces this one -- now when this is the app's main thread, else at the app's next
 /// event, with its state, while this call waits for it. Otherwise (no edit ran, a recovery
-/// failed or runs already: the replacement's own error) the call fails as the error's panic.
+/// failed or runs already: the replacement's own error, reported as the JIT's) the call fails as
+/// the error's panic.
 #[cold]
 #[inline(never)]
 fn compile_ice(up: usize, message: &str) -> u64 {
@@ -3501,8 +3502,10 @@ fn compile_ice(up: usize, message: &str) -> u64 {
 }
 
 /// compile_ice's recovery, on the program thread that met the internal compiler error `message`.
-/// Returns when no next run takes over: the call then fails as the error's panic.
-pub(crate) fn ice_at_call(message: &str) {
+/// Returns when no next run takes over: the call then fails as the error's panic. True when the
+/// error was reported as the JIT's failure (a restarted run's, before or after its restore): no
+/// panic of the program, so nothing parks it as one.
+pub(crate) fn ice_at_call(message: &str) -> bool {
     let on_main = os::thread::current() == MAIN_TID.load(Ordering::Relaxed);
     // (a recovery this process asked for already: its restart is this call's end too)
     let restarting = crate::reload::recover_compile_ice(message, on_main) || crate::reload::unit_suspect().is_some() && crate::hot_failure::recovering();
@@ -3519,9 +3522,14 @@ pub(crate) fn ice_at_call(message: &str) {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-    } else if crate::hot_failure::recovering() {
-        // the warm restart's own process failed the same way: the JIT error devhub reports
-        crate::hot_failure::restart_failed(message);
+        false
+    } else if crate::hot_failure::restart_failed(message) {
+        // the warm restart's own process failed the same way before its restore completed: the
+        // JIT error devhub reports
+        true
+    } else {
+        // past its restore: still the JIT's, never the program's
+        crate::hot_failure::replacement_jit_failed(message)
     }
 }
 
@@ -3532,6 +3540,11 @@ pub(crate) fn is_ice_stub_message(message: &str) -> bool {
 }
 
 fn fatal_compile_error(p: &PanicInfo, report: &str) {
+    // an internal compiler error in a restarted run is the JIT's, reported as its restart's failure
+    // (ice_at_call): no error of the program's that rustc rejects, so no end of the run as one
+    if is_ice_stub_message(&p.message) && crate::hot_failure::replacement() {
+        return;
+    }
     if COMPILE_ERRORS_FATAL.load(std::sync::atomic::Ordering::Relaxed) && p.message.starts_with("compile error in ") {
         eprintln!("makepad-run: {} -- the program cannot run past it (rustc rejects it)\n  report: {}", p.message, report);
         // an app domain's compile error is that domain's crash (its thread ends next); the others go on
@@ -3694,6 +3707,7 @@ use crate::stack::ensure_sufficient_stack;
 /// thread redirects it into this glue (x64::hang_tramp in front of rt_hang); 0 = none.
 pub(crate) static HANG_TRAMP: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(not(target_arch = "aarch64"))]
 rt_fn! {
     /// The hang watchdog's interrupt, run on the interrupted thread through HANG_TRAMP: the same
     /// decision as a watchdog signal; when it acts, the call unwinds to its recovery point
@@ -4607,8 +4621,9 @@ impl Unit {
             u.rt.panic_impl = u.emit_code(&panic_tramp(crate::web32::w32_panic_impl as *const () as usize as u64), "relax::panic_impl");
         }
         u.env.resume = u.rt.resume;
+        #[cfg(not(target_arch = "aarch64"))]
         if os::fault::NEEDS_HANG_TRAMP {
-            HANG_TRAMP.store(u.emit_code(&relax_backend::x64::hang_tramp(rt_hang as *const () as usize as u64), "relax::hang_tramp"), Ordering::Relaxed);
+            HANG_TRAMP.store(u.emit_code(&x64::hang_tramp(rt_hang as *const () as usize as u64), "relax::hang_tramp"), Ordering::Relaxed);
         }
         u.env.syms = u.syms.vals;
         u.env.sym_class = u.syms.classes;
@@ -6560,7 +6575,13 @@ impl Unit {
         let f = &self.prog.files[def.file as usize];
         for a in f.ast.list(f.ast.item(def.item).attrs) {
             if a.toks.hi >= a.toks.lo + 3 && f.tok_text(a.toks.lo) == "link_name" && f.tok_text(a.toks.lo + 1) == "=" {
-                return f.tok_text(a.toks.lo + 2).trim_matches('"').to_string();
+                let name = crate::lit::unescape_str(f.tok_text(a.toks.lo + 2));
+                // LLVM's leading SOH requests an exact object-file symbol. Our lookups use
+                // C names, so undo Mach-O's ABI prefix only for these exact names.
+                if let Some(exact) = name.strip_prefix('\u{1}') {
+                    return crate::global_asm::c_name(exact).to_string();
+                }
+                return name;
             }
         }
         self.prog.name(d).to_string()
@@ -8536,11 +8557,20 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
 /// MAKEPAD_RUN_TEST_HOT_BUILD_ERROR=<name part>: in a process a live edit ran in, the build of a fn
 /// whose name contains it fails with an internal compiler error, as a closure whose owner's body
 /// is gone does (tools/run/fixture/hot_fail.py).
+/// MAKEPAD_RUN_TEST_REPLACEMENT_BUILD_ERROR=<name part>: in a restarted run (no edit in it), the
+/// build of such a fn fails the same way: the JIT's error in the restart's own run
+/// (tools/run/fixture/hot_fail.py).
 unsafe fn test_hot_build_error(up: *mut Unit, id: u32) -> Result<(), String> {
     static WANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    static WANT_REPLACEMENT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     if let Some(w) = WANT.get_or_init(|| std::env::var("MAKEPAD_RUN_TEST_HOT_BUILD_ERROR").ok().filter(|w| !w.is_empty())) {
         if (&*up).fns[id as usize].name.contains(w.as_str()) && crate::hot_failure::edit_ran() {
             return Err(format!("internal compiler error: MAKEPAD_RUN_TEST_HOT_BUILD_ERROR: forced for `{w}`"));
+        }
+    }
+    if let Some(w) = WANT_REPLACEMENT.get_or_init(|| std::env::var("MAKEPAD_RUN_TEST_REPLACEMENT_BUILD_ERROR").ok().filter(|w| !w.is_empty())) {
+        if (&*up).fns[id as usize].name.contains(w.as_str()) && !crate::hot_failure::edit_ran() && crate::hot_failure::replacement() {
+            return Err(format!("internal compiler error: MAKEPAD_RUN_TEST_REPLACEMENT_BUILD_ERROR: forced for `{w}`"));
         }
     }
     Ok(())
@@ -21983,6 +22013,8 @@ extern "C" fn relax_allocator_swap(phase: u32) {
 pub extern "C" fn __relax_exit(code: i32) {
     crate::domain::exit_current(code);
     let code = crate::check::finish_test_deps(code);
+    // a run past a JIT error ends with the JIT error's verdict, not the program's code
+    let code = crate::hot_failure::verdict(code).code();
     crate::tui::exit_code(code);
     os::proc::exit(code)
 }
@@ -21992,6 +22024,8 @@ extern "C" fn recorded_exit(code: i32) -> ! {
     // an app domain's exit ends that domain only (domain.rs)
     crate::domain::exit_current(code);
     let code = crate::check::finish_test_deps(code);
+    // a run past a JIT error ends with the JIT error's verdict, not the program's code
+    let code = crate::hot_failure::verdict(code).code();
     crate::tui::exit_code(code);
     os::proc::exit(code)
 }
