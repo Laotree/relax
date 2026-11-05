@@ -1010,6 +1010,18 @@ fn request<R>(site: &'static std::panic::Location<'static>, class: Class, deadli
     if is_owner() || CHILD.load(Ordering::Relaxed) {
         return Some(f());
     }
+    let mut out: Option<R> = None;
+    let mut f = Some(f);
+    let mut run = || out = Some((f.take().unwrap())());
+    if !request_dyn(site, class, deadline, yields, &mut run) {
+        return None;
+    }
+    Some(out.unwrap())
+}
+
+/// `request` past its owner fast path, for every result type (one copy, not one per caller's
+/// closure): false when the request was withdrawn or given back, and the caller asks again.
+fn request_dyn(site: &'static std::panic::Location<'static>, class: Class, deadline: Option<std::time::Instant>, yields: bool, run: &mut dyn FnMut()) -> bool {
     assert_no_leaf("a request to the compiler's owner");
     // a front reader that must not wait (lowering ahead) gives the work back first; a back
     // end's finish is never refused (its slots stay in flight until it is served)
@@ -1018,11 +1030,6 @@ fn request<R>(site: &'static std::panic::Location<'static>, class: Class, deadli
         crate::preempt::point();
     }
     start();
-    let mut out: Option<R> = None;
-    let outp: *mut Option<R> = &mut out;
-    let mut f = Some(f);
-    let mut run = move || unsafe { *outp = Some((f.take().unwrap())()) };
-    let run: &mut dyn FnMut() = &mut run;
     // SAFETY: the request is done (or withdrawn) before this frame returns; the owner runs the
     // closure only between this push and the Done store
     let run: *mut (dyn FnMut() + 'static) = unsafe { std::mem::transmute(run) };
@@ -1128,7 +1135,7 @@ fn request<R>(site: &'static std::panic::Location<'static>, class: Class, deadli
         }
     }
     if withdrawn {
-        return None;
+        return false;
     }
     match req.panic.take() {
         Some(p) if p.is::<crate::preempt::OwnerBusy>() => match req.yielded.take() {
@@ -1136,7 +1143,7 @@ fn request<R>(site: &'static std::panic::Location<'static>, class: Class, deadli
             // count: `_idle`) it waits for that build to end, then its caller asks again
             Some(build) => {
                 build.wait();
-                None
+                false
             }
             // served nested and blocked by an earlier request on the owner: the requester's
             // work is cancelled as a preemption is (its queries too) and redone later. Only
@@ -1148,7 +1155,7 @@ fn request<R>(site: &'static std::panic::Location<'static>, class: Class, deadli
             crate::lifeline::set_panic_at_raw(req.panic_at.get());
             resume_said(p)
         }
-        None => Some(out.unwrap()),
+        None => true,
     }
 }
 
