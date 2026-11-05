@@ -175,19 +175,24 @@ fn symbol_at_imp(pc: u64) -> Option<(String, u64, String)> {
 }
 
 /// The program's atexit handlers, in the order it registered them.
-static PROGRAM_ATEXIT: std::sync::Mutex<Vec<extern "C" fn()>> = std::sync::Mutex::new(Vec::new());
+static PROGRAM_ATEXIT: std::sync::Mutex<Vec<(u64, extern "C" fn())>> = std::sync::Mutex::new(Vec::new());
 
 /// The program's `atexit`: [`exit`] runs the handler, while JIT code can still compile.
 pub extern "C" fn program_atexit(f: extern "C" fn()) -> i32 {
-    PROGRAM_ATEXIT.lock().unwrap_or_else(|e| e.into_inner()).push(f);
+    PROGRAM_ATEXIT.lock().unwrap_or_else(|e| e.into_inner()).push((crate::domain::current(), f));
     0
+}
+
+/// A run ended: its handlers go with it, not run (its end does not depend on its cleanup).
+pub fn forget_program_atexit(bases: &[u64]) {
+    PROGRAM_ATEXIT.lock().unwrap_or_else(|e| e.into_inner()).retain(|h| !bases.contains(&h.0));
 }
 
 /// Runs (and empties) the program's atexit handlers, last registered first; one a handler
 /// registers runs too. exit() runs them, and so does the exit of the run's app domain, which
 /// ends the process from the host (domain.rs exit_current).
 pub fn run_program_atexit() {
-    while let Some(f) = { let mut g = PROGRAM_ATEXIT.lock().unwrap_or_else(|e| e.into_inner()); g.pop() } {
+    while let Some((_, f)) = { let mut g = PROGRAM_ATEXIT.lock().unwrap_or_else(|e| e.into_inner()); g.pop() } {
         f();
     }
 }

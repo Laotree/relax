@@ -31,6 +31,11 @@ extern "system" {
     pub fn DuplicateHandle(src_process: HANDLE, src: HANDLE, dst_process: HANDLE, dst: *mut HANDLE, access: u32, inherit: i32, options: u32) -> i32;
     pub fn CloseHandle(h: HANDLE) -> i32;
     pub fn SuspendThread(t: HANDLE) -> u32;
+    pub fn CancelSynchronousIo(t: HANDLE) -> i32;
+    pub fn CreateEventW(attributes: *const u8, manual_reset: i32, initial: i32, name: *const u16) -> HANDLE;
+    pub fn SetEvent(event: HANDLE) -> i32;
+    pub fn WaitForMultipleObjectsEx(n: u32, handles: *const HANDLE, all: i32, ms: u32, alertable: i32) -> u32;
+    pub fn SleepEx(ms: u32, alertable: i32) -> u32;
     pub fn ResumeThread(t: HANDLE) -> u32;
     pub fn GetThreadContext(t: HANDLE, ctx: *mut Context) -> i32;
     pub fn SetThreadContext(t: HANDLE, ctx: *const Context) -> i32;
@@ -85,6 +90,40 @@ extern "system" {
     pub fn CreateDirectoryW(name: *const u16, attributes: *const SecurityAttributes) -> i32;
     pub fn GetDriveTypeW(root: *const u16) -> u32;
     pub fn CompareStringOrdinal(a: *const u16, a_len: i32, b: *const u16, b_len: i32, ignore_case: i32) -> i32;
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    pub fn CreateEventExW(attrs: *const u8, name: *const u16, flags: u32, access: u32) -> HANDLE;
+    pub fn CreateMutexW(attrs: *const u8, initial: i32, name: *const u16) -> HANDLE;
+    pub fn CreateSemaphoreW(attrs: *const u8, initial: i32, max: i32, name: *const u16) -> HANDLE;
+    pub fn CreatePipe(read: *mut HANDLE, write: *mut HANDLE, attrs: *const u8, size: u32) -> i32;
+    pub fn CreateNamedPipeW(name: *const u16, mode: u32, pipe_mode: u32, instances: u32, out: u32, inp: u32, timeout: u32, attrs: *const u8) -> HANDLE;
+    pub fn CreateJobObjectW(attrs: *const u8, name: *const u16) -> HANDLE;
+    pub fn CreateProcessW(app: *const u16, cmd: *mut u16, process_attrs: *const u8, thread_attrs: *const u8, inherit: i32, flags: u32, env: *mut u8, cwd: *const u16, startup: *mut u8, info: *mut ProcessInformation) -> i32;
+    pub fn FindFirstFileExW(name: *const u16, level: i32, data: *mut u8, op: i32, filter: *const u8, flags: u32) -> HANDLE;
+    pub fn FindFirstFileW(name: *const u16, data: *mut u8) -> HANDLE;
+    pub fn FindClose(h: HANDLE) -> i32;
+    pub fn GetProcessHandleCount(process: HANDLE, count: *mut u32) -> i32;
+    pub fn MapViewOfFile(h: HANDLE, access: u32, hi: u32, lo: u32, size: usize) -> *mut u8;
+    pub fn MapViewOfFileEx(h: HANDLE, access: u32, hi: u32, lo: u32, size: usize, base: *mut u8) -> *mut u8;
+}
+
+#[link(name = "ws2_32")]
+extern "system" {
+    pub fn socket(af: i32, ty: i32, protocol: i32) -> usize;
+    pub fn WSASocketW(af: i32, ty: i32, protocol: i32, info: *const u8, group: u32, flags: u32) -> usize;
+    pub fn accept(s: usize, addr: *mut u8, len: *mut i32) -> usize;
+    pub fn closesocket(s: usize) -> i32;
+}
+
+/// PROCESS_INFORMATION
+#[repr(C)]
+pub struct ProcessInformation {
+    pub process: HANDLE,
+    pub thread: HANDLE,
+    pub pid: u32,
+    pub tid: u32,
 }
 
 #[link(name = "ntdll")]
@@ -185,6 +224,7 @@ pub const MEM_RESERVE: u32 = 0x2000;
 pub const MEM_RELEASE: u32 = 0x8000;
 pub const MEM_DECOMMIT: u32 = 0x4000;
 pub const PAGE_NOACCESS: u32 = 0x01;
+pub const PAGE_READONLY: u32 = 0x02;
 pub const PAGE_READWRITE: u32 = 0x04;
 pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 pub const PAGE_EXECUTE_READ: u32 = 0x20;
@@ -194,6 +234,7 @@ pub const MEM_PRESERVE_PLACEHOLDER: u32 = 0x0000_0002;
 pub const SEC_RESERVE: u32 = 0x0400_0000;
 pub const INVALID_HANDLE_VALUE: HANDLE = -1;
 
+pub const THREAD_TERMINATE: u32 = 0x0001;
 pub const THREAD_SUSPEND_RESUME: u32 = 0x0002;
 pub const THREAD_GET_CONTEXT: u32 = 0x0008;
 pub const THREAD_SET_CONTEXT: u32 = 0x0010;

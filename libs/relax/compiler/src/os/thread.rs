@@ -113,6 +113,17 @@ mod unix {
         }
     }
 
+    /// A run's end: ends the system call thread `t` is waiting in (EINTR: no handler restarts one).
+    /// The thread itself does the rest.
+    pub fn end_kick(t: u64, _waiting: usize) {
+        kick(t);
+    }
+
+    /// (`end_kick`'s second argument: only Windows needs it)
+    pub fn waiting_cell() -> usize {
+        0
+    }
+
     pub fn fork() -> i32 {
         unsafe { libc_fork() }
     }
@@ -124,7 +135,7 @@ mod unix {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod imp {
-    pub use super::unix::{current, exit_now, fork, kick, name, note_current};
+    pub use super::unix::{current, end_kick, waiting_cell, exit_now, fork, kick, name, note_current};
 
     pub fn realtime() -> bool {
         extern "C" {
@@ -137,7 +148,7 @@ mod imp {
 
 #[cfg(target_vendor = "apple")]
 mod imp {
-    pub use super::unix::{current, exit_now, fork, kick, name, note_current};
+    pub use super::unix::{current, end_kick, waiting_cell, exit_now, fork, kick, name, note_current};
     use super::unix::pthread_self;
 
     /// A thread with a time-constraint policy (CoreAudio's IO threads, audio workgroups).
@@ -193,6 +204,17 @@ mod imp {
     /// from this (the watching) thread; the fault layer decides (os::fault::interrupt).
     pub fn kick(t: u64) {
         crate::os::fault::interrupt(t);
+    }
+
+    /// A run's end: ends the wait thread `t` is in (os::fault::end_interrupt; `waiting`: its
+    /// `waiting_cell`).
+    pub fn end_kick(t: u64, waiting: usize) {
+        crate::os::fault::end_interrupt(t, waiting)
+    }
+
+    /// Where the calling thread says what it waits on, for `end_kick`.
+    pub fn waiting_cell() -> usize {
+        crate::domain_threads::waits::cell()
     }
 
     /// A time-critical thread (WASAPI render threads run at THREAD_PRIORITY_TIME_CRITICAL or

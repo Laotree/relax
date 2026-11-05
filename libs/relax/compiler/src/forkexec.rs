@@ -81,12 +81,16 @@ pub(crate) extern "C" fn relax_fork_exec() -> i32 {
     let pid = crate::os::thread::fork();
     let err = crate::os::proc::last_error();
     if pid == 0 {
+        crate::domain_res::fork_child();
         EXEC_CHILD.store(true, Ordering::SeqCst);
         if let (Some(t), Some(k)) = (t, k) {
             t[k][3].store(STATE_CHILD, Ordering::Release);
         }
-    } else if let (Some(t), Some(k)) = (t, k) {
-        t[k][0].store(if pid > 0 { pid as u64 } else { 0 }, Ordering::Release);
+    } else {
+        crate::domain_res::note_child(pid);
+        if let (Some(t), Some(k)) = (t, k) {
+            t[k][0].store(if pid > 0 { pid as u64 } else { 0 }, Ordering::Release);
+        }
     }
     crate::os::proc::set_last_error(err);
     pid

@@ -97,6 +97,28 @@ pub unsafe fn patch_code_u32(addr: u64, w: u32) {
     fill_code(addr, 4, |b| (*(b.as_mut_ptr() as *const std::sync::atomic::AtomicU32)).store(w, std::sync::atomic::Ordering::Release));
 }
 
+/// The code [addr, addr + len) of a run that ended: nothing can execute it any more, while whatever
+/// still reads it (a thunk's word, a disassembly) can, and a compile still in flight can finish
+/// writing (through the RW alias, which stays). The whole range goes at once, also what no code was
+/// placed in yet. Where code has one read-write-execute view (MAKEPAD_RUN_WX=0, the perf map) it
+/// turns read-write. A failure is fatal: the old run would go on.
+pub fn end_code(addr: u64, len: usize) {
+    if no_codegen() {
+        return;
+    }
+    #[cfg(unix)]
+    let ok = {
+        const PROT_READ: i32 = 1;
+        unsafe { unix::mprotect(addr as *mut u8, len, if single_code_view(addr) { unix::PROT_RW } else { PROT_READ }) == 0 }
+    };
+    #[cfg(windows)]
+    let ok = end_code_committed(addr, len);
+    if !ok {
+        eprintln!("makepad run: the code of an ended run at {:#x} ({} bytes) could not be made non-executable", addr, len);
+        std::process::abort();
+    }
+}
+
 /// The OS page size (mprotect's granularity): 4 KB on x86-64, 16 KB on Apple arm64.
 pub fn page_size() -> u64 {
     static PAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -547,6 +569,11 @@ mod imp {
         }
     }
 
+    /// Whether code at `addr` has one read-write-execute view (written where it runs).
+    pub(super) fn single_code_view(addr: u64) -> bool {
+        code_rw_of(addr).is_none()
+    }
+
     /// Where code bytes at `addr` are written: the RW alias, or (single RWX view) the address.
     #[inline]
     #[track_caller]
@@ -781,6 +808,12 @@ mod imp {
         None
     }
 
+    /// Whether code at `addr` has one read-write-execute view (never here: the RW alias is the
+    /// only way code is written).
+    pub(super) fn single_code_view(_addr: u64) -> bool {
+        false
+    }
+
     /// Writes machine code: copies through the RW view, then invalidates the instruction cache
     /// for the RX range.
     #[track_caller]
@@ -831,6 +864,8 @@ mod imp {
     /// reservation; append-only (lookups read entries without the lock), a released one keeps
     /// its entry with total 0
     static RES: [[AtomicU64; 5]; REGIONS] = [const { [const { AtomicU64::new(0) }; 5] }; REGIONS];
+    /// Per reservation: where its ended code starts (`end_code_committed`), 0: it runs.
+    static ENDED_FROM: [AtomicU64; REGIONS] = [const { AtomicU64::new(0) }; REGIONS];
     static RES_N: AtomicUsize = AtomicUsize::new(0);
 
     // W^X (JITSAFE fix 15): the code part of a reservation is two views of one pagefile-backed
@@ -1028,6 +1063,35 @@ mod imp {
         }
     }
 
+    /// `super::end_code`: only committed pages can change, the ones committed later come up
+    /// non-executable (`commit`, which reads ENDED_FROM after it sets a granule's bit, as this reads
+    /// the bits after it set ENDED_FROM: one of the two protects each granule).
+    pub(super) fn end_code_committed(addr: u64, len: usize) -> bool {
+        let n = RES_N.load(Ordering::Acquire);
+        for r in 0..n {
+            let (base, code, rw) = (RES[r][0].load(Ordering::Relaxed), RES[r][1].load(Ordering::Relaxed), RES[r][3].load(Ordering::Relaxed));
+            if RES[r][2].load(Ordering::Acquire) == 0 || addr < base || addr - base >= code {
+                continue;
+            }
+            ENDED_FROM[r].store(addr, Ordering::SeqCst);
+            let end = addr + len as u64;
+            let mut g = (addr - base) / GRANULE;
+            while base + g * GRANULE < end {
+                if BITS[r][(g / 64) as usize].load(Ordering::SeqCst) & (1u64 << (g % 64)) != 0 {
+                    let lo = (base + g * GRANULE).max(addr);
+                    let hi = (base + (g + 1) * GRANULE).min(end);
+                    let mut old = 0u32;
+                    if unsafe { VirtualProtect(lo as *mut u8, (hi - lo) as usize, if rw != 0 { PAGE_READONLY } else { PAGE_READWRITE }, &mut old) } == 0 {
+                        return false;
+                    }
+                }
+                g += 1;
+            }
+            return true;
+        }
+        false
+    }
+
     /// Committed pages fault in as they are first written (see unix::prefault).
     pub fn prefault(_addr: u64, _len: usize) {}
 
@@ -1069,6 +1133,13 @@ mod imp {
                     panic!("out of memory: committing {:#x} (+{:#x})", at, size);
                 }
                 BITS[r][w].fetch_or(b, Ordering::AcqRel);
+                // the run ended while this was being committed, or before: nothing runs here
+                let from = ENDED_FROM[r].load(Ordering::SeqCst);
+                if from != 0 && csize != 0 && split > from {
+                    let lo = at.max(from);
+                    let mut old = 0u32;
+                    unsafe { VirtualProtect(lo as *mut u8, (split - lo) as usize, if rw != 0 { PAGE_READONLY } else { PAGE_READWRITE }, &mut old) };
+                }
             }
             return;
         }
