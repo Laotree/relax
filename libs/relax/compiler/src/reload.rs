@@ -4899,7 +4899,7 @@ pub fn domain_stopping(id: u32) {
 }
 
 // the first domain of a restarted run gets the state the previous run left
-// (MAKEPAD_RUN_RESTORE, read once)
+// (MAKEPAD_RUN_RESTORE, read once: run_end::run_input)
 static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 pub(crate) fn domain_loaded(inputs: Option<Inputs>) {
@@ -4908,7 +4908,7 @@ pub(crate) fn domain_loaded(inputs: Option<Inputs>) {
     clear_restart_pending();
     let mut restored = None;
     if FIRST.swap(false, std::sync::atomic::Ordering::AcqRel) {
-        if let Some(path) = std::env::var_os("MAKEPAD_RUN_RESTORE") {
+        if let Some(path) = crate::run_end::run_input("MAKEPAD_RUN_RESTORE") {
             let _k = crate::zone_alloc::kept();
             restored = std::fs::read_to_string(&path).ok();
             let _ = std::fs::remove_file(&path);
@@ -5167,6 +5167,14 @@ pub extern "C" fn __relax_restored_state(buf: *mut u8, cap: usize) -> usize {
             Some(t) => copy_out(t, buf, cap),
             None => usize::MAX,
         }
+    })
+}
+
+/// When the edit whose restart started this run was saved (unix ms; 0 for a run no restart started):
+/// MAKEPAD_RUN_RESTART_T0 as this run has it (run_end::run_input), for save -> back on screen.
+pub extern "C" fn __relax_restart_saved_ms() -> f64 {
+    crate::jit::host_boundary("__relax_restart_saved_ms", || {
+        crate::run_end::run_input("MAKEPAD_RUN_RESTART_T0").and_then(|v| v.into_string().ok()).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0)
     })
 }
 
@@ -5557,22 +5565,74 @@ pub(crate) fn hand_back() {
     }
 }
 
-/// What the next run reads, as a process finds it in its environment (a value, or none): the
-/// recovery on its way, `state` as the app left it, when the edit behind this was saved.
+/// What the next run reads (run_end::run_input; a value, or none): the recovery on its way, `state`
+/// as the app left it, when the edit behind this was saved. A process started for the next run
+/// finds it in its environment, a run started in place in the restart's hand-over.
 pub(crate) fn next_run_env(state: Option<&[u8]>) -> Result<Vec<(&'static str, Option<std::ffi::OsString>)>, String> {
     let recovery = crate::hot_failure::hand_over()?.map(|path| path.into_os_string());
     let restore = match state {
-        Some(st) => {
-            // (one file, which the next run removes when it reads it: on Windows a run of a process
-            // that starts again has another pid)
-            let path = std::env::temp_dir().join(format!("relax-restart-state-{}", std::process::id()));
-            std::fs::write(&path, st).map_err(|e| format!("cannot write the state: {e}"))?;
-            Some(path.into_os_string())
-        }
+        Some(st) => Some(restart_state_file(st)?.into_os_string()),
         None => None,
     };
     let saved = RESTART_SAVED_MS.load(std::sync::atomic::Ordering::Relaxed).to_string();
     Ok(vec![("MAKEPAD_JIT_RECOVERY", recovery), ("MAKEPAD_RUN_RESTORE", restore), ("MAKEPAD_RUN_RESTART_T0", Some(saved.into()))])
+}
+
+/// The app's state for the next run (MAKEPAD_RUN_RESTORE), in a file of its own, which that run
+/// removes when it reads it: made new in this user's own directory (makepad_remote's socket dir),
+/// so no other user can read it, put it there first or point it elsewhere.
+pub(crate) fn restart_state_file(st: &[u8]) -> Result<std::path::PathBuf, String> {
+    #[cfg(unix)]
+    let dir = makepad_remote::carrier::unix::own_socket_dir().map_err(|e| format!("cannot write the state: {e}"))?;
+    #[cfg(not(unix))]
+    let dir = makepad_remote::carrier::unix::socket_dir();
+    let path = dir.join(format!("relax-restart-state-{}-{}", std::process::id(), crate::clock::wall_ns()));
+    write_new_private(&path, st).map_err(|e| format!("cannot write the state {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// `bytes` in a file made at `path` (0600 on Unix), never one that is there already, nor a link's
+/// target: another file or link at `path` is an error.
+fn write_new_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(path)?.write_all(bytes)
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn a_restarts_state_file_is_made_new_never_through_a_link() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("relax-state-file-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("target");
+    std::fs::write(&target, b"keep").unwrap();
+    let link = dir.join("state-link");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert!(write_new_private(&link, b"state").is_err(), "a link at the path is refused");
+    assert_eq!(std::fs::read(&target).unwrap(), b"keep", "the link's target is untouched");
+    assert!(write_new_private(&target, b"state").is_err(), "a file at the path is refused");
+    let fresh = dir.join("state-fresh");
+    let _ = std::fs::remove_file(&fresh);
+    write_new_private(&fresh, b"state").unwrap();
+    assert_eq!(std::fs::read(&fresh).unwrap(), b"state");
+    assert_eq!(std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777, 0o600);
+    for f in [&fresh, &link, &target] {
+        let _ = std::fs::remove_file(f);
+    }
+    let _ = std::fs::remove_dir(&dir);
+    // the restart's own: in this user's 0700 directory, 0600
+    let state = restart_state_file(b"state").unwrap();
+    let own = makepad_remote::carrier::unix::socket_dir();
+    assert_eq!(state.parent(), Some(own.as_path()));
+    assert_eq!(std::fs::metadata(&own).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(std::fs::metadata(&state).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(std::fs::read(&state).unwrap(), b"state");
+    std::fs::remove_file(&state).unwrap();
 }
 
 /// A run with no app domain starts again as a process: the loader binary with the same command
@@ -5871,6 +5931,7 @@ pub fn restart_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_restart_requested" => __relax_restart_requested as *const () as usize,
         b"__relax_restart_reason" => __relax_restart_reason as *const () as usize,
         b"__relax_restored_state" => __relax_restored_state as *const () as usize,
+        b"__relax_restart_saved_ms" => __relax_restart_saved_ms as *const () as usize,
         b"__relax_restart_now" => __relax_restart_now as *const () as usize,
         b"__relax_hot_load_failed" => __relax_hot_load_failed as *const () as usize,
         b"__relax_live_stream" => __relax_live_stream as *const () as usize,
