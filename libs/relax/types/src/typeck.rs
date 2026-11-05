@@ -6242,10 +6242,18 @@ impl<'a> Fcx<'a> {
         // must keep its `&u8`. A coercion that fails leaves no trace; the
         // enclosing coercion site reports a real mismatch. As for match arms,
         // an unresolved, unit or unsized expectation constrains nothing.
+        // One that holds keeps its inference only: the `?`'s type stays the
+        // Continue value's, and the enclosing site adjusts it. An adjustment
+        // left on the `?` would have a later match arm (whose hint is the
+        // earlier arms' type) skip CoerceMany's coercion of it to theirs
+        // (`Some(v) => v, None => args.next()?`: `&String` to `&str`).
         if let Some(expected) = expected {
             let s = self.shallow(expected);
             if !matches!(self.tcx.tys.kind(s), TyKind::Infer(_) | TyKind::Error) && s != self.tcx.tys.unit && !self.is_unsized_ty(s) {
-                self.try_coerce_inner(output, expected, Some(e), lo, false);
+                let saved = self.save_value_adjustments(e.0);
+                if self.try_coerce_inner(output, expected, Some(e), lo, false).is_some() {
+                    self.restore_value_adjustments(e.0, saved);
+                }
             }
         }
         output
