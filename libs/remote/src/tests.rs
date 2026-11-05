@@ -799,3 +799,48 @@ fn req_wire_round_trip() {
     assert!(Req::from_wire(&w[..w.len() - 1]).is_none());
     assert!(Req::from_wire(b"2:ui").is_none());
 }
+
+/// A run whose TMPDIR is deep is still reached: a test's own home under a lease's scratch dir
+/// made one 121 bytes long, its socket there could not be bound, and a capture of its JIT waited
+/// a jitlegs leg out to twice its time (11-05). A child of this test binary listens with such a
+/// TMPDIR and says where.
+#[test]
+fn a_run_with_a_deep_tmpdir_is_reached() {
+    use std::io::BufRead;
+    if std::env::var_os("MAKEPAD_REMOTE_DEEP_CHILD").is_some() {
+        let ep = Endpoint::new("makepad-remote-deep");
+        ep.register_cmd(dispatch);
+        let sock = ep.listen_unix("").unwrap();
+        println!("deep socket {}", sock.display());
+        // serves until the parent closes its stdin
+        let _ = std::io::stdin().read_line(&mut String::new());
+        return;
+    }
+    let base = std::env::temp_dir().join(format!("makepad-remote-deep-{}", std::process::id()));
+    let (deep, registry) = (base.join("lease").join("d".repeat(120)).join("tmp"), base.join("registry"));
+    for d in [&deep, &registry] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "tests::a_run_with_a_deep_tmpdir_is_reached", "--nocapture", "--test-threads=1"])
+        .env("MAKEPAD_REMOTE_DEEP_CHILD", "1")
+        .env("TMPDIR", &deep)
+        .env("MAKEPAD_REMOTE_REGISTRY", &registry)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = std::io::BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok);
+    let said = out.by_ref().find_map(|l| l.strip_prefix("deep socket ").map(str::to_string));
+    let sock = std::path::PathBuf::from(said.expect("the child listens"));
+    assert!(!sock.starts_with(&deep) && sock.starts_with(crate::carrier::unix::socket_dir()), "{}", sock.display());
+    let app = crate::discovery::apps_in(&registry).into_iter().find(|a| a.pid == child.id()).expect("its discovery file");
+    assert_eq!((app.socket.as_str(), app.unreachable()), (sock.to_str().unwrap(), None));
+    let lines: Vec<String> = Client::new(Target::Unix(sock.clone()), "deep-test").cmd("ping").unwrap().map_while(Result::ok).collect();
+    assert_eq!(lines.first().map(String::as_str), Some("{\"pong\":1}"));
+    drop(child.stdin.take());
+    out.for_each(drop);
+    assert!(child.wait().unwrap().success());
+    assert!(!sock.exists(), "its socket goes with it");
+    std::fs::remove_dir_all(&base).unwrap();
+}
