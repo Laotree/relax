@@ -837,6 +837,16 @@ impl<'a> Sim<'a> {
                 }
             }
         }
+        // the proc macros the module exports (its crate's own, or re-exported): `ext_macro` answers
+        // them, so a glob of the module binds them -- unlisted, a glob lookup of the name would find
+        // a binding the glob never planted and stay undetermined
+        for n in crate::macro_reg::proc_macro_names() {
+            let Some(name) = self.p.syms.get(&n) else { continue };
+            if !have.contains(&(name, 2)) && self.ext_macro(t, name).is_some() {
+                have.insert((name, 2));
+                names.push((name, 2));
+            }
+        }
         let r = std::rc::Rc::new(names);
         self.ext_names.insert(t, r.clone());
         r

@@ -162,6 +162,20 @@ pub(crate) fn attr_entry_for(krate: &str, name: &str) -> Option<Entry> {
     })
 }
 
+/// The names of the registered proc macros (derives, function-like and attribute macros), each
+/// once: what any module can export in the macro namespace besides its `macro_rules!`.
+pub(crate) fn proc_macro_names() -> Vec<String> {
+    if in_world() { return Vec::new(); }
+    REG.with(|r| {
+        let r = r.borrow();
+        let Some(r) = r.as_ref() else { return Vec::new() };
+        let mut names: Vec<String> = r.derives.iter().chain(&r.macros).map(|(n, _)| n.clone()).collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    })
+}
+
 /// A proc macro exported by this crate itself, rather than by a dependency.
 pub(crate) fn exported_proc_macro(krate: &str, name: &str, kind: Kind) -> Option<Entry> {
     if in_world() { return None; }
