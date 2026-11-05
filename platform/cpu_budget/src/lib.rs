@@ -192,10 +192,10 @@ impl Budget {
                 }
                 drop(s);
                 match WAIT_HOOK.get() {
-                    Some(hook) => hook(job.class, &thread::park),
+                    Some(hook) => hook(job.class),
                     None => thread::park(),
                 }
-                s = self.state.lock().unwrap();
+                s = self.lock();
                 if let Some(desired) = desired {
                     job.class = desired.load(Relaxed);
                     if let Some(w) = s.waiters.iter_mut().find(|w| w.ticket == job.ticket) { w.class = job.class; }
@@ -205,6 +205,9 @@ impl Budget {
         }
         self.install(s, job)
     }
+    /// A panic under this lock (a permit that names no row) comes before any change to the table, and
+    /// stays that thread's: every other thread's tokens go on.
+    fn lock(&self) -> MutexGuard<'_, State> { self.state.lock().unwrap_or_else(|e| e.into_inner()) }
     fn install(&self, mut s: MutexGuard<'_, State>, mut job: Job) -> u32 {
         let index = s.slots.iter().position(Option::is_none).unwrap_or_else(|| {
             assert!(s.slots.len() < ROWS, "more threads hold a CPU permit than the table has rows");
@@ -228,7 +231,7 @@ impl Budget {
     }
     fn admit(&self, class: u8, client: u8, label: &str) -> u32 {
         valid(class, client);
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.lock();
         let ticket = s.ticket;
         s.ticket = s.ticket.checked_add(1).expect("CPU budget ticket overflow");
         self.acquire(s, Job::new(class, client, label, ticket), None)
@@ -272,7 +275,7 @@ impl Budget {
     /// True: it lent one, and `take_back` ends that.
     fn lend(&self) -> bool {
         let me = me();
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.lock();
         let now = self.now();
         let mut lent = false;
         for i in 0..s.slots.len() {
@@ -288,7 +291,7 @@ impl Budget {
     /// A compile job's token goes back while its request waits for another build on the owner: on
     /// a machine with one token that build gets no other. Its row and permit stay.
     fn lend_permit(&self, permit: u32) {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.lock();
         let now = self.now();
         let job = s.slots[permit as usize].as_mut().expect("lent a released CPU permit");
         assert!(!job.lent, "lent a CPU permit twice");
@@ -302,7 +305,7 @@ impl Budget {
     /// sleeps anywhere). Over the limit no one new is admitted and its next checkpoint yields.
     fn take_back(&self) {
         let me = me();
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.lock();
         let now = self.now();
         let mut back = false;
         for i in 0..s.slots.len() {
@@ -315,7 +318,7 @@ impl Budget {
     }
     /// `take_back` of `lend_permit`: its job has not run meanwhile, and the same goes.
     fn take_back_permit(&self, permit: u32) {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.lock();
         let now = self.now();
         Self::count_again(&mut s, permit as usize, now);
         self.refresh(&mut s);
@@ -329,7 +332,7 @@ impl Budget {
         Self::start_counting(s, &job);
     }
     fn tokens(&self) -> Tokens {
-        let s = self.state.lock().unwrap();
+        let s = self.lock();
         let now = self.now();
         let holders = s.slots.iter().flatten().map(|j| Holder {
             thread: j.thread, class: j.class, client: j.client, label: j.label.text().to_owned(), lent: j.lent, above: j.above,
@@ -342,7 +345,7 @@ impl Budget {
         self.checkpoint_following(permit, held_locks, lock_site, None)
     }
     fn checkpoint_following(&self, permit: u32, held_locks: u32, lock_site: &str, desired: Option<&AtomicU8>) -> u32 {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.lock();
         let now = self.now();
         let job = s.slots[permit as usize].as_mut().expect("released CPU permit");
         let span = Span { label: job.label, ns: now.saturating_sub(job.checkpoint_at) };
@@ -365,13 +368,13 @@ impl Budget {
         permit
     }
     fn release(&self, permit: u32) {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.lock();
         self.remove(&mut s, permit, self.now());
         self.refresh(&mut s);
     }
     fn reclass(&self, permit: u32, class: u8) {
         valid(class, APP);
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.lock();
         let now = self.now();
         let job = s.slots[permit as usize].as_mut().expect("released CPU permit");
         let old = job.class;
@@ -387,7 +390,7 @@ impl Budget {
     }
     fn warming(&self) -> bool { self.warmup.load(Relaxed) == 1 }
     fn begin_warmup(&self) {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.lock();
         // Only JIT startup may begin it. Input before startup also closes the latch.
         if self.warmup.compare_exchange(0, 1, Relaxed, Relaxed).is_ok() {
             self.refresh(&mut s);
@@ -396,7 +399,7 @@ impl Budget {
     fn end_warmup(&self) {
         // Input dispatch stays atomic-only after the first interaction/settle.
         if self.warmup.load(Relaxed) == 2 { return; }
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.lock();
         self.warmup.store(2, Relaxed);
         self.refresh(&mut s);
     }
@@ -407,7 +410,7 @@ impl Budget {
         self.waits[class as usize][bucket].fetch_add(1, Relaxed);
         self.max_wait[class as usize].fetch_max(ns, Relaxed);
         if ns <= 100_000_000 { return; }
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.lock();
         let now = self.now();
         let culprit = s.slots.iter().flatten().filter(|j| !j.lent)
             .max_by_key(|j| (j.class, now.saturating_sub(j.checkpoint_at)))
@@ -418,7 +421,7 @@ impl Budget {
         s.worst.push_back(Worst { class, label: Label::new(label), ns, when: now, culprit });
     }
     fn report(&self) -> String {
-        let s = self.state.lock().unwrap();
+        let s = self.lock();
         let now = self.now();
         let mut running = [[0u32; 3]; 3];
         let mut spans = s.spans;
@@ -500,7 +503,7 @@ fn me() -> u64 {
 }
 #[cfg(not(any(unix, windows)))]
 fn me() -> u64 { 0 }
-static WAIT_HOOK: OnceLock<fn(u8, &dyn Fn())> = OnceLock::new();
+static WAIT_HOOK: OnceLock<extern "C" fn(u8)> = OnceLock::new();
 fn global() -> &'static Budget {
     static BUDGET: OnceLock<Budget> = OnceLock::new();
     BUDGET.get_or_init(|| {
@@ -583,13 +586,15 @@ pub fn park() { thread::park(); }
 #[relax_api]
 pub fn park_for(ns: u64) { thread::park_timeout(std::time::Duration::from_nanos(ns)); }
 
-/// Admission whose class follows a native job while its worker waits.
+/// Admission whose class follows a native job while its worker waits. `desired` is the job's
+/// `AtomicU8::as_ptr`, alive for the call: the byte crosses the Relax op boundary, std's type doesn't.
 #[relax_api]
-pub fn admit_following(desired: &AtomicU8, client: u8, label: &str) -> u32 {
+pub fn admit_following(desired: *const u8, client: u8, label: &str) -> u32 {
+    let desired = unsafe { &*(desired as *const AtomicU8) };
     let b = global();
     let class = desired.load(Relaxed);
     valid(class, client);
-    let mut s = b.state.lock().unwrap();
+    let mut s = b.lock();
     let ticket = s.ticket;
     s.ticket = s.ticket.checked_add(1).expect("CPU budget ticket overflow");
     b.acquire(s, Job::new(class, client, label, ticket), Some(desired))
@@ -598,7 +603,8 @@ pub fn admit_following(desired: &AtomicU8, client: u8, label: &str) -> u32 {
 /// Native workers whose waiters may promote them while they are parked. Like
 /// `checkpoint`, with a live class and an unpark from the promoting waiter.
 #[relax_api]
-pub fn checkpoint_following(permit: u32, held_locks: u32, lock_site: &str, desired: &AtomicU8) -> u32 {
+pub fn checkpoint_following(permit: u32, held_locks: u32, lock_site: &str, desired: *const u8) -> u32 {
+    let desired = unsafe { &*(desired as *const AtomicU8) };
     global().checkpoint_following(permit, held_locks, lock_site, Some(desired))
 }
 
@@ -617,7 +623,7 @@ impl Admission {
     pub fn poll(&mut self, class: u8, client: u8, label: &str) -> Option<u32> {
         valid(class, client);
         let b = global();
-        let mut s = b.state.lock().unwrap();
+        let mut s = b.lock();
         let ticket = *self.ticket.get_or_insert_with(|| {
             let ticket = s.ticket;
             s.ticket = s.ticket.checked_add(1).expect("CPU budget ticket overflow");
@@ -641,7 +647,7 @@ impl Drop for Admission {
     fn drop(&mut self) {
         if let Some(ticket) = self.ticket.take() {
             let b = global();
-            let mut s = b.state.lock().unwrap();
+            let mut s = b.lock();
             s.waiters.retain(|w| w.ticket != ticket);
             b.refresh(&mut s);
         }
@@ -669,6 +675,7 @@ pub fn reclass(permit: u32, class: u8) { global().reclass(permit, class); }
 /// Waits nest (a thread in a futex wait's entry compiles the futex call and waits for that build, a
 /// job back from a wait holds for a pause under the wait's own guard): the outermost lends, the
 /// inner ones count. True: a `take_back` ends this one.
+#[relax_api]
 pub fn lend() -> bool {
     if !ADMITTED.with(Cell::get) { return false; }
     let lends = LENDS.with(Cell::get);
@@ -677,6 +684,7 @@ pub fn lend() -> bool {
     lent
 }
 /// `Budget::take_back`, when the outermost `lend` ends.
+#[relax_api]
 pub fn take_back() {
     let lends = LENDS.with(Cell::get);
     if lends == 0 { return; }
@@ -684,8 +692,10 @@ pub fn take_back() {
     if lends == 1 { global().take_back(); }
 }
 /// `Budget::lend_permit`.
+#[relax_api]
 pub fn lend_permit(permit: u32) { global().lend_permit(permit); }
 /// `Budget::take_back_permit`.
+#[relax_api]
 pub fn take_back_permit(permit: u32) { global().take_back_permit(permit); }
 /// One permit, as `tokens` reports it.
 pub struct Holder {
@@ -709,12 +719,46 @@ pub struct Tokens {
     pub holders: Vec<Holder>,
     pub waiting: Vec<Waiting>,
 }
-pub fn tokens() -> Tokens { global().tokens() }
-/// Sets what wraps every thread's wait for a token: `hook(class, park)` calls `park`. The budget
-/// sits below the JIT's wait registry, which registers those waits through this.
-pub fn set_wait_hook(hook: fn(u8, &dyn Fn())) { let _ = WAIT_HOOK.set(hook); }
+/// `tokens`, one row a line: its strings and vectors do not cross the Relax op boundary.
+#[relax_api]
+pub fn tokens_text(out: &mut [u8]) -> usize {
+    let t = global().tokens();
+    let mut text = format!("{} {} {} {}\n", t.running, t.limits[0], t.limits[1], t.limits[2]);
+    for h in &t.holders {
+        text += &format!("h {} {} {} {} {} {} {}\n", h.thread, h.class, h.client, u8::from(h.lent), u8::from(h.above), h.held_ns, h.label.replace('\n', " "));
+    }
+    for w in &t.waiting {
+        text += &format!("w {} {} {}\n", w.thread, w.class, w.client);
+    }
+    fill(out, &text)
+}
+pub fn tokens() -> Tokens {
+    let text = read_text(tokens_text);
+    let mut lines = text.lines();
+    let mut head = lines.next().unwrap().split(' ').map(|n| n.parse().unwrap());
+    let mut next = || head.next().unwrap();
+    let mut tokens = Tokens { running: next(), limits: [next(), next(), next()], holders: Vec::new(), waiting: Vec::new() };
+    for line in lines {
+        let mut fields = line.splitn(8, ' ');
+        let row = fields.next().unwrap();
+        let mut number = || fields.next().unwrap().parse::<u64>().unwrap();
+        let (thread, class, client) = (number(), number() as u8, number() as u8);
+        if row == "w" {
+            tokens.waiting.push(Waiting { thread, class, client });
+        } else {
+            let (lent, above, held_ns) = (number() != 0, number() != 0, number());
+            tokens.holders.push(Holder { thread, class, client, label: fields.next().unwrap().to_owned(), lent, above, held_ns });
+        }
+    }
+    tokens
+}
+/// Sets what every thread's wait for a token runs: `hook(class)` calls `park`. The budget sits below
+/// the JIT's wait registry, which registers those waits through this.
+#[relax_api]
+pub fn set_wait_hook(hook: extern "C" fn(u8)) { let _ = WAIT_HOOK.set(hook); }
 /// The class `set_thread_class` last gave the calling thread (the UI thread: Interactive); None: it
 /// set none, or a promotion failed. A job the thread waits for runs at its class meanwhile.
+#[relax_api]
 pub fn thread_class() -> Option<u8> { THREAD_CLASS.with(Cell::get).map(|class| if class > BACKGROUND { INTERACTIVE } else { class }) }
 #[relax_api]
 pub fn queued(class: u8, client: u8, delta: i32) {
@@ -731,18 +775,19 @@ pub fn end_warmup() { global().end_warmup(); }
 #[relax_api]
 pub fn warming() -> bool { global().warming() }
 #[relax_api]
-pub fn report(out: &mut [u8]) -> usize {
-    let text = global().report();
+pub fn report(out: &mut [u8]) -> usize { fill(out, &global().report()) }
+/// Native convenience wrapper; strings do not cross the Relax op boundary.
+pub fn report_string() -> String { read_text(report) }
+fn fill(out: &mut [u8], text: &str) -> usize {
     let mut len = text.len().min(out.len());
     while !text.is_char_boundary(len) { len -= 1; }
     out[..len].copy_from_slice(&text.as_bytes()[..len]);
     len
 }
-/// Native convenience wrapper; strings do not cross the Relax op boundary.
-pub fn report_string() -> String {
+fn read_text(op: fn(&mut [u8]) -> usize) -> String {
     let mut out = vec![0; 4096];
     loop {
-        let len = report(&mut out);
+        let len = op(&mut out);
         // Up to three bytes may be omitted to preserve a UTF-8 boundary.
         if len + 4 < out.len() { out.truncate(len); return String::from_utf8(out).unwrap(); }
         out.resize(out.len() * 2, 0);
