@@ -7676,7 +7676,8 @@ impl<'a> Fcx<'a> {
             // #[rustc_on_unimplemented] messages) for an unmet trait bound
             if let PredicateKind::Clause(crate::next_solver::ClauseKind::Trait(p)) = &predicate.kind {
                 let (prog, tcx) = (self.prog, self.tcx);
-                let mut msg = trait_error_message(prog, tcx, code, p, &mut |t| self.ty_str(t));
+                let p = normalize_clause_for_diagnostics(&self.infcx, prog, &obligation.goal.param_env, p);
+                let mut msg = trait_error_message(prog, tcx, code, &p, &mut |t| self.ty_str(t));
                 if code == "E0277" { msg.push_str(&crate::next_solver::diagnostics::auto_trait_failure_notes(&self.infcx, prog, &obligation.goal, Some(&self.b))); }
                 self.err(obligation.cause.span, format!("{code}: {msg}"));
                 continue;
@@ -7961,6 +7962,24 @@ impl crate::types::fold::TypeFolder for EraseFreeRegions {
     }
 }
 
+/// rustc derive_errors.rs find_best_leaf_obligation ends in deeply_normalize_for_diagnostics: the reported bound
+/// names the types its aliases normalize to (`Vec<usize>: FromIterator<u64>`, not
+/// `FromIterator<<Map<Iter<'_, &T>, {closure}> as Iterator>::Item>`). An argument that does not normalize, or
+/// normalizes to a type with inference variables of the probe, is reported as it is.
+fn normalize_clause_for_diagnostics(infcx: &crate::infer::InferCtxt<'_>, prog: &Program, env: &crate::next_solver::ParamEnvId, p: &crate::next_solver::TraitClause) -> crate::next_solver::TraitClause {
+    use crate::types::TypeFlags;
+    let tys = &infcx.tcx.tys;
+    let mut p = p.clone();
+    for arg in p.trait_ref.args.iter_mut() {
+        let crate::consts::GenericArg::Type(t) = arg else { continue };
+        let resolved = infcx.deeply_resolve_ignoring_regions(*t);
+        if !tys.flags(resolved).intersects(TypeFlags::HAS_ALIAS) { continue; }
+        let normalized = infcx.probe(|_| crate::next_solver::fulfill::ObligationCtxt::new(infcx, prog).deeply_normalize_ty(env, resolved).ok());
+        if let Some(n) = normalized.filter(|&n| !tys.flags(n).intersects(TypeFlags::HAS_NON_REGION_INFER)) { *t = n; }
+    }
+    p
+}
+
 pub(crate) fn trait_error_message(prog: &Program, tcx: &Tcx, code: &str, p: &crate::next_solver::TraitClause, ty_str: &mut dyn FnMut(TyId) -> String) -> String {
     let mut args = Vec::new();
     for arg in &p.trait_ref.args {
@@ -7976,6 +7995,16 @@ pub(crate) fn trait_error_message(prog: &Program, tcx: &Tcx, code: &str, p: &cra
         "E0277" if core && name == "Send" => format!("`{}` cannot be sent between threads safely", self_ty),
         "E0277" if core && name == "Sync" => format!("`{}` cannot be shared between threads safely", self_ty),
         "E0277" if core && name == "Iterator" => format!("`{}` is not an iterator", self_ty),
+        // core's FromIterator #[rustc_on_unimplemented] (library/core/src/iter/traits/collect.rs)
+        "E0277" if core && name == "FromIterator" && args.len() == 2 => {
+            let self_kind = match p.trait_ref.args.first() { Some(crate::consts::GenericArg::Type(t)) => Some(tcx.tys.kind(*t)), _ => None };
+            match self_kind {
+                Some(TyKind::Ref(_, inner, _)) if matches!(tcx.tys.kind(*inner), TyKind::Slice(_)) => format!("a slice of type `{}` cannot be built since we need to store the elements somewhere", self_ty),
+                Some(TyKind::Slice(_)) => format!("a slice of type `{}` cannot be built since `{}` has no definite size", self_ty, self_ty),
+                Some(TyKind::Array(..)) => format!("an array of type `{}` cannot be built directly from an iterator", self_ty),
+                _ => format!("a value of type `{}` cannot be built from an iterator over elements of type `{}`", self_ty, args[1]),
+            }
+        }
         "E0277" => format!("the trait bound `{}: {}` is not satisfied", self_ty, tr),
         "E0283" => format!("type annotations needed: cannot satisfy `{}: {}`", self_ty, tr),
         _ => format!("overflow evaluating the requirement `{}: {}`", self_ty, tr),
