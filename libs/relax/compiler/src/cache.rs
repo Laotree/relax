@@ -6977,6 +6977,7 @@ mod cold_tests {
         assert_eq!(format!("{:?}", part.bodies), format!("{:?}", fresh_part.bodies));
         assert_eq!(part.rules_exp, fresh_part.rules_exp);
         assert_eq!(part.body_origin, fresh_part.body_origin);
+        assert_eq!(part.pm_editions, fresh_part.pm_editions);
         assert_eq!(format!("{:?}", &f.ast.part.get().unwrap().exprs[..]), format!("{:?}", &fresh.ast.part.get().unwrap().exprs[..]));
         commit_runs().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();

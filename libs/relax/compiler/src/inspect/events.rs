@@ -371,17 +371,24 @@ pub fn on_panic(info: &crate::jit::PanicInfo, regs: *const u64) {
         return;
     }
     let domain = crate::domain::current_app_domain();
-    if crate::hot_failure::recovering() && crate::hot_failure::replacement_running() && domain == crate::run::app_domain() {
+    if crate::hot_failure::replacement_running() && domain == crate::run::app_domain()
+        && crate::hot_failure::restart_failed(&format!("{}: {} at {}", info.kind, info.message, info.location))
+    {
         // Recovery is an infrastructure attempt. Publish its failure to the
         // watcher and unwind; parking it would ask the agent to repair the JIT.
-        crate::hot_failure::restart_failed(&format!("{}: {} at {}", info.kind, info.message, info.location));
         return;
     }
     // a call of a stub whose build hit an internal compiler error, built off this thread or
     // panicking in its compile: a failed hot load like a call's own (jit.rs compile_ice), no panic
-    // of the program to park. It parks only when no fresh process took over.
-    if crate::jit::is_ice_stub_message(&info.message) && !crate::hot_failure::has_error() {
-        crate::jit::ice_at_call(&info.message);
+    // of the program to park. It parks only when no fresh process took over. In a restarted run
+    // every such call is its JIT error's, the ones after its report included (another thread's
+    // call of the stub met the error after the watcher reported it)
+    if crate::jit::is_ice_stub_message(&info.message)
+        && (!crate::hot_failure::has_error() || crate::hot_failure::replacement())
+        && crate::jit::ice_at_call(&info.message)
+    {
+        // reported as the JIT's failure (a restarted run's): the call unwinds, no program panic parks
+        return;
     }
     // the run window shows the app's parked panic (resume, restart) in a live session; a run that
     // is none (a test's child) ends as its panic ends it
@@ -426,7 +433,7 @@ pub fn on_panic(info: &crate::jit::PanicInfo, regs: *const u64) {
             Some(b) => format!("{{\"reruns\":{},\"note\":\"side effects since it began may repeat\"}}", json_str(b)),
             None => "null".into(),
         },
-        if primary { format!(",\"restart\":{{\"domain\":{},\"window_kept\":true}}", domain.unwrap()) } else { match &restartable {
+        if primary { format!(",\"restart\":{{\"domain\":{},\"window_kept\":{}}}", domain.unwrap(), crate::run::hosted_run()) } else { match &restartable {
             Some((_, name, rets)) => format!(
                 ",\"restart\":{{\"fn\":{},\"return_words\":{}}}",
                 json_str(&super::short(name, 160)),
@@ -697,7 +704,7 @@ pub fn cmd_resume(req: &Req, out: &mut Out) {
                     }
                 });
                 match spawned {
-                    Ok(_) => out.line(&format!("{{\"resumed\":\"P{}\",\"as\":\"restart\",\"window_kept\":true,\"state_kept\":false}}", id)),
+                    Ok(_) => out.line(&format!("{{\"resumed\":\"P{}\",\"as\":\"restart\",\"window_kept\":{},\"state_kept\":false}}", id, crate::run::hosted_run())),
                     Err(e) => out.err(&format!("cannot start the restart: {e}")),
                 }
                 return;

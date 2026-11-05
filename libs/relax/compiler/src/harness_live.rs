@@ -81,8 +81,6 @@ pub(super) struct Verdict {
 
 /// Park outside the compiler owner until the next verified edit.
 pub(super) fn complete(v: Verdict, ms: f64) -> Edit {
-    // A recovered test process proves readiness with its first completed test run.
-    crate::hot_failure::ready();
     crate::hot_failure::pump();
     if crate::hot_failure::has_error() { std::process::exit(crate::hot_failure::verdict(101).code()); }
     let (state, ready) = LIVE.get().unwrap();

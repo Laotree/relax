@@ -399,11 +399,6 @@ pub struct Unit {
     /// hot reload: const -> the slots whose build read its value (folded into their code), so an
     /// edit of the const recompiles them (reload.rs)
     pub const_readers: relax_session::sync::Mutex<crate::fxhash::HashMap<DefId, Vec<u32>>>,
-    /// live sessions (M10): the structs whose field offsets the program computed (`offset_of!`),
-    /// as code that builds a value by raw writes at them does. A field an edit adds goes to the
-    /// extension block, with no offset to give that code, and whether such a value set a removed
-    /// field that needs dropping is unknown: those edits restart (reload.rs layout_edit)
-    pub offsets_computed: relax_session::sync::Mutex<crate::fxhash::HashSet<DefId>>,
     /// per slot: the slots whose optimised RIR its RIR took in this run -- inlined bodies and
     /// callees answering nounwind true (a false answer assumes nothing of the body). Grows
     /// over rebuilds, never shrinks: code made from an earlier RIR names them too. The disk
@@ -524,7 +519,7 @@ pub struct Unit {
     pub(crate) forwards: crate::fxhash::HashMap<u64, (u32, bool)>,
     /// the owners of the interned closure types (preserve_closure_bodies)
     pub(crate) closure_owners: ClosureOwners,
-    /// bytes of the per-thread block handed out by `tls_alloc`
+    /// the end of this unit's last variable in the per-thread block (`tls_alloc`)
     pub tls_next: u32,
     /// panicking stand-ins for foreign fns this host lacks, by symbol
     missing_stubs: relax_session::sync::Mutex<HashMap<String, u64>>,
@@ -841,6 +836,13 @@ static TLS_KEY: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Bytes of a thread-local block any unit placed variables in (`Unit::tls_alloc`; the most of
 /// every unit's): no thread writes a block beyond it.
 static TLS_USED: AtomicU32 = AtomicU32::new(TLS_FIRST_FREE);
+/// The next free byte of every thread's block, for every unit of the run: one block per thread
+/// holds the variables of all of them (the program's, a macro world's), so no two share bytes. Each
+/// unit placing its own from TLS_FIRST_FREE put the program's `next_keys::KEYS` on the bytes a macro
+/// world had written on the main thread before the program ran (its `proc_macro::CALL_SITE`): the
+/// program's first HashMap read an Option that was neither. A run's end starts it over, as static
+/// TLS's (os::tls); the threads that stay meet the next run with a fresh block (`fresh_thread`).
+static TLS_NEXT: AtomicU32 = AtomicU32::new(TLS_FIRST_FREE);
 /// Thread-local blocks no thread uses (zeroed), for the next thread's `rt_tls_block`.
 static SPARE_TLS_BLOCKS: crate::stack::Spares<u64> = crate::stack::Spares::new();
 
@@ -950,8 +952,8 @@ pub(crate) fn window_tls_block() {
     if old == 0 || crate::web32::in_misc(old) { return; }
     let new = crate::web32::alloc(TLS_CAP);
     // the runtime's words (domain base, thread record, coverage, entry marks); the program's
-    // variables start as a new thread's (zero): the old block's are other units' (each unit
-    // places its variables from TLS_FIRST_FREE), the shadow stack words among them
+    // variables start as a new thread's (zero): the old block's are other units', the shadow
+    // stack words among them
     unsafe { std::ptr::copy_nonoverlapping(old as *const u8, new as *mut u8, TLS_FIRST_FREE as usize) };
     // (the runtime's thread record moves with the copy: slot 1 points to it)
     crate::harness::reach::moved(old, new);
@@ -3492,7 +3494,8 @@ fn park_compile_error(up: usize, slot: u32) -> u64 {
 /// live edits it is a failed hot load (reload.rs recover_compile_ice): recorded, and a fresh
 /// process replaces this one -- now when this is the app's main thread, else at the app's next
 /// event, with its state, while this call waits for it. Otherwise (no edit ran, a recovery
-/// failed or runs already: the replacement's own error) the call fails as the error's panic.
+/// failed or runs already: the replacement's own error, reported as the JIT's) the call fails as
+/// the error's panic.
 #[cold]
 #[inline(never)]
 fn compile_ice(up: usize, message: &str) -> u64 {
@@ -3506,8 +3509,10 @@ fn compile_ice(up: usize, message: &str) -> u64 {
 }
 
 /// compile_ice's recovery, on the program thread that met the internal compiler error `message`.
-/// Returns when no next run takes over: the call then fails as the error's panic.
-pub(crate) fn ice_at_call(message: &str) {
+/// Returns when no next run takes over: the call then fails as the error's panic. True when the
+/// error was reported as the JIT's failure (a restarted run's, before or after its restore): no
+/// panic of the program, so nothing parks it as one.
+pub(crate) fn ice_at_call(message: &str) -> bool {
     let on_main = os::thread::current() == MAIN_TID.load(Ordering::Relaxed);
     // (a recovery this process asked for already: its restart is this call's end too)
     let restarting = crate::reload::recover_compile_ice(message, on_main) || crate::reload::unit_suspect().is_some() && crate::hot_failure::recovering();
@@ -3524,9 +3529,14 @@ pub(crate) fn ice_at_call(message: &str) {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-    } else if crate::hot_failure::recovering() {
-        // the warm restart's own process failed the same way: the JIT error devhub reports
-        crate::hot_failure::restart_failed(message);
+        false
+    } else if crate::hot_failure::restart_failed(message) {
+        // the warm restart's own process failed the same way before its restore completed: the
+        // JIT error devhub reports
+        true
+    } else {
+        // past its restore: still the JIT's, never the program's
+        crate::hot_failure::replacement_jit_failed(message)
     }
 }
 
@@ -3537,6 +3547,11 @@ pub(crate) fn is_ice_stub_message(message: &str) -> bool {
 }
 
 fn fatal_compile_error(p: &PanicInfo, report: &str) {
+    // an internal compiler error in a restarted run is the JIT's, reported as its restart's failure
+    // (ice_at_call): no error of the program's that rustc rejects, so no end of the run as one
+    if is_ice_stub_message(&p.message) && crate::hot_failure::replacement() {
+        return;
+    }
     if COMPILE_ERRORS_FATAL.load(std::sync::atomic::Ordering::Relaxed) && p.message.starts_with("compile error in ") {
         eprintln!("makepad-run: {} -- the program cannot run past it (rustc rejects it)\n  report: {}", p.message, report);
         // an app domain's compile error is that domain's crash (its thread ends next); the others go on
@@ -4443,7 +4458,6 @@ impl Unit {
             fn_create: Default::default(),
             consts: Default::default(),
             const_readers: Default::default(),
-            offsets_computed: Default::default(),
             body_deps: Default::default(),
             statics: Default::default(),
             const_certs: Default::default(),
@@ -4649,9 +4663,9 @@ impl Unit {
         relax_codegen::opt::set_mem_fns(u.rs.memcpy, u.rs.memmove);
         relax_codegen::loops::set_memset(u.rs.memset);
         if w32 {
-            // the shadow stacks' thread-local words, and the code transform (relax_codegen::web32)
-            let off = u.tls_alloc(16, 8);
-            crate::web32::set_ss_off(off);
+            // the shadow stacks' thread-local words, one place for every unit of the run (the
+            // runtime reads them there: web32.rs), and the code transform (relax_codegen::web32)
+            let off = crate::web32::ss_off_or(|| u.tls_alloc(16, 8));
             let ss = u.syms.intern(crate::syms::SymKind::Rt("w32_ss"), off as u64);
             let grow = u.syms.intern(crate::syms::SymKind::Rt("w32_stack"), crate::web32::rt_w32_stack as *const () as usize as u64);
             relax_codegen::web32::configure(relax_codegen::web32::Cfg { syms: u.syms.vals, base: crate::web32::BASE, ss, grow });
@@ -5265,15 +5279,23 @@ impl Unit {
     }
 
     /// Reserves `size` bytes of every thread's thread-local block (zeroed per thread on
-    /// first use); returns the offset for `Inst::TlsAddr`.
+    /// first use), bytes no other unit's variable has (TLS_NEXT); returns the offset for
+    /// `Inst::TlsAddr`.
     pub fn tls_alloc(&mut self, size: u32, align: u32) -> u32 {
         let a = align.max(1);
-        let at = (self.tls_next + a - 1) / a * a;
-        if (at + size) as usize > TLS_CAP {
-            panic!("thread-local block full");
-        }
-        self.tls_next = at + size;
-        TLS_USED.fetch_max(self.tls_next, Ordering::Release);
+        let mut cur = TLS_NEXT.load(Ordering::Relaxed);
+        let at = loop {
+            let at = (cur + a - 1) / a * a;
+            if (at + size) as usize > TLS_CAP {
+                panic!("thread-local block full");
+            }
+            match TLS_NEXT.compare_exchange(cur, at + size, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => break at,
+                Err(c) => cur = c,
+            }
+        };
+        self.tls_next = self.tls_next.max(at + size);
+        TLS_USED.fetch_max(at + size, Ordering::Release);
         at
     }
 
@@ -8550,11 +8572,20 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
 /// MAKEPAD_RUN_TEST_HOT_BUILD_ERROR=<name part>: in a process a live edit ran in, the build of a fn
 /// whose name contains it fails with an internal compiler error, as a closure whose owner's body
 /// is gone does (tools/run/fixture/hot_fail.py).
+/// MAKEPAD_RUN_TEST_REPLACEMENT_BUILD_ERROR=<name part>: in a restarted run (no edit in it), the
+/// build of such a fn fails the same way: the JIT's error in the restart's own run
+/// (tools/run/fixture/hot_fail.py).
 unsafe fn test_hot_build_error(up: *mut Unit, id: u32) -> Result<(), String> {
     static WANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    static WANT_REPLACEMENT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     if let Some(w) = WANT.get_or_init(|| std::env::var("MAKEPAD_RUN_TEST_HOT_BUILD_ERROR").ok().filter(|w| !w.is_empty())) {
         if (&*up).fns[id as usize].name.contains(w.as_str()) && crate::hot_failure::edit_ran() {
             return Err(format!("internal compiler error: MAKEPAD_RUN_TEST_HOT_BUILD_ERROR: forced for `{w}`"));
+        }
+    }
+    if let Some(w) = WANT_REPLACEMENT.get_or_init(|| std::env::var("MAKEPAD_RUN_TEST_REPLACEMENT_BUILD_ERROR").ok().filter(|w| !w.is_empty())) {
+        if (&*up).fns[id as usize].name.contains(w.as_str()) && !crate::hot_failure::edit_ran() && crate::hot_failure::replacement() {
+            return Err(format!("internal compiler error: MAKEPAD_RUN_TEST_REPLACEMENT_BUILD_ERROR: forced for `{w}`"));
         }
     }
     Ok(())
@@ -21997,6 +22028,8 @@ extern "C" fn relax_allocator_swap(phase: u32) {
 pub extern "C" fn __relax_exit(code: i32) {
     crate::domain::exit_current(code);
     let code = crate::check::finish_test_deps(code);
+    // a run past a JIT error ends with the JIT error's verdict, not the program's code
+    let code = crate::hot_failure::verdict(code).code();
     crate::tui::exit_code(code);
     os::proc::exit(code)
 }
@@ -22006,6 +22039,8 @@ extern "C" fn recorded_exit(code: i32) -> ! {
     // an app domain's exit ends that domain only (domain.rs)
     crate::domain::exit_current(code);
     let code = crate::check::finish_test_deps(code);
+    // a run past a JIT error ends with the JIT error's verdict, not the program's code
+    let code = crate::hot_failure::verdict(code).code();
     crate::tui::exit_code(code);
     os::proc::exit(code)
 }
@@ -27598,6 +27633,7 @@ pub(crate) unsafe fn reset_statics() {
     #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
     static_glue::reset_statics();
     UNIT = std::ptr::null_mut();
+    reset(&TLS_NEXT, AtomicU32::new(TLS_FIRST_FREE));
     reset(&AUX_UNITS, relax_session::sync::Mutex::new(Vec::new()));
     reset(&WATCHDOG_CALLS, relax_session::sync::Mutex::new(Vec::new()));
     reset(&QUIT_SEEN, AtomicBool::new(false));

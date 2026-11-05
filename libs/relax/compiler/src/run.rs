@@ -245,7 +245,7 @@ pub fn cmd_run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         cmd_run_inner(sess, args, None)
     };
     if crate::harness::live::enabled() && crate::hot_failure::recovering() {
-        crate::hot_failure::restart_failed(&format!("the replacement test harness ended before a verdict (exit {code})"));
+        crate::hot_failure::restart_failed(&format!("the replacement test harness ended before it started (exit {code})"));
         crate::hot_failure::pump();
     }
     let code = crate::hot_failure::verdict(code).code();
@@ -556,6 +556,11 @@ pub(crate) fn resolve_package(
     let units = with_sysroot_proc_macro(units, std_dir);
     let t_load = Instant::now();
     let mut g = unitgraph::load(&units, check_only)?;
+    // cargo's `[env]` configuration of the workspace, for every crate's compile-time environment
+    // and every build script (a build script's own run has it in its process environment)
+    if std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none() {
+        crate::crates::set_config_env(crate::resolve::cargo_env(workspace)?);
+    }
     let t_loaded = Instant::now();
     // The graph is enough to choose the host. Its window opens now, beside the rest of the
     // resolve (the watch inputs, the substitutions, the hash and the build scripts); the process
@@ -723,7 +728,7 @@ fn warm_front(images: &crate::cache::FrontImages, sess: &std::sync::Arc<crate::S
 
 fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session: Option<&mut Option<crate::serve::Session>>) -> i32 {
     // Restore before resolution so a failed replacement compile is a JIT verdict too.
-    if std::env::var_os("MAKEPAD_JIT_RECOVERY").is_some() {
+    if crate::run_end::run_input("MAKEPAD_JIT_RECOVERY").is_some() {
         crate::hot_failure::enable();
         crate::hot_failure::restore();
     }
@@ -1754,10 +1759,16 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
 
     // ---- the libraries the build scripts link (#[link] blocks load on the first miss)
     let t = Instant::now();
-    let (n_link, missing) = link_libraries(&prog, &g.link_libs, g.native.as_ref(), 0);
+    let (n_link, missing) = match link_libraries(&prog, &g.link_libs, g.native.as_ref(), 0) {
+        Ok(linked) => linked,
+        Err(error) => {
+            eprintln!("makepad-run: {error}");
+            return 1;
+        }
+    };
     phase(&format!("link libraries ({})", n_link), t);
-    // a library that is not there only matters when one of its symbols is used: that miss is
-    // reported where it happens (the #[link] block's lazy load); here only with --verbose
+    // Optional system libraries still report a miss when their symbols are used. A failed
+    // --allow-c bundle has already stopped the run: all of its externs depend on that load.
     if !missing.is_empty() {
         verbose!("makepad-run: libraries not found: {:?}", missing);
     }
@@ -2096,6 +2107,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }));
     }
     relax_codegen::fncost::mark("boot done, calling main");
+    // a restarted run's program is in and its main is called next: the restart completed (a hosted
+    // app's, at its domain's load)
+    if !HAL_RUN.load(Ordering::Acquire) { crate::hot_failure::restored(); }
     let main_ms = crate::clock::ms_since_start();
     MAIN_START_MS.store(main_ms as u64, Ordering::Relaxed);
     crate::boot_stats::main_called();
@@ -2318,19 +2332,20 @@ pub(crate) fn exported_fns(prog: &crate::program::Program, prefixes: &[String]) 
 }
 
 /// Loads the libraries the build scripts link and the ones `#[link]` blocks of files from
-/// `first_file` on name: (how many, the ones not found).
-pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(String, bool)], native: Option<&crate::native::NativeLib>, first_file: usize) -> (usize, Vec<String>) {
+/// `first_file` on name: (how many, the optional ones not found). A native bundle's
+/// load failure is fatal, with the loader's diagnostic and the crates it carries.
+pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(String, bool)], native: Option<&crate::native::NativeLib>, first_file: usize) -> Result<(usize, Vec<String>), String> {
     let mut missing = Vec::new();
     // no-codegen mode: nothing is linked at run time -- native code is the host binary's, and
     // the program reaches only the symbols the host exports (jit.rs foreign_addr)
     if prog.session.options.no_codegen {
-        return (0, missing);
+        return Ok((0, missing));
     }
     // `--allow-c`: the native dependencies' library (front native.rs), its symbols global
     if let Some(n) = native {
-        if !crate::os::proc::load_path(&n.path) {
-            missing.push(format!("{} (--allow-c native library of {})", n.path, n.crates.join(", ")));
-        }
+        crate::os::proc::load_path(&n.path).map_err(|error| {
+            format!("cannot load {} (--allow-c native library of {}): {}", n.path, n.crates.join(", "), error)
+        })?;
     }
     let provided_static = |name: &str| native.is_some_and(|n| n.statics.iter().any(|s| s == name));
     for (name, fw) in link_libs {
@@ -2351,7 +2366,7 @@ pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(Strin
             missing.push(name);
         }
     }
-    (n_link, missing)
+    Ok((n_link, missing))
 }
 
 /// The native run host: the OS loop starts before compilation, the graph opens a host window,
