@@ -93,6 +93,12 @@ impl App {
     pub fn serves(&self, service: &str) -> bool {
         self.caps.iter().any(|c| c.split('/').next() == Some(service))
     }
+
+    /// Why nothing can reach this process: it runs, but its socket could not be bound
+    /// (`"socket_error"`, carrier/unix.rs `listen`).
+    pub fn unreachable(&self) -> Option<String> {
+        self.text("socket_error").map(|why| format!("pid {} ({}) runs but cannot be reached: {}", self.pid, self.app, why))
+    }
 }
 
 pub(crate) fn alive(pid: u32) -> bool {
@@ -341,9 +347,13 @@ pub fn find(spec: &str, caller: &Caller) -> Result<App, String> {
     if spec.starts_with("tcp:") {
         return list.into_iter().rfind(|a| a.socket == spec).ok_or_else(|| no_endpoint(spec));
     }
-    match spec.parse::<u32>() {
+    let app = match spec.parse::<u32>() {
         Ok(pid) => list.into_iter().find(|a| a.answers_to(pid)).ok_or_else(|| no_endpoint(spec)),
         Err(_) => named(&list, spec, caller),
+    }?;
+    match app.unreachable() {
+        Some(why) => Err(why),
+        None => Ok(app),
     }
 }
 

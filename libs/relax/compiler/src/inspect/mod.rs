@@ -179,7 +179,8 @@ pub fn start(app: &str) {
     let sock = match endpoint.listen_unix(&extra) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("makepad-remote: cannot listen on {}: {}", makepad_remote::carrier::unix::paths(pid).0.display(), e);
+            // (also when the run is silent: nothing else would say why inspect finds no socket)
+            eprintln!("makepad-remote: pid {} app {}: makepad inspect cannot reach this run: {}", pid, app, e);
             return;
         }
     };

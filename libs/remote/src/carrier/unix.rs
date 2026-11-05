@@ -89,33 +89,58 @@ mod imp {
         let _ = s.set_read_timeout(None);
     }
 
+    /// The longest socket path a `sockaddr_un` holds, its terminating zero not counted.
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+    pub(super) const SOCKET_PATH_MAX: usize = 103;
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd")))]
+    pub(super) const SOCKET_PATH_MAX: usize = 107;
+
+    /// Why the socket at `path` cannot be bound: its length said plainly, else the bind's error.
+    fn unbindable(path: &Path, e: &io::Error) -> String {
+        let n = path.as_os_str().len();
+        if n > SOCKET_PATH_MAX {
+            format!("its socket path {} is {} bytes, over the {} a Unix socket's path holds (it is in TMPDIR: a shorter one fixes it)", path.display(), n, SOCKET_PATH_MAX)
+        } else {
+            format!("its socket {} could not be bound: {}", path.display(), e)
+        }
+    }
+
     /// Listens on this process's socket and writes the discovery file: `{"pid","app","socket",
     /// "started_ms","caps"}` plus `extra` (already-serialised `,"key":value` fields). Register the
     /// services first: the caps are written now. Returns the socket path.
+    /// A socket that cannot be bound is an error, and the discovery file says why
+    /// (`"socket_error"`, no caps): a client names the reason instead of finding no app.
     pub fn listen(ep: &Endpoint, extra: &str) -> io::Result<PathBuf> {
         let _ = crate::cmd::now_ms();
-        let pid = std::process::id();
-        let (sock, disc) = paths(pid);
-        let _ = std::fs::remove_file(&sock);
-        let listener = bind(&sock)?;
-        let caps: Vec<String> = ep.caps().iter().map(|c| crate::cmd::json_str(c)).collect();
-        let info = format!(
-            "{{\"pid\":{},\"app\":{},\"socket\":{},\"started_ms\":{},\"caps\":[{}]{}}}\n",
-            pid,
-            crate::cmd::json_str(ep.app()),
-            crate::cmd::json_str(&sock.display().to_string()),
-            crate::cmd::wall_ms(),
-            caps.join(","),
-            format!("{extra}{}", crate::discovery::lease_field())
-        );
-        let _ = std::fs::write(&disc, info);
-        ep.set_discovery(disc.clone());
+        let (sock, disc) = paths(std::process::id());
+        let served = serve_announced(ep, extra, &sock, &disc);
         extern "C" {
             fn atexit(f: extern "C" fn()) -> i32;
         }
         unsafe { atexit(cleanup) };
+        served.map(|()| sock)
+    }
+
+    /// [`listen`] on the socket `sock`, announced in the discovery file `disc`.
+    pub(super) fn serve_announced(ep: &Endpoint, extra: &str, sock: &Path, disc: &Path) -> io::Result<()> {
+        let _ = std::fs::remove_file(sock);
+        let bound = bind(sock).map_err(|e| io::Error::new(e.kind(), unbindable(sock, &e)));
+        let caps: Vec<String> = if bound.is_ok() { ep.caps().iter().map(|c| crate::cmd::json_str(c)).collect() } else { Vec::new() };
+        let info = format!(
+            "{{\"pid\":{},\"app\":{},\"socket\":{},\"started_ms\":{},\"caps\":[{}]{}{}}}\n",
+            std::process::id(),
+            crate::cmd::json_str(ep.app()),
+            crate::cmd::json_str(&sock.display().to_string()),
+            crate::cmd::wall_ms(),
+            caps.join(","),
+            bound.as_ref().err().map_or(String::new(), |e| format!(",\"socket_error\":{}", crate::cmd::json_str(&e.to_string()))),
+            format!("{extra}{}", crate::discovery::lease_field())
+        );
+        let _ = std::fs::write(disc, info);
+        let listener = bound?;
+        ep.set_discovery(disc.to_path_buf());
         accept_loop(ep, listener);
-        Ok(sock)
+        Ok(())
     }
 
     fn accept_loop(ep: &Endpoint, listener: UnixListener) {
@@ -169,6 +194,29 @@ mod imp {
 
 #[cfg(unix)]
 pub use imp::*;
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::imp::*;
+
+    /// A TMPDIR deep in a target dir gave a run a socket path longer than a Unix socket holds:
+    /// `makepad inspect` found no app and waited. The run's discovery file says why now, and a
+    /// client names it.
+    #[test]
+    fn a_socket_path_too_long_to_bind_is_said_in_the_discovery_file() {
+        let sock = std::env::temp_dir().join("d".repeat(SOCKET_PATH_MAX)).join("makepad-remote-1.sock");
+        let disc = std::env::temp_dir().join(format!("makepad-remote-long-test-{}.json", std::process::id()));
+        let ep = crate::endpoint::Endpoint::new("makepad-remote-long");
+        ep.register_cmd(|_, _| {});
+        let err = serve_announced(&ep, "", &sock, &disc).unwrap_err().to_string();
+        assert!(err.contains(&format!("bytes, over the {SOCKET_PATH_MAX}")), "{err}");
+        let app = crate::discovery::parse(&std::fs::read_to_string(&disc).unwrap()).unwrap();
+        std::fs::remove_file(&disc).unwrap();
+        assert!(app.caps.is_empty(), "nothing is served: {:?}", app.caps);
+        let why = app.unreachable().expect("the discovery file says why");
+        assert!(why.contains("runs but cannot be reached") && why.contains(&err), "{why}");
+    }
+}
 
 #[cfg(windows)]
 mod imp {
