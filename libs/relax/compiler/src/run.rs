@@ -641,7 +641,7 @@ pub(crate) fn resolve_package(
             // `--allow-c`: cargo builds the native dependencies (front native.rs); a build
             // script's own child run never builds them again
             let triple = crate::cfg::CfgSet::host(sess, &[]).triple();
-            let native_request = (options.allow_c && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none()).then(|| crate::native::Request { workspace, package, cargo_flags, relax_dir: target_dir, triple });
+            let native_request = (options.allow_c && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none()).then(|| crate::native::Request { workspace, package, cargo_flags, relax_dir: target_dir, triple, resolvable: native_resolvable });
             // a cold `--allow-c` boot: while cargo still compiles the C code, the proc-macro world
             // (built from the other crates' outputs) starts beside it, unless a macro crate needs
             // a native package's output
@@ -1757,7 +1757,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
 
     // ---- the libraries the build scripts link (#[link] blocks load on the first miss)
     let t = Instant::now();
-    let (n_link, missing) = match link_libraries(&prog, &g.link_libs, g.native.as_ref(), 0) {
+    let (n_link, missing, callbacks) = match link_libraries(&prog, &g.link_libs, g.native.as_ref(), 0) {
         Ok(linked) => linked,
         Err(error) => {
             eprintln!("makepad-run: {error}");
@@ -1977,6 +1977,11 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
         None => 0,
     });
+    // the native library's C code calls into the program: its stubs go to the unit's fns
+    if let Err(error) = crate::owner::call(crate::owner::Class::Program, || bind_native_callbacks(&u, &callbacks)) {
+        eprintln!("makepad-run: {error}");
+        return 1;
+    }
     let up: *mut Unit = &mut *u;
     unsafe { RUN_UNIT = up };
     if let Err(e) = finish_window() {
@@ -2329,21 +2334,80 @@ pub(crate) fn exported_fns(prog: &crate::program::Program, prefixes: &[String]) 
     Ok(out)
 }
 
+/// native::Resolvable for this process: the libraries loaded, which of the symbols the
+/// dynamic loader binds (what a native library's import resolves to without the program).
+fn native_resolvable(names: &[String], dylibs: &[String], frameworks: &[String]) -> Vec<bool> {
+    for l in dylibs {
+        let _ = crate::os::proc::load_library(l, false) || crate::os::proc::load_library_versioned(l);
+    }
+    for f in frameworks {
+        let _ = crate::os::proc::load_library(f, true);
+    }
+    names.iter().map(|n| {
+        let Ok(c) = std::ffi::CString::new(n.as_str()) else { return false };
+        unsafe { !crate::os::proc::lookup(std::ptr::null_mut(), c.as_ptr().cast()).is_null() || !crate::os::proc::find_system(c.as_ptr().cast()).is_null() }
+    }).collect()
+}
+
+/// The callback stubs of an `--allow-c` native library (front native_stub.rs): per symbol its
+/// C code calls into the program, the stub's pointer slot and the `#[no_mangle]` fn it goes to.
+#[derive(Default)]
+pub(crate) struct NativeCallbacks(Vec<(usize, DefId)>);
+
+/// The stubs of the library `handle`, each matched to the program's fn of its name; a symbol
+/// no fn of the program defines is the error a linker would report.
+fn native_callbacks(prog: &crate::program::Program, n: &crate::native::NativeLib, handle: usize) -> Result<NativeCallbacks, String> {
+    let names = crate::os::proc::symbol_in(handle, crate::native_stub::NAMES);
+    let slots = crate::os::proc::symbol_in(handle, crate::native_stub::SLOTS);
+    if names == 0 || slots == 0 {
+        return Ok(NativeCallbacks::default());
+    }
+    let exports = crate::global_asm::exported_fns(prog);
+    let mut out = Vec::new();
+    let mut at = names as *const std::ffi::c_char;
+    loop {
+        let name = unsafe { std::ffi::CStr::from_ptr(at) }.to_string_lossy().into_owned();
+        if name.is_empty() {
+            break;
+        }
+        let Some(&d) = exports.get(&name) else {
+            return Err(format!("cannot load {} (--allow-c native library of {}): its C code calls `{}`, which no library and no `#[no_mangle]` fn of the program defines", n.path, n.crates.join(", "), name));
+        };
+        out.push((slots + 8 * out.len(), d));
+        at = unsafe { at.add(name.len() + 1) };
+    }
+    Ok(NativeCallbacks(out))
+}
+
+/// Points the native library's callback stubs at the unit's fns (their callable addresses, as a
+/// fn pointer handed to C has them) before the program's first call into the library. A unit
+/// that loads the library binds them again (a restart, a domain), the last one's fns winning.
+pub(crate) fn bind_native_callbacks(u: &Unit, cb: &NativeCallbacks) -> Result<(), String> {
+    for &(slot, d) in &cb.0 {
+        let addr = crate::global_asm::fn_addr(u, d)?;
+        unsafe { (*(slot as *const std::sync::atomic::AtomicU64)).store(addr, Ordering::Release) };
+    }
+    Ok(())
+}
+
 /// Loads the libraries the build scripts link and the ones `#[link]` blocks of files from
-/// `first_file` on name: (how many, the optional ones not found). A native bundle's
-/// load failure is fatal, with the loader's diagnostic and the crates it carries.
-pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(String, bool)], native: Option<&crate::native::NativeLib>, first_file: usize) -> Result<(usize, Vec<String>), String> {
+/// `first_file` on name: (how many, the optional ones not found, the native library's callbacks
+/// to bind once the unit is made). A native bundle's load failure is fatal, with the loader's
+/// diagnostic and the crates it carries, and so is a callback the program does not define.
+pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(String, bool)], native: Option<&crate::native::NativeLib>, first_file: usize) -> Result<(usize, Vec<String>, NativeCallbacks), String> {
     let mut missing = Vec::new();
     // no-codegen mode: nothing is linked at run time -- native code is the host binary's, and
     // the program reaches only the symbols the host exports (jit.rs foreign_addr)
     if prog.session.options.no_codegen {
-        return Ok((0, missing));
+        return Ok((0, missing, NativeCallbacks::default()));
     }
     // `--allow-c`: the native dependencies' library (front native.rs), its symbols global
+    let mut callbacks = NativeCallbacks::default();
     if let Some(n) = native {
-        crate::os::proc::load_path(&n.path).map_err(|error| {
+        let handle = crate::os::proc::load_path(&n.path).map_err(|error| {
             format!("cannot load {} (--allow-c native library of {}): {}", n.path, n.crates.join(", "), error)
         })?;
+        callbacks = native_callbacks(prog, n, handle)?;
     }
     let provided_static = |name: &str| native.is_some_and(|n| n.statics.iter().any(|s| s == name));
     for (name, fw) in link_libs {
@@ -2364,7 +2428,7 @@ pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(Strin
             missing.push(name);
         }
     }
-    Ok((n_link, missing))
+    Ok((n_link, missing, callbacks))
 }
 
 /// The native run host: the OS loop starts before compilation, the graph opens a host window,

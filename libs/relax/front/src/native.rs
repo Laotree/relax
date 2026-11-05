@@ -37,7 +37,13 @@ pub struct Request<'a> {
     pub cargo_flags: &'a [String],
     pub relax_dir: &'a str,
     pub triple: &'a str,
+    pub resolvable: Resolvable,
 }
+
+/// Which of the C symbols `names` the loader process binds once the libraries `dylibs` and the
+/// frameworks `frameworks` are loaded: what the dynamic loader can bind a native library's
+/// import to (the C runtime and system libraries; the program's code is in none of them).
+pub type Resolvable = fn(names: &[String], dylibs: &[String], frameworks: &[String]) -> Vec<bool>;
 
 /// What cargo's build script of one native package produced.
 pub struct ScriptOut {
@@ -182,7 +188,7 @@ pub fn build(g: &Graph, seeds: &[usize], req: &Request) -> Result<Built, String>
     let flags: Vec<&String> = req.cargo_flags.iter().filter(|f| f.as_str() != "--release").collect();
 
     // ---- the key
-    let mut h = fnv(b"native-link-v10", 0xcbf29ce484222325);
+    let mut h = fnv(b"native-link-v11", 0xcbf29ce484222325);
     h = fnv(req.triple.as_bytes(), h);
     h = fnv(&selection_key(&script_pkgs, &lib_pkgs).to_le_bytes(), h);
     for f in &flags {
@@ -244,7 +250,7 @@ pub fn build(g: &Graph, seeds: &[usize], req: &Request) -> Result<Built, String>
         return Ok(Built { scripts: out.scripts, lib: None });
     }
     if !std::path::Path::new(&lib_path).is_file() {
-        link(&lib_path, &out.archives, &out.search, &out.fw_search, &out.dylibs, &out.frameworks)?;
+        link(&lib_path, &out.archives, &out.search, &out.fw_search, &out.dylibs, &out.frameworks, req.triple, req.resolvable)?;
     }
     if std::path::Path::new(&fast_mark).is_file() {
         optimize_later(g, req, exe, &flags, script_pkgs, lib_pkgs, seeds, &out, lib_path.clone(), fast_mark);
@@ -386,7 +392,7 @@ fn optimize_later(g: &Graph, req: &Request, exe: std::path::PathBuf, flags: &[&S
     let scripts = script_table(g);
     let seeds = seeds.to_vec();
     let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
-    let (workspace, package, relax_dir, triple) = (req.workspace.to_string(), req.package.to_string(), req.relax_dir.to_string(), req.triple.to_string());
+    let (workspace, package, relax_dir, triple, resolvable) = (req.workspace.to_string(), req.package.to_string(), req.relax_dir.to_string(), req.triple.to_string(), req.resolvable);
     let said = |o: &Outputs| -> Vec<(usize, bool, Vec<String>, Vec<(String, String)>)> {
         let mut v: Vec<_> = o.scripts.iter().map(|s| (s.krate, s.host, s.cfgs.clone(), s.env.clone())).collect();
         v.sort();
@@ -412,7 +418,7 @@ fn optimize_later(g: &Graph, req: &Request, exe: std::path::PathBuf, flags: &[&S
             return;
         }
         let tmp = format!("{}.opt{}", lib_path, std::process::id());
-        if link(&tmp, &o.archives, &o.search, &o.fw_search, &o.dylibs, &o.frameworks).is_ok() && std::fs::rename(&tmp, &lib_path).is_ok() {
+        if link(&tmp, &o.archives, &o.search, &o.fw_search, &o.dylibs, &o.frameworks, &triple, resolvable).is_ok() && std::fs::rename(&tmp, &lib_path).is_ok() {
             let _ = std::fs::remove_file(&fast_mark);
             
         } else {
@@ -594,7 +600,37 @@ fn cargo_selection(flags: &[&String]) -> Vec<String> {
     out
 }
 
-fn link(lib_path: &str, archives: &[String], search: &[String], fw_search: &[String], dylibs: &[String], frameworks: &[String]) -> Result<(), String> {
+/// The imports a linked native library binds by name at load time, as C names: on Mach-O the
+/// ones its link found in no library (`nm -m`: "dynamically looked up"; one bound to libSystem
+/// is its own), on ELF every undefined one (`nm -D`; ELF records no providing library), the
+/// symbol version off.
+fn library_imports(lib: &str) -> Result<Vec<String>, String> {
+    let apple = cfg!(target_vendor = "apple");
+    let mut nm = Command::new("nm");
+    nm.args(if apple { ["-m", "-u"] } else { ["-D", "-u"] }).arg(lib);
+    let out = nm.output().map_err(|e| format!("--allow-c: cannot read the native library's imports: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("--allow-c: nm failed for {lib}: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    let mut imports = std::collections::BTreeSet::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let name = if apple {
+            // "(undefined) external _name (dynamically looked up)"
+            let Some(rest) = line.trim().strip_suffix("(dynamically looked up)") else { continue };
+            let Some(name) = rest.split_whitespace().last() else { continue };
+            name.strip_prefix('_').unwrap_or(name)
+        } else {
+            // "                 U name@VERSION", "w name" (a weak one may stay unbound)
+            let mut words = line.split_whitespace();
+            let (Some("U"), Some(name)) = (words.next(), words.next()) else { continue };
+            name.split('@').next().unwrap_or(name)
+        };
+        imports.insert(name.to_string());
+    }
+    Ok(imports.into_iter().collect())
+}
+
+fn link(lib_path: &str, archives: &[String], search: &[String], fw_search: &[String], dylibs: &[String], frameworks: &[String], triple: &str, resolvable: Resolvable) -> Result<(), String> {
     if let Some(d) = std::path::Path::new(lib_path).parent() {
         let _ = std::fs::create_dir_all(d);
     }
@@ -667,12 +703,37 @@ fn link(lib_path: &str, archives: &[String], search: &[String], fw_search: &[Str
     for f in frameworks {
         cmd.args(["-framework", f]);
     }
-    let out = cmd.output().map_err(|e| format!("--allow-c: cannot run the C compiler to link the native library: {e}"))?;
-    let _ = std::fs::remove_file(&symbols_path);
-    if !out.status.success() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("--allow-c: linking the native library failed ({} archive(s): {}):\n{}", archives.len(), archives.join(" "), String::from_utf8_lossy(&out.stderr)));
+    let run = |cmd: &mut Command| -> Result<(), String> {
+        let out = cmd.output().map_err(|e| format!("--allow-c: cannot run the C compiler to link the native library: {e}"))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        Err(format!("--allow-c: linking the native library failed ({} archive(s): {}):\n{}", archives.len(), archives.join(" "), String::from_utf8_lossy(&out.stderr)))
+    };
+    let mut linked = run(&mut cmd);
+    // C code calling back into Rust (crate::native_stub): an import the link left that no library
+    // the loader binds defines is the program's. Its stub links in front, and the loader points it
+    // at the program's `#[no_mangle]` fn of that name, or refuses to start.
+    if linked.is_ok() {
+        let stubs_path = format!("{}.callbacks.o", tmp);
+        linked = library_imports(&tmp).and_then(|imports| {
+            let resolved = resolvable(&imports, dylibs, frameworks);
+            let callbacks: Vec<String> = imports.into_iter().zip(resolved).filter(|(_, r)| !r).map(|(n, _)| n).collect();
+            if callbacks.is_empty() {
+                return Ok(());
+            }
+            std::fs::write(&stubs_path, crate::native_stub::object(triple, &callbacks)?).map_err(|e| format!("{stubs_path}: {e}"))?;
+            let mut with_stubs = Command::new(cc());
+            with_stubs.arg(&stubs_path).args(cmd.get_args());
+            run(&mut with_stubs)
+        });
+        let _ = std::fs::remove_file(&stubs_path);
     }
+    let _ = std::fs::remove_file(&symbols_path);
+    if linked.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    linked?;
     std::fs::rename(&tmp, lib_path).map_err(|e| format!("{}: {}", lib_path, e))
 }
 
