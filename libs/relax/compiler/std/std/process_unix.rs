@@ -409,6 +409,13 @@ impl Command {
         child.wait()
     }
 
+    /// real std's `env_saw_path() && !program_is_path()`: the Command's own PATH (set, removed,
+    /// or the environment cleared) has to find a bare program name. posix_spawnp would search
+    /// this process's PATH, so such a Command forks and execvp's with its environment in place.
+    fn searches_own_path(&self) -> bool {
+        (self.env_clear || self.env.iter().any(|(k, _)| k.as_encoded_bytes() == b"PATH")) && !self.program.as_encoded_bytes().contains(&b'/')
+    }
+
     fn envp(&self) -> io::Result<Option<Vec<CString>>> {
         if !self.env_clear && self.env.is_empty() {
             return Ok(None);
@@ -579,15 +586,16 @@ impl Command {
         let (stderr_child, stderr_parent) = setup_stdio(self.stderr.take(), default_piped, false)?;
 
         #[cfg(not(target_os = "android"))]
-        if !self.closures.is_empty() {
+        if !self.closures.is_empty() || self.searches_own_path() {
             if exec {
                 // CommandExt::exec: real std runs the closures in this process before the exec
                 for p in self.closures.iter_mut() {
                     unsafe { p.call()? };
                 }
             } else {
-                // real std: no posix_spawn when there are pre_exec closures -- fork, set the child
-                // up, run the closures, exec; a CLOEXEC pipe carries a failure's errno back
+                // real std: no posix_spawn when there are pre_exec closures or the Command's own
+                // PATH finds the program -- fork, set the child up, run the closures, exec; a
+                // CLOEXEC pipe carries a failure's errno back
                 let pid = unsafe { self.fork_exec(&prog, &argv, envp_ptr, &cwd, &stdin_child, &stdout_child, &stderr_child)? };
                 drop(stdin_child);
                 drop(stdout_child);
@@ -675,12 +683,23 @@ impl Command {
                         }
                     }
                     signal(SIGPIPE, 0);
-                    execvpe(prog.as_ptr(), argv.as_ptr(), envp_ptr);
+                    let _env = crate::env::env_read_lock();
+                    exec_path_env(prog.as_ptr(), argv.as_ptr(), envp_ptr);
                     return Err(io::Error::last_os_error());
                 }
             }
             posix_spawnattr_setflags(&mut attr as *mut SpawnAttr, flags);
+            // an exec (Darwin's SETEXEC) searches the new program's PATH, as real std's execvp
+            // with its environment in place does (exec_path_env); a failed one puts ours back
+            let _env = exec.then(crate::env::env_read_lock);
+            let was = sys::os::environ();
+            if exec {
+                sys::os::set_environ(envp_ptr);
+            }
             let r = posix_spawnp(&mut pid as *mut sys::pid_t, prog.as_ptr(), &actions as *const SpawnFileActions, &attr as *const SpawnAttr, argv.as_ptr(), envp_ptr);
+            if exec {
+                sys::os::set_environ(was);
+            }
             posix_spawn_file_actions_destroy(&mut actions as *mut SpawnFileActions);
             posix_spawnattr_destroy(&mut attr as *mut SpawnAttr);
             if r != 0 {
@@ -894,29 +913,15 @@ unsafe fn child_fail(fd: c_int, e: io::Error) -> ! {
     sys::_exit(1)
 }
 
-/// execvp with an explicit environment: execvpe on Linux; on macOS (no execvpe)
-/// posix_spawnp with POSIX_SPAWN_SETEXEC, which is execve after the PATH search.
+/// real std's do_exec tail: the new program's environment becomes this process's `environ`,
+/// then execvp, whose PATH search reads it, so the Command's own PATH finds a bare program name
+/// (glibc's execvpe and posix_spawnp search the caller's). Returns only on failure, with this
+/// process's environment back (errno kept: a store sets none).
 unsafe fn exec_path_env(file: *const c_char, argv: *const *const c_char, envp: *const *const c_char) {
-    #[cfg(not(target_vendor = "apple"))]
-    {
-        execvpe(file, argv, envp);
-    }
-    #[cfg(target_vendor = "apple")]
-    {
-        let mut attr = SpawnAttr { storage: [0; 64] };
-        posix_spawnattr_init(&mut attr as *mut SpawnAttr);
-        posix_spawnattr_setflags(&mut attr as *mut SpawnAttr, POSIX_SPAWN_SETEXEC);
-        let mut pid: sys::pid_t = 0;
-        let r = posix_spawnp(&mut pid as *mut sys::pid_t, file, core::ptr::null(), &attr as *const SpawnAttr, argv, envp);
-        if r != 0 {
-            set_errno(r);
-        }
-    }
-}
-
-#[cfg(target_vendor = "apple")]
-unsafe fn set_errno(e: c_int) {
-    *__error() = e;
+    let was = sys::os::environ();
+    sys::os::set_environ(envp);
+    execvp(file, argv);
+    sys::os::set_environ(was);
 }
 
 /// Iterator over a Command's arguments (Command::get_args).
@@ -1082,8 +1087,7 @@ extern "C" {
     fn setpgid(pid: sys::pid_t, pgid: sys::pid_t) -> c_int;
     #[cfg(not(target_vendor = "apple"))]
     fn signal(sig: c_int, handler: usize) -> usize;
-    #[cfg(not(target_vendor = "apple"))]
-    fn execvpe(file: *const c_char, argv: *const *const c_char, envp: *const *const c_char) -> c_int;
+    fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
     fn sigaddset(set: *mut SigSet, sig: c_int) -> c_int;
     #[cfg(not(target_os = "android"))]
     fn fork() -> sys::pid_t;
@@ -1095,8 +1099,6 @@ extern "C" {
     #[cfg(not(target_os = "android"))]
     #[link_name = "signal"]
     fn fork_signal(sig: c_int, handler: usize) -> usize;
-    #[cfg(target_vendor = "apple")]
-    fn __error() -> *mut c_int;
     fn poll(fds: *mut PollFd, n: u32, timeout: c_int) -> c_int;
 }
 
