@@ -2113,6 +2113,13 @@ impl Program {
         &self.edit_current
     }
 
+    /// Whether file `f` is the version current now: a boot file no edit replaced, or the version
+    /// an edit made current (a replaced, refused or rolled-back version is not).
+    pub fn is_current_version(&self, f: u32) -> bool {
+        let boot = self.edit_boot.get(&f).copied().unwrap_or(f);
+        self.edit_current.get(&boot).map_or(true, |&now| now == f)
+    }
+
     pub fn commit_version(&mut self, v: FileVersion, pairs: &[(u32, u32)]) -> Result<u32, String> {
         self.commit_version_inner(v, pairs, false, None)
     }
