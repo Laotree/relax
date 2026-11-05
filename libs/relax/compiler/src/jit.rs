@@ -17408,15 +17408,17 @@ pub(crate) fn tier_stuck(u: &Unit) -> Vec<(u32, String)> {
         return Vec::new();
     }
     let mut v = Vec::new();
+    // (a slot's own place in the queue is a walk of all of it: thousands of slots wait in a cold run)
+    let queued = queue::tier_queued();
     for id in 0..u.fns.len() as u32 {
         let f = &u.fns[id as usize];
         if !f.compiled || f.code_len == 0 || unsafe { (*tier_rec(&u.slots, id).add(3)).load(Ordering::Relaxed) } != T_QUEUED {
             continue;
         }
-        if matches!(crate::inspect::codever::kind_at(u, f.code).tier, tier::O3 | tier::INSTRUMENTED_O3) {
+        if queued.contains(&id) || matches!(crate::inspect::codever::kind_at(u, f.code).tier, tier::O3 | tier::INSTRUMENTED_O3) {
             continue;
         }
-        let (verdict, _) = tier_explain(u, id);
+        let (verdict, _) = tier_explain_at(u, id, None);
         if verdict.starts_with(STUCK_VERDICT) {
             v.push((id, verdict));
         }
@@ -17448,6 +17450,10 @@ const STUCK_VERDICT: &str = "STUCK below O3";
 /// counted (PGO) window, the verdict, retiers left, pins. The decision history is the tier log's
 /// (inspect/tierlog.rs). Unit read (owner job).
 pub(crate) fn tier_explain(u: &Unit, id: u32) -> (String, Vec<(String, String)>) {
+    tier_explain_at(u, id, queue::tier_position(id))
+}
+/// `tier_explain`, its place in the O3 queue (`queue::tier_position`) looked up already.
+fn tier_explain_at(u: &Unit, id: u32, place: Option<(queue::TierEntry, usize, usize)>) -> (String, Vec<(String, String)>) {
     use crate::inspect::tierlog as tl;
     let mut rows: Vec<(String, String)> = Vec::new();
     let f = &u.fns[id as usize];
@@ -17498,7 +17504,7 @@ pub(crate) fn tier_explain(u: &Unit, id: u32) -> (String, Vec<(String, String)>)
     let active = TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).contains(&id);
     let queued = {
         let inbox = !TIER_INBOX.is_empty();
-        queue::tier_position(id).map(|((_, why, at, _), ahead, total)| {
+        place.map(|((_, why, at, _), ahead, total)| {
             format!("waiting ({}) for {}, {} of {} jobs go first", Q_WHY[why as usize], ms(now.saturating_sub(at)), ahead, total)
         }).or_else(|| (inbox && state == T_QUEUED).then(|| "in rt_hot's inbox (moved into the queue by the next worker)".to_string()))
     };
