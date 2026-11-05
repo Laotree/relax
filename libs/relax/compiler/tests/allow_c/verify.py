@@ -47,6 +47,7 @@ baseline = run("cargo", ["cargo", "run", "--release", "--locked", "--quiet"])
 command = [binary, "run", "--allow-c", "allow-c-fixture"]
 first = run("first", command)
 assert first.stdout == baseline.stdout, "native/JIT fixture output differs from cargo"
+assert "callback 50\n" in first.stdout, f"C code calling back into Rust: {first.stdout}"
 assert "building native dependencies with cargo" in first.stderr, "cold native build was not exercised"
 
 native = scratch / "jit" / "native"
@@ -73,15 +74,16 @@ manifest = fixture / "Cargo.toml"
 manifest.write_text(manifest.read_text().split("[patch.crates-io]")[0])
 run("lock-without-patches", ["cargo", "generate-lockfile", "--offline"])
 
-# An unused function still carries an unresolved import. RTLD_NOW must reject
-# the entire native bundle before even the fixture's first println runs.
+# An unused function still carries an unresolved import. Neither a library nor
+# the program defines it: the native bundle is rejected before even the
+# fixture's first println runs.
 with (fixture / "cnative" / "csrc" / "cnative.c").open("a") as source:
     source.write('\nextern int cn_missing_native_symbol(void);\n'
                  'int cn_unresolved(void) { return cn_missing_native_symbol(); }\n')
 failed = run("unresolved", command, success=False)
 assert failed.returncode == 1, f"loader failure exit status: {failed.returncode}"
 assert not failed.stdout, "program started despite a missing native import"
-for expected in ["cannot load", "libnative.", "--allow-c native library of cnative 0.1.0", "cn_missing_native_symbol"]:
+for expected in ["cannot load", "libnative.", "--allow-c native library of cnative 0.1.0", "`cn_missing_native_symbol`", "no `#[no_mangle]` fn of the program"]:
     assert expected in failed.stderr, f"missing loader diagnostic {expected!r}: {failed.stderr}"
 print("PASS loader: unresolved import reports library, crate and loader error; exit 1; no program output")
 
