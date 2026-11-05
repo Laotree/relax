@@ -1759,7 +1759,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
 
     // ---- the libraries the build scripts link (#[link] blocks load on the first miss)
     let t = Instant::now();
-    let (n_link, missing, callbacks) = match link_libraries(&prog, &g.link_libs, g.native.as_ref(), 0) {
+    let (n_link, missing, callbacks) = match link_libraries(&prog, &g.link_libs, g.native.as_ref(), 0, None) {
         Ok(linked) => linked,
         Err(error) => {
             eprintln!("makepad-run: {error}");
@@ -1980,7 +1980,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         None => 0,
     });
     // the native library's C code calls into the program: its stubs go to the unit's fns
-    if let Err(error) = crate::owner::call(crate::owner::Class::Program, || bind_native_callbacks(&u, &callbacks)) {
+    if let Err(error) = crate::owner::call(crate::owner::Class::Program, || bind_native_callbacks(&u, &callbacks, None)) {
         eprintln!("makepad-run: {error}");
         return 1;
     }
@@ -2360,22 +2360,43 @@ mod native_tests {
         let names = ["strlen", "malloc", "relax_native_no_such_symbol"].map(String::from);
         assert_eq!(super::native_resolvable(&names, &[], &[]), [true, true, false]);
     }
+
+    /// Domain 2 of an edited package (its `#[no_mangle]` fn another DefId) does not take the
+    /// slots live domain 1 bound; the same code, a restart and a binder that ended do.
+    #[test]
+    fn an_edited_relaunch_does_not_rebind_a_live_domains_callbacks() {
+        use crate::program::DefId;
+        let (slot, old_fn, new_fn) = (0x1000usize, DefId(7), DefId(9));
+        let owners = [(slot, Some(1), old_fn)];
+        let live = |o: Option<u32>| o == Some(1);
+        assert_eq!(super::slot_conflict(&owners, Some(2), &[(slot, new_fn)], live), Some((slot, Some(1), old_fn)));
+        assert_eq!(super::slot_conflict(&owners, Some(2), &[(slot, old_fn)], live), None);
+        assert_eq!(super::slot_conflict(&owners, Some(1), &[(slot, new_fn)], live), None);
+        assert_eq!(super::slot_conflict(&owners, Some(2), &[(slot, new_fn)], |_| false), None);
+        assert_eq!(super::slot_conflict(&owners, Some(2), &[(0x2000, new_fn)], live), None);
+    }
 }
 
-/// The callback stubs of an `--allow-c` native library (front native_stub.rs): per symbol its
-/// C code calls into the program, the stub's pointer slot and the `#[no_mangle]` fn it goes to.
+/// The callback stubs of an `--allow-c` native library (front native_stub.rs): the library and
+/// its crates, and per symbol its C code calls into the program the stub's pointer slot, the
+/// `#[no_mangle]` fn it goes to and the symbol.
 #[derive(Default)]
-pub(crate) struct NativeCallbacks(Vec<(usize, DefId)>);
+pub(crate) struct NativeCallbacks {
+    lib: String,
+    crates: String,
+    slots: Vec<(usize, DefId, String)>,
+}
 
-/// The stubs of the library `handle`, each matched to the program's fn of its name; a symbol
-/// no fn of the program defines is the error a linker would report.
-fn native_callbacks(prog: &crate::program::Program, n: &crate::native::NativeLib, handle: usize) -> Result<NativeCallbacks, String> {
+/// The stubs of the library `handle`, each matched to the program's fn of its name (one of the
+/// loader's crates, `crates`: a domain's own, None: any); a symbol no fn defines is the error a
+/// linker would report.
+fn native_callbacks(prog: &crate::program::Program, n: &crate::native::NativeLib, handle: usize, crates: Option<&std::collections::HashSet<u32>>) -> Result<NativeCallbacks, String> {
     let names = crate::os::proc::symbol_in(handle, crate::native_stub::NAMES);
     let slots = crate::os::proc::symbol_in(handle, crate::native_stub::SLOTS);
     if names == 0 || slots == 0 {
         return Ok(NativeCallbacks::default());
     }
-    let exports = crate::global_asm::exported_fns(prog);
+    let exports = crate::global_asm::exported_fns_of(prog, |k| crates.is_none_or(|c| c.contains(&k)));
     let mut out = Vec::new();
     let mut at = names as *const std::ffi::c_char;
     loop {
@@ -2386,19 +2407,46 @@ fn native_callbacks(prog: &crate::program::Program, n: &crate::native::NativeLib
         let Some(&d) = exports.get(&name) else {
             return Err(format!("cannot load {} (--allow-c native library of {}): its C code calls `{}`, which no library and no `#[no_mangle]` fn of the program defines", n.path, n.crates.join(", "), name));
         };
-        out.push((slots + 8 * out.len(), d));
         at = unsafe { at.add(name.len() + 1) };
+        out.push((slots + 8 * out.len(), d, name));
     }
-    Ok(NativeCallbacks(out))
+    Ok(NativeCallbacks { lib: n.path.clone(), crates: n.crates.join(", "), slots: out })
+}
+
+/// Who bound each callback slot of the process's native libraries: (slot, the run (None) or a
+/// domain, the fn).
+static SLOT_OWNERS: relax_session::sync::Mutex<Vec<(usize, Option<crate::domain::DomainId>, DefId)>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// The first of `slots` (slot, fn) that `owner` must not take: one another binder that is still
+/// `live` holds with a different fn (slot, that binder, its fn). One library serves every
+/// domain, so its slots are one table: a domain of the same code binds the same fns, a restart
+/// (the same binder) and a binder that ended rebind.
+fn slot_conflict(owners: &[(usize, Option<crate::domain::DomainId>, DefId)], owner: Option<crate::domain::DomainId>, slots: &[(usize, DefId)], live: impl Fn(Option<crate::domain::DomainId>) -> bool) -> Option<(usize, Option<crate::domain::DomainId>, DefId)> {
+    slots.iter().find_map(|&(slot, d)| owners.iter().find(|o| o.0 == slot && o.1 != owner && o.2 != d && live(o.1)).copied())
 }
 
 /// Points the native library's callback stubs at the unit's fns (their callable addresses, as a
-/// fn pointer handed to C has them) before the program's first call into the library. A unit
-/// that loads the library binds them again (a restart, a domain), the last one's fns winning.
-pub(crate) fn bind_native_callbacks(u: &Unit, cb: &NativeCallbacks) -> Result<(), String> {
-    for &(slot, d) in &cb.0 {
+/// fn pointer handed to C has them) before the program's first call into the library, for
+/// `owner` (None: the run, else a domain). A domain of an edited package whose fns differ from
+/// those a live domain bound is refused: the library's C code would call the other's fns.
+pub(crate) fn bind_native_callbacks(u: &Unit, cb: &NativeCallbacks, owner: Option<crate::domain::DomainId>) -> Result<(), String> {
+    let _k = crate::zone_alloc::kept();
+    let mut owners = SLOT_OWNERS.lock().unwrap_or_else(|e| e.into_inner());
+    let slots: Vec<(usize, DefId)> = cb.slots.iter().map(|s| (s.0, s.1)).collect();
+    let live = |o: Option<crate::domain::DomainId>| o.is_none_or(|id| crate::domain::info(id).is_some_and(|i| matches!(i.state, crate::domain::DomainState::Compiling(_) | crate::domain::DomainState::Running)));
+    if let Some((slot, other, was)) = slot_conflict(&owners, owner, &slots, live) {
+        let &(_, d, ref name) = cb.slots.iter().find(|s| s.0 == slot).expect("a conflicting slot is one of these");
+        let who = |o: Option<crate::domain::DomainId>| o.map_or("the run".to_string(), |id| format!("domain {id}"));
+        return Err(format!(
+            "cannot bind {} (--allow-c native library of {}) for {}: its C code calls `{}`, which {} bound to its own `{}` (this one is `{}`); one library serves both, so restart {} to pick up the edit",
+            cb.lib, cb.crates, who(owner), name, who(other), u.prog.def_path(was), u.prog.def_path(d), who(other)
+        ));
+    }
+    for &(slot, d) in &slots {
         let addr = crate::global_asm::fn_addr(u, d)?;
         unsafe { (*(slot as *const std::sync::atomic::AtomicU64)).store(addr, Ordering::Release) };
+        owners.retain(|o| o.0 != slot);
+        owners.push((slot, owner, d));
     }
     Ok(())
 }
@@ -2407,7 +2455,8 @@ pub(crate) fn bind_native_callbacks(u: &Unit, cb: &NativeCallbacks) -> Result<()
 /// `first_file` on name: (how many, the optional ones not found, the native library's callbacks
 /// to bind once the unit is made). A native bundle's load failure is fatal, with the loader's
 /// diagnostic and the crates it carries, and so is a callback the program does not define.
-pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(String, bool)], native: Option<&crate::native::NativeLib>, first_file: usize) -> Result<(usize, Vec<String>, NativeCallbacks), String> {
+/// The native library's callbacks are the fns of `crates` (a domain's; None: any).
+pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(String, bool)], native: Option<&crate::native::NativeLib>, first_file: usize, crates: Option<&std::collections::HashSet<u32>>) -> Result<(usize, Vec<String>, NativeCallbacks), String> {
     let mut missing = Vec::new();
     // no-codegen mode: nothing is linked at run time -- native code is the host binary's, and
     // the program reaches only the symbols the host exports (jit.rs foreign_addr)
@@ -2420,7 +2469,7 @@ pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(Strin
         let handle = crate::os::proc::load_path(&n.path).map_err(|error| {
             format!("cannot load {} (--allow-c native library of {}): {}", n.path, n.crates.join(", "), error)
         })?;
-        callbacks = native_callbacks(prog, n, handle)?;
+        callbacks = native_callbacks(prog, n, handle, crates)?;
     }
     let provided_static = |name: &str| native.is_some_and(|n| n.statics.iter().any(|s| s == name));
     for (name, fw) in link_libs {
