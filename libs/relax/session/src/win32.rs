@@ -18,6 +18,7 @@ extern "system" {
     // errors
     pub fn GetLastError() -> u32;
     pub fn SetLastError(e: u32);
+    pub fn GetEnvironmentVariableW(name: *const u16, value: *mut u16, size: u32) -> u32;
     // processes, threads
     pub fn GetCurrentProcess() -> HANDLE;
     pub fn GetCurrentThread() -> HANDLE;
