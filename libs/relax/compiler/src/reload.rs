@@ -2428,10 +2428,11 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, sources: &[Edit], partial:
             (edits, cur)
         });
         loop {
-            let (macro_table, epoch, snapshots) = cur;
+            let (macro_table, epoch, mut snapshots) = cur;
             // Only owned snapshots are reachable here; never retain a Unit/Program reference
             // across the unlock. Lazy stubs and background/spec workers can compile meanwhile.
             trace_stage("snapshot");
+            crate::program::share_import_edits(&mut snapshots, edits.iter().map(|e| e.src.as_slice()));
             let pre: Vec<Option<Result<crate::program::FileVersion, String>>> = edits.iter().zip(snapshots).map(|(e, s)| s.map(|s| s.parse(e.src.clone()))).collect();
             trace_stage("reparse");
             let step = call_traced("relock", || {
