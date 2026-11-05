@@ -381,7 +381,7 @@ fn dispatch(pool: &'static Pool, task: Task) -> Result<(), (Task, std::io::Error
         let id = pool.started.fetch_add(1, Ordering::Relaxed);
         pool.alive.fetch_add(1, Ordering::Relaxed);
         let w2 = w.clone();
-        let spawned = std::thread::Builder::new().name(format!("run-jit-{id}")).spawn(move || worker_main(w2));
+        let spawned = std::thread::Builder::new().name(format!("run-jit-{id}")).stack_size(crate::run_threads::COMPILER_STACK).spawn(move || worker_main(w2));
         (w, spawned)
     };
     match spawned {
