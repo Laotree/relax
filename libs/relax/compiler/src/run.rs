@@ -556,6 +556,11 @@ pub(crate) fn resolve_package(
     let units = with_sysroot_proc_macro(units, std_dir);
     let t_load = Instant::now();
     let mut g = unitgraph::load(&units, check_only)?;
+    // cargo's `[env]` configuration of the workspace, for every crate's compile-time environment
+    // and every build script (a build script's own run has it in its process environment)
+    if std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none() {
+        crate::crates::set_config_env(crate::resolve::cargo_env(workspace)?);
+    }
     let t_loaded = Instant::now();
     // The graph is enough to choose the host. Its window opens now, beside the rest of the
     // resolve (the watch inputs, the substitutions, the hash and the build scripts); the process
