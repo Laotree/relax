@@ -2144,6 +2144,14 @@ impl<'a> Lcx<'a> {
                     self.write_place(&pl, t, v);
                     self.own_local(li);
                 }
+                (None, Some(p)) if fsig.asyncness && self.b.pat_local.contains_key(&(p.0 | crate::typeck::ASYNC_ARG_KEY)) => {
+                    // An async fn first captures the whole argument. Its pattern
+                    // is matched by the coroutine on the first poll, not here.
+                    let li = self.b.pat_local[&(p.0 | crate::typeck::ASYNC_ARG_KEY)];
+                    let pl = self.local_place(li);
+                    self.write_place(&pl, t, v);
+                    self.own_local(li);
+                }
                 (None, Some(p)) if !matches!(ast.pat(p), Pat::Ident { by_ref: false, sub: None, .. }) && self.needs_drop_glue(t) => {
                     // a parameter pattern (`ref s: S`, `(a, _): (D, D)`, `_: D`): the argument is a
                     // variable of the function like `let _tmp = arg; let pat = _tmp;` (rustc):
@@ -2508,6 +2516,20 @@ impl<'a> Lcx<'a> {
             }
         }
         self.coro = Some(Coro { ct, env, cx, frame_off, tag, up_size: ul.size, await_slots: Vec::new(), await_tys: Vec::new(), poll_scratch: Vec::new(), call_private: Default::default(), call_sret: Default::default(), poll_ret, suspends: Vec::new(), cancel_end: Some(cancel_end), pending_ret, after_done, after_panic });
+        if ce & crate::tcx::ASYNC_FN_BODY != 0 {
+            for p in self.b.param_pats.clone() {
+                if let Some(&li) = self.b.pat_local.get(&(p.0 | crate::typeck::ASYNC_ARG_KEY)) {
+                    let t = self.monomorphize(self.b.locals[li as usize].ty);
+                    let place = self.local_place(li);
+                    let saved = (self.match_root, self.pat_path.take());
+                    self.match_root = Some(MatchRoot::Local(li));
+                    self.pat_path = Some(Vec::new());
+                    self.bind_pat_place(p, &place, t);
+                    self.match_root = saved.0;
+                    self.pat_path = saved.1;
+                }
+            }
+        }
         self.pos = ast.block(body).lo;
         let mark = self.stmt_temps.len();
         let v = self.lower_block(body);
