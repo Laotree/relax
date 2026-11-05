@@ -125,6 +125,32 @@ fn a_second_binary_targets_main_is_its_entry() {
     assert_eq!(warnings, ["function `unused_in_bin` is never used [dead_code]"]);
 }
 
+/// rustc lints each crate it compiles on its own: a binary's call of `Write::write_all` is no use
+/// of the library's `use std::io::Write;` (the check had pooled the traits every checked body calls
+/// methods of, so one crate's call hid another crate's unused trait import).
+#[test]
+fn another_crates_method_call_leaves_a_trait_import_unused() {
+    let Some(warnings) = warnings_in_child("check_lint_tests::another_crates_method_call_leaves_a_trait_import_unused") else {
+        return check_package("use std::io::Write;\npub fn f() -> u32 { 1 }\n", &[
+            "use std::io::Write;\nfn main() { let mut v: Vec<u8> = Vec::new(); v.write_all(b\"x\").unwrap(); let _ = pkg::f(); }\n",
+        ]);
+    };
+    assert_eq!(warnings, ["unused import: `std::io::Write` [unused_imports]"]);
+}
+
+/// The same for macro imports: a binary that glob-imports the library and invokes a macro of the same
+/// name (its own) does not use the library's `use m::mm;` (the names written in a module that
+/// glob-imports another had counted for the imports of a module of another crate).
+#[test]
+fn another_crates_macro_call_leaves_a_macro_import_unused() {
+    let Some(warnings) = warnings_in_child("check_lint_tests::another_crates_macro_call_leaves_a_macro_import_unused") else {
+        return check_package("mod m {\n    macro_rules! mm { () => {} }\n    pub(crate) use mm;\n    pub(crate) fn g() { mm!(); }\n}\nuse m::mm;\npub fn f() { m::g(); }\n", &[
+            "use pkg::*;\nmacro_rules! mm { () => {} }\nfn main() { mm!(); f(); }\n",
+        ]);
+    };
+    assert_eq!(warnings, ["unused import: `m::mm` [unused_imports]"]);
+}
+
 /// A crate's `const _: () = assert!(cfg!(..))` (E0080 under the JIT's check only): the check evaluates every const
 /// item (rustc_hir_analysis check_crate), and `cfg!` in one is the literal the crate's cfg gives
 /// (rustc_builtin_macros cfg.rs expand_cfg); MIR building had made every `cfg!` false.
