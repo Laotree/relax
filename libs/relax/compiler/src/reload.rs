@@ -4620,7 +4620,7 @@ pub fn domain_stopping(id: u32) {
 }
 
 // the first domain of a restarted run gets the state the previous run left
-// (MAKEPAD_RUN_RESTORE, read once)
+// (MAKEPAD_RUN_RESTORE, read once: run_end::run_input)
 static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 pub(crate) fn domain_loaded(inputs: Option<Inputs>) {
@@ -4629,7 +4629,7 @@ pub(crate) fn domain_loaded(inputs: Option<Inputs>) {
     clear_restart_pending();
     let mut restored = None;
     if FIRST.swap(false, std::sync::atomic::Ordering::AcqRel) {
-        if let Some(path) = std::env::var_os("MAKEPAD_RUN_RESTORE") {
+        if let Some(path) = crate::run_end::run_input("MAKEPAD_RUN_RESTORE") {
             let _k = crate::zone_alloc::kept();
             restored = std::fs::read_to_string(&path).ok();
             let _ = std::fs::remove_file(&path);
@@ -4888,6 +4888,14 @@ pub extern "C" fn __relax_restored_state(buf: *mut u8, cap: usize) -> usize {
             Some(t) => copy_out(t, buf, cap),
             None => usize::MAX,
         }
+    })
+}
+
+/// When the edit whose restart started this run was saved (unix ms; 0 for a run no restart started):
+/// MAKEPAD_RUN_RESTART_T0 as this run has it (run_end::run_input), for save -> back on screen.
+pub extern "C" fn __relax_restart_saved_ms() -> f64 {
+    crate::jit::host_boundary("__relax_restart_saved_ms", || {
+        crate::run_end::run_input("MAKEPAD_RUN_RESTART_T0").and_then(|v| v.into_string().ok()).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0)
     })
 }
 
@@ -5278,8 +5286,9 @@ pub(crate) fn hand_back() {
     }
 }
 
-/// What the next run reads, as a process finds it in its environment (a value, or none): the
-/// recovery on its way, `state` as the app left it, when the edit behind this was saved.
+/// What the next run reads (run_end::run_input; a value, or none): the recovery on its way, `state`
+/// as the app left it, when the edit behind this was saved. A process started for the next run
+/// finds it in its environment, a run started in place in the restart's hand-over.
 pub(crate) fn next_run_env(state: Option<&[u8]>) -> Result<Vec<(&'static str, Option<std::ffi::OsString>)>, String> {
     let recovery = crate::hot_failure::hand_over()?.map(|path| path.into_os_string());
     let restore = match state {
@@ -5592,6 +5601,7 @@ pub fn restart_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_restart_requested" => __relax_restart_requested as *const () as usize,
         b"__relax_restart_reason" => __relax_restart_reason as *const () as usize,
         b"__relax_restored_state" => __relax_restored_state as *const () as usize,
+        b"__relax_restart_saved_ms" => __relax_restart_saved_ms as *const () as usize,
         b"__relax_restart_now" => __relax_restart_now as *const () as usize,
         b"__relax_hot_load_failed" => __relax_hot_load_failed as *const () as usize,
         b"__relax_live_stream" => __relax_live_stream as *const () as usize,

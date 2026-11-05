@@ -723,7 +723,7 @@ fn warm_front(images: &crate::cache::FrontImages, sess: &std::sync::Arc<crate::S
 
 fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session: Option<&mut Option<crate::serve::Session>>) -> i32 {
     // Restore before resolution so a failed replacement compile is a JIT verdict too.
-    if std::env::var_os("MAKEPAD_JIT_RECOVERY").is_some() {
+    if crate::run_end::run_input("MAKEPAD_JIT_RECOVERY").is_some() {
         crate::hot_failure::enable();
         crate::hot_failure::restore();
     }
