@@ -390,19 +390,21 @@ impl Layouts {
     /// A closure's environment. Its type names the file version whose body made it: the
     /// storages of every lowered body are recorded (`note_closure_storages`), so a closure of a
     /// version a live edit replaced keeps the environment that version gave it. Only the
-    /// current version is derived from the owner's type check here (a replaced version's
-    /// expression ids name other expressions, or none, in the current body).
+    /// current version is derived from the owner's type check here: a replaced version's
+    /// expression ids name other expressions, or none, in its owner's current body, and an owner
+    /// the edit removed has no body of the program at all (it keeps the replaced version's file,
+    /// and a check of it now resolves against names the edit took away).
     pub fn closure_storage(&self, prog: &crate::program::Program, tcx: &Tcx, ty: TyId) -> ClosureStorage {
         let ty = tcx.tys.erase_regions(ty);
         if let Some(storage) = self.closure_storage.get(&ty) { return storage; }
         let TyKind::Closure(file, ce, crate::types::ClosureArgs { parent_args: owner, .. }) = tcx.tys.kind(ty) else { panic!("closure storage for non-closure") };
         let TyKind::FnDef(def, args, _) = tcx.tys.kind(*owner) else { panic!("closure owner") };
-        let body = crate::typeck::codegen_body(prog, tcx, *def, tcx.tys.list(*args));
-        if body.file != *file {
+        if !prog.is_current_version(*file) {
             if let Some(storage) = self.version_storage.get(&ty) { return storage; }
             panic!("the environment of a closure of a replaced version of {} (expression {}) is unknown: no body of that version was lowered in this process",
                 prog.file_paths.get(*file as usize).map_or("?", |p| p.as_str()), ce & !crate::tcx::ASYNC_FN_BODY);
         }
+        let body = crate::typeck::codegen_body(prog, tcx, *def, tcx.tys.list(*args));
         let storage = ClosureStorage::for_codegen(prog, tcx, &body, *ce);
         self.closure_storage.insert(ty, storage.clone());
         storage
