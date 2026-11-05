@@ -14,6 +14,8 @@ warm: one edit, and within 20 s either
             brings the new value,
 and in both a fresh run of the edited sources (read-only on the cache) prints the new value.
 A probe that reads late first calls its reader after the edit: that code comes from the store then.
+A const that only values read must land, and a const a type uses must restart, saying why (MUST).
+const_every: one const of a dependency, every way code reads it, all from the warm cache.
 A stored entry can be older than the manifest of the run that reads it: the edited text's first run,
 reaching none of the late readers, writes its own manifest (its keys are "unchanged" from then on),
 and the next run's first late reads must still see that the entries they find are of the old text.
@@ -53,7 +55,7 @@ PROBES = [
     ("const_generic", V, "CONST_GEN: usize = 1;", "CONST_GEN: usize = 2;", 2),
     ("const_generic_assoc", V, "CONST_GEN_TY: usize = 1;", "CONST_GEN_TY: usize = 2;", 2),
     ("const_array_arg", V, "CONST_ARR: usize = 1;", "CONST_ARR: usize = 2;", 2),
-    ("const_array_assoc", V, "for D1 {\n    const K: u64 = 1;", "for D1 {\n    const K: u64 = 2;", 2),
+    ("const_array_assoc", V, "for D1 {\n    const LK: u64 = 1;", "for D1 {\n    const LK: u64 = 2;", 2),
     ("const_array_ty", V, "CONST_ARR_TY: usize = 1;", "CONST_ARR_TY: usize = 2;", 2),
     ("impl_added", V, "// impl_added\n", "impl Drop for Plain {\n    fn drop(&mut self) {}\n}\n", 1),
     ("impl_removed", V, "impl Drop for Droppy {\n    fn drop(&mut self) {}\n}\n", "", 0),
@@ -65,6 +67,16 @@ PROBES = [
     ("const_pattern", V, "CONST_PATTERN: u64 = 1;", "CONST_PATTERN: u64 = 2;", 2),
     ("const_len", V, "CONST_LEN: usize = 1;", "CONST_LEN: usize = 2;", 2),
     ("const_dep", "dep/src/lib.rs", "DEP_VALUE: u64 = 1;", "DEP_VALUE: u64 = 2;", 2),
+    ("const_other_new", V, "CONST_FOR_NEW: u64 = 1;", "CONST_FOR_NEW: u64 = 2;", 2),
+    ("static_through_new", V, "CONST_THROUGH_NEW: u64 = 1;", "CONST_THROUGH_NEW: u64 = 2;", 2),
+    ("const_array_fn", V, "CONST_LEN_FN: usize = 1;", "CONST_LEN_FN: usize = 2;", 2),
+    ("const_array_macro", V, "CONST_LEN_MAC: usize = 1;", "CONST_LEN_MAC: usize = 2;", 2),
+    ("const_array_alias", V, "CONST_LEN_AL: usize = 1;", "CONST_LEN_AL: usize = 2;", 2),
+    ("const_dep_array", "dep/src/lib.rs", "DEP_LEN: usize = 1;", "DEP_LEN: usize = 2;", 2),
+    ("const_dep_generic", "dep/src/lib.rs", "DEP_GEN: usize = 1;", "DEP_GEN: usize = 2;", 2),
+    ("const_dep_generic_field", "dep/src/lib.rs", "DEP_FIELD: usize = 1;", "DEP_FIELD: usize = 2;", 2),
+    ("const_dep_generic_alias", "dep/src/lib.rs", "DEP_ALIAS: usize = 1;", "DEP_ALIAS: usize = 2;", 2),
+    ("const_dep_in_main_type", "dep/src/lib.rs", "DEP_FOR_MAIN: usize = 1;", "DEP_FOR_MAIN: usize = 2;", 2),
     ("const_same", V, "CONST_SAME: u64 = 1;", "CONST_SAME: u64 = 2;", 2),
     ("const_include", "src/data.txt", "x", "xx", 2),
     ("body_include", "src/body.txt", "y", "yy", 2),
@@ -76,6 +88,34 @@ PROBES = [
     ("static_through", V, "STATIC_THROUGH: u64 = 1;", "STATIC_THROUGH: u64 = 2;", 2),
     ("static_late", V, "STATIC_LATE: u64 = 1;", "STATIC_LATE: u64 = 2;", 2),
 ]
+PROBES += [
+    ("const_nonliteral", V, "CONST_NONLIT: u64 = 1 + 0;", "CONST_NONLIT: u64 = 2 + 0;", 2),
+    ("const_discr", V, "CONST_DISCR: isize = 1;", "CONST_DISCR: isize = 2;", 2),
+    ("const_array_derived", V, "CONST_ARR_BASE: usize = 1;", "CONST_ARR_BASE: usize = 2;", 4),
+    ("static_from_const", V, "CONST_FOR_STATIC: u64 = 1;", "CONST_FOR_STATIC: u64 = 2;", 2),
+    ("static_through_fn", V, "CONST_FOR_FN: u64 = 1;", "CONST_FOR_FN: u64 = 2;", 2),
+    ("const_every", "dep/src/lib.rs", "EVERY: u64 = 1;", "EVERY: u64 = 2;", 2),
+]
+# every value a probe prints, when it is more than its own
+READS = {"const_every": {"every_direct": 2, "every_fn": 2, "every_inlined": 2, "every_generic": 2, "every_closure": 2, "every_assoc": 2, "every_derived": 3, "every_late": 2}}
+LAND = "landed"
+IN_TYPE = r"used in a type"
+RUNS_ONCE = r"an initializer runs once"
+# what an edit must do: consts only values read land, consts a type uses restart with their reason
+MUST = {
+    "const_direct": LAND, "const_through": LAND, "const_inlined": LAND, "const_derived": LAND, "const_assoc": LAND,
+    "const_assoc_named": LAND, "const_assoc_foreign": LAND, "const_assoc_dep_generic": LAND, "const_assoc_wrapped": LAND,
+    "const_assoc_prim": LAND, "const_assoc_blanket": LAND, "const_assoc_closure": LAND, "const_assoc_chain": LAND,
+    "const_opaque": LAND, "const_inferred": LAND, "trait_default": LAND, "const_macro": LAND, "const_macro_same": LAND,
+    "const_dep": LAND, "const_same": LAND, "const_late": LAND, "const_nonliteral": LAND, "const_every": LAND,
+    "const_generic": IN_TYPE, "const_generic_assoc": IN_TYPE, "const_array_arg": IN_TYPE, "const_array_assoc": IN_TYPE,
+    "const_array_ty": IN_TYPE, "const_len": IN_TYPE, "const_array_derived": IN_TYPE, "const_discr": IN_TYPE,
+    "const_array_fn": IN_TYPE, "const_array_macro": IN_TYPE, "const_array_alias": IN_TYPE,
+    "const_dep_array": IN_TYPE, "const_dep_in_main_type": IN_TYPE, "const_dep_generic_field": IN_TYPE, "const_dep_generic_alias": IN_TYPE,
+    "const_other_new": LAND, "static_from_const": RUNS_ONCE, "static_through_fn": RUNS_ONCE, "static_through_new": RUNS_ONCE,
+}
+# A second edit in the same session: the first one's evaluations must not read as a type's.
+SECOND = {"const_nonliteral": ("CONST_NONLIT: u64 = 2 + 0;", "CONST_NONLIT: u64 = 3 + 0;", 3), "const_direct": ("CONST_DIRECT: u64 = 2;", "CONST_DIRECT: u64 = 3;", 3)}
 tmp = tempfile.mkdtemp(prefix="warm-const-edit-")
 pkg = os.path.join(tmp, "pkg")
 shutil.copytree(os.path.join(HERE, "pkg"), pkg)
@@ -96,6 +136,14 @@ def once(tag, mode, **more):
 def value(line, probe):
     m = re.search(r"\b%s=(\d+)" % probe, line)
     return int(m.group(1)) if m else None
+
+
+def shows_new(line, probe, want):
+    return all(value(line, n) == w for n, w in READS.get(probe, {probe: want}).items())
+
+
+def stale_reads(line, probe, want):
+    return ", ".join("%s=%s want %d" % (n, value(line, n), w) for n, w in READS.get(probe, {probe: want}).items() if value(line, n) != w)
 
 
 def save(path, text):
@@ -140,6 +188,7 @@ def session(probe, rel, old, new, want):
         if not cold and not any("prelinked" in l for l in err) and not wait(lambda: any("prelinked" in l for l in err), 5):
             row["outcome"] = "not warm"
             return row, err
+        t_save = time.time()
         save(path, base.replace(old, new))
         said = lambda: next((l for l in err if ": patched (" in l or "a restart applies it" in l or "REFUSED" in l), None)
         wait(lambda: said() is not None, 20)
@@ -148,20 +197,31 @@ def session(probe, rel, old, new, want):
         if not restart:
             # the late readers' first call, once the edit is in
             open(late, "w").close()
-        landed = wait(lambda: last() is not None and value(last(), probe) == want, 2 if line else 0)
-        row["value"] = value(last() or "", probe)
+        landed = wait(lambda: last() is not None and shows_new(last(), probe, want), 2 if line else 0)
+        row["ms"] = int((time.time() - t_save) * 1e3)
+        row["value"] = stale_reads(last() or "", probe, want) or want if probe in READS else value(last() or "", probe)
         row["patch"] = re.sub(r"^.*?: ", "", line)[:96]
         t = next((l for l in reversed(err) if l.startswith("reload-trace:")), "")
-        row["trace"] = " ".join(x for x in t.split() if re.match(r"(rung|changed_consts|changed_statics|selected_slots|installed)=", x))
+        row["trace"] = " ".join(x for x in t.split() if re.match(r"(rung|total_ms|watch_ms|sub\.look_ms|changed_consts|changed_statics|selected_slots|installed)=", x))
+        if landed and probe in SECOND:
+            old2, new2, want = SECOND[probe]
+            mark = len(err)
+            save(path, base.replace(old, new).replace(old2, new2))
+            wait(lambda: any(": patched (" in l or "a restart applies it" in l or "REFUSED" in l for l in err[mark:]), 20)
+            landed = wait(lambda: last() is not None and shows_new(last(), probe, want), 2)
+            if not landed:
+                row["outcome"], row["patch"] = "SECOND EDIT DID NOT LAND", next((l for l in err[mark:] if "a restart applies it" in l or "REFUSED" in l), "")[:96]
+                return row, err
         if landed:
             row["outcome"] = "landed"
         elif restart:
             row["outcome"] = "restart"
             open(late, "w").close()
             subprocess.run([relax, "inspect", str(p.pid), "session", "relaunch"], env=env, capture_output=True, text=True)
-            if not wait(lambda: value(last() or "", probe) == want, 60):
+            if not wait(lambda: shows_new(last() or "", probe, want), 60):
                 row["outcome"] = "RELAUNCH STALE"
             row["relaunch"] = value(last() or "", probe)
+            row["ms"] = int((time.time() - t_save) * 1e3)
         elif not line:
             row["outcome"] = "no answer"
         else:
@@ -177,8 +237,8 @@ def session(probe, rel, old, new, want):
             open(late, "w").close()
             r = once("fresh-" + probe, "1", MAKEPAD_RUN_CACHE="readonly", WARM_EDIT_LATE=late) if not cold else once("fresh-" + probe, "1", WARM_EDIT_LATE=late)
             line = next((l for l in r.stdout.splitlines() if l.startswith("out tick ")), "")
-            row["fresh"] = value(line, probe)
-            if row["fresh"] != want:
+            row["fresh"] = want if shows_new(line, probe, want) else stale_reads(line, probe, want)
+            if not shows_new(line, probe, want):
                 row["outcome"] += " + FRESH RUN STALE"
         save(path, base)
 
@@ -226,8 +286,13 @@ for probe, rel, old, new, want in PROBES:
         continue
     row, err = session(probe, rel, old, new, want)
     ok = row["outcome"] in ("landed", "restart")
+    must = MUST.get(probe)
+    if ok and must == LAND and row["outcome"] != "landed":
+        row["outcome"], ok = "RESTART, MUST LAND", False
+    if ok and must and must != LAND and (row["outcome"] != "restart" or not any(re.search(must, l) for l in err)):
+        row["outcome"], ok = "MUST RESTART WITH REASON", False
     fails += 0 if ok else 1
-    print("%-23s %-15s value=%-4s want=%-2s relaunch=%-4s fresh=%-4s %s | %s" % (probe, row["outcome"], row["value"], want, row.get("relaunch", "-"), row.get("fresh", "-"), row["trace"], row["patch"]), flush=True)
+    print("%-23s %-15s %6s ms value=%-4s want=%-2s relaunch=%-4s fresh=%-4s %s | %s" % (probe, row["outcome"], row.get("ms", "-"), row["value"], want, row.get("relaunch", "-"), row.get("fresh", "-"), row["trace"], row["patch"]), flush=True)
     if not ok and "-v" in args:
         for l in err[-12:]:
             print("    | " + l[:200])

@@ -846,7 +846,9 @@ mod tests {
         let text = crate::vfs::mounts_text();
         assert!(text.contains(&format!("\t{offset}+{}\n", bytes.len())), "{text}");
         let root2 = dir.join("vfs").join("r2").to_string_lossy().into_owned();
-        let line = text.lines().find(|l| l.starts_with(&root_dir)).unwrap().replacen(&root_dir, &root2, 1);
+        // The mount table uses normalized VFS roots, even when the caller uses native paths.
+        let prefix = format!("{}\t", crate::vfs::normalize_path(&root_dir));
+        let line = text.lines().find(|l| l.starts_with(&prefix)).unwrap().replacen(&prefix, &format!("{root2}\t"), 1);
         crate::vfs::mount_text(&line).unwrap();
         assert_eq!(crate::vfs::read(format!("{root2}/Cargo.toml")).unwrap(), b);
         let _ = std::fs::remove_dir_all(&dir);

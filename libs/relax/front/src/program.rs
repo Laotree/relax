@@ -573,6 +573,10 @@ pub struct Program {
     /// text (declarations, then the skipped bodies' part, then generated bodies): the code
     /// cache never keys or resolves closures, sites or positions through them.
     edit_versions: Vec<u32>,
+    /// Per boot file a live edit gave a version: the version current now (a refused or rolled
+    /// back version is not), and per committed version the boot file it is a version of.
+    edit_current: HashMap<u32, u32>,
+    edit_boot: HashMap<u32, u32>,
     /// Committed files used only during a warm checker crate recollection.
     check_files: Option<std::collections::HashMap<String, u32>>,
     parse_reuse: HashMap<u32, std::sync::Arc<crate::parse_work::Reuse>>,
@@ -877,6 +881,8 @@ impl Program {
             mod_dirs: Default::default(),
             source_versions: Default::default(),
             edit_versions: Vec::new(),
+            edit_current: Default::default(),
+            edit_boot: Default::default(),
             check_files: None,
             parse_reuse: Default::default(),
             syms: Interner::default(),
@@ -2092,6 +2098,11 @@ impl Program {
         self.edit_versions.contains(&f)
     }
 
+    /// Per boot file a live edit gave a version: the version current now.
+    pub fn current_versions(&self) -> &HashMap<u32, u32> {
+        &self.edit_current
+    }
+
     pub fn commit_version(&mut self, v: FileVersion, pairs: &[(u32, u32)]) -> Result<u32, String> {
         self.commit_version_inner(v, pairs, false, None)
     }
@@ -2163,6 +2174,9 @@ impl Program {
         self.source_versions.entry(old).or_insert_with(|| self.crates[krate as usize].context.clone());
         self.source_versions.insert(new, v.context.clone());
         self.edit_versions.push(new);
+        let boot = self.edit_boot.get(&old).copied().unwrap_or(old);
+        self.edit_boot.insert(new, boot);
+        self.edit_current.insert(boot, new);
         self.crates[krate as usize].context = v.context;
         let mut pf = v.pf;
         self.map_image(&v.path, krate, &mut pf);
@@ -2268,6 +2282,9 @@ impl Program {
     /// Hot reload: a refused patch (or a rolled-back one) points every def of `new` back at
     /// `old` (the version stays loaded, unused). `pairs` as given to commit_version.
     pub fn revert_version(&mut self, old: u32, new: u32, pairs: &[(u32, u32)]) {
+        if let Some(&boot) = self.edit_boot.get(&new) {
+            if old == boot { self.edit_current.remove(&boot); } else { self.edit_current.insert(boot, old); }
+        }
         if let Some(context) = self.source_versions.get(&old) {
             self.crates[self.file_crate[old as usize] as usize].context = context.clone();
         }

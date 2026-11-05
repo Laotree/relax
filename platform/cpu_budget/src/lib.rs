@@ -1,6 +1,11 @@
 //! One process-wide CPU budget, shared by native and Relax callers.
 //! A permit belongs to one worker; only `reclass` may be called by another thread.
 //! Callers must use the permit returned by `checkpoint` and release it exactly once.
+//! A permit is a row of the table, a token is one count of `running`: a thread asleep lends its
+//! token (`lend`) and keeps its row, so the permit its caller holds stays good.
+//! The JIT always has a job able to run: with no job of its running one is admitted over a full
+//! budget, on a row that counts no token (`above`) and never yields. A long slice would run on slow
+//! code the whole way otherwise, and settled work keeps its cores: nothing is reserved.
 use makepad_relax_api::relax_api;
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
@@ -18,7 +23,13 @@ pub const JIT: u8 = 1;
 pub const HAL: u8 = 2;
 const CLASSES: [&str; 3] = ["interactive", "visible", "background"];
 const BUCKETS: usize = 33;
+/// Rows of the permit table: one per thread holding a permit, more than a process has threads.
+const ROWS: usize = 1 << 16;
 const RECENT_NS: u64 = 60_000_000_000;
+/// A row's word in `Budget::classes`: its class and these.
+const CLASS_BITS: u8 = 3;
+const NEVER_YIELDS: u8 = 0x40;
+const FORCED_YIELD: u8 = 0x80;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Label {
@@ -46,17 +57,31 @@ struct Job {
     ticket: u64,
     admitted_at: u64,
     checkpoint_at: u64,
+    /// the thread it was last admitted on (`me`)
+    thread: u64,
+    /// its token is back in the budget while its thread sleeps (`lend`): not counted in `running`
+    lent: bool,
+    /// the JIT's job admitted over a full budget: it holds no token
+    above: bool,
 }
-struct Waiter { class: u8, client: u8, ticket: u64, thread: Thread }
+impl Job {
+    fn new(class: u8, client: u8, label: &str, ticket: u64) -> Self {
+        Self { class, client, label: Label::new(label), ticket, admitted_at: 0, checkpoint_at: 0, thread: 0, lent: false, above: false }
+    }
+}
+struct Waiter { class: u8, client: u8, ticket: u64, thread: Thread, id: u64 }
 #[derive(Clone, Copy, Default)]
 struct Span { label: Label, ns: u64 }
 #[derive(Clone, Copy)]
 struct Worst { class: u8, label: Label, ns: u64, when: u64, culprit: Option<(u8, Span)> }
 struct State {
-    slots: Box<[Option<Job>]>,
+    /// The permit table, grown when lent rows leave no free one (`ROWS`).
+    slots: Vec<Option<Job>>,
     waiters: Vec<Waiter>,
     ticket: u64,
     running: usize,
+    /// the JIT's jobs among the rows that run, `above` ones too
+    jit_running: usize,
     background: usize,
     waiting: u8,
     parked: [u64; 3],
@@ -98,14 +123,14 @@ impl Budget {
             origin: Instant::now(), cores, limit,
             background_limit: limit.saturating_sub(2).min(physical.saturating_sub(1)).max(1),
             state: Mutex::new(State {
-                slots: vec![None; cores].into_boxed_slice(), waiters: Vec::new(), ticket: 0,
-                running: 0, background: 0, waiting: 0, parked: [0; 3], admitted: [0; 3],
+                slots: vec![None; cores], waiters: Vec::new(), ticket: 0,
+                running: 0, jit_running: 0, background: 0, waiting: 0, parked: [0; 3], admitted: [0; 3],
                 runtime: [0; 3], spans: [Span::default(); 3], warnings: HashMap::new(),
                 worst: VecDeque::new(),
                 #[cfg(test)]
                 changed: None,
             }),
-            classes: (0..cores).map(|_| AtomicU8::new(INTERACTIVE)).collect(),
+            classes: (0..ROWS).map(|_| AtomicU8::new(INTERACTIVE)).collect(),
             yield_classes: AtomicU8::new(0), contended_classes: AtomicU8::new(0), warmup: AtomicU8::new(0),
             queued: std::array::from_fn(|_| std::array::from_fn(|_| AtomicI64::new(0))),
             waits: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
@@ -113,13 +138,17 @@ impl Budget {
         }
     }
     fn now(&self) -> u64 { self.origin.elapsed().as_nanos().min(u64::MAX as u128) as u64 }
-    fn room(&self, s: &State, class: u8, client: u8) -> bool {
-        s.running < match class {
+    fn class_limit(&self, class: u8) -> usize {
+        match class {
             INTERACTIVE => self.cores,
             VISIBLE => self.limit,
             BACKGROUND => self.background_limit,
             _ => unreachable!(),
-        } && (class != BACKGROUND || client != APP || !self.warming() || s.background == 0)
+        }
+    }
+    fn room(&self, s: &State, class: u8, client: u8) -> bool {
+        client == JIT && s.jit_running == 0
+            || s.running < self.class_limit(class) && (class != BACKGROUND || client != APP || !self.warming() || s.background == 0)
     }
     fn first(&self, s: &State) -> Option<usize> {
         s.waiters.iter().enumerate().filter(|(_, w)| self.room(s, w.class, w.client)).min_by_key(|(_, w)| (w.class, w.ticket)).map(|(i, _)| i)
@@ -138,7 +167,7 @@ impl Budget {
         for (index, job) in s.slots.iter().enumerate() {
             if let Some(job) = job {
                 self.classes[index].store(job.class | if job.class == BACKGROUND && job.client == APP
-                    && self.warming() && s.background > 1 { 0x80 } else { 0 }, Relaxed);
+                    && self.warming() && s.background > 1 { FORCED_YIELD } else { 0 } | if job.above { NEVER_YIELDS } else { 0 }, Relaxed);
             }
         }
         if let Some(i) = self.first(s) {
@@ -154,7 +183,7 @@ impl Budget {
             && first.is_none_or(|i| key < (s.waiters[i].class, s.waiters[i].ticket));
         if !immediate {
             // Only the contended path grows the waiter list. No thread is created here.
-            s.waiters.push(Waiter { class: job.class, client: job.client, ticket: job.ticket, thread: thread::current() });
+            s.waiters.push(Waiter { class: job.class, client: job.client, ticket: job.ticket, thread: thread::current(), id: me() });
             self.refresh(&mut s);
             loop {
                 if let Some(i) = self.first(&s).filter(|&i| s.waiters[i].ticket == job.ticket) {
@@ -162,7 +191,10 @@ impl Budget {
                     break;
                 }
                 drop(s);
-                thread::park();
+                match WAIT_HOOK.get() {
+                    Some(hook) => hook(job.class, &thread::park),
+                    None => thread::park(),
+                }
                 s = self.state.lock().unwrap();
                 if let Some(desired) = desired {
                     job.class = desired.load(Relaxed);
@@ -174,13 +206,19 @@ impl Budget {
         self.install(s, job)
     }
     fn install(&self, mut s: MutexGuard<'_, State>, mut job: Job) -> u32 {
-        let index = s.slots.iter().position(Option::is_none).unwrap();
+        let index = s.slots.iter().position(Option::is_none).unwrap_or_else(|| {
+            assert!(s.slots.len() < ROWS, "more threads hold a CPU permit than the table has rows");
+            s.slots.push(None);
+            s.slots.len() - 1
+        });
         let now = self.now();
         job.admitted_at = now;
         job.checkpoint_at = now;
+        job.thread = me();
+        job.above = job.client == JIT && s.running >= self.class_limit(job.class);
+        ADMITTED.with(|admitted| admitted.set(true));
         s.slots[index] = Some(job);
-        s.running += 1;
-        s.background += usize::from(job.class == BACKGROUND && job.client == APP);
+        Self::start_counting(&mut s, &job);
         s.admitted[job.class as usize] += 1;
         self.classes[index].store(job.class, Relaxed);
         self.refresh(&mut s);
@@ -193,15 +231,15 @@ impl Budget {
         let mut s = self.state.lock().unwrap();
         let ticket = s.ticket;
         s.ticket = s.ticket.checked_add(1).expect("CPU budget ticket overflow");
-        self.acquire(s, Job { class, client, label: Label::new(label), ticket, admitted_at: 0, checkpoint_at: 0 }, None)
+        self.acquire(s, Job::new(class, client, label, ticket), None)
     }
     fn should_yield(&self, permit: u32) -> bool {
         let class = self.classes[permit as usize].load(Relaxed);
-        class & 0x80 != 0 || self.yield_classes.load(Relaxed) & (1 << (class & 0x7f)) != 0
+        class & NEVER_YIELDS == 0 && (class & FORCED_YIELD != 0 || self.yield_classes.load(Relaxed) & (1 << (class & CLASS_BITS)) != 0)
     }
     fn contended(&self, permit: u32) -> bool {
         let class = self.classes[permit as usize].load(Relaxed);
-        class & 0x80 != 0 || self.contended_classes.load(Relaxed) & (1 << (class & 0x7f)) != 0
+        class & FORCED_YIELD != 0 || self.contended_classes.load(Relaxed) & (1 << (class & CLASS_BITS)) != 0
     }
     fn span(s: &mut State, label: Label, ns: u64) {
         if let Some(span) = s.spans.iter_mut().find(|span| span.label == label) {
@@ -213,11 +251,92 @@ impl Budget {
     }
     fn remove(&self, s: &mut State, permit: u32, now: u64) -> Job {
         let job = s.slots[permit as usize].take().expect("released CPU permit");
-        s.running -= 1;
+        if !job.lent { Self::stop_counting(s, &job, now); }
+        job
+    }
+    fn start_counting(s: &mut State, job: &Job) {
+        s.running += usize::from(!job.above);
+        s.jit_running += usize::from(job.client == JIT);
+        s.background += usize::from(job.class == BACKGROUND && job.client == APP);
+    }
+    fn stop_counting(s: &mut State, job: &Job, now: u64) {
+        s.running -= usize::from(!job.above);
+        s.jit_running -= usize::from(job.client == JIT);
         s.background -= usize::from(job.class == BACKGROUND && job.client == APP);
         s.runtime[job.class as usize] += now.saturating_sub(job.admitted_at);
         Self::span(s, job.label, now.saturating_sub(job.checkpoint_at));
-        job
+    }
+    /// The calling thread goes to sleep on other work: the tokens of its permits go back to the
+    /// budget, its rows stay. A compile job's permit is not lent: it moves between threads
+    /// (the owner borrows it), and its job gives it up and is admitted again.
+    /// True: it lent one, and `take_back` ends that.
+    fn lend(&self) -> bool {
+        let me = me();
+        let mut s = self.state.lock().unwrap();
+        let now = self.now();
+        let mut lent = false;
+        for i in 0..s.slots.len() {
+            let Some(job) = s.slots[i].as_mut().filter(|j| j.thread == me && j.client != JIT && !j.lent) else { continue };
+            job.lent = true;
+            let job = *job;
+            Self::stop_counting(&mut s, &job, now);
+            lent = true;
+        }
+        if lent { self.refresh(&mut s); }
+        lent
+    }
+    /// A compile job's token goes back while its request waits for another build on the owner: on
+    /// a machine with one token that build gets no other. Its row and permit stay.
+    fn lend_permit(&self, permit: u32) {
+        let mut s = self.state.lock().unwrap();
+        let now = self.now();
+        let job = s.slots[permit as usize].as_mut().expect("lent a released CPU permit");
+        assert!(!job.lent, "lent a CPU permit twice");
+        job.lent = true;
+        let job = *job;
+        Self::stop_counting(&mut s, &job, now);
+        self.refresh(&mut s);
+    }
+    /// The calling thread is awake: its lent tokens are its own again, at once, whatever is running
+    /// by now. It never waits here: it may hold locks that what runs now needs (a program thread
+    /// sleeps anywhere). Over the limit no one new is admitted and its next checkpoint yields.
+    fn take_back(&self) {
+        let me = me();
+        let mut s = self.state.lock().unwrap();
+        let now = self.now();
+        let mut back = false;
+        for i in 0..s.slots.len() {
+            if s.slots[i].as_ref().is_some_and(|j| j.thread == me && j.lent) {
+                Self::count_again(&mut s, i, now);
+                back = true;
+            }
+        }
+        if back { self.refresh(&mut s); }
+    }
+    /// `take_back` of `lend_permit`: its job has not run meanwhile, and the same goes.
+    fn take_back_permit(&self, permit: u32) {
+        let mut s = self.state.lock().unwrap();
+        let now = self.now();
+        Self::count_again(&mut s, permit as usize, now);
+        self.refresh(&mut s);
+    }
+    fn count_again(s: &mut State, index: usize, now: u64) {
+        let job = s.slots[index].as_mut().expect("took back a released CPU permit");
+        job.lent = false;
+        job.admitted_at = now;
+        job.checkpoint_at = now;
+        let job = *job;
+        Self::start_counting(s, &job);
+    }
+    fn tokens(&self) -> Tokens {
+        let s = self.state.lock().unwrap();
+        let now = self.now();
+        let holders = s.slots.iter().flatten().map(|j| Holder {
+            thread: j.thread, class: j.class, client: j.client, label: j.label.text().to_owned(), lent: j.lent, above: j.above,
+            held_ns: now.saturating_sub(j.admitted_at),
+        }).collect();
+        let waiting = s.waiters.iter().map(|w| Waiting { thread: w.id, class: w.class, client: w.client }).collect();
+        Tokens { running: s.running, limits: [self.cores, self.limit, self.background_limit], holders, waiting }
     }
     fn checkpoint(&self, permit: u32, held_locks: u32, lock_site: &str) -> u32 {
         self.checkpoint_following(permit, held_locks, lock_site, None)
@@ -290,7 +409,7 @@ impl Budget {
         if ns <= 100_000_000 { return; }
         let mut s = self.state.lock().unwrap();
         let now = self.now();
-        let culprit = s.slots.iter().flatten()
+        let culprit = s.slots.iter().flatten().filter(|j| !j.lent)
             .max_by_key(|j| (j.class, now.saturating_sub(j.checkpoint_at)))
             .map(|j| (j.class, Span { label: j.label, ns: now.saturating_sub(j.checkpoint_at) }));
         // A monotone deque retains exactly the possible maxima of the rolling minute.
@@ -303,7 +422,9 @@ impl Budget {
         let now = self.now();
         let mut running = [[0u32; 3]; 3];
         let mut spans = s.spans;
-        for job in s.slots.iter().flatten() {
+        let lent = s.slots.iter().flatten().filter(|j| j.lent).count();
+        let above = s.slots.iter().flatten().filter(|j| j.above && !j.lent).count();
+        for job in s.slots.iter().flatten().filter(|j| !j.lent) {
             running[job.class as usize][job.client as usize] += 1;
             let ns = now.saturating_sub(job.checkpoint_at);
             if let Some(span) = spans.iter_mut().find(|span| span.label == job.label) { span.ns = span.ns.max(ns); }
@@ -324,6 +445,8 @@ impl Budget {
         spans.sort_by_key(|span| std::cmp::Reverse(span.ns));
         let mut out = format!("cpu {total}/{} running", self.limit);
         if total > self.limit { let _ = write!(out, " (+{} over)", total - self.limit); }
+        if lent != 0 { let _ = write!(out, ", {lent} lent by sleeping threads"); }
+        if above != 0 { let _ = write!(out, ", {above} JIT job above the budget"); }
         let _ = write!(out, ", warming: {}", if warm { "yes" } else { "no" });
         if let Some(w) = worst {
             let _ = write!(out, ", worst: {} {:?} waited {}", CLASSES[w.class as usize], w.label.text(), human(w.ns));
@@ -363,6 +486,21 @@ fn human(ns: u64) -> String {
     else if ns < 1_000_000_000 { format!("{:.1} ms", ns as f64 / 1_000_000.0) }
     else { format!("{:.1} s", ns as f64 / 1_000_000_000.0) }
 }
+/// The calling thread, as the JIT's wait registry names it (`relax_base::waits::me`).
+#[cfg(unix)]
+fn me() -> u64 {
+    unsafe extern "C" { fn pthread_self() -> usize; }
+    unsafe { pthread_self() as u64 }
+}
+#[cfg(windows)]
+fn me() -> u64 {
+    #[link(name = "kernel32")]
+    unsafe extern "system" { fn GetCurrentThreadId() -> u32; }
+    unsafe { GetCurrentThreadId() as u64 }
+}
+#[cfg(not(any(unix, windows)))]
+fn me() -> u64 { 0 }
+static WAIT_HOOK: OnceLock<fn(u8, &dyn Fn())> = OnceLock::new();
 fn global() -> &'static Budget {
     static BUDGET: OnceLock<Budget> = OnceLock::new();
     BUDGET.get_or_init(|| {
@@ -454,7 +592,7 @@ pub fn admit_following(desired: &AtomicU8, client: u8, label: &str) -> u32 {
     let mut s = b.state.lock().unwrap();
     let ticket = s.ticket;
     s.ticket = s.ticket.checked_add(1).expect("CPU budget ticket overflow");
-    b.acquire(s, Job { class, client, label: Label::new(label), ticket, admitted_at: 0, checkpoint_at: 0 }, Some(desired))
+    b.acquire(s, Job::new(class, client, label, ticket), Some(desired))
 }
 
 /// Native workers whose waiters may promote them while they are parked. Like
@@ -483,7 +621,7 @@ impl Admission {
         let ticket = *self.ticket.get_or_insert_with(|| {
             let ticket = s.ticket;
             s.ticket = s.ticket.checked_add(1).expect("CPU budget ticket overflow");
-            s.waiters.push(Waiter { class, client, ticket, thread: thread::current() });
+            s.waiters.push(Waiter { class, client, ticket, thread: thread::current(), id: me() });
             ticket
         });
         let w = s.waiters.iter_mut().find(|w| w.ticket == ticket).unwrap();
@@ -492,7 +630,7 @@ impl Admission {
         if let Some(i) = b.first(&s).filter(|&i| s.waiters[i].ticket == ticket) {
             s.waiters.swap_remove(i);
             self.ticket = None;
-            Some(b.install(s, Job { class, client, label: Label::new(label), ticket, admitted_at: 0, checkpoint_at: 0 }))
+            Some(b.install(s, Job::new(class, client, label, ticket)))
         } else {
             b.refresh(&mut s);
             None
@@ -527,6 +665,57 @@ pub fn checkpoint(permit: u32, held_locks: u32, lock_site: &str) -> u32 { global
 pub fn release(permit: u32) { global().release(permit); }
 #[relax_api]
 pub fn reclass(permit: u32, class: u8) { global().reclass(permit, class); }
+/// `Budget::lend`, for the JIT: a thread asleep on JIT work or a program lock keeps no token.
+/// Waits nest (a thread in a futex wait's entry compiles the futex call and waits for that build, a
+/// job back from a wait holds for a pause under the wait's own guard): the outermost lends, the
+/// inner ones count. True: a `take_back` ends this one.
+pub fn lend() -> bool {
+    if !ADMITTED.with(Cell::get) { return false; }
+    let lends = LENDS.with(Cell::get);
+    let lent = lends > 0 || global().lend();
+    LENDS.with(|count| count.set(lends + u32::from(lent)));
+    lent
+}
+/// `Budget::take_back`, when the outermost `lend` ends.
+pub fn take_back() {
+    let lends = LENDS.with(Cell::get);
+    if lends == 0 { return; }
+    LENDS.with(|count| count.set(lends - 1));
+    if lends == 1 { global().take_back(); }
+}
+/// `Budget::lend_permit`.
+pub fn lend_permit(permit: u32) { global().lend_permit(permit); }
+/// `Budget::take_back_permit`.
+pub fn take_back_permit(permit: u32) { global().take_back_permit(permit); }
+/// One permit, as `tokens` reports it.
+pub struct Holder {
+    pub thread: u64,
+    pub class: u8,
+    pub client: u8,
+    pub label: String,
+    /// its thread sleeps: the token is back in the budget
+    pub lent: bool,
+    /// the JIT's one job over a full budget: it holds no token
+    pub above: bool,
+    pub held_ns: u64,
+}
+/// One thread queued for a token.
+pub struct Waiting { pub thread: u64, pub class: u8, pub client: u8 }
+/// Who has the budget now, for the inspector (the thread ids are `relax_base::waits::me`'s).
+pub struct Tokens {
+    pub running: usize,
+    /// what each class may reach: it is admitted below this
+    pub limits: [usize; 3],
+    pub holders: Vec<Holder>,
+    pub waiting: Vec<Waiting>,
+}
+pub fn tokens() -> Tokens { global().tokens() }
+/// Sets what wraps every thread's wait for a token: `hook(class, park)` calls `park`. The budget
+/// sits below the JIT's wait registry, which registers those waits through this.
+pub fn set_wait_hook(hook: fn(u8, &dyn Fn())) { let _ = WAIT_HOOK.set(hook); }
+/// The class `set_thread_class` last gave the calling thread (the UI thread: Interactive); None: it
+/// set none, or a promotion failed. A job the thread waits for runs at its class meanwhile.
+pub fn thread_class() -> Option<u8> { THREAD_CLASS.with(Cell::get).map(|class| if class > BACKGROUND { INTERACTIVE } else { class }) }
 #[relax_api]
 pub fn queued(class: u8, client: u8, delta: i32) {
     valid(class, client);
@@ -562,6 +751,10 @@ pub fn report_string() -> String {
 
 thread_local! {
     static THREAD_CLASS: Cell<Option<u8>> = const { Cell::new(None) };
+    /// this thread was admitted once: a thread that never was skips the budget's lock when it sleeps
+    static ADMITTED: Cell<bool> = const { Cell::new(false) };
+    /// the lends in progress on this thread: above 0 its tokens are lent
+    static LENDS: Cell<u32> = const { Cell::new(0) };
     /// set_ui_thread's thread: its OS class stays the UI's
     static UI_THREAD: Cell<bool> = const { Cell::new(false) };
 }

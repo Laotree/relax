@@ -581,6 +581,14 @@ pub struct Cache {
     view: Vec<u128>,
     /// the program's item graph (cache/deps.rs), built on the first key that needs it
     deps: Option<std::sync::Arc<deps::Deps>>,
+    /// the crates the loader binds, as they went into `iface` and `view`
+    bound: Vec<(u32, u64)>,
+    /// how many const edits moved the keys to the edited text (`keys_follow_text`): none means
+    /// the keys describe the sources this run started from
+    keys_moved: u32,
+    /// per crate: a const edit reached it, so its startup fingerprint no longer vouches for its
+    /// keys (`cert_fps`)
+    keys_moved_crates: Vec<bool>,
     /// (crate, name) -> what the name finds from the crate (deps.rs name_closure)
     name_memo: HashMap<(u32, deps::Name), u128>,
     /// per definition: its body's names, as one closure hash (code keys)
@@ -935,6 +943,9 @@ impl Cache {
             iface_plain: Vec::new(),
             view: Vec::new(),
             deps: None,
+            bound: Vec::new(),
+            keys_moved: 0,
+            keys_moved_crates: Vec::new(),
             name_memo: HashMap::new(),
             body_names: HashMap::new(),
             digests: Vec::new(),
@@ -1048,6 +1059,7 @@ impl Cache {
             },
         }
         let provided: Vec<(u32, u64)> = from.provided.clone();
+        c.bound = provided.clone();
         c.iface = items::apply_bound(prog, &c.iface_plain, &provided);
         // the views (a restored collected program digests no file: its interfaces are restored)
         let mut view = items::crate_views(prog, &c.iface_plain, &deps::atomic_crates(prog, ncr));
@@ -2418,19 +2430,19 @@ impl Cache {
         };
         // (a graph whose component ids ran far is not built over: the next one starts them again)
         let stored = stored.filter(|g| g.ids_left());
-        let clean = deps::Deps::clean_crates(prog, &self.iface_plain, stored.as_ref());
+        let clean = deps::Deps::clean_crates(prog, &prog.files, &self.iface_plain, stored.as_ref());
         let mut digested = digest(&clean, &mut self.digests);
         let t_dg = t0.elapsed();
         // the item graph lives as long as the program (a settle rebuild's new cache inherits
         // it): built in the slot arena, it never pins the cold state's compiler chunks
-        let built = crate::zone_alloc::slots_with(|| deps::Deps::build(prog, &self.digests, &self.iface_plain, valid, stored.as_ref()));
+        let built = crate::zone_alloc::slots_with(|| deps::Deps::build(prog, &prog.files, &self.digests, &self.iface_plain, valid, stored.as_ref()));
         let over = built.is_some() && clean.iter().any(|&c| c);
         let g = match built {
             Some(g) => g,
             None => {
                 // the alias or macro names changed: every crate is walked
                 digested += digest(&[], &mut self.digests);
-                crate::zone_alloc::slots_with(|| deps::Deps::build(prog, &self.digests, &self.iface_plain, valid, None)).expect("a graph built from scratch")
+                crate::zone_alloc::slots_with(|| deps::Deps::build(prog, &prog.files, &self.digests, &self.iface_plain, valid, None)).expect("a graph built from scratch")
             }
         };
         if self.verbose {
@@ -2440,7 +2452,7 @@ impl Cache {
         }
         if over && std::env::var("MAKEPAD_RUN_DEPS_VERIFY").is_ok_and(|v| v == "1") {
             digest(&[], &mut self.digests);
-            let scratch = deps::Deps::build(prog, &self.digests, &self.iface_plain, valid, None).expect("a graph built from scratch");
+            let scratch = deps::Deps::build(prog, &prog.files, &self.digests, &self.iface_plain, valid, None).expect("a graph built from scratch");
             match g.same_closures(&scratch) {
                 Ok(()) => eprintln!("makepad-run cache: item graph verified: built over the stored graph = built from scratch"),
                 Err(e) => eprintln!("makepad-run cache: item graph verify FAILED: {e}"),
@@ -3301,6 +3313,12 @@ impl Cache {
             let c = *self.crate_by_ident.get(i)?;
             h.u128(*i);
             h.u128(*self.fps.get(c as usize)?);
+            // a const edit reached it: no entry's hash matches, read or written, and each
+            // key the entry names is compared
+            if self.keys_moved_crates.get(c as usize) == Some(&true) {
+                h.str("keys moved");
+                h.u32(self.keys_moved);
+            }
         }
         Some(h.finish128())
     }
@@ -3643,6 +3661,13 @@ impl Cache {
     /// `stop` (a mid-run write: a program request waits for the owner thread) is asked every 64
     /// slots; yes drops this record (false comes back) and a later write makes it again.
     pub fn record_manifest(&mut self, u: &Unit, root: u32, order: &[u32], present: usize, stop: &dyn Fn() -> bool) -> bool {
+        // past a const edit the slots' code is of two texts: the image would hold new values under
+        // the crate fingerprints of the start, and the next start keeps the manifest it has
+        if self.keys_moved != 0 {
+            self.manifest_done = true;
+            self.manifest_len = order.len();
+            return true;
+        }
         let t0 = std::time::Instant::now();
         if !crate::preempt::is_stopped() && relax_codegen::warm::enabled() {
             for (id, f) in u.fns.iter().enumerate() {
@@ -8495,6 +8520,173 @@ impl Linker {
 /// the owner thread).
 pub(crate) unsafe fn linked_code(up: *mut Unit) -> bool {
     (&*up).cache.as_ref().is_some_and(|c| !(&*c.get()).linked.is_empty())
+}
+
+/// Before a const edit commits (on the owner thread): the item graph of the running text, and each
+/// changed const's closure in it (None: no node of its own -- a sysroot crate's, one a macro made).
+pub(crate) unsafe fn const_closures(up: *mut Unit, consts: &[DefId]) -> Vec<(DefId, Option<u128>)> {
+    let Some(c) = (&*up).cache.as_ref().map(|c| c.get()) else { return Vec::new() };
+    let u = &*up;
+    let g = (&mut *c).deps_graph(u);
+    consts.iter().map(|&d| (d, g.def_closure(&u.prog, d))).collect()
+}
+
+/// What a const edit's re-key found.
+pub(crate) struct Rekeyed {
+    /// the linked slots a new run of this text would not link: their key changed, or that of a
+    /// slot their code took in
+    pub(crate) readers: Vec<u32>,
+    /// the changed consts whose closure is what it was: keys cannot show their readers (what
+    /// changed is outside the text: an included file)
+    pub(crate) blind: Vec<DefId>,
+}
+
+/// After a const edit committed (on the owner thread): the keys follow the text, and the linked
+/// slots are compared with them. `before`: `const_closures`.
+pub(crate) unsafe fn rekey_after_const_edit(up: *mut Unit, before: &[(DefId, Option<u128>)]) -> Rekeyed {
+    let Some(c) = (&*up).cache.as_ref().map(|c| c.get()) else { return Rekeyed { readers: Vec::new(), blind: Vec::new() } };
+    let c = &mut *c;
+    c.keys_follow_text(&*up);
+    let g = c.deps_graph(&*up);
+    let blind = before.iter().filter(|(d, was)| was.is_none() || g.def_closure(&(*up).prog, *d) == *was).map(|(d, _)| *d).collect();
+    Rekeyed { readers: c.linked_readers(&mut *up), blind }
+}
+
+/// A const edit's text went away (refused at the gate, rolled back): the keys follow it back.
+pub(crate) unsafe fn rekey_after_revert(up: *mut Unit) {
+    if let Some(c) = (&*up).cache.as_ref().map(|c| c.get()) {
+        (&mut *c).keys_follow_text(&*up);
+    }
+}
+
+impl Cache {
+    /// The program's text changed under the code keys: from here on a slot's key is the one a new
+    /// run of this text computes, so a late reader's lookup never finds code of the old value
+    /// and what compiles from here is recorded under what it was made from. Keys are made from
+    /// the item graph and the crates' interfaces, memoized per slot and definition: all follow,
+    /// over the graph of the text before (only the crates that can see an edit are walked).
+    fn keys_follow_text(&mut self, u: &Unit) {
+        let t0 = std::time::Instant::now();
+        let prog = &u.prog;
+        let ncr = self.iface_plain.len();
+        let boot = prog.boot_files.min(prog.files.len());
+        let before = self.deps_graph(u);
+        if self.digests.len() < prog.files.len() {
+            self.digests.resize(prog.files.len(), None);
+        }
+        // the crates a session's edits reach, a refused one's too: its text just went away
+        let edited = crate::reload::edited_crates();
+        let seeing = prog.crates_seeing_files(edited.iter().filter_map(|c| prog.file_crate.iter().position(|x| x == c).map(|f| f as u32)));
+        let atomic = deps::atomic_crates(prog, ncr);
+        let want = |digests: &[Option<std::sync::Arc<items::FileDigest>>], skip: &dyn Fn(u32) -> bool| -> Vec<usize> {
+            (0..boot).filter(|&f| digests[f].is_none() && prog.file_crate.get(f).is_some_and(|&c| !atomic.get(c as usize).copied().unwrap_or(true) && !skip(c))).collect()
+        };
+        let need = want(&self.digests, &|c| !seeing.get(c as usize).copied().unwrap_or(false));
+        items::file_digests_of(prog, &need, &mut self.digests);
+        // the text now, per boot file
+        let mut parsed: Vec<std::sync::Arc<crate::parser::ParsedFile>> = prog.files[..boot].to_vec();
+        let mut versions: HashMap<u32, u32> = HashMap::new();
+        for (&b, &n) in prog.current_versions() {
+            if (b as usize) < boot {
+                parsed[b as usize] = prog.files[n as usize].clone();
+                versions.insert(n, b);
+            }
+        }
+        for &n in versions.keys() { let _ = self.digest_of(u, n as usize); }
+        let view = |digests: &[Option<std::sync::Arc<items::FileDigest>>]| -> Vec<Option<std::sync::Arc<items::FileDigest>>> {
+            let mut v = digests[..boot].to_vec();
+            for (&n, &b) in &versions { v[b as usize] = digests[n as usize].clone(); }
+            v
+        };
+        let known = |c: usize| if seeing.get(c).copied().unwrap_or(false) { None } else { self.iface_plain.get(c).copied() };
+        let mut plain = items::crate_ifaces_keeping(prog, &self.fps, &view(&self.digests), &known);
+        plain.truncate(ncr);
+        let clean = deps::Deps::clean_crates(prog, &parsed, &plain, Some(&before));
+        let need = want(&self.digests, &|c| clean.get(c as usize).copied().unwrap_or(false));
+        items::file_digests_of(prog, &need, &mut self.digests);
+        let valid = before.built_from();
+        let built = crate::zone_alloc::slots_with(|| deps::Deps::build(prog, &parsed, &view(&self.digests), &plain, valid, Some(&before)));
+        let mut g = match built {
+            Some(g) => g,
+            None => {
+                // the alias or macro names changed: every crate is walked
+                let need = want(&self.digests, &|_| false);
+                items::file_digests_of(prog, &need, &mut self.digests);
+                crate::zone_alloc::slots_with(|| deps::Deps::build(prog, &parsed, &view(&self.digests), &plain, valid, None)).expect("a graph built from scratch")
+            }
+        };
+        g.file_versions = versions;
+        if self.verbose {
+            eprintln!("makepad-run cache: keys follow the edit: item graph over {} nodes walked {} in {:.1} ms", g.nodes_n, g.walked, t0.elapsed().as_secs_f64() * 1e3);
+        }
+        self.deps = Some(crate::zone_alloc::slots_with(|| std::sync::Arc::new(g)));
+        self.iface = items::apply_bound(prog, &plain, &self.bound);
+        self.iface_plain = plain;
+        self.name_memo.clear();
+        self.body_names.clear();
+        self.def_bodies.clear();
+        self.slot_keys.clear();
+        self.const_body_keys.clear();
+        self.keys_moved += 1;
+        self.keys_moved_crates = seeing;
+    }
+
+    /// The linked slots a new run of the text now would not link: its lookup finds another key, or
+    /// the entry's certificate names a slot with another key. A slot's patched code was lowered by
+    /// this run: its reads are in `const_readers`.
+    fn linked_readers(&mut self, u: &mut Unit) -> Vec<u32> {
+        let t0 = std::time::Instant::now();
+        let mut ids: Vec<u32> = self.linked.iter().copied().filter(|&id| u.fns[id as usize].patch_gen == 0).collect();
+        ids.sort_unstable();
+        let (n, mut by_key, mut by_cert) = (ids.len(), 0usize, 0usize);
+        let mut keys: HashMap<Vec<u8>, Option<u128>> = HashMap::new();
+        let mut readers = Vec::new();
+        for id in ids {
+            let Some(&entry) = self.linked_key.get(&id) else { readers.push(id); continue };
+            let same = self.slot_key(u, id) == Some(entry) || {
+                // the code of its unverified twin's entry (Linker::lookup, SPEC-V)
+                matches!(u.fns[id as usize].key, FnKey::Inst(..) | FnKey::Closure(..)) && self.code_key_bytes(u, &FnKey::Plain(id)).is_some_and(|k| k.0 == entry)
+            };
+            if !same {
+                by_key += 1;
+                readers.push(id);
+            } else if self.entry_holds(u, entry, &mut keys) != Some(true) {
+                by_cert += 1;
+                readers.push(id);
+            }
+        }
+        if self.verbose {
+            eprintln!("makepad-run cache: re-key: {} of {} linked slots read the edit ({} by key, {} by what their code took in; {} keys of those) in {:.1} ms", readers.len(), n, by_key, by_cert, keys.len(), t0.elapsed().as_secs_f64() * 1e3);
+        }
+        readers
+    }
+
+    /// Whether every slot code entry `key`'s certificate names has the key it recorded. None: the
+    /// entry is gone or does not decode. `keys`: the keys of the slots asked about so far.
+    fn entry_holds(&mut self, u: &mut Unit, key: u128, keys: &mut HashMap<Vec<u8>, Option<u128>>) -> Option<bool> {
+        let (p, i) = self.index_at(key)?;
+        let pack = self.stores[p as usize].clone();
+        let (kind, payload) = pack.get_checked_at(i as usize, key)?;
+        if kind != KIND_CODE || payload.is_empty() { return None; }
+        let mut d = D { b: payload, p: 0 };
+        if d.u32()? != ENTRY_VERSION { return None; }
+        d.str()?;
+        let (_, nounwind_end) = skip_build_inputs(&mut d)?;
+        let mut d = D { b: payload, p: nounwind_end };
+        let nc = d.u32()? as usize;
+        for _ in 0..nc { d.u128()?; }
+        d.u128()?;
+        for _ in 0..d.u32()? {
+            let b = d.bytes()?;
+            let want = d.u128()?;
+            if !keys.contains_key(b) {
+                let now = unsafe { Linker::new(self) }.dec_fnkey(u, &mut D { b, p: 0 }, 0).and_then(|k| self.const_body_key(u, &k)).map(|k| k.0);
+                keys.insert(b.to_vec(), now);
+            }
+            if keys[b] != Some(want) { return Some(false); }
+        }
+        Some(true)
+    }
 }
 
 /// Re-entrant cache lookup; the caller is on the owner thread.

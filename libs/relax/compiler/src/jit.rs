@@ -391,6 +391,8 @@ pub struct Unit {
     pub(crate) reload_rir: Option<std::collections::HashSet<u32>>,
     pub(crate) reload_errors: std::collections::HashSet<u32>,
     pub(crate) reload_specs: std::collections::HashSet<u32>,
+    /// the slots in flight (Fn::inflight)
+    pub(crate) flights: std::collections::HashMap<u32, Flight>,
     /// serialises slot creation (one entry per key, dense ids)
     fn_create: relax_session::sync::Mutex<()>,
     pub consts: crate::fxhash::HashMap<(DefId, Vec<TyId>), u64>,
@@ -4090,6 +4092,7 @@ impl Unit {
             reload_rir: None,
             reload_errors: Default::default(),
             reload_specs: Default::default(),
+            flights: Default::default(),
             fn_map: crate::conc::MemoMap::new_kept(17),
             fn_create: Default::default(),
             consts: Default::default(),
@@ -8148,13 +8151,7 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
             Err(p) => {
                 // the finish failed: its slots are no longer in flight (else the next call of any
                 // of them waits for a build that never ends), then the failure goes on to rt_compile
-                owner::publish(|| {
-                    let u = &mut *up;
-                    for &x in &in_flight {
-                        u.fns[x as usize].inflight = false;
-                    }
-                    INFLIGHT_GEN.fetch_add(1, Ordering::Release);
-                });
+                owner::publish(|| end_flight(up, &in_flight));
                 std::panic::resume_unwind(p)
             }
         };
@@ -10895,27 +10892,103 @@ unsafe fn wait_inflight(up: *mut Unit, id: u32) {
     if BATCH_FLIGHT.with(|b| b.borrow().contains(&id)) {
         return;
     }
-    let _priority = main_discovery().then(|| queue::promote(up as usize, id));
     owner::busy_if_nested();
+    let end = flight_end(up, id);
+    let flight = &(&*up).flights[&id];
+    let (root, holder) = (flight.root, flight.holder);
+    // the build runs at the class of who waits for it, or it could starve behind that class's work
+    let _priority = queue::promote(up as usize, root, owner::waiter_class());
+    let _token = crate::pool::lend_served();
     // a program thread's front gives the owner back rather than wait here while program requests
-    // queue (owner::may_yield): it asks again once a build ended. The generation is read before the
-    // flag, so a build that ends in between is not missed.
-    let gen = std::cell::Cell::new(0);
-    owner::pump_wait(&|| {
-        gen.set(INFLIGHT_GEN.load(Ordering::Acquire));
-        !(&*up).fns[id as usize].inflight || owner::may_yield()
-    });
+    // queue (owner::may_yield): it asks again once the build ended
+    owner::pump_wait_build(id, end.name, holder, &|| !(&*up).fns[id as usize].inflight || owner::may_yield());
     if (&*up).fns[id as usize].inflight {
-        owner::yield_for_build(gen.get())
+        owner::yield_for_build(yielded(up, id))
     }
 }
 
-/// Bumped whenever slots stop being in flight (a back end's finish, a batch's end, a failed
-/// finish): a front that gave the owner back waits for it to move (owner::yield_for_build).
-static INFLIGHT_GEN: AtomicU64 = AtomicU64::new(0);
+/// A slot in flight (Fn::inflight), as who waits for it sees it (the owner's: Unit::flights).
+pub(crate) struct Flight {
+    /// the thread running its build (waits::me)
+    holder: u64,
+    /// the slot its build was queued for: a deferred candidate's build is its caller's
+    root: u32,
+    /// what the threads that gave the owner back sleep on
+    end: Option<std::sync::Arc<FlightEnd>>,
+}
 
-pub(crate) fn inflight_gen() -> u64 {
-    INFLIGHT_GEN.load(Ordering::Acquire)
+/// The end of a slot's flight.
+pub(crate) struct FlightEnd {
+    ended: relax_session::sync::Mutex<bool>,
+    wake: relax_session::sync::Condvar,
+    /// the slot's fn, as the wait registry labels the wait (kept for good: labels are 'static)
+    name: &'static str,
+}
+
+/// Slots `slots` are in flight from now, in a build of `root` on thread `holder` (owner).
+unsafe fn begin_flight(up: *mut Unit, root: u32, holder: u64, slots: &[u32]) {
+    let _kept = crate::zone_alloc::kept();
+    let u = &mut *up;
+    for &x in slots {
+        u.fns[x as usize].inflight = true;
+        let flight = u.flights.entry(x).or_insert(Flight { holder, root, end: None });
+        (flight.holder, flight.root) = (holder, root);
+    }
+}
+
+/// Slots `slots` are no longer in flight: who waits for them off the owner goes on (owner).
+unsafe fn end_flight(up: *mut Unit, slots: &[u32]) {
+    let _kept = crate::zone_alloc::kept();
+    let u = &mut *up;
+    for &x in slots {
+        u.fns[x as usize].inflight = false;
+        if let Some(Flight { end: Some(end), .. }) = u.flights.remove(&x) {
+            *end.ended.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            end.wake.notify_all();
+        }
+    }
+}
+
+/// A front gave the owner back (owner::yield_for_build): what its requester waits for off the owner.
+pub(crate) struct Yielded {
+    unit: usize,
+    slot: u32,
+    root: u32,
+    holder: u64,
+    class: u8,
+    end: std::sync::Arc<FlightEnd>,
+}
+
+/// The end of slot `id`'s flight, for someone who waits for it (owner).
+unsafe fn flight_end(up: *mut Unit, id: u32) -> std::sync::Arc<FlightEnd> {
+    let _kept = crate::zone_alloc::kept();
+    let u = &mut *up;
+    let name = &u.fns[id as usize].name;
+    let flight = u.flights.get_mut(&id).expect("a slot in flight has a flight");
+    flight.end.get_or_insert_with(|| std::sync::Arc::new(FlightEnd {
+        ended: relax_session::sync::Mutex::new(false),
+        wake: relax_session::sync::Condvar::new(),
+        name: Box::leak(name.clone()),
+    })).clone()
+}
+
+unsafe fn yielded(up: *mut Unit, id: u32) -> Yielded {
+    let end = flight_end(up, id);
+    let flight = &(&*up).flights[&id];
+    Yielded { unit: up as usize, slot: id, root: flight.root, holder: flight.holder, class: owner::waiter_class(), end }
+}
+
+impl Yielded {
+    /// Off the owner, until the build ended: it keeps no CPU token and its build runs at its class.
+    pub(crate) fn wait(self) {
+        let _priority = queue::promote(self.unit, self.root, self.class);
+        let _budget = crate::pool::suspend();
+        let _w = crate::waits::begin(crate::waits::Kind::Build, self.slot as u64, self.holder, self.end.name);
+        let mut ended = self.end.ended.lock().unwrap_or_else(|e| e.into_inner());
+        while !*ended {
+            ended = self.end.wake.wait(ended).unwrap_or_else(|e| e.into_inner());
+        }
+    }
 }
 
 crate::memo_local! {
@@ -19668,14 +19741,6 @@ fn startup_phase() -> bool {
     STARTUP_PHASE.load(Ordering::Acquire) == 1
 }
 
-/// Only actual UI demand opens the next frontier. Helper lowering and tier-up builds
-/// may discover slots, but never recursively seed another ahead generation.
-fn main_discovery() -> bool {
-    let main = MAIN_TID.load(Ordering::Relaxed);
-    main != 0 && if owner::is_owner() { owner::serving().1 == main } else { me() == main }
-        && !LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false)
-}
-
 /// A build for a program thread (not a speculative or tier-up worker's) past startup (the first
 /// present, or a headless program's main).
 /// Its lazy compiles are built as the startup's are (baseline code, no inline candidates but Relax
@@ -21159,6 +21224,7 @@ fn take_pause_turn(mine: u32) {
         job_rows::counted(false);
         BG_ACTIVE.fetch_sub(1, Ordering::SeqCst);
     }
+    let _budget = crate::pool::suspend_program();
     while PAUSE_HOLDER.compare_exchange(0, me, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         std::thread::sleep(std::time::Duration::from_micros(200));
     }
@@ -21266,6 +21332,7 @@ fn job_gate() -> JobGuard {
             return JobGuard;
         }
         BG_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        let _budget = crate::pool::suspend_program();
         // A job never starts while an allocator swap is in progress, however long the swap
         // takes: it would allocate from the zone the swap is re-registering (a wall-clock
         // escape here turned a slow machine into a crash). The thread that began the swap
@@ -21320,6 +21387,7 @@ impl Drop for JobIdle {
                 return;
             }
             BG_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            let _budget = crate::pool::suspend_program();
             let mut g = BG_MX.lock().unwrap_or_else(|e| e.into_inner());
             while BG_DRAINED.load(Ordering::SeqCst) {
                 g = BG_CV.wait_timeout(g, std::time::Duration::from_millis(50)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0);
@@ -21377,6 +21445,8 @@ fn pause_compile_jobs(what: &str, trace: bool) {
     let mut next_log = 5000u128;
     let mut told = false;
     let busy = || BG_ACTIVE.load(Ordering::SeqCst) > mine || owner::busy_for_other(me());
+    // the jobs it waits for may need a token
+    let _budget = crate::pool::suspend_program();
     loop {
         if !busy() {
             // nothing runs: from here a job that comes back from waiting holds too (JobIdle),
@@ -21806,7 +21876,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
                 let u = &mut *up;
                 for &x in &slots {
                     if !u.fns[x as usize].inflight {
-                        u.fns[x as usize].inflight = true;
+                        begin_flight(up, id, owner::owner_tid(), &[x]);
                         flight.push(x);
                         BATCH_FLIGHT.with(|b| b.borrow_mut().push(x));
                     }
@@ -21919,13 +21989,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
             Err(e) => out.push((id, Err(e))),
         }
     }
-    {
-        let u = &mut *up;
-        for &x in &flight {
-            u.fns[x as usize].inflight = false;
-        }
-        INFLIGHT_GEN.fetch_add(1, Ordering::Release);
-    }
+    end_flight(up, &flight);
     out
 }
 
@@ -22139,10 +22203,13 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
             spec_enqueue_calls(up, id, &p.func, &skip, depth);
         }
     }
+    // (its back end runs on the thread the front is served for)
+    let holder = match owner::serving().1 {
+        0 => owner::owner_tid(),
+        requester => requester,
+    };
+    begin_flight(up, id, holder, &slots);
     let u = &mut *up;
-    for &x in &slots {
-        u.fns[x as usize].inflight = true;
-    }
     let e = &u.env;
     let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: !TIER1_ENABLED.load(Ordering::Relaxed), syms: e.syms, sym_class: e.sym_class, near: e.near };
     let (fold, rotate) = (u.opt.fold, u.opt.layout);
@@ -22161,9 +22228,23 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
     Begin::Back(BackWork { id, capture_unit: u.wasm_export_id, spec, front, slots, epoch, env, fold, rotate, lc, session, name, w1, memo })
 }
 
+/// (tests) 1: the next back end stops at its start, showing 2 and its thread, until a test stores 0.
+#[cfg(test)]
+static BACK_END_GATE: AtomicU32 = AtomicU32::new(0);
+#[cfg(test)]
+static BACK_END_THREAD: AtomicU64 = AtomicU64::new(0);
+
 impl BackWork {
     /// Optimises and generates the code (any thread, no unit state).
     pub(crate) fn run(self) -> BackDone {
+        #[cfg(test)]
+        if BACK_END_GATE.load(Ordering::SeqCst) == 1 {
+            BACK_END_THREAD.store(me(), Ordering::SeqCst);
+            BACK_END_GATE.store(2, Ordering::SeqCst);
+            while BACK_END_GATE.load(Ordering::SeqCst) != 0 {
+                std::thread::yield_now();
+            }
+        }
         let BackWork { id, capture_unit, spec, front, slots, epoch, env, fold, rotate, lc, session, name, w1, memo: worthy } = self;
         let options = &session.options;
         let runtime = &session.runtime;
@@ -22284,11 +22365,7 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
                 },
             }
         }
-        let u = &mut *up;
-        for &x in &slots {
-            u.fns[x as usize].inflight = false;
-        }
-        INFLIGHT_GEN.fetch_add(1, Ordering::Release);
+        end_flight(up, &slots);
     }
     if stale {
         // a live patch landed while this back end ran: start over from the new source
@@ -23039,7 +23116,15 @@ unsafe fn owner_front<'u>(up: *const Unit) -> (&'u Program, &'u Tcx) {
 }
 
 pub fn front_read(site: &'static str) -> FrontRead {
-    let g = FRONT_RW.read().unwrap_or_else(|e| e.into_inner());
+    let g = match FRONT_RW.try_read() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            // behind a writer, the owner: what it waits for may need the token
+            let _budget = crate::pool::suspend_program();
+            FRONT_RW.read().unwrap_or_else(|e| e.into_inner())
+        }
+    };
     let _ = FRONT_READS.try_with(|c| c.set(c.get() + 1));
     FrontRead { prior_site: FRONT_READ_SITE.try_with(|old| old.replace(site)).unwrap_or(""), _g: g, traced: front_trace().then(|| (site, std::time::Instant::now())), row: front_holders::claim(site) }
 }
@@ -23482,7 +23567,7 @@ fn lower_ahead(f: &FrontShared, id: u32, own: bool) -> u8 {
                     // the writer may need the front: hold neither lock while the helper finishes
                     drop(pending);
                     drop(r);
-                    let _priority = (MAIN_TID.load(Ordering::Relaxed) == me()).then(|| queue::promote(f.unit.load(Ordering::Acquire) as usize, id));
+                    let _priority = queue::promote(f.unit.load(Ordering::Acquire) as usize, id, owner::waiter_class());
                     let _idle = JobIdle::enter();
                     let _budget = crate::pool::suspend();
                     let _w = AheadWait::begin(4);
@@ -24053,7 +24138,7 @@ pub unsafe fn typeck_ahead_slot(up: *mut Unit, id: u32) {
         // a helper is checking this very body: wait for its result rather than check it again
         // under the unit lock (not while holding that lock: a constant evaluation's call)
         if !owner::is_owner() && f.inprog.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
-            let _priority = (MAIN_TID.load(Ordering::Relaxed) == me()).then(|| queue::promote(up as usize, id));
+            let _priority = queue::promote(up as usize, id, owner::waiter_class());
             let _budget = crate::pool::suspend();
             // (a wait for another thread: not a running job meanwhile, job_sleep's reason)
             let _idle = JobIdle::enter();
@@ -25107,11 +25192,12 @@ mod front_yield_tests {
         let f = u.fn_id(FnKey::Inst(triple, Vec::new()));
         let up = &mut *u as *mut Unit as usize;
         // another thread's back end of `triple` runs off the unit
-        crate::owner::call(crate::owner::Class::Program, || unsafe { (&mut *(up as *mut Unit)).fns[f as usize].inflight = true });
+        let builder = me();
+        crate::owner::call(crate::owner::Class::Program, || unsafe { begin_flight(up as *mut Unit, f, builder, &[f]) });
         // an app thread calls it: its front waits on the owner for that build
         let app = std::thread::spawn(move || rt_compile_in(up, f as u64));
         let owner = crate::owner::owner_tid();
-        while !crate::waits::of(owner).is_some_and(|w| w.kind == crate::waits::Kind::Pump) {
+        while !crate::waits::of(owner).is_some_and(|w| w.kind == crate::waits::Kind::Build) {
             std::thread::yield_now();
         }
         // a program request meanwhile (a landing check): served while the build is in flight
@@ -25127,13 +25213,213 @@ mod front_yield_tests {
             std::thread::yield_now();
         }
         assert!(check.join().unwrap(), "served before the build ended");
+        // off the owner it waits for that build, by name and with who runs it
+        let wait = loop {
+            match crate::waits::snapshot().into_iter().find(|w| w.kind == crate::waits::Kind::Build && w.thread != owner) {
+                Some(w) => break w,
+                None => std::thread::yield_now(),
+            }
+        };
+        assert_eq!((wait.object, wait.holder, wait.label), (f as u64, builder, "front_yield::triple"), "the wait names the build");
         // the build ends (its finish): the front is asked again and builds `triple` itself
-        crate::owner::publish(|| unsafe {
-            (&mut *(up as *mut Unit)).fns[f as usize].inflight = false;
-            INFLIGHT_GEN.fetch_add(1, Ordering::Release);
-        });
+        crate::owner::publish(|| unsafe { end_flight(up as *mut Unit, &[f]) });
         assert_ne!(app.join().unwrap(), 0);
         assert!(u.fns[f as usize].build_err.is_none(), "{:?}", u.fns[f as usize].build_err);
+        // (the isolated process owns the runtime globals)
+        std::mem::forget(u);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Two fns (`triple`, `quad`) in a fresh unit, and the path of their source.
+    fn two_fn_unit(name: &str) -> (Box<Unit>, u32, u32, std::path::PathBuf) {
+        crate::borrowck::lazy::disable_gandalf();
+        let source = "#![no_std]\npub fn triple(x: u32) -> u32 { x * 3 }\npub fn quad(x: u32) -> u32 { x * 4 }\n";
+        let path = std::env::temp_dir().join(format!("relax-{name}-{}.rs", std::process::id()));
+        std::fs::write(&path, source).unwrap();
+        let session = std::sync::Arc::new(crate::Session::default());
+        let mut prog = Program::new(&session);
+        prog.load_crate(name, path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+        let def = |n: &str| prog.defs.iter().enumerate().find_map(|(i, _)| (prog.name(DefId(i as u32)) == n).then_some(DefId(i as u32))).unwrap();
+        let (triple, quad) = (def("triple"), def("quad"));
+        let mut tcx = Tcx::new();
+        tcx.collect(&prog);
+        let mut u = Unit::new(prog, tcx, 0);
+        let (f, g) = (u.fn_id(FnKey::Inst(triple, Vec::new())), u.fn_id(FnKey::Inst(quad, Vec::new())));
+        SPEC_UNIT.store(&mut *u as *mut Unit, Ordering::Release);
+        (u, f, g, path)
+    }
+
+    /// A compile job running beside the build below, with the rest of the JIT's room in the budget:
+    /// the build cannot go above the budget (the JIT has a job running), it needs a token. It waits
+    /// for the build as far as the registry goes: no thread here runs on while the others are stuck.
+    /// Ends with `stop`.
+    fn other_compile_job(stop: std::sync::Arc<AtomicBool>) -> (std::thread::JoinHandle<()>, u64) {
+        use makepad_cpu_budget as budget;
+        BACK_END_THREAD.store(0, Ordering::SeqCst);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let job = std::thread::spawn(move || {
+            let permit = budget::admit(budget::BACKGROUND, budget::JIT, "another compile job");
+            tx.send(me()).unwrap();
+            let mut building = 0;
+            while building == 0 {
+                building = BACK_END_THREAD.load(Ordering::SeqCst);
+                std::thread::yield_now();
+            }
+            let _row = crate::waits::begin(crate::waits::Kind::Build, u64::MAX, building, "another compile job's wait");
+            while !stop.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            budget::release(permit);
+        });
+        let thread = rx.recv().unwrap();
+        (job, thread)
+    }
+
+    /// As many jobs as CPU tokens, each with its token, all calling one fn whose speculative build
+    /// (Background, in flight) sits out a checkpoint for them: the build needs a token and they wait
+    /// for the build. Budget::acquire held it for good: nothing moved until the process died.
+    /// `callers` of the jobs call; the others keep their tokens, running.
+    /// `jobs` is the tokens left beside the other compile job and the build.
+    /// Returns once the callers are on their way: the jobs, and the callers still to end.
+    fn jobs_on_every_token(up: usize, slot: u32, jobs: usize, callers: usize) -> (Vec<std::thread::JoinHandle<u64>>, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use makepad_cpu_budget as budget;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        BACK_END_GATE.store(1, Ordering::SeqCst);
+        queue::spec(up, slot);
+        while BACK_END_GATE.load(Ordering::SeqCst) != 2 {
+            std::thread::yield_now();
+        }
+        let (admitted, go, left) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(callers)));
+        let handles = (0..jobs).map(|i| {
+            let (admitted, go, left) = (admitted.clone(), go.clone(), left.clone());
+            std::thread::spawn(move || {
+                let permit = budget::admit(budget::VISIBLE, budget::APP, "a pool job");
+                admitted.fetch_add(1, Ordering::SeqCst);
+                while !go.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                let code = if i < callers {
+                    let code = rt_compile_in(up, slot as u64);
+                    left.fetch_sub(1, Ordering::SeqCst);
+                    code
+                } else {
+                    1
+                };
+                while left.load(Ordering::SeqCst) != 0 {
+                    std::thread::yield_now();
+                }
+                budget::release(permit);
+                code
+            })
+        }).collect();
+        // the build's token is the one the last job waits for: its first checkpoint yields it
+        while !budget::tokens().waiting.iter().any(|w| w.class == budget::VISIBLE && w.client == budget::APP) {
+            std::thread::yield_now();
+        }
+        BACK_END_GATE.store(0, Ordering::SeqCst);
+        while admitted.load(Ordering::SeqCst) < jobs {
+            std::thread::yield_now();
+        }
+        // (a build that no longer stops here would pass without showing anything)
+        let building = BACK_END_THREAD.load(Ordering::SeqCst);
+        while !crate::waits::of(building).is_some_and(|w| w.kind == crate::waits::Kind::Token) {
+            assert!(queue::running_class(up, slot).is_some(), "the build sits out its checkpoint for the last job");
+            std::thread::yield_now();
+        }
+        go.store(true, Ordering::SeqCst);
+        (handles, left)
+    }
+
+    #[test]
+    fn jobs_on_every_token_do_not_hang_on_a_build_that_needs_one() {
+        isolated_test!(jobs_on_every_token_do_not_hang_on_a_build_that_needs_one);
+        use std::sync::Arc;
+        let (u, f, g, path) = two_fn_unit("budget_lock");
+        let up = &*u as *const Unit as usize;
+        let tokens = makepad_cpu_budget::limit() as usize;
+        assert!(makepad_cpu_budget::background_limit() >= 2, "this needs the build and the other compile job in Background");
+        // every job calls: they sleep without their tokens, and the build gets one. The registry's
+        // chain says so when it does not: a plain failure, as it stands still. (A second of age: a
+        // job between its wait's row and giving its token up looks stuck for that moment.)
+        let stop = Arc::new(AtomicBool::new(false));
+        let (other, _) = other_compile_job(stop.clone());
+        let (jobs, left) = jobs_on_every_token(up, f, tokens - 1, tokens - 1);
+        while left.load(Ordering::SeqCst) != 0 {
+            if let Some(chain) = crate::inspect::budget_deadlock(1_000_000_000) {
+                panic!("deadlock: {chain}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        for job in jobs {
+            assert_ne!(job.join().unwrap(), 0);
+        }
+        stop.store(true, Ordering::SeqCst);
+        other.join().unwrap();
+        assert!(u.fns[f as usize].build_err.is_none(), "{:?}", u.fns[f as usize].build_err);
+        // one job calls and the others run on: only its token comes free, and Background is not let
+        // in below its limit. The build takes the class of who waits for it.
+        let stop = Arc::new(AtomicBool::new(false));
+        let (other, other_thread) = other_compile_job(stop.clone());
+        let (jobs, left) = jobs_on_every_token(up, g, tokens - 1, 1);
+        let building = BACK_END_THREAD.load(Ordering::SeqCst);
+        let waiter = || crate::waits::snapshot().into_iter().find(|w| w.thread != other_thread && w.holder == building && matches!(w.kind, crate::waits::Kind::Pump | crate::waits::Kind::Build)).map(|w| (w.thread, w.since_ns));
+        while left.load(Ordering::SeqCst) != 0 {
+            // (the same wait before and after: its promotion stands while the class is read)
+            let before = waiter();
+            let class = queue::running_class(up, g);
+            if let (Some(_), Some(class)) = (before, class) {
+                if waiter() == before {
+                    assert_eq!(class, makepad_cpu_budget::VISIBLE, "the build runs at its waiter's class");
+                }
+            }
+            std::thread::yield_now();
+        }
+        for job in jobs {
+            assert_ne!(job.join().unwrap(), 0);
+        }
+        stop.store(true, Ordering::SeqCst);
+        other.join().unwrap();
+        assert!(u.fns[g as usize].build_err.is_none(), "{:?}", u.fns[g as usize].build_err);
+        assert!(makepad_cpu_budget::tokens().holders.iter().all(|h| h.client != makepad_cpu_budget::APP), "the jobs' permits are released, none lent");
+        // (the isolated process owns the runtime globals)
+        std::mem::forget(u);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The app's jobs hold every token and run on, waiting for nothing: a speculative build queued
+    /// behind them still runs, beside them and taking no token: a tier-up does not wait for a busy
+    /// pool, which would leave its work on slow code.
+    #[test]
+    fn a_compile_job_runs_beside_jobs_on_every_token() {
+        isolated_test!(a_compile_job_runs_beside_jobs_on_every_token);
+        use makepad_cpu_budget as budget;
+        let (u, f, _, path) = two_fn_unit("budget_full");
+        let up = &*u as *const Unit as usize;
+        let tokens = budget::limit() as usize;
+        let permits: Vec<u32> = (0..tokens).map(|_| budget::admit(budget::VISIBLE, budget::APP, "a busy pool job")).collect();
+        BACK_END_GATE.store(1, Ordering::SeqCst);
+        queue::spec(up, f);
+        // (held back it stands still with no compile job in the budget: a plain failure after 10 s)
+        let mut since = std::time::Instant::now();
+        while BACK_END_GATE.load(Ordering::SeqCst) != 2 {
+            if budget::tokens().holders.iter().any(|h| h.client == budget::JIT) {
+                since = std::time::Instant::now();
+            }
+            assert!(since.elapsed().as_secs() < 10, "no compile job runs beside a full budget: {}", budget::report_string());
+            std::thread::yield_now();
+        }
+        let now = budget::tokens();
+        assert_eq!(now.running, tokens, "it takes no token from the app");
+        assert!(now.holders.iter().any(|h| h.client == budget::JIT && h.above), "it runs above the budget");
+        BACK_END_GATE.store(0, Ordering::SeqCst);
+        while queue::running_class(up, f).is_some() {
+            std::thread::yield_now();
+        }
+        assert!(u.fns[f as usize].build_err.is_none(), "{:?}", u.fns[f as usize].build_err);
+        for permit in permits {
+            budget::release(permit);
+        }
         // (the isolated process owns the runtime globals)
         std::mem::forget(u);
         let _ = std::fs::remove_file(&path);
