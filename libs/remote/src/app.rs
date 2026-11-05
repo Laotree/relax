@@ -20,6 +20,30 @@ use std::path::{Path, PathBuf};
 /// Frames of one folder kept per window (older ones are deleted when a new one is written).
 const KEPT_PER_WINDOW: usize = 64;
 
+/// The `app` service request (the app's AI tools) of a command line, when it is one: `tools`
+/// (the service's `list`) or `call <service>.<tool> [<instance>] [<json args>]`, the arguments
+/// being the rest of the line from its first `{`. Err: the usage of a `call` without its tool.
+/// Every other command is the `cmd` service's (None).
+pub fn app_request_of(line: &str) -> Option<Result<String, String>> {
+    let (head, args) = match line.find('{') {
+        Some(at) => (&line[..at], line[at..].trim()),
+        None => (line, "{}"),
+    };
+    let mut words = head.split_whitespace();
+    match words.next()? {
+        "tools" => Some(Ok("list".to_string())),
+        "call" => {
+            let Some(tool) = words.next() else {
+                return Some(Err("call <service>.<tool> [<instance>] [<json args>]".into()));
+            };
+            let instance: Vec<&str> = words.collect();
+            let head = if instance.is_empty() { format!("call {tool}") } else { format!("call {tool} {}", instance.join(" ")) };
+            Some(Ok(format!("{head}\n{args}")))
+        }
+        _ => None,
+    }
+}
+
 /// Words (the command, its sub-command) and `k=v` arguments of an argv.
 pub fn split_args(argv: &[String]) -> (Vec<String>, Vec<(String, String)>) {
     let (mut words, mut kv) = (Vec::new(), Vec::new());
@@ -53,6 +77,8 @@ pub fn typed_line(words: &[String]) -> String {
         s
     };
     match words[0].as_str() {
+        // the app service's: its JSON arguments are the rest of the line, as typed
+        "call" | "tools" => words.join(" "),
         "eval" => {
             // options first (`--in path` or `in=path`, `mutate=1`, `panic=P1`), then the expression
             let mut kv = Vec::new();
@@ -150,18 +176,12 @@ fn run_inner(client: &Client, argv: &[String], each: &mut dyn FnMut(&str) -> boo
         ("rec", s) if !matches!(s, Some("save" | "status" | "mark" | "on" | "off")) => rec(client, &kv),
         ("gq", _) => gq(client, &kv),
         ("tweak", Some("final")) => return tweak_final(client, &words, &kv, each),
-        ("tools", _) => return app_request(client, "list", each),
-        ("call", _) => {
-            let Some(tool) = second else {
-                return Ok((emit(Err("call <service>.<tool> [<instance>] [<json args>]".into()), each), None));
+        ("tools" | "call", _) => {
+            return match app_request_of(&words.join(" ")) {
+                Some(Ok(request)) => app_request(client, &request, each),
+                Some(Err(usage)) => Ok((emit(Err(usage), each), None)),
+                None => unreachable!("tools and call are app requests"),
             };
-            let rest = &words[2..];
-            let (instance, args) = match rest.last() {
-                Some(last) if last.trim_start().starts_with('{') => (&rest[..rest.len() - 1], last.as_str()),
-                _ => (rest, "{}"),
-            };
-            let head = if instance.is_empty() { format!("call {tool}") } else { format!("call {tool} {}", instance.join(" ")) };
-            return app_request(client, &format!("{head}\n{args}"), each);
         }
         _ => return forward(client, &words, &kv, each),
     };
