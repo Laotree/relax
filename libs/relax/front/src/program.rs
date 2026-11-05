@@ -730,8 +730,10 @@ pub struct Program {
     pub legacy_const_args: crate::collected::ImageMap<DefId, std::sync::Arc<crate::def_collector::LegacyOwner>>,
     pub(crate) legacy_const_attrs: std::sync::Arc<HashMap<DefId, Vec<u32>>>,
     declaration_versions: HashMap<u32, DeclarationState>,
-    /// per file version: the import change it made to the macro table (revert_version)
-    import_versions: HashMap<u32, crate::macros::ImportEdit>,
+    /// per file version: the import changes it made to the macro table (revert_version)
+    import_versions: HashMap<u32, Vec<crate::macros::ImportEdit>>,
+    /// the file version whose added items are being collected (add_items)
+    adding_to: Option<u32>,
     pub def_id_to_node_id: crate::collected::ImageMap<DefId, (u32, crate::def_collector::NodeId)>,
     pub impl_trait_in_trait_data: crate::collected::ImageMap<DefId, crate::assoc::ImplTraitInTraitData>,
     pub associated_types_for_impl_traits: crate::collected::ImageMap<DefId, Vec<DefId>>,
@@ -912,6 +914,7 @@ impl Program {
             legacy_const_attrs: Default::default(),
             declaration_versions: Default::default(),
             import_versions: Default::default(),
+            adding_to: None,
             def_id_to_node_id: Default::default(),
             impl_trait_in_trait_data: Default::default(),
             associated_types_for_impl_traits: Default::default(),
@@ -1766,6 +1769,13 @@ impl Program {
                     (None, Some((s, t))) => (s, Some(t)),
                     (None, None) => (self.crates[krate as usize].context.read_source(path)?.src.to_vec(), None),
                 };
+                if let Some(version) = self.adding_to {
+                    let c = &self.crates[krate as usize];
+                    if let Some(e) = crate::preload::new_file_imports(path, &self.cur_mod_path, &kname, c.root_path(), edition, &c.cfg, &src, &c.context) {
+                        std::sync::Arc::make_mut(&mut self.macros).apply_import_edit(&e);
+                        self.import_versions.entry(version).or_default().push(e);
+                    }
+                }
                 let bctx = std::rc::Rc::new(crate::builtins::FileCtx::new(&kname, path, &self.cur_mod_path, &self.crates[krate as usize].cfg));
                 let (pf, used) = self.crates[krate as usize].context.parse_input(src, pre, edition,
                     Some(crate::macros::MacroScope::new(self.macros.clone())), bctx, crate::parser::lazy_auto())?;
@@ -2148,7 +2158,7 @@ impl Program {
         }
         if let Some(e) = v.imports {
             table.apply_import_edit(&e);
-            self.import_versions.insert(new, e);
+            self.import_versions.insert(new, vec![e]);
         }
         let fwd: HashMap<u32, u32> = pairs.iter().copied().collect();
         // block modules: the same (paired) items under a block (block ids shift with the edit)
@@ -2291,7 +2301,9 @@ impl Program {
         self.parse_reuse.remove(&new);
         self.path_seg_cache.clear();
         self.forget_bindings();
-        if let Some(e) = self.import_versions.remove(&new) { std::sync::Arc::make_mut(&mut self.macros).apply_import_edit(&e.undone()); }
+        for e in self.import_versions.remove(&new).unwrap_or_default().into_iter().rev() {
+            std::sync::Arc::make_mut(&mut self.macros).apply_import_edit(&e.undone());
+        }
         let back: Vec<(u32, u32)> = pairs.iter().map(|&(a, b)| (b, a)).collect();
         self.retarget_file(new, old, &back);
         self.collect_version_definitions(old, false, false, None).expect("previously collected definition body");
@@ -2342,6 +2354,13 @@ impl Program {
         if items.is_empty() {
             return Ok(Vec::new());
         }
+        self.adding_to = Some(file);
+        let added = self.collect_added_items(file, items);
+        self.adding_to = None;
+        added
+    }
+
+    fn collect_added_items(&mut self, file: u32, items: &[(ItemId, Result<u32, DefId>)]) -> Result<Vec<DefId>, String> {
         let first = self.defs.len();
         for &(iid, at) in items {
             match at {

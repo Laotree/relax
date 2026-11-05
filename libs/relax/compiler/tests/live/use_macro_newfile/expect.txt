@@ -1,2 +1,0 @@
-# a module file the edit declares has imports of its own
-v1 patch|reinst

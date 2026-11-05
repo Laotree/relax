@@ -1069,15 +1069,24 @@ pub(crate) fn import_edit(s: &crate::program::ParseSnapshot, src: &[u8]) -> Opti
     let previous = s.previous.as_ref()?;
     let old = &previous.src[..previous.src_len as usize];
     if old == src { return None; }
-    let imports = |text: &[u8]| {
-        let mut toks = Vec::with_capacity(text.len() / 4);
-        crate::lexer::lex(text, s.edition, &mut toks).ok()?;
-        let scan = scan_tokens(&s.path, &s.dir, &s.mod_path, &s.kname, s.edition, &s.cfg, text.len(), text.to_vec().into(), toks, &s.context, ScanSurface::Imports)?;
-        Some(crate::macros::FileImports { uses: scan.uses, aliases: scan.aliases, macro_use: scan.macro_use, mods: scan.mods, mod_items: scan.mod_items })
-    };
+    let imports = |text: &[u8]| file_imports(&s.path, &s.dir, &s.mod_path, &s.kname, s.edition, &s.cfg, text, &s.context);
     let (was, now) = (imports(old)?, imports(src)?);
     if was.same_as(&now) { return None; }
     Some(crate::macros::ImportEdit { krate: s.kname.clone(), root: s.root.clone(), was, now })
+}
+
+/// A module file a live edit declared: no prescan read its imports.
+pub(crate) fn new_file_imports(path: &str, mpath: &str, krate: &str, root: &str, edition: u16, cfg: &CfgSet, src: &[u8], context: &crate::source_context::Context) -> Option<crate::macros::ImportEdit> {
+    let dir = if path.ends_with("/mod.rs") { crate::program::dir_of(path).to_string() } else { format!("{}/{}", crate::program::dir_of(path), crate::program::stem_of(path)) };
+    let now = file_imports(path, &dir, mpath, krate, edition, cfg, src, context)?;
+    Some(crate::macros::ImportEdit { krate: krate.to_string(), root: root.to_string(), was: Default::default(), now })
+}
+
+fn file_imports(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cfg: &CfgSet, src: &[u8], context: &crate::source_context::Context) -> Option<crate::macros::FileImports> {
+    let mut toks = Vec::with_capacity(src.len() / 4);
+    crate::lexer::lex(src, edition, &mut toks).ok()?;
+    let scan = scan_tokens(path, dir, mpath, krate, edition, cfg, src.len(), src.to_vec().into(), toks, context, ScanSurface::Imports)?;
+    Some(crate::macros::FileImports { uses: scan.uses, aliases: scan.aliases, macro_use: scan.macro_use, mods: scan.mods, mod_items: scan.mod_items })
 }
 
 /// What a scan reads besides the file's modules.
