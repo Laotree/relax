@@ -1493,3 +1493,10 @@ pub fn root_crate() -> u32 {
 pub fn set_root_crate(c: u32) {
     ROOT_CRATE.store(c, std::sync::atomic::Ordering::Relaxed);
 }
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&LIVE_SESSION, std::sync::atomic::AtomicBool::new(false));
+    reset(&ROOT_CRATE, std::sync::atomic::AtomicU32::new(0));
+}

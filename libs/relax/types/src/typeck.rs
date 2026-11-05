@@ -597,13 +597,14 @@ pub fn instantiate_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, 
     try_instantiate_body(cx, prog, tcx, def, args).unwrap_or_else(|_| no_codegen_body(prog, tcx, def, args))
 }
 
+static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// rustc_middle/src/ty/normalize_erasing_regions.rs:172-186: normalization failure
 /// is a result for consumers that cannot require a fully monomorphic instance.
 pub(crate) fn try_instantiate_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Result<Body, crate::next_solver::NoSolution> {
     // Diagnostic only: sample one in N calls, including queries outside JIT scopes.
     // Keep this off for timing runs; symbolizing a backtrace is deliberately expensive.
     static SAMPLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let sample = *SAMPLE.get_or_init(|| std::env::var("MAKEPAD_RUN_TYPECK_BACKTRACE").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
     if sample != 0 && CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % sample == 0 {
         let trace = format!("makepad-run typeck-backtrace: {} def={} args={:?} origin={} time={}\n{}\nmakepad-run typeck-backtrace-end\n",
@@ -8411,4 +8412,11 @@ fn op_trait_unimplemented(tr: &str, x: &str, y: &str) -> String {
         "ShrAssign" => assign(">>="),
         _ => format!("E0277: the trait bound `{}: {}<{}>` is not satisfied", x, tr, y),
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&CALLS, std::sync::atomic::AtomicU64::new(0));
+    reset(&CHECKED_DEFS, relax_session::sync::Mutex::new(None));
 }

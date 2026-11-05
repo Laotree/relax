@@ -135,11 +135,12 @@ fn jit_error(record: &str, reason: &str) {
 /// run's summary counts them all).
 const CHECKER_PANIC_RECORDS: u64 = 16;
 
+static RECORDED: AtomicU64 = AtomicU64::new(0);
+
 /// A panic in a check of `body` (borrowck::lazy's sink, typeck_bg): its own record, since no hot load
 /// failed and the app runs on. This ledger is where the next one is seen. Runs on the checking
 /// thread: a write that fails stays pending for the next flush, and nothing here waits for it.
 pub fn checker_panic(body: &str, message: &str) {
-    static RECORDED: AtomicU64 = AtomicU64::new(0);
     if RECORDED.fetch_add(1, Ordering::Relaxed) >= CHECKER_PANIC_RECORDS { return; }
     let _kept = crate::zone_alloc::kept();
     let r = record(&empty_attempt(), Outcome::CheckerPanic, format!("checker panic in `{body}`: {message}"), String::new(), Vec::new());
@@ -237,19 +238,17 @@ pub fn verdict(code: i32) -> Verdict {
     }
 }
 
-/// An existing process restart carries the recovery identity and changed units
-/// alongside the app's snapshot. It does not manufacture another hot load.
-#[cfg(any(unix, windows))]
-pub(crate) fn prepare_exec(cmd: &mut std::process::Command) -> Result<(), String> {
+/// A restart carries the recovery identity and changed units to the next run alongside the app's
+/// state, in a file it reads (`restore`). It does not manufacture another hot load.
+pub(crate) fn hand_over() -> Result<Option<std::path::PathBuf>, String> {
     let _kept = crate::zone_alloc::kept();
     let recovery = state().recovery.as_ref().map(|r| (r.attempt.clone(), r.failure.clone()));
-    let Some((attempt, failure)) = recovery else { return Ok(()) };
+    let Some((attempt, failure)) = recovery else { return Ok(None) };
     let mut data = record(&attempt, Outcome::Refused, String::new(), failure, Vec::new());
     data.units = (*attempt.units).clone();
     let path = makepad_remote::hot::home().join("hot-restart").join(format!("{}.json", data.id));
     std::fs::create_dir_all(path.parent().unwrap()).and_then(|_| std::fs::write(&path, data.to_json())).map_err(|e| e.to_string())?;
-    cmd.env("MAKEPAD_JIT_RECOVERY", path);
-    Ok(())
+    Ok(Some(path))
 }
 
 /// Windows: the next run never started, and the run that asked for it has ended, so its parent
@@ -283,4 +282,11 @@ pub(crate) fn restore() {
         }
         None => eprintln!("makepad hot: cannot restore the pending recovery record"),
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&STATE, std::sync::OnceLock::new());
+    reset(&RECORDED, AtomicU64::new(0));
 }

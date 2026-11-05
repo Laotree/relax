@@ -81,3 +81,10 @@ pub fn ms_since_process_start() -> f64 {
     mark_process_start();
     PROCESS_START.get().unwrap().1.elapsed().as_secs_f64() * 1e3
 }
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&T0, std::sync::OnceLock::new());
+    reset(&PROCESS_START, std::sync::OnceLock::new());
+}

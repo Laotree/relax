@@ -330,13 +330,14 @@ enum Tier {
     Optimized,
 }
 
+static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The optimized tier of a first-tier library (module doc), on a background thread: cargo with
 /// the release opt-level in its own target, then, when its scripts said what the first tier's
 /// did, its archives linked over `lib_path` (the running process keeps the library it loaded).
 /// Once per process; a process that ends first leaves it to the next start (cargo resumes).
 #[allow(clippy::too_many_arguments)]
 fn optimize_later(g: &Graph, req: &Request, exe: std::path::PathBuf, flags: &[&String], script_pkgs: Vec<String>, lib_pkgs: Vec<String>, seeds: &[usize], fast: &Outputs, lib_path: String, fast_mark: String) {
-    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return;
     }
@@ -352,7 +353,7 @@ fn optimize_later(g: &Graph, req: &Request, exe: std::path::PathBuf, flags: &[&S
         v
     };
     let want = said(fast);
-    let _ = std::thread::Builder::new().name("run-native-opt".into()).spawn(move || {
+    let _ = relax_base::run_threads::spawn("run-native-opt", move || {
         let _z = crate::zone_alloc::compiler_thread();
         let flag_refs: Vec<&String> = flags.iter().collect();
         let m = match run_cargo_with(&pkg, &scripts, &workspace, &package, &relax_dir, &exe, &flag_refs, &script_pkgs, &lib_pkgs, &seeds, Tier::Optimized) {
@@ -660,4 +661,10 @@ fn test_selections_check_with_dev_dependencies() {
     assert_eq!(s(&["--lib", "--features", "a"]), ["--features", "a", "--tests"]);
     assert_eq!(s(&["--bins", "--bin", "x"]), ["--tests"]);
     assert_eq!(s(&["--test", "it", "--test=two", "--no-default-features"]), ["--no-default-features", "--tests"]);
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&STARTED, std::sync::atomic::AtomicBool::new(false));
 }

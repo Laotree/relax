@@ -1748,3 +1748,9 @@ crate::collected_enum!(LifetimeKey; 0 => Named(a,b), 1 => Reference(n), 2 => Sel
 crate::collected_enum!(ResolvedArg; 0 => StaticLifetime, 1 => EarlyBound(id), 2 => LateBound(d,v,id), 3 => Free(d,id), 4 => Error);
 crate::collected_fields!(ResolveBoundVars, names, named_variable_map, late_bound_vars_map, opaque_captured_lifetimes, early_indices, generic_indices);
 crate::collected_enum!(BoundVariableKind; 0 => Ty, 1 => Region(r), 2 => Const);
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&TRIVIAL, relax_session::sync::Mutex::new(None));
+}

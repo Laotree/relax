@@ -4383,3 +4383,8 @@ fn ty_mentions_self(ast: &ast::Ast, t: ast::TyId) -> bool {
         _ => false,
     }
 }
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    resolve_bound_vars::reset_statics();
+}

@@ -470,7 +470,7 @@ fn enqueue(options: &crate::options::Options, src: &Arc<dyn FrontSource>, def: D
     if !STARTED.swap(true, Ordering::SeqCst) {
         let s = src.clone(); let verbose = options.verbose;
         { let _k = crate::zone_alloc::kept();
-        let _ = std::thread::Builder::new().name("gandalf".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); worker(s, verbose) });
+        let _ = crate::run_threads::spawn("gandalf", move || { let _z = crate::zone_alloc::compiler_thread(); worker(s, verbose) });
         }
     }
     WAKE.notify_one();
@@ -1023,3 +1023,30 @@ fn grew(b: &super::field_views::Summary, a: &super::field_views::Summary) -> boo
 #[cfg(test)]
 #[path = "lazy_tests.rs"]
 mod lazy_tests;
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&WITHHELD, AtomicU64::new(0));
+    reset(&SUBS, Mutex::new(Vec::new()));
+    reset(&VERDICTS, LazyLock::new(|| Mutex::new(HashMap::default())));
+    reset(&DISJOINT, LazyLock::new(|| Mutex::new(HashMap::default())));
+    reset(&RECORDED_OWNERS, Mutex::new(None));
+    reset(&VERDICT_KEYS, Mutex::new(Vec::new()));
+    reset(&CACHED_CLEAN, AtomicU64::new(0));
+    reset(&CACHED_UNCHECKED, AtomicU64::new(0));
+    reset(&QUEUE, Mutex::new(None));
+    reset(&REHOMED, Mutex::new(Vec::new()));
+    reset(&STARTED, AtomicBool::new(false));
+    reset(&STOP, AtomicBool::new(false));
+    reset(&CHECKED, AtomicU64::new(0));
+    reset(&PANICS, AtomicU64::new(0));
+    reset(&STALE, AtomicU64::new(0));
+    reset(&PANIC_NOTES, Mutex::new(Vec::new()));
+    reset(&CHECK_NS, AtomicU64::new(0));
+    reset(&PREEMPTED, AtomicU64::new(0));
+    reset(&VIOLATIONS, AtomicU64::new(0));
+    reset(&IDLE_REPORTED, AtomicBool::new(false));
+    reset(&RUNNING, Mutex::new(None));
+    reset(&SETTLE, Mutex::new(Vec::new()));
+}

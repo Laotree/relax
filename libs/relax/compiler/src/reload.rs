@@ -4444,8 +4444,8 @@ fn ms(t0: Instant) -> f64 {
 static RESTART_SUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Why this process's unit cannot be trusted (None: it can): a compiler panic inside an edit's
 /// transaction, or an internal compiler error at a call after edits. No edit applies to it again:
-/// the recovery is a fresh process (exec_restart: the same sources, the warm cache, the app's
-/// state when it left one).
+/// the recovery is a next run (run_end::restart: the same sources, the warm cache, the app's state
+/// when it left one).
 static UNIT_SUSPECT: relax_session::sync::Mutex<Option<String>> = relax_session::sync::Mutex::new(None);
 
 pub(crate) fn mark_unit_suspect(why: &str) {
@@ -4542,10 +4542,11 @@ pub fn domain_stopping(id: u32) {
     RESTART_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
+// the first domain of a restarted run gets the state the previous run left
+// (MAKEPAD_RUN_RESTORE, read once)
+static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 pub(crate) fn domain_loaded(inputs: Option<Inputs>) {
-    // the first domain of a restarted process gets the state the previous process left
-    // (MAKEPAD_RUN_RESTORE, read once)
-    static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
     // this run loads the sources as they are: no edit waits for a restart any more
     SOURCES_WAIT.store(false, Ordering::Release);
     clear_restart_pending();
@@ -4789,7 +4790,7 @@ pub extern "C" fn __relax_restart_reason(buf: *mut u8, cap: usize) -> usize {
     })
 }
 
-/// The state the previous process left for this one (MAKEPAD_RUN_RESTORE), read once.
+/// The state the previous run left for this one (MAKEPAD_RUN_RESTORE), read once.
 pub extern "C" fn __relax_restored_state(buf: *mut u8, cap: usize) -> usize {
     crate::jit::host_boundary("__relax_restored_state", move || {
         if crate::domain::current_app_domain().is_some() && crate::domain::current_app_domain() == crate::run::app_domain() {
@@ -4800,8 +4801,7 @@ pub extern "C" fn __relax_restored_state(buf: *mut u8, cap: usize) -> usize {
         if up.is_null() { return usize::MAX; }
         let session = unsafe { crate::jit::unit_session(up) };
         let runtime = &session.runtime;
-        static STATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-        let s = STATE.get_or_init(|| {
+        let s = RESTORED_STATE.get_or_init(|| {
             let p = runtime.restore.clone()?;
             let t = std::fs::read_to_string(&p).ok();
             let _ = std::fs::remove_file(&p);
@@ -4825,17 +4825,21 @@ pub extern "C" fn __relax_hot_load_failed(why: *const u8, len: usize) {
     })
 }
 
-/// The app's restart with its state: the process starts again with it (MAKEPAD_RUN_RESTORE).
-/// Returns only when replacing the process failed.
+/// The app's restart with its state: the next run starts with it (MAKEPAD_RUN_RESTORE). Returns only
+/// when the restart could not start.
 pub extern "C" fn __relax_restart_now(state: *const u8, len: usize) {
     crate::jit::host_boundary("__relax_restart_now", move || {
         let st = unsafe { if state.is_null() { &[][..] } else { std::slice::from_raw_parts(state, len) } };
         // a rebuilt makepad waits: the process restarts into it (or this returns, said why)
         if host::restart_now(st) { return; }
         RESTART_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
-        if let Err(e) = exec_restart(Some(st)) {
-            crate::hot_failure::restart_failed(&e);
-            eprintln!("makepad live: {e}");
+        let why = RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        match next_run(&why, Some(st)) {
+            Ok(()) => crate::run_end::leave(),
+            Err(e) => {
+                crate::hot_failure::restart_failed(&e);
+                eprintln!("makepad live: {e}");
+            }
         }
     })
 }
@@ -5075,32 +5079,44 @@ fn return_address_above(sp: u64, old: &dyn Fn(u64) -> Option<String>) -> Option<
     None
 }
 
-/// Restarts the program to apply `why`: a program that restarts with its state
-/// (std::relax::restart_supported) is asked to at its next safe point and its process starts
-/// again with the state; any other program's process starts again right away (same binary and
-/// command line). The program's sources are compiled by the new run; the loader itself is current
-/// (a change of its own inputs goes through host::request), so nothing is rebuilt. Returns how,
-/// or why it cannot.
+/// `__relax_restored_state`: the state the restart left, read once.
+static RESTORED_STATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Restarts the program to apply `why`, in this process and its window: a program that restarts
+/// with its state (std::relax::restart_supported) is asked to at its next safe point and its next
+/// run starts with the state; any other program's run ends and the next starts right away. The
+/// program's sources are compiled by the new run; the loader itself is current (a change of its own
+/// inputs goes through host::request), so nothing is rebuilt. Returns how, or why it cannot.
 fn restart_in_place(why: String) -> Result<&'static str, String> {
     if crate::harness::live::enabled() {
-        return restart_process(&why).map(|_| "test process restart");
+        return restart_run(&why).map(|_| "test restart");
     }
-    *RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()) = why;
+    *RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()) = why.clone();
     RESTART_CONFIRMED.store(true, std::sync::atomic::Ordering::SeqCst);
     if RESTART_SUPPORTED.load(std::sync::atomic::Ordering::SeqCst) {
         RESTART_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
         wake_program();
         return Ok("restart with the program's state");
     }
-    exec_restart(None).map(|_| "process restart")
+    next_run(&why, None).map(|_| "restart")
 }
 
-/// The process starts again now, same binary and command line, without the app's state (the
-/// app is not asked: a test process of `makepad test --live`, an app stopped at a parked panic or
-/// at an internal compiler error in a call). Returns only on failure.
-pub fn restart_process(why: &str) -> Result<(), String> {
+/// The next run starts now, without the app's state (the app is not asked: a test run of `makepad
+/// test --live`, an app stopped at a parked panic or at an internal compiler error in a call).
+pub fn restart_run(why: &str) -> Result<(), String> {
     *RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()) = why.to_string();
-    exec_restart(None)
+    next_run(why, None)
+}
+
+/// The next run starts, with `state` as the app left it. An app's run ends in this process, which
+/// keeps its window (`run_end`); this returns and the run's end comes to the thread. A run with no
+/// app domain, whose memory is the process's (a terminal program, a test harness), is its process:
+/// that starts again, and this returns only when it could not.
+fn next_run(why: &str, state: Option<&[u8]>) -> Result<(), String> {
+    if crate::run::hosted_run() {
+        return crate::run_end::restart(why.to_string(), state);
+    }
+    exec_restart(state)
 }
 
 /// Failures alone automatically request the same restart as `session relaunch`.
@@ -5166,7 +5182,7 @@ pub fn set_before_exec(prepare: fn() -> Vec<(String, String)>, undo: fn()) {
 }
 
 /// Readies the host's handover for `cmd`, which execs next (its environment is added).
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 pub(crate) fn hand_over(cmd: &mut std::process::Command) {
     let f = *BEFORE_EXEC.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((prepare, _)) = f {
@@ -5177,7 +5193,7 @@ pub(crate) fn hand_over(cmd: &mut std::process::Command) {
 }
 
 /// The exec after [`hand_over`] failed: the host takes its handover back.
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 pub(crate) fn hand_back() {
     let f = *BEFORE_EXEC.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, undo)) = f {
@@ -5185,27 +5201,39 @@ pub(crate) fn hand_back() {
     }
 }
 
-/// The process starts again: the loader binary with the same command line, `state` handed to the
-/// new run (MAKEPAD_RUN_RESTORE). An exec in place; Windows has none, there its parent process starts
-/// the next run (restart_parent.rs). Returns only on failure.
+/// What the next run reads, as a process finds it in its environment (a value, or none): the
+/// recovery on its way, `state` as the app left it, when the edit behind this was saved.
+pub(crate) fn next_run_env(state: Option<&[u8]>) -> Result<Vec<(&'static str, Option<std::ffi::OsString>)>, String> {
+    let recovery = crate::hot_failure::hand_over()?.map(|path| path.into_os_string());
+    let restore = match state {
+        Some(st) => {
+            // (one file, which the next run removes when it reads it: on Windows a run of a process
+            // that starts again has another pid)
+            let path = std::env::temp_dir().join(format!("relax-restart-state-{}", std::process::id()));
+            std::fs::write(&path, st).map_err(|e| format!("cannot write the state: {e}"))?;
+            Some(path.into_os_string())
+        }
+        None => None,
+    };
+    let saved = RESTART_SAVED_MS.load(std::sync::atomic::Ordering::Relaxed).to_string();
+    Ok(vec![("MAKEPAD_JIT_RECOVERY", recovery), ("MAKEPAD_RUN_RESTORE", restore), ("MAKEPAD_RUN_RESTART_T0", Some(saved.into()))])
+}
+
+/// A run with no app domain starts again as a process: the loader binary with the same command
+/// line. An exec in place; Windows has none, there its parent process starts the next run
+/// (restart_parent.rs). Returns only on failure.
 fn exec_restart(state: Option<&[u8]>) -> Result<(), String> {
     #[cfg(any(unix, windows))]
     {
         let exe = host::loader().ok_or("the makepad binary's path is unknown")?;
         let mut cmd = std::process::Command::new(exe);
         cmd.args(crate::harness::live::restart_args(std::env::args_os().skip(1).collect()));
-        crate::hot_failure::prepare_exec(&mut cmd)?;
-        match state {
-            Some(st) => {
-                // (one file, which the next run removes when it reads it: on Windows that run has another pid)
-                let path = std::env::temp_dir().join(format!("relax-restart-state-{}", std::process::id()));
-                std::fs::write(&path, st).map_err(|e| format!("cannot write the state: {e}"))?;
-                cmd.env("MAKEPAD_RUN_RESTORE", &path);
+        for (name, value) in next_run_env(state)? {
+            match value {
+                Some(value) => { cmd.env(name, value); }
+                None => { cmd.env_remove(name); }
             }
-            None => { cmd.env_remove("MAKEPAD_RUN_RESTORE"); }
         }
-        cmd.env("MAKEPAD_RUN_RESTART_T0", RESTART_SAVED_MS.load(std::sync::atomic::Ordering::Relaxed).to_string());
-        restart_begins();
         // the run's end as at exit: compiles stop and this run's code goes into the disk cache,
         // so the restarted run links it instead of compiling it again (exec skips the exit handlers)
         crate::run::summary("restart");
@@ -5213,12 +5241,10 @@ fn exec_restart(state: Option<&[u8]>) -> Result<(), String> {
         crate::tui::exit_code(0);
         crate::tui::finish(false);
         eprintln!("makepad live: restarting ({})", RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()));
-        hand_over(&mut cmd);
         #[cfg(unix)]
         let e = std::os::unix::process::CommandExt::exec(&mut cmd);
         #[cfg(windows)]
         let e = crate::restart_parent::request(&cmd);
-        hand_back();
         Err(format!("restart failed: {e}"))
     }
     #[cfg(not(any(unix, windows)))]
@@ -5698,9 +5724,7 @@ pub fn start_watcher(up: *mut Unit, inputs: Inputs) {
     struct P(*mut Unit);
     unsafe impl Send for P {}
     let p = P(up);
-    let spawned = std::thread::Builder::new()
-        .name("run-live".to_string())
-        .spawn(move || { let _z = crate::zone_alloc::compiler_thread();
+    let spawned = crate::run_threads::spawn("run-live", move || { let _z = crate::zone_alloc::compiler_thread();
             let p = p;
             makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
             // a panic here (the ICE hook is silent on the compiler's owner thread) would end
@@ -5783,9 +5807,10 @@ pub(crate) fn outside_packages<'a>(asked: impl Iterator<Item = &'a str>) -> Vec<
     asked.filter(|p| v.inputs.outside_packages(p, &std_dir)).collect()
 }
 
+static STD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// A source file a live session watches and patches (`own_source`).
 pub(crate) fn own_source_file(prog: &crate::program::Program, file: u32) -> bool {
-    static STD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let std_dir = STD.get_or_init(|| std::env::var("MAKEPAD_RUN_STD").unwrap_or_default());
     prog.file_paths.get(file as usize).is_some_and(|p| own_source(p, std_dir))
 }
@@ -6137,7 +6162,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     // the last two path parts say which crate and file
     let short = |p: &str| -> String { let v: Vec<&str> = p.rsplit('/').take(2).collect(); v.into_iter().rev().collect::<Vec<_>>().join("/") };
     crate::harness::live::wait_initial();
-    loop {
+    crate::run_threads::on_end(watch_events::kick);
+    while !crate::run_threads::ending() {
         crate::hot_failure::pump();
         if crate::hot_failure::recovering() {
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -7648,4 +7674,36 @@ mod commit_tests {
         crate::vfs::set_edits(None);
         let _ = std::fs::remove_dir_all(&edits);
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    host::reset_statics();
+    reset(&EDITED_CRATES, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&RESTART_SUPPORTED, std::sync::atomic::AtomicBool::new(false));
+    reset(&LAYOUT_GROUP, std::sync::atomic::AtomicU32::new(0));
+    reset(&UNIT_SUSPECT, relax_session::sync::Mutex::new(None));
+    reset(&RESTART_REQUESTED, std::sync::atomic::AtomicBool::new(false));
+    reset(&PINNED, std::sync::atomic::AtomicBool::new(false));
+    reset(&CATCH_UP, std::sync::atomic::AtomicBool::new(false));
+    reset(&RETRY_NOW, std::sync::atomic::AtomicBool::new(false));
+    reset(&RESTART_REASON, relax_session::sync::Mutex::new(String::new()));
+    reset(&RESTART_SAVED_MS, std::sync::atomic::AtomicU64::new(0));
+    reset(&DOMAIN_RESTORED, relax_session::sync::Mutex::new(None));
+    reset(&DOMAIN_LOADING, std::sync::atomic::AtomicBool::new(false));
+    reset(&DOMAIN_INPUTS, relax_session::sync::Mutex::new(None));
+    reset(&WATCH_INPUTS, relax_session::sync::Mutex::new(None));
+    reset(&WATCH_GONE, std::sync::atomic::AtomicBool::new(false));
+    reset(&FIRST, std::sync::atomic::AtomicBool::new(true));
+    reset(&PATCH_WAKER, relax_session::sync::Mutex::new(None));
+    reset(&PATCHED, relax_session::sync::Mutex::new(Patched::new()));
+    reset(&RESTORED_STATE, std::sync::OnceLock::new());
+    reset(&UNVERIFIED_PATCHES, std::sync::atomic::AtomicUsize::new(0));
+    reset(&SOURCES_WAIT, std::sync::atomic::AtomicBool::new(false));
+    reset(&RESTART_CONFIRMED, std::sync::atomic::AtomicBool::new(false));
+    reset(&RESTART_PENDING, std::sync::Mutex::new(Vec::new()));
+    reset(&RELAUNCH_ASKED, std::sync::atomic::AtomicBool::new(false));
+    reset(&STREAMS, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&STD, std::sync::OnceLock::new());
 }

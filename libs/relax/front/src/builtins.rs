@@ -151,11 +151,12 @@ pub fn lex_stream(s: &str) -> Option<TokenStream> {
     to_stream(s.as_bytes(), &toks, 0, toks.len().saturating_sub(1), &|_lo, _hi| cs)
 }
 
+static ROOT: std::sync::OnceLock<Option<crate::resolve::FileRoot>> = std::sync::OnceLock::new();
+
 /// The path `file!()` names for source file `path`, as cargo passes it to rustc: a path
 /// package's file under the run's workspace root relative to that root, any other as given
 /// (resolve.rs FileRoot); `Location::caller().file()` and panic locations name the same path.
 pub fn file_macro_path(path: &str) -> String {
-    static ROOT: std::sync::OnceLock<Option<crate::resolve::FileRoot>> = std::sync::OnceLock::new();
     let root = ROOT.get_or_init(|| crate::zone_alloc::kept_with(|| crate::resolve::FileRoot::of(&crate::dirs::workspace_dir())));
     root.as_ref().and_then(|r| r.relative(path)).unwrap_or_else(|| path.to_string())
 }
@@ -2830,4 +2831,12 @@ mod payload_tests {
         assert!(payload_of(b"\0relax-include:").is_none());
         assert!(payload_of(b"\0relax-include:no key and path").is_none());
     }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&BY_DIR, relax_session::sync::Mutex::new(None));
+    reset(&ROOT, std::sync::OnceLock::new());
+    reset(&PAYLOADS, relax_session::sync::Mutex::new(None));
 }

@@ -124,3 +124,11 @@ pub fn cpu_ns() -> u64 {
 
 // This crate's source stamp (build.rs, libs/relax/self_stamp.rs): relax-compiler folds it into the codegen identity.
 include!(concat!(env!("OUT_DIR"), "/src_stamp.rs"));
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub unsafe fn reset_statics() {
+    dbgloc::reset_statics();
+    passes::reset_statics();
+    rir::reset_statics();
+    stats::reset_statics();
+}

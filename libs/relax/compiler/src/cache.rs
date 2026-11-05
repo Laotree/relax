@@ -198,7 +198,7 @@ pub fn verify_front_images() {
         return;
     }
     { let _k = crate::zone_alloc::kept();
-    let _ = std::thread::Builder::new().name("run-cache-verify".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
+    let _ = crate::run_threads::spawn("run-cache-verify", move || { let _z = crate::zone_alloc::compiler_thread();
         makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
         let mut bad: Vec<std::path::PathBuf> = Vec::new();
         for (st, i) in &used {
@@ -355,6 +355,12 @@ pub mod warm_count {
     }
     pub fn get(k: usize) -> u64 {
         N[k].load(Relaxed)
+    }
+
+    /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+    pub(crate) unsafe fn reset_statics() {
+        use relax_session::reset_static as reset;
+        reset(&N, [const { AtomicU64::new(0) }; 46]);
     }
 }
 
@@ -1192,7 +1198,7 @@ impl Cache {
         if mode != Mode::ReadOnly {
             let r = root.clone();
             { let _k = crate::zone_alloc::kept();
-            let _ = std::thread::Builder::new().name("run-cache-prune".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
+            let _ = crate::run_threads::spawn("run-cache-prune", move || { let _z = crate::zone_alloc::compiler_thread();
                 makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
                 let (b, a) = prune_root(&r);
                 if verbose && std::env::var_os("MAKEPAD_RUN_CACHE_TRACE").is_some() && b != a {
@@ -5003,7 +5009,7 @@ static DEFERRED_FRONT: relax_session::sync::Mutex<Vec<DeferredFront>> = relax_se
 pub fn start_deferred_front() {
     if DEFERRED_FRONT.lock().unwrap().is_empty() { return; }
     let _k = crate::zone_alloc::kept();
-    let _ = std::thread::Builder::new().name("run-front-graph".into()).spawn(|| { let _z = crate::zone_alloc::compiler_thread();
+    let _ = crate::run_threads::spawn("run-front-graph", || { let _z = crate::zone_alloc::compiler_thread();
         makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
         let t = std::time::Instant::now();
         let r = flush_front_graphs();
@@ -6245,7 +6251,7 @@ impl FrontWriters {
         self.held = false;
         for _ in 0..crate::preload::jobs() {
             let queue = self.queue.clone();
-            self.workers.push(std::thread::Builder::new().name("run-front-writer".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
+            self.workers.push(crate::run_threads::spawn("run-front-writer", move || { let _z = crate::zone_alloc::compiler_thread();
                 // the records written after the first present must not slow the first frames
                 if low { makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND); }
                 let (queue, wake) = &*queue;
@@ -9203,3 +9209,23 @@ pub(crate) static THUNK_DECODE_NS: std::sync::atomic::AtomicU64 = std::sync::ato
 /// Entries recorded so far, in every store (a reader that saw no new one need not ask the owner
 /// for `pending_bytes` again: run.rs spill_cache).
 pub static RECORDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    warm_count::reset_statics();
+    reset(&FRONT_USED, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&WRITTEN, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&TRACE, relax_session::sync::Mutex::new(None));
+    reset(&FRONT_GRAPH_WRITES, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&DEFERRED_FRONT, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&THUNK_DECODED, std::sync::atomic::AtomicU64::new(0));
+    reset(&THUNK_DECODE_NS, std::sync::atomic::AtomicU64::new(0));
+}
+
+/// The mappings of the stores: last of what a run held, since what the run's tables are views of
+/// lives in them (`run_end`).
+pub(crate) unsafe fn reset_stores() {
+    front_run::reset_statics();
+    relax_session::reset_static(&FRONT_STORES, relax_session::sync::Mutex::new(Vec::new()));
+}

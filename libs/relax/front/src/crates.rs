@@ -565,3 +565,9 @@ fn a_package_crate_never_keeps_a_sysroot_name() {
     }
     assert_eq!(own_crate_name("alloc_menu".to_string()), "alloc_menu");
 }
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&CRATE_ENV, relax_session::sync::Mutex::new(Vec::new()));
+}

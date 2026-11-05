@@ -121,6 +121,7 @@ mod first_frame;
 pub mod hot_failure;
 #[cfg(any(windows, test))]
 pub mod restart_parent;
+pub mod run_end;
 mod harness;
 mod test_pkg;
 pub mod tui;
@@ -1307,4 +1308,38 @@ fn round18_rpit_diagnostic() {
     eprintln!("{all}");
     assert!(output.status.success());
     assert!(all.contains("test result: 10 passed; 0 failed"), "{all}");
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub unsafe fn reset_statics() {
+    cache::reset_statics();
+    check::reset_statics();
+    coverage::reset_statics();
+    domain::reset_statics();
+    domain_res::reset_statics();
+    first_frame::reset_statics();
+    front::reset_statics();
+    harness::reset_statics();
+    hot_failure::reset_statics();
+    inspect::reset_statics();
+    invalid::reset_statics();
+    jit::reset_statics();
+    mainprof::reset_statics();
+    modules::reset_statics();
+    native_macros::reset_statics();
+    os::reset_statics();
+    owner::reset_statics();
+    pmhost::reset_statics();
+    postframe::reset_statics();
+    provided::reset_statics();
+    reload::reset_statics();
+    run::reset_statics();
+    sandbox::reset_statics();
+    stale::reset_statics();
+    syms::reset_statics();
+    tui::reset_statics();
+    typeck_bg::reset_statics();
+    wasm_export::reset_statics();
+    web::reset_statics();
+    web32::reset_statics();
 }

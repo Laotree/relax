@@ -6402,3 +6402,15 @@ mod deferred_load_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&RECORD_IMPORT_USES, std::sync::atomic::AtomicBool::new(false));
+    reset(&SHARED_STD, relax_session::sync::Mutex::new(None));
+    reset(&SHARING, std::sync::atomic::AtomicBool::new(false));
+    reset(&WORLD_WAITERS, std::sync::atomic::AtomicUsize::new(0));
+    reset(&PARSE_AGAIN, std::sync::atomic::AtomicU64::new(0));
+    reset(&COLLECTING, std::sync::atomic::AtomicBool::new(false));
+    reset(&COLLECT_MISSES, relax_session::sync::Mutex::new(Vec::new()));
+}

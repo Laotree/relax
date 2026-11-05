@@ -41,7 +41,7 @@ pub fn start(up: *mut Unit, root: u32, main: Option<DefId>) {
     let _k = crate::zone_alloc::kept();
     RUNNING.store(true, Ordering::Release);
     // (typeck recurses deeply on big bodies: the check workers' stack)
-    let spawned = std::thread::Builder::new().name("run-typeck-bg".into()).stack_size(256 << 20).spawn(move || {
+    let spawned = crate::run_threads::spawn_sized("run-typeck-bg", 256 << 20, move || {
         let _z = crate::zone_alloc::compiler_thread();
         // ended however it ends (done, the run stopping, a panic)
         struct Ended;
@@ -244,4 +244,11 @@ fn named_fns(prog: &Program, b: &Body) -> Vec<DefId> {
     }).collect();
     out.extend(b.methods.values().chain(b.binops.values()).map(|m| m.def));
     out
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&STATS, [const { AtomicU64::new(0) }; 5]);
+    reset(&RUNNING, AtomicBool::new(false));
 }

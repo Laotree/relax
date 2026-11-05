@@ -151,7 +151,7 @@ pub(super) extern "C" fn take_fault() -> u32 { FAULT.with(|f| f.replace(false)) 
 pub(crate) fn restart(mut edit: Edit, why: &str) {
     edit.restarted = true;
     LIVE.get().unwrap().0.lock().unwrap().edit = edit;
-    if let Err(e) = crate::reload::restart_process(why) {
+    if let Err(e) = crate::reload::restart_run(why) {
         eprintln!("makepad test: {e}");
         crate::hot_failure::restart_failed(&e);
         crate::hot_failure::pump();
@@ -173,4 +173,10 @@ pub(crate) fn restart_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsStr
         if w == "--harness-restart" { words.next(); } else { out.push(w); }
     }
     out
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&LIVE, OnceLock::new());
 }
