@@ -6316,7 +6316,13 @@ impl Unit {
         }
         let def = self.prog.def(d);
         let (file, pos) = (def.file, self.prog.files[def.file as usize].ast.item(def.item).lo);
-        let site = self.site(file, pos, &format!("foreign function `{}` is not available on this host -- cfg the call out or link its library", name));
+        // std's own runtime calls: nothing to cfg out or link, this JIT and std are of different trees
+        let why = if name.starts_with("__relax_") {
+            format!("this JIT has no `{}`, which the std at {} calls: they come from different trees", name, crate::std_dir())
+        } else {
+            format!("foreign function `{}` is not available on this host -- cfg the call out or link its library", name)
+        };
+        let site = self.site(file, pos, &why);
         // no-codegen: an interpreted stub makes the same call (the precompiled glue has no
         // per-site code)
         let a = if self.prog.session.options.no_codegen {

@@ -786,8 +786,10 @@ pub fn std_dir() -> String {
     concat!(env!("CARGO_MANIFEST_DIR"), "/std").to_string()
 }
 
-/// Where std's sources may be, in order: the workspace's own (when it is a makepad checkout),
-/// beside the binary's target dir, under <dir>/src, and the tree the binary was built from.
+/// Where std's sources may be, in order: the workspace's own or that of the makepad checkout it
+/// lies in (apps/commercial builds against the tree around it), beside the binary's target dir,
+/// under <dir>/src, and the tree the binary was built from. The workspace's tree comes first: a
+/// lease's binary matches the lease's tree, and the tree beside it may have moved on since.
 pub fn std_candidates(workspace: Option<&str>) -> Vec<String> {
     let mut d = std::env::current_exe().unwrap_or_default();
     for _ in 0..3 {
@@ -795,12 +797,27 @@ pub fn std_candidates(workspace: Option<&str>) -> Vec<String> {
     }
     let mut v: Vec<String> = Vec::new();
     if let Some(w) = workspace {
-        v.push(format!("{}/libs/relax/compiler/std", w));
+        for dir in std::path::Path::new(w).ancestors() {
+            v.push(format!("{}/libs/relax/compiler/std", dir.display()));
+        }
     }
     v.push(format!("{}/libs/relax/compiler/std", d.display()));
     v.push(format!("{}/src/libs/relax/compiler/std", d.display()));
     v.push(concat!(env!("CARGO_MANIFEST_DIR"), "/std").to_string());
     v
+}
+
+#[cfg(test)]
+#[test]
+fn a_workspace_inside_a_checkout_takes_that_checkouts_std_before_the_one_beside_the_binary() {
+    let v = std_candidates(Some("/t/lane/apps/commercial"));
+    let at = |c: &str| v.iter().position(|x| x == c);
+    let mut beside = std::env::current_exe().unwrap();
+    for _ in 0..3 {
+        beside.pop();
+    }
+    assert_eq!(at("/t/lane/apps/commercial/libs/relax/compiler/std"), Some(0));
+    assert!(at("/t/lane/libs/relax/compiler/std").unwrap() < at(&format!("{}/libs/relax/compiler/std", beside.display())).unwrap(), "{v:?}");
 }
 
 /// Loads core, alloc (when present) and std; returns core and the dependency list user crates
