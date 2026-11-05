@@ -72,6 +72,14 @@ const RESERVE: usize = N * CHUNK;
 const NONE: usize = usize::MAX;
 // Compatible with 4/16/64 KB OS pages and Windows allocation granularity.
 const PAGE: usize = 64 << 10;
+/// What a small chunk commits at first (a slot of any class fits). Windows charges a committed page
+/// whether or not it is ever touched, and a thread has one chunk per size class it has used: Fab's
+/// 31 program threads held 1.38 GB of chunks with 45 MB touched (a pool worker: 17 chunks, 108 KB).
+/// A chunk carved past this commits the rest at once: at most one more call per chunk. Elsewhere
+/// only touched pages count, so a chunk commits whole.
+const FIRST_COMMIT: usize = if cfg!(windows) { 1 << MAX_SHIFT } else { CHUNK };
+// A warm chunk was never carved past its first commit, so it serves any class as it is.
+const _: () = assert!(WARM_TOUCHED_MAX <= FIRST_COMMIT);
 
 /// Slow-path event counts (relaxed; the fast paths count nothing): contended lock acquisitions,
 /// scheduler yields while waiting, commits, decommits, partial-list pushes and pops.
@@ -477,6 +485,8 @@ struct Owned {
     live: AtomicUsize,
     /// The arena's trim epoch this chunk's owner last looked at (`owned_tick`)
     trim_seen: usize,
+    /// How far the bump may go without committing more (`State::committed`)
+    limit: usize,
 }
 /// Compiler arena: a chunk is attached to at most one thread, the one that has it as its current
 /// chunk for the class (`remote != NONE` while attached). That thread allocates and frees its own
@@ -494,7 +504,6 @@ struct Chunk {
     /// lock may read it: the owner's thread-local record outlives its attached chunks (a thread
     /// hands every chunk back before its thread-locals go, DomainExitGuard).
     owner_quiet: AtomicUsize,
-    _line: [usize; 1],
     remote: AtomicUsize, // NONE: detached (and closes publication during handoff)
     remote_bytes: AtomicUsize,
     live: AtomicUsize,
@@ -1010,7 +1019,7 @@ impl Arena {
     /// and the remote list opens. Called with the chunk's lock held.
     unsafe fn attach(&self, h: &Chunk, s: &State) {
         // (a chunk taken from the lists had its free pages released there: no trim before the next epoch)
-        *h.owned.get() = Owned { free: s.free, bump: AtomicUsize::new(s.bump), stride: s.stride, live: AtomicUsize::new(h.live.load(Ordering::Relaxed)), trim_seen: self.trim_epoch.load(Ordering::Relaxed) };
+        *h.owned.get() = Owned { free: s.free, bump: AtomicUsize::new(s.bump), stride: s.stride, live: AtomicUsize::new(h.live.load(Ordering::Relaxed)), limit: s.committed, trim_seen: self.trim_epoch.load(Ordering::Relaxed) };
         if self.dynamic {
             let q = DOMAIN.try_with(|t| &t.quiet as *const AtomicU8 as usize).unwrap_or(0);
             h.owner_quiet.store(q, Ordering::Relaxed);
@@ -1120,7 +1129,7 @@ impl Arena {
     /// which a program at rest gets only when something compiles (Fab kept them through hours of
     /// edits).
     unsafe fn trim_detached(&self, index: usize, s: &mut State, live: usize) {
-        if s.stride == 0 || s.committed != CHUNK || s.bump < OWNED_TRIM_MIN || live * s.stride * 4 >= s.bump || live * 2 > s.trim_live {
+        if s.stride == 0 || s.committed == 0 || s.bump < OWNED_TRIM_MIN || live * s.stride * 4 >= s.bump || live * 2 > s.trim_live {
             return;
         }
         s.trim_live = live;
@@ -1578,7 +1587,7 @@ impl Arena {
     unsafe fn from_partial(&self, i: usize, stride: usize, class: usize, accounted: usize, attach: bool) -> *mut u8 {
         let h = &self.headers[i];
         let mut s = lock(&h.state);
-        if s.stride != stride || s.committed != CHUNK || s.released || s.attached {
+        if s.stride != stride || s.committed == 0 || s.released || s.attached {
             return null_mut(); // reused for something else since it was listed
         }
         let p = if s.free != 0 {
@@ -1586,6 +1595,9 @@ impl Arena {
             s.free = *(p as *const usize);
             p
         } else if s.bump + s.stride <= CHUNK {
+            if s.bump + s.stride > s.committed && !self.commit_rest(i, &mut s) {
+                return null_mut();
+            }
             let p = (self.base.load(Ordering::Relaxed) + i * CHUNK + s.bump) as *mut u8;
             s.bump += s.stride;
             p
@@ -1634,6 +1646,9 @@ impl Arena {
             s.free = *(p as *const usize);
             p
         } else if s.bump + s.stride <= CHUNK {
+            if s.bump + s.stride > s.committed && !self.commit_rest(c.index, &mut s) {
+                return null_mut();
+            }
             let p = (self.base.load(Ordering::Relaxed) + c.index * CHUNK + s.bump) as *mut u8;
             s.bump += s.stride;
             p
@@ -1658,7 +1673,7 @@ impl Arena {
             p
         } else {
             let b = o.bump.load(Ordering::Relaxed);
-            if b + o.stride > CHUNK || h.remote.load(Ordering::Relaxed) != 0 {
+            if b + o.stride > o.limit || h.remote.load(Ordering::Relaxed) != 0 {
                 return self.pop_owned_slow(index, class, accounted);
             }
             o.bump.store(b + o.stride, Ordering::Relaxed);
@@ -1667,6 +1682,30 @@ impl Arena {
         o.live.store(o.live.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
         h.account.store(h.account.load(Ordering::Relaxed).wrapping_add(accounted), Ordering::Relaxed);
         p as *mut u8
+    }
+    /// Small chunk `index` (its lock held) commits the rest of itself. False: the OS refused.
+    #[cold]
+    #[inline(never)]
+    unsafe fn commit_rest(&self, index: usize, s: &mut State) -> bool {
+        let at = self.base.load(Ordering::Relaxed) + index * CHUNK + s.committed;
+        if !os::commit(at as *mut u8, CHUNK - s.committed) {
+            return false;
+        }
+        event(E_COMMIT);
+        self.committed.fetch_add(CHUNK - s.committed, Ordering::Relaxed);
+        s.committed = CHUNK;
+        true
+    }
+    /// The owner's next carve from its chunk `index` is committed. False: the OS refused (the chunk
+    /// goes back, and the alloc takes the path that reports it).
+    unsafe fn commit_owned(&self, index: usize, h: &Chunk, o: &mut Owned) -> bool {
+        if o.bump.load(Ordering::Relaxed) + o.stride <= o.limit {
+            return true;
+        }
+        let mut s = lock(&h.state);
+        let ok = self.commit_rest(index, &mut s);
+        o.limit = s.committed;
+        ok
     }
     /// `pop_owned` with an empty owned list: the blocks other threads freed first, then the bump;
     /// a full chunk goes back (later frees into it make it listable) and the thread moves on.
@@ -1686,7 +1725,7 @@ impl Arena {
         let p = if p != 0 {
             o.free = *(p as *const usize);
             p
-        } else if o.bump.load(Ordering::Relaxed) + o.stride <= CHUNK {
+        } else if o.bump.load(Ordering::Relaxed) + o.stride <= CHUNK && self.commit_owned(index, h, o) {
             let b = o.bump.load(Ordering::Relaxed);
             o.bump.store(b + o.stride, Ordering::Relaxed);
             self.base.load(Ordering::Relaxed) + index * CHUNK + b
@@ -1735,7 +1774,7 @@ impl Arena {
                     o.free = *(p as *const usize);
                 } else {
                     let b = o.bump.load(Ordering::Relaxed);
-                    if b + o.stride > CHUNK || h.remote.load(Ordering::Relaxed) != 0 {
+                    if b + o.stride > o.limit || h.remote.load(Ordering::Relaxed) != 0 {
                         return alloc_in_slow(size, l.align(), self);
                     }
                     o.bump.store(b + o.stride, Ordering::Relaxed);
@@ -1929,7 +1968,7 @@ impl Arena {
             }
         }
         let committed = if small {
-            CHUNK
+            FIRST_COMMIT
         } else {
             match l.size().checked_add(PAGE - 1) {
                 Some(n) => n & !(PAGE - 1),
@@ -2229,7 +2268,7 @@ impl Arena {
         s.released = true;
         // Released chunks cannot be reached through an old current slot, even while their
         // pages stay warm; only a new generation may allocate from them.
-        if s.stride != 0 && s.committed == CHUNK && s.order == 0 && s.bump <= WARM_TOUCHED_MAX {
+        if s.stride != 0 && s.committed != 0 && s.order == 0 && s.bump <= WARM_TOUCHED_MAX {
             let touched = s.bump;
             drop(s);
             if self.warm_put(index, touched) {
@@ -2366,7 +2405,7 @@ impl Arena {
         for index in 0..N {
             let h = &self.headers[index];
             let mut s = lock(&h.state);
-            if (COMPILER && s.attached) || s.stride == 0 || s.committed != CHUNK || h.live.load(Ordering::Relaxed) == 0 || s.free == 0 {
+            if (COMPILER && s.attached) || s.stride == 0 || s.committed == 0 || h.live.load(Ordering::Relaxed) == 0 || s.free == 0 {
                 continue;
             }
             let chunk = base + index * CHUNK;
