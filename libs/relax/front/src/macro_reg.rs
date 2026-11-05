@@ -564,7 +564,8 @@ pub fn set_build_outputs(sess: &std::sync::Arc<crate::Session>, units: &[CrateUn
             }
             for (ui, u) in reg.units.iter_mut().enumerate() {
                 if u.name == c.name && u.harness == c.harness {
-                    if let Some(cs) = cfgs.get(ci) {
+                    let host_outputs = c.host.as_ref().and_then(|h| h.build_outputs.as_ref());
+                    if let Some(cs) = host_outputs.map(|o| &o.0).or_else(|| cfgs.get(ci)) {
                         if u.cfgs != *cs {
                             u.cfgs = cs.clone();
                             if u.proc_macro {
@@ -572,7 +573,7 @@ pub fn set_build_outputs(sess: &std::sync::Arc<crate::Session>, units: &[CrateUn
                             }
                         }
                     }
-                    if let Some(ev) = env.get(ci) {
+                    if let Some(ev) = host_outputs.map(|o| &o.1).or_else(|| env.get(ci)) {
                         u.env = ev.clone();
                     }
                 }

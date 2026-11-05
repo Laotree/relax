@@ -6560,7 +6560,13 @@ impl Unit {
         let f = &self.prog.files[def.file as usize];
         for a in f.ast.list(f.ast.item(def.item).attrs) {
             if a.toks.hi >= a.toks.lo + 3 && f.tok_text(a.toks.lo) == "link_name" && f.tok_text(a.toks.lo + 1) == "=" {
-                return f.tok_text(a.toks.lo + 2).trim_matches('"').to_string();
+                let name = crate::lit::unescape_str(f.tok_text(a.toks.lo + 2));
+                // LLVM's leading SOH requests an exact object-file symbol. Our lookups use
+                // C names, so undo Mach-O's ABI prefix only for these exact names.
+                if let Some(exact) = name.strip_prefix('\u{1}') {
+                    return crate::global_asm::c_name(exact).to_string();
+                }
+                return name;
             }
         }
         self.prog.name(d).to_string()

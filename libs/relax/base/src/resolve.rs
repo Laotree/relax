@@ -1796,7 +1796,7 @@ pub struct GraphUnit {
     pub name: String,
     pub src_path: String,
     pub edition: String,
-    /// a host-side unit (build-dependency / proc-macro side: cargo's opt-level 0 copy)
+    /// a host-side unit (build-dependency / proc-macro side)
     pub host: bool,
     /// build | run-custom-build
     pub mode: String,
@@ -1829,7 +1829,7 @@ impl Units {
         };
         let s = |x: Option<&crate::json::Json>| x.map(|v| v.str().to_string()).unwrap_or_default();
         let list = |x: Option<&crate::json::Json>| x.map(|v| v.arr().iter().map(|s| s.str().to_string()).collect()).unwrap_or_default();
-        let units = units
+        let mut units: Vec<GraphUnit> = units
             .iter()
             .map(|u| {
                 let t = u.get("target");
@@ -1839,7 +1839,7 @@ impl Units {
                     name: s(t.and_then(|t| t.get("name"))),
                     src_path: s(t.and_then(|t| t.get("src_path"))),
                     edition: s(t.and_then(|t| t.get("edition"))),
-                    host: u.get("profile").and_then(|p| p.get("opt_level")).map(|o| o.str() == "0").unwrap_or(false) || matches!(u.get("relax_host"), Some(crate::json::Json::Bool(true))),
+                    host: matches!(u.get("relax_host"), Some(crate::json::Json::Bool(true))),
                     mode: s(u.get("mode")),
                     harness: u.get("mode").is_some_and(|m| m.str() == "test"),
                     sysroot: false,
@@ -1848,6 +1848,17 @@ impl Units {
                 }
             })
             .collect();
+        // Cargo may optimize host dependencies and may leave target dependencies
+        // unoptimized. Their compilation side follows edges from proc macros and
+        // build scripts, independently of either profile or target triple.
+        let mut pending: Vec<usize> = units.iter().enumerate().filter_map(|(i, u)|
+            (u.host || u.kind.iter().any(|k| matches!(k.as_str(), "proc-macro" | "custom-build"))).then_some(i)).collect();
+        let mut seen = vec![false; units.len()];
+        while let Some(i) = pending.pop() {
+            if i >= units.len() || std::mem::replace(&mut seen[i], true) { continue; }
+            units[i].host = true;
+            pending.extend(units[i].deps.iter().map(|d| d.0));
+        }
         let roots = j.get("roots").map(|r| r.arr().iter().map(|x| x.num() as usize).collect()).unwrap_or_default();
         Ok(Units { units, roots, bins: Vec::new() })
     }

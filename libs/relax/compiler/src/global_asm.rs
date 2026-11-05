@@ -225,7 +225,7 @@ fn place_all(u: &Unit) -> Result<HashMap<String, u64>, String> {
 
 /// The C name of an assembly symbol: Mach-O prefixes C names with `_` (dlsym, extern blocks and
 /// `#[no_mangle]` know them without it).
-fn c_name(n: &str) -> &str {
+pub(crate) fn c_name(n: &str) -> &str {
     if cfg!(target_vendor = "apple") {
         n.strip_prefix('_').unwrap_or(n)
     } else {
