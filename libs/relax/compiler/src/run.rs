@@ -547,6 +547,8 @@ pub(crate) fn resolve_package(
     } else { None };
     let units = if let Some((_, _, units)) = pre.filter(|(p, f, _)| units_json.is_empty() && p == package && f == cargo_flags) {
         Ok(units)
+    } else if units_json.is_empty() && check_only {
+        unitgraph::check_unit_graph(sess, workspace, package, cargo_flags)
     } else if units_json.is_empty() {
         unitgraph::unit_graph(sess, workspace, package, cargo_flags)
     } else {
