@@ -25622,6 +25622,11 @@ mod front_yield_tests {
         let handles = (0..jobs).map(|i| {
             let (admitted, go, left) = (admitted.clone(), go.clone(), left.clone());
             std::thread::spawn(move || {
+                // (the wait's own code compiled first: under the JIT a thread waiting for a compile
+                // lends its token, and the build would get it)
+                admitted.fetch_add(0, Ordering::SeqCst);
+                let _ = go.load(Ordering::SeqCst);
+                std::thread::yield_now();
                 let permit = budget::admit(budget::VISIBLE, budget::APP, "a pool job");
                 admitted.fetch_add(1, Ordering::SeqCst);
                 while !go.load(Ordering::SeqCst) {
@@ -25656,20 +25661,82 @@ mod front_yield_tests {
         (handles, left)
     }
 
+    /// Other compile jobs up to the JIT's floor, so the build is past it: a Visible job waiting for a
+    /// token takes the build's at its checkpoint, and the build needs another. (Below the floor it
+    /// keeps its token: `a_build_below_the_jit_floor_finishes_and_the_last_job_runs_after_it`.)
+    fn compile_jobs_at_the_floor(stop: &std::sync::Arc<AtomicBool>) -> (Vec<std::thread::JoinHandle<()>>, Vec<u64>) {
+        (0..makepad_cpu_budget::jit_floor().max(1)).map(|_| other_compile_job(stop.clone())).unzip()
+    }
+
+    /// With the JIT short of its floor, Visible work leaves it the token: the build keeps its own
+    /// through its checkpoints and finishes while a job waits for a token, and the job then runs. The
+    /// build waits for nothing that job holds, so this is no hang.
+    #[test]
+    fn a_build_below_the_jit_floor_finishes_and_the_last_job_runs_after_it() {
+        isolated_test!(a_build_below_the_jit_floor_finishes_and_the_last_job_runs_after_it);
+        use makepad_cpu_budget as budget;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        // (a small machine has no floor for the build to be below)
+        if budget::jit_floor() < 2 {
+            return;
+        }
+        let (u, f, _, path) = two_fn_unit("budget_floor");
+        let up = &*u as *const Unit as usize;
+        let jobs = budget::limit() as usize - 1;
+        let stop = Arc::new(AtomicBool::new(false));
+        let (other, _) = other_compile_job(stop.clone());
+        BACK_END_GATE.store(1, Ordering::SeqCst);
+        queue::spec(up, f);
+        reached("the build at its gate", || BACK_END_GATE.load(Ordering::SeqCst) == 2);
+        let (admitted, done) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
+        let handles: Vec<_> = (0..jobs).map(|_| {
+            let (admitted, done) = (admitted.clone(), done.clone());
+            std::thread::spawn(move || {
+                // (compiled before it holds a token, as in `jobs_on_every_token`)
+                admitted.fetch_add(0, Ordering::SeqCst);
+                let _ = done.load(Ordering::SeqCst);
+                std::thread::yield_now();
+                let permit = budget::admit(budget::VISIBLE, budget::APP, "a pool job");
+                admitted.fetch_add(1, Ordering::SeqCst);
+                while !done.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                budget::release(permit);
+            })
+        }).collect();
+        reached("the last job waiting for a token", || budget::tokens().waiting.iter().any(|w| w.class == budget::VISIBLE && w.client == budget::APP));
+        BACK_END_GATE.store(0, Ordering::SeqCst);
+        // (the jobs keep their tokens until the end: a build that gave its own up would stand still here)
+        reached("the build finished on its own token", || queue::running_class(up, f).is_none());
+        reached("the last job running after it", || admitted.load(Ordering::SeqCst) >= jobs);
+        done.store(true, Ordering::SeqCst);
+        for job in handles {
+            job.join().unwrap();
+        }
+        stop.store(true, Ordering::SeqCst);
+        other.join().unwrap();
+        assert!(u.fns[f as usize].build_err.is_none(), "{:?}", u.fns[f as usize].build_err);
+        // (the isolated process owns the runtime globals)
+        std::mem::forget(u);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn jobs_on_every_token_do_not_hang_on_a_build_that_needs_one() {
         isolated_test!(jobs_on_every_token_do_not_hang_on_a_build_that_needs_one);
         use std::sync::Arc;
         let (u, f, g, path) = two_fn_unit("budget_lock");
         let up = &*u as *const Unit as usize;
-        let tokens = makepad_cpu_budget::limit() as usize;
-        assert!(makepad_cpu_budget::background_limit() >= 2, "this needs the build and the other compile job in Background");
+        let floor = makepad_cpu_budget::jit_floor().max(1);
+        let jobs_beside = makepad_cpu_budget::limit() as usize - floor as usize;
+        assert!(makepad_cpu_budget::background_limit() > floor, "this needs the build and the other compile jobs in Background");
         // every job calls: they sleep without their tokens, and the build gets one. The registry's
         // chain says so when it does not: a plain failure, as it stands still. (A second of age: a
         // job between its wait's row and giving its token up looks stuck for that moment.)
         let stop = Arc::new(AtomicBool::new(false));
-        let (other, _) = other_compile_job(stop.clone());
-        let (jobs, left) = jobs_on_every_token(up, f, tokens - 1, tokens - 1);
+        let (others, _) = compile_jobs_at_the_floor(&stop);
+        let (jobs, left) = jobs_on_every_token(up, f, jobs_beside, jobs_beside);
         while left.load(Ordering::SeqCst) != 0 {
             if let Some(chain) = crate::inspect::budget_deadlock(1_000_000_000) {
                 panic!("deadlock: {chain}");
@@ -25680,15 +25747,15 @@ mod front_yield_tests {
             assert_ne!(job.join().unwrap(), 0);
         }
         stop.store(true, Ordering::SeqCst);
-        other.join().unwrap();
+        others.into_iter().for_each(|other| other.join().unwrap());
         assert!(u.fns[f as usize].build_err.is_none(), "{:?}", u.fns[f as usize].build_err);
         // one job calls and the others run on: only its token comes free, and Background is not let
         // in below its limit. The build takes the class of who waits for it.
         let stop = Arc::new(AtomicBool::new(false));
-        let (other, other_thread) = other_compile_job(stop.clone());
-        let (jobs, left) = jobs_on_every_token(up, g, tokens - 1, 1);
+        let (others, other_threads) = compile_jobs_at_the_floor(&stop);
+        let (jobs, left) = jobs_on_every_token(up, g, jobs_beside, 1);
         let building = BACK_END_THREAD.load(Ordering::SeqCst);
-        let waiter = || crate::waits::snapshot().into_iter().find(|w| w.thread != other_thread && w.holder == building && matches!(w.kind, crate::waits::Kind::Pump | crate::waits::Kind::Build)).map(|w| (w.thread, w.since_ns));
+        let waiter = || crate::waits::snapshot().into_iter().find(|w| !other_threads.contains(&w.thread) && w.holder == building && matches!(w.kind, crate::waits::Kind::Pump | crate::waits::Kind::Build)).map(|w| (w.thread, w.since_ns));
         while left.load(Ordering::SeqCst) != 0 {
             // (the same wait before and after: its promotion stands while the class is read)
             let before = waiter();
@@ -25704,7 +25771,7 @@ mod front_yield_tests {
             assert_ne!(job.join().unwrap(), 0);
         }
         stop.store(true, Ordering::SeqCst);
-        other.join().unwrap();
+        others.into_iter().for_each(|other| other.join().unwrap());
         assert!(u.fns[g as usize].build_err.is_none(), "{:?}", u.fns[g as usize].build_err);
         assert!(makepad_cpu_budget::tokens().holders.iter().all(|h| h.client != makepad_cpu_budget::APP), "the jobs' permits are released, none lent");
         // (the isolated process owns the runtime globals)

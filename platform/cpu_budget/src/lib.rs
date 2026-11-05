@@ -595,6 +595,9 @@ pub fn limit() -> u32 { global().limit as u32 }
 /// How many Background jobs run at once.
 #[relax_api]
 pub fn background_limit() -> u32 { global().background_limit as u32 }
+/// How many of the JIT's Background jobs Visible work leaves room for: `JIT_FLOOR`, on this machine.
+#[relax_api]
+pub fn jit_floor() -> u32 { global().jit_floor as u32 }
 
 /// The budget's native park token. JIT and native std have different thread-local
 /// parkers; queue notifications and admission notifications must wake the same one.
