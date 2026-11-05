@@ -21,7 +21,9 @@
 //! - A static laid out after a domain exists is copied into every live block (`materialize`).
 //! - Threads: a thread JIT code starts inherits its parent's base (std's thread start calls
 //!   `relax_domain_base` / `relax_domain_enter`); `call_jit` runs in the unit's domain 0; a
-//!   thread that native code starts gets the runtime unit's compile domain from `rt_tls_block`.
+//!   thread that native code starts gets the runtime unit's compile domain from `rt_tls_block`,
+//!   and its calls into the program (`jit::app_call`) run in the run's app domain (`RUN_SCOPE`)
+//!   unless a scope put it in a domain (`foreign_enter`).
 //!
 //! A constant's value is shared read-only data, but one that points at a static (`const C:
 //! &AtomicU32 = &S`), or at other per-domain data, directly or through data it points to, would
@@ -228,6 +230,18 @@ pub fn foreign_scope_of(base: u64) -> u64 {
     let heap = domains().iter().find(|d| d.info.base == base && base != 0)
         .and_then(|d| d.heap.as_deref()).map_or(std::ptr::null(), |h| crate::zone_alloc::domain::raw(h));
     scope_record(base, heap)
+}
+
+/// The run's app domain (`run::app_domain`) as a `foreign_scope` record, for a call native code
+/// makes on a thread that is in no domain (`jit::app_call`: a waker, a UI router, any callback
+/// passed on with no scope of its own). 0: no app domain launched, a program run directly is in
+/// the compile domain itself. A record of a run that ended enters nothing (`destroy`).
+static RUN_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `RUN_SCOPE`: no lock, a realtime thread reads it.
+#[inline]
+pub(crate) fn run_scope() -> u64 {
+    RUN_SCOPE.load(std::sync::atomic::Ordering::Acquire)
 }
 
 fn scope_record(base: u64, heap: *const ()) -> u64 {
@@ -1511,6 +1525,10 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
 }
 
 fn launch_main(upn: usize, id: DomainId, base: u64, target: u64, arg: u64, package: &str, around: Option<Around>) -> Result<std::thread::JoinHandle<()>, String> {
+    if crate::run::app_domain() == Some(id) {
+        // (its block and heap are in the registry: a native thread's call finds them from now)
+        RUN_SCOPE.store(foreign_scope_of(base), std::sync::atomic::Ordering::Release);
+    }
     let token = relax_domain_reserve(base);
     let name = format!("domain-{id}-{package}");
     if let Some(d) = domains().iter_mut().find(|d| d.info.id == id) {
@@ -1986,4 +2004,5 @@ pub(crate) unsafe fn reset_statics() {
     reset(&DOMAINS, Mutex::new(Vec::new()));
     reset(&TLS_KEYS, Mutex::new(Vec::new()));
     reset(&LOADED, Mutex::new(Vec::new()));
+    reset(&RUN_SCOPE, std::sync::atomic::AtomicU64::new(0));
 }

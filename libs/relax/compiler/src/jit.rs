@@ -2284,8 +2284,10 @@ pub(crate) fn kick_app_callers(bases: &[u64]) -> bool {
 
 /// Native code calls JIT code through this, whatever thread it is on (`makepad_relax_api::app_call`).
 /// `thunk(data)` runs under a recovery point of its own: false when the run ended under it, and all
-/// the caller's frames go on from here with what they hold. Realtime safe: no lock, no allocation.
-/// A panic in the callback is the abort of any `extern "C"` callback.
+/// the caller's frames go on from here with what they hold. On a thread in no domain the call is
+/// the run's app's: its statics, its heap (a thread a scope put in a domain stays in that one).
+/// Realtime safe: no lock, no allocation. A panic in the callback is the abort of any `extern "C"`
+/// callback.
 pub fn app_call(thunk: unsafe extern "C" fn(*mut u8), data: *mut u8) -> bool {
     let enter = APP_ENTER.load(Ordering::Acquire);
     // (out of an op: JIT code and the runtime it calls run in the kept phase)
@@ -2296,6 +2298,13 @@ pub fn app_call(thunk: unsafe extern "C" fn(*mut u8), data: *mut u8) -> bool {
             thunk(data);
             return true;
         }
+        // a thread in no domain (native code started it: a device's, the inspect server's; a scope
+        // put none around the call) is in the compile domain (`rt_tls_block`), whose statics and
+        // heap are not the app's: the call runs in the run's app domain and leaves it after
+        let b = tls_block_if_any();
+        let here = if b == 0 { 0 } else { *(b as *const u64) };
+        let none = here == 0 || here == crate::domain::default_base();
+        let scoped = crate::domain::foreign_enter(if none { crate::domain::run_scope() } else { 0 });
         let e = END_CTX.with(|c| c.get() as *mut u64);
         let saved = [*e, *e.add(1)];
         let over = APP_CALL_OVER.with(|o| o.replace(*ctx_ptr()));
@@ -2310,6 +2319,7 @@ pub fn app_call(thunk: unsafe extern "C" fn(*mut u8), data: *mut u8) -> bool {
         APP_CALL_OVER.with(|o| o.set(over));
         *e = saved[0];
         *e.add(1) = saved[1];
+        crate::domain::foreign_leave(scoped);
         if r == LEAVE_RUN_ENDED {
             note_abandoned_frames(true);
         }
