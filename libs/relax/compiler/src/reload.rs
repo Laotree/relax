@@ -1956,7 +1956,18 @@ fn classify_moving(prog: &crate::program::Program, old_file: u32, new: &crate::p
             (ItemKind::Static(_, _, ea), ItemKind::Static(_, _, eb)) if ea.is_some() && eb.is_some() => {
                 let (ea, eb) = (oa.expr(ea.get().unwrap()), na.expr(eb.get().unwrap()));
                 if !attrs_same || toks_norm(old, la, ea.lo, &[]) != toks_norm(new, lb, eb.lo, &[]) {
-                    why.push(format!("{}: the type of static `{}` changed; its storage has the old size -- restart the app (the value is not migrated yet)", pos(new, b.lo), name));
+                    // its declared type as each version spells it (between the name and the `=`)
+                    let ty = |pf: &crate::parser::ParsedFile, it: &crate::ast::Item, e: u32| -> String {
+                        let t = pf.src.get(it.name.hi as usize..e as usize).map(String::from_utf8_lossy).unwrap_or_default();
+                        let t = t.trim().trim_start_matches(':').trim_end().trim_end_matches('=');
+                        t.split_whitespace().collect::<Vec<_>>().join(" ")
+                    };
+                    let (ta, tb) = (ty(old, a, ea.lo), ty(new, b, eb.lo));
+                    if ta != tb {
+                        why.push(format!("{}: static `{}` changed its type from `{}` to `{}`: its storage holds a value of the old type -- restart the app", pos(new, b.lo), name, ta, tb));
+                    } else {
+                        why.push(format!("{}: static `{}` changed its declaration (attributes or mutability): its storage was made for the old one -- restart the app", pos(new, b.lo), name));
+                    }
                     continue;
                 }
                 match def {
