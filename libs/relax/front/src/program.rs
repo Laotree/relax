@@ -2176,6 +2176,12 @@ impl Program {
         self.edit_versions.contains(&f)
     }
 
+    /// Whether a live edit committed a file version, current or not (a refused or rolled-back
+    /// version stays loaded): the program's tables are no longer the boot's.
+    pub fn has_edit_versions(&self) -> bool {
+        !self.edit_versions.is_empty()
+    }
+
     /// Per boot file a live edit gave a version: the version current now.
     pub fn current_versions(&self) -> &HashMap<u32, u32> {
         &self.edit_current

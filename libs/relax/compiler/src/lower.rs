@@ -257,6 +257,12 @@ pub struct Lcx<'a> {
     drop_flags: Vec<Option<VReg>>,
     /// scope depth a `let` declared each local at (its drop flag registers there)
     decl_depth: Vec<Option<usize>>,
+    /// an async fn's pattern parameter's bindings, declared right after the parameter's whole
+    /// argument rather than at their own number (typeck numbers them after every parameter):
+    /// binding local -> (the argument's local, its order among the pattern's bindings)
+    decl_after: HashMap<u32, (u32, u32)>,
+    /// while an async fn's pattern parameter is bound: its argument's local, the bindings so far
+    decl_follow: Option<(u32, u32)>,
     /// instructions run at function entry (drop flag initialisation)
     entry_inits: Vec<Inst>,
     /// fold branches on known constants (a check only); the registers a fold relied on, which must
@@ -527,6 +533,8 @@ impl<'a> Lcx<'a> {
             scopes: vec![Vec::new()],
             drop_flags: vec![None; n],
             decl_depth: vec![None; n],
+            decl_after: HashMap::default(),
+            decl_follow: None,
             entry_inits: Vec::new(),
             fold: u.prog.session.options.const_fuel,
             fold_regs: std::cell::RefCell::new(Vec::new()),
@@ -2516,6 +2524,9 @@ impl<'a> Lcx<'a> {
         }
         self.coro = Some(Coro { ct, env, cx, frame_off, tag, up_size: ul.size, await_slots: Vec::new(), await_tys: Vec::new(), poll_scratch: Vec::new(), call_private: Default::default(), call_sret: Default::default(), poll_ret, suspends: Vec::new(), cancel_end: Some(cancel_end), pending_ret, after_done, after_panic });
         if ce & crate::tcx::ASYNC_FN_BODY != 0 {
+            // a pattern parameter's bindings are declared right after its whole argument
+            // (rustc_ast_lowering: `let __argN = __argN; let <pat> = __argN;` parameter by
+            // parameter): they drop before it and after the parameters declared after it
             for p in self.b.param_pats.clone() {
                 if let Some(&li) = self.b.pat_local.get(&(p.0 | crate::typeck::ASYNC_ARG_KEY)) {
                     let t = self.monomorphize(self.b.locals[li as usize].ty);
@@ -2523,7 +2534,9 @@ impl<'a> Lcx<'a> {
                     let saved = (self.match_root, self.pat_path.take());
                     self.match_root = Some(MatchRoot::Local(li));
                     self.pat_path = Some(Vec::new());
+                    self.decl_follow = Some((li, 0));
                     self.bind_pat_place(p, &place, t);
+                    self.decl_follow = None;
                     self.match_root = saved.0;
                     self.pat_path = saved.1;
                 }
@@ -3783,10 +3796,16 @@ impl<'a> Lcx<'a> {
         self.drop_flags[li as usize] = Some(f);
         let top = self.scopes.len() - 1;
         let at = self.decl_depth[li as usize].filter(|d| *d <= top).unwrap_or(top);
+        if let Some((arg, n)) = self.decl_follow.filter(|&(arg, _)| arg != li) {
+            self.decl_after.insert(li, (arg, n));
+            self.decl_follow = Some((arg, n + 1));
+        }
         // a scope drops its locals in reverse declaration order, whatever order they were
         // first assigned in (`let (x, y); y = ..; x = ..;` drops y, then x); locals are
-        // numbered in declaration order
-        let pos = self.scopes[at].iter().position(|&x| x > li).unwrap_or(self.scopes[at].len());
+        // numbered in declaration order, but for an async fn's pattern bindings (decl_after)
+        let rank = |x: u32| self.decl_after.get(&x).map_or((x, 0), |&(arg, n)| (arg, 1 + n));
+        let r = rank(li);
+        let pos = self.scopes[at].iter().position(|&x| rank(x) > r).unwrap_or(self.scopes[at].len());
         self.scopes[at].insert(pos, li);
         f
     }
