@@ -185,21 +185,20 @@ impl Inputs {
         crate::unitgraph::unit_graph(sess, &g.workspace, &g.package, &g.flags).map_or(true, |units| graph_shape(&units) != g.shape)
     }
 
-    /// The loader binary's own sources (cargo's dep-info `<exe>.d` next to it, which lists every
-    /// file the binary was built from; none for a binary not built by cargo). Outside the
-    /// target directory only. A file newer than the binary has no stamp: the binary is already
-    /// older than it, so the first scan sees it as changed. Read once per process.
+    /// The loader binary's own sources ([`runner_paths`]). Outside the target directory only. A
+    /// file newer than the binary has no stamp: the binary is already older than it, so the first
+    /// scan sees it as changed. Read once per process.
     pub(super) fn add_runner(&mut self) {
         static RUNNER: std::sync::OnceLock<Vec<(String, Stamp)>> = std::sync::OnceLock::new();
+        let workspace = self.graph.as_ref().map(|g| g.workspace.clone()).unwrap_or_else(crate::run::workspace_dir);
         let runner = RUNNER.get_or_init(|| {
             let _k = crate::zone_alloc::kept();
             let Some(exe) = super::host::loader() else { return Vec::new() };
             let built = std::fs::metadata(&exe).and_then(|m| m.modified()).ok();
             let target = super::host::target_dir(&exe);
-            let picked = exe.file_name().is_some_and(|n| n.to_string_lossy().starts_with("makepad.jit-"));
-            let Ok(text) = std::fs::read_to_string(exe.with_extension("d")) else { return Vec::new() };
+            let picked = super::host::picked(&exe);
             let mut out = Vec::new();
-            for path in dep_info_paths(&text) {
+            for path in runner_paths(&exe, &workspace) {
                 if target.as_ref().is_some_and(|t| Path::new(&path).starts_with(t)) { continue; }
                 // the devhub linked into the binary (its CLI) is no part of a running app: no
                 // "Update ready" on every app for a devhub landing
@@ -278,6 +277,21 @@ impl Inputs {
     }
 }
 
+/// The files the loader `exe` runs: for a cargo build, its dep-info `<exe>.d` (every file the
+/// binary was built from); for a JIT devhub picked by its inputs' content ([`super::host::picked`]),
+/// its `<exe>.inputs` (repo-relative, lease/loaders.rs) in the workspace it was picked for. The
+/// `makepad.d` beside a picked binary is another build's, of another checkout: a lane's session
+/// watched the box's checkout, and its lane's own JIT sources were no input of it (W3752,
+/// 11-06). None for a binary with neither.
+fn runner_paths(exe: &Path, workspace: &str) -> Vec<String> {
+    if super::host::picked(exe) {
+        let Some(name) = exe.file_name() else { return Vec::new() };
+        let Ok(text) = std::fs::read_to_string(exe.with_file_name(format!("{}.inputs", name.to_string_lossy()))) else { return Vec::new() };
+        return text.lines().filter(|l| !l.is_empty()).map(|rel| crate::vfs::normalize_path(&format!("{workspace}/{rel}"))).collect();
+    }
+    std::fs::read_to_string(exe.with_extension("d")).map(|text| dep_info_paths(&text)).unwrap_or_default()
+}
+
 /// The prerequisites of a cargo dep-info file (`target: a b\ c ...`; `\ ` is a space in a
 /// path), one rule per line.
 fn dep_info_paths(text: &str) -> Vec<String> {
@@ -322,6 +336,25 @@ mod tests {
             inputs.insert(Path::new("changed"), kind);
             assert!(inputs.restart_reason(["changed"].into_iter()).is_some());
         }
+    }
+
+    #[test]
+    fn a_picked_jit_runs_the_sources_of_the_tree_it_was_picked_for() {
+        let dir = std::env::temp_dir().join(format!("relax-runner-paths-{}", std::process::id()));
+        let host = dir.join("target/host");
+        std::fs::create_dir_all(&host).unwrap();
+        // the target's own build is of the box's checkout; the picked binary is the lane tree's
+        std::fs::write(host.join("makepad.d"), format!("{}/makepad: /box/libs/relax/base/src/vfs.rs\n", host.display())).unwrap();
+        std::fs::write(host.join("makepad.jit-0123456789abcdef01234567.inputs"), "libs/relax/base/src/vfs.rs\ntools/run/src/main.rs\n").unwrap();
+        let picked = host.join("makepad.jit-0123456789abcdef01234567");
+        assert!(super::super::host::picked(&picked));
+        assert_eq!(runner_paths(&picked, "/lane"), ["/lane/libs/relax/base/src/vfs.rs", "/lane/tools/run/src/main.rs"]);
+        let built = host.join("makepad");
+        assert!(!super::super::host::picked(&built));
+        assert_eq!(runner_paths(&built, "/lane"), ["/box/libs/relax/base/src/vfs.rs"], "cargo's own build runs what its dep-info names");
+        // a store's binary keeps no inputs file: it names none
+        assert!(runner_paths(&dir.join("makepad.jit-89abcdef0123456789abcdef"), "/lane").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

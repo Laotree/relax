@@ -14,7 +14,8 @@
 //! click would do before it ([`route`]).
 //!
 //! One rebuild at a time; a change during it builds once more after it. The new binary is the
-//! one cargo leaves at the loader's own path. Its codegen identity (codegen_id.rs) keys every cache
+//! one cargo leaves at the loader's own path, which a JIT devhub picked by its inputs' content has
+//! not ([`picked`]): its run picks again. Its codegen identity (codegen_id.rs) keys every cache
 //! it uses: a rebuild that changed what generates code starts from no stored code; one that changed
 //! only the rest of the binary (devhub, platform glue) keeps every stored build.
 use relax_session::sync::Mutex;
@@ -79,6 +80,15 @@ pub(crate) fn target_dir(exe: &Path) -> Option<PathBuf> {
     layout(exe).map(|l| l.0)
 }
 
+/// A JIT devhub picked by the content of its inputs for the tree it runs (`makepad.jit-<key>`:
+/// lease/loaders.rs, lease/jitstore.rs). Cargo never writes that file, and the checkout its
+/// target builds is not that tree: a lane's session on the box's binary rebuilt the box's
+/// checkout for 79 s and ran the same binary again, its lane's own JIT sources never built
+/// (W3752, 11-06). It cannot rebuild itself; the run that picked it picks again for the tree.
+pub(crate) fn picked(exe: &Path) -> bool {
+    exe.file_name().is_some_and(|n| n.to_string_lossy().starts_with("makepad.jit-"))
+}
+
 /// How a build of the loader runs.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Priority {
@@ -105,6 +115,9 @@ fn command(priority: Priority) -> Result<(std::process::Command, String), String
         return Err("this platform cannot replace a running makepad binary".into());
     }
     let exe = loader().ok_or("the makepad binary's path is unknown")?;
+    if picked(&exe) {
+        return Err(format!("{} was picked for this tree by its inputs' content: cargo never writes it, and its run picks the JIT again", exe.display()));
+    }
     let (package, manifest) = PACKAGE.lock().unwrap_or_else(|e| e.into_inner()).ok_or("no loader package")?;
     let (target, profile, triple) = layout(&exe).ok_or_else(|| format!("{} is not in a cargo target directory", exe.display()))?;
     if !Path::new(manifest).is_file() {
