@@ -3114,12 +3114,20 @@ fn enum_edit(u: &Unit, d: DefId, old: &crate::tcx::AdtT, fresh: &crate::tcx::Adt
         }
     }
     let n = old.variants.len();
+    let signed = |v: u128| crate::tcx::Discr { val: v, ty: crate::program::Prim::Isize, bytes: u.tcx.tys.ptr_bytes }.signed_value();
+    // a derived `PartialOrd`/`Ord` orders variants by their discriminants: the running ones keep
+    // theirs in the same order (a written-out discriminant can change it in place)
+    let mut by_old: Vec<usize> = (0..n).collect();
+    by_old.sort_by_key(|&i| signed(running_discriminants[i]));
+    if let Some(w) = by_old.windows(2).find(|w| signed(fresh_discriminants[at[w[0]]]) >= signed(fresh_discriminants[at[w[1]]])) {
+        return Err(format!("enum `{}`: the running variants' discriminants change their order (`{}` is no longer below `{}`); values kept in that order (a sorted list, a `BTreeMap`) would be out of it -- restart the app", name, u.prog.syms.str(old.variants[w[0]].name), u.prog.syms.str(old.variants[w[1]].name)));
+    }
     let unmoved = at.iter().enumerate().all(|(i, &j)| i == j) && running_discriminants[..n] == fresh_discriminants[..n];
     if fresh.variants.len() == n && unmoved && old.live_tags.is_empty() {
         return Ok((old.clone(), Vec::new()));
     }
     let old_tags: Vec<u128> = if old.live_tags.is_empty() { running_discriminants.to_vec() } else { old.live_tags.clone() };
-    let wide = |v: u128| v as i64 as i128 != crate::tcx::Discr { val: v, ty: crate::program::Prim::Isize, bytes: u.tcx.tys.ptr_bytes }.signed_value();
+    let wide = |v: u128| v as i64 as i128 != signed(v);
     let tags = match kept_tags(&old_tags, &at, fresh.variants.len()) {
         Some(tags) if !tags.iter().chain(fresh_discriminants).any(|&v| wide(v)) => tags,
         _ => return Err(format!("enum `{}`: a discriminant does not fit 64 bits -- restart the app", name)),
@@ -3232,8 +3240,8 @@ fn enum_variant_names<'a>(pf: &'a crate::parser::ParsedFile, it: &crate::ast::It
 /// `discriminant_value`, a derived `Hash` (it hashes the variant's position) -- may have kept what
 /// it made (a hash table's keys, an index), which the new numbers read differently: the restart
 /// rung, naming it. A derived `PartialEq`, `PartialOrd` or `Ord` of the enum compares them only:
-/// equal stays equal and the running variants keep their order (enum_edit), and its new text is
-/// rebuilt. None: nothing that ran reads them, or the edit keeps them.
+/// equal stays equal and the running variants keep their order, by position and by discriminant
+/// (enum_edit), and its new text is rebuilt. None: nothing that ran reads them, or the edit keeps them.
 fn enum_numbers_read(u: &Unit, d: DefId, versions: &[(crate::program::FileVersion, Plan)], visible: &[bool]) -> Option<String> {
     let old = u.tcx.adts.get(&d)?;
     let mut new: Option<Vec<(&[u8], bool)>> = None;
@@ -8634,7 +8642,7 @@ mod round32_tests {
         isolated_test!(enum_reload_snapshots);
         const CHILD: &str = "MAKEPAD_RUN_ENUM_RELOAD_CASE";
         let Ok(case) = std::env::var(CHILD) else {
-            for case in ["same", "changed", "removed", "reordered", "added", "larger", "named", "executable", "callee", "named_code", "unrelated"] {
+            for case in ["same", "changed", "order", "removed", "reordered", "added", "larger", "named", "executable", "callee", "named_code", "unrelated"] {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "reload::round32_tests::enum_reload_snapshots", "--nocapture", "--test-threads=1"])
                     .env(CHILD, case).env("MAKEPAD_RUN_CTFE", "0").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0")
@@ -8647,7 +8655,10 @@ mod round32_tests {
         crate::borrowck::lazy::disable_gandalf();
         let (old, new, accept) = match case.as_str() {
             "same" => ("enum E { A = 1, B }", "enum E { A = 1 + 0, B }", true),
-            "changed" => ("enum E { A = 1, B }", "enum E { A = 2, B }", false),
+            // M10: the running values keep their tags (AdtT::live_tags) and read the new numbers
+            "changed" => ("enum E { A = 1, B }", "enum E { A = 2, B }", true),
+            // ... unless the running variants' numbers change their order (a derived `Ord`)
+            "order" => ("enum E { A = 1, B = 2 }", "enum E { A = 3, B = 2 }", false),
             "removed" => ("enum E { A = 1, B }", "enum E { A = 1 }", false),
             "reordered" => ("enum E { A = 1, B }", "enum E { B = 1, A }", false),
             "added" => ("enum E { A = 1, B }", "enum E { A = 1, B, C }", true),
@@ -8688,7 +8699,7 @@ mod round32_tests {
             "{case}: {:?}; queried values after transaction: {:?}", outcome.lines, values(&unit));
         assert_eq!(unit.stats.ctfe_code, runs, "{case}: the transaction must not run an initializer");
         if accept {
-            assert_eq!(&values(&unit)[..2], before);
+            assert_eq!(&values(&unit)[..2], if case == "changed" { vec![2, 3] } else { before.clone() });
             unsafe { rollback(up, outcome.undo.unwrap(), "test"); }
         }
         assert_eq!(values(&unit), before, "running values restored");
