@@ -1285,24 +1285,34 @@ pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32, late: bool, er
     pt.mark("children");
     for c in &crates {
         let t = traits.remove(&c.krate).unwrap_or_default();
-        finish_crate(prog, tcx, c, root, &refs, &children, &t, late, &mut pt);
+        finish_crate(&CrateCx { prog, tcx, c, root, refs: &refs, children: &children }, &t, late, &mut pt);
     }
     pt.report(crates.len());
 }
 
+/// The shared read-only context for one checked crate's lints.
+struct CrateCx<'a> {
+    prog: &'a Program,
+    tcx: &'a Tcx,
+    c: &'a CrateItems<'a>,
+    root: u32,
+    refs: &'a HashMap<DefId, BodyInfo>,
+    children: &'a HashMap<DefId, Vec<DefId>>,
+}
+
 /// One checked crate's dead code and reachability lints (`late`), and its unused imports.
-#[allow(clippy::too_many_arguments)]
-fn finish_crate(prog: &Program, tcx: &Tcx, c: &CrateItems, root: u32, refs: &HashMap<DefId, BodyInfo>, children: &HashMap<DefId, Vec<DefId>>, traits: &HashSet<DefId>, late: bool, pt: &mut PartTimes) {
+fn finish_crate(cx: &CrateCx<'_>, traits: &HashSet<DefId>, late: bool, pt: &mut PartTimes) {
+    let CrateCx { prog, tcx, c, .. } = *cx;
     let reach = Reach::compute(prog, tcx, c);
     pt.mark("Reach::compute");
-    if late { late_lints(prog, tcx, c, root, refs, children, &reach, pt); }
+    if late { late_lints(cx, &reach, pt); }
     crate::lint_imports::check(prog, tcx, c, &reach, traits);
     pt.mark("lint_imports::check");
 }
 
 /// misc_checking_3 of one checked crate: dead code, then the late lints of its items.
-#[allow(clippy::too_many_arguments)]
-fn late_lints(prog: &Program, tcx: &Tcx, c: &CrateItems, root: u32, refs: &HashMap<DefId, BodyInfo>, children: &HashMap<DefId, Vec<DefId>>, reach: &Reach, pt: &mut PartTimes) {
+fn late_lints(cx: &CrateCx<'_>, reach: &Reach, pt: &mut PartTimes) {
+    let CrateCx { prog, tcx, c, root, refs, children } = *cx;
     let own = &c.own[..];
     let mut s = Dead { prog, tcx, own, refs, live: HashSet::new(), live_log: Vec::new(), live_fields: HashSet::new(), worklist: Vec::new(), scanned: HashSet::new(), propagated: false, ignored_derived: HashMap::new(), children };
     // seeds
