@@ -607,6 +607,12 @@ impl Layouts {
     /// its values are rustc's bytes, and an application whose tree holds the framework's sources
     /// has the crate in its scope.
     pub fn live_editable(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, d: crate::program::DefId, adt: &crate::tcx::AdtT, t: TyId) -> bool {
+        self.live_editable_form(lcx, d, adt) && Self::is_copy(lcx, tcx, t) == Some(false)
+    }
+
+    /// What live_editable asks of a struct but its Copy impl: of the application's scope (not a
+    /// provided crate's), named fields, Rust's repr, in a live session.
+    pub fn live_editable_form(&self, lcx: &LayoutCx<'_>, d: crate::program::DefId, adt: &crate::tcx::AdtT) -> bool {
         if !LIVE_SESSION.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
         }
@@ -618,13 +624,13 @@ impl Layouts {
         if adt.repr_c || adt.repr_packed != 0 || adt.repr_align != 0 || adt.repr_int.is_some() || adt.no_niche || adt.valid_start.is_some() || adt.valid_end.is_some() {
             return false;
         }
-        if adt.variants.first().map_or(true, |v| v.shape != 2) {
-            return false;
-        }
-        match tcx.copy_trait {
-            Some(c) => !tcx.type_implements_trait(prog, crate::tcx::TypingEnv::fully_monomorphized(&prog), TraitRef { def_id: c, args: vec![GenericArg::Type(t)] }).may_apply(),
-            None => false,
-        }
+        adt.variants.first().is_some_and(|v| v.shape == 2)
+    }
+
+    /// Whether `t` may be Copy (None: there is no Copy trait to ask).
+    pub fn is_copy(lcx: &LayoutCx<'_>, tcx: &Tcx, t: TyId) -> Option<bool> {
+        let c = tcx.copy_trait?;
+        Some(tcx.type_implements_trait(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), TraitRef { def_id: c, args: vec![GenericArg::Type(t)] }).may_apply())
     }
 
     /// Live sessions (M10): an enum of the program's own crate with Rust's repr, which variants

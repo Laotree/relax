@@ -22,6 +22,9 @@ its vtable linked from the disk cache as much as built by this run; dyn_impl_rem
 object's vtable holds removed with the code that made it changed: lands (MUST), the object keeps its vtable.
 enum_insert*: a variant inserted before a held one: lands (MUST); restarts (MUST) when code that ran read
 the numbers it moves, an `as` cast or a derived `Hash`, linked from the disk cache as much as built by this run.
+field_copy: a field added to a Copy struct no running value holds: lands (MUST) in its new layout, and the reader
+whose text stays (it builds an outer struct holding it) is rebuilt for it. field_copy_frame: one the loop's frame
+holds restarts (MUST), naming the running fn.
 A stored entry can be older than the manifest of the run that reads it: the edited text's first run,
 reaching none of the late readers, writes its own manifest (its keys are "unchanged" from then on),
 and the next run's first late reads must still see that the entries they find are of the old text.
@@ -99,6 +102,8 @@ PROBES = [
     ("dyn_method_add_late", V, "pub trait Dm {\n    fn a(&self) -> u64;\n}\npub struct DmX;\nimpl Dm for DmX {\n    fn a(&self) -> u64 {\n        1\n", "pub trait Dm {\n    fn z(&self) -> u64 {\n        9\n    }\n    fn a(&self) -> u64;\n}\npub struct DmX;\nimpl Dm for DmX {\n    fn a(&self) -> u64 {\n        2\n", 2),
     ("dyn_vtable_fresh", V, "pub trait Dv {\n    fn a(&self) -> u64;\n}\npub struct DvX;\nimpl Dv for DvX {\n    fn a(&self) -> u64 {\n        1\n    }\n}\npub fn dv_read() -> u64 {\n    dv_held().a()\n}\n", "pub trait Dv {\n    fn z(&self) -> u64 {\n        9\n    }\n    fn a(&self) -> u64;\n}\npub struct DvX;\nimpl Dv for DvX {\n    fn a(&self) -> u64 {\n        2\n    }\n}\npub fn dv_read() -> u64 {\n    dv_held().a() * 10 + dv_held().z() - 9\n}\n", 20),
     ("dyn_impl_removed", V, "impl std::fmt::Display for Ri {\n    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {\n        write!(f, \"{}\", self.0)\n    }\n}\npub const RI_K: u64 = 0;\npub fn ri_make() -> Box<dyn std::fmt::Display + Send + Sync> {\n    Box::new(Ri(7))\n", "pub const RI_K: u64 = 1;\npub fn ri_make() -> Box<dyn std::fmt::Display + Send + Sync> {\n    Box::new(7u64)\n", 2),
+    ("field_copy", V, "pub struct Cp {\n    pub a: u32,\n    pub b: u64,\n}\n#[inline(never)]\npub fn cp_make(i: u32) -> Cp {\n    Cp { a: i, b: (i as u64) << 8 }\n", "pub struct Cp {\n    pub a: u32,\n    pub c: u16,\n    pub b: u64,\n}\n#[inline(never)]\npub fn cp_make(i: u32) -> Cp {\n    Cp { a: i, c: 3, b: (i as u64) << 9 }\n", 1540),
+    ("field_copy_frame", V, "pub struct CpF {\n    pub a: u32,\n    pub b: u64,\n}\n#[inline(never)]\npub fn cpf_new() -> CpF {\n    CpF { a: 1, b: 1 }\n", "pub struct CpF {\n    pub z: u8,\n    pub a: u32,\n    pub b: u64,\n}\n#[inline(never)]\npub fn cpf_new() -> CpF {\n    CpF { z: 0, a: 1, b: 2 }\n", 3),
     ("enum_insert", V, "pub enum Ev {\n    A,\n    B(u32),\n    C { level: u8 },\n}\npub static EV: std::sync::Mutex<Option<Ev>> = std::sync::Mutex::new(None);\n#[inline(never)]\npub fn ev_read() -> u64 {\n    let mut g = EV.lock().unwrap();\n    let held = g.get_or_insert(Ev::C { level: 4 });\n    let level = match held {\n        Ev::C { level } => *level as u64,\n        _ => 0,\n    };\n    level + if Ev::A < *held { 10 } else { 0 }\n}\n", "pub enum Ev {\n    A,\n    X(u16),\n    B(u32),\n    C { level: u8 },\n}\npub static EV: std::sync::Mutex<Option<Ev>> = std::sync::Mutex::new(None);\n#[inline(never)]\npub fn ev_read() -> u64 {\n    let mut g = EV.lock().unwrap();\n    let held = g.get_or_insert(Ev::C { level: 4 });\n    let level = match held {\n        Ev::C { level } => *level as u64,\n        _ => 0,\n    };\n    level + if Ev::A < *held { 10 } else { 0 } + if Ev::X(3) < *held && Ev::A < Ev::X(3) { 300 } else { 0 }\n}\n", 314),
     ("enum_insert_cast", V, "pub enum Lv {\n    Low,\n    High,", "pub enum Lv {\n    Low,\n    Mid,\n    High,", 2),
     ("enum_insert_hash", V, "pub enum Hk {\n    P,\n    Q,\n}\npub const HK_K: u64 = 0;", "pub enum Hk {\n    P,\n    R,\n    Q,\n}\npub const HK_K: u64 = 1;", 2),
@@ -187,7 +192,7 @@ MUST = {
     # a trait object the program made holds the old method table: linked from the disk cache too
     "dyn_method_add": r"old method table", "dyn_method_add_late": r"old method table", "dyn_vtable_fresh": r"old method table", "dyn_impl_removed": LAND,
     # a variant inserted before a held one: lands; restarts when code that ran read the numbers it moves
-    "enum_insert": LAND, "enum_insert_cast": r"read them as numbers", "enum_insert_hash": r"derived `Hash`",
+    "enum_insert": LAND, "field_copy": LAND, "field_copy_frame": r"is running: its frame may hold", "enum_insert_cast": r"read them as numbers", "enum_insert_hash": r"derived `Hash`",
 }
 # A second edit in the same session: the first one's evaluations must not read as a type's.
 SECOND = {"field_nested": ("pub v: [u64; 3],\n}\nimpl Inner {\n    pub fn new() -> Inner {\n        Inner { v: [5; 3] }", "pub v: [u64; 4],\n}\nimpl Inner {\n    pub fn new() -> Inner {\n        Inner { v: [5; 4] }", 45), "const_nonliteral": ("CONST_NONLIT: u64 = 2 + 0;", "CONST_NONLIT: u64 = 3 + 0;", 3), "const_direct": ("CONST_DIRECT: u64 = 2;", "CONST_DIRECT: u64 = 3;", 3)}
@@ -418,8 +423,8 @@ for probe, rel, old, new, want in PROBES:
     fails += 0 if ok else 1
     print("%-23s %-15s %6s ms value=%-4s want=%-2s relaunch=%-4s fresh=%-4s %s | %s" % (probe, row["outcome"], row.get("ms", "-"), row["value"], want, row.get("relaunch", "-"), row.get("fresh", "-"), row["trace"], row["patch"]), flush=True)
     if not ok and "-v" in args:
-        for l in err[-12:]:
-            print("    | " + l[:200])
+        for l in [l for l in err[:-12] if "restart the app" in l or "new layout" in l] + err[-12:]:
+            print("    | " + l[:400])
 shutil.rmtree(tmp, ignore_errors=True)
 print("cache_warm_const_edit: %s" % ("ok" if not fails else "%d stale" % fails))
 sys.exit(1 if fails else 0)

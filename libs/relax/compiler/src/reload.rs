@@ -2124,11 +2124,20 @@ fn const_code_using(u: &Unit, d: DefId, gone: &[u32], names: &[&[u8]], visible: 
 /// its slot by name and type (a renamed one by type, when exactly one field went and one came
 /// with that type), an added one goes to the extension block, a removed one whose type needs no
 /// drop stays as a dead slot. Anything else: Err with the reason (restart rung).
-fn layout_edit(u: &Unit, d: DefId, fresh: &crate::tcx::AdtT, running_discriminants: &[u128], fresh_discriminants: &[u128]) -> Result<(crate::tcx::AdtT, Vec<String>), String> {
+///
+/// `new_layout`: a struct no running value of is left (fresh_layout_struct, no_live_values),
+/// which takes its new definition as it is.
+fn layout_edit(u: &Unit, d: DefId, fresh: &crate::tcx::AdtT, running_discriminants: &[u128], fresh_discriminants: &[u128], new_layout: bool) -> Result<(crate::tcx::AdtT, Vec<String>), String> {
     let old = u.tcx.adts.get(&d).ok_or("no running definition")?;
     let name = u.prog.def_path(d);
     if old.is_enum {
         return enum_edit(u, d, old, fresh, running_discriminants, fresh_discriminants);
+    }
+    if new_layout {
+        if fresh.is_enum || fresh.n_generics != 0 || fresh.variants.len() != 1 {
+            return Err(format!("struct `{}`: its generics changed -- restart the app", name));
+        }
+        return Ok((fresh.clone(), vec![format!("struct `{}` takes its new layout: no running value of it is left, and the code using it is rebuilt", name)]));
     }
     let t = {
         let args: Vec<TyId> = (0..old.n_generics).map(|_| u.tcx.tys.unit).collect();
@@ -3133,6 +3142,127 @@ fn enum_edit(u: &Unit, d: DefId, old: &crate::tcx::AdtT, fresh: &crate::tcx::Adt
     Ok((adt, notes))
 }
 
+/// Live sessions (M10): whether a value of type `t` can hold a value of one of the ADTs `s`, by
+/// value or behind a pointer, as far as its type shows: through ADT arguments, references,
+/// pointers, arrays, slices, tuples, fn pointers and fn items (their signatures), closures (their
+/// captures and signature), a trait object's arguments, an alias's arguments, and an opaque
+/// type's hidden type (as its defining fn's check found it; one not found counts as holding one).
+/// Trait objects made from one are asked apart (no_live_values: the vtables).
+fn ty_holds(u: &Unit, t: TyId, s: &[DefId], depth: u32) -> bool {
+    use crate::types::TyKind::*;
+    if depth > 24 {
+        return true;
+    }
+    let tys = &u.tcx.tys;
+    let any = |l: crate::types::TyList| tys.list(l).iter().any(|a| ty_holds(u, *a, s, depth + 1));
+    match tys.kind(t).clone() {
+        Adt(d, args, _) => s.contains(&d) || any(args),
+        Ref(_, x, _) | Ptr(_, x) | Slice(x) | Array(x, _) => ty_holds(u, x, s, depth + 1),
+        Tuple(v) => any(v),
+        FnPtr(ps, r, _, _) => any(ps) || ty_holds(u, r, s, depth + 1),
+        FnDef(d, args, _) => any(args) || u.tcx.fn_item_sig(&u.prog, d).is_some_and(|g| g.params.iter().chain([&g.ret]).any(|p| ty_holds(u, *p, s, depth + 1))),
+        Closure(_, _, c) => [c.parent_args, c.closure_sig_as_fn_ptr_ty, c.tupled_upvars_ty].into_iter().any(|x| ty_holds(u, x, s, depth + 1)),
+        Dyn(_, args, bounds, ..) => any(args) || tys.list(bounds).iter().any(|b| ty_holds(u, b.1, s, depth + 1)),
+        Alias(_, a) => any(a.args) || match a.kind {
+            crate::types::AliasTyKind::Opaque { def_id } => opaque_hidden(u, def_id).map_or(true, |h| ty_holds(u, h, s, depth + 1)),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// The hidden type of opaque type `o`, as the check of the fn defining it found it.
+fn opaque_hidden(u: &Unit, o: DefId) -> Option<TyId> {
+    let mut f = u.prog.def(o).parent;
+    for _ in 0..8 {
+        if f == crate::program::NO_DEF {
+            return None;
+        }
+        if matches!(u.prog.def(f).kind, DefKind::Fn | DefKind::AssocFn) {
+            break;
+        }
+        f = u.prog.def(f).parent;
+    }
+    if !matches!(u.prog.def(f).kind, DefKind::Fn | DefKind::AssocFn) || !def_is_bound(&u.prog, f) {
+        return None;
+    }
+    u.tcx.typeck(&u.prog, f).hidden_types.iter().find(|(k, _)| **k == o).map(|(_, t)| *t)
+}
+
+/// Live sessions (M10): struct `d` with the ADTs whose fields hold it (ty_holds), and theirs: the
+/// types whose layout follows `d`'s, and every type a value of `d` can be held in.
+fn holding_adts(u: &Unit, d: DefId) -> Vec<DefId> {
+    let mut s = vec![d];
+    loop {
+        let n = s.len();
+        for (a, adt) in u.tcx.adts.iter() {
+            if !s.contains(a) && adt.variants.iter().any(|v| v.fields.iter().any(|f| ty_holds(u, f.ty, &s, 0))) {
+                s.push(*a);
+            }
+        }
+        if s.len() == n {
+            return s;
+        }
+    }
+}
+
+/// Live sessions (M10): a struct whose layout can change in place, because no running value of it
+/// is left (no_live_values) and every user of its layout is rebuilt with the edit (fresh_users):
+/// one with the form of a live-editable struct that is Copy (a bitwise copy would share the
+/// extension block, so it cannot keep its first layout), and no generics.
+fn fresh_layout_struct(u: &Unit, d: DefId) -> bool {
+    let Some(adt) = u.tcx.adts.get(&d) else { return false };
+    let lcx = crate::layout::LayoutCx::new(&u.prog);
+    if adt.n_generics != 0 || !u.lay.live_editable_form(&lcx, d, adt) {
+        return false;
+    }
+    let t = u.tcx.tys.intern(crate::types::TyKind::Adt(d, crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
+    crate::layout::Layouts::is_copy(&lcx, &u.tcx, t) == Some(true)
+}
+
+/// Live sessions (M10), for a struct that takes its new layout (fresh_layout_struct; `s`: it and
+/// the ADTs holding it, holding_adts): where a running value of it may be, as the restart's reason.
+/// A static or thread-local the run knows (placed, or with its place reserved) whose type can hold
+/// one; a trait object made from a type that can (its vtable, made this run: the object may be
+/// alive).
+/// Values behind pointers converted to other types, and frames, are asked apart (raw_builder; the
+/// frames at the install). None: no running value of it is left.
+fn no_live_values(u: &Unit, d: DefId, s: &[DefId]) -> Option<String> {
+    let name = def_name(&u.prog, d);
+    let held = |t: TyId| ty_holds(u, t, s, 0);
+    let mut at: Vec<DefId> = u.statics.keys().chain(u.tls_places.keys()).copied().collect();
+    at.sort_unstable_by_key(|s| s.0);
+    for st in at {
+        if u.tcx.const_ty(&u.prog, st).map_or(true, held) {
+            let mut n = st;
+            while u.prog.syms.str(u.prog.def(n).name).starts_with("__") && u.prog.def(n).parent != crate::program::NO_DEF {
+                n = u.prog.def(n).parent;
+            }
+            return Some(format!("struct `{}` changed its layout, and `{}` may hold values of it in the old one -- restart the app", name, u.prog.def_path(n)));
+        }
+    }
+    if let Some((src, _)) = u.vtables.snapshot().into_iter().map(|(k, _)| k).find(|(src, _)| held(*src)) {
+        return Some(format!("struct `{}` changed its layout, and the running code made trait objects of `{}`, which may hold values of it in the old one -- restart the app", name, crate::typeck::type_name(&u.prog, &u.tcx, src)));
+    }
+    None
+}
+
+/// Live sessions (M10): whether the code of `f` (its signature and its checked body: the types
+/// of its expressions and patterns, and the generic arguments of its paths and method calls) can
+/// handle a value of one of `s` (ty_holds): it is built for their layouts. Some: the first such
+/// type.
+fn body_holds(u: &Unit, f: DefId, s: &[DefId]) -> Option<TyId> {
+    let held = |t: &TyId| ty_holds(u, *t, s, 0);
+    if let Some(t) = u.tcx.fn_sig(&u.prog, f).and_then(|g| g.params.iter().chain([&g.ret]).copied().find(held)) {
+        return Some(t);
+    }
+    let body = u.tcx.typeck(&u.prog, f);
+    let mut seen: crate::fxhash::HashSet<TyId> = Default::default();
+    let mut ask = |t: &TyId| seen.insert(*t) && held(t);
+    body.expr_ty.iter().chain(body.pat_ty.iter()).copied().find(&mut ask)
+        .or_else(|| body.res_args.values().chain(body.methods.values().map(|m| &m.args)).find_map(|l| u.tcx.tys.list(*l).iter().copied().find(&mut ask)))
+}
+
 /// The statics and thread-locals of the running program whose type holds `d` (where a value of
 /// it may live), for a note: ` (`A`, `B` hold values of it)`, or empty.
 fn holders_note(u: &Unit, d: DefId) -> String {
@@ -3993,6 +4123,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // (its text changed)
     let layout_defs: Vec<DefId> = changes.iter().filter_map(|c| if let Change::Layout(d) = c { Some(*d) } else { None }).collect();
     let mut moved_fields: Vec<(DefId, Vec<u32>)> = Vec::new();
+    // the structs that take their new layout (fresh_layout_struct), each with the ADTs holding it
+    let mut fresh_structs: Vec<(DefId, Vec<DefId>)> = Vec::new();
     for &d in &layout_defs {
         // an enum's matches see the new variants
         if u.prog.def(d).kind == DefKind::Enum {
@@ -4001,6 +4133,13 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 restart.push(line);
             }
             continue;
+        }
+        if fresh_layout_struct(u, d) {
+            let s = holding_adts(u, d);
+            if let Some(line) = no_live_values(u, d, &s) {
+                restart.push(line);
+            }
+            fresh_structs.push((d, s));
         }
         let old_names: Vec<Vec<u8>> = u.tcx.adts.get(&d).map(|a| a.variants[0].fields.iter().map(|f| u.prog.syms.str(f.name).as_bytes().to_vec()).collect()).unwrap_or_default();
         // what the text shows; the commit compares the resolved types (layout_edit), and a field
@@ -4060,6 +4199,41 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 }
             }
             field_named += named;
+        }
+    }
+    // A struct taking its new layout: every fn whose code can handle its values (body_holds) is
+    // type-checked and rebuilt with the edit (its text may not change: a fn building an outer
+    // struct that holds it), and every constant that can hold them is evaluated again. The code
+    // of other crates and generic instances over it are rebuilt after the commit (fresh_users).
+    let fresh_held: Vec<DefId> = fresh_structs.iter().flat_map(|(_, s)| s.iter().copied()).collect();
+    let mut fresh_consts: Vec<DefId> = Vec::new();
+    if !fresh_structs.is_empty() {
+        let mut seen: crate::fxhash::HashSet<DefId> = Default::default();
+        for f in u.fns.iter() {
+            let FnKey::Inst(fd, _) = &f.key else { continue };
+            let fd = *fd;
+            if !(f.compiled || f.rir.is_some() || !f.history().inlined_into.is_empty()) || !visible_crates[u.prog.def(fd).krate as usize] || !def_is_bound(&u.prog, fd) || !seen.insert(fd) {
+                continue;
+            }
+            match u.prog.def(fd).kind {
+                DefKind::Fn | DefKind::AssocFn if !body_defs.contains(&fd) => {
+                    if let Some(t) = body_holds(u, fd, &fresh_held) {
+                        if reload_trace() {
+                            eprintln!("reload: `{}` handles `{}`, which holds a struct taking its new layout: rebuilt", u.prog.def_path(fd), crate::typeck::type_name(&u.prog, &u.tcx, t));
+                        }
+                        body_defs.push(fd);
+                    }
+                }
+                DefKind::Const | DefKind::AssocConst => fresh_consts.push(fd),
+                _ => {}
+            }
+        }
+        let held = |c: DefId| u.tcx.const_ty(&u.prog, c).map_or(true, |t| ty_holds(u, t, &fresh_held, 0));
+        fresh_consts.retain(|&c| held(c));
+        for (c, _) in u.consts.keys() {
+            if !fresh_consts.contains(c) && visible_crates[u.prog.def(*c).krate as usize] && held(*c) {
+                fresh_consts.push(*c);
+            }
         }
     }
     for (v, plan) in &versions {
@@ -4404,6 +4578,11 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // consts whose value depends on a changed one: the readers' slots (consts compiled as
     // initializers) and, conservatively, every evaluated const whose initializer names one
     let mut consts_hit: Vec<DefId> = const_defs.clone();
+    for c in fresh_consts {
+        if !consts_hit.contains(&c) {
+            consts_hit.push(c);
+        }
+    }
     while !consts_hit.is_empty() {
         let mut grew = false;
         let names: Vec<Vec<u8>> = consts_hit.iter().map(|d| def_name(&u.prog, *d).into_bytes()).collect();
@@ -4959,11 +5138,12 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             }
             let before = running_discriminants.iter().find(|(ed, _)| *ed == d).map_or(&[][..], |(_, v)| v.as_slice());
             trace_sub("layout_discr");
-            let edited = layout_edit(u, d, &fresh_adt, before, &after);
+            let new_layout = fresh_structs.iter().any(|x| x.0 == d);
+            let edited = layout_edit(u, d, &fresh_adt, before, &after, new_layout);
             trace_sub("layout_edit");
             match edited {
                 Ok((adt, notes)) => {
-                    if let (Some(old), Some((_, moved))) = (u.tcx.adts.get(&d), moved_fields.iter().find(|m| m.0 == d)) {
+                    if let (false, Some(old), Some((_, moved))) = (new_layout, u.tcx.adts.get(&d), moved_fields.iter().find(|m| m.0 == d)) {
                         for (k, (o, n)) in old.variants[0].fields.iter().zip(&adt.variants[0].fields).enumerate() {
                             if o.name != n.name && !u.prog.syms.str(o.name).starts_with("__relax_dead_") && !moved.contains(&(k as u32)) {
                                 layout_restart.push(format!("struct `{}`: field `{}` changed its type though its text did not (what the type names changed), and its readers are not known -- restart the app", def_name(&u.prog, d), u.prog.syms.str(o.name)));
@@ -4975,7 +5155,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                         u.tcx.insert_ctor_sigs(d, &adt);
                     }
                     if let Some(old) = u.tcx.adts.insert(d, adt) {
-                        if !old.is_enum {
+                        if !old.is_enum && !new_layout {
                             for f in &u.tcx.adts[&d].variants[0].fields {
                                 if old.variants[0].fields.iter().any(|o| o.name == f.name) { continue; }
                                 if let Some(c) = u.field_default_const(d, f.name).filter(|&c| is_live_default(&u.prog, c)) {
@@ -5041,6 +5221,15 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 layout_restart.push(format!("struct `{}`: `{}` {}, which leaves the hidden word of its live layout as the memory had it, and after this edit its values need that word (fields added live, or a removed field to drop) -- restart the app", u.prog.def_path(s), u.prog.def_path(by), how));
             }
         }
+        // a struct taking its new layout: a value of it behind a pointer converted to another type
+        // (an address kept as a number, bytes) is not seen by its holders' types
+        let fresh_defs: Vec<DefId> = fresh_structs.iter().map(|x| x.0).collect();
+        if !fresh_defs.is_empty() && layout_restart.is_empty() {
+            if let Some((s, by, conv)) = raw_builder(u, &fresh_defs, &replaced_raw) {
+                let how = if conv { "reaches its bytes as other data (a pointer cast to another type, an address, inline assembly)" } else { "writes its fields in place through a raw pointer" };
+                layout_restart.push(format!("struct `{}` changed its layout, and `{}` {}: a value of it may be kept where its type does not show -- restart the app", u.prog.def_path(s), u.prog.def_path(by), how));
+            }
+        }
         trace_sub("raw_builders");
         unsafe {
             u.prog.reclaim_caches();
@@ -5050,6 +5239,50 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         if !saved_adts.is_empty() {
             let files: Vec<u32> = saved_adts.iter().map(|(d, _)| u.prog.def(*d).file).collect();
             crate::cache::layout_edit_committed(up, files.into_iter());
+        }
+    }
+    // A struct that took its new layout (fresh_layout_struct): the code of every instance over the
+    // types holding it (`Vec<P>::push`, other crates' generic code), their glue and shims, and what
+    // inlined any of them, is rebuilt; the fns that can handle its values were type-checked with
+    // the edit (fresh_held, above) and are rebuilt with their closures.
+    if !fresh_held.is_empty() {
+        let holds = |u: &Unit, t: TyId| ty_holds(u, t, &fresh_held, 0);
+        let mut users: Vec<u32> = Vec::new();
+        for (i, f) in u.fns.iter().enumerate() {
+            let hit = match &f.key {
+                FnKey::Inst(_, args) => args.iter().any(|a| holds(u, *a)),
+                FnKey::Glue(_, t) => holds(u, *t),
+                FnKey::Shim(sh) => sh.args.iter().any(|a| holds(u, *a)),
+                _ => false,
+            };
+            if hit && !in_flight_only(u, i as u32, &removed_all) {
+                users.push(i as u32);
+            }
+        }
+        users.extend(u.slots_of_defs(body_defs.iter().copied()));
+        users.extend(u.closures_of_slots(users.clone()));
+        let mut seen: crate::fxhash::HashSet<u32> = Default::default();
+        let mut work = users;
+        while let Some(c) = work.pop() {
+            if !seen.insert(c) {
+                continue;
+            }
+            let f = &u.fns[c as usize];
+            if !slots.contains(&c) && !fresh.contains(&c) {
+                if f.compiled {
+                    slots.push(c);
+                } else if f.rir.is_some() {
+                    fresh.push(c);
+                }
+            }
+            for &x in f.history().inlined_into.iter() {
+                if !in_flight_only(u, x, &removed_all) {
+                    if reload_trace() && !seen.contains(&x) {
+                        eprintln!("reload: `{}` inlined `{}`, rebuilt for a struct taking its new layout", u.fns[x as usize].name, f.name);
+                    }
+                    work.push(x);
+                }
+            }
         }
     }
     let added_impls: Vec<DefId> = added_defs.iter().copied().filter(|d| u.prog.def(*d).kind == DefKind::Impl).collect();
@@ -5819,7 +6052,28 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let t3 = Instant::now();
     out.ms[2] = (t3 - t2).as_secs_f64() * 1e3;
     let u = &mut *up;
+    // A struct taking its new layout: no program thread may be in code built for the old one.
+    // The threads stand still from here to the install (pause_for_patch), so none enters it
+    // before the patch is in; one in it, or a stack not read to its end, restarts.
+    let mut pre_paused = false;
+    if !fresh_structs.is_empty() && errs.is_empty() {
+        pre_paused = crate::inspect::instrument::pause_for_patch();
+        let rebuilt: crate::fxhash::HashSet<u32> = slots.iter().copied().collect();
+        let names: Vec<String> = fresh_structs.iter().map(|x| def_name(&u.prog, x.0)).collect();
+        let why = match crate::invalid::frame_in(u, &rebuilt) {
+            Ok(None) => None,
+            Ok(Some(running)) => Some(format!("struct `{}` changed its layout, and {}: its frame may hold values of it in the old one -- restart the app", names.join("`, `"), running)),
+            Err(e) => Some(format!("struct `{}` changed its layout, and the program's stacks could not be read to see that no frame holds values of it in the old one ({}) -- restart the app", names.join("`, `"), e)),
+        };
+        if let Some(why) = why {
+            errs.push(why);
+            as_restart = true;
+        }
+    }
     if !errs.is_empty() {
+        if pre_paused {
+            crate::inspect::instrument::resume_program();
+        }
         // nothing installs: the running versions come back, and everything built from the
         // refused text is dropped (built again from the running text when needed)
         u.flush_cache_records();
@@ -5978,8 +6232,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // (a hold there stopped every loop that holds such a struct: the UI thread). The program
     // threads stand still while an enum edit installs, so their stacks show every frame in code it
     // replaces (invalid::hold_old_frames, after the install).
-    let breaking: Vec<DefId> = saved_adts.iter().filter(|(_, old)| old.is_enum).map(|(d, _)| *d).collect();
-    let paused = !breaking.is_empty() && crate::inspect::instrument::pause_for_patch();
+    // (a struct that took its new layout is one too: its frames were asked, under this pause)
+    let breaking: Vec<DefId> = saved_adts.iter().filter(|(d, old)| old.is_enum || fresh_structs.iter().any(|x| x.0 == *d)).map(|(d, _)| *d).collect();
+    let paused = pre_paused || (!breaking.is_empty() && crate::inspect::instrument::pause_for_patch());
     for (id, r) in pre {
         match r {
             Ok(c) => {
@@ -6046,7 +6301,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     if !breaking.is_empty() {
         let breaking_names: Vec<String> = breaking.iter().map(|d| def_name(&u.prog, *d)).collect();
         let rebuilt: std::collections::HashSet<u32> = u.patch_log.iter().filter(|(_, g)| *g == gen).map(|(id, _)| *id).collect();
-        let why = format!("layout-changing patch gen {} (variants of {}) replaced it: code built for the old layout never runs again", gen, breaking_names.join(", "));
+        let why = format!("layout-changing patch gen {} (fields or variants of {}) replaced it: code built for the old layout never runs again", gen, breaking_names.join(", "));
         crate::invalid::invalidate(u, |g| matches!(g, crate::invalid::Group::Patch { slot, gen: g0 } if g0 < gen && rebuilt.contains(&slot)), gen, "invalidated code", None, &why);
         let held = crate::invalid::hold_old_frames(u, gen, &breaking_names.join(", "), paused);
         if held > 0 {

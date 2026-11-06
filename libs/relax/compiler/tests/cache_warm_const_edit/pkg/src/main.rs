@@ -382,6 +382,7 @@ fn run() {
         let every_late = if late { warm_const_dep::every_late() } else { 0 };
         let (const_late, static_late, body_late, always_late) = if late { (const_late(), static_late(), body_late(), always_late()) } else { (0, 0, 0, 0) };
         let running = fields::Running::new();
+        let held_copy = values::cpf_new();
         let field_running_frame = running.u[0] + running.u.len() as u64 * 10;
         let row = [
             ("field_running_frame", field_running_frame),
@@ -464,6 +465,8 @@ fn run() {
             ("enum_insert", values::ev_read()),
             ("enum_insert_cast", values::lv_read()),
             ("enum_insert_hash", values::hk_read()),
+            ("field_copy", values::cp_read()),
+            ("field_copy_frame", held_copy.a as u64 + held_copy.b),
         ];
         let mut line = format!("out tick {n}");
         for (name, v) in row.into_iter().chain(readers::row(late)) {

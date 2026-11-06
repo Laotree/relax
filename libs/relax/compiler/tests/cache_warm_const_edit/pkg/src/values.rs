@@ -362,3 +362,36 @@ impl ViaNew {
     }
 }
 pub static STATIC_THROUGH_NEW: ViaNew = ViaNew::new();
+
+// A Copy struct no running value holds (a frame of the loop never sees one): a field added
+// before another moves it, and the reader whose text stays builds an outer struct holding it.
+#[derive(Clone, Copy)]
+pub struct Cp {
+    pub a: u32,
+    pub b: u64,
+}
+#[inline(never)]
+pub fn cp_make(i: u32) -> Cp {
+    Cp { a: i, b: (i as u64) << 8 }
+}
+pub struct CpOuter {
+    pub tag: u8,
+    pub cs: [Cp; 2],
+}
+#[inline(never)]
+pub fn cp_read() -> u64 {
+    let o = CpOuter { tag: 1, cs: [cp_make(1), cp_make(2)] };
+    o.cs.iter().map(|c| c.a as u64 + c.b).sum::<u64>() + o.tag as u64
+}
+
+// A Copy struct the loop's frame holds: a field added restarts (the frame may hold one in the
+// old layout).
+#[derive(Clone, Copy)]
+pub struct CpF {
+    pub a: u32,
+    pub b: u64,
+}
+#[inline(never)]
+pub fn cpf_new() -> CpF {
+    CpF { a: 1, b: 1 }
+}
