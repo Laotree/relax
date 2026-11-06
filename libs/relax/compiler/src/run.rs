@@ -1153,9 +1153,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // (test_pkg.rs), else the graph's one (the lib's unit tests); the graph's other targets are
     // loaded with it (one program, one collected image) and never run here
     let subject_ci = if harness || plain_test {
-        let canon = |p: &str| std::fs::canonicalize(p).map(|c| c.display().to_string()).unwrap_or_else(|_| p.to_string());
         match &subject {
-            Some(path) => match g.bins.iter().copied().find(|&ci| canon(&g.crates[ci].src_path) == canon(path)) {
+            Some(path) => match g.bins.iter().copied().find(|&ci| crate::vfs::canonical(&g.crates[ci].src_path) == crate::vfs::canonical(path)) {
                 Some(ci) => ci,
                 None => {
                     eprintln!("makepad-run: --subject {path}: no test target of {package}'s graph has that source");
@@ -1932,9 +1931,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             let names = g.crates.iter().enumerate().filter(|(ci, c)| !c.registry && crate_of[*ci] != u32::MAX).map(|(ci, _)| (crate_of[ci], g.pkg[ci].1.clone())).collect();
             let subjects = test_subjects.clone();
             crate::check::start_test_deps(&mut *u, move |prog| {
-                fn canon(p: &str) -> String {
-                    std::fs::canonicalize(p).map(|c| c.display().to_string()).unwrap_or_else(|_| p.to_string())
-                }
+                use crate::vfs::canonical as canon;
                 let std_dir = format!("{}/", canon(&crate::std_dir()).trim_end_matches('/'));
                 // the subject's dependencies (a test graph's other targets are not its)
                 let mut crates: Vec<u32> = candidates.into_iter().filter(|k| {
