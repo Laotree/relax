@@ -1663,7 +1663,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     } else { None };
     if let Some(r) = &reuse {
         if std::env::var_os("MAKEPAD_RUN_CHECK_TIMES").is_some() {
-            eprintln!("makepad check: verdict keys of {} crates in {:.1} ms ({} + {} files skipped): {} unchanged ({} beside added items), run record {}", r.crates(), r.t_keys.as_secs_f64() * 1e3, r.skipped.0, r.skipped.1, r.hits(), r.added_hits(), r.full());
+            eprintln!("makepad check: verdict keys of {} crates in {:.1} ms ({} + {} files skipped): {} unchanged ({} against changed interfaces), run record {}", r.crates(), r.t_keys.as_secs_f64() * 1e3, r.skipped.0, r.skipped.1, r.hits(), r.restored(), r.full());
         }
         // (a load that parsed or collected anything records it with the check: run it)
         if r.full() && prog.front_restored.iter().all(|x| *x) && !CHECK_RECORDS_COLLECTED.load(Ordering::Relaxed) {
