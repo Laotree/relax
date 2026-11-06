@@ -1204,8 +1204,9 @@ impl Layouts {
 
     fn tagged(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, adt: &crate::tcx::AdtT, vfl: &[Vec<FieldL>], vls: &[Vec<&'static Layout>], repr: Repr) -> Layout {
         let nv = vfl.len();
-        // the discriminants of inhabited variants, and the largest gap between them (wrapping)
-        let mut ds: Vec<i128> = (0..nv).filter(|&i| adt.repr_c || !vfl[i].iter().any(|f| f.uninhabited)).map(|i| adt.discriminant_for_variant(tcx, lcx.prog, i as u32).expect("existing layout variant").signed_value()).collect();
+        // the tags of inhabited variants (their discriminants, or the tags a live edit kept), and
+        // the largest gap between them (wrapping)
+        let mut ds: Vec<i128> = (0..nv).filter(|&i| adt.repr_c || !vfl[i].iter().any(|f| f.uninhabited)).map(|i| adt.tag_for_variant(tcx, lcx.prog, i as u32).expect("existing layout variant").signed_value()).collect();
         ds.sort();
         ds.dedup();
         let discr_signed = match adt.repr_int {

@@ -461,6 +461,9 @@ fn run() {
             ("dyn_method_add_late", if late { values::dm_late() } else { 0 }),
             ("dyn_vtable_fresh", values::dv_read()),
             ("dyn_impl_removed", values::ri_read()),
+            ("enum_insert", values::ev_read()),
+            ("enum_insert_cast", values::lv_read()),
+            ("enum_insert_hash", values::hk_read()),
         ];
         let mut line = format!("out tick {n}");
         for (name, v) in row.into_iter().chain(readers::row(late)) {

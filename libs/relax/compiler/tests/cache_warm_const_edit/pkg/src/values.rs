@@ -242,6 +242,55 @@ pub fn ri_read() -> u64 {
     RI.get_or_init(ri_make).to_string().len() as u64 + RI_K
 }
 
+// enum_insert: a value held from the first run, a variant inserted before it (a running variant
+// keeps its tag by name) and the reader edited to build the new one and order it
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+pub enum Ev {
+    A,
+    B(u32),
+    C { level: u8 },
+}
+pub static EV: std::sync::Mutex<Option<Ev>> = std::sync::Mutex::new(None);
+#[inline(never)]
+pub fn ev_read() -> u64 {
+    let mut g = EV.lock().unwrap();
+    let held = g.get_or_insert(Ev::C { level: 4 });
+    let level = match held {
+        Ev::C { level } => *level as u64,
+        _ => 0,
+    };
+    level + if Ev::A < *held { 10 } else { 0 }
+}
+// enum_insert_cast: a fieldless enum read as a number (`as`) by running code; a variant inserted
+// before a running one moves its number: the edit restarts
+#[derive(Clone, Copy)]
+pub enum Lv {
+    Low,
+    High,
+}
+#[inline(never)]
+pub fn lv_index(l: Lv) -> u64 {
+    l as u64
+}
+pub fn lv_read() -> u64 {
+    lv_index(Lv::High)
+}
+// enum_insert_hash: a derived `Hash` ran (a set holds a value's hash, made from the variant's
+// position); a variant inserted before the held one moves it: the edit restarts
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Hk {
+    P,
+    Q,
+}
+pub const HK_K: u64 = 0;
+pub static HK: std::sync::Mutex<Option<std::collections::HashSet<Hk>>> = std::sync::Mutex::new(None);
+#[inline(never)]
+pub fn hk_read() -> u64 {
+    let mut g = HK.lock().unwrap();
+    let set = g.get_or_insert_with(|| [Hk::Q].into_iter().collect());
+    set.contains(&Hk::Q) as u64 + HK_K
+}
+
 pub const CONST_NONLIT: u64 = 1 + 0;
 
 pub const CONST_DISCR: isize = 1;

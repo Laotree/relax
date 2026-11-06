@@ -130,6 +130,12 @@ pub struct AdtT {
     /// Live sessions (M10): (added field, dead base slot) for a retyped scalar field -- running
     /// values get the old value converted (`as`, lossless widening) instead of the default.
     pub ext_conv: Vec<(u32, u32)>,
+    /// Live sessions (M10): per variant, the tag value its running values hold in the enum's
+    /// Direct-tagged layout, once a live edit inserted a variant before others or changed a
+    /// discriminant (a variant keeps its tag by name; an added one takes a new one). The
+    /// discriminants are the new text's (`discriminant_for_variant`); reading one decodes the tag.
+    /// Empty: each tag is the discriminant.
+    pub live_tags: Vec<u128>,
 }
 
 /// rustc_middle/src/ty/adt.rs:33,340. Identity flags come only from collected attributes.
@@ -1453,33 +1459,38 @@ impl Tcx {
         self.variances.take();
         self.err_sink.get_mut().unwrap_or_else(|e| e.into_inner()).extend(p.errors);
         if let Some(adt) = p.adt {
-            // a tuple constructor is a fn item (rustc: its own FnDef type with the ADT's args):
-            // its signature, fields to the ADT
-            if !adt.is_union {
-                let n = adt.n_generics;
-                let pargs = adt.generic_indices.identity_types_consts(&self.tys);
-                let ret = self.tys.intern(TyKind::Adt(d, self.tys.mk_list(&pargs), adt.region_params));
-                for v in adt.variants.iter().filter(|v| v.shape == 1) {
-                    self.ctor_sigs.insert(v.def, FnSigT {
-                        region_contract: adt.region_contract.clone(),
-                        generic_indices: adt.generic_indices.clone(),
-                        bound_regions: 0,
-                        params: v.fields.iter().map(|f| f.ty).collect(),
-                        ret,
-                        self_kind: 0,
-                        n_generics: n,
-                        n_parent_generics: if adt.is_enum { n } else { 0 },
-                        is_const: false,
-                        rustc_promotable: false,
-                        rustc_intrinsic: false,
-                        header: FnHeader::RUST,
-                        track_caller: false,
-                        target_features: Vec::new(),
-                        safe_target_features: false,
-                    });
-                }
-            }
+            self.insert_ctor_sigs(d, &adt);
             self.adts.insert(d, adt);
+        }
+    }
+
+    /// A tuple constructor is a fn item (rustc: its own FnDef type with the ADT's args): the
+    /// signatures of ADT `d`'s, fields to the ADT. Also for the variants a live edit adds (M10).
+    pub fn insert_ctor_sigs(&mut self, d: DefId, adt: &AdtT) {
+        if adt.is_union {
+            return;
+        }
+        let n = adt.n_generics;
+        let pargs = adt.generic_indices.identity_types_consts(&self.tys);
+        let ret = self.tys.intern(TyKind::Adt(d, self.tys.mk_list(&pargs), adt.region_params));
+        for v in adt.variants.iter().filter(|v| v.shape == 1) {
+            self.ctor_sigs.insert(v.def, FnSigT {
+                region_contract: adt.region_contract.clone(),
+                generic_indices: adt.generic_indices.clone(),
+                bound_regions: 0,
+                params: v.fields.iter().map(|f| f.ty).collect(),
+                ret,
+                self_kind: 0,
+                n_generics: n,
+                n_parent_generics: if adt.is_enum { n } else { 0 },
+                is_const: false,
+                rustc_promotable: false,
+                rustc_intrinsic: false,
+                header: FnHeader::RUST,
+                track_caller: false,
+                target_features: Vec::new(),
+                safe_target_features: false,
+            });
         }
     }
 
@@ -1528,7 +1539,7 @@ impl Tcx {
             };
             flags.insert(identity);
         }
-        let mut adt = AdtT { region_contract: self.region_contract(cx, prog, d, &env), generic_indices: crate::types::variance::GenericIndices::from_env(&env), flags, region_params: env.regions.identity_args(&self.tys), is_enum: false, is_union: false, n_generics, variants: Vec::new(), repr_c, repr_int, repr_align, repr_packed, valid_start, valid_end, no_niche, param_maybe_unsized, ext_from: u32::MAX, ext_conv: Vec::new() };
+        let mut adt = AdtT { region_contract: self.region_contract(cx, prog, d, &env), generic_indices: crate::types::variance::GenericIndices::from_env(&env), flags, region_params: env.regions.identity_args(&self.tys), is_enum: false, is_union: false, n_generics, variants: Vec::new(), repr_c, repr_int, repr_align, repr_packed, valid_start, valid_end, no_niche, param_maybe_unsized, ext_from: u32::MAX, ext_conv: Vec::new(), live_tags: Vec::new() };
         match &it.kind {
             ItemKind::Struct(r) => {
                 let (shape, fields) = self.lower_fields(cx, prog, file, module, &env, &ast.row(*r).data);

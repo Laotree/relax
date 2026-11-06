@@ -289,7 +289,7 @@ pub struct Undo {
     consts: Vec<((DefId, Vec<TyId>), u64)>,
     consts_hit: Vec<DefId>,
     adts: Vec<(DefId, crate::tcx::AdtT)>,
-    variants: Vec<(DefId, usize)>,
+    variants: Vec<(DefId, Vec<DefId>)>,
     const_failed: Vec<(DefId, Vec<TyId>)>,
     full_inputs: bool,
     /// a const edit moved the code keys: they follow the rollback's text
@@ -647,8 +647,11 @@ pub unsafe fn rollback(up: *mut Unit, undo: Undo, why: &str) -> Vec<String> {
             }
             recollect_impls(u, &undo.removed, undo.scope.as_deref());
             restore_traits(u, &undo.traits, undo.scope.as_deref());
-            for (d, n) in &undo.variants { u.prog.truncate_variants(*d, *n); }
-            for (d, adt) in &undo.adts { u.tcx.adts.insert(*d, adt.clone()); }
+            for (d, had) in &undo.variants { u.prog.restore_variants(*d, had); }
+            for (d, adt) in &undo.adts {
+                if adt.is_enum { u.tcx.insert_ctor_sigs(*d, adt); }
+                u.tcx.adts.insert(*d, adt.clone());
+            }
             publish_reload(u, &undo.versions, undo.full_inputs, undo.scope.as_deref());
             u.lay.clear();
             u.prog.reclaim_caches();
@@ -3086,43 +3089,254 @@ fn niche_fields(u: &Unit, d: DefId) -> Vec<usize> {
 /// each concrete instantiation known to the session, matching the widget registry's keys.
 
 
-/// An enum's edit in a live session (M10): variants added after the running ones (which keep
-/// their names, fields and discriminants) apply in place when every value keeps its
-/// representation -- live enums are always tagged and give outer types no niche (layout.rs),
-/// so the check is the size, alignment and every running variant's field offsets.
+/// An enum's edit in a live session (M10): the running variants keep their names, fields and
+/// order among themselves, and a variant may be added anywhere (or a discriminant change). Every
+/// value keeps its representation -- live enums are always tagged and give outer types no niche
+/// (layout.rs) -- so a running variant keeps its tag by name and an added one takes a tag no
+/// running value holds (AdtT::live_tags; the discriminants are the new text's, decoded from the
+/// tags). The layout check is the size, alignment, tag and every running variant's field offsets
+/// (enum_fits, once the new definition is in); what running code made of discriminants that move
+/// is asked before the commit (enum_numbers_read).
 fn enum_edit(u: &Unit, d: DefId, old: &crate::tcx::AdtT, fresh: &crate::tcx::AdtT, running_discriminants: &[u128], fresh_discriminants: &[u128]) -> Result<(crate::tcx::AdtT, Vec<String>), String> {
     let name = u.prog.def_path(d);
     if !u.lay.live_editable_enum(&crate::layout::LayoutCx::new(&u.prog), d, old) || !fresh.is_enum || fresh.n_generics != old.n_generics {
         return Err(format!("enum `{}` keeps its first layout in a live session only when it is the program's own with Rust's repr -- restart the app", name));
     }
-    let n = old.variants.len();
-    if fresh.variants.len() < n {
-        return Err(format!("enum `{}`: a variant was removed; a running value may hold it -- restart the app", name));
-    }
-    for (i, (vo, vn)) in old.variants.iter().zip(fresh.variants.iter()).enumerate() {
+    let at = running_variants_at(old, fresh).map_err(|v| match v {
+        Some(v) => format!("enum `{}`: variant `{}` was removed; a running value may hold it{} -- restart the app", name, u.prog.syms.str(v), holders_note(u, d)),
+        None => format!("enum `{}`: its running variants changed their order; values kept in that order (a sorted list, a `BTreeMap`) would be out of it -- restart the app", name),
+    })?;
+    for (vo, &j) in old.variants.iter().zip(&at) {
+        let vn = &fresh.variants[j];
         let same_fields = vo.fields.len() == vn.fields.len() && vo.fields.iter().zip(vn.fields.iter()).all(|(a, b)| a.name == b.name && a.ty == b.ty);
-        if vo.name != vn.name || vo.shape != vn.shape || running_discriminants[i] != fresh_discriminants[i] || !same_fields {
-            return Err(format!("enum `{}`: variant `{}` changed, moved or was removed; running values would be read as another variant -- restart the app", name, u.prog.syms.str(vo.name)));
+        if vo.shape != vn.shape || !same_fields {
+            return Err(format!("enum `{}`: variant `{}` changed its fields; running values would be read as the old ones -- restart the app", name, u.prog.syms.str(vo.name)));
         }
     }
-    if fresh.variants.len() == n {
+    let n = old.variants.len();
+    let unmoved = at.iter().enumerate().all(|(i, &j)| i == j) && running_discriminants[..n] == fresh_discriminants[..n];
+    if fresh.variants.len() == n && unmoved && old.live_tags.is_empty() {
         return Ok((old.clone(), Vec::new()));
     }
-    // (the layout check: apply_locked, once the new definition is in -- enum_fits)
-    let notes = fresh.variants[n..].iter().map(|v| format!("variant `{}` added to `{}`", u.prog.syms.str(v.name), name)).collect();
-    Ok((fresh.clone(), notes))
+    let old_tags: Vec<u128> = if old.live_tags.is_empty() { running_discriminants.to_vec() } else { old.live_tags.clone() };
+    let wide = |v: u128| v as i64 as i128 != crate::tcx::Discr { val: v, ty: crate::program::Prim::Isize, bytes: u.tcx.tys.ptr_bytes }.signed_value();
+    let tags = match kept_tags(&old_tags, &at, fresh.variants.len()) {
+        Some(tags) if !tags.iter().chain(fresh_discriminants).any(|&v| wide(v)) => tags,
+        _ => return Err(format!("enum `{}`: a discriminant does not fit 64 bits -- restart the app", name)),
+    };
+    let mut adt = fresh.clone();
+    adt.live_tags = if tags.as_slice() == fresh_discriminants { Vec::new() } else { tags };
+    let notes = fresh.variants.iter().enumerate().filter(|(j, _)| !at.contains(j)).map(|(_, v)| format!("variant `{}` added to `{}`", u.prog.syms.str(v.name), name)).collect();
+    Ok((adt, notes))
+}
+
+/// The statics and thread-locals of the running program whose type holds `d` (where a value of
+/// it may live), for a note: ` (`A`, `B` hold values of it)`, or empty.
+fn holders_note(u: &Unit, d: DefId) -> String {
+    // (a `thread_local!`'s storage is a static of its expansion: named by the item it declares)
+    let named = |mut s: DefId| {
+        while u.prog.syms.str(u.prog.def(s).name).starts_with("__") && u.prog.def(s).parent != crate::program::NO_DEF {
+            s = u.prog.def(s).parent;
+        }
+        def_name(&u.prog, s)
+    };
+    let mut names: Vec<String> = u.statics.keys().chain(u.tls_places.keys()).filter(|&&s| u.tcx.const_ty(&u.prog, s).is_some_and(|t| ty_mentions(u, t, &[d], 0))).map(|&s| named(s)).collect();
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        return String::new();
+    }
+    let more = names.len() > 4;
+    names.truncate(4);
+    format!(" (`{}`{} hold{} values of it)", names.join("`, `"), if more { " and others" } else { "" }, if names.len() == 1 && !more { "s" } else { "" })
+}
+
+/// The tags of an enum's `n` variants after a live edit (M10): running variant `i`, now variant
+/// `at[i]`, keeps its tag `old_tags[i]` (the value its running values hold); an added one takes the
+/// next tag none of them holds, from 0 up. None: no tag is left.
+fn kept_tags(old_tags: &[u128], at: &[usize], n: usize) -> Option<Vec<u128>> {
+    let mut next = old_tags.iter().map(|&t| t as i64).max().map_or(0, |m| m.max(-1)).checked_add(1)?;
+    let mut tags: Vec<Option<u128>> = vec![None; n];
+    for (i, &j) in at.iter().enumerate() {
+        *tags.get_mut(j)? = Some(*old_tags.get(i)?);
+    }
+    tags.into_iter().map(|t| match t {
+        Some(t) => Some(t),
+        None => {
+            let t = next as u128;
+            next = next.checked_add(1)?;
+            Some(t)
+        }
+    }).collect()
+}
+
+#[cfg(test)]
+mod kept_tags_tests {
+    use super::kept_tags;
+
+    #[test]
+    fn a_running_variant_keeps_its_tag_and_an_inserted_one_takes_a_free_one() {
+        // A B C, then X inserted before B: A 0, X 3, B 1, C 2
+        assert_eq!(kept_tags(&[0, 1, 2], &[0, 2, 3], 4), Some(vec![0, 3, 1, 2]));
+        // then Z inserted first: the running tags stay, Z takes 4
+        assert_eq!(kept_tags(&[0, 3, 1, 2], &[1, 2, 3, 4], 5), Some(vec![4, 0, 3, 1, 2]));
+        // appended: the tags are the discriminants
+        assert_eq!(kept_tags(&[0, 1], &[0, 1], 3), Some(vec![0, 1, 2]));
+        // negative discriminants (-2, -1 as the tag's bits): an added variant's tag is no running one's
+        let m = |v: i64| v as u64 as u128;
+        assert_eq!(kept_tags(&[m(-2), m(-1)], &[1, 2], 3), Some(vec![0, m(-2), m(-1)]));
+        // a running variant placed where the new list has none
+        assert_eq!(kept_tags(&[0, 1], &[0, 5], 3), None);
+    }
+}
+
+/// Where each running variant of `old` is in `fresh`, by name; Err(Some(name)): one is gone,
+/// Err(None): they changed their order among themselves.
+fn running_variants_at(old: &crate::tcx::AdtT, fresh: &crate::tcx::AdtT) -> Result<Vec<usize>, Option<crate::program::Sym>> {
+    let mut at = Vec::with_capacity(old.variants.len());
+    for vo in &old.variants {
+        match fresh.variants.iter().position(|vn| vn.name == vo.name) {
+            Some(j) => at.push(j),
+            None => return Err(Some(vo.name)),
+        }
+    }
+    if at.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(None);
+    }
+    Ok(at)
 }
 
 /// The layout of every compiled instance of enum `d` before (`before`) and after an edit: the
-/// running values keep their representation (size, alignment, tag, running variants' fields).
-fn enum_fits(before: &[(TyId, crate::layout::Layout)], u: &Unit) -> Result<(), String> {
+/// running values keep their representation (size, alignment, tag, running variants' fields;
+/// `at`: where each running variant is now, running_variants_at).
+fn enum_fits(before: &[(TyId, crate::layout::Layout)], u: &Unit, at: &[usize]) -> Result<(), String> {
     for (t, b) in before {
         let a = u.layout_of(*t);
-        if a.size != b.size || a.align != b.align || a.tag != b.tag || b.variant_fields.iter().zip(a.variant_fields.iter()).any(|(x, y)| x != y) {
+        let moved = b.variant_fields.iter().enumerate().any(|(i, x)| at.get(i).and_then(|&j| a.variant_fields.get(j)) != Some(x));
+        if a.size != b.size || a.align != b.align || a.tag != b.tag || a.enc != b.enc || moved {
             return Err(format!("enum `{}`: the added variant does not fit the running values' layout ({} -> {} bytes) -- restart the app", crate::typeck::type_name(&u.prog, &u.tcx, *t), b.size, a.size));
         }
     }
     Ok(())
+}
+
+/// The variant names of enum item `it` (with whether one has an explicit discriminant), or None.
+fn enum_variant_names<'a>(pf: &'a crate::parser::ParsedFile, it: &crate::ast::Item) -> Option<Vec<(&'a [u8], bool)>> {
+    let crate::ast::ItemKind::Enum(r) = &it.kind else { return None };
+    Some(pf.ast.list(pf.ast.row(*r).variants).iter().map(|v| (pf.text(v.name).as_bytes(), v.disc.is_some())).collect())
+}
+
+/// Live sessions (M10), before the commit of an edit of enum `d` that moves where its running
+/// variants are or a discriminant (a variant added before running ones; a discriminant written
+/// out): code that ran and read them as numbers -- an `as` cast, `mem::discriminant`,
+/// `discriminant_value`, a derived `Hash` (it hashes the variant's position) -- may have kept what
+/// it made (a hash table's keys, an index), which the new numbers read differently: the restart
+/// rung, naming it. A derived `PartialEq`, `PartialOrd` or `Ord` of the enum compares them only:
+/// equal stays equal and the running variants keep their order (enum_edit), and its new text is
+/// rebuilt. None: nothing that ran reads them, or the edit keeps them.
+fn enum_numbers_read(u: &Unit, d: DefId, versions: &[(crate::program::FileVersion, Plan)], visible: &[bool]) -> Option<String> {
+    let old = u.tcx.adts.get(&d)?;
+    let mut new: Option<Vec<(&[u8], bool)>> = None;
+    for (v, plan) in versions {
+        for &(i, j) in &plan.pairs {
+            if u.prog.item_defs.get(&(v.old, i)) == Some(&d) {
+                new = enum_variant_names(&v.pf, &v.pf.ast.items[j as usize]);
+            }
+        }
+    }
+    let new = new?;
+    // (a running variant gone or out of order: enum_edit's restart at the commit)
+    let at: Vec<usize> = old.variants.iter().map(|vo| new.iter().position(|(m, _)| *m == u.prog.syms.str(vo.name).as_bytes())).collect::<Option<_>>()?;
+    let positions_move = at.iter().enumerate().any(|(i, &j)| i != j);
+    let written = new.iter().any(|v| v.1) || old.variants.iter().any(|v| matches!(v.discr, crate::tcx::VariantDiscr::Explicit(_)));
+    if !positions_move && !written {
+        return None;
+    }
+    let name = def_name(&u.prog, d);
+    let fieldless = old.variants.iter().all(|v| v.fields.is_empty());
+    let prog = &u.prog;
+    let is_it = |t: TyId| matches!(u.tcx.tys.kind(t), crate::types::TyKind::Adt(a, _, _) if *a == d);
+    // the impl `f` is a method of, when it is a derived one of this enum: its trait's name
+    let derived_of_it = |f: DefId| -> Option<&'static str> {
+        let imp = prog.def(f).parent;
+        if imp == crate::program::NO_DEF || prog.def(imp).kind != DefKind::Impl || !relax_types::lint::is_automatically_derived(prog, imp) {
+            return None;
+        }
+        if !u.tcx.impl_self.get(&imp).is_some_and(|&t| is_it(t)) {
+            return None;
+        }
+        let tr = prog.syms.str(prog.def(*u.tcx.impl_trait.get(&imp)?).name);
+        Some(["PartialEq", "PartialOrd", "Ord", "Hash"].into_iter().find(|k| *k == tr).unwrap_or("other"))
+    };
+    // `at_it`: the instance's type arguments name the enum
+    let reads = |f: DefId, at_it: bool| -> bool {
+        let pf = &prog.files[prog.def(f).file as usize];
+        let it = pf.ast.item(prog.def(f).item);
+        let text = toks(pf, it.lo, it.hi, &[]);
+        let cast = fieldless && text.iter().any(|t| *t == b"as");
+        let call = text.iter().any(|t| *t == b"discriminant_value" || *t == b"discriminant");
+        if !cast && !call {
+            return false;
+        }
+        if !def_is_bound(prog, f) {
+            // code an earlier edit replaced: its text is all there is to go by
+            return call || text.iter().any(|t| *t == name.as_bytes());
+        }
+        let body = u.tcx.typeck(prog, f);
+        let bpf = &prog.files[body.file as usize];
+        (0..body.expr_ty.len()).any(|i| {
+            let e = body.expr_at(i);
+            match bpf.ast.expr(e).kind {
+                crate::ast::ExprKind::Cast(x, _) => cast && body.has_expr(x) && is_it(body.ty(x)),
+                crate::ast::ExprKind::Call(callee, xs) if call => {
+                    let named = matches!(body.res.get(&callee.0), Some(relax_types::typeck::Res::Def(c)) if matches!(prog.syms.str(prog.def(*c).name), "discriminant_value" | "discriminant"));
+                    named && (at_it || bpf.ast.list(xs).first().is_some_and(|&x| body.has_expr(x) && ty_mentions(u, body.ty(x), &[d], 0)))
+                }
+                _ => false,
+            }
+        })
+    };
+    let moves = if positions_move { "a variant added before running ones moves their positions and discriminants" } else { "a discriminant written out may change" };
+    let mut seen: crate::fxhash::HashSet<(DefId, bool)> = Default::default();
+    for f in u.fns.iter() {
+        let FnKey::Inst(fd, args) = &f.key else { continue };
+        if !(f.compiled || f.rir.is_some() || !f.history().inlined_into.is_empty()) {
+            continue;
+        }
+        let fd = *fd;
+        if !visible.get(prog.def(fd).krate as usize).copied().unwrap_or(true) {
+            // the library's `mem::discriminant` at it
+            if matches!(prog.syms.str(prog.def(fd).name), "discriminant" | "discriminant_value") && args.iter().any(|t| ty_mentions(u, *t, &[d], 0)) {
+                return Some(format!("enum `{}`: {}, and `{}` read them as numbers in the running code: what it made of them may be kept -- restart the app", name, moves, u.prog.def_path(fd)));
+            }
+            continue;
+        }
+        let at_it = args.iter().any(|t| ty_mentions(u, *t, &[d], 0));
+        if !matches!(prog.def(fd).kind, DefKind::Fn | DefKind::AssocFn) || !seen.insert((fd, at_it)) {
+            continue;
+        }
+        let derived = derived_of_it(fd);
+        if positions_move && derived == Some("Hash") {
+            return Some(format!("enum `{}`: {}, and its derived `Hash` (which hashes the variant's position) ran: a hash table may hold the hashes it made -- restart the app", name, moves));
+        }
+        if matches!(derived, Some("PartialEq" | "PartialOrd" | "Ord")) || !reads(fd, at_it) {
+            continue;
+        }
+        return Some(format!("enum `{}`: {}, and `{}` read them as numbers in the running code: what it made of them may be kept (a hash, an index) -- restart the app", name, moves, u.prog.def_path(fd)));
+    }
+    // a constant evaluated from them holds the old number
+    for i in 0..prog.defs.len() {
+        let c = DefId(i as u32);
+        let def = prog.def(c);
+        if !matches!(def.kind, DefKind::Const | DefKind::AssocConst | DefKind::AnonConst | DefKind::Static) || !visible.get(def.krate as usize).copied().unwrap_or(false) {
+            continue;
+        }
+        let ran = if def.kind == DefKind::Static { u.statics.get(&c).is_some_and(|&a| a != 0) } else { u.tcx.const_was_evaluated(c) };
+        if ran && reads(c, false) {
+            return Some(format!("enum `{}`: {}, and `{}` was evaluated from them: its value holds the old number -- restart the app", name, moves, u.prog.def_path(c)));
+        }
+    }
+    None
 }
 
 fn item_mentions(prog: &crate::program::Program, d: DefId, names: &[&[u8]]) -> bool {
@@ -3780,6 +3994,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         // an enum's matches see the new variants
         if u.prog.def(d).kind == DefKind::Enum {
             set_names.push(def_name(&u.prog, d).into_bytes());
+            if let Some(line) = enum_numbers_read(u, d, &versions, &visible_crates) {
+                restart.push(line);
+            }
             continue;
         }
         let old_names: Vec<Vec<u8>> = u.tcx.adts.get(&d).map(|a| a.variants[0].fields.iter().map(|f| u.prog.syms.str(f.name).as_bytes().to_vec()).collect()).unwrap_or_default();
@@ -4506,9 +4723,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let mut removed_defs: Vec<DefId> = Vec::new();
     let mut add_errs: Vec<String> = Vec::new();
     let mut saved_adts: Vec<(DefId, crate::tcx::AdtT)> = Vec::new();
-    let saved_variants: Vec<(DefId, usize)> = layout_defs.iter().filter_map(|&d| {
+    let saved_variants: Vec<(DefId, Vec<DefId>)> = layout_defs.iter().filter_map(|&d| {
         let def = u.prog.def(d);
-        (def.kind == DefKind::Enum).then(|| (d, u.prog.variants[def.sub as usize].len()))
+        (def.kind == DefKind::Enum).then(|| (d, u.prog.variants[def.sub as usize].clone()))
     }).collect();
     let mut layout_restart: Vec<String> = Vec::new();
     let mut added_defaults: Vec<(DefId, u32, DefId)> = Vec::new();
@@ -4613,7 +4830,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                         u.prog.revert_version(o, n, &news_pairs[k]);
                     }
                     u.prog.rebind_use(std::mem::take(&mut use_undo));
-                    for &(d, n) in &saved_variants { u.prog.truncate_variants(d, n); }
+                    for (d, had) in &saved_variants { u.prog.restore_variants(*d, had); }
                     restore_traits(u, &saved_traits, Some(&visible_crates));
                     u.tcx.publish_collected();
                     drop(fw);
@@ -4750,6 +4967,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                             }
                         }
                     }
+                    // (a tuple variant the edit adds: its constructor's signature)
+                    if adt.is_enum {
+                        u.tcx.insert_ctor_sigs(d, &adt);
+                    }
                     if let Some(old) = u.tcx.adts.insert(d, adt) {
                         if !old.is_enum {
                             for f in &u.tcx.adts[&d].variants[0].fields {
@@ -4798,7 +5019,11 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 if before.is_empty() {
                     continue;
                 }
-                if let Err(r) = enum_fits(&before, u) {
+                let at = match (saved_adts.iter().find(|(x, _)| *x == ed), u.tcx.adts.get(&ed)) {
+                    (Some((_, old)), Some(now)) => running_variants_at(old, now).unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+                if let Err(r) = enum_fits(&before, u, &at) {
                     layout_restart.push(r);
                 }
             }
@@ -5615,11 +5840,12 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         unsafe { u.prog.reclaim_caches(); }
         // the running enum variants and struct layouts come back with the versions, under the
         // same write: a background type check reads them (and the declarations they publish)
-        for (d, n) in saved_variants {
-            u.prog.truncate_variants(d, n);
+        for (d, had) in saved_variants {
+            u.prog.restore_variants(d, &had);
         }
         if !saved_adts.is_empty() {
             for (d, a) in saved_adts {
+                if a.is_enum { u.tcx.insert_ctor_sigs(d, &a); }
                 u.tcx.adts.insert(d, a);
             }
             u.tcx.publish_collected();
