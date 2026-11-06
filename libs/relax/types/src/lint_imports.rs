@@ -26,7 +26,8 @@ pub const REDUNDANT_IMPORTS: Lint = lint::lint("redundant_imports");
 pub const UNUSED_EXTERN_CRATES: Lint = lint::lint("unused_extern_crates");
 
 /// Per checked crate, the traits one of whose methods its bodies call (collected with the bodies):
-/// a call in one crate is no use of another crate's import.
+/// a call in one crate is no use of another crate's import. None outside a check (from its
+/// `reset` to its take): a body linted then (a live save's) adds nothing.
 static METHOD_TRAITS: relax_session::sync::Mutex<Option<HashMap<u32, HashSet<DefId>>>> = relax_session::sync::Mutex::new(None);
 
 pub fn reset() {
@@ -48,7 +49,7 @@ pub fn note_method(prog: &Program, tcx: &Tcx, krate: u32, d: DefId) {
         DefKind::Impl => match tcx.impl_trait.get(&def.parent) { Some(&t) => t, None => return },
         _ => return,
     };
-    METHOD_TRAITS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(krate).or_default().insert(t);
+    if let Some(m) = METHOD_TRAITS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() { m.entry(krate).or_default().insert(t); }
 }
 
 /// The traits in scope at code of module `m` (its block scopes up to the item's module: what it
@@ -72,8 +73,7 @@ pub fn note_scope_traits(prog: &Program, krate: u32, m: u32, item: &str) {
         traits.extend(md.anon_traits.iter().map(|&(t, _)| t).filter(|&t| has_item(t)));
         for &(g, _) in &md.globs { if prog.def(g).kind == DefKind::Mod { stack.push(prog.def(g).sub); } }
     }
-    let mut mt = METHOD_TRAITS.lock().unwrap_or_else(|e| e.into_inner());
-    mt.get_or_insert_with(HashMap::new).entry(krate).or_default().extend(traits);
+    if let Some(m) = METHOD_TRAITS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() { m.entry(krate).or_default().extend(traits); }
 }
 
 /// An identifier token of a file and where it is written.
