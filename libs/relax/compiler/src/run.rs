@@ -1153,9 +1153,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // (test_pkg.rs), else the graph's one (the lib's unit tests); the graph's other targets are
     // loaded with it (one program, one collected image) and never run here
     let subject_ci = if harness || plain_test {
-        let canon = |p: &str| std::fs::canonicalize(p).map(|c| c.display().to_string()).unwrap_or_else(|_| p.to_string());
         match &subject {
-            Some(path) => match g.bins.iter().copied().find(|&ci| canon(&g.crates[ci].src_path) == canon(path)) {
+            Some(path) => match g.bins.iter().copied().find(|&ci| crate::vfs::canonical(&g.crates[ci].src_path) == crate::vfs::canonical(path)) {
                 Some(ci) => ci,
                 None => {
                     eprintln!("makepad-run: --subject {path}: no test target of {package}'s graph has that source");
@@ -1247,6 +1246,17 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         },
         None => order,
     };
+    // a one-shot check whose load's graph certificate is current, as a check of the same command
+    // line found it that printed only stored verdicts: what that check printed, with no load
+    // (check_reuse.rs Early). Otherwise the certificate is validated for the load here.
+    let early = if check && !watch && session.is_none() && !selftest && boundary.is_none() && crate::check::reuse_allowed(options) {
+        front_images.as_ref().and_then(|images| crate::check_reuse::Early::open(&prog, images, &pre, crate::check_reuse::graph_key(&g), args))
+    } else { None };
+    if let Some(code) = early.as_ref().and_then(|e| e.replay()) {
+        phase("early check record", t);
+        crate::relaxed::finish_check();
+        return code;
+    }
     let tp = Instant::now();
     let root_dir = crate::unitgraph::manifest_dir_of(&g.crates[g.root].src_path);
     // the one app-crate rule (borrowck::event): check, serve and run share it
@@ -1295,10 +1305,11 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // relaunch built the world for the suffix's derives and waited 10 s for every std file.
     if restored_crates != 0 { crate::program::share_std_end(); }
     let collected_restored = restored_crates == pre.len();
-    // a check whose image did not hold every crate before the checked ones records it again
+    // a check whose image did not hold every crate a restore can keep while the checked ones
+    // load again records it again (not the crates after them: those load again every time)
     if check_restore {
-        let reloaded = front_images.as_ref().map_or(0, |images| pre.iter().filter(|c| images.reloads(&c.name, &c.root)).count());
-        CHECK_RECORDS_COLLECTED.store(restored_crates + reloaded < pre.len(), Ordering::Relaxed);
+        let keepable = front_images.as_ref().map_or(0, |images| images.reload_prefix(&pre));
+        CHECK_RECORDS_COLLECTED.store(restored_crates < keepable, Ordering::Relaxed);
     }
     // a load that parses crates expands their macros: the proc-macro world starts building on
     // its own thread now. A warm restore of the whole program expands nothing: no world (the
@@ -1579,7 +1590,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
         // (a load that parsed or collected anything records it with the check: run it)
         if r.full() && prog.front_restored.iter().all(|x| *x) && !CHECK_RECORDS_COLLECTED.load(Ordering::Relaxed) {
-            let code = r.print_reused(&prog);
+            let texts = r.reused_texts(&prog);
+            let code = crate::check_reuse::print_reused_texts(&texts, r.crates());
+            if let Some(e) = &early { e.record(r, &texts, options.verbose); }
             crate::relaxed::finish_check();
             if front_recordable() {
                 let r = crate::cache::Cache::flush_front_graphs();
@@ -1918,9 +1931,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             let names = g.crates.iter().enumerate().filter(|(ci, c)| !c.registry && crate_of[*ci] != u32::MAX).map(|(ci, _)| (crate_of[ci], g.pkg[ci].1.clone())).collect();
             let subjects = test_subjects.clone();
             crate::check::start_test_deps(&mut *u, move |prog| {
-                fn canon(p: &str) -> String {
-                    std::fs::canonicalize(p).map(|c| c.display().to_string()).unwrap_or_else(|_| p.to_string())
-                }
+                use crate::vfs::canonical as canon;
                 let std_dir = format!("{}/", canon(&crate::std_dir()).trim_end_matches('/'));
                 // the subject's dependencies (a test graph's other targets are not its)
                 let mut crates: Vec<u32> = candidates.into_iter().filter(|k| {

@@ -5345,8 +5345,13 @@ impl FrontImages {
     /// Whether the stored graph of `pre` is current (its certificate holds): a restore of it then
     /// reads its collected image and stores only.
     pub(crate) fn certified(&self, pre: &[crate::preload::PreCrate]) -> bool {
+        self.certificate(pre).is_some()
+    }
+    /// The stored graph of `pre` when it is current: its certificate (begin_load validates it;
+    /// a load of `pre` after this one does not again).
+    pub(crate) fn certificate(&self, pre: &[crate::preload::PreCrate]) -> Option<std::sync::Arc<crate::crate_image::GraphImage>> {
         crate::crate_image::CrateImages::begin_load(self, pre);
-        self.certificate.lock().unwrap().is_some()
+        self.certificate.lock().unwrap().clone()
     }
     /// What writes the images of the files and parts a program parses (Program::front_sink).
     pub fn sink(&self) -> Option<std::sync::Arc<dyn crate::parser::ImageSink>> {
@@ -6644,6 +6649,35 @@ mod cold_tests {
         assert_eq!(crate::crate_image::encode(&read_front_graph(&store, identity).unwrap()), crate::crate_image::encode(&graph),
             "run-time preload and collected publication must not alter the boot demand certificate");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An app check loads its checked crates again every time (reload_crates). Its first load puts
+    /// them, the crates depending on them and the ones of their names last, so the collected image
+    /// it records is the one the next check restores: that restore keeps every other crate, and a
+    /// check that restored that many records nothing again (run.rs CHECK_RECORDS_COLLECTED).
+    #[test]
+    fn a_first_app_check_loads_its_checked_crates_last() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let cfg = crate::cfg::CfgSet::host(sess, &[]);
+        let dir = std::env::temp_dir().join(format!("relax-reload-order-{}-{}", std::process::id(), crate::clock::wall_ns()));
+        // three padding crates stand where std's are; `app` is checked, `user` depends on it, `app`'s
+        // bin shares its name
+        let crates: [(&str, &[usize]); 8] = [("pad0", &[]), ("pad1", &[]), ("pad2", &[]), ("app", &[]), ("lib", &[]), ("user", &[3]), ("other", &[4]), ("app", &[4])];
+        let pre: Vec<crate::preload::PreCrate> = crates.iter().enumerate().map(|(i, (name, deps))| crate::preload::PreCrate {
+            name: name.to_string(), root: dir.join(format!("c{i}/lib.rs")).to_string_lossy().into_owned(), edition: 2021, cfg: cfg.clone(),
+            deps: deps.iter().map(|&d| (crates[d].0.to_string(), crates[d].0.to_string())).collect(), proc_macro: false,
+            image_deps: deps.to_vec(), image_dep_names: deps.iter().map(|&d| (crates[d].0.to_string(), crates[d].0.to_string())).collect(),
+        }).collect();
+        let images = FrontImages { dir: dir.join("cache"), ..Default::default() };
+        assert_eq!(images.load_order(&pre, 3), None, "a run's first load keeps its order");
+        assert_eq!(images.reload_prefix(&pre), pre.len());
+        images.reload_crates(vec![("app".to_string(), pre[3].root.clone())]);
+        let order = images.load_order(&pre, 3).expect("the checked crate and what loads with it go last");
+        assert_eq!(order, vec![0, 1, 2, 4, 6, 3, 5, 7]);
+        // in the declared order the restore stops at the checked crate; in the new one, after
+        // every crate that does not load with it
+        assert_eq!(images.reload_prefix(&pre), 3);
+        assert_eq!(images.reload_prefix(&crate::preload::reorder(&pre, &order).unwrap()), 5);
     }
 
     /// An edit keeps the collected graph's crates below the first changed crate (mapped from

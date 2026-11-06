@@ -429,6 +429,10 @@ pub struct CrateInfo {
     /// the crate's errors are reported (set by the check for its checked crates): validation-only
     /// checks run for it and for no other crate
     pub validate: bool,
+    /// a provided crate (rustc built it into the loader and `makepad run` binds it): rustc lays
+    /// its types out, so none of them takes the live layout, wherever the crate's sources are
+    /// (an edit of one rebuilds makepad, it is never patched in place). Set when the unit binds it.
+    pub rustc_laid: bool,
     /// relaxed-Rust features this crate opts in to (relaxed.rs; empty = strict), read on first
     /// use (only a relaxable error or the borrow checker asks; strict programs never read it)
     relaxed: std::sync::OnceLock<Vec<String>>,
@@ -545,13 +549,19 @@ fn retain_load_memos<K: Clone + std::hash::Hash + Eq, V: Clone>(
     entries.retain(|k, v| keep(k, v));
     let kept = entries.len();
     if kept != before {
-        *cache = Default::default();
+        *cache = cache.empty_like();
         for (k, v) in entries {
             cache.insert(k, v);
         }
     }
     (kept, before - kept)
 }
+
+/// Buckets (log2) of the per-(module, name) memos, `scope_cache` and `glob_cache`: a body check
+/// of a big workspace fills each with ~1M entries (sandbox: 0.88M and 0.98M), and a chain longer
+/// than a node or two is a cache miss per node on every lookup. 8 MB of buckets each, in zeroed
+/// pages that stay untouched until a bucket is used.
+const NAME_MEMO_BITS: u32 = 20;
 
 pub struct Program {
     collected_starts: Vec<collected::Start>,
@@ -611,10 +621,6 @@ pub struct Program {
     /// bodies are being checked: during collection nearly every lookup is unique, and a memo
     /// would cost more than it saves (set by jit::Unit::new)
     pub body_memos: std::sync::atomic::AtomicBool,
-    /// `path_segs` per path occurrence: (file, segment count, first lo, a hash of every
-    /// segment's span) -> the segments' kinds and symbols (a pure function of the file's text;
-    /// cleared when a file is replaced)
-    pub path_seg_cache: crate::conc::MemoMap<(u32, u32, u32, u64), std::sync::Arc<[(crate::ast::SegKind, Sym)]>>,
     /// traits each module's scope binds, with visibility (after import resolution)
     trait_bind_cache: crate::conc::MemoMap<u32, std::sync::Arc<Vec<(DefId, BindVis)>>>,
     /// imports are resolved (glob results no longer change)
@@ -934,19 +940,18 @@ impl Program {
             trait_scope: Default::default(),
             errors: Vec::new(),
             macros: Default::default(),
-            glob_cache: Default::default(),
+            glob_cache: crate::conc::MemoMap::with_bits(NAME_MEMO_BITS),
             glob_amb_cache: Default::default(),
             glob_prec_cache: Default::default(),
             own_crates: Vec::new(),
             sim_ambiguity: None,
             sim_diags: None,
             sim_macros: None,
-            scope_cache: Default::default(),
+            scope_cache: crate::conc::MemoMap::with_bits(NAME_MEMO_BITS),
             import_used: Default::default(),
             glob_used: Default::default(),
             extern_used: Default::default(),
             body_memos: Default::default(),
-            path_seg_cache: Default::default(),
             trait_bind_cache: Default::default(),
             prelexed: Default::default(),
             ahead: Default::default(),
@@ -1285,7 +1290,7 @@ impl Program {
         let root_mod = self.new_module(root_def, None, None, krate, 0);
         self.defs[root_def.0 as usize].sub = root_mod;
         self.defs[root_def.0 as usize].scope = root_mod;
-        self.crates.push(CrateInfo { name: cname, root_mod, edition, recursion_limit: 128, deps, cfg, proc_macro: false, is_bin: false, harness: false, validate: false, relaxed: Default::default(), features: Default::default(), impl_view: Default::default(), root_path: root.to_string(), context: crate::source_context::Context::new(root, self.sources.clone(), &self.session) });
+        self.crates.push(CrateInfo { name: cname, root_mod, edition, recursion_limit: 128, deps, cfg, proc_macro: false, is_bin: false, harness: false, validate: false, rustc_laid: false, relaxed: Default::default(), features: Default::default(), impl_view: Default::default(), root_path: root.to_string(), context: crate::source_context::Context::new(root, self.sources.clone(), &self.session) });
         let kname = self.syms.str(cname).to_string();
         let akey = crate::preload::crate_key(&kname, root, &self.crates[krate as usize].cfg);
         if !self.ahead.contains_key(&akey) {
@@ -2129,7 +2134,6 @@ impl Program {
     pub fn memo_mem_lines(&self) -> Vec<(String, u64)> {
         let mut out = Vec::new();
         let mut push = |name: &str, (n, b): (usize, usize)| out.push((format!("program {} ({})", name, n), b as u64));
-        push("path_seg_cache", self.path_seg_cache.mem_stats(|_, v| 16 + v.len() * std::mem::size_of::<(crate::ast::SegKind, Sym)>()));
         push("scope_cache", self.scope_cache.mem_stats(|_, _| 0));
         push("glob_cache", self.glob_cache.mem_stats(|_, _| 0));
         push("trait_bind_cache", self.trait_bind_cache.mem_stats(|_, v| 40 + v.capacity() * std::mem::size_of::<(DefId, BindVis)>()));
@@ -2144,7 +2148,6 @@ impl Program {
     pub unsafe fn detach_caches(&self, retired: &mut Vec<Box<dyn Send>>) {
         retired.push(Box::new(self.glob_cache.detach()));
         retired.push(Box::new(self.scope_cache.detach()));
-        retired.push(Box::new(self.path_seg_cache.detach()));
         retired.push(Box::new(self.trait_bind_cache.detach()));
         retired.push(Box::new(self.trait_scope.detach()));
     }
@@ -2155,7 +2158,6 @@ impl Program {
     pub unsafe fn reclaim_caches(&self) {
         self.glob_cache.reclaim();
         self.scope_cache.reclaim();
-        self.path_seg_cache.reclaim();
         self.trait_bind_cache.reclaim();
         self.trait_scope.reclaim();
     }
@@ -2224,13 +2226,6 @@ impl Program {
         for &(lo, hi) in &v.idents {
             let s = std::str::from_utf8(&v.pf.src[lo as usize..hi as usize]).unwrap_or("?").to_string();
             self.syms.intern(&s);
-        }
-        // A path's segments depend only on its file's text (a file version never changes) and
-        // on whether each name is interned yet; path_segs recomputes an entry that met a name
-        // not interned, so the memo stays valid across a scoped item edit. Clearing (and freeing)
-        // it cost ~0.7 s per item edit once boot filled it (lead decision 52 R1).
-        if !same_scopes && visible.is_none() {
-            self.path_seg_cache.clear();
         }
         let new = self.files.len() as u32;
         let table = std::sync::Arc::make_mut(&mut self.macros);
@@ -2380,7 +2375,6 @@ impl Program {
             self.crates[self.file_crate[old as usize] as usize].context = context.clone();
         }
         self.parse_reuse.remove(&new);
-        self.path_seg_cache.clear();
         self.forget_bindings();
         for e in self.import_versions.remove(&new).unwrap_or_default().into_iter().rev() {
             std::sync::Arc::make_mut(&mut self.macros).apply_import_edit(&e.undone());
@@ -4057,23 +4051,19 @@ impl Program {
         // Scope/trait-scope also read the implicit prelude. A changed prelude
         // therefore invalidates those scopes even without an explicit glob edge.
         let prelude_changed = self.prelude_modules().iter().any(|m| invalid.contains(m));
-        let files: crate::fxhash::HashSet<u32> = invalid.iter().map(|&m| self.mods[m as usize].file).collect();
         let scope = retain_load_memos(&mut self.scope_cache, |(m, _, _), v| !prelude_changed && !invalid.contains(m) && v.is_some());
         let glob = retain_load_memos(&mut self.glob_cache, |(m, _, _), v| !invalid.contains(m) && v.is_some());
-        // Segments are file text, not resolution results. Invalidate the files of
-        // changed scopes conservatively; unchanged files cannot acquire new text.
-        let path_seg = retain_load_memos(&mut self.path_seg_cache, |(f, _, _, _), _| !files.contains(f));
         let trait_bind = retain_load_memos(&mut self.trait_bind_cache, |m, v| !invalid.contains(m) && !v.is_empty());
         let trait_scope = retain_load_memos(&mut self.trait_scope, |m, v| !prelude_changed && !invalid.contains(m) && !v.is_empty());
         self.imports_done = true;
         self.load_graph = Some(graph);
         if std::env::var_os("MAKEPAD_RUN_DEFERRED_TRACE").is_some() {
-            let kept = scope.0 + glob.0 + path_seg.0 + trait_bind.0 + trait_scope.0;
-            let dropped = scope.1 + glob.1 + path_seg.1 + trait_bind.1 + trait_scope.1;
-            eprintln!("makepad-run deferred: front-load {} imports_retried={} imports_done={} settle_retries={} wait_modules={} modules_invalidated={} cache_kept={} cache_dropped={} prelude_changed={} scope={:?} glob={:?} path_seg={:?} trait_bind={:?} trait_scope={:?} index_built={}",
+            let kept = scope.0 + glob.0 + trait_bind.0 + trait_scope.0;
+            let dropped = scope.1 + glob.1 + trait_bind.1 + trait_scope.1;
+            eprintln!("makepad-run deferred: front-load {} imports_retried={} imports_done={} settle_retries={} wait_modules={} modules_invalidated={} cache_kept={} cache_dropped={} prelude_changed={} scope={:?} glob={:?} trait_bind={:?} trait_scope={:?} index_built={}",
                 self.def_path(self.mods[m as usize].def), retried, completed, settled, affected.len(),
                 if prelude_changed { self.mods.len() } else { invalid.len() }, kept, dropped, prelude_changed,
-                scope, glob, path_seg, trait_bind, trait_scope, indexed);
+                scope, glob, trait_bind, trait_scope, indexed);
         }
         Ok((d0, bindings_changed))
     }
@@ -6185,41 +6175,36 @@ pub fn hint_path(defs: &[Def], syms: &Interner, files: &[std::sync::Arc<ParsedFi
 /// Files parsed ahead (preload.rs) that the loader parsed again (run.rs reports it).
 pub static PARSE_AGAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// A path's segments as (kind, symbol), memoised per occurrence in `path_seg_cache` once body
-/// memos are on.
-pub fn path_segs(prog: &Program, file: u32, p: &Path) -> std::sync::Arc<[(SegKind, Sym)]> {
-    if !prog.body_memos.load(std::sync::atomic::Ordering::Relaxed) {
-        return path_segs_uncached(prog, file, p).into();
-    }
-    let mut h: u64 = 0;
-    for s in prog.files[file as usize].ast.segs(p.segs) {
-        h = (h.rotate_left(5) ^ (((s.name.lo as u64) << 32) | s.name.hi as u64)).wrapping_mul(0xf135_7aea_2e62_a9c5);
-    }
-    let lo = prog.files[file as usize].ast.segs(p.segs).first().map_or(0, |s| s.name.lo);
-    let key = (file, p.segs.len() as u32, lo, h);
-    let stale = match prog.path_seg_cache.get(&key) {
-        // (a name not interned when the entry was made may be now: Program::commit_version_in)
-        Some(v) if v.iter().any(|&(_, sym)| sym == u32::MAX) => Some(v),
-        Some(v) => return v,
-        None => None,
-    };
-    let v: std::sync::Arc<[(SegKind, Sym)]> = path_segs_uncached(prog, file, p).into();
-    if stale.as_deref() != Some(&*v) { prog.path_seg_cache.insert(key, v.clone()); }
-    v
+/// A path's segments as (kind, symbol), `u32::MAX` for a name no file interned: held inline up
+/// to four segments. Built afresh on each call: two string-table probes per segment cost less
+/// than any memo of them (a per-occurrence one held 4M entries for sandbox and cost 8% of the
+/// body checks walking its chains).
+pub struct PathSegs {
+    len: usize,
+    inline: [(SegKind, Sym); 4],
+    spill: Vec<(SegKind, Sym)>,
 }
 
-fn path_segs_uncached(prog: &Program, file: u32, p: &Path) -> Vec<(SegKind, Sym)> {
-    let f = &prog.files[file as usize];
-    let mut v = Vec::new();
-    for s in prog.files[file as usize].ast.segs(p.segs) {
-        let t = f.text(s.name);
-        let t = match t.strip_prefix("r#") {
-            Some(x) => x,
-            None => t,
-        };
-        v.push((s.kind(), prog.syms.get(t).unwrap_or(u32::MAX)));
+impl std::ops::Deref for PathSegs {
+    type Target = [(SegKind, Sym)];
+    #[inline]
+    fn deref(&self) -> &[(SegKind, Sym)] {
+        if self.len > 4 { &self.spill } else { &self.inline[..self.len] }
     }
-    v
+}
+
+pub fn path_segs(prog: &Program, file: u32, p: &Path) -> PathSegs {
+    let f = &prog.files[file as usize];
+    let segs = f.ast.segs(p.segs);
+    let mut out = PathSegs { len: segs.len(), inline: [(SegKind::Ident, u32::MAX); 4], spill: Vec::new() };
+    if segs.len() > 4 { out.spill.reserve_exact(segs.len()); }
+    for (i, s) in segs.iter().enumerate() {
+        let t = f.text(s.name);
+        let t = t.strip_prefix("r#").unwrap_or(t);
+        let v = (s.kind(), prog.syms.get(t).unwrap_or(u32::MAX));
+        if segs.len() <= 4 { out.inline[i] = v } else { out.spill.push(v) }
+    }
+    out
 }
 
 /// One lookup through glob imports (a fixpoint over glob cycles, see lookup_in_module_vis).
@@ -6415,7 +6400,6 @@ mod deferred_load_tests {
         p.defer_skipped_imports(1, &pending);
         p.scope_cache.clear();
         p.glob_cache.clear();
-        p.path_seg_cache.clear();
         p.trait_bind_cache.clear();
         p.trait_scope.clear();
         p.imports_done = true;

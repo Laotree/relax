@@ -5,8 +5,11 @@
 //! and reloads them around the slow call alone. Without that, every value an inlined `sub(a, p)`
 //! returned stayed in stack memory, and live sessions ran a mesh's winding number 5x slower than
 //! `makepad test`. The result copied on (the next copy's argument copy) stays in registers too
-//! once the copies are tiled. The same call as a real call in the loop keeps the slots in memory
-//! (a flush and reload per iteration costs more than it saves).
+//! once the copies are tiled. The result buffer lowering made for that call (`Slot::ret`) is not
+//! flushed before it: the call writes all of it, and a flush keeps the cells live around the loop,
+//! which the copy's path paid for (a BVH walk's popped Option stored and copied each iteration).
+//! The same call as a real call in the loop keeps the slots in memory (a flush and reload per
+//! iteration costs more than it saves).
 use relax_backend::passes;
 use relax_backend::rir::*;
 
@@ -21,13 +24,15 @@ fn push(f: &mut Func, b: u32, i: Inst) {
 /// `fn(n) -> u64`: `acc = 0; i = 0; while i < n { a = i; r = step(a); acc += r; i += 1 } acc`,
 /// `step` (Fn(7), result buffer first) inlined as `r = a + 1` behind its patch flag, its call in
 /// the slow block. `guarded`: that call is the copy's slow call (`guard_calls`), else a plain call.
-/// `copied`: the continuation reads the result from a copy of it (`q = r; acc += q`).
-fn build(guarded: bool, copied: bool) -> (Func, u32, u32) {
+/// `copied`: the continuation reads the result from a copy of it (`q = r; acc += q`). `ret`: the
+/// result buffer is the one lowering made for the call (`Slot::ret`).
+fn build(guarded: bool, copied: bool, ret: bool) -> (Func, u32, u32) {
     let mut f = Func::new("sroa_guard_calls".into(), 0);
     let n = f.vreg(Cls::I);
     f.params = vec![n];
     f.rets = vec![Cls::I];
     let (r_slot, a_slot, q_slot) = (f.slot(8, 8), f.slot(8, 8), f.slot(8, 8));
+    f.slots[r_slot as usize].ret = ret;
     let b: Vec<u32> = (0..7).map(|_| f.block()).collect();
     let v: Vec<VReg> = (0..13).map(|_| f.vreg(Cls::I)).collect();
     let (r, a, i, acc, c, flag, w, fast, x, y, rv, one, q) = (v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12]);
@@ -110,7 +115,7 @@ fn slot_access_blocks(f: &Func) -> Vec<usize> {
 
 #[test]
 fn a_guarded_copys_slots_stay_in_registers_and_meet_memory_only_at_its_slow_call() {
-    let (mut f, slow, cont) = build(true, false);
+    let (mut f, slow, cont) = build(true, false, false);
     sroa(&mut f, false);
     assert_eq!(slot_access_blocks(&f), vec![slow as usize], "only the slow block touches the slots:\n{}", f.dump());
     let s = &f.blocks[slow as usize].insts;
@@ -122,7 +127,7 @@ fn a_guarded_copys_slots_stay_in_registers_and_meet_memory_only_at_its_slow_call
 
 #[test]
 fn a_guarded_copys_result_copied_on_stays_in_registers() {
-    let (mut f, slow, cont) = build(true, true);
+    let (mut f, slow, cont) = build(true, true, false);
     sroa(&mut f, true);
     assert_eq!(slot_access_blocks(&f), vec![slow as usize], "only the slow block touches the slots:\n{}", f.dump());
     let s = &f.blocks[slow as usize].insts;
@@ -133,7 +138,36 @@ fn a_guarded_copys_result_copied_on_stays_in_registers() {
 
 #[test]
 fn the_same_call_in_the_loop_keeps_its_slots_in_memory() {
-    let (mut f, _, cont) = build(false, false);
+    let (mut f, _, cont) = build(false, false, true);
     sroa(&mut f, false);
     assert!(slot_access_blocks(&f).contains(&(cont as usize)), "a real call in the loop: the slots stay in memory:\n{}", f.dump());
+}
+
+/// The slot each `SlotAddr` vreg names.
+fn slot_addrs(f: &Func) -> Vec<Option<u32>> {
+    let mut out = vec![None; f.vregs.len()];
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::SlotAddr(d, sl) = i {
+                out[d.0 as usize] = Some(*sl);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn a_guarded_copys_result_buffer_is_read_back_after_its_slow_call_but_not_flushed_before_it() {
+    let (mut f, slow, cont) = build(true, false, true);
+    sroa(&mut f, false);
+    assert_eq!(slot_access_blocks(&f), vec![slow as usize], "only the slow block touches the slots:\n{}", f.dump());
+    let addrs = slot_addrs(&f);
+    let s = &f.blocks[slow as usize].insts;
+    let call = s.iter().position(|i| matches!(i, Inst::Call(Callee::Fn(7), ..))).expect("the slow call stays");
+    let stored: Vec<Option<u32>> = s[..call].iter().filter_map(|i| if let Inst::Store(_, base, _, _) = i { Some(addrs[base.0 as usize]) } else { None }).collect();
+    // slot 1: the argument copy, slot 0: the result buffer
+    assert_eq!(stored, vec![Some(1)], "only the argument goes to memory before the slow call:\n{}", f.dump());
+    let loaded: Vec<Option<u32>> = s[call + 1..].iter().filter_map(|i| if let Inst::Load(_, _, base, _) = i { Some(addrs[base.0 as usize]) } else { None }).collect();
+    assert!(loaded.contains(&Some(0)), "the result is read back after it:\n{}", f.dump());
+    assert!(!f.blocks[cont as usize].insts.iter().any(|i| matches!(i, Inst::Load(..))), "the continuation reads the result from a register:\n{}", f.dump());
 }

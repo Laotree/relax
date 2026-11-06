@@ -603,13 +603,16 @@ impl Layouts {
 
     /// Live sessions (M10, hotreload.md section 13): a struct in the application's scope that
     /// edits may give fields in place -- named fields, no repr other than Rust's, not Copy (a
-    /// bitwise copy would share the extension block).
+    /// bitwise copy would share the extension block). Never a provided crate's (`rustc_laid`):
+    /// its values are rustc's bytes, and an application whose tree holds the framework's sources
+    /// has the crate in its scope.
     pub fn live_editable(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, d: crate::program::DefId, adt: &crate::tcx::AdtT, t: TyId) -> bool {
         if !LIVE_SESSION.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
         }
         let prog = lcx.prog;
-        if !crate::borrowck::event::app_crate(prog, prog.def(d).krate) || adt.is_enum || adt.is_union {
+        let krate = prog.def(d).krate;
+        if prog.crates[krate as usize].rustc_laid || !crate::borrowck::event::app_crate(prog, krate) || adt.is_enum || adt.is_union {
             return false;
         }
         if adt.repr_c || adt.repr_packed != 0 || adt.repr_align != 0 || adt.repr_int.is_some() || adt.no_niche || adt.valid_start.is_some() || adt.valid_end.is_some() {
@@ -631,7 +634,8 @@ impl Layouts {
             return false;
         }
         let prog = lcx.prog;
-        prog.def(d).krate == root_crate() && !adt.repr_c && adt.repr_int.is_none() && adt.repr_align == 0 && adt.repr_packed == 0 && !adt.no_niche
+        let krate = prog.def(d).krate;
+        krate == root_crate() && !prog.crates[krate as usize].rustc_laid && !adt.repr_c && adt.repr_int.is_none() && adt.repr_align == 0 && adt.repr_packed == 0 && !adt.no_niche
     }
 
     /// Is `t` 4 GiB or larger (its layout saturated)?

@@ -1351,6 +1351,7 @@ impl<'a> Ctx<'a> {
             crate::jit::cert_note_value(u, d, &args);
             return Some(a);
         }
+        if crate::jit::refuses_tainted(u, d) { return None; }
         if u.const_failed.contains(&(d, args.clone())) || self.depth >= CALL_DEPTH {
             return None;
         }

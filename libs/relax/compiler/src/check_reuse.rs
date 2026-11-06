@@ -41,6 +41,11 @@
 //! it printed no signature error, of any crate), the check prints the stored diagnostics right
 //! after the load (run.rs), before declaration collection: nothing a check prints in between
 //! rests on anything but the keys' inputs and those errors.
+//!
+//! Such a check also stores what it printed as its early record (`Early`), under a key known
+//! before the load: the command line, the unit graph and the load's graph certificate (the inputs
+//! and module probes the front's images rest on). The next check of that command line whose
+//! certificate is current prints it right after the build scripts, with no load at all.
 use crate::ast::ItemId;
 use crate::check_order::{Entry, GroupAt, Out, Phase, Stage};
 use crate::program::{DefKind, Program, NO_DEF};
@@ -53,6 +58,8 @@ const KIND_CRATE: u32 = 1;
 const KIND_RUN: u32 = 2;
 /// a checked crate's interface by file and item (`Table`), under its identity and interface hash
 const KIND_TABLE: u32 = 3;
+/// a whole check's output under a key known before the load (`Early`)
+const KIND_EARLY: u32 = 4;
 /// a late lint: printed only when the required analyses passed (check_order.rs Stage::required)
 pub(crate) const LATE: u8 = 1;
 /// reported by the well-formedness checks, which run only when nothing failed before them
@@ -125,6 +132,10 @@ pub(crate) struct Reuse {
     pub(crate) t_keys: std::time::Duration,
     /// files the load skipped: of the checked crates, of the others
     pub(crate) skipped: (usize, usize),
+    /// every crate's files, (path, content hash): the texts the keys rest on (Early::record)
+    files: Vec<(String, u128)>,
+    /// the hits' late inputs
+    late: Vec<(String, u8, String, u128)>,
 }
 
 /// What a check's crates' keys rest on beyond the crates: the Relax build and options, the
@@ -415,6 +426,7 @@ impl Reuse {
             stored: Vec::new(), run_key, run_hit: false, idents, texts, heads, ifaces, cur, table_stored: vec![false; n],
             deps, added: Vec::new(), store_entries: 0, sig_clean: false, t_keys: Default::default(),
             skipped: (skipped.iter().filter(|s| is_checked[s.0 as usize]).count(), skipped.iter().filter(|s| !is_checked[s.0 as usize]).count()),
+            files: Vec::new(), late: Vec::new(),
         };
         r.added = vec![false; r.checked.len()];
         // MAKEPAD_RUN_CHECK_REUSE_TRACE: each crate's key parts (two checks' traces diff to what changed)
@@ -460,6 +472,7 @@ impl Reuse {
                 r.raw[j] = Some(p.to_vec());
                 if since.is_empty() {
                     r.hit[j] = true;
+                    r.late.extend(v.late);
                     r.stored.extend(v.entries);
                 } else {
                     changed.push((j, v, since));
@@ -493,6 +506,7 @@ impl Reuse {
                 if ok {
                     r.hit[j] = true;
                     r.added[j] = true;
+                    r.late.extend(v.late);
                     r.stored.extend(v.entries);
                 } else {
                     r.raw[j] = None;
@@ -500,6 +514,7 @@ impl Reuse {
             }
             r.run_hit = matches!(store.get_checked(r.run_key), Some((KIND_RUN, _)));
         }
+        if r.full() { r.files = text_files.into_iter().flatten().collect(); }
         r.t_keys = t0.elapsed();
         r
     }
@@ -528,15 +543,11 @@ impl Reuse {
         }).collect()
     }
 
-    /// A check whose every crate is unchanged (`full`): the stored diagnostics, printed as the
-    /// check that stored them printed them, and the check's summary. Exit code 0 (the check that
-    /// stored them passed).
-    pub(crate) fn print_reused(&self, prog: &Program) -> i32 {
-        let entries = crate::check_order::sort(prog, self.replayed(true, true));
-        crate::check_order::print(&entries, true, true, crate::diag::enabled());
-        eprintln!("makepad check: {} crates unchanged since a passing check: their verdicts reused", self.crates());
-        eprintln!("makepad check: 0 body owners of the checked crates, 0 compiled in all, 0 errors");
-        0
+    /// A check whose every crate is unchanged (`full`): the stored diagnostics in the order the
+    /// check that stored them printed them (`print_reused_texts` prints them).
+    pub(crate) fn reused_texts(&self, prog: &Program) -> Vec<String> {
+        crate::check_order::sort(prog, self.replayed(true, true)).into_iter()
+            .filter_map(|e| match e.out { Out::Warning(s) => Some(s), _ => None }).collect()
     }
 
     /// A passing check's diagnostics `entries` (its own: no replayed one; `flags` LATE / WF,
@@ -630,6 +641,163 @@ impl Reuse {
             .and_then(|_| crate::store::append(&self.path, new, drop_all).map_err(|e| e.to_string()));
         if verbose { eprintln!("makepad check: verdicts stored ({:?})", r.err()); }
     }
+}
+
+/// A check whose every crate is unchanged: its stored diagnostics `texts` (Reuse::reused_texts),
+/// printed as the check that stored them printed them, and the summary of its `crates` checked
+/// crates. Exit code 0 (the check that stored them passed).
+pub(crate) fn print_reused_texts(texts: &[String], crates: usize) -> i32 {
+    let entries: Vec<Entry> = texts.iter().map(|t| Entry { stage: Stage::new(Phase::Resolve, 0), seq: 0, out: Out::Warning(t.clone()), group_at: None }).collect();
+    crate::check_order::print(&entries, true, true, crate::diag::enabled());
+    eprintln!("makepad check: {} crates unchanged since a passing check: their verdicts reused", crates);
+    eprintln!("makepad check: 0 body owners of the checked crates, 0 compiled in all, 0 errors");
+    0
+}
+
+/// What a check's output rests on in its unit graph (unitgraph.rs Graph) beyond the load's
+/// recipe: every crate as the graph has it (binary, test harness, package, its build script's
+/// output), the root, the bins, the linked libraries.
+pub(crate) fn graph_key(g: &crate::unitgraph::Graph) -> u128 {
+    let mut h = Sip128::new();
+    h.str("relax-check-graph");
+    let strs = |h: &mut Sip128, v: &[String]| { h.u32(v.len() as u32); for s in v { h.str(s); } };
+    let deps = |h: &mut Sip128, v: &[(usize, String)]| { h.u32(v.len() as u32); for (d, a) in v { h.u32(*d as u32); h.str(a); } };
+    let env = |h: &mut Sip128, v: &[(String, String)]| { h.u32(v.len() as u32); for (k, x) in v { h.str(k); h.str(x); } };
+    h.u32(g.crates.len() as u32);
+    for (ci, c) in g.crates.iter().enumerate() {
+        h.str(&c.name); h.str(&c.src_path); h.u32(c.edition as u32); strs(&mut h, &c.features); deps(&mut h, &c.deps);
+        h.u8(c.proc_macro as u8); h.u8(c.bin as u8); h.u8(c.harness as u8); h.u8(c.build_script as u8); h.str(&c.version); h.u8(c.registry as u8);
+        match &c.host {
+            None => h.u8(0),
+            Some(u) => {
+                h.u8(1); strs(&mut h, &u.features); deps(&mut h, &u.deps);
+                match &u.build_outputs { None => h.u8(0), Some((cfgs, vars)) => { h.u8(1); strs(&mut h, cfgs); env(&mut h, vars); } }
+            }
+        }
+        let (dir, name, ver) = &g.pkg[ci];
+        h.str(dir); h.str(name); h.str(ver);
+        strs(&mut h, &g.cfgs[ci]);
+        env(&mut h, &g.env[ci]);
+    }
+    h.u32(g.root as u32);
+    h.u32(g.bins.len() as u32);
+    for b in &g.bins { h.u32(*b as u32); }
+    h.u32(g.link_libs.len() as u32);
+    for (l, framework) in &g.link_libs { h.str(l); h.u8(*framework as u8); }
+    h.u8(g.native.is_some() as u8);
+    h.finish128()
+}
+
+/// A one-shot check's early record (run.rs): a check whose every crate hit and that printed its
+/// stored diagnostics (`print_reused_texts`) stores what it printed, under a key known before the load:
+/// the Relax build and options and the `MAKEPAD_RUN_*` variables (`env_key`), the command line,
+/// the unit graph (`graph_key`), the load's recipe and the inputs and module probes of its front
+/// graph certificate. The certificate is current only while every input has its recorded text
+/// (cache.rs begin_load: a recorded stat stands for the text, else the file is hashed). A later
+/// check with that key, whose certificate is current and whose late inputs (include_str!, env!)
+/// are unchanged, prints the record right after the build scripts: no load, no verdict keys.
+pub(crate) struct Early {
+    path: PathBuf,
+    key: u128,
+    write: bool,
+    /// the certificate's inputs: a record is stored only when the check's files are these
+    inputs: HashMap<String, u128>,
+    n_probes: usize,
+}
+
+/// A decoded early record.
+struct EarlyRecord {
+    crates: u32,
+    late: Vec<(String, u8, String, u128)>,
+    /// the stores the recording check used (store.rs live): kept in use by each replay
+    stores: Vec<String>,
+    texts: Vec<String>,
+}
+
+impl Early {
+    /// The early record of a check (`args`: its command line) of the crates `pre` with the unit
+    /// graph `graph` (`graph_key`). None: the cache is off or verifying, or the load's graph
+    /// certificate is not current.
+    pub(crate) fn open(prog: &Program, images: &crate::cache::FrontImages, pre: &[crate::preload::PreCrate], graph: u128, args: &[String]) -> Option<Early> {
+        let mode = crate::cache::mode_from_env(&prog.session.options)?;
+        if mode == crate::cache::Mode::Verify { return None; }
+        let cert = images.certificate(pre)?;
+        let mut h = Sip128::new();
+        h.str("relax-check-early");
+        h.u32(VERSION);
+        h.u128(env_key(prog));
+        h.u32(args.len() as u32);
+        for a in args { h.str(a); }
+        h.u128(graph);
+        h.u128(cert.identity);
+        h.u32(cert.inputs.len() as u32);
+        for (p, x) in &cert.inputs { h.str(p); h.u128(*x); }
+        h.u32(cert.probes.len() as u32);
+        for (p, e) in &cert.probes { h.str(p); h.u8(*e as u8); }
+        let path = crate::dirs::relax_dir().join("cache").join(format!("check-early-{:016x}.rcs", cert.identity as u64));
+        Some(Early { path, key: h.finish128(), write: mode == crate::cache::Mode::On, inputs: cert.inputs.iter().cloned().collect(), n_probes: cert.probes.len() })
+    }
+
+    /// The stored output printed when the record is current (its late inputs unchanged): the
+    /// check's exit code. None: no current record.
+    pub(crate) fn replay(&self) -> Option<i32> {
+        let times = std::env::var_os("MAKEPAD_RUN_CHECK_TIMES").is_some();
+        let found = crate::store::Store::open(&self.path).and_then(|store| match store.get_checked(self.key) {
+            Some((KIND_EARLY, p)) => decode_early(p),
+            _ => None,
+        });
+        let current = found.filter(|r| r.late.iter().all(|(c, k, name, h)| late_current(c, *k, name, *h)));
+        if times {
+            eprintln!("makepad check: early record ({} inputs, {} probes): {}", self.inputs.len(), self.n_probes, if current.is_some() { "current" } else { "none" });
+        }
+        let r = current?;
+        for s in &r.stores { crate::store::stamp_used(Path::new(s)); }
+        Some(print_reused_texts(&r.texts, r.crates as usize))
+    }
+
+    /// Stores what a check whose every crate hit printed (`texts`, `reuse`'s): only when the
+    /// check's files are the certificate's inputs as they were validated (a file the load read
+    /// again could have changed since).
+    pub(crate) fn record(&self, reuse: &Reuse, texts: &[String], verbose: bool) {
+        if !self.write { return; }
+        if let Some((p, _)) = reuse.files.iter().find(|(p, x)| self.inputs.get(p) != Some(x)) {
+            if verbose { eprintln!("makepad check: early record not stored: {} is not the certificate's", p); }
+            return;
+        }
+        let mut late = reuse.late.clone();
+        late.extend(crate::sip::late_inputs());
+        late.sort();
+        late.dedup();
+        let mut stores: Vec<String> = crate::store::live().into_iter().map(|p| p.display().to_string()).collect();
+        stores.sort();
+        let mut w = W(Vec::new());
+        w.u32(VERSION);
+        w.u32(reuse.crates() as u32);
+        w.u32(late.len() as u32);
+        for (k, kind, name, h) in &late { w.str(k); w.0.push(*kind); w.str(name); w.u128(*h); }
+        w.u32(stores.len() as u32);
+        for s in &stores { w.str(s); }
+        w.u32(texts.len() as u32);
+        for t in texts { w.str(t); }
+        let entry = crate::pack::NewEntry { key: self.key, kind: KIND_EARLY, payload: w.0 };
+        // (one record per recipe: the last check's)
+        let r = self.path.parent().map_or(Ok(()), crate::pack::ensure_private_dir)
+            .and_then(|_| crate::store::append(&self.path, vec![entry], true).map_err(|e| e.to_string()));
+        if verbose { eprintln!("makepad check: early record stored ({:?})", r.err()); }
+    }
+}
+
+fn decode_early(p: &[u8]) -> Option<EarlyRecord> {
+    let mut r = R(p);
+    if r.u32()? != VERSION { return None; }
+    let crates = r.u32()?;
+    let mut late = Vec::new();
+    for _ in 0..r.u32()? { late.push((r.str()?, r.u8()?, r.str()?, r.u128()?)); }
+    let mut stores = Vec::new();
+    for _ in 0..r.u32()? { stores.push(r.str()?); }
+    let mut texts = Vec::new();
+    for _ in 0..r.u32()? { texts.push(r.str()?); }
+    r.0.is_empty().then_some(EarlyRecord { crates, late, stores, texts })
 }
 
 struct W(Vec<u8>);

@@ -6908,6 +6908,24 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
     };
     // invoked reload sites: the reloads go on both edges (blocks made below)
     let mut edge_reloads: Vec<(usize, u32, VReg)> = Vec::new();
+    // (block, instruction, slot): a guarded copy's slow call handed the slot as its result buffer
+    // alone (`Slot::ret`: it writes all of it). The cells' values before it are dead, so they are
+    // not flushed: a flush keeps them live around the loop the copy runs in, which the copy's own
+    // path pays for (a popped Option's tag stored, copied and reloaded each iteration)
+    let ret_sites: Vec<(u32, u32, u32)> = reload_sites
+        .iter()
+        .copied()
+        .filter(|&(bi, k, sl)| {
+            f.slots[sl as usize].ret
+                && f.guard_call(bi as usize, k as usize)
+                && match &f.blocks[bi as usize].insts[k as usize] {
+                    Inst::Call(Callee::Fn(id) | Callee::CFn(id, _), args, _) => {
+                        f.sret_callees.contains(id) && args.first().map(|a| at(*a)) == Some((sl, 0)) && !args[1..].iter().any(|a| at(*a).0 == sl)
+                    }
+                    _ => false,
+                }
+        })
+        .collect();
     // temporaries of sub-cell accesses (vregs nv0.., added after the rewrite)
     let nv0 = f.vregs.len() as u32;
     let mut sub_tmps: Vec<Cls> = Vec::new();
@@ -7036,7 +7054,7 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                 Inst::Call(_, args, _) if !esc_addr.is_empty() => {
                     // an escaped slot's last use: the slot gets its cells' values first
                     for &(sl, a) in &esc_addr {
-                        if !args.iter().any(|x| at(*x).0 == sl) {
+                        if !args.iter().any(|x| at(*x).0 == sl) || ret_sites.contains(&(bi as u32, k as u32, sl)) {
                             continue;
                         }
                         let g = root[sl as usize] as usize;
