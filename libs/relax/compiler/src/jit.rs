@@ -11226,8 +11226,11 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done) {
                 }
             }
             // SPEC-V: the base of a twin that reached O3 (twin_base_build) goes on to its own O3
-            // build now that it has code
+            // build now that it has code, as hot as its twin ran
             if take_twin_o3_base(up, id) {
+                if let Some(t) = u.plain_twin_of(id) {
+                    take_twin_heat(u, id, t);
+                }
                 queue_now(u, id, Q_MARKED, 0);
             }
             if perf_map_on() {
@@ -15240,7 +15243,26 @@ struct FrequencyProfile {
     counters: &'static [AtomicU64],
 }
 
+/// MAKEPAD_RUN_OPT=-twinpgo: SPEC-V twins get no counted build, and their bases neither their
+/// counts nor their heat (counted_build, Unit::profile_of, take_twin_heat)
+fn twin_pgo_off(options: &relax_session::Options) -> bool {
+    relax_backend::stats::opt_off(options, "-twinpgo")
+}
+
 impl Unit {
+    /// Slot `id`'s counted build's profile, or (a SPEC-V base that has none) its twin's: the same
+    /// body, which ran in the base's place while its verdict was out (counts_for maps it by
+    /// source position).
+    fn profile_of(&self, id: u32) -> Option<&FrequencyProfile> {
+        self.frequency_profiles.get(&id).or_else(|| self.plain_twin_of(id).and_then(|t| self.frequency_profiles.get(&t)))
+    }
+
+    /// The PGO counts slot `id`'s O3 build puts on the blocks of `rir` (its O3 input or a
+    /// snapshot callee's): its profile's (`profile_of`), None when it has none or nothing ran.
+    pub(crate) fn pgo_counts_for(&self, id: u32, rir: &relax_backend::rir::Func) -> Option<Vec<f32>> {
+        self.profile_of(id).and_then(|p| p.counts_for(rir))
+    }
+
     /// Slot `id`'s PGO counts as (source position, executions of the counted block holding it),
     /// for makepad inspect `asm` (None: the slot has no counted build). The positions are the
     /// counted (pre-O3) RIR's: the fn's own code, not what O3 inlines into it later.
@@ -17189,6 +17211,20 @@ unsafe fn twin_base_build(up: *mut Unit, t: u32) {
     o2_base(up, b);
 }
 
+/// SPEC-V: base `b` takes its twin `t`'s heat: the twin ran in its place (the same body), so the
+/// base's own record saw none of it, and its O3 build (from the twin's counts: Unit::profile_of)
+/// would wait behind every slot that ran -- past the end of a short run, whose next launch then
+/// built it. Read with the slot records' races (an estimate either way: slot_heat).
+unsafe fn take_twin_heat(u: &Unit, b: u32, t: u32) {
+    let Some(threshold) = u.tier1.as_ref().map(|x| x.threshold).filter(|_| !twin_pgo_off(&u.prog.session.options)) else { return };
+    let now = tier_clock();
+    let (rb, rt) = (tier_rec(&u.slots, b), tier_rec(&u.slots, t));
+    let cost = tier_cost_now(rt, threshold, now).0.max(tier_cost_now(rb, threshold, now).0);
+    (*rb.add(9)).store(cost, Ordering::Relaxed);
+    (*rb.add(4)).store(now, Ordering::Relaxed);
+    (*rb).store(tier_refill(threshold, cost), Ordering::Relaxed);
+}
+
 /// SPEC-V: bases of O3 twins waiting for their O2 install, then queued for O3 (twin_base_build)
 static TWIN_O3_BASES: relax_session::sync::Mutex<Vec<(usize, u32)>> = relax_session::sync::Mutex::new(Vec::new());
 
@@ -18682,9 +18718,9 @@ fn pgo_forget(u: &Unit) {
 }
 
 /// Slot `id` turned hot: builds and installs its counted code (O3 worker). False: no counted build
-/// for it (not a plain instance or closure, no RIR, already counted, PGO off, or it failed) -- its
+/// for it (not a plain instance, closure or SPEC-V twin, no RIR, already counted, PGO off, or it failed) -- its
 /// O3 build goes ahead now.
-unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
+pub(crate) unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
     let _site = FrontSite::enter(5);
     let session = crate::jit::unit_session(up);
     let options = &session.options;
@@ -18692,6 +18728,11 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
         return false;
     }
     let t0 = cpu_ns();
+    // a SPEC-V twin too: it runs in its base's place, whose O3 build takes its counts. Its code is
+    // unverified for good: baseline RIR calling other twins, which no verified rebuild replaces
+    // (its O3 build starts from it too). MAKEPAD_RUN_OPT=-twinpgo: not
+    let twin = !twin_pgo_off(options) && owner::publish(|| matches!((&*up).fns[id as usize].key, FnKey::Plain(_)));
+    let to_upgrade = |r: &relax_backend::rir::Func| !twin && upgradable(r);
     // code linked from the disk cache has no RIR: its front end runs here first, off the unit,
     // as compile_tier1 does it (so warm launches count too)
     let needs_rir = |up: *mut Unit| {
@@ -18707,10 +18748,10 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
     }
     // its O1 build (or the upgrade of baseline RIR it starts from) here, not in the take
     if !owner::is_owner() {
-        let mode = owner::publish(|| if needs_rir(up) { Some(RirMode::Tier0) } else { (&*up).fns[id as usize].rir.as_ref().is_some_and(|r| upgradable(r)).then_some(RirMode::Normal) });
+        let mode = owner::publish(|| if needs_rir(up) { Some(RirMode::Tier0) } else { (&*up).fns[id as usize].rir.as_ref().is_some_and(|r| to_upgrade(r)).then_some(RirMode::Normal) });
         if let Some(m) = mode {
             build_off_owner(up, &[(id, m)]);
-            if m == RirMode::Tier0 && owner::publish(|| (&*up).fns[id as usize].rir.as_ref().is_some_and(|r| upgradable(r))) {
+            if m == RirMode::Tier0 && owner::publish(|| (&*up).fns[id as usize].rir.as_ref().is_some_and(|r| to_upgrade(r))) {
                 build_off_owner(up, &[(id, RirMode::Normal)]);
             }
         }
@@ -18720,7 +18761,7 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
         // View::handle_event, set_uniform, ...) went to O3 with static frequencies every warm
         // launch: no PGO layout, inlining or register weights for the code that runs the most.
         // The O3 build that follows finds the RIR built (no second build).
-        let missing = |up: *mut Unit| needs_rir(up) || (&*up).fns[id as usize].rir.as_ref().is_some_and(|r| upgradable(r));
+        let missing = |up: *mut Unit| needs_rir(up) || (&*up).fns[id as usize].rir.as_ref().is_some_and(|r| to_upgrade(r));
         if owner::publish(|| missing(up)) {
             for _ in 0..PREFRONT_ROUNDS {
                 let Ok((left, needs)) = owner::publish_or_bail(|| {
@@ -18728,7 +18769,7 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
                     if needs_rir(up) {
                         let _ = build_rir_or_skip(up, id, RirMode::Tier0);
                     }
-                    if !needs_rir(up) && (&*up).fns[id as usize].rir.as_ref().is_some_and(|r| upgradable(r)) {
+                    if !needs_rir(up) && (&*up).fns[id as usize].rir.as_ref().is_some_and(|r| to_upgrade(r)) {
                         let _ = build_rir_or_skip(up, id, RirMode::Normal);
                     }
                     (missing(up), owner::take_needs())
@@ -18748,10 +18789,10 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
             return None;
         }
         let f = &u.fns[id as usize];
-        if !matches!(f.key, FnKey::Inst(..) | FnKey::Closure(..)) || !f.compiled || f.o3.load(Ordering::Relaxed) || f.build_err.is_some()
-            || f.building || f.inflight || f.unverified.load(Ordering::Relaxed) || u.frequency_profiles.contains_key(&id) || crate::inspect::instrument::active(id) {
+        if !(twin || matches!(f.key, FnKey::Inst(..) | FnKey::Closure(..))) || !f.compiled || f.o3.load(Ordering::Relaxed) || f.build_err.is_some()
+            || f.building || f.inflight || !twin && f.unverified.load(Ordering::Relaxed) || u.profile_of(id).is_some() || crate::inspect::instrument::active(id) {
             if tier1_trace() {
-                eprintln!("O3c-refused #{} {}: key {} compiled {} o3 {} err {} building {} inflight {} unverified {} profiled {}", id, f.name, matches!(f.key, FnKey::Inst(..) | FnKey::Closure(..)), f.compiled, f.o3.load(Ordering::Relaxed), f.build_err.is_some(), f.building, f.inflight, f.unverified.load(Ordering::Relaxed), u.frequency_profiles.contains_key(&id));
+                eprintln!("O3c-refused #{} {}: key {} compiled {} o3 {} err {} building {} inflight {} unverified {} profiled {}", id, f.name, matches!(f.key, FnKey::Inst(..) | FnKey::Closure(..)), f.compiled, f.o3.load(Ordering::Relaxed), f.build_err.is_some(), f.building, f.inflight, f.unverified.load(Ordering::Relaxed), u.profile_of(id).is_some());
             }
             return None;
         }
@@ -18759,20 +18800,20 @@ unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bool {
         // was built above, off the owner; where that could not be done (a front only the owner
         // could run) the slot is not counted (rule I-PURE: no background O1 build on the owner)
         // and its O3 build goes ahead
-        if needs_rir(up) || f.rir.as_ref().is_some_and(|r| upgradable(r)) {
+        if needs_rir(up) || f.rir.as_ref().is_some_and(|r| to_upgrade(r)) {
             PGO_STATS[3].fetch_add(1, Ordering::Relaxed);
             if tier1_trace() {
-                eprintln!("O3c-refused #{} {}: no normal RIR (needs front {}, upgradable {})", id, f.name, needs_rir(up), f.rir.as_ref().is_some_and(|r| upgradable(r)));
+                eprintln!("O3c-refused #{} {}: no normal RIR (needs front {}, upgradable {})", id, f.name, needs_rir(up), f.rir.as_ref().is_some_and(|r| to_upgrade(r)));
             }
             return None;
         }
         let u = &*up;
         let f = &u.fns[id as usize];
         // (a naked fn is its assembly alone: a counter would clobber its argument registers)
-        if tier1_trace() && f.rir.as_ref().filter(|r| !r.plain_calls && !r.naked && !r.blocks.is_empty()).is_none() {
+        if tier1_trace() && f.rir.as_ref().filter(|r| (twin || !r.plain_calls) && !r.naked && !r.blocks.is_empty()).is_none() {
             eprintln!("O3c-refused #{} {}: rir {} plain_calls {}", id, f.name, f.rir.is_some(), f.rir.as_ref().is_some_and(|r| r.plain_calls));
         }
-        let rir = f.rir.as_ref().filter(|r| !r.plain_calls && !r.naked && !r.blocks.is_empty())?.clone();
+        let rir = f.rir.as_ref().filter(|r| (twin || !r.plain_calls) && !r.naked && !r.blocks.is_empty())?.clone();
         let e = &u.env;
         let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: true, syms: e.syms, sym_class: e.sym_class, near: e.near };
         Some((rir, env, u.opt.fold, u.opt.layout, PATCH_EPOCH.load(Ordering::SeqCst), f.version))
@@ -19513,7 +19554,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let name = u.fns[id as usize].name.to_string();
     // PGO: the counted build's block counts for the O3 input (they go onto its blocks; the
     // passes carry them to layout and register allocation)
-    let counts = if options.no_block_freq { None } else { u.frequency_profiles.get(&id).and_then(|p| p.counts_for(&rir)) };
+    let counts = if options.no_block_freq { None } else { u.pgo_counts_for(id, &rir) };
     // hot (INL5's large growth room): a counted root turned hot
     let hot_root = counts.is_some();
     if tier1_trace() {
@@ -21614,7 +21655,7 @@ unsafe fn o3_assemble_owner(up: *mut Unit, options: &crate::options::Options, a:
     }
     if !options.no_block_freq {
         for (c, r, _) in &a.snap {
-            if let Some(cc) = u.frequency_profiles.get(c).and_then(|p| p.counts_for(r)).filter(|v| v.len() == r.blocks.len()) {
+            if let Some(cc) = u.pgo_counts_for(*c, r).filter(|v| v.len() == r.blocks.len()) {
                 a.snap_counts.push((*c, cc));
             }
         }
