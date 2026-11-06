@@ -62,9 +62,7 @@ pub fn own_errors(prog: &crate::program::Program, root: u32, errs: &[String], ph
 /// is in the workspace, except std (MAKEPAD_RUN_STD may live inside it) and proc-macro crates (their
 /// code runs in the macro host, never in the program).
 pub fn workspace_crates(prog: &crate::program::Program, root: u32) -> Vec<u32> {
-    fn canon(p: &str) -> String {
-        std::fs::canonicalize(p).map(|c| c.display().to_string()).unwrap_or_else(|_| p.to_string())
-    }
+    use crate::vfs::canonical as canon;
     let ws = format!("{}/", canon(&crate::run::workspace_dir()).trim_end_matches('/'));
     let std_dir = format!("{}/", canon(&crate::std_dir()).trim_end_matches('/'));
     let mut out = Vec::new();

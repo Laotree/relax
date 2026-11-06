@@ -178,12 +178,14 @@ impl Drop for TraceTransaction {
 /// Framework exclusions are rooted at that tree, never a substring of an app's path.
 pub(crate) fn gandalf_app_roots(units: &crate::unitgraph::Units, launched_dir: &str) -> Vec<String> {
     let tree = crate::resolve::find_root(launched_dir).unwrap_or_else(|_| launched_dir.to_string());
-    let tree = gandalf_path(&tree);
+    // Canonical paths prevent a path dependency's symlink from escaping the project. Virtual
+    // (git/VFS) workspaces have no filesystem path; lexical normalization works there.
+    let tree = crate::vfs::canonical(&tree);
     units.units.iter().filter_map(|unit| {
         if !unit.pkg_id.starts_with("path+file://") { return None; }
         if matches!(unit.name.as_str(), "std" | "core" | "alloc" | "proc_macro") { return None; }
         let source = unit.src_path.as_str();
-        let path = gandalf_path(source);
+        let path = crate::vfs::canonical(source);
         let rel = std::path::Path::new(&path).strip_prefix(&tree).ok()?;
         // tools/: the framework's runtime crates apps link (relax, ...)
         if ["platform", "draw", "widgets", "libs", "tools", "engine", "relax",
@@ -192,13 +194,6 @@ pub(crate) fn gandalf_app_roots(units: &crate::unitgraph::Units, launched_dir: &
         }
         Some(crate::vfs::normalize_path(source))
     }).collect()
-}
-
-fn gandalf_path(path: &str) -> String {
-    // Canonical paths prevent a path dependency's symlink from escaping the project.
-    // Virtual (git/VFS) workspaces have no filesystem path; lexical normalization works there.
-    crate::vfs::canonicalize(path).map(|p| crate::vfs::normalize_path(&p.to_string_lossy()))
-        .unwrap_or_else(|_| crate::vfs::normalize_path(path))
 }
 
 /// A live edit refused by the gate: one strictly technical console line, the event's
