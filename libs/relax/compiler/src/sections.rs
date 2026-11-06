@@ -7,6 +7,12 @@
 //! under rustc. COFF defines no bounds: a section `name$part` joins `name`, its parts sorted by
 //! their names, so a table's `$a` and `$z` marker statics enclose its `$m` entries.
 //!
+//! Constructor sections run before the program's entry, as the platform's start code runs them:
+//! ELF's `.preinit_array`, `.init_array.<priority>` and `.init_array`, Mach-O's `__mod_init_func`,
+//! COFF's `.CRT$XC*` (`run_constructors`). The tables the JIT does not run -- terminators, TLS
+//! callbacks, C initializers, `.ctors` -- and constructors that take arguments are refused before
+//! the entry runs, never skipped.
+//!
 //! A section is laid out whole when the program first names one of its statics or bounds: every
 //! static of the program's current files that names it (rustc keeps a `#[used]` one however
 //! unreferenced; the others are kept here too). The block is fixed from then on, so an edit that
@@ -16,6 +22,7 @@ use crate::ast::{ItemId, ItemKind};
 use crate::jit::Unit;
 use crate::parser::ParsedFile;
 use crate::program::{DefId, DefKind};
+use crate::types::TyKind;
 
 /// A laid-out output section: [start, end) and its statics in layout order.
 pub(crate) struct Section {
@@ -227,4 +234,133 @@ pub(crate) fn edit_moves_a_section(u: &Unit, old: u32, new: &ParsedFile) -> Opti
         }
     }
     None
+}
+
+/// What the platform's start code does with section `name`: runs its fn pointers before the
+/// entry, ordered by (rank, key), or nothing the JIT does (why it refuses it).
+enum Startup {
+    Run(u32, String),
+    Refuse(&'static str),
+}
+
+fn startup_of(name: &str) -> Option<Startup> {
+    use Startup::*;
+    if cfg!(target_vendor = "apple") {
+        match name.split(',').nth(1).map(str::trim)? {
+            "__mod_init_func" => Some(Run(0, String::new())),
+            "__mod_term_func" => Some(Refuse("a terminator table (run at exit)")),
+            _ => None,
+        }
+    } else if cfg!(windows) {
+        let part = name.strip_prefix(".CRT$")?;
+        match part.as_bytes().get(..2)? {
+            // `_initterm` over [__xc_a, __xc_z): the parts in name order
+            b"XC" => Some(Run(0, part.to_string())),
+            b"XI" => Some(Refuse("a C initializer table (its int result can stop the start)")),
+            b"XL" => Some(Refuse("a TLS callback table (run at thread start and end)")),
+            b"XP" | b"XT" => Some(Refuse("a terminator table (run at exit)")),
+            _ => None,
+        }
+    } else if name == ".preinit_array" {
+        Some(Run(0, String::new()))
+    } else if let Some(rest) = name.strip_prefix(".init_array") {
+        // ld: SORT_BY_INIT_PRIORITY(.init_array.*) before the plain .init_array
+        match rest.strip_prefix('.').map(|p| p.parse::<u32>()) {
+            None if rest.is_empty() => Some(Run(2, String::new())),
+            Some(Ok(n)) => Some(Run(1, format!("{:010}", n))),
+            _ => None,
+        }
+    } else if name.starts_with(".fini_array") {
+        Some(Refuse("a terminator table (run at exit)"))
+    } else if name.starts_with(".ctors") || name.starts_with(".dtors") {
+        Some(Refuse("a legacy constructor table"))
+    } else {
+        None
+    }
+}
+
+/// Whether `t` is a constructor table entry the JIT can call: a fn pointer taking nothing, or an
+/// array of them.
+fn plain_ctor(u: &Unit, t: crate::types::TyId) -> bool {
+    match u.tcx.tys.kind(t).clone() {
+        TyKind::FnPtr(ps, ..) => u.tcx.tys.list(ps).is_empty(),
+        TyKind::Array(e, _) => matches!(u.tcx.tys.kind(e), TyKind::FnPtr(ps, ..) if u.tcx.tys.list(*ps).is_empty()),
+        _ => false,
+    }
+}
+
+/// The constructors of the program crate `root` links (its dependency closure, proc-macro crates
+/// not), in the order the platform's start code calls them: (static, fn address). Err: the tables
+/// it has that the JIT does not run, each named.
+fn constructors(u: &mut Unit, root: u32) -> Result<Vec<(DefId, u64)>, String> {
+    if u.prog.ptr_bytes == 4 {
+        return Ok(Vec::new());
+    }
+    let mut linked = vec![false; u.prog.crates.len()];
+    let mut next = vec![root];
+    while let Some(k) = next.pop() {
+        let Some(c) = u.prog.crates.get(k as usize) else { continue };
+        if linked[k as usize] || c.proc_macro {
+            continue;
+        }
+        linked[k as usize] = true;
+        next.extend(c.deps.iter().map(|d| d.1));
+    }
+    let current: std::collections::HashSet<u32> = u.prog.mods.iter().map(|m| m.file).collect();
+    let mut found: Vec<(u32, String, DefId)> = Vec::new();
+    let mut refused = Vec::new();
+    for (i, def) in u.prog.defs.iter().enumerate() {
+        if def.kind != DefKind::Static || !current.contains(&def.file) || !linked.get(def.krate as usize).copied().unwrap_or(false) {
+            continue;
+        }
+        let f = &u.prog.files[def.file as usize];
+        let Some(name) = item_section(f, def.item) else { continue };
+        let Some(how) = startup_of(&name) else { continue };
+        let d = DefId(i as u32);
+        let at = u.pos_str(def.file, f.ast.item(def.item).lo);
+        match how {
+            Startup::Refuse(why) => refused.push(format!("{}: static `{}` is in `{}`, {}: makepad run does not run it -- run the program natively (cargo)", at, u.prog.def_path(d), name, why)),
+            Startup::Run(rank, key) => match u.tcx.const_ty(&u.prog, d) {
+                Some(t) if plain_ctor(u, t) => found.push((rank, key, d)),
+                _ => refused.push(format!("{}: static `{}` is in `{}`, a constructor table, but is not a fn pointer taking nothing (or an array of them): makepad run calls only those -- run the program natively (cargo)", at, u.prog.def_path(d), name)),
+            },
+        }
+    }
+    if !refused.is_empty() {
+        return Err(refused.join("\n"));
+    }
+    // a part's order is its name's (COFF), then the program's definition order for the link order
+    found.sort();
+    let mut out = Vec::new();
+    for (_, _, d) in found {
+        let a = u.static_addr(d);
+        if a == 0 {
+            return Err(format!("constructor table `{}`: could not evaluate it -- see its own error", u.prog.def_path(d)));
+        }
+        let size = u.tcx.const_ty(&u.prog, d).map_or(0, |t| u.layout_of(t).size as u64);
+        for w in 0..size / 8 {
+            // a null entry is skipped, as the C runtime's `_initterm` skips one
+            let f = unsafe { std::ptr::read_unaligned((a + 8 * w) as *const u64) };
+            if f != 0 {
+                out.push((d, f));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Runs the constructors of the program crate `root` links, in domain `domain` (None: the unit's
+/// compile domain), before its entry: the platform's start code runs them before `main` (and before
+/// a test harness's). Err: a table the JIT refuses, or a constructor that panicked (natively a
+/// panic out of an `extern "C"` fn aborts the start too).
+pub(crate) unsafe fn run_constructors(up: *mut Unit, root: u32, domain: Option<u64>) -> Result<(), String> {
+    let list = crate::owner::call(crate::owner::Class::Program, || constructors(&mut *up, root))?;
+    let domain = domain.unwrap_or_else(|| (&*up).syms.dom0());
+    for (d, f) in list {
+        if let Err(p) = crate::jit::call_jit_in(up, domain, f, 0) {
+            let name = crate::owner::call(crate::owner::Class::Program, || (&*up).prog.def_path(d));
+            return Err(format!("a constructor in `{}` (before main) {}: {}", name, p.kind, p.message));
+        }
+    }
+    Ok(())
 }

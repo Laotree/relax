@@ -2215,6 +2215,14 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         crate::why::event("boundary", "boot-done-before-main", 0, "", Some(crate::why::Cause::new("", 0, "boot-only", "application main has not run")));
         std::process::exit(0);
     }
+    // the platform's start code runs the program's constructors before its entry (sections.rs)
+    if !entry_defs.is_empty() || harness || !exports_mode && !HAL_RUN.load(Ordering::Acquire) {
+        if let Err(e) = unsafe { crate::sections::run_constructors(up, root, None) } {
+            eprintln!("makepad-run: {e}");
+            std::mem::forget(u);
+            return crate::check::finish_test_deps(1);
+        }
+    }
     for (k, d) in entry_defs.iter().enumerate() {
         // speculative workers may be compiling (they add slots): the owner thread around fn_id
         let en = crate::owner::call(crate::owner::Class::Program, || {
