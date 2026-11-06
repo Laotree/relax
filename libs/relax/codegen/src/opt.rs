@@ -1118,10 +1118,18 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
             f.nocapture.push(c.clone());
         }
     }
-    // split the block after the call
+    // split the block after the call: the continuation takes the block's buffers, the block keeps
+    // a copy of its head. The inliners take a block's sites front to back, so the rest of the
+    // block is split again at the next one: a tail copied out instead left each piece of a
+    // straight-line run holding the capacity of everything after it (rt_lock's `heavy`, 8k calls
+    // in a 16k-instruction block: 9 GB for its O3 build)
     let blk = &mut f.blocks[bi];
-    let tail = blk.insts.split_off(ii + 1);
-    let tail_pos = blk.pos.split_off(ii + 1);
+    let mut head = Vec::with_capacity(ii + 1 + callee.params.len());
+    head.extend(blk.insts.drain(..=ii));
+    let tail = std::mem::replace(&mut blk.insts, head);
+    let mut head_pos = Vec::with_capacity(ii + 1 + callee.params.len());
+    head_pos.extend(blk.pos.drain(..=ii));
+    let tail_pos = std::mem::replace(&mut blk.pos, head_pos);
     let call = blk.insts.pop().expect("inline site");
     let call_pos = blk.pos.pop().unwrap_or(0);
     let mut old_term = std::mem::replace(&mut blk.term, Term::Unreachable);
@@ -6372,6 +6380,29 @@ mod inline_priority_tests {
         let mut f = callee(size);
         f.blocks[0].insts.fill(Inst::Iconst(VReg(0), 1));
         f
+    }
+
+    /// Every call of a long straight-line block inlined: the function's buffers stay linear in its
+    /// size (each split hands the rest of the block on; copied out, the pieces held N^2/4 slots)
+    #[test]
+    fn straight_line_sites_keep_buffers_linear() {
+        let options = &relax_session::Options::default();
+        let c = cheap_callee(1);
+        let get = |_: u32| Some((&c as *const Func, 0));
+        let mut f = Func::new("caller".into(), 0);
+        let v = f.vreg(Cls::I);
+        f.block();
+        for _ in 0..2000 {
+            f.blocks[0].insts.extend([Inst::Iconst(v, 1), Inst::Call(Callee::Fn(1), vec![], vec![])]);
+            f.blocks[0].pos.extend([0, 0]);
+        }
+        f.blocks[0].term = Term::Ret(vec![]);
+        let took = inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|_, _| false, &|_| false, &InlineLimits::tier1(), None, None);
+        assert_eq!(took.len(), 2000, "every site is inlined");
+        f.verify().unwrap();
+        let len: usize = f.blocks.iter().map(|b| b.insts.len()).sum();
+        let held: usize = f.blocks.iter().map(|b| b.insts.capacity() + b.pos.capacity()).sum();
+        assert!(held <= 8 * len, "{held} instruction and position slots held for {len} instructions");
     }
 
     #[test]

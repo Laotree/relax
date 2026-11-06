@@ -747,7 +747,7 @@ impl Encoder<'_> {
             keys.push(MappedKey::new(def_key_in(prog, tcx, self.crate_ident, &mut memo, &mut files, DefId(i as u32))));
         }
         // per crate: its definitions by key, without the keys two of them have (asked between
-        // crates and every 4096 definitions too: Fab's sorts held the owner 64-70 ms between checks)
+        // crates and every 4096 definitions too: a large app's sorts held the owner 64-70 ms between checks)
         let mut maps: Vec<Vec<(u128, u32)>> = vec![Vec::new(); prog.crates.len()];
         for (i, k) in keys.iter().enumerate() {
             if i % 4096 == 4095 && stop() { return None; }
