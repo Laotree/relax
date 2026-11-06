@@ -673,13 +673,6 @@ pub fn check_subjects(u: &mut Unit, root: u32, crates: &[u32], errors: Vec<Strin
     (n, std::mem::take(&mut *SUBJECT_WARNINGS.lock().unwrap_or_else(|e| e.into_inner())))
 }
 
-/// The lints `makepad test`'s check does not judge: a test run records no import or macro uses
-/// (`makepad check` does, run.rs, and loads its checked crates fresh for them), so these would
-/// call every import unused, or never fire. run.rs check_test_subjects names them.
-pub(crate) const TEST_UNCHECKED: &str = "unused_imports, unused_extern_crates, redundant_imports, unused_macros, unused_macro_rules and the macro-call lints (semicolon_in_expressions_from_macros, named_arguments_used_positionally): not checked by test runs; `makepad check` has them";
-/// Those of TEST_UNCHECKED a test run would report wrongly (the others never fire there)
-const TEST_UNCHECKED_IMPORTS: [&str; 3] = ["unused_imports", "unused_extern_crates", "redundant_imports"];
-
 /// The warnings of the last check of `check_subjects`, in order
 static SUBJECT_WARNINGS: relax_session::sync::Mutex<Vec<String>> = relax_session::sync::Mutex::new(Vec::new());
 
@@ -1339,8 +1332,6 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     for (i, r) in reported.into_iter().enumerate() {
         let late = relax_types::lint::is_late(r.lint);
         if !late_ok && late { continue; }
-        // (`makepad test`: what rests on import uses is not judged -- TEST_UNCHECKED)
-        if quiet && TEST_UNCHECKED_IMPORTS.contains(&r.lint) { continue; }
         let stage = if r.lint.is_empty() { Stage::new(Phase::Attrs, 0) } else { crate::check_order::stage_of_lint(r.lint, r.def) };
         // (a body's liveness lints keep the order its analysis reports them in: rustc's)
         let seq = if stage.phase == Phase::Mir && stage.step == crate::check_order::MIR_LIVENESS { r.seq } else { 0 };
