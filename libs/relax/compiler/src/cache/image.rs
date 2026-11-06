@@ -998,6 +998,8 @@ pub(crate) struct PrelinkedSlot {
     pub inlined: Vec<u32>,
     /// tier-1 (O3) code (cache.rs TIER_O3)
     pub o3: bool,
+    /// a live session: the patch flags and copy versions its code reads (jit note_guard_reads)
+    pub guards: Vec<relax_backend::rir::Sym>,
     /// O2 code (cache.rs TIER_O2): no O2 build for it this run
     pub o2: bool,
     /// baseline code (cache.rs TIER_BASE): built again at O2 after the first present
@@ -1692,6 +1694,8 @@ impl Linker {
         let at = u.code_block(total as u64);
         // copied and linked in place: one pass over the block
         let mut linked = vec![false; layout.len()];
+        let live = u.prog.session.options.live;
+        let mut guards: Vec<Vec<relax_backend::rir::Sym>> = vec![Vec::new(); if live { layout.len() } else { 0 }];
         {
             let env = &u.env;
             let syms = &u.syms;
@@ -1711,7 +1715,12 @@ impl Linker {
                             };
                             let v = match t {
                                 IMG_SLOT | IMG_THUNK | IMG_CALL => im.slot_of(ix).map(|x| env.reloc_value(match t { IMG_SLOT => Reloc::Slot(x), IMG_CALL => Reloc::Call(x), _ => Reloc::Thunk(x) })),
-                                IMG_SYM => im.fresh.get(&ri).copied().or_else(|| im.sym_sym.get(ix as usize).copied().flatten().flatten()).map(|s| syms.value(s)),
+                                IMG_SYM => im.fresh.get(&ri).copied().or_else(|| im.sym_sym.get(ix as usize).copied().flatten().flatten()).map(|s| {
+                                    if live && (s.off == crate::jit::PATCH_FLAG_OFF || s.off == crate::jit::COPY_VER_OFF) {
+                                        guards[k].push(s);
+                                    }
+                                    syms.value(s)
+                                }),
                                 IMG_TLS_KEY => Some(env.reloc_value(Reloc::TlsKey)),
                                 IMG_TLS_SLOW => Some(env.reloc_value(Reloc::TlsSlow)),
                                 _ => Some(env.reloc_value(Reloc::Resume)),
@@ -1734,7 +1743,7 @@ impl Linker {
             c.linked.reserve(layout.len());
             c.linked_key.reserve(layout.len());
         }
-        for ((si, id, off, n, trailer), ok) in layout.into_iter().zip(linked) {
+        for (k, ((si, id, off, n, trailer), ok)) in layout.into_iter().zip(linked).enumerate() {
             if !ok {
                 // its bytes stay in the block, unreachable: no table word points there
                 im.failed += 1;
@@ -1751,7 +1760,7 @@ impl Linker {
             c.linked.insert(id);
             c.linked_key.insert(id, entry);
             let verdict = if tier == TIER_O3 { TierVerdict::None } else { c.tier_verdict_key(entry) };
-            out.push(PrelinkedSlot { id, at: at + off as u64, len: n as u32, trailer, pc, inlined, o3: tier == TIER_O3, o2: tier == TIER_O2, base: tier == TIER_BASE, kind, verdict });
+            out.push(PrelinkedSlot { id, at: at + off as u64, len: n as u32, trailer, pc, inlined, o3: tier == TIER_O3, guards: if live { std::mem::take(&mut guards[k]) } else { Vec::new() }, o2: tier == TIER_O2, base: tier == TIER_BASE, kind, verdict });
         }
         out
     }

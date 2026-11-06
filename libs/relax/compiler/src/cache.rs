@@ -3195,6 +3195,13 @@ impl Cache {
         if matches!(u.fns[id as usize].key, FnKey::Inst(d, _) if u.prog.def(d).kind == DefKind::ForeignFn) {
             return;
         }
+        // a live session's guards that compare a copy version which moved (jit::copy_ver): a later
+        // session's version starts at 0 and would reach their value again
+        if crate::jit::names_moved_copy_ver(u, relocs.iter().filter_map(|r| match r.target { Reloc::Sym(s) => Some(s), _ => None })) {
+            trace_lookup(u, id, "norecord:copy version moved");
+            if o3.is_some() { warm_count::add(warm_count::O3_DROPPED, 1); }
+            return;
+        }
         let Some(key) = self.slot_key(u, id) else {
             if o3.is_some() { warm_count::add(warm_count::O3_DROPPED, 1); }
             self.stats.unencodable += 1;

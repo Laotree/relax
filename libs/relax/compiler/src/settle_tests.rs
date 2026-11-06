@@ -1208,6 +1208,69 @@ fn round50_inline_const_reload() {
 }
 
 #[test]
+fn copy_versions_move_with_the_flags_their_code_reads() {
+    isolated_test!(copy_versions_move_with_the_flags_their_code_reads);
+    // Copy versions (note_guard_reads): code that reads patch flags notes the copy versions it
+    // reads under each. A flag set before the install moves them at the install (a callee patched
+    // before it is caught), one set after moves them at the patch (set_patched); a slot whose code
+    // reads no flag that was set keeps its version. The disk cache never stores code naming a
+    // version that moved: a later session's starts at 0 and would reach the value again while the
+    // code's copies may be stale. Control: the same record naming a version at 0 is encoded.
+    crate::borrowck::lazy::disable_gandalf();
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-copy-versions-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("input.rs"), "pub fn hot(out: &mut u32) { *out = 7; }\npub fn cool(out: &mut u32) { *out = 8; }\npub fn early() {}\npub fn late() {}\nfn main() {}\n").unwrap();
+    std::env::set_var("MAKEPAD_RUN_CACHE_DIR", dir.join("cache"));
+    let session = std::sync::Arc::new(crate::Session::default());
+    let (prog, core, krate) = crate::load_with_std(&session, dir.join("input.rs").to_str().unwrap(), "copy_versions", false).unwrap();
+    let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| (d.krate == krate && prog.name(DefId(i as u32)) == name).then_some(DefId(i as u32))).unwrap();
+    let defs = [def("hot"), def("cool"), def("early"), def("late")];
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    crate::owner::call(crate::owner::Class::Program, || {
+        let [hot, cool, early, late] = defs.map(|d| u.fn_id(FnKey::Inst(d, Vec::new())));
+        let at = |u: &Unit, id: u32, off: i64| {
+            let s = loop_counter_sym(u, id);
+            relax_backend::rir::Sym { id: s.id, off: s.off + off }
+        };
+        let ver = |u: &Unit, id: u32| unsafe { (*tier_rec(&u.slots, id).add((TIER_COPY / 8) as usize)).load(Ordering::Acquire) };
+        set_patched(&u, early);
+        let reads = [at(&u, early, PATCH_FLAG_OFF), at(&u, late, PATCH_FLAG_OFF), at(&u, hot, COPY_VER_OFF)];
+        note_guard_reads(&mut u, reads.into_iter());
+        assert_eq!(ver(&u, hot), 1, "a callee patched before the install is caught at it");
+        set_patched(&u, late);
+        assert_eq!(ver(&u, hot), 2, "a callee patched after the install moves the version at the patch");
+        let reads = [at(&u, cool, COPY_VER_OFF)];
+        note_guard_reads(&mut u, reads.into_iter());
+        assert_eq!(ver(&u, cool), 0, "code that reads no flag keeps its version");
+        let mut cache = crate::cache::Cache::open(&u, crate::cache::Mode::ReadOnly).unwrap();
+        cache.mode = crate::cache::Mode::On;
+        u.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
+        for (id, stored) in [(cool, true), (hot, false)] {
+            let built = unsafe { compile_fn(up, id) }.unwrap();
+            // the code with a pool word naming the slot's copy version (unlinked: zero)
+            let mut code = built.0.clone();
+            let word = code.len() as u32;
+            code.extend([0u8; 8]);
+            let mut relocs = built.2.clone();
+            relocs.push(relax_backend::rir::RelocAt { at: word, kind: relax_backend::rir::RelocKind::Pool64, target: relax_backend::rir::Reloc::Sym(at(&u, id, COPY_VER_OFF)) });
+            let mut cache = u.cache.take().unwrap();
+            let before = cache.stats.recorded;
+            let pending = cache.defer_record(&u, id, &code, &relocs, &built.1).expect("a fresh install is deferrable");
+            cache.record_pending(&u, &pending);
+            assert_eq!(cache.stats.recorded > before, stored, "{}: a record naming a copy version at {} is {}", u.fns[id as usize].name, ver(&u, id), if stored { "encoded" } else { "never encoded" });
+            u.cache = Some(cache);
+        }
+    });
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::mem::forget(u);
+}
+
+#[test]
 fn deferred_cache_record_is_dropped_when_a_source_changed() {
     isolated_test!(deferred_cache_record_is_dropped_when_a_source_changed);
     // A deferred record (Cache::defer_record) is encoded after the install; an edit, rollback or

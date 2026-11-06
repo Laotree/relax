@@ -179,6 +179,14 @@ impl Syms {
         Sym::new(id)
     }
 
+    /// The slot of a tier record symbol (`SymKind::TierRec`), without copying the kind.
+    pub(crate) fn tier_slot(&self, id: u32) -> Option<u32> {
+        match ((id as usize) < self.kinds.len()).then(|| &self.kinds[id as usize]) {
+            Some(SymKind::TierRec(s)) => Some(*s),
+            _ => None,
+        }
+    }
+
     pub fn kind(&self, id: u32) -> Option<SymKind> {
         if (id as usize) < self.kinds.len() {
             Some(self.kinds[id as usize].clone())
