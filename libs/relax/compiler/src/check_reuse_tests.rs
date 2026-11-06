@@ -65,7 +65,7 @@ fn reuse_child() {
     let pre = std::mem::take(&mut prog.errors);
     let mut reuse = std::env::var_os("RELAX_CHECK_REUSE_STORE").map(|s| crate::check_reuse::Reuse::open_in(&prog, root, &crates, std::path::Path::new(&s), true));
     if let Some(r) = reuse.as_ref().filter(|r| r.full()) {
-        eprintln!("reuse child exit {}", r.print_reused(&prog));
+        eprintln!("reuse child exit {}", crate::check_reuse::print_reused_texts(&r.reused_texts(&prog), r.crates()));
         return;
     }
     let mut tcx = crate::tcx::Tcx::new();
@@ -209,4 +209,66 @@ fn a_lint_flag_checks_again() {
 #[test]
 fn a_check_denying_its_warnings_stores_nothing() {
     changed("denywarn", &[("lib.rs", LIB), ("bin.rs", BIN)], &[("MAKEPAD_RUN_LINT_FLAGS", "-D warnings")], |_| {}, &[("MAKEPAD_RUN_LINT_FLAGS", "-D warnings")], 0);
+}
+
+const EARLY_CHILD: &str = "RELAX_CHECK_EARLY_CHILD";
+
+/// In a child (EARLY_CHILD names the package folder): `makepad check --workspace early_pkg` there,
+/// as the command line runs it (run.rs: the early record before the load).
+#[test]
+fn early_child() {
+    let Some(dir) = std::env::var_os(EARLY_CHILD).map(std::path::PathBuf::from) else { return };
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    std::env::set_current_dir(&dir).unwrap();
+    let sess = std::sync::Arc::new(crate::Session::default());
+    let code = crate::run::cmd_run(&sess, &["--check".to_string(), "--workspace".to_string(), "early_pkg".to_string()]);
+    eprintln!("early child exit {code}");
+}
+
+/// The early record (check_reuse.rs Early) stands only while the load's graph certificate does:
+/// a check after an edit that keeps the file's size and mtime prints a fresh verdict, as does one
+/// after a late input (an include_str! file) changed; with nothing changed the record is printed.
+#[test]
+fn an_edit_keeping_size_and_mtime_gets_a_fresh_verdict() {
+    if std::env::var_os(CHILD).is_some() || std::env::var_os(EARLY_CHILD).is_some() { return; }
+    let lib = "const DATA: &str = include_str!(\"data.txt\");\nconst _: () = assert!(DATA.len() == 2);\nfn unused_a() {}\n";
+    let dir = package("early", &[("Cargo.toml", "[package]\nname = \"early_pkg\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"lib.rs\"\n"), ("lib.rs", lib), ("data.txt", "ok")]);
+    // (a certificate records a file's stat only once the file has been quiet that long)
+    std::thread::sleep(std::time::Duration::from_nanos(crate::vfs::STAT_RACY_NS + 300_000_000));
+    let check = || {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "check_reuse_tests::early_child", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(EARLY_CHILD, &dir).env("MAKEPAD_RUN_CACHE_DIR", dir.join("cache")).env("MAKEPAD_RUN_CHECK_TIMES", "1")
+            .env_remove("MAKEPAD_RUN_LINT_FLAGS").output().unwrap();
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}\n{stderr}");
+        let code = stderr.lines().find_map(|l| l.strip_prefix("early child exit ")).map(|c| c.parse::<i32>().unwrap());
+        let diags: Vec<String> = stderr.lines().filter(|l| l.contains(": warning: ") || l.contains(": error") || l.contains(": E0")).map(str::to_string).collect();
+        let replayed = stderr.lines().any(|l| l.starts_with("makepad check: early record (") && l.ends_with(": current"));
+        (code, diags, replayed, stderr.into_owned())
+    };
+    let named = |diags: &[String], name: &str| diags.iter().any(|d| d.contains(name));
+    let cold = check();
+    assert!(cold.0 == Some(0) && named(&cold.1, "unused_a") && !cold.2, "{}", cold.3);
+    // every verdict reused: that output is stored as the early record
+    let warm = check();
+    assert!(warm.0 == Some(0) && warm.1 == cold.1 && !warm.2 && warm.3.contains("their verdicts reused"), "{}", warm.3);
+    let early = check();
+    assert!(early.0 == Some(0) && early.1 == cold.1 && early.2, "the early record is printed: {}", early.3);
+    // a late input changed: checked again (the assertion fails)
+    std::fs::write(dir.join("data.txt"), "bad").unwrap();
+    let late = check();
+    assert!(late.0 != Some(0) && !late.2 && late.1.iter().any(|d| d.contains("E0080")), "{}", late.3);
+    std::fs::write(dir.join("data.txt"), "ok").unwrap();
+    let back = check();
+    assert!(back.0 == Some(0) && back.1 == cold.1, "{}", back.3);
+    // same size, mtime restored: the stat differs in its ctime only
+    let path = dir.join("lib.rs");
+    let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+    std::fs::write(&path, lib.replace("unused_a", "unused_b")).unwrap();
+    std::fs::File::options().write(true).open(&path).unwrap().set_modified(mtime).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len() as usize, lib.len());
+    let fresh = check();
+    assert!(fresh.0 == Some(0) && !fresh.2 && named(&fresh.1, "unused_b") && !named(&fresh.1, "unused_a"), "a fresh verdict: {}", fresh.3);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
