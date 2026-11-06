@@ -1011,8 +1011,11 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     // a test harness is a terminal program: no progress line
     let hosted = !entries.is_empty() || !export_names.is_empty() || harness || plain_test;
-    // the `unused_macros` lints need the macro uses of the whole load
-    if check { relax_types::macros::uses::record(true); relax_front::program::set_record_import_uses(true); }
+    // the `unused_macros` lints need the macro uses of the whole load (and `unused_imports` the
+    // import uses): a check's, and `makepad test`'s check of the crates under test (not a test's
+    // run of its own binary: it prints no warnings)
+    let test_lints = (harness || plain_test) && !check && !self_exec;
+    if check || test_lints { relax_types::macros::uses::record(true); relax_front::program::set_record_import_uses(true); }
     // Android: stderr is the embedder's pipe into logcat, line by line; the session-log tee in
     // front of it held lines back for up to a minute and lost a crashing run's last lines
     if !check && !watch && session.is_none() && !hosted && !cfg!(target_os = "android") {
@@ -1300,12 +1303,16 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // as a run's does -- their resolution and expansion record what the check's lints read
     // (import and macro uses). The others parse every crate.
     let check_restore = check && !watch && !root_only && !selftest && !workspace_check && session.is_none();
-    if check_restore {
-        let mut roots: Vec<String> = crate::reload::gandalf_app_roots(&units, &crate::unitgraph::manifest_dir_of(&g.crates[g.root].src_path));
-        let own_dir = &g.pkg[g.root].0;
-        roots.extend((0..g.crates.len()).filter(|&c| g.pkg[c].0 == *own_dir).map(|c| crate::vfs::normalize_path(&g.crates[c].src_path)));
-        // These crates' lints need fresh import and macro uses too.
-        roots.extend(also_graph.iter().map(|&c| crate::vfs::normalize_path(&g.crates[c].src_path)));
+    // `makepad test`: the crate under test loads again too, for the same uses
+    if check_restore || test_lints {
+        let mut roots: Vec<String> = vec![crate::vfs::normalize_path(&g.crates[g.root].src_path)];
+        if check_restore {
+            roots.extend(crate::reload::gandalf_app_roots(&units, &crate::unitgraph::manifest_dir_of(&g.crates[g.root].src_path)));
+            let own_dir = &g.pkg[g.root].0;
+            roots.extend((0..g.crates.len()).filter(|&c| g.pkg[c].0 == *own_dir).map(|c| crate::vfs::normalize_path(&g.crates[c].src_path)));
+            // These crates' lints need fresh import and macro uses too.
+            roots.extend(also_graph.iter().map(|&c| crate::vfs::normalize_path(&g.crates[c].src_path)));
+        }
         let checked: Vec<(String, String)> = pre.iter().filter(|c| roots.contains(&crate::vfs::normalize_path(&c.root))).map(|c| (c.name.clone(), c.root.clone())).collect();
         if let Some(images) = front_images.as_ref() { images.reload_crates(checked); }
     }
@@ -2015,6 +2022,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // after the cache is open: subjects whose check is stored are not checked again
         // (a test's run of its own binary prints no warnings: its parent printed them)
         let n = check_test_subjects(&mut u, root, &test_subjects, harness, !self_exec);
+        // (what the tests' own code resolves and expands from now on is no lint's input)
+        if test_lints { relax_types::macros::uses::record(false); relax_front::program::set_record_import_uses(false); }
         phase("test check", t_check);
         if n > 0 {
             let names: Vec<String> = test_subjects.iter().map(|&k| u.prog.syms.str(u.prog.crates[k as usize].name).to_string()).collect();
@@ -2730,9 +2739,11 @@ pub(crate) fn check_test_subjects(u: &mut Unit, root: u32, subjects: &[u32], har
     };
     if show_warnings && !crate::diag::enabled() {
         for w in &warnings { stderr_line!("{}", w); }
-        // (what it leaves out, said each time: no warning of those is no verdict on them)
-        let counted = match warnings.len() { 0 => "no warnings".to_string(), 1 => "1 warning".to_string(), n => format!("{n} warnings") };
-        stderr_line!("makepad test: {} ({})", counted, crate::check::TEST_UNCHECKED);
+        match warnings.len() {
+            0 => {}
+            1 => stderr_line!("makepad test: 1 warning"),
+            n => stderr_line!("makepad test: {n} warnings"),
+        }
     }
     verbose!("makepad-run: test check: coherence {:.0} ms, skipped files' load {:.0} ms ({} files), check {:.0} ms{}",
         (t1 - t0).as_secs_f64() * 1e3, (t2 - t1).as_secs_f64() * 1e3, u.prog.files.len() - files, t2.elapsed().as_secs_f64() * 1e3,

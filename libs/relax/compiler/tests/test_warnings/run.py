@@ -3,9 +3,9 @@
 /absolute/path/to/makepad.
 
 src/t.rs's test has an unused import, an unused `let` and an unused `Result`: `cargo test` prints
-3 warnings (the JIT printed none). The unused import is not judged by test runs yet (they record no
-import uses): each run's summary line says so (check.rs TEST_UNCHECKED), and the other 2 print.
-1. A first run prints the 2 and the summary.
+3 warnings (the JIT printed none), and none for src/a.rs, whose imports its fn's body and signature
+use (a test run once called them unused: it recorded no import uses).
+1. A first run prints the 3.
 2. An unchanged rerun (its check is stored whole) prints them again, as cargo replays a fresh
    crate's warnings.
 3. A run after an edit elsewhere in the crate checks it again and prints them.
@@ -23,8 +23,8 @@ import time
 
 binary = str(Path(sys.argv[1]).resolve())
 here = Path(__file__).resolve().parent
-WANT = ["warning: unused variable: `unused`", "warning: unused `Result` that must be used",
-         "makepad test: 2 warnings (unused_imports, "]
+WANT = ["warning: unused import: `std::collections::HashMap`", "warning: unused variable: `unused`",
+         "warning: unused `Result` that must be used", "makepad test: 3 warnings"]
 
 
 def fail(why, out=""):
@@ -52,8 +52,8 @@ with tempfile.TemporaryDirectory(prefix="test-warnings-") as tmp:
         if missing(out, WANT):
             fail("%s: no %s" % (step, ", ".join(missing(out, WANT))), out)
         n = sum(1 for line in out.splitlines() if ": warning: " in line)
-        if n != 2:
-            fail("%s: %d warnings, want 2" % (step, n), out)
+        if n != 3:
+            fail("%s: %d warnings, want 3" % (step, n), out)
 
     run("first run")
     run("unchanged rerun")
