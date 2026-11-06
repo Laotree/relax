@@ -1306,10 +1306,11 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // relaunch built the world for the suffix's derives and waited 10 s for every std file.
     if restored_crates != 0 { crate::program::share_std_end(); }
     let collected_restored = restored_crates == pre.len();
-    // a check whose image did not hold every crate before the checked ones records it again
+    // a check whose image did not hold every crate a restore can keep while the checked ones
+    // load again records it again (not the crates after them: those load again every time)
     if check_restore {
-        let reloaded = front_images.as_ref().map_or(0, |images| pre.iter().filter(|c| images.reloads(&c.name, &c.root)).count());
-        CHECK_RECORDS_COLLECTED.store(restored_crates + reloaded < pre.len(), Ordering::Relaxed);
+        let keepable = front_images.as_ref().map_or(0, |images| images.reload_prefix(&pre));
+        CHECK_RECORDS_COLLECTED.store(restored_crates < keepable, Ordering::Relaxed);
     }
     // a load that parses crates expands their macros: the proc-macro world starts building on
     // its own thread now. A warm restore of the whole program expands nothing: no world (the
