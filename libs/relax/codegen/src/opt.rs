@@ -1544,7 +1544,10 @@ fn unguard_prefix(f: &mut Func, guards: Vec<NewGuard>) {
 /// guard that finds the word moved still reads its own flags in its check block, and a guard's
 /// slow call does not end the stretch: its path holds a moved word, which every later site there
 /// sees as moved too, reading its own flags.
-fn share_copy_ver_reads(options: &relax_session::Options, f: &mut Func) {
+/// Runs after each inlining and again after full unrolling: a constant loop inside a copy (a
+/// box's three axes) ended the stretch until its back edge was gone (a mesh's distance walk kept 8
+/// reads of the word in its two loops, where 2 do).
+pub fn share_copy_ver_reads(options: &relax_session::Options, f: &mut Func) {
     if f.guard_calls.is_empty() || opt_off(options, "-guardshare") {
         return;
     }
@@ -1566,10 +1569,12 @@ fn share_copy_ver_reads(options: &relax_session::Options, f: &mut Func) {
             uses[u.0 as usize] += 1;
         }
     }
-    // a guard's compare at the end of block `bi`: (its load's index, word, value, result), when
-    // the block branches on it to its fast path or its check block (that reads the flags, then
-    // branches to the same fast path or to the slow call)
-    let site = |f: &Func, bi: usize| -> Option<(usize, Sym, i64, VReg)> {
+    // a guard's compare at the end of block `bi`: (its load's index, word, value, result, whether
+    // the load and compare may go), when the block branches on it to its fast path or its check
+    // block (that reads the flags, then branches to the same fast path or to the slow call). Its
+    // result may have other uses (sites that share it already, or since jump threading): they
+    // take the earlier result with it.
+    let site = |f: &Func, bi: usize| -> Option<(usize, Sym, i64, VReg, bool)> {
         let b = &f.blocks[bi];
         let Term::Branch(h, t, e) = b.term else { return None };
         let Term::Branch(_, t2, slow) = f.blocks[e as usize].term else { return None };
@@ -1581,8 +1586,8 @@ fn share_copy_ver_reads(options: &relax_session::Options, f: &mut Func) {
         let j = n.checked_sub(2)?;
         let Inst::AtomicLoad(Mem::Int(8, false), AtomOrd::Relaxed, ww, a) = b.insts[j] else { return None };
         let word = addr[a.0 as usize]?;
-        let one = |v: VReg| defs[v.0 as usize] == 1 && uses[v.0 as usize] == 1;
-        (hh == h && ww == w && one(h) && one(w) && defs[a.0 as usize] == 1).then_some((j, word, ver, h))
+        let once = |v: VReg| defs[v.0 as usize] == 1;
+        (hh == h && ww == w && defs[a.0 as usize] == 1).then_some((j, word, ver, h, once(h) && once(w) && uses[w.0 as usize] == 1))
     };
     let reach = reachable(f);
     let preds = relax_backend::regalloc::preds_of(f, &reach);
@@ -1614,6 +1619,8 @@ fn share_copy_ver_reads(options: &relax_session::Options, f: &mut Func) {
     // frame last may have waited
     let mut out: Vec<Vec<(Sym, i64, VReg)>> = vec![Vec::new(); nb];
     let mut shared = 0u32;
+    // a shared site's result -> the earlier one, for all its uses
+    let mut ren: Vec<Option<VReg>> = vec![None; nv];
     for &bi in &order {
         let mut avail: Vec<(Sym, i64, VReg)> = if bi == 0 || preds[bi].iter().any(|&p| rank[p as usize] >= rank[bi]) {
             Vec::new()
@@ -1628,13 +1635,12 @@ fn share_copy_ver_reads(options: &relax_session::Options, f: &mut Func) {
         if (0..upto).any(|ii| matches!(b.insts[ii], Inst::Call(..)) && !f.guard_call(bi, ii)) {
             avail.clear();
         }
-        if let Some((j, word, ver, h)) = site {
+        if let Some((j, word, ver, h, removable)) = site {
             match avail.iter().find(|x| x.0 == word && x.1 == ver) {
-                Some(&(_, _, h0)) => {
+                Some(&(_, _, h0)) if removable => {
                     let b = &mut f.blocks[bi];
                     let a = match b.insts[j] { Inst::AtomicLoad(_, _, _, a) => a, _ => unreachable!() };
-                    let Term::Branch(c, _, _) = &mut b.term else { unreachable!() };
-                    *c = h0;
+                    ren[h.0 as usize] = Some(h0);
                     b.insts.truncate(j);
                     b.pos.truncate(j);
                     let mut gone = GuardSize { insts: 2, cost: (2 * RUSTC_INSTR_COST) as u32 };
@@ -1647,10 +1653,24 @@ fn share_copy_ver_reads(options: &relax_session::Options, f: &mut Func) {
                     f.guard_size.sub(gone);
                     shared += 1;
                 }
+                Some(_) => {}
                 None => avail.push((word, ver, h)),
             }
         }
         out[bi] = avail;
+    }
+    if shared > 0 {
+        let to = |v: VReg| ren[v.0 as usize].unwrap_or(v);
+        for b in &mut f.blocks {
+            for i in &mut b.insts {
+                let mut hit = false;
+                for_uses(i, |u| hit |= ren[u.0 as usize].is_some());
+                if hit {
+                    *i = rename_operands(i, &to);
+                }
+            }
+            relax_backend::regalloc::term_vregs_mut(&mut b.term, |v| *v = to(*v));
+        }
     }
     if shared > 0 && inline_trace(&f.name) {
         eprintln!("inline-trace {}: {} guard compares share an earlier read", f.name, shared);
@@ -6999,10 +7019,26 @@ mod inline_priority_tests {
         assert_eq!(loads(&unshared), 3 + 3, "{}", unshared.dump());
         assert_eq!(inline_inst_count(&f), inline_inst_count(&unshared));
         // a call in between: the word is read again after it
-        let f = build(options, vec![leaf_call(), Inst::Call(Callee::Fn(5), vec![], vec![]), leaf_call(), leaf_call()]);
+        let mut f = build(options, vec![leaf_call(), Inst::Call(Callee::Fn(5), vec![], vec![]), leaf_call(), leaf_call()]);
         assert_eq!(loads(&f), 2 + 3, "{}", f.dump());
         let c = conds(&f);
         assert!(c.len() == 3 && c[0] != c[1] && c[1] == c[2], "{:?} {}", c, f.dump());
+        // ... until the pipeline removes it (full unrolling removes a copy's constant loop so):
+        // the pass after it shares the first read with both later sites, the third site's
+        // branch included (it branched on the second's result)
+        let size = f.guard_size;
+        for b in &mut f.blocks {
+            if let Some(k) = b.insts.iter().position(|i| matches!(i, Inst::Call(Callee::Fn(5), ..))) {
+                b.insts.remove(k);
+                b.pos.remove(k);
+            }
+        }
+        share_copy_ver_reads(options, &mut f);
+        f.verify().unwrap();
+        assert_eq!(loads(&f), 1 + 3, "{}", f.dump());
+        let c = conds(&f);
+        assert!(c.len() == 3 && c.iter().all(|x| *x == c[0]), "{:?} {}", c, f.dump());
+        assert!(f.guard_size.insts < size.insts, "{:?} -> {:?}", size, f.guard_size);
     }
 
     #[test]
