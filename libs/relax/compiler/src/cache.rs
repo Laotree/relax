@@ -8220,7 +8220,8 @@ impl Linker {
             }
             3 => {
                 let def = self.cache().dec_def(u, d)?;
-                if u.prog.def(def).kind != DefKind::Static {
+                // a static, or a section bound (sections.rs)
+                if u.prog.def(def).kind != DefKind::Static && !u.is_section_bound(def) {
                     return None;
                 }
                 let s = u.static_sym(def);

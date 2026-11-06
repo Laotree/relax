@@ -95,6 +95,7 @@ pub mod sandbox;
 pub mod stale;
 pub mod invalid;
 pub mod domain;
+mod sections;
 pub(crate) mod domain_res;
 pub(crate) mod domain_threads;
 pub mod jit;
