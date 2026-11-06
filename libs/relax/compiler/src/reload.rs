@@ -6509,19 +6509,33 @@ pub(crate) fn pinned() -> bool {
 /// is proven for it): each of its files (absolute) -> the git blob id the landing wrote there (None:
 /// it removed the file), and whether the watch said it waits. A change that leaves a file saying
 /// just that waits; any other content of it, and every other file, is the person's own save and
-/// applies at once. `hold off` lets the landing in (one whole scan). A run's end in place drops it:
-/// the restarted run reads every file as it is.
+/// applies at once (the file is the person's from then on). Meanwhile a read of a held file (a
+/// module loaded late, an include a save reads again) gives its text from before the landing
+/// (`vfs::hold_read`): a held app never runs the landed code. `hold off` lets the landing in (one
+/// whole scan). A run's end in place drops it: the restarted run reads every file as it is.
 static LANDING_HOLD: relax_session::sync::Mutex<std::collections::BTreeMap<String, (Option<[u8; 20]>, bool)>> = relax_session::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// `inspect hold files=...`: holds back these files of a landing (workspace-relative, each with
-/// the blob id it lands at, None when it removes the file), with those it holds already. Returns
+/// the blob id it lands at, None when it removes the file), with those it holds already. It comes
+/// before the landing moves the checkout (devhub's fast-forward waits for it), so a file held now
+/// says on disk what the app was built from: its reads give that until the release. A file held
+/// already keeps the text it held (a later landing of it changes only what it lands at). Returns
 /// how many it holds.
 pub(crate) fn hold_landing(files: &[(String, Option<[u8; 20]>)]) -> Result<usize, String> {
     let workspace = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|v| v.inputs.workspace())
         .ok_or("this run watches no sources (not a live session, or its watcher ended)")?;
     let mut held = LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner());
     for (rel, oid) in files {
-        held.insert(crate::vfs::normalize_path(&format!("{workspace}/{rel}")), (*oid, false));
+        let path = crate::vfs::normalize_path(&format!("{workspace}/{rel}"));
+        if !held.contains_key(&path) {
+            let before = match crate::vfs::read_unheld(&path) {
+                Ok(text) => Some(std::sync::Arc::<[u8]>::from(text)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(format!("{rel}: {e}")),
+            };
+            crate::vfs::hold_read(&path, before);
+        }
+        held.insert(path, (*oid, false));
     }
     eprintln!("makepad live: a landing is held back: {} file(s) wait while they say what it wrote; other saves apply", held.len());
     Ok(held.len())
@@ -6530,6 +6544,7 @@ pub(crate) fn hold_landing(files: &[(String, Option<[u8; 20]>)]) -> Result<usize
 /// `inspect hold off`: the held landing goes in (one whole scan). Returns how many files it held.
 pub(crate) fn release_landing() -> usize {
     let n = std::mem::take(&mut *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner())).len();
+    crate::vfs::release_read(None);
     if n > 0 {
         eprintln!("makepad live: the held landing goes in ({n} file(s))");
         CATCH_UP.store(true, std::sync::atomic::Ordering::Release);
@@ -6543,11 +6558,17 @@ pub(crate) fn landing_held() -> usize {
 }
 
 /// Whether the change of `path` waits: it says what a held landing wrote there. Its stamp stays,
-/// so the scan after `hold off` sees it changed.
-fn held_back(path: &str) -> bool {
+/// so the scan after `hold off` sees it changed. Once `settled` (the save's quiet window is over)
+/// on other text, the file is the person's: it is held no more.
+fn held_back(path: &str, settled: bool) -> bool {
     let key = crate::vfs::normalize_path(path);
     let Some((landed, _)) = LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied() else { return false };
-    if crate::vfs::read(path).ok().map(|data| crate::vfs::blob_oid(&data)) != landed {
+    if crate::vfs::read_unheld(path).ok().map(|data| crate::vfs::blob_oid(&data)) != landed {
+        if settled {
+            LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+            crate::vfs::release_read(Some(&key));
+            eprintln!("makepad live: {path}: the person's save of a held landing's file applies; it is held no more");
+        }
         return false;
     }
     let mut held = LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner());
@@ -8590,7 +8611,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             eprintln!("makepad live: one watch round: {} files in {:.2} ms; hot set {} files", files.len(), t_round.elapsed().as_secs_f64() * 1e3, hot.len());
         }
         // a held landing's files wait (`hold_landing`); the person's saves go on
-        changed.retain(|&k| !held_back(&files[k].0));
+        changed.retain(|&k| !held_back(&files[k].0, false));
         let mut quiet_retry = changed.is_empty() && retry_due;
         if changed.is_empty() && !quiet_retry {
             continue;
@@ -8687,7 +8708,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         if waited { watch_events::kick(); }
         let settled_stamps = last;
         // (what settled may be a held landing's: it waits, the rest applies)
-        changed.retain(|&k| !held_back(&files[k].0));
+        changed.retain(|&k| !held_back(&files[k].0, true));
         if changed.is_empty() && !quiet_retry {
             continue;
         }
