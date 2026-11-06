@@ -882,18 +882,31 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
         let check_times = std::env::var_os("MAKEPAD_RUN_CHECK_TIMES").is_some();
         let defs: Vec<crate::program::DefId> = (0..u.prog.defs.len()).filter(|&i| own[u.prog.defs[i].krate as usize]).map(|i| crate::program::DefId(i as u32)).filter(|&d| !is_live_default(&u.prog, d)).collect();
         let (prog, tcx) = (&u.prog, &u.tcx);
-        for e in par_map(&defs, jobs(), |&d| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // the item lint passes meanwhile, on a thread of their own: they report lints only (no
+        // error of the check's), and the lints are ordered when printed (check_order.rs)
+        let sigs = std::thread::scope(|sc| {
+            let lints = std::thread::Builder::new().name("run-check-lints".into()).stack_size(256 << 20).spawn_scoped(sc, || {
+                let _z = crate::zone_alloc::compiler_thread();
                 let t0 = std::time::Instant::now();
-                let mut e = tcx.check_def_signature(prog, d);
-                let dt_sig = t0.elapsed();
-                if prog.def(d).kind == DefKind::Impl { e.extend(relax_types::unsafety::check_impl(prog, tcx, d)); }
-                let dt = t0.elapsed();
-                if check_times && dt.as_millis() >= 500 {
-                    stderr_line!("makepad check: slow sig {:.2} s (check_def_sig {:.2} s): {:?} {}", dt.as_secs_f64(), dt_sig.as_secs_f64(), prog.def(d).kind, prog.def_path(d));
-                }
-                e
-            }))
-            .unwrap_or_else(|_| vec![format!("internal compiler error while checking the signature of {} -- makepad run bug, report it", prog.def_path(d))])) {
+                relax_types::lint_pass::check_items(prog, tcx, own);
+                if check_times { stderr_line!("makepad check: lint_pass::check_items {:.2} s (beside the signatures)", t0.elapsed().as_secs_f64()); }
+            }).expect("check lints");
+            let sigs = par_map(&defs, jobs(), |&d| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let t0 = std::time::Instant::now();
+                    let mut e = tcx.check_def_signature(prog, d);
+                    let dt_sig = t0.elapsed();
+                    if prog.def(d).kind == DefKind::Impl { e.extend(relax_types::unsafety::check_impl(prog, tcx, d)); }
+                    let dt = t0.elapsed();
+                    if check_times && dt.as_millis() >= 500 {
+                        stderr_line!("makepad check: slow sig {:.2} s (check_def_sig {:.2} s): {:?} {}", dt.as_secs_f64(), dt_sig.as_secs_f64(), prog.def(d).kind, prog.def_path(d));
+                    }
+                    e
+                }))
+                .unwrap_or_else(|_| vec![format!("internal compiler error while checking the signature of {} -- makepad run bug, report it", prog.def_path(d))]));
+            if let Err(p) = lints.join() { std::panic::resume_unwind(p); }
+            sigs
+        });
+        for e in sigs {
             errors.extend(staged(Stage::new(Phase::Wf, 0), e));
         }
     }
@@ -920,7 +933,6 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     if entry { errors.extend(staged(Stage::new(Phase::Attrs, 0), relax_types::item_checks::entry_symbol_conflict(&u.prog, &own_all, root))); }
     st.mark("entry");
     errors.extend(staged(Stage::new(Phase::Early, 2), relax_types::lint_levels::check(&u.prog, &own))); st.mark("lint_levels");
-    relax_types::lint_pass::check_items(&u.prog, &u.tcx, &own); st.mark("lint_pass::check_items");
     relax_types::lint_dead::reset();
     let privacy = u.prog.import_privacy_errors(&own);
     erroneous_imports.extend(privacy.iter().filter_map(|(i, _)| *i));
@@ -1031,30 +1043,34 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     if std::env::var_os("MAKEPAD_RUN_CHECK_TIMES").is_some() {
         stderr_line!("makepad check: owners breakdown: rsim {:.2} s, sigs {:.2} s, item_checks {:.2} s, wfcheck {:.2} s", d_rsim.as_secs_f64(), d_sigs.as_secs_f64(), d_items.as_secs_f64(), d_wf.as_secs_f64());
     }
-    // typeck-audit 1.27: anonymous constants outside bodies are body owners of their own
-    for anon in fresh_crates.iter().flat_map(|&k| crate::borrowck::body::signature_anon_consts(&u.prog, &u.tcx, k)).collect::<Vec<_>>() {
-        if is_live_default(&u.prog, anon) { continue; }
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let body = u.tcx.typeck(&u.prog, anon);
+    // typeck-audit 1.27: anonymous constants outside bodies are body owners of their own (typed
+    // and checked on MAKEPAD_RUN_JOBS threads; their results, and the evaluations, in order)
+    let anons: Vec<crate::program::DefId> = fresh_crates.iter().flat_map(|&k| crate::borrowck::body::signature_anon_consts(&u.prog, &u.tcx, k)).filter(|&anon| !is_live_default(&u.prog, anon)).collect();
+    let checked_anons = {
+        let (prog, tcx) = (&u.prog, &u.tcx);
+        par_map(&anons, jobs(), |&anon| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let body = tcx.typeck(prog, anon);
             let errs = body.errors.to_vec();
             let mut diags = Vec::new();
             if errs.is_empty() {
-                relax_types::lint::check_literals(&u.prog, &u.tcx, &body);
-                relax_types::lint_pass::check_body(&u.prog, &u.tcx, &body);
+                relax_types::lint::check_literals(prog, tcx, &body);
+                relax_types::lint_pass::check_body(prog, tcx, &body);
             }
             // rustc check_consts: an anonymous constant is a const context of its own
             if errs.is_empty() && crate::borrowck::enabled(options) {
-                if let Some((_, relax_front::def_collector::NodeId::AnonConst(expr))) = u.prog.def_id_to_node_id.get(&anon) {
+                if let Some((_, relax_front::def_collector::NodeId::AnonConst(expr))) = prog.def_id_to_node_id.get(&anon) {
                     let state = crate::tcx::EvalState::new();
-                    let cx = crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &state);
-                    let errs = crate::borrowck::check_anon_const(&cx, &u.prog, &u.tcx, &body, *expr);
+                    let cx = crate::tcx::EvalCx::new(prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &state);
+                    let errs = crate::borrowck::check_anon_const(&cx, prog, tcx, &body, *expr);
                     if !errs.is_empty() {
-                        diags.extend(crate::borrowck::lazy::report_checked(&u.prog, 0, u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), anon, &body.args, errs, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()));
+                        diags.extend(crate::borrowck::lazy::report_checked(prog, 0, tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), anon, &body.args, errs, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()));
                     }
                 }
             }
             (errs, diags)
-        }));
+        })))
+    };
+    for (anon, r) in anons.into_iter().zip(checked_anons) {
         match r {
             Ok((e, diags)) => {
                 let e_ok = e.is_empty() && diags.is_empty();
