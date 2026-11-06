@@ -18829,6 +18829,18 @@ fn pgo_credit(id: u32) -> bool {
     }
 }
 
+/// `makepad live`'s settle (MAKEPAD_RUN_LIVE_SETTLE): the O3 work for the code that ran so far
+/// is done. No O3 build is queued, running or held for the startup, no counting window is open
+/// (MAKEPAD_RUN_O3_PROGRESS's pending count is 0), and no O3 build waits for a verdict, its own or
+/// that of a callee it left out unverified (UNVERIFIED_LEFT: built again once that is verified).
+pub(crate) fn o3_settled(u: &Unit) -> bool {
+    let key = u as *const Unit as usize;
+    queue::counts()[2] + TIER_ACTIVE.lock().map_or(0, |a| a.len()) + usize::from(startup_holds_tier1()) == 0
+        && !pgo_counting()
+        && AWAIT_VERDICT.lock().map_or(true, |a| a.is_empty())
+        && !UNVERIFIED_LEFT.lock().map_or(false, |l| l.iter().any(|x| x.0 == key))
+}
+
 /// Some slot's counting window is open (parked slots are not waited for).
 fn pgo_counting() -> bool {
     COUNTING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|e| !e.parked)

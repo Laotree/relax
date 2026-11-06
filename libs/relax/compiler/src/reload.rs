@@ -5578,6 +5578,14 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // the new bodies are installed: the guards of their copies inlined before call them now
     for &id in &flagged {
         jit::set_patched(&*up, id);
+        // (which running code that reaches: the fns whose code was built with a copy of it)
+        let u = &*up;
+        let hosts = &u.fns[id as usize].history().copy_hosts;
+        if !hosts.is_empty() {
+            let mut names: Vec<&str> = hosts.iter().take(4).map(|&h| &u.fns[h as usize].name[..]).collect();
+            if hosts.len() > 4 { names.push(".."); }
+            out.lines.push(format!("guarded copies: `{}` was inlined into {} fn(s), whose copies call it now: {}", u.fns[id as usize].name, hosts.len(), names.join(", ")));
+        }
     }
     let u = &mut *up;
     // the patch event (flight recorder `reload.patch`; inspect `stale` names it)
