@@ -759,6 +759,15 @@ pub fn state(id: DomainId) -> Option<DomainState> {
     domains().iter().find(|d| d.info.id == id).map(|d| d.info.state.clone())
 }
 
+/// How long ago domain `id` presented its first frame (`first_present`: a window's frame, or a
+/// tray app's first tray); None before it has. No snapshot: the run's window looks every turn.
+pub fn presented_ago(id: DomainId) -> Option<std::time::Duration> {
+    let d = domains();
+    let d = d.iter().find(|d| d.info.id == id)?;
+    let at = std::time::Duration::from_secs_f64(d.info.first_frame_ms? / 1e3);
+    Some(d.started.elapsed().saturating_sub(at))
+}
+
 pub fn info(id: DomainId) -> Option<DomainInfo> {
     let snapshot = domains().iter().find(|d| d.info.id == id).map(snapshot);
     snapshot.map(with_block_memory)
