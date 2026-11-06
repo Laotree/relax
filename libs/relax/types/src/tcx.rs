@@ -292,6 +292,9 @@ pub struct Tcx {
     future_defs: std::sync::OnceLock<Option<(DefId, DefId)>>,
     /// Return-position `impl Trait` declarations keyed by their opaque DefId.
     pub opaques: crate::conc::ShardMap<DefId, OpaqueDecl>,
+    /// The errors of lowering an opaque's bounds where it is written (E0412 ..), reported again by
+    /// every later lowering of it (`lower_opaque`).
+    opaque_lowering_errors: crate::conc::ShardMap<DefId, Vec<String>>,
     /// rustc `inferred_outlives_of` (a query there): the outlives requirements an ADT's fields put on its own
     /// parameters, computed once per ADT; cleared whenever declarations change.
     pub inferred_outlives: crate::conc::ShardMap<DefId, std::sync::Arc<Vec<outlives::OutlivesPredicate>>>,
@@ -460,6 +463,7 @@ impl Tcx {
             async_fns: crate::conc::MemoMap::with_bits(10),
             future_defs: Default::default(),
             opaques: Default::default(),
+            opaque_lowering_errors: Default::default(),
             inferred_outlives: Default::default(),
             inferred_outlives_overflow: Default::default(),
             trait_closure: Default::default(),
@@ -1168,6 +1172,7 @@ impl Tcx {
         self.const_tys.remove_all(&gone);
         for impls in self.trait_impls_of.values_mut() { impls.retain(|d| !gone.contains(d)); }
         self.opaques.retain(|k, _| !gone.contains(k));
+        self.opaque_lowering_errors.retain(|k, _| !gone.contains(k));
         self.publish_collected();
     }
 
@@ -2535,10 +2540,17 @@ impl Tcx {
         let bs = prog.files[file as usize].ast.list(bounds);
         let opaque_def = prog.node_id_to_def_id[&(file, relax_front::def_collector::NodeId::OpaqueTy(t))];
         let me = self.lower_opaque_ty(prog, opaque_def);
+        // (the errors of lowering its bounds are reported by every lowering of it: a signature's
+        // errors, and what its body's check skips for them, must not depend on what lowered the
+        // opaque first -- another thread's lint pass, say)
         if self.opaques.contains_key(&opaque_def) {
+            for e in self.opaque_lowering_errors.get(&opaque_def).unwrap_or_default() { self.reraise_error(cx, e); }
             return me;
         }
-        self.opaques.insert(opaque_def, OpaqueDecl::default());
+        // (its own bounds naming it again: the lowering in progress on this thread covers them; a
+        // lowering in progress on another thread is done again here, as init_once computes a cell)
+        let Ok(_lowering) = crate::cycle::enter(crate::cycle::Kind::OpaqueBounds, opaque_def.0, 0) else { return me };
+        let outer = cx.state.errors.replace(Some(Vec::new()));
         let f = &prog.files[file as usize];
         let mut decl = OpaqueDecl::default();
         decl.region_contract = self.region_contract(cx,prog,opaque_def,env);
@@ -2580,7 +2592,11 @@ impl Tcx {
                 decl.bounds.push((td, targs));
             }
         }
+        let errors = cx.state.errors.replace(outer).unwrap_or_default();
+        // (the errors before the declaration: a reader that finds the declaration finds them)
+        self.opaque_lowering_errors.insert(opaque_def, errors.clone());
         self.opaques.insert(opaque_def, decl);
+        for e in errors { self.reraise_error(cx, e); }
         me
     }
 
