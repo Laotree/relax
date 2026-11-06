@@ -506,6 +506,9 @@ pub enum StaleDecision {
     Stop,
     /// the run starts again with its command line
     Restart,
+    /// the run ends meanwhile (a restart or stop taken elsewhere: the ring, the WM's toast): no
+    /// second restart
+    Ending,
 }
 
 /// A stale access (stale.rs), parked on behalf of thread `os_id` (it waits in its fault handler
@@ -515,8 +518,8 @@ pub enum StaleDecision {
 pub fn park_stale(os_id: u64, domain: Option<crate::domain::DomainId>, message: &str, frames: &[u64]) -> StaleDecision {
     let (id, decision) = park_for_restart(ParkKind::Stale, "stale access", os_id, domain, message, frames,
         |id| format!("makepad: stale access parked as P{} -- makepad inspect {} panics; resume P{} restart | stop", id, std::process::id(), id));
-    let d = if decision == 5 { StaleDecision::Stop } else { StaleDecision::Restart };
-    super::flightrec::panic_decided(id, match d { StaleDecision::Stop => "stale: stop", StaleDecision::Restart => "stale: restart" });
+    let d = match decision { 3 => StaleDecision::Restart, 5 => StaleDecision::Stop, _ => StaleDecision::Ending };
+    super::flightrec::panic_decided(id, match d { StaleDecision::Stop => "stale: stop", StaleDecision::Restart => "stale: restart", StaleDecision::Ending => "stale: the run ended" });
     d
 }
 
@@ -893,6 +896,33 @@ mod tests {
         assert!(resume(&format!("resume P{id} panic")).contains("could not build"), "its thread cannot go on: no unwind into the app");
         assert!(resume(&format!("resume P{id} restart")).contains("\"as\":\"restart\""));
         assert_eq!(caller.join().unwrap(), UpdateParked::Restart, "the restart is its thread's to start");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A stale access parked while its run ends (a restart or stop taken elsewhere, its domain
+    /// stopping) starts no restart of its own: the run's end is its outcome. (The ending run got a
+    /// second restart from the stale watcher.)
+    #[test]
+    fn a_stale_access_parked_as_its_run_ends_starts_no_second_restart() {
+        isolated_test!(a_stale_access_parked_as_its_run_ends_starts_no_second_restart);
+        let home = std::env::temp_dir().join(format!("relax-stale-ending-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("MAKEPAD_HOME", &home);
+        let parked = || { let t0 = std::time::Instant::now(); while parked_now().is_empty() && t0.elapsed().as_secs() < 10 { std::thread::sleep(std::time::Duration::from_millis(10)); } !parked_now().is_empty() };
+        let caller = std::thread::spawn(|| park_stale(1, None, "stale access: test", &[]));
+        assert!(parked(), "the stale access parked");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!caller.is_finished(), "it waits for the person's choice");
+        crate::run_threads::run_ends();
+        RESUME.notify_all();
+        assert_eq!(caller.join().unwrap(), StaleDecision::Ending, "the run ends: no restart");
+        assert!(parked_now().is_empty(), "the ended park leaves the list");
+        crate::run_threads::begin_run();
+        let domain: crate::domain::DomainId = 9;
+        let caller = std::thread::spawn(move || park_stale(1, Some(domain), "stale access: test", &[]));
+        assert!(parked(), "the stale access parked");
+        release_domain(domain);
+        assert_eq!(caller.join().unwrap(), StaleDecision::Ending, "its domain stops: no restart");
         let _ = std::fs::remove_dir_all(&home);
     }
 }
