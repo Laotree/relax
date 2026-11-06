@@ -1037,6 +1037,12 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             crate::inspect::start(&package);
         }
     }
+    // a check answers too when asked (MAKEPAD_RUN_INSPECT=1): `makepad inspect <pid> prof
+    // threads=run-check` profiles its body checks, host frames walked by their CFI; a check
+    // otherwise starts no listener (an unchanged one ends in a second)
+    if check && session.is_none() && std::env::var("MAKEPAD_RUN_INSPECT").is_ok_and(|v| v == "1") {
+        crate::inspect::start(&package);
+    }
     let mut prog_args: Vec<Vec<u8>> = vec![package.clone().into_bytes()];
     let mut k = i + 1;
     while k < args.len() && args[k] != "--" {
@@ -1582,6 +1588,11 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             return code;
         }
     }
+    // a check presents nothing: the boot's crate records and front graph (queued by a load that
+    // parsed) are written now, on the writer's thread beside the check, as a run's are after its
+    // first present -- not after the check, which then waited seconds for them at its end
+    // (record_check_front)
+    if check && !selftest && front_recordable() { crate::cache::start_deferred_front(); }
     if check {
         let mut own = vec![false; prog.crates.len()];
         for &k in &checked { prog.crates[k as usize].validate = true; own[k as usize] = true; }

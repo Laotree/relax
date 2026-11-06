@@ -463,6 +463,9 @@ pub struct Unit {
     pub locations: relax_session::sync::Mutex<crate::fxhash::HashMap<(String, u32, u32), u64>>,
     /// constants whose evaluation failed (reported once, not re-run per use)
     pub const_failed: std::collections::HashSet<(DefId, Vec<TyId>)>,
+    /// `makepad check` (eval_items): the check-mode interpreter's verdicts on the checked crates'
+    /// constants and statics, computed ahead on the pool; check_initializer takes each
+    pub interp_ahead: std::collections::HashMap<DefId, relax_types::const_eval::interp::Outcome>,
     pub core_path_cache: crate::conc::MemoMap<String, Option<DefId>>,
     /// `T: Unpin` answers (noalias on `&mut T` params needs it)
     unpin_cache: crate::conc::MemoMap<TyId, bool>,
@@ -1450,6 +1453,10 @@ unsafe fn adopt_runtime_unit(u: *mut Unit) {
     }
 }
 /// Tokens identify calls, never a process-wide arm/disarm generation.
+/// MAKEPAD_RUN_CHECK_TIMES: where the check's constant evaluation goes (CPU ns): the check-mode
+/// interpreter, the value's evaluation to data, the initializers compiled and run, the rest of
+/// eval_init (layout, storage, final checks), the cache records (check.rs eval_items prints them).
+pub(crate) static INIT_NS: [AtomicU64; 5] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static WATCHDOG_ID: AtomicU64 = AtomicU64::new(1);
 struct WatchdogCall {
     token: u64,
@@ -4494,6 +4501,7 @@ impl Unit {
             vtables: crate::conc::MemoMap::new_kept(16),
             locations: Default::default(),
             const_failed: std::collections::HashSet::new(),
+            interp_ahead: std::collections::HashMap::new(),
             core_path_cache: crate::conc::MemoMap::with_bits(8),
             unpin_cache: Default::default(),
             query_errors,
@@ -6939,14 +6947,18 @@ impl Unit {
         impl Drop for Pop { fn drop(&mut self) { let _ = CONST_STACK.try_with(|s| { s.borrow_mut().pop(); }); } }
         let _ = CONST_STACK.try_with(|s| s.borrow_mut().push((d, args.clone(), depth)));
         let cert = CertGuard::begin(FnKey::Inst(d, args.clone()));
+        let t_init = cpu_ns();
         let evaluated = { let _pop = Pop; self.eval_init(d, args.clone(), false) };
+        INIT_NS[3].fetch_add(cpu_ns() - t_init, Ordering::Relaxed);
         let cert = cert.finish();
         match evaluated {
             Some(a) => {
+                let t_rec = cpu_ns();
                 if let Some(mut cache) = self.cache.take() {
                     cache.record_const(self, d, &args, a, &cert);
                     self.cache = Some(cache);
                 }
+                INIT_NS[4].fetch_add(cpu_ns() - t_rec, Ordering::Relaxed);
                 crate::zone_alloc::kept_with(|| self.const_certs.insert((d, args.clone()), cert));
                 // the cache keeps the shared read-only image; the unit uses the per-domain one
                 // where the value reaches a static (domain.rs rehome_const)
@@ -7123,7 +7135,8 @@ impl Unit {
         use relax_types::const_eval::interp::{check_item, Outcome};
         let def = self.prog.def(d);
         if !self.prog.crates[def.krate as usize].validate || !matches!(def.kind, DefKind::Const | DefKind::Static | DefKind::AnonConst) { return true; }
-        match check_item(&self.prog, &self.tcx, d) {
+        let outcome = match self.interp_ahead.remove(&d) { Some(o) => o, None => check_item(&self.prog, &self.tcx, d) };
+        match outcome {
             Outcome::Error(span, msg) => {
                 let e = if msg.starts_with('E') { self.prog.record_error(span.file, span.lo, "typeck", msg) } else { self.prog.record_uncoded_error(span.file, span.lo, "typeck", msg) };
                 self.errors.push(e);
@@ -7144,7 +7157,10 @@ impl Unit {
         // `makepad check`: the check-mode interpreter first (rustc's CTFE undefined-behaviour,
         // mutable-global and final-value checks; diagnostics only). An evaluation it rejects is not
         // run here, as rustc stops at the error.
-        if self.prog.session.options.const_fuel && args.is_empty() && !self.check_initializer(d) { return None; }
+        let t_interp = cpu_ns();
+        let checked = !(self.prog.session.options.const_fuel && args.is_empty()) || self.check_initializer(d);
+        INIT_NS[0].fetch_add(cpu_ns() - t_interp, Ordering::Relaxed);
+        if !checked { return None; }
         let _census_context = self.exec_context(false);
         let options = &self.prog.session.clone().options;
         // Initializers outside the CTFE subset already have cached executable
@@ -7193,11 +7209,15 @@ impl Unit {
         }
         let ok = self.ctfe_eval_into(d, &args, buf);
         self.stats.ctfe_ns += cpu_ns() - t0;
+        INIT_NS[1].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
         if ok {
             self.stats.ctfe_data += 1;
             return Some(buf);
         }
-        self.run_init_code(d, args, buf)
+        let t1 = cpu_ns();
+        let r = self.run_init_code(d, args, buf);
+        INIT_NS[2].fetch_add(cpu_ns() - t1, Ordering::Relaxed);
+        r
     }
 
     /// Records static `d`'s initial value (of type `t`, just evaluated into `buf`, by CTFE or by
