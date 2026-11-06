@@ -6680,6 +6680,21 @@ pub(crate) fn offer_restart(why: &str) {
     live_log(&format!("{{\"event\":\"restart_offered\",\"pid\":{},\"why\":{}}}", std::process::id(), json_str(why)));
 }
 
+/// What a change of the sources after the app crashed waits for (offer_restart_after_crash).
+pub const CRASHED_SOURCES_CHANGED: &str = "the sources changed since the app crashed";
+
+/// The sources changed after the app crashed (the run window shows its failure): the next run,
+/// which runs them, is offered as a failed edit's restart is -- the window's Restart, the WM's
+/// toast, `session relaunch` -- and never started on its own: a landing changes the sources as
+/// the person's save does. Offered once until a run loads them (every save says it again).
+pub fn offer_restart_after_crash() {
+    let why = CRASHED_SOURCES_CHANGED;
+    if RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p == why) { return; }
+    note_restart_pending(why);
+    eprintln!("makepad live: {why}: Restart runs them; offered (the run window's Restart, the WM's toast, or `makepad inspect <app> session relaunch`)");
+    live_log(&format!("{{\"event\":\"restart_offered\",\"pid\":{},\"why\":{}}}", std::process::id(), json_str(why)));
+}
+
 /// A restart the person asked for (`session relaunch`, a restart toast's click): a dock app's
 /// waiting rebuilt makepad may take it (`host::restart_now`).
 pub(crate) static RESTART_CONFIRMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
