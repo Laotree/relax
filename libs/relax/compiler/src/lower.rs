@@ -8339,9 +8339,23 @@ impl<'a> Lcx<'a> {
     fn lower_slice_range(&mut self, e: ExprId, a: ExprId, i: ExprId, t: TyId) -> Val {
         // base[lo..hi] -> fat pointer
         let at = self.body_ty(a);
-        let (mut pl, mut pt) = self.lower_place(a);
         // autoderef recorded by type checking (Vec<T> -> [T], String -> str, &&[T] ..)
         let derefs = self.b.index_derefs(e.0);
+        // `CONST[lo..hi]` of a const array: the constant's own immutable allocation, as for
+        // `CONST[i]` (rustc promotes the index's `&CONST`), so the sub-slice is 'static -- a stack
+        // copy dangles once the fn or closure that sliced it returns (`GAPS[..1].iter()` returned
+        // from a closure). A mutable range slices a copy.
+        let promoted = if derefs == 0 && !self.want_mut && matches!(self.ast().expr(strip_paren(self.ast(), a)).kind, ExprKind::Path(_))
+            && matches!(self.kind(at), TyKind::Array(..)) && self.promotable(a)
+            && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), at) {
+            self.promote_rvalue(a, true).map(|p| (Place::Mem(p, 0), at))
+        } else {
+            None
+        };
+        let (mut pl, mut pt) = match promoted {
+            Some(x) => x,
+            None => self.lower_place(a),
+        };
         for k in 0..derefs {
             let (a2, b2) = self.deref_place(e.0, k, pl, pt);
             pl = a2;
@@ -8353,7 +8367,6 @@ impl<'a> Lcx<'a> {
             pl = if self.unsized_ty(inner) { Place::Regs(p) } else { Place::Mem(p[0], 0) };
             pt = inner;
         }
-        let _ = at;
         let (elem_size, base, len) = match self.kind(pt) {
             TyKind::Array(el, n) => {
                 let n = n.try_to_target_usize(&self.u.tcx.tys).expect("normalized array length");
