@@ -414,6 +414,26 @@ const ID_BITS: u32 = 26;
 const ID_MASK: u32 = (1 << ID_BITS) - 1;
 const _: () = assert!(MAX_CHUNKS * CHUNK == 1 << ID_BITS);
 
+/// context.rs:288-308 NUM_PREINTERNED_TY_VARS, _ANON_BOUND_TYS_I/_V, _RE_VARS, _ANON_RE_BOUNDS_I/_V
+const PRE_TY_VARS: usize = 100;
+const PRE_BOUND_DEPTHS: usize = 3;
+const PRE_BOUND_VARS: usize = 20;
+const PRE_RE_VARS: usize = 500;
+
+/// `Types::pre`: type variables 0..100, anonymous bound types (depth < 3, var < 20), region
+/// variables 0..500 and anonymous bound regions (depth < 3, var < 20).
+#[derive(Clone, Copy)]
+struct Preinterned {
+    ty_vars: [TyId; PRE_TY_VARS],
+    anon_bound_tys: [[TyId; PRE_BOUND_VARS]; PRE_BOUND_DEPTHS],
+    re_vars: [RegionId; PRE_RE_VARS],
+    anon_re_bounds: [[RegionId; PRE_BOUND_VARS]; PRE_BOUND_DEPTHS],
+}
+impl Preinterned {
+    const EMPTY: Self = Self { ty_vars: [TyId(0); PRE_TY_VARS], anon_bound_tys: [[TyId(0); PRE_BOUND_VARS]; PRE_BOUND_DEPTHS],
+        re_vars: [RegionId(0); PRE_RE_VARS], anon_re_bounds: [[RegionId(0); PRE_BOUND_VARS]; PRE_BOUND_DEPTHS] };
+}
+
 /// The type interner. Shared by every thread that type-checks or lowers: `intern` takes
 /// `&self` (rustc's sharded interners). Entries live in an append-only arena of fixed-size
 /// chunks, so a `&TyKind` stays valid while other threads intern; the map from kind to id is
@@ -446,6 +466,10 @@ pub struct Types {
     pub f32_: TyId,
     pub f64_: TyId,
     pub str_ref: TyId,
+    /// rustc_middle/src/ty/context.rs CommonTypes / CommonLifetimes: the variables and anonymous
+    /// bound variables nearly every body names, interned once by `new` (`intern` and
+    /// `intern_region` hand these out without hashing)
+    pre: Preinterned,
     /// The target's pointer width in bytes (size_of::<usize>()): 8, or 4 for the wasm32 web
     /// target (Program::ptr_bytes, set when declarations are collected).
     pub ptr_bytes: u32,
@@ -494,6 +518,7 @@ impl Types {
             f32_: TyId(0),
             f64_: TyId(0),
             str_ref: TyId(0),
+            pre: Preinterned::EMPTY,
             ptr_bytes: 8,
         };
         let mut t = t;
@@ -513,7 +538,29 @@ impl Types {
         t.f32_ = t.intern(TyKind::Float(Prim::F32));
         t.f64_ = t.intern(TyKind::Float(Prim::F64));
         t.str_ref = t.intern(TyKind::Ref(false, t.str_, crate::types::RegionId::ERASED));
+        let mut pre = Preinterned::EMPTY;
+        for (v, id) in pre.ty_vars.iter_mut().enumerate() { *id = t.intern_kind(TyKind::Infer(v as u32)); }
+        for (d, row) in pre.anon_bound_tys.iter_mut().enumerate() {
+            for (v, id) in row.iter_mut().enumerate() { *id = t.intern_kind(TyKind::Bound(d as u32, BoundTy { var: BoundVar(v as u32), kind: BoundTyKind::Anon })); }
+        }
+        for (v, id) in pre.re_vars.iter_mut().enumerate() { *id = t.intern_region_kind(RegionKind::ReVar(v as u32)); }
+        for (d, row) in pre.anon_re_bounds.iter_mut().enumerate() {
+            for (v, id) in row.iter_mut().enumerate() { *id = t.intern_region_kind(RegionKind::ReBound(d as u32, BoundVar(v as u32))); }
+        }
+        t.pre = pre;
         t
+    }
+
+    /// Whether the pre-interned ids name what `new` interned (a restored image keeps `new`'s
+    /// first ids: it was collected from an interner that `new` started).
+    pub(crate) fn preinterned_hold(&self) -> bool {
+        let p = &self.pre;
+        p.ty_vars.iter().enumerate().all(|(v, id)| *self.kind(*id) == TyKind::Infer(v as u32))
+            && p.anon_bound_tys.iter().enumerate().all(|(d, row)| row.iter().enumerate().all(|(v, id)|
+                *self.kind(*id) == TyKind::Bound(d as u32, BoundTy { var: BoundVar(v as u32), kind: BoundTyKind::Anon })))
+            && p.re_vars.iter().enumerate().all(|(v, id)| self.region_kind(*id) == RegionKind::ReVar(v as u32))
+            && p.anon_re_bounds.iter().enumerate().all(|(d, row)| row.iter().enumerate().all(|(v, id)|
+                self.region_kind(*id) == RegionKind::ReBound(d as u32, BoundVar(v as u32))))
     }
 
     #[inline(always)]
@@ -586,7 +633,7 @@ impl Types {
         let mapped = self.image.as_ref().map_or(0, |image| image.len());
         let chunks = self.chunks.iter().filter(|c| !c.load(std::sync::atomic::Ordering::Relaxed).is_null()).count();
         let mut by: [usize; 10] = [0; 10];
-        let (mut inf_n, mut par_n) = (0usize, 0usize);
+        let (mut inf_n, mut par_n, mut re_n) = (0usize, 0usize, 0usize);
         for i in 0..n {
             let e = self.entry(TyId(i as u32));
             let ix = match &e.kind {
@@ -601,6 +648,10 @@ impl Types {
             if e.meta & F_PARAM != 0 {
                 par_n += 1;
             }
+            // region variables and no other inference variable: a body's renumbered types
+            if e.meta & F_INFER == 0 && self.flags(TyId(i as u32)).intersects(TypeFlags::HAS_RE_INFER) {
+                re_n += 1;
+            }
         }
         let (list_chunks, list_table) = self.lists.heap_bytes();
         let mut out = vec![
@@ -609,6 +660,7 @@ impl Types {
             ("types: list intern table".to_string(), list_table as u64),
             (format!("types: holding inference vars ({}; entries)", inf_n), (inf_n * es) as u64),
             (format!("types: holding generic params ({}; entries)", par_n), (par_n * es) as u64),
+            (format!("types: holding region vars only ({}; entries)", re_n), (re_n * es) as u64),
             ("types: intern table".to_string(), self.index.bytes() as u64),
         ];
         let names = ["bool", "tuple", "adt", "fndef", "assoc", "infer", "ref", "closure", "fnptr", "other"];
@@ -624,7 +676,18 @@ impl Types {
         out.into_iter().map(|(k, v)| (format!("{} [{} B]", k, v), v)).collect()
     }
 
+    #[inline]
     pub fn intern(&self, k: TyKind) -> TyId {
+        match k {
+            TyKind::Infer(v) if (v as usize) < PRE_TY_VARS => return self.pre.ty_vars[v as usize],
+            TyKind::Bound(d, BoundTy { var, kind: BoundTyKind::Anon }) if (d as usize) < PRE_BOUND_DEPTHS && (var.0 as usize) < PRE_BOUND_VARS =>
+                return self.pre.anon_bound_tys[d as usize][var.0 as usize],
+            _ => {}
+        }
+        self.intern_kind(k)
+    }
+
+    fn intern_kind(&self, k: TyKind) -> TyId {
         use std::sync::atomic::Ordering::{Relaxed, Release};
         let h = Self::hash_of(&k);
         if let Some(id) = self.find(h, &k) {
@@ -772,6 +835,8 @@ impl Types {
     pub fn map_regions(&self, t: TyId, f: &impl Fn(RegionId, u32) -> RegionId, depth: u32) -> TyId {
         struct Regions<'a> { map: &'a dyn Fn(RegionId, u32) -> RegionId }
         impl fold::TypeFolder for Regions<'_> {
+            // every region kind sets one of these: a type without them has nothing to map
+            fn fold_flags(&self) -> Option<TypeFlags> { Some(TypeFlags::HAS_REGIONS) }
             fn fold_region(&mut self, _tys: &Types, r: RegionId, depth: u32) -> RegionId { (self.map)(r, depth) }
         }
         use fold::TypeFolder;
@@ -1035,8 +1100,19 @@ impl Types {
 }
 
 impl Types {
+    #[inline]
     pub fn intern_region(&self, kind: RegionKind) -> RegionId {
-        if kind == RegionKind::ReErased { return RegionId::ERASED; }
+        match kind {
+            RegionKind::ReErased => return RegionId::ERASED,
+            RegionKind::ReVar(v) if (v as usize) < PRE_RE_VARS => return self.pre.re_vars[v as usize],
+            RegionKind::ReBound(d, var) if (d as usize) < PRE_BOUND_DEPTHS && (var.0 as usize) < PRE_BOUND_VARS =>
+                return self.pre.anon_re_bounds[d as usize][var.0 as usize],
+            _ => {}
+        }
+        self.intern_region_kind(kind)
+    }
+
+    fn intern_region_kind(&self, kind: RegionKind) -> RegionId {
         let r = &self.regions;
         r.index();
         let h = region_hash(&kind);
