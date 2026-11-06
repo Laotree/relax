@@ -1211,38 +1211,51 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
     // once a patch sets one, the site calls the slot (its new body, or one rebuilt around the new
     // copy). The slow call is never inlined again (`guard_calls`); the callee's own slow calls
     // come along with its body. The inliner drops the guards no frame can wait before
-    // (`unguard_prefix`).
+    // (`unguard_prefix`). A build that read its slot's copy version (`Func::copy_ver`) checks that
+    // one word first: while it holds the value the build read, no flag its code reads was set
+    // after the build began, so the flags are read (in a block of their own) only once it moved.
     let mut flags: Vec<Sym> = callee.patch_flag.into_iter().chain(callee.unguarded_flags.iter().copied()).collect();
     flags.sort_unstable();
     flags.dedup();
     let mut guard = None;
+    let cold = if call_count >= 0.0 { 0.0 } else { -1.0 };
     let slow = (!flags.is_empty()).then(|| {
+        let mut chk = Vec::with_capacity(flags.len() * 3);
         let mut acc = None;
-        let n0 = f.blocks[bi].insts.len();
         for &flag in &flags {
             let (a, w) = (f.vreg(Cls::I), f.vreg(Cls::I));
-            f.blocks[bi].insts.extend([Inst::Addr(a, flag), Inst::AtomicLoad(Mem::Int(8, false), AtomOrd::Relaxed, w, a)]);
+            chk.extend([Inst::Addr(a, flag), Inst::AtomicLoad(Mem::Int(8, false), AtomOrd::Relaxed, w, a)]);
             acc = Some(match acc {
                 None => w,
                 Some(x) => {
                     let o = f.vreg(Cls::I);
-                    f.blocks[bi].insts.push(Inst::IBin(IOp::Or, IntTy { bits: 64, signed: false }, o, x, w));
+                    chk.push(Inst::IBin(IOp::Or, IntTy { bits: 64, signed: false }, o, x, w));
                     o
                 }
             });
         }
         let c = f.vreg(Cls::I);
+        chk.push(Inst::ICmpI(Cond::Eq, false, c, acc.expect("a guard flag"), 0));
+        let (cond, at_site, check) = match f.copy_ver {
+            Some((word, ver)) => {
+                let (a, w, h) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+                let n = chk.len();
+                let check = Block { insts: chk, pos: vec![call_pos; n], term: Term::Unreachable, term_pos: call_pos, count: cold };
+                (h, vec![Inst::Addr(a, word), Inst::AtomicLoad(Mem::Int(8, false), AtomOrd::Relaxed, w, a), Inst::ICmpI(Cond::Eq, false, h, w, ver as i64)], Some((c, check)))
+            }
+            None => (c, chk, None),
+        };
+        let n = at_site.len();
         let blk = &mut f.blocks[bi];
-        blk.insts.push(Inst::ICmpI(Cond::Eq, false, c, acc.expect("a guard flag"), 0));
-        let n = blk.insts.len() - n0;
+        blk.insts.extend(at_site);
         blk.pos.extend(std::iter::repeat(call_pos).take(n));
         f.guard_calls.push((call_pos, id));
-        guard = Some(NewGuard { cond: c, fast: boff, slow: 0, insts: n, pos: call_pos, slot: id, flags: std::mem::take(&mut flags) });
+        guard = Some(NewGuard { cond, fast: boff, check: None, slow: 0, insts: n, pos: call_pos, slot: id, flags: std::mem::take(&mut flags) });
         let term = match unwind {
             Some(u) => Term::Invoke(cont, u),
             None => Term::Jump(cont),
         };
-        (c, Block { insts: vec![call], pos: vec![call_pos], term, term_pos: call_pos, count: if call_count >= 0.0 { 0.0 } else { -1.0 } })
+        (cond, check, Block { insts: vec![call], pos: vec![call_pos], term, term_pos: call_pos, count: cold })
     });
     for &(p, s) in &callee.guard_calls {
         f.guard_calls.push((ctx_of(p), s));
@@ -1329,21 +1342,33 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
         f.blocks.push(Block { insts, pos, term, term_pos, count: scaled(cb.count) });
     }
     f.blocks.extend(extra);
-    if let Some((c, b)) = slow {
-        f.blocks[bi].term = Term::Branch(c, boff, f.blocks.len() as u32);
+    if let Some((c, check, b)) = slow {
+        let mut at = f.blocks.len() as u32;
+        f.blocks[bi].term = Term::Branch(c, boff, at);
+        if let Some((fc, mut cb)) = check {
+            cb.term = Term::Branch(fc, boff, at + 1);
+            f.blocks.push(cb);
+            if let Some(g) = guard.as_mut() {
+                g.check = Some(at);
+            }
+            at += 1;
+        }
         if let Some(g) = guard.as_mut() {
-            g.slow = f.blocks.len() as u32;
+            g.slow = at;
         }
         f.blocks.push(b);
     }
     guard
 }
 
-/// A guard `inline_site` put before an inlined copy: the block ending in `Branch(cond, fast, slow)`
-/// ends with its `insts` flag loads and compare; `slow` calls `slot` at `pos`.
+/// A guard `inline_site` put before an inlined copy: the block ending in `Branch(cond, fast,
+/// check or slow)` ends with its `insts` flag loads and compare, or with its host's copy version
+/// check (`check`: the block that reads the flags then, `Branch(.., fast, slow)`); `slow` calls
+/// `slot` at `pos`.
 struct NewGuard {
     cond: VReg,
     fast: u32,
+    check: Option<u32>,
     slow: u32,
     insts: usize,
     pos: u64,
@@ -1367,9 +1392,9 @@ fn unguard_prefix(f: &mut Func, guards: Vec<NewGuard>) {
     let guards: Vec<(usize, NewGuard)> = guards
         .into_iter()
         .filter_map(|g| {
-            let gb = (0..nb).find(|&b| matches!(f.blocks[b].term, Term::Branch(c, t, e) if c == g.cond && t == g.fast && e == g.slow))?;
+            let gb = (0..nb).find(|&b| matches!(f.blocks[b].term, Term::Branch(c, t, e) if c == g.cond && t == g.fast && e == g.check.unwrap_or(g.slow)))?;
             let n = f.blocks[gb].insts.len();
-            (n >= g.insts && matches!(f.blocks[gb].insts[n - 1], Inst::ICmpI(Cond::Eq, false, c, _, 0) if c == g.cond)).then_some((gb, g))
+            (n >= g.insts && matches!(f.blocks[gb].insts[n - 1], Inst::ICmpI(Cond::Eq, false, c, _, _) if c == g.cond)).then_some((gb, g))
         })
         .collect();
     let mut slow = vec![false; nb];
@@ -1424,10 +1449,12 @@ fn unguard_prefix(f: &mut Func, guards: Vec<NewGuard>) {
         blk.insts.truncate(n);
         blk.pos.truncate(n);
         blk.term = Term::Jump(g.fast);
-        let sb = &mut f.blocks[g.slow as usize];
-        sb.insts.clear();
-        sb.pos.clear();
-        sb.term = Term::Unreachable;
+        for b in g.check.into_iter().chain([g.slow]) {
+            let sb = &mut f.blocks[b as usize];
+            sb.insts.clear();
+            sb.pos.clear();
+            sb.term = Term::Unreachable;
+        }
         if let Some(k) = f.guard_calls.iter().position(|&(p, s)| p == g.pos && s == g.slot) {
             f.guard_calls.remove(k);
         }
@@ -6621,6 +6648,61 @@ mod inline_priority_tests {
         assert_eq!(inline_calls(options, &mut outer, 0, &get, &|_| false, &InlineLimits::tier1()).len(), 1);
         outer.verify().unwrap();
         assert!(outer.guard_calls.is_empty(), "{}", outer.dump());
+        assert_eq!(outer.unguarded_flags, vec![flag, mid_flag]);
+    }
+
+    #[test]
+    fn a_host_reads_its_copy_version_before_the_flags() {
+        // a live session's build that read its slot's copy version: a guard compares that one
+        // word with the value first, and reads the flags (its copy's and those of the copies the
+        // body inlined unguarded) in a block of its own only once the word moved. A site no frame
+        // can wait before drops both blocks, as it drops a guard of flags alone.
+        let options = &relax_session::Options::default();
+        let (flag, mid_flag, word) = (Sym { id: 9, off: 16 }, Sym { id: 10, off: 16 }, Sym { id: 11, off: 24 });
+        let mut leaf = callee(2);
+        leaf.patch_flag = Some(flag);
+        let mut mid = callee(0);
+        mid.patch_flag = Some(mid_flag);
+        mid.blocks[0].insts = vec![Inst::Call(Callee::Fn(1), vec![], vec![])];
+        mid.blocks[0].pos = vec![5];
+        let get = |id: u32| (id == 1).then_some((&leaf as *const Func, ATTR_ALWAYS));
+        assert_eq!(inline_calls(options, &mut mid, 0, &get, &|_| false, &InlineLimits::tier1()).len(), 1);
+        assert_eq!(mid.unguarded_flags, vec![flag]);
+        let get = |id: u32| match id {
+            1 => Some((&leaf as *const Func, ATTR_ALWAYS)),
+            2 => Some((&mid as *const Func, ATTR_ALWAYS)),
+            _ => None,
+        };
+        // in a loop: the word, then the flags
+        let mut outer = caller_in_loop();
+        outer.copy_ver = Some((word, 3));
+        outer.blocks[1].insts = vec![Inst::Call(Callee::Fn(2), vec![], vec![])];
+        outer.blocks[1].pos = vec![7];
+        assert_eq!(inline_calls(options, &mut outer, 0, &get, &|_| false, &InlineLimits::tier1()).len(), 1);
+        outer.verify().unwrap();
+        let b1 = &outer.blocks[1];
+        assert!(matches!(b1.insts[..], [Inst::Addr(_, w), Inst::AtomicLoad(Mem::Int(8, false), AtomOrd::Relaxed, _, _), Inst::ICmpI(Cond::Eq, false, _, _, 3)] if w == word), "{}", outer.dump());
+        let Term::Branch(_, fast, check) = b1.term else { panic!("{}", outer.dump()) };
+        let cb = &outer.blocks[check as usize];
+        let read: Vec<Sym> = cb.insts.iter().filter_map(|i| match i { Inst::Addr(_, s) => Some(*s), _ => None }).collect();
+        assert_eq!(read, vec![flag, mid_flag], "{}", outer.dump());
+        assert!(matches!(cb.insts.last(), Some(Inst::ICmpI(Cond::Eq, false, _, _, 0))), "{}", outer.dump());
+        let Term::Branch(_, fast2, slow) = cb.term else { panic!("{}", outer.dump()) };
+        assert_eq!(fast2, fast);
+        assert_eq!(outer.blocks[slow as usize].insts, vec![Inst::Call(Callee::Fn(2), vec![], vec![])]);
+        assert_eq!(outer.guard_calls, vec![(7, 2)]);
+        let words = outer.blocks.iter().flat_map(|b| &b.insts).filter(|i| matches!(i, Inst::Addr(_, s) if *s == word)).count();
+        assert_eq!(words, 1, "{}", outer.dump());
+        // before the loop: unguarded, both blocks dropped, both flags noted
+        let mut outer = caller();
+        outer.copy_ver = Some((word, 3));
+        outer.blocks[0].insts = vec![Inst::Call(Callee::Fn(2), vec![], vec![])];
+        outer.blocks[1].insts.clear();
+        outer.blocks[1].pos.clear();
+        assert_eq!(inline_calls(options, &mut outer, 0, &get, &|_| false, &InlineLimits::tier1()).len(), 1);
+        outer.verify().unwrap();
+        assert!(outer.guard_calls.is_empty(), "{}", outer.dump());
+        assert!(!outer.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(i, Inst::Addr(..) | Inst::AtomicLoad(..) | Inst::Call(..))), "{}", outer.dump());
         assert_eq!(outer.unguarded_flags, vec![flag, mid_flag]);
     }
 

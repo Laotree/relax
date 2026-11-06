@@ -185,6 +185,9 @@ pub struct SlotHistory {
     pub retired: Vec<(u64, u32, PcMap)>,
     /// slots that inlined this function (recompiled when it is patched)
     pub inlined_into: Vec<u32>,
+    /// a live session: the slots whose copy version code that reads this slot's patch flag also
+    /// reads (sorted; `note_guard_reads`): they move when the flag is set (`set_patched`)
+    pub copy_hosts: Vec<u32>,
 }
 
 impl FnEntry {
@@ -194,7 +197,7 @@ impl FnEntry {
     }
     /// Reading an untouched slot's history never allocates.
     pub fn history(&self) -> &SlotHistory {
-        static EMPTY: SlotHistory = SlotHistory { prev: Vec::new(), retired: Vec::new(), inlined_into: Vec::new() };
+        static EMPTY: SlotHistory = SlotHistory { prev: Vec::new(), retired: Vec::new(), inlined_into: Vec::new(), copy_hosts: Vec::new() };
         self.history.as_deref().unwrap_or(&EMPTY)
     }
 }
@@ -1590,6 +1593,7 @@ unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, 
     {
         let t = if tier1 { tier::O3 } else if s.base { tier::BASELINE } else if s.o2 { tier::O2 } else { tier::O1 };
         let _as = code_as(CodeKind::new(t, origin::IMAGE));
+        note_guard_reads(u, s.guards.iter().copied());
         u.install_prelinked(s.id, s.at, s.len, s.trailer, s.pc);
     }
     if tier1 {
@@ -7533,6 +7537,7 @@ impl Unit {
 
     fn install_code(&mut self, id: u32, code: &[u8], relocs: &[relax_backend::rir::RelocAt], pc_map: Vec<(u32, u64)>, gen: u32) -> Result<u64, String> {
         let _cost_install = relax_codegen::fncost::phase(6);
+        note_code_guard_reads(self, relocs);
         // makepad inspect: new code for an instrumented slot (a live patch, a verdict's rebuild,
         // a lazy recompile) replaces its counters and probes, and the first code of a slot whose
         // SPEC-V twin (or base) is instrumented runs the same fn: either way the instruments are
@@ -12493,6 +12498,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     let u = &*up;
     // (an inline candidate's preparation: the back end inlines it guarded, as its RIR would be)
     func.patch_flag = patch_flag(u, id);
+    func.copy_ver = copy_ver(u, id);
     Ok((Prep { func, cfg, callees: snap, ro: u.ro_reader(), relayout, name, deferred, facts }, prep_ns))
 }
 
@@ -15862,10 +15868,96 @@ pub(crate) fn patch_flag(u: &Unit, id: u32) -> Option<relax_backend::rir::Sym> {
 }
 
 /// A live patch replaced slot `id`'s body (installed first): its inlined copies call the slot from
-/// now on, and it is never inlined again.
+/// now on, and it is never inlined again. The copy versions of the code that reads its flag move
+/// after it is set, so their guards read the flags again.
 pub(crate) fn set_patched(u: &Unit, id: u32) {
     u.fns[id as usize].patched.store(true, Ordering::Relaxed);
     unsafe { (*tier_rec(&u.slots, id).add((TIER_PATCH / 8) as usize)).store(1, Ordering::Release) };
+    for &h in &u.fns[id as usize].history().copy_hosts {
+        move_copy_ver(u, h);
+    }
+}
+
+/// A live session's copy version of slot `id` as a build of it reads it (`Func::copy_ver`): its
+/// tier record word that the guards of the copies its code inlines read first. None: they read
+/// their flags alone (not a live session, or `MAKEPAD_RUN_OPT=-guard`: no guards at all).
+pub(crate) fn copy_ver(u: &Unit, id: u32) -> Option<(relax_backend::rir::Sym, u64)> {
+    let options = &u.prog.session.options;
+    if !options.live || relax_backend::stats::opt_off(options, "-guard") {
+        return None;
+    }
+    let s = loop_counter_sym(u, id);
+    let v = unsafe { (*tier_rec(&u.slots, id).add((TIER_COPY / 8) as usize)).load(Ordering::Acquire) };
+    Some((relax_backend::rir::Sym { id: s.id, off: s.off + COPY_VER_OFF }, v))
+}
+
+/// Slot `id`'s copy version moves on: code built before holds the old value, so its guards read
+/// their flags. It only grows.
+fn move_copy_ver(u: &Unit, id: u32) {
+    unsafe { (*tier_rec(&u.slots, id).add((TIER_COPY / 8) as usize)).fetch_add(1, Ordering::Release) };
+}
+
+/// The patch flags (their slots) and copy versions (theirs) code names among `syms`.
+fn guard_reads(u: &Unit, syms: impl Iterator<Item = relax_backend::rir::Sym>) -> (Vec<u32>, Vec<u32>) {
+    let (mut flags, mut vers) = (Vec::new(), Vec::new());
+    for s in syms {
+        if s.off != PATCH_FLAG_OFF && s.off != COPY_VER_OFF {
+            continue;
+        }
+        if let Some(x) = u.syms.tier_slot(s.id) {
+            if s.off == PATCH_FLAG_OFF { flags.push(x) } else { vers.push(x) }
+        }
+    }
+    for v in [&mut flags, &mut vers] {
+        v.sort_unstable();
+        v.dedup();
+    }
+    (flags, vers)
+}
+
+/// Code being installed (any tier, a disk-cache link or the startup image's) reads the patch
+/// flags and copy versions among `syms` (the guards of its inlined copies): each flag notes the
+/// versions, which move when a patch sets it (set_patched), and a flag set already moves them
+/// now. So a copy version holds the value a build read only while no flag that code of its slot
+/// reads was set after the read: a callee patched before the install is caught at it, one patched
+/// after at the patch. (Unit lock held, as for set_patched; before the code can run.)
+pub(crate) fn note_guard_reads(u: &mut Unit, syms: impl Iterator<Item = relax_backend::rir::Sym>) {
+    let (flags, vers) = guard_reads(u, syms);
+    if flags.is_empty() || vers.is_empty() {
+        return;
+    }
+    for &y in &flags {
+        let h = &u.fns[y as usize].history().copy_hosts;
+        if vers.iter().any(|v| h.binary_search(v).is_err()) {
+            crate::zone_alloc::slots_with(|| {
+                let h = &mut u.fns[y as usize].history.get_or_insert_with(Default::default).copy_hosts;
+                for &v in &vers {
+                    if let Err(k) = h.binary_search(&v) {
+                        h.insert(k, v);
+                    }
+                }
+            });
+        }
+        if unsafe { (*tier_rec(&u.slots, y).add((TIER_PATCH / 8) as usize)).load(Ordering::Acquire) } != 0 {
+            for &v in &vers {
+                move_copy_ver(u, v);
+            }
+        }
+    }
+}
+
+/// note_guard_reads for code about to be placed (a live session): the symbols its relocations name.
+fn note_code_guard_reads(u: &mut Unit, relocs: &[relax_backend::rir::RelocAt]) {
+    if u.prog.session.options.live {
+        note_guard_reads(u, relocs.iter().filter_map(|r| match r.target { relax_backend::rir::Reloc::Sym(s) => Some(s), _ => None }));
+    }
+}
+
+/// Code whose guards compare a copy version that moved this session (`syms`): it is never stored
+/// on disk. A later session's version starts at 0 and reaches the value again while the code's
+/// copies may be stale; code stored with every version at 0 reads the flags at the first move.
+pub(crate) fn names_moved_copy_ver(u: &Unit, syms: impl Iterator<Item = relax_backend::rir::Sym>) -> bool {
+    guard_reads(u, syms).1.iter().any(|&x| unsafe { (*tier_rec(&u.slots, x).add((TIER_COPY / 8) as usize)).load(Ordering::Acquire) } != 0)
 }
 
 /// The loop counter and rt_loop_hot symbols for the baseline / O1 / O2 code of slot `id` (unit
@@ -16064,19 +16156,25 @@ fn rt_loop_hot(counter: u64, fp: u64) {
 /// last cost check (wall_ns), counted code bytes | flags, TIER_INBOX link (low 32 bits) | queue
 /// reason Q_* (high 32 bits), cost rate at queueing, loop counter, decayed cost at the last check]
 /// (read by JIT code, rt_hot and rt_loop_hot without the lock), patch flag (a live session: 1 once a
-/// patch replaced the slot's body; the guards of its inlined copies read it). The budget (signed) is what the
+/// patch replaced the slot's body; the guards of its inlined copies read it), copy version (a live
+/// session: moves each time a patch sets a flag the slot's code reads; the guards in its code
+/// read it before their flags, copy_ver). The budget (signed) is what the
 /// count stub takes each call's weight from (call_weight) and rt_loop_hot each LOOP_CHUNK back
 /// edges' cost from; at or below 0 the next call goes to rt_hot, which decays the cost seen so far,
 /// adds what was spent since and either queues the slot (tier_check) or refills the budget. The
 /// loop counter is the word the slot's own baseline / O1 / O2 code decrements per loop iteration
 /// (profile::loop_counters).
-const TIER_REC: usize = 88;
+const TIER_REC: usize = 96;
 /// the loop counter's offset in the tier record (word 8)
 const TIER_LOOP: u64 = 64;
 /// the patch flag's offset in the tier record (word 10)
 const TIER_PATCH: u64 = 80;
 /// a patch flag symbol's offset from its slot's loop counter symbol (both `SymKind::TierRec`)
 pub(crate) const PATCH_FLAG_OFF: i64 = (TIER_PATCH - TIER_LOOP) as i64;
+/// the copy version's offset in the tier record (word 11)
+const TIER_COPY: u64 = 88;
+/// a copy version symbol's offset from its slot's loop counter symbol
+pub(crate) const COPY_VER_OFF: i64 = (TIER_COPY - TIER_LOOP) as i64;
 /// Cost units: a back edge is 1, a call CALL_COST plus its code's size (call_weight). The O3
 /// threshold is MAKEPAD_RUN_O3_CALLS (default 2000) x O3_CALL_UNITS = 40000 units, which a loop
 /// reaches in 40000 back edges (HotSpot's C2 Tier4BackEdgeThreshold, as before) and a tiny fn in
@@ -19229,8 +19327,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         }
         // A caller's version alone cannot protect an in-flight build: a patch may change
         // a callee before this build has registered its inlined_into edge. Capture the
-        // epoch before any snapshot yields, and reject the entire old snapshot on install.
-        let epoch = PATCH_EPOCH.load(Ordering::SeqCst);
+        // epoch before any snapshot yields, and reject the entire old snapshot on install. (With
+        // it the root's copy version, which the guards of the copies it inlines compare: copy_ver.)
+        let epoch = (PATCH_EPOCH.load(Ordering::SeqCst), copy_ver(&*up, id));
         let (rir, version) = {
             let u = &*up;
             let f = &u.fns[id as usize];
@@ -19562,7 +19661,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     }
     drop(front);
     let t1 = cpu_ns();
-    let Some((rir, version, epoch, sandboxed, assembled, callees, inline_all, ro, env, cfg, name, counts, hot_root)) = snapped else {
+    let Some((rir, version, (epoch, host_ver), sandboxed, assembled, callees, inline_all, ro, env, cfg, name, counts, hot_root)) = snapped else {
         return false;
     };
     let assembled = assembled.unwrap_or_else(|| {
@@ -19605,6 +19704,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, String> {
         let _arena = crate::zone_alloc::job("O3", runtime.burst_arena);
         let mut func = (*rir).clone();
+        func.copy_ver = host_ver;
         for x in &nocapture {
             if !func.nocapture.contains(x) {
                 func.nocapture.push(x.clone());
@@ -20011,6 +20111,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 let u = &mut *up;
                 let te = cpu_ns();
                 let o3_group = if blob { None } else { crate::invalid::group_of(u, id, 0, &inlined) };
+                // (placed here, not by install_code: what its guards read is noted as there)
+                note_code_guard_reads(u, &relocs);
                 let at = if blob {
                     u.emit_or_redirect(&code, &relocs, "O3").expect("O3 interpreted code installs")
                 } else {
