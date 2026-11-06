@@ -141,7 +141,8 @@ fn a_refused_enum_edit_keeps_the_older_body_a_closure_needs() {
 
 /// A closure of a replaced version whose body is gone is no error of the program, so no edit of
 /// it can resume the call: it is an internal compiler error, a failed hot load (jit.rs compile_ice,
-/// tools/run/fixture/hot_fail.py), which never parks.
+/// tools/run/fixture/hot_fail.py), which never parks. Its one line carries what the report needs
+/// (jit.rs missing_owner_facts): the owner, both versions, the bodies held, what the edit kept.
 #[test]
 fn a_closure_of_a_replaced_version_without_its_body_is_an_internal_error() {
     in_child("reload_items_tests::a_closure_of_a_replaced_version_without_its_body_is_an_internal_error", &["only"], |_| {
@@ -157,6 +158,9 @@ fn a_closure_of_a_replaced_version_without_its_body_is_an_internal_error() {
             let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call("run_stored"))).unwrap_err();
             let message = failed.downcast_ref::<String>().cloned().unwrap_or_default();
             assert!(message.contains("closure parent body missing") && crate::jit::is_ice_stub_message(message.trim_start_matches("JIT call panicked: ")), "{message}");
+            for fact in ["owner `", "store", "lib.rs:", "the closure's version v", "replaced by v", "owner bodies held: none", "the edit that replaced it kept this body", "owner code ", "inlined into "] {
+                assert!(message.contains(fact), "{fact:?} in {message}");
+            }
         });
     });
 }
