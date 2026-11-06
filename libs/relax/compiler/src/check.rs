@@ -1177,24 +1177,29 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     let checked = seeds.len();
     let mut st = StepTimes::new("after bodies:");
     st.mark("merge");
-    // the late lints of the anonymous constants inside the bodies (rustc visit_nested_body: a
-    // const argument `U::<300>` is a body of its own, its literal typed as the parameter); a
-    // repeat count its owner typed was linted with the owner; an owner whose clean verdict was
-    // stored (its text holds the constant) is not typed again
+    // the anonymous constants inside the bodies are body owners of their own (rustc
+    // par_body_owners: an array length or const argument in a body is typed by its own typeck,
+    // which reports its errors): their type errors, and their late lints (rustc
+    // visit_nested_body: a const argument `U::<300>` is a body of its own, its literal typed as
+    // the parameter). A repeat count its owner typed was linted with the owner, but its errors as
+    // a constant (`[0; n]` with `n` a local) are its own; an owner whose clean verdict was stored
+    // (its text holds the constant) is not typed again
     let stored: std::collections::HashSet<crate::program::DefId> = fns.iter().zip(&skip).filter(|(_, s)| **s).map(|(f, _)| f.0.owner).collect();
     for &k in &fresh_crates {
         let uu = unsafe { &*up };
         for (anon, owner, e) in crate::borrowck::body::body_anon_consts(&uu.prog, &uu.tcx, k) {
             if stored.contains(&owner) || is_live_default(&uu.prog, owner) { continue; }
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let outer = uu.tcx.typeck(&uu.prog, owner);
-                if !outer.errors.is_empty() || (outer.has_expr(e) && outer.expr_typed.get(outer.expr_ix(e))) { return; }
+                let owner_typed = outer.has_expr(e) && outer.expr_typed.get(outer.expr_ix(e));
                 let body = uu.tcx.typeck(&uu.prog, anon);
-                if body.errors.is_empty() {
+                if !owner_typed && body.errors.is_empty() && outer.errors.is_empty() {
                     relax_types::lint::check_literals(&uu.prog, &uu.tcx, &body);
                     relax_types::lint_dead::collect_body(&uu.prog, &uu.tcx, &body);
                 }
+                body.errors.to_vec()
             }));
+            if let Ok(errs) = r { errors.extend(staged(Stage::of(Phase::Typeck, 0, anon), errs)); }
         }
     }
     st.mark("body anon consts");
