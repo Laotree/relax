@@ -390,6 +390,26 @@ fn fields(w: &mut TypeWalker, ast: &Ast, l: List<FieldDef>, pub_only: bool) {
 
 // ================================================================ body references
 
+/// A body that failed its type check: the traits of the methods it did resolve are used (rustc's
+/// method probe records a used trait import as each call resolves, an error later in the body
+/// or not), and with a method error (E0599: no item `name` found) so is every trait in scope that
+/// has an item of that name (report_method_error marks the call's in-scope traits used, which the
+/// resolver gathered by the name: the error is very possibly why the trait was not used). Its
+/// other references are not collected: with an error, no dead code is reported.
+pub fn note_failed_body(prog: &Program, tcx: &Tcx, body: &Body) {
+    if !lint::enabled() { return; }
+    let d = prog.def(body.def);
+    for m in body.methods.values() { crate::lint_imports::note_method(prog, tcx, d.krate, m.def); }
+    for r in body.res.values() {
+        if let Res::Def(x) = r { crate::lint_imports::note_method(prog, tcx, d.krate, *x); }
+    }
+    for e in body.errors.iter() {
+        let Some((_, rest)) = e.split_once(": E0599: ") else { continue };
+        let Some(name) = rest.split_once("named `").and_then(|(_, n)| n.split_once('`')).map(|(n, _)| n) else { continue };
+        crate::lint_imports::note_scope_traits(prog, d.krate, d.scope, name);
+    }
+}
+
 pub fn collect_body(prog: &Program, tcx: &Tcx, body: &Body) {
     if !lint::enabled() { return; }
     let d = prog.def(body.def);
@@ -1222,10 +1242,16 @@ pub struct CrateItems<'p> {
     pub defs: Vec<DefId>,
     pub mods: Vec<u32>,
     pub imports: Vec<&'p crate::program::Import>,
+    /// its imports that never bind and are reported (E0432, E0603): rustc counts them used
+    pub unresolved: Vec<&'p crate::program::Import>,
 }
 
-/// The checked crates are done: run the analysis and report, one crate at a time.
-pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32) {
+/// The checked crates are done: run the analysis and report, one crate at a time. `late`: the
+/// required analyses passed, so rustc's misc_checking_3 runs (dead code and the late lints);
+/// without it only the unused imports are reported (rustc's resolver and check_unused_traits
+/// report them before the analyses can fail). `erroneous`: the imports (by index) the check
+/// reported an error of that never bind in rustc, besides the ones still open.
+pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32, late: bool, erroneous: &[usize]) {
     if !lint::enabled() { return; }
     let mut pt = PartTimes { on: std::env::var_os("MAKEPAD_RUN_CHECK_TIMES").is_some(), t: std::time::Instant::now(), parts: Vec::new() };
     let refs = BODY_REFS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
@@ -1235,7 +1261,7 @@ pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32) {
     let mut crates: Vec<CrateItems> = (0..n as u32).filter(|&k| is_own(k)).map(|k| {
         let mut own = vec![false; n];
         own[k as usize] = true;
-        CrateItems { krate: k, own, defs: Vec::new(), mods: Vec::new(), imports: Vec::new() }
+        CrateItems { krate: k, own, defs: Vec::new(), mods: Vec::new(), imports: Vec::new(), unresolved: Vec::new() }
     }).collect();
     let mut slot = vec![usize::MAX; n];
     for (i, c) in crates.iter().enumerate() { slot[c.krate as usize] = i; }
@@ -1248,24 +1274,36 @@ pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32) {
     for (m, md) in prog.mods.iter().enumerate() {
         if is_own(md.krate) { crates[slot[md.krate as usize]].mods.push(m as u32); }
     }
-    for im in prog.imports_iter() {
+    let open: HashSet<usize> = prog.open_reportable_imports(0).into_iter().chain(erroneous.iter().copied()).collect();
+    for (i, im) in prog.imports_iter().enumerate() {
         let k = prog.mods[im.module as usize].krate;
-        if is_own(k) { crates[slot[k as usize]].imports.push(im); }
+        if !is_own(k) { continue; }
+        let c = &mut crates[slot[k as usize]];
+        c.imports.push(im);
+        if open.contains(&i) { c.unresolved.push(im); }
     }
     pt.mark("children");
     for c in &crates {
         let t = traits.remove(&c.krate).unwrap_or_default();
-        finish_crate(prog, tcx, c, root, &refs, &children, &t, &mut pt);
+        finish_crate(prog, tcx, c, root, &refs, &children, &t, late, &mut pt);
     }
     pt.report(crates.len());
 }
 
-/// One checked crate's dead code, reachability lints and unused imports.
+/// One checked crate's dead code and reachability lints (`late`), and its unused imports.
 #[allow(clippy::too_many_arguments)]
-fn finish_crate(prog: &Program, tcx: &Tcx, c: &CrateItems, root: u32, refs: &HashMap<DefId, BodyInfo>, children: &HashMap<DefId, Vec<DefId>>, traits: &HashSet<DefId>, pt: &mut PartTimes) {
-    let own = &c.own[..];
+fn finish_crate(prog: &Program, tcx: &Tcx, c: &CrateItems, root: u32, refs: &HashMap<DefId, BodyInfo>, children: &HashMap<DefId, Vec<DefId>>, traits: &HashSet<DefId>, late: bool, pt: &mut PartTimes) {
     let reach = Reach::compute(prog, tcx, c);
     pt.mark("Reach::compute");
+    if late { late_lints(prog, tcx, c, root, refs, children, &reach, pt); }
+    crate::lint_imports::check(prog, tcx, c, &reach, traits);
+    pt.mark("lint_imports::check");
+}
+
+/// misc_checking_3 of one checked crate: dead code, then the late lints of its items.
+#[allow(clippy::too_many_arguments)]
+fn late_lints(prog: &Program, tcx: &Tcx, c: &CrateItems, root: u32, refs: &HashMap<DefId, BodyInfo>, children: &HashMap<DefId, Vec<DefId>>, reach: &Reach, pt: &mut PartTimes) {
+    let own = &c.own[..];
     let mut s = Dead { prog, tcx, own, refs, live: HashSet::new(), live_log: Vec::new(), live_fields: HashSet::new(), worklist: Vec::new(), scanned: HashSet::new(), propagated: false, ignored_derived: HashMap::new(), children };
     // seeds
     let mut deferred: Vec<Work> = Vec::new();
@@ -1344,22 +1382,20 @@ fn finish_crate(prog: &Program, tcx: &Tcx, c: &CrateItems, root: u32, refs: &Has
     pt.mark("mark 2");
     let _ = pre_derived;
     // report
-    let rep = Reporter { s: &s, reach: &reach };
+    let rep = Reporter { s: &s, reach };
     if executable { rep.run(&DEAD_CODE_PUB_IN_BINARY, &pre_live, true, &all); }
     rep.run(&DEAD_CODE, &s.live, false, &all);
     pt.mark("report");
-    crate::lint_late::missing_copy_implementations(prog, tcx, &c.defs, &reach);
+    crate::lint_late::missing_copy_implementations(prog, tcx, &c.defs, reach);
     pt.mark("missing_copy_implementations");
     crate::lint_late::variant_size_differences(prog, tcx, &c.defs);
     pt.mark("variant_size_differences");
-    crate::lint_late::async_fn_in_trait(prog, &c.defs, &reach);
+    crate::lint_late::async_fn_in_trait(prog, &c.defs, reach);
     pt.mark("async_fn_in_trait");
     crate::lint_late::repr_transparent_fields(prog, tcx, &c.defs);
     pt.mark("repr_transparent_fields");
-    unnameable_types(prog, own, &reach);
+    unnameable_types(prog, own, reach);
     pt.mark("unnameable_types");
-    crate::lint_imports::check(prog, tcx, c, &reach, traits);
-    pt.mark("lint_imports::check");
 }
 
 fn is_executable(prog: &Program, root: u32) -> bool {

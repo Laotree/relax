@@ -127,6 +127,7 @@ mod harness;
 mod test_pkg;
 pub mod tui;
 pub mod check;
+mod check_order;
 mod typeck_bg;
 mod gandalf_out;
 pub mod serve;
