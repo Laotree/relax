@@ -2043,6 +2043,29 @@ fn def_is_bound(prog: &crate::program::Program, d: DefId) -> bool {
     prog.mods.get(def.scope as usize).map_or(false, |m| m.values.get(&def.name) == Some(&d) || m.types.get(&def.name) == Some(&d))
 }
 
+/// The instance slot `s` is code of (a closure's: its fn's).
+fn slot_instance(u: &Unit, s: u32) -> Option<(DefId, &[TyId])> {
+    let mut k = s;
+    for _ in 0..64 {
+        match &u.fns[k as usize].key {
+            FnKey::Closure(_, _, p) => k = *p,
+            FnKey::Inst(d, args) => return Some((*d, args)),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Whether slot `s` is code of a fn that is no longer the program's (`removed` by this edit, or
+/// replaced by an earlier one): code in flight, which keeps its slots and is never rebuilt against
+/// the new definitions (its old text need not check against them).
+fn in_flight_only(u: &Unit, s: u32, removed: &[DefId]) -> bool {
+    let Some((d, _)) = slot_instance(u, s) else { return false };
+    let def = u.prog.def(d);
+    let in_trait = def.parent != crate::program::NO_DEF && u.prog.def(def.parent).kind == DefKind::Trait;
+    removed.contains(&d) || matches!(def.kind, DefKind::Fn | DefKind::AssocFn) && !in_trait && !def_is_bound(&u.prog, d)
+}
+
 /// Whether type `t` names an ADT of one of `crates`.
 fn ty_in_crates(u: &Unit, t: TyId, crates: &[u32], depth: u32) -> bool {
     use crate::types::TyKind::*;
@@ -3512,10 +3535,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // removed one's place (at the commit). A trait object holding one of its fns was made by
     // code no call shows: that edit restarts, unless the impl's type goes too (then every value
     // of it is made by code naming it).
-    let gone_impls: Vec<DefId> = versions.iter().flat_map(|(_, p)| p.removed.iter().copied()).filter(|d| u.prog.def(*d).kind == DefKind::Impl).collect();
+    let removed_all: Vec<DefId> = versions.iter().flat_map(|(_, p)| p.removed.iter().copied()).collect();
+    let gone_impls: Vec<DefId> = removed_all.iter().copied().filter(|d| u.prog.def(*d).kind == DefKind::Impl).collect();
     let mut impl_over: Vec<u32> = Vec::new();
     if !gone_impls.is_empty() {
-        let removed_all: Vec<DefId> = versions.iter().flat_map(|(_, p)| p.removed.iter().copied()).collect();
         let slots_of_impls = |u: &Unit, impls: &[DefId]| -> std::collections::HashSet<u32> {
             let fns = impls.iter().flat_map(|&imp| u.prog.impls[u.prog.def(imp).sub as usize].items.iter().copied()).filter(|d| u.prog.def(*d).kind == DefKind::AssocFn);
             let mut set: std::collections::HashSet<u32> = u.slots_of_defs(fns).into_iter().collect();
@@ -3566,16 +3589,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     continue;
                 }
                 // the instance this code belongs to (a closure's: its fn's)
-                let mut k = c;
-                let mut inst = None;
-                for _ in 0..64 {
-                    match &u.fns[k as usize].key {
-                        FnKey::Closure(_, _, p) => k = *p,
-                        FnKey::Inst(d, args) => { inst = Some((*d, args.clone())); break; }
-                        _ => break,
-                    }
-                }
-                match inst {
+                match slot_instance(u, c) {
                     // a removed fn's or an earlier version's: code in flight
                     Some((d, _)) if removed_all.contains(&d) || !def_is_bound(&u.prog, d) => {}
                     Some((d, args)) if !std_crates.contains(&u.prog.def(d).krate) && !(blanket && !args.is_empty()) && !args.iter().any(|a| ty_mentions(u, *a, &adts, 0)) => {
@@ -4334,8 +4348,13 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             let mentions = |u: &Unit, t: TyId| -> bool { ty_mentions(u, t, &dtypes, 0) };
             let names: Vec<Vec<u8>> = dtypes.iter().map(|d| def_name(&u.prog, *d).into_bytes()).collect();
             let nref: Vec<&[u8]> = names.iter().map(|n| n.as_slice()).collect();
+            // (not the code of a fn the edit replaced or removed: it keeps its slots, and its old
+            // text need not check against the new impls -- a removed derive's marker impl)
             for i in 0..u.fns.len() {
                 let f = &u.fns[i];
+                if in_flight_only(u, i as u32, &removed_all) {
+                    continue;
+                }
                 let hit = match &f.key {
                     FnKey::Glue(_, t) => mentions(u, *t),
                     // Exact type dependencies still rebuild instances such as Vec<Edited>
@@ -4355,7 +4374,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             let mut work: Vec<u32> = slots.iter().chain(fresh.iter()).copied().filter(|&s| matches!(u.fns[s as usize].key, FnKey::Glue(..))).collect();
             while let Some(s) = work.pop() {
                 for c in u.fns[s as usize].history().inlined_into.clone() {
-                    if slots.contains(&c) || fresh.contains(&c) {
+                    if slots.contains(&c) || fresh.contains(&c) || in_flight_only(u, c, &removed_all) {
                         continue;
                     }
                     if u.fns[c as usize].compiled {
