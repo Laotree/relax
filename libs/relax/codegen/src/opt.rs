@@ -4438,7 +4438,7 @@ pub fn compact_slots(f: &mut Func) -> u64 {
 /// u32::MAX - 1 several), through moves, address arithmetic (any index), selects and call
 /// results of calls taking it; `esc[s]`: s's address is stored to memory, returned, a
 /// parameter, or mixed with another slot's. None when the fixpoint does not settle.
-fn slot_derivation(f: &Func) -> Option<(Vec<u32>, Vec<bool>)> {
+pub(crate) fn slot_derivation(f: &Func) -> Option<(Vec<u32>, Vec<bool>)> {
     const NONE: u32 = u32::MAX;
     const MULTI: u32 = u32::MAX - 1;
     let ns = f.slots.len();

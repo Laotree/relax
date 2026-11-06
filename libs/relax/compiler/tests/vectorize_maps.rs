@@ -3,9 +3,10 @@
 // whose branches only pick values (folded into selects: pick_lanes, and pick_sum filling a local
 // array), every length 0..=40 at several start offsets (unaligned vector loads, remainders of
 // every size), and destination streams that overlap the source streams at every distance from
-// -9 to 9 elements (the runtime distance check must keep the scalar order); each result is
-// compared with a reference whose per-element step is a call (never widened); called often
-// enough to tier up.
+// -9 to 9 elements, also within a local array (the runtime distance check must keep the scalar
+// order; a local array whose address goes nowhere else needs none against other streams); each
+// result is compared with a reference whose per-element step is a call (never widened); called
+// often enough to tier up.
 use std::hint::black_box;
 
 #[inline(never)]
@@ -281,6 +282,44 @@ fn pick_lanes_ref(t: &[[f32; 8]; 3], p: [f32; 2]) -> [f32; 8] {
     out
 }
 
+/// a local array mapped onto itself `k` elements on (stored at a + k, loaded at a): both streams
+/// are the array's, so the distance check stays and each element is made from one already
+/// rewritten, in order; summed after
+#[inline(never)]
+fn slot_ahead(src: &[f32], k: usize, n: usize) -> f32 {
+    let mut a = [0.0f32; 64];
+    for (o, v) in a.iter_mut().zip(src) {
+        *o = *v;
+    }
+    unsafe {
+        let p = a.as_mut_ptr();
+        let q = p.add(k);
+        for i in 0..n {
+            *q.add(i) = *p.add(i) * 2.0 + 1.0;
+        }
+    }
+    let mut w = 0.0f32;
+    for &s in &a {
+        w += s;
+    }
+    w
+}
+#[inline(never)]
+fn slot_ahead_ref(src: &[f32], k: usize, n: usize) -> f32 {
+    let mut a = [0.0f32; 64];
+    for (o, v) in a.iter_mut().zip(src) {
+        *o = *v;
+    }
+    for i in 0..n {
+        a[i + k] = black_box(a[i] * 2.0) + 1.0;
+    }
+    let mut w = 0.0f32;
+    for &s in &a {
+        w += s;
+    }
+    w
+}
+
 fn bits(v: &[f32]) -> Vec<u32> {
     v.iter().map(|x| x.to_bits()).collect()
 }
@@ -408,6 +447,9 @@ fn vectorized_maps() {
                     w += s;
                 }
                 fails += (pick_sum(&t, p, n % 9).to_bits() != w.to_bits()) as u32;
+            }
+            for k in 0..10 {
+                fails += (slot_ahead(&src, k, n).to_bits() != slot_ahead_ref(&src, k, n).to_bits()) as u32;
             }
             let mut d = vec![0.0f32; 64];
             let mut c = vec![0.0f32; 64];

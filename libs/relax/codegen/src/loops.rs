@@ -369,7 +369,7 @@ fn wtype(wops: &[WOp], vregs: &[Cls], kind: Lane, k: usize) -> Wt {
         WOp::Load(_) => if kind == Lane::F32 { Wt::F } else { Wt::I },
         WOp::Bin(VX::FCmp(..), ..) => Wt::M,
         WOp::Bin(..) => Wt::F,
-        WOp::Int(VX::CmpEq(_), ..) => Wt::M,
+        WOp::Int(VX::ICmp(..), ..) => Wt::M,
         WOp::Int(VX::And | VX::Or | VX::Xor, a, b) => match wtype(wops, vregs, kind, a) {
             Wt::Any => wtype(wops, vregs, kind, b),
             t => t,
@@ -395,20 +395,22 @@ fn wtype(wops: &[WOp], vregs: &[Cls], kind: Lane, k: usize) -> Wt {
 /// loop's exits are guards on a down-counting length (`n != 0`), a pointer or counter reaching an end
 /// (`p == end`), a counter below a bound (`i < n`) or a pointer being null (an iterator's niche test). The scalar loop remains the tail
 /// and fallback, including its exact short-circuit exhaustion behavior. A vector iteration (one
-/// 16-byte vector per stream) is admitted only when every scalar guard succeeds for all of its
-/// elements (the back edge's own test of its last element excepted: made after the vector loop,
-/// on into the scalar loop or out of the loop); runtime distance checks exclude dependencies
-/// within a vector (equal pointers are OK). A float loop's lanes also compare, blend, and read a
-/// float's bits; a body that branches only to pick values is widened as a copy with those
-/// branches folded into selects.
-fn vectorize_stream_maps(f: &mut Func) -> bool {
-    stream_maps(f, None)
+/// 16-byte vector per stream; with AVX2 two side by side, which pair256 makes one 256-bit
+/// vector, then one more when a vector's elements are left) is admitted only when every scalar
+/// guard succeeds for all of its elements (the back edge's own test of its last element
+/// excepted: made after the vector loop, on into the scalar loop or out of the loop); runtime
+/// distance checks exclude dependencies within an iteration (equal pointers are OK), but for a
+/// stack slot whose address goes nowhere else, which no other pointer reaches. A float loop's
+/// lanes also compare, blend, and read a float's bits; a body that branches only to pick values
+/// is widened as a copy with those branches folded into selects.
+fn vectorize_stream_maps(options: &relax_session::Options, f: &mut Func) -> bool {
+    stream_maps(options, f, None)
 }
 
 /// The stream-map vectoriser over every loop of `f`, or (`only`) over the loop at that head alone:
 /// a copy whose value branches were folded, tried without a remark of its own (its checks and
 /// verdict go to the remark of the loop it came from).
-fn stream_maps(f: &mut Func, only: Option<u32>) -> bool {
+fn stream_maps(options: &relax_session::Options, f: &mut Func, only: Option<u32>) -> bool {
     if !f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::Store(Mem::Int(1, false) | Mem::Int(4, _) | Mem::F32, ..)))) {
         return false;
     }
@@ -439,7 +441,7 @@ fn stream_maps(f: &mut Func, only: Option<u32>) -> bool {
             // selects is widened in its place -- or dropped, the loop keeping its branches
             if only.is_none() && value_branch_loop(f, head, &members) {
                 let mut g = f.clone();
-                if fold_value_branches(&mut g, head, &members) && stream_maps(&mut g, Some(head)) {
+                if fold_value_branches(&mut g, head, &members) && stream_maps(options, &mut g, Some(head)) {
                     *f = g;
                     transformed.resize(f.blocks.len(), false);
                     for (done, member) in transformed.iter_mut().zip(&members) { *done |= *member; }
@@ -548,11 +550,7 @@ fn stream_maps(f: &mut Func, only: Option<u32>) -> bool {
                     Inst::ICmpI(c @ (Cond::Eq | Cond::Ne), _, d, s, 0) if store.is_none() && kind == Some(Lane::F32) && matches!(sv[s.0 as usize], Sv::Lane(_)) && !matches!(block.term, Term::Branch(cv, ..) if cv == d) => {
                         let x = lane_of!(s, Wt::I);
                         wops.push(WOp::Const(0));
-                        wops.push(WOp::Int(VX::CmpEq(VW::S), x, wops.len() - 1));
-                        if c == Cond::Ne {
-                            wops.push(WOp::Const(u32::MAX));
-                            wops.push(WOp::Int(VX::Xor, wops.len() - 2, wops.len() - 1));
-                        }
+                        wops.push(WOp::Int(VX::ICmp(c, VW::S), x, wops.len() - 1));
                         sv[d.0 as usize] = Sv::Lane(wops.len() - 1);
                     }
                     Inst::Mov(d, s) => match sv[s.0 as usize] {
@@ -727,6 +725,11 @@ fn stream_maps(f: &mut Func, only: Option<u32>) -> bool {
         let sz = kind.bytes();
         let lanes = 16 / sz;
         let shift = sz.trailing_zeros() as i64;
+        // AVX2 (x64): an iteration takes two vectors per stream, side by side, which pair256
+        // makes one 256-bit vector; one vector more when that many elements are left
+        let pair = options.cpu.avx2 && kind != Lane::Byte;
+        // the bytes of a stream an iteration reads or writes
+        let span = if pair { 32 } else { 16 };
         let streams: Vec<Stream> = loads.iter().map(|x| x.0).chain(std::iter::once(dst)).collect();
         // indexed streams scale by the element size
         if streams.iter().any(|s| s.iv.is_some() && 1i64 << s.sh != sz) { continue; }
@@ -785,7 +788,7 @@ fn stream_maps(f: &mut Func, only: Option<u32>) -> bool {
         // dependencies between the store and the loads that a vector would reorder, when their
         // distance is known
         for l in loads.iter().map(|x| x.0) {
-            if l.root == dst.root && l.iv == dst.iv && l.sh == dst.sh && dst.disp - l.disp > 0 && dst.disp - l.disp < 16 { continue 'candidate; }
+            if l.root == dst.root && l.iv == dst.iv && l.sh == dst.sh && dst.disp - l.disp > 0 && dst.disp - l.disp < span { continue 'candidate; }
         }
         // The scalar temporaries are not produced by the widened body. All observable
         // loop-carried values must be precisely the pointer and length recurrences -- except
@@ -856,10 +859,9 @@ fn stream_maps(f: &mut Func, only: Option<u32>) -> bool {
         }
         // entry: one guard's run length against a vector's elements, so a short run (the common
         // entry of a loop over a few elements) goes to the scalar loop after two instructions;
-        // guard: every check (any one failing also leaves for the scalar loop); body: the vector loop
+        // guard: every check (any one failing also leaves for the scalar loop); then the vector loop
         let entry = f.blocks.len() as u32;
         let guard = entry + 1;
-        let body = entry + 2;
         let pos = f.blocks[head as usize].term_pos;
         let mut pre = Vec::new();
         let long = f.vreg(Cls::I);
@@ -992,14 +994,23 @@ fn stream_maps(f: &mut Func, only: Option<u32>) -> bool {
         and_ok(f, &mut init, ok, Inst::ICmpI(Cond::Ge, false, enough, trip, lanes));
         // the address of each stream's first element
         let mut eff: Vec<(Stream, VReg)> = Vec::new();
+        let mut eff_scaled: Vec<(VReg, u8, VReg)> = Vec::new();
         let mut eff_of = |f: &mut Func, init: &mut Vec<Inst>, st: Stream| -> VReg {
             if let Some(e) = eff.iter().find(|e| e.0 == st) {
                 return e.1;
             }
             let mut a = st.root;
             if let Some(iv) = st.iv {
-                let (t, u) = (f.vreg(Cls::I), f.vreg(Cls::I));
-                init.push(Inst::IBinI(IOp::Shl, U64_TY, t, iv, st.sh as i64));
+                let t = match eff_scaled.iter().find(|x| x.0 == iv && x.1 == st.sh) {
+                    Some(x) => x.2,
+                    None => {
+                        let t = f.vreg(Cls::I);
+                        init.push(Inst::IBinI(IOp::Shl, U64_TY, t, iv, st.sh as i64));
+                        eff_scaled.push((iv, st.sh, t));
+                        t
+                    }
+                };
+                let u = f.vreg(Cls::I);
                 init.push(Inst::IBin(IOp::Add, U64_TY, u, st.root, t));
                 a = u;
             }
@@ -1011,80 +1022,128 @@ fn stream_maps(f: &mut Func, only: Option<u32>) -> bool {
             eff.push((st, a));
             a
         };
-        let d_eff = eff_of(f, &mut init, dst);
+        // A store into a private stack slot and a load from any other pointer (or a load from
+        // one and a store elsewhere) never overlap: no check between them
+        let private = private_slots(f);
+        let apart = |a: VReg, b: VReg| private.as_ref().is_some_and(|(der, private)| {
+            let of = |v: VReg| der.get(v.0 as usize).copied().unwrap_or(u32::MAX);
+            let (x, y) = (of(a), of(b));
+            x != y && [x, y].iter().any(|&s| s < u32::MAX - 1 && private[s as usize])
+        });
         for l in loads.iter().map(|x| x.0) {
-            if l == dst { continue; }
+            if l == dst || apart(l.root, dst.root) { continue; }
+            let d_eff = eff_of(f, &mut init, dst);
             let s_eff = eff_of(f, &mut init, l);
             let (distance, far, same, safe) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
             // Only forward dependencies matter: loads precede the store and a
             // destination behind the source cannot overwrite a later input.
             init.push(Inst::IBin(IOp::Sub, U64_TY, distance, d_eff, s_eff));
-            init.push(Inst::ICmpI(Cond::Ge, false, far, distance, 16));
+            init.push(Inst::ICmpI(Cond::Ge, false, far, distance, span));
             init.push(Inst::ICmp(Cond::Eq, false, same, d_eff, s_eff));
             init.push(Inst::IBin(IOp::Or, U64_TY, safe, far, same));
             init.push(Inst::IBin(IOp::And, U64_TY, ok, ok, safe));
         }
-        // the invariant scalars in every lane (once per entry); per iteration the addresses of
-        // the indexed streams
-        let mut vectors: Vec<VReg> = Vec::new();
-        let mut wide = Vec::new();
-        let mut scaled: Vec<(VReg, u8, VReg)> = Vec::new();
-        let mut bases: Vec<(VReg, VReg, u8, VReg)> = Vec::new();
-        let mut addr_of = |f: &mut Func, wide: &mut Vec<Inst>, st: Stream| -> VReg {
-            let Some(iv) = st.iv else { return st.root };
-            if let Some(b) = bases.iter().find(|b| b.0 == st.root && b.1 == iv && b.2 == st.sh) {
-                return b.3;
+        // the invariant scalars and constants in every lane, made in `at`: each goes into a vector
+        // once, however many operations read it (each copy would hold a register across the loop)
+        let invariants = |f: &mut Func, at: &mut Vec<Inst>| -> Vec<Option<VReg>> {
+            let mut inv: Vec<Option<VReg>> = vec![None; wops.len()];
+            for (k, w) in wops.iter().enumerate() {
+                let made = match *w {
+                    WOp::Splat(r) => wops[..k].iter().position(|x| matches!(*x, WOp::Splat(q) if q == r)),
+                    WOp::Const(c) => wops[..k].iter().position(|x| matches!(*x, WOp::Const(d) if d == c)),
+                    _ => continue,
+                };
+                inv[k] = Some(match made {
+                    Some(j) => inv[j].expect("made before"),
+                    None => {
+                        let v = f.vreg(Cls::V128);
+                        at.push(match *w {
+                            WOp::Splat(r) => Inst::VSplat(v, r),
+                            WOp::Const(c) => Inst::VConst(v, c),
+                            _ => unreachable!(),
+                        });
+                        v
+                    }
+                });
             }
-            let t = match scaled.iter().find(|x| x.0 == iv && x.1 == st.sh) {
-                Some(x) => x.2,
-                None => {
-                    let t = f.vreg(Cls::I);
-                    wide.push(Inst::IBinI(IOp::Shl, U64_TY, t, iv, st.sh as i64));
-                    scaled.push((iv, st.sh, t));
-                    t
-                }
-            };
-            let u = f.vreg(Cls::I);
-            wide.push(Inst::IBin(IOp::Add, U64_TY, u, st.root, t));
-            bases.push((st.root, iv, st.sh, u));
-            u
+            inv
         };
-        for (k, w) in wops.iter().enumerate() {
-            // an invariant scalar or a constant goes into a vector once, however many
-            // operations read it (each copy would hold a register across the loop)
-            let made = match *w {
-                WOp::Splat(r) => wops[..k].iter().position(|x| matches!(*x, WOp::Splat(q) if q == r)),
-                WOp::Const(c) => wops[..k].iter().position(|x| matches!(*x, WOp::Const(d) if d == c)),
-                _ => None,
-            };
-            if let Some(j) = made {
-                vectors.push(vectors[j]);
-                continue;
-            }
-            let v = f.vreg(Cls::V128);
-            vectors.push(v);
-            match *w {
-                WOp::Splat(r) => init.push(Inst::VSplat(v, r)),
-                WOp::Const(c) => init.push(Inst::VConst(v, c)),
-                WOp::Load(st) => {
-                    let a = addr_of(f, &mut wide, st);
-                    wide.push(Inst::VLoad(v, a, st.disp as i32));
+        // a vector iteration of `n` vectors per stream (the n vectors of a value made one after
+        // another, each operation's in a row) over the invariants `inv` (None: its own, made
+        // first), stepping the streams by as many elements; per iteration the addresses of the
+        // indexed streams
+        let iteration = |f: &mut Func, n: usize, inv: Option<&[Option<VReg>]>| -> Vec<Inst> {
+            let mut wide = Vec::new();
+            let own;
+            let inv = match inv {
+                Some(inv) => inv,
+                None => {
+                    own = invariants(f, &mut wide);
+                    &own
                 }
-                WOp::Bin(o, a, b2) => wide.push(Inst::VX(o, v, vectors[a], vectors[b2])),
-                WOp::Int(o, a, b2) => wide.push(Inst::VX(o, v, vectors[a], vectors[b2])),
-                WOp::Un(o, a) => wide.push(Inst::VX(o, v, vectors[a], vectors[a])),
-                WOp::Sel(m, a, b2) => wide.push(Inst::VSel(v, vectors[m], vectors[a], vectors[b2])),
-                WOp::Same(a, _) => wide.push(Inst::Mov(v, vectors[a])),
+            };
+            let mut scaled: Vec<(VReg, u8, VReg)> = Vec::new();
+            let mut bases: Vec<(VReg, VReg, u8, VReg)> = Vec::new();
+            let mut addr_of = |f: &mut Func, wide: &mut Vec<Inst>, st: Stream| -> VReg {
+                let Some(iv) = st.iv else { return st.root };
+                if let Some(b) = bases.iter().find(|b| b.0 == st.root && b.1 == iv && b.2 == st.sh) {
+                    return b.3;
+                }
+                let t = match scaled.iter().find(|x| x.0 == iv && x.1 == st.sh) {
+                    Some(x) => x.2,
+                    None => {
+                        let t = f.vreg(Cls::I);
+                        wide.push(Inst::IBinI(IOp::Shl, U64_TY, t, iv, st.sh as i64));
+                        scaled.push((iv, st.sh, t));
+                        t
+                    }
+                };
+                let u = f.vreg(Cls::I);
+                wide.push(Inst::IBin(IOp::Add, U64_TY, u, st.root, t));
+                bases.push((st.root, iv, st.sh, u));
+                u
+            };
+            let mut vectors: Vec<Vec<VReg>> = Vec::new();
+            for (k, w) in wops.iter().enumerate() {
+                if let Some(v) = inv[k] {
+                    vectors.push(vec![v; n]);
+                    continue;
+                }
+                let vs: Vec<VReg> = (0..n).map(|_| f.vreg(Cls::V128)).collect();
+                for (h, &v) in vs.iter().enumerate() {
+                    match *w {
+                        WOp::Load(st) => {
+                            let a = addr_of(f, &mut wide, st);
+                            wide.push(Inst::VLoad(v, a, (st.disp + 16 * h as i64) as i32));
+                        }
+                        WOp::Bin(o, a, b2) | WOp::Int(o, a, b2) => wide.push(Inst::VX(o, v, vectors[a][h], vectors[b2][h])),
+                        WOp::Un(o, a) => wide.push(Inst::VX(o, v, vectors[a][h], vectors[a][h])),
+                        WOp::Sel(m, a, b2) => wide.push(Inst::VSel(v, vectors[m][h], vectors[a][h], vectors[b2][h])),
+                        WOp::Same(a, _) => wide.push(Inst::Mov(v, vectors[a][h])),
+                        WOp::Splat(_) | WOp::Const(_) => unreachable!("made once ahead"),
+                    }
+                }
+                vectors.push(vs);
             }
-        }
-        let a = addr_of(f, &mut wide, dst);
-        wide.push(Inst::VStore(a, dst.disp as i32, vectors[value]));
-        for &p in &walkers { wide.push(Inst::IBinI(IOp::Add, U64_TY, p, p, 16)); }
-        for &c in &counts { wide.push(Inst::IBinI(IOp::Sub, U64_TY, c, c, lanes)); }
-        for &i in &ivs { wide.push(Inst::IBinI(IOp::Add, U64_TY, i, i, lanes)); }
-        wide.push(Inst::IBinI(IOp::Sub, U64_TY, trip, trip, lanes));
-        let again = f.vreg(Cls::I);
-        wide.push(Inst::ICmpI(Cond::Ge, false, again, trip, lanes));
+            let a = addr_of(f, &mut wide, dst);
+            for h in 0..n {
+                wide.push(Inst::VStore(a, (dst.disp + 16 * h as i64) as i32, vectors[value][h]));
+            }
+            let n = n as i64;
+            for &p in &walkers { wide.push(Inst::IBinI(IOp::Add, U64_TY, p, p, 16 * n)); }
+            for &c in &counts { wide.push(Inst::IBinI(IOp::Sub, U64_TY, c, c, lanes * n)); }
+            for &i in &ivs { wide.push(Inst::IBinI(IOp::Add, U64_TY, i, i, lanes * n)); }
+            wide.push(Inst::IBinI(IOp::Sub, U64_TY, trip, trip, lanes * n));
+            wide
+        };
+        // (pair: the two-vector loop's invariants are made ahead of it, as 256-bit vectors; the
+        // one vector after it makes its own, so that no 128-bit copy is held across the loop)
+        let inv = invariants(f, &mut init);
+        let (mut one, two) = if pair {
+            (iteration(f, 1, None), Some(iteration(f, 2, Some(&inv))))
+        } else {
+            (iteration(f, 1, Some(&inv)), None)
+        };
         // tail: the back edge's test of the vector's last element, its operands as they were
         // then (each root now, less the step it took since)
         let mut tested = Vec::new();
@@ -1123,10 +1182,37 @@ fn stream_maps(f: &mut Func, only: Option<u32>) -> bool {
             tested.push(test);
             tail_term = Some(Term::Branch(cond, t, e));
         }
+        // the blocks after the guard: one vector at a time while a vector's elements are left,
+        // or (pair) two at a time while two vectors' are, then one when one vector's are; then
+        // the tail or the scalar loop
+        let mut made: Vec<(Vec<Inst>, Term)> = Vec::new();
+        let at = entry + 2;
+        match two {
+            None => {
+                let after = if tail_term.is_some() { at + 1 } else { head };
+                let again = f.vreg(Cls::I);
+                one.push(Inst::ICmpI(Cond::Ge, false, again, trip, lanes));
+                made.push((one, Term::Branch(again, at, after)));
+            }
+            Some(mut two) => {
+                // at: two vectors' elements left? at + 1: two at a time; at + 2: one vector's
+                // left? at + 3: one vector
+                let after = if tail_term.is_some() { at + 4 } else { head };
+                let (first, again, rest) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+                made.push((vec![Inst::ICmpI(Cond::Ge, false, first, trip, 2 * lanes)], Term::Branch(first, at + 1, at + 3)));
+                two.push(Inst::ICmpI(Cond::Ge, false, again, trip, 2 * lanes));
+                made.push((two, Term::Branch(again, at + 1, at + 2)));
+                made.push((vec![Inst::ICmpI(Cond::Ge, false, rest, trip, lanes)], Term::Branch(rest, at + 3, after)));
+                made.push((one, Term::Jump(after)));
+            }
+        }
+        if let Some(term) = tail_term {
+            made.push((tested, term));
+        }
         // the slots' addresses, made again ahead of the vector code
         for &(d, sl) in &slots {
             let a = f.vreg(Cls::I);
-            for i in pre.iter_mut().chain(&mut init).chain(&mut wide).chain(&mut tested) {
+            for i in pre.iter_mut().chain(&mut init).chain(made.iter_mut().flat_map(|m| &mut m.0)) {
                 i.vregs_mut(|v| if *v == d { *v = a });
             }
             pre.insert(0, Inst::SlotAddr(a, sl));
@@ -1137,16 +1223,39 @@ fn stream_maps(f: &mut Func, only: Option<u32>) -> bool {
             }
         }
         f.blocks.push(Block { pos: vec![pos; pre.len()], insts: pre, term: Term::Branch(long, guard, head), term_pos: pos, count: -1.0 });
-        f.blocks.push(Block { pos: vec![pos; init.len()], insts: init, term: Term::Branch(ok, body, head), term_pos: pos, count: -1.0 });
-        f.blocks.push(Block { pos: vec![pos; wide.len()], insts: wide, term: Term::Branch(again, body, if tail_term.is_some() { body + 1 } else { head }), term_pos: pos, count: -1.0 });
-        if let Some(term) = tail_term {
-            f.blocks.push(Block { pos: vec![pos; tested.len()], insts: tested, term, term_pos: pos, count: -1.0 });
+        f.blocks.push(Block { pos: vec![pos; init.len()], insts: init, term: Term::Branch(ok, at, head), term_pos: pos, count: -1.0 });
+        for (insts, term) in made {
+            f.blocks.push(Block { pos: vec![pos; insts.len()], insts, term, term_pos: pos, count: -1.0 });
         }
         for (done, member) in transformed.iter_mut().zip(&members) { *done |= *member; }
         relax_backend::remark::loop_done();
         changed = true;
     }
     changed
+}
+
+/// The stack slots no pointer reaches but those made from their own address: per value the slot
+/// it points into (`slot_derivation`: u32::MAX none, u32::MAX - 1 several), and per slot whether
+/// its address (and what is computed from it) goes only into loads', stores' and copies'
+/// addresses and pure arithmetic -- never stored, returned, mixed with another slot's, a call's
+/// argument or an effect's operand. None when the derivation does not settle.
+fn private_slots(f: &Func) -> Option<(Vec<u32>, Vec<bool>)> {
+    let (der, esc) = crate::opt::slot_derivation(f)?;
+    let mut private: Vec<bool> = esc.iter().map(|e| !e).collect();
+    for b in &f.blocks {
+        for i in &b.insts {
+            let access = matches!(i, Inst::Store(..) | Inst::StoreX(..) | Inst::VStore(..) | Inst::VStoreX(..) | Inst::Copy(..));
+            if access || !relax_backend::passes::is_mem_effect(i) {
+                continue;
+            }
+            for_uses(i, |v| {
+                if let Some(&s) = der.get(v.0 as usize).filter(|s| **s < u32::MAX - 1) {
+                    private[s as usize] = false;
+                }
+            });
+        }
+    }
+    Some((der, private))
 }
 
 /// A loop head's source position (makepad inspect remarks): its first instruction's, else its
@@ -1371,7 +1480,7 @@ pub fn vectorize_reductions(options: &relax_session::Options, f: &mut Func) -> b
     if !vectorize_on(options) {
         return false;
     }
-    let mut changed = vectorize_stream_maps(f);
+    let mut changed = vectorize_stream_maps(options, f);
     changed |= vectorize_lane_accumulators(options, f);
     let nb0 = f.blocks.len();
     let mut ndef = vec![0u32; f.vregs.len()];
