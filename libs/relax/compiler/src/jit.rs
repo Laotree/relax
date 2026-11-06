@@ -1560,9 +1560,18 @@ unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, 
     if u.fns[s.id as usize].compiled {
         return;
     }
-    let tier1 = s.inlined.is_some();
-    if let Some(inl) = &s.inlined {
-        cached_tier1(up, s.id, inl);
+    let tier1 = s.o3;
+    if tier1 {
+        cached_tier1(up, s.id, &s.inlined);
+    } else {
+        // below O3 too (as a disk-cache link registers them): a live patch of a slot this code
+        // took in builds it again (reload), which the copies it inlined unguarded rely on
+        let u = &mut *up;
+        for &c in &s.inlined {
+            if c != s.id && (c as usize) < u.fns.len() && !u.fns[c as usize].history().inlined_into.contains(&s.id) {
+                crate::zone_alloc::slots_with(|| u.fns[c as usize].history.get_or_insert_with(Default::default).inlined_into.push(s.id));
+            }
+        }
     }
     if s.o2 {
         o2_cached(up, s.id);
@@ -1583,8 +1592,8 @@ unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, 
         let _as = code_as(CodeKind::new(t, origin::IMAGE));
         u.install_prelinked(s.id, s.at, s.len, s.trailer, s.pc);
     }
-    if let Some(inl) = &s.inlined {
-        u.code.write().unwrap_or_else(|e| e.into_inner()).note_inlined(s.at, inl);
+    if tier1 {
+        u.code.write().unwrap_or_else(|e| e.into_inner()).note_inlined(s.at, &s.inlined);
     }
     // (perf maps and the cache trace name the slot: prelink_startup decoded the identities first)
     if perf_map_on() {

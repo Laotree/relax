@@ -985,7 +985,7 @@ pub(crate) fn skip_fnkey(d: &mut D, depth: u32, v: &mut dyn FnMut(Atom)) -> Opti
 
 
 /// A slot installed from the startup image: its code (linked, at `at`), unwind trailer, pc map
-/// and, for tier-1 code, the slots its body inlined.
+/// and the slots its body inlined.
 pub(crate) struct PrelinkedSlot {
     pub id: u32,
     pub at: u64,
@@ -993,7 +993,11 @@ pub(crate) struct PrelinkedSlot {
     /// its unwind trailer, read in place from the image (Unit::unwind_at)
     pub trailer: &'static [u8],
     pub pc: crate::jit::PcMap,
-    pub inlined: Option<Vec<u32>>,
+    /// the slots its code took in, at every tier: a live patch of one builds this code again
+    /// (reload: `inlined_into`), which a copy inlined unguarded relies on (opt::unguard_prefix)
+    pub inlined: Vec<u32>,
+    /// tier-1 (O3) code (cache.rs TIER_O3)
+    pub o3: bool,
     /// O2 code (cache.rs TIER_O2): no O2 build for it this run
     pub o2: bool,
     /// baseline code (cache.rs TIER_BASE): built again at O2 after the first present
@@ -1740,14 +1744,14 @@ impl Linker {
             let s = &im.slots[si];
             let (pcs, tier, inl, entry, key) = (s.pc, s.tier, s.inl, s.entry, s.key);
             let pc = crate::jit::PcMap::mapped(&im.bytes[pcs.0..pcs.1], files);
-            if !u.aux { crate::harness::reach::note(id, im.flat[inl.0..inl.1].iter().filter_map(|&k| im.slot_of(k))); }
-            let inlined = (tier == TIER_O3).then(|| im.flat[inl.0..inl.1].iter().filter_map(|&k| im.slot_of(k)).collect());
+            let inlined: Vec<u32> = im.flat[inl.0..inl.1].iter().filter_map(|&k| im.slot_of(k)).collect();
+            if !u.aux { crate::harness::reach::note(id, inlined.iter().copied()); }
             let kind = im.keys[key as usize].first().copied().unwrap_or(u8::MAX);
             let c = self.cache();
             c.linked.insert(id);
             c.linked_key.insert(id, entry);
             let verdict = if tier == TIER_O3 { TierVerdict::None } else { c.tier_verdict_key(entry) };
-            out.push(PrelinkedSlot { id, at: at + off as u64, len: n as u32, trailer, pc, inlined, o2: tier == TIER_O2, base: tier == TIER_BASE, kind, verdict });
+            out.push(PrelinkedSlot { id, at: at + off as u64, len: n as u32, trailer, pc, inlined, o3: tier == TIER_O3, o2: tier == TIER_O2, base: tier == TIER_BASE, kind, verdict });
         }
         out
     }

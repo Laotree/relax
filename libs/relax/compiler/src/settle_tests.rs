@@ -658,8 +658,8 @@ fn main() {}
 #[test]
 fn prebuild_builds_callees_that_ran_before() {
     isolated_test!(prebuild_builds_callees_that_ran_before);
-    // A warm session's startup image links baseline code that inlined tiny drop glue and core fns
-    // (no inlining records below O3); an O2 build over that code (the SETTLE-TIER sweep) calls
+    // A warm session's startup image links baseline code that inlined tiny drop glue and core fns;
+    // an O2 build over that code (the SETTLE-TIER sweep) calls
     // them. Those that ran in the image's session are built before the replacement's install, not
     // on the program's threads at its first call; a callee with no sign of having run stays lazy.
     crate::borrowck::lazy::disable_gandalf();
