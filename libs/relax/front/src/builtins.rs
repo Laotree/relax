@@ -2127,6 +2127,12 @@ pub fn expand_attr_macro(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], 
             trees.extend(docs.next().unwrap().1.trees);
         }
         if j == k { continue; }
+        // A `#[cfg]` of the item, before or after this attribute, held (the item is expanded) and
+        // is gone from what the macro sees: rustc_expand expand.rs take_first_attr takes cfg
+        // attributes before any macro attribute, and expand_cfg_true leaves a `cfg_trace` in its
+        // place whose tokens are empty ("unobservable to token-based proc macros"). An item whose
+        // tokens were configured first (demand.rs active_tokens) has no such attribute either.
+        if toks.at(a.toks.lo as usize).kind == T::Ident && buf.get(start, toks.at(a.toks.lo as usize).hi) == b"cfg" { continue; }
         let end = toks.at(a.toks.hi as usize - 1).hi;
         let span = span_of(start, end);
         let mut hash = Punct::new('#', Spacing::Alone);

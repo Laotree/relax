@@ -455,6 +455,12 @@ pub fn take() -> (Vec<String>, Vec<String>) {
     (errors, warnings)
 }
 
+/// How many reports `take_reported` would return now: the reports a pass made are the ones
+/// between its start's and its end's count (`makepad check`'s verdict reuse tags them).
+pub fn reported_len() -> usize {
+    SINK.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
+
 /// Everything reported since the last take, in report order (a report made twice is there twice).
 pub fn take_reported() -> Vec<Reported> {
     std::mem::take(&mut *SINK.lock().unwrap_or_else(|e| e.into_inner()))

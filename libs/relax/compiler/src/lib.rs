@@ -128,6 +128,7 @@ mod test_pkg;
 pub mod tui;
 pub mod check;
 mod check_order;
+mod check_reuse;
 mod typeck_bg;
 mod gandalf_out;
 pub mod serve;
@@ -1294,6 +1295,9 @@ mod value_tests;
 
 #[cfg(test)]
 mod check_lint_tests;
+
+#[cfg(test)]
+mod check_reuse_tests;
 
 #[cfg(test)]
 #[test]

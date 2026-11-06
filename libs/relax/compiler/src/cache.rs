@@ -250,6 +250,20 @@ pub enum Mode {
     ReadOnly,
 }
 
+/// The interface hash (items.rs: the file's items outside the fn bodies that are holes) of each
+/// file of `want`, by file (None: not wanted), on several threads: `makepad check`'s verdict keys
+/// (check_reuse.rs).
+pub(crate) fn file_ifaces(prog: &crate::program::Program, want: &[usize]) -> Vec<Option<u128>> {
+    let mut out = vec![None; prog.files.len()];
+    items::file_digests_of(prog, want, &mut out);
+    out.into_iter().map(|d| d.map(|d| d.iface)).collect()
+}
+
+/// File `f`'s interface text (holes marked `{..}`): check_reuse.rs traces.
+pub(crate) fn file_iface_text(prog: &crate::program::Program, f: usize) -> Vec<u8> {
+    prog.files.get(f).map_or(Vec::new(), |pf| items::iface_text(pf))
+}
+
 /// MAKEPAD_RUN_CACHE: unset / `on` = on (the default), `off` / `0`, `verify`, `readonly`.
 pub fn mode_from_env(options: &crate::options::Options) -> Option<Mode> {
     // A process-wide optimization budget depends on which functions ran before this one.
