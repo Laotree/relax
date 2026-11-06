@@ -6,17 +6,27 @@
 //! options, every `MAKEPAD_RUN_*` variable (the command line's lint flags among them), the checked
 //! crates and the root, the crate as rustc is invoked on it (name, root, edition, cfg with the
 //! features, binary or not, test harness, its dependencies by alias) and the text of every file of
-//! it; and of each crate of its dependency closure, the interface (cache/items.rs: its items
-//! outside the fn bodies that are holes; a file the load skipped by its text) when that crate is
-//! checked too, its text when it is not (std, a registry crate), and the text of its whole
-//! closure when it is a proc-macro crate (its code makes the expansions). The file hashes are the
-//! front's (ParsedFile::source_hash: the graph certificate's memo on a warm start). So a body
-//! edit in a dependency checks that dependency again, not every crate above it.
+//! it; and of each crate of its dependency closure, the text when that crate is not checked (std,
+//! a registry crate), the text of its whole closure when it is a proc-macro crate (its code makes
+//! the expansions), and its identity when it is checked too. The file hashes are the front's
+//! (ParsedFile::source_hash: the graph certificate's memo on a warm start).
 //!
 //! What the key cannot name travels with the verdict and is checked before the verdict is used:
-//! the macro inputs outside the source that the crate and its closure read (include_str!,
-//! include!, env!: session sip.rs late inputs, which lazily parsed bodies read after the load),
-//! and the text of every other crate a stored diagnostic points into.
+//! the interface of each checked crate of the closure (cache/items.rs: its items outside the fn
+//! bodies that are holes; a file the load skipped by its text), the macro inputs outside the
+//! source that the crate and its closure read (include_str!, include!, env!: session sip.rs late
+//! inputs, which lazily parsed bodies read after the load), and the text of every other crate a
+//! stored diagnostic points into. So a body edit in a dependency checks that dependency again,
+//! not every crate above it. An interface that changed only by items added to its files (a fn,
+//! const, static, struct, union, enum, type alias, trait or inline module that defines no impl,
+//! macro or extern block inside it: `KIND_TABLE` holds each checked crate's interface by item,
+//! items.rs FileTable) leaves a verdict standing unless the
+//! crate's modules see an added item through glob imports (rustc_resolve: a glob imports every name
+//! of its module; the new name may shadow the prelude there, turn a binding pattern into a
+//! constant, or clash with another glob's), or a module that sees it through globs had its name
+//! already from elsewhere (a path through that module now finds it, or an ambiguity): then every
+//! crate above it is checked again. Any other name an added item has was unresolved before, and
+//! the check that stored the verdict passed.
 //!
 //! A verdict (`KIND_CRATE`) is the crate's diagnostics as the check rendered them, each with where
 //! the sort places it (check_order.rs: its stage and its group, by path) and whether only a check
@@ -31,15 +41,18 @@
 //! it printed no signature error, of any crate), the check prints the stored diagnostics right
 //! after the load (run.rs), before declaration collection: nothing a check prints in between
 //! rests on anything but the keys' inputs and those errors.
+use crate::ast::ItemId;
 use crate::check_order::{Entry, GroupAt, Out, Phase, Stage};
-use crate::program::{Program, NO_DEF};
+use crate::program::{DefKind, Program, NO_DEF};
 use crate::sip::Sip128;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const KIND_CRATE: u32 = 1;
 const KIND_RUN: u32 = 2;
+/// a checked crate's interface by file and item (`Table`), under its identity and interface hash
+const KIND_TABLE: u32 = 3;
 /// a late lint: printed only when the required analyses passed (check_order.rs Stage::required)
 pub(crate) const LATE: u8 = 1;
 /// reported by the well-formedness checks, which run only when nothing failed before them
@@ -54,7 +67,28 @@ struct Verdict {
     late: Vec<(String, u8, String, u128)>,
     /// (crate identity, its text): the other crates its diagnostics point into
     refs: Vec<(u128, u128)>,
+    /// (crate identity, its interface): the checked crates of its closure, as it was checked
+    deps: Vec<(u128, u128)>,
     entries: Vec<Stored>,
+}
+
+/// A checked crate's interface by file and item, as a stored verdict above it saw it: its head
+/// (identity, dependencies by alias) and by path the file's rest and its named items' hashes
+/// (items.rs FileTable), sorted.
+struct Table {
+    head: u128,
+    files: Vec<(String, u128, Vec<u128>)>,
+}
+
+/// A file of a checked crate that a checked crate depends on, now: its path, the file (None: the
+/// load skipped it; its text hash stands for its interface and rest), its interface hash, its
+/// table's rest and named items (hash, item) by hash.
+struct CurFile {
+    path: String,
+    file: Option<usize>,
+    iface: u128,
+    rest: u128,
+    named: Vec<(u128, ItemId)>,
 }
 
 /// One check's reuse: the checked crates' keys, the hits and their diagnostics.
@@ -74,6 +108,17 @@ pub(crate) struct Reuse {
     /// by crate: identity, text
     idents: Vec<u128>,
     texts: Vec<u128>,
+    /// by crate, of the checked crates some checked crate depends on: head, interface hash, files
+    /// (CurFile), whether the store holds that interface's table
+    heads: Vec<u128>,
+    ifaces: Vec<u128>,
+    cur: Vec<Vec<CurFile>>,
+    table_stored: Vec<bool>,
+    /// parallel to `checked`: (identity, interface) of the checked crates of its closure, now
+    deps: Vec<Vec<(u128, u128)>>,
+    /// parallel to `checked`: a hit whose verdict was checked against an interface that only
+    /// gained items since (stored again with today's)
+    added: Vec<bool>,
     store_entries: usize,
     /// run.rs: no signature error was printed (a run record may be stored)
     pub(crate) sig_clean: bool,
@@ -116,24 +161,14 @@ fn skipped_files(prog: &Program) -> Vec<(u32, String, u128)> {
     }).collect()
 }
 
-/// Each crate's files: (path, content hash) by path, with the `skipped` ones; `iface`: the
-/// interface hash instead for the loaded files of the crates it marks.
-fn crate_files(prog: &Program, iface: &[bool], skipped: &[(u32, String, u128)]) -> Vec<Vec<(String, u128)>> {
-    let n = prog.crates.len();
-    let want: Vec<usize> = (0..prog.files.len())
-        .filter(|f| !prog.front_macro_fragments.contains(f) && prog.file_crate.get(*f).is_some_and(|&c| iface.get(c as usize).copied().unwrap_or(false)))
-        .collect();
-    let ifaces = if want.is_empty() { Vec::new() } else { crate::cache::file_ifaces(prog, &want) };
-    let mut files: Vec<Vec<(String, u128)>> = vec![Vec::new(); n];
+/// Each crate's files: (path, content hash) by path, with the `skipped` ones.
+fn crate_files(prog: &Program, skipped: &[(u32, String, u128)]) -> Vec<Vec<(String, u128)>> {
+    let mut files: Vec<Vec<(String, u128)>> = vec![Vec::new(); prog.crates.len()];
     for f in 0..prog.files.len() {
         if prog.front_macro_fragments.contains(&f) { continue; }
         let (Some(&c), Some(path)) = (prog.file_crate.get(f), prog.file_paths.get(f)) else { continue };
         let Some(v) = files.get_mut(c as usize) else { continue };
-        let h = match ifaces.get(f).copied().flatten() {
-            Some(i) => i,
-            None => prog.files[f].source_hash(path),
-        };
-        v.push((path.clone(), h));
+        v.push((path.clone(), prog.files[f].source_hash(path)));
     }
     for (c, path, h) in skipped {
         if let Some(v) = files.get_mut(*c as usize) { v.push((path.clone(), *h)); }
@@ -142,20 +177,141 @@ fn crate_files(prog: &Program, iface: &[bool], skipped: &[(u32, String, u128)]) 
     files
 }
 
-/// A crate's hash over `files` (crate_files), with its identity and its dependencies by alias.
-fn crate_hash(prog: &Program, c: u32, what: &str, idents: &[u128], files: &[(String, u128)]) -> u128 {
+/// The files of the crates `of` marks, by crate: their interfaces by item (CurFile), by path.
+fn iface_files(prog: &Program, of: &[bool], skipped: &[(u32, String, u128)]) -> Vec<Vec<CurFile>> {
+    let mut files: Vec<Vec<CurFile>> = (0..prog.crates.len()).map(|_| Vec::new()).collect();
+    let want: Vec<usize> = (0..prog.files.len())
+        .filter(|f| !prog.front_macro_fragments.contains(f) && prog.file_crate.get(*f).is_some_and(|&c| of.get(c as usize).copied().unwrap_or(false)))
+        .collect();
+    if want.is_empty() { return files; }
+    let mut tables = crate::cache::file_tables(prog, &want);
+    for f in want {
+        let (Some(&c), Some(path), Some((d, t))) = (prog.file_crate.get(f), prog.file_paths.get(f), tables[f].take()) else { continue };
+        files[c as usize].push(CurFile { path: path.clone(), file: Some(f), iface: d.iface, rest: t.rest, named: t.named });
+    }
+    for (c, path, h) in skipped {
+        if of.get(*c as usize).copied().unwrap_or(false) {
+            files[*c as usize].push(CurFile { path: path.clone(), file: None, iface: *h, rest: *h, named: Vec::new() });
+        }
+    }
+    for v in &mut files {
+        v.sort_unstable_by(|a, b| (&a.path, a.iface).cmp(&(&b.path, b.iface)));
+        v.dedup_by(|a, b| a.path == b.path && a.iface == b.iface);
+    }
+    files
+}
+
+/// A crate's head: its identity and its dependencies by alias.
+fn head_hash(prog: &Program, c: u32, idents: &[u128]) -> u128 {
     let ci = &prog.crates[c as usize];
     let mut h = Sip128::new();
-    h.str(what);
+    h.str("check-head");
     h.u128(idents[c as usize]);
     let mut deps: Vec<(&str, u128)> = ci.deps.iter().filter(|(_, d)| *d != c).map(|&(a, d)| (prog.syms.str(a), idents[d as usize])).collect();
     deps.sort_unstable();
     deps.dedup();
     h.u32(deps.len() as u32);
     for (a, d) in deps { h.str(a); h.u128(d); }
-    h.u32(files.len() as u32);
-    for (p, x) in files { h.str(p); h.u128(*x); }
     h.finish128()
+}
+
+/// A crate's hash over its head and `files` (path, hash).
+fn crate_hash<'a>(what: &str, head: u128, files: impl ExactSizeIterator<Item = (&'a str, u128)>) -> u128 {
+    let mut h = Sip128::new();
+    h.str(what);
+    h.u128(head);
+    h.u32(files.len() as u32);
+    for (p, x) in files { h.str(p); h.u128(x); }
+    h.finish128()
+}
+
+/// The store key of a checked crate's interface table.
+fn table_key(ident: u128, iface: u128) -> u128 {
+    let mut h = Sip128::new();
+    h.str("relax-check-table");
+    h.u128(ident);
+    h.u128(iface);
+    h.finish128()
+}
+
+/// The items `cur` added to the interface `old` saw ((file, item)), when that is all that changed:
+/// the same head, files and rest of each, and every item of old still there as it was. None
+/// otherwise.
+fn added_items(old: &Table, head: u128, cur: &[CurFile]) -> Option<Vec<(usize, ItemId)>> {
+    if old.head != head || old.files.len() != cur.len() { return None; }
+    let mut added = Vec::new();
+    for ((path, rest, named), c) in old.files.iter().zip(cur) {
+        if *path != c.path || *rest != c.rest { return None; }
+        // (both by hash: old's must all be in cur's)
+        let mut i = 0;
+        for &(h, item) in &c.named {
+            match named.get(i) {
+                Some(&o) if o == h => i += 1,
+                Some(&o) if o < h => return None,
+                _ => added.push((c.file?, item)),
+            }
+        }
+        if i < named.len() { return None; }
+    }
+    Some(added)
+}
+
+/// By module, the modules that import it with a glob (`use m::*`).
+fn glob_users(prog: &Program) -> Vec<Vec<u32>> {
+    let mut users: Vec<Vec<u32>> = vec![Vec::new(); prog.mods.len()];
+    for (m, md) in prog.mods.iter().enumerate() {
+        for &(g, _) in &md.globs {
+            let gd = prog.def(g);
+            if gd.kind == DefKind::Mod {
+                if let Some(v) = users.get_mut(gd.sub as usize) { v.push(m as u32); }
+            }
+        }
+    }
+    users
+}
+
+/// The crates whose check item `item` added to file `file` can change: those of the modules that
+/// see its module's names through glob imports, its own among them. None: every crate above it
+/// -- one of those modules, or a module one of them sees through globs, binds its name already
+/// (a path through it found that binding, which the new item shadows or makes ambiguous), or the
+/// item has no definition in a module.
+fn added_reach(prog: &Program, users: &[Vec<u32>], file: usize, item: ItemId) -> Option<HashSet<u32>> {
+    let &d = prog.item_defs.get(&(file as u32, item.0))?;
+    let def = *prog.def(d);
+    if def.parent == NO_DEF || prog.def(def.parent).kind != DefKind::Mod { return None; }
+    let m = prog.def(def.parent).sub;
+    let n = prog.mods.len();
+    // (a struct's constructor is bound to its item too)
+    let own = |x: crate::program::DefId| { let xd = prog.def(x); xd.file == def.file && xd.item == def.item };
+    let mut seen = vec![false; n];
+    let mut sees = vec![m];
+    seen[m as usize] = true;
+    let mut k = 0;
+    while k < sees.len() {
+        let a = sees[k] as usize;
+        k += 1;
+        for &b in users.get(a).into_iter().flatten() {
+            if !std::mem::replace(&mut seen[b as usize], true) { sees.push(b); }
+        }
+    }
+    let mut seen = vec![false; n];
+    let mut walk = sees.clone();
+    for &a in &walk { seen[a as usize] = true; }
+    let mut k = 0;
+    while k < walk.len() {
+        let md = &prog.mods[walk[k] as usize];
+        k += 1;
+        if [md.types.get(&def.name), md.values.get(&def.name)].into_iter().flatten().any(|&x| !own(x)) { return None; }
+        for &(g, _) in &md.globs {
+            let gd = prog.def(g);
+            match gd.kind {
+                DefKind::Mod => if !std::mem::replace(&mut seen[gd.sub as usize], true) { walk.push(gd.sub) },
+                DefKind::Enum => if [false, true].into_iter().filter_map(|ns| prog.lookup_in_container(g, def.name, ns)).any(|x| !own(x)) { return None },
+                _ => {}
+            }
+        }
+    }
+    Some(sees.iter().map(|&a| prog.mods[a as usize].krate).collect())
 }
 
 /// The text of crate `c` and of every crate of its closure (a proc-macro crate's code).
@@ -193,6 +349,7 @@ impl Reuse {
         checked.sort_unstable();
         checked.dedup();
         let idents: Vec<u128> = (0..n as u32).map(|c| ident(prog, c)).collect();
+        let heads: Vec<u128> = (0..n as u32).map(|c| head_hash(prog, c, &idents)).collect();
         let mut is_checked = vec![false; n];
         for &c in &checked { is_checked[c as usize] = true; }
         let closures: Vec<Vec<u32>> = checked.iter().map(|&c| crate::check::dependency_closure(prog, c)).collect();
@@ -202,10 +359,10 @@ impl Reuse {
             if is_checked[*d as usize] && !prog.crates[*d as usize].proc_macro { iface_of[*d as usize] = true; }
         }
         let skipped = skipped_files(prog);
-        let text_files = crate_files(prog, &[], &skipped);
-        let texts: Vec<u128> = (0..n as u32).map(|c| crate_hash(prog, c, "check-text", &idents, &text_files[c as usize])).collect();
-        let iface_files = if iface_of.iter().any(|x| *x) { crate_files(prog, &iface_of, &skipped) } else { Vec::new() };
-        let ifaces: Vec<u128> = (0..n as u32).map(|c| if iface_of[c as usize] { crate_hash(prog, c, "check-iface", &idents, &iface_files[c as usize]) } else { 0 }).collect();
+        let text_files = crate_files(prog, &skipped);
+        let texts: Vec<u128> = (0..n).map(|c| crate_hash("check-text", heads[c], text_files[c].iter().map(|(p, h)| (p.as_str(), *h)))).collect();
+        let cur = iface_files(prog, &iface_of, &skipped);
+        let ifaces: Vec<u128> = (0..n).map(|c| if iface_of[c] { crate_hash("check-iface", heads[c], cur[c].iter().map(|f| (f.path.as_str(), f.iface))) } else { 0 }).collect();
         let mut deep: HashMap<u32, u128> = HashMap::new();
         let env = env_key(prog);
         let set = {
@@ -229,13 +386,18 @@ impl Reuse {
             h.u8(ci.harness as u8);
             let mut v: Vec<u128> = closure.iter().map(|&d| {
                 if prog.crates[d as usize].proc_macro { *deep.entry(d).or_insert_with(|| deep_text(prog, d, &texts)) }
-                else if is_checked[d as usize] { ifaces[d as usize] }
+                else if iface_of[d as usize] { idents[d as usize] }
                 else { texts[d as usize] }
             }).collect();
             v.sort_unstable();
             h.u32(v.len() as u32);
             for x in v { h.u128(x); }
             h.finish128()
+        }).collect();
+        let deps: Vec<Vec<(u128, u128)>> = closures.iter().map(|closure| {
+            let mut v: Vec<(u128, u128)> = closure.iter().filter(|&&d| iface_of[d as usize]).map(|&d| (idents[d as usize], ifaces[d as usize])).collect();
+            v.sort_unstable();
+            v
         }).collect();
         let run_key = {
             let mut h = Sip128::new();
@@ -247,19 +409,21 @@ impl Reuse {
             h.finish128()
         };
         let path = dir.join(format!("check-{:016x}.rcs", set as u64));
+        let trace = std::env::var_os("MAKEPAD_RUN_CHECK_REUSE_TRACE").is_some();
         let mut r = Reuse {
             path, write, hit: vec![false; checked.len()], raw: vec![None; checked.len()], keys, checked, closures,
-            stored: Vec::new(), run_key, run_hit: false, idents, texts, store_entries: 0, sig_clean: false, t_keys: Default::default(),
+            stored: Vec::new(), run_key, run_hit: false, idents, texts, heads, ifaces, cur, table_stored: vec![false; n],
+            deps, added: Vec::new(), store_entries: 0, sig_clean: false, t_keys: Default::default(),
             skipped: (skipped.iter().filter(|s| is_checked[s.0 as usize]).count(), skipped.iter().filter(|s| !is_checked[s.0 as usize]).count()),
         };
+        r.added = vec![false; r.checked.len()];
         // MAKEPAD_RUN_CHECK_REUSE_TRACE: each crate's key parts (two checks' traces diff to what changed)
-        if std::env::var_os("MAKEPAD_RUN_CHECK_REUSE_TRACE").is_some() {
+        if trace {
             for c in 0..n {
                 let j = r.checked.binary_search(&(c as u32)).ok();
-                eprintln!("check-reuse-trace: {} checked={} text={:032x} iface={:032x} key={}", prog.syms.str(prog.crates[c].name), j.is_some(), r.texts[c], ifaces[c], j.map_or(String::new(), |j| format!("{:032x}", r.keys[j])));
-                for (p, h) in text_files[c].iter().chain(iface_files.get(c).into_iter().flatten()) {
-                    eprintln!("check-reuse-trace:   {} {:032x}", p, h);
-                }
+                eprintln!("check-reuse-trace: {} checked={} text={:032x} iface={:032x} key={}", prog.syms.str(prog.crates[c].name), j.is_some(), r.texts[c], r.ifaces[c], j.map_or(String::new(), |j| format!("{:032x}", r.keys[j])));
+                for (p, h) in &text_files[c] { eprintln!("check-reuse-trace:   {} {:032x}", p, h); }
+                for f in &r.cur[c] { eprintln!("check-reuse-trace:   {} {:032x} iface", f.path, f.iface); }
             }
             for s in &skipped { eprintln!("check-reuse-trace: skipped {} {}", prog.syms.str(prog.crates[s.0 as usize].name), s.1); }
             // (=<path part>[,<path part>..]: the interface text of the files whose path holds one)
@@ -273,23 +437,75 @@ impl Reuse {
         }
         if let Some(store) = crate::store::Store::open(&r.path) {
             r.store_entries = store.index.len();
+            for c in 0..n {
+                if iface_of[c] { r.table_stored[c] = matches!(store.get_checked(table_key(r.idents[c], r.ifaces[c])), Some((KIND_TABLE, _))); }
+            }
             let by_ident: HashMap<u128, u32> = r.idents.iter().enumerate().map(|(c, &i)| (i, c as u32)).collect();
             let mut late_memo: HashMap<(String, u8, String, u128), bool> = HashMap::new();
+            // verdicts checked against an interface that changed since: (j, verdict, the changed
+            // (crate, interface it saw))
+            let mut changed: Vec<(usize, Verdict, Vec<(u32, u128)>)> = Vec::new();
             for j in 0..r.checked.len() {
                 let Some((KIND_CRATE, p)) = store.get_checked(r.keys[j]) else { continue };
                 let Some(v) = decode(p) else { continue };
                 let late_ok = v.late.iter().all(|(c, k, name, h)| *late_memo.entry((c.clone(), *k, name.clone(), *h)).or_insert_with(|| late_current(c, *k, name, *h)));
                 let refs_ok = v.refs.iter().all(|(i, t)| by_ident.get(i).is_some_and(|&c| r.texts[c as usize] == *t));
-                if !late_ok || !refs_ok { continue; }
-                r.hit[j] = true;
+                // (the key holds the checked crates of the closure by identity: these are they)
+                if !late_ok || !refs_ok || v.deps.len() != r.deps[j].len() { continue; }
+                let mut since: Vec<(u32, u128)> = Vec::new();
+                for ((i, was), (i2, now)) in v.deps.iter().zip(&r.deps[j]) {
+                    if i != i2 { since.push((u32::MAX, 0)); break; }
+                    if was != now { since.push((by_ident[i], *was)); }
+                }
                 r.raw[j] = Some(p.to_vec());
-                r.stored.extend(v.entries);
+                if since.is_empty() {
+                    r.hit[j] = true;
+                    r.stored.extend(v.entries);
+                } else {
+                    changed.push((j, v, since));
+                }
+            }
+            // an interface that only gained items: the crates the items can reach
+            let mut reach: HashMap<(u32, u128), Option<HashSet<u32>>> = HashMap::new();
+            let mut users: Option<Vec<Vec<u32>>> = None;
+            for (j, v, since) in changed {
+                let c = r.checked[j];
+                let ok = since.iter().all(|&(d, was)| {
+                    if d == u32::MAX { return false; }
+                    let reach = reach.entry((d, was)).or_insert_with(|| {
+                        let old = match store.get_checked(table_key(r.idents[d as usize], was)) { Some((KIND_TABLE, p)) => decode_table(p), _ => None };
+                        let added = old.and_then(|old| added_items(&old, r.heads[d as usize], &r.cur[d as usize]));
+                        let users = users.get_or_insert_with(|| glob_users(prog));
+                        let reach = added.as_ref().and_then(|added| {
+                            let mut all = HashSet::new();
+                            for &(f, item) in added { all.extend(added_reach(prog, users, f, item)?); }
+                            Some(all)
+                        });
+                        if trace {
+                            let names: Vec<&str> = added.iter().flatten().filter_map(|&(f, item)| prog.item_defs.get(&(f as u32, item.0)).map(|&x| prog.syms.str(prog.def(x).name))).collect();
+                            let crates: Vec<&str> = reach.iter().flatten().map(|&k| prog.syms.str(prog.crates[k as usize].name)).collect();
+                            eprintln!("check-reuse-trace: {} interface changed: added {:?}, reaching {:?}", prog.syms.str(prog.crates[d as usize].name), added.as_ref().map(|_| names), reach.as_ref().map(|_| crates));
+                        }
+                        reach
+                    });
+                    reach.as_ref().is_some_and(|reach| !reach.contains(&c))
+                });
+                if ok {
+                    r.hit[j] = true;
+                    r.added[j] = true;
+                    r.stored.extend(v.entries);
+                } else {
+                    r.raw[j] = None;
+                }
             }
             r.run_hit = matches!(store.get_checked(r.run_key), Some((KIND_RUN, _)));
         }
         r.t_keys = t0.elapsed();
         r
     }
+
+    /// The hits whose verdicts were checked against an interface that only gained items since.
+    pub(crate) fn added_hits(&self) -> usize { self.added.iter().filter(|a| **a).count() }
 
     /// Whether checked crate `c`'s verdict is reused.
     pub(crate) fn is_hit(&self, c: u32) -> bool {
@@ -375,28 +591,21 @@ impl Reuse {
             }
             refs.sort_unstable();
             refs.dedup();
-            let mut w = W(Vec::new());
-            w.u32(VERSION);
-            w.u32(mine.len() as u32);
-            for (k, kind, name, h) in mine { w.str(k); w.0.push(*kind); w.str(name); w.u128(*h); }
-            w.u32(refs.len() as u32);
-            for (i, t) in &refs { w.u128(*i); w.u128(*t); }
-            w.u32(per[j].len() as u32);
-            for &i in &per[j] {
+            let entries: Vec<Stored> = per[j].iter().filter_map(|&i| {
                 let e = &entries[i];
-                let Out::Warning(text) = &e.out else { continue };
-                w.0.push(e.stage.phase.code());
-                w.0.push(e.stage.step);
-                w.0.push(flags[i]);
-                w.u32(e.seq);
-                match &groups[i] {
-                    GroupAt::Zero => w.0.push(0),
-                    GroupAt::At => w.0.push(1),
-                    GroupAt::Path(p, l, col) => { w.0.push(2); w.str(p); w.u32(*l); w.u32(*col); }
-                }
-                w.str(text);
+                let Out::Warning(text) = &e.out else { return None };
+                Some(Stored { phase: e.stage.phase, step: e.stage.step, flags: flags[i], seq: e.seq, group: groups[i].clone(), text: text.clone() })
+            }).collect();
+            let late = mine.into_iter().cloned().collect();
+            new.push(crate::pack::NewEntry { key: self.keys[j], kind: KIND_CRATE, payload: encode(&Verdict { late, refs, deps: self.deps[j].clone(), entries }) });
+        }
+        // a hit checked against an interface that only gained items: stored with today's
+        for j in 0..self.checked.len() {
+            if !self.added[j] { continue; }
+            if let Some(mut v) = self.raw[j].take().as_deref().and_then(decode) {
+                v.deps = self.deps[j].clone();
+                new.push(crate::pack::NewEntry { key: self.keys[j], kind: KIND_CRATE, payload: encode(&v) });
             }
-            new.push(crate::pack::NewEntry { key: self.keys[j], kind: KIND_CRATE, payload: w.0 });
         }
         if self.sig_clean {
             new.push(crate::pack::NewEntry { key: self.run_key, kind: KIND_RUN, payload: VERSION.to_le_bytes().to_vec() });
@@ -407,6 +616,13 @@ impl Reuse {
         if drop_all {
             for j in 0..self.checked.len() {
                 if let Some(p) = self.raw[j].take() { new.push(crate::pack::NewEntry { key: self.keys[j], kind: KIND_CRATE, payload: p }); }
+            }
+        }
+        // the interfaces the verdicts were checked against, by item (a later check compares them)
+        for c in 0..self.cur.len() {
+            if self.ifaces[c] == 0 { continue; }
+            if drop_all || !self.table_stored[c] {
+                new.push(crate::pack::NewEntry { key: table_key(self.idents[c], self.ifaces[c]), kind: KIND_TABLE, payload: encode_table(self.heads[c], &self.cur[c]) });
             }
         }
         let dir = self.path.parent().unwrap_or(Path::new("."));
@@ -437,6 +653,59 @@ impl<'a> R<'a> {
     fn str(&mut self) -> Option<String> { let n = self.u32()? as usize; String::from_utf8(self.take(n)?.to_vec()).ok() }
 }
 
+fn encode(v: &Verdict) -> Vec<u8> {
+    let mut w = W(Vec::new());
+    w.u32(VERSION);
+    w.u32(v.late.len() as u32);
+    for (k, kind, name, h) in &v.late { w.str(k); w.0.push(*kind); w.str(name); w.u128(*h); }
+    w.u32(v.refs.len() as u32);
+    for (i, t) in &v.refs { w.u128(*i); w.u128(*t); }
+    w.u32(v.deps.len() as u32);
+    for (i, f) in &v.deps { w.u128(*i); w.u128(*f); }
+    w.u32(v.entries.len() as u32);
+    for e in &v.entries {
+        w.0.push(e.phase.code());
+        w.0.push(e.step);
+        w.0.push(e.flags);
+        w.u32(e.seq);
+        match &e.group {
+            GroupAt::Zero => w.0.push(0),
+            GroupAt::At => w.0.push(1),
+            GroupAt::Path(p, l, col) => { w.0.push(2); w.str(p); w.u32(*l); w.u32(*col); }
+        }
+        w.str(&e.text);
+    }
+    w.0
+}
+
+fn encode_table(head: u128, files: &[CurFile]) -> Vec<u8> {
+    let mut w = W(Vec::new());
+    w.u32(VERSION);
+    w.u128(head);
+    w.u32(files.len() as u32);
+    for f in files {
+        w.str(&f.path);
+        w.u128(f.rest);
+        w.u32(f.named.len() as u32);
+        for (h, _) in &f.named { w.u128(*h); }
+    }
+    w.0
+}
+
+fn decode_table(p: &[u8]) -> Option<Table> {
+    let mut r = R(p);
+    if r.u32()? != VERSION { return None; }
+    let head = r.u128()?;
+    let mut files = Vec::new();
+    for _ in 0..r.u32()? {
+        let (path, rest) = (r.str()?, r.u128()?);
+        let mut named = Vec::new();
+        for _ in 0..r.u32()? { named.push(r.u128()?); }
+        files.push((path, rest, named));
+    }
+    r.0.is_empty().then_some(Table { head, files })
+}
+
 fn decode(p: &[u8]) -> Option<Verdict> {
     let mut r = R(p);
     if r.u32()? != VERSION { return None; }
@@ -444,6 +713,8 @@ fn decode(p: &[u8]) -> Option<Verdict> {
     for _ in 0..r.u32()? { late.push((r.str()?, r.u8()?, r.str()?, r.u128()?)); }
     let mut refs = Vec::new();
     for _ in 0..r.u32()? { refs.push((r.u128()?, r.u128()?)); }
+    let mut deps = Vec::new();
+    for _ in 0..r.u32()? { deps.push((r.u128()?, r.u128()?)); }
     let mut entries = Vec::new();
     for _ in 0..r.u32()? {
         let phase = Phase::of_code(r.u8()?)?;
@@ -456,5 +727,5 @@ fn decode(p: &[u8]) -> Option<Verdict> {
         };
         entries.push(Stored { phase, step, flags, seq, group, text: r.str()? });
     }
-    r.0.is_empty().then_some(Verdict { late, refs, entries })
+    r.0.is_empty().then_some(Verdict { late, refs, deps, entries })
 }
