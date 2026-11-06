@@ -930,7 +930,7 @@ fn decls_naming_removed(u: &Unit, removed: &[DefId], news: &[u32], visible: &[bo
         return Vec::new();
     }
     let names: Vec<Vec<u8>> = gone.iter().map(|d| def_name(prog, *d).into_bytes()).filter(|n| !n.is_empty()).collect();
-    let aliases: Vec<(DefId, crate::program::Sym)> = gone.iter().filter(|d| prog.def(**d).kind == DefKind::TypeAlias).map(|&d| (d, prog.def(d).name)).collect();
+    let syms: Vec<(DefId, crate::program::Sym)> = gone.iter().map(|&d| (d, prog.def(d).name)).collect();
     // the live modules' files (Program::current_source_file_sets) and the edit's new versions
     let mut live = Vec::with_capacity(prog.mods.len());
     let mut files: Vec<u32> = news.to_vec();
@@ -957,8 +957,36 @@ fn decls_naming_removed(u: &Unit, removed: &[DefId], news: &[u32], visible: &[bo
                 .or_else(|| u.tcx.impl_trait_bounds.get(&d).and_then(|b| b.iter().find_map(|(_, t, a)| tr(*t).or_else(|| a.iter().find_map(|&x| of(x)))))),
             DefKind::Struct | DefKind::Enum | DefKind::Union => u.tcx.adts.get(&d).and_then(|a| a.variants.iter().flat_map(|v| v.fields.iter()).find_map(|f| of(f.ty))),
             DefKind::Const | DefKind::Static | DefKind::AssocConst => u.tcx.const_ty(prog, d).and_then(of),
+            // its supertraits (transitively: `trait Loud: Words`)
+            DefKind::Trait => u.tcx.trait_closure.get(&d).and_then(|v| v.iter().find_map(|t| tr(*t))),
             _ => None,
         }
+    };
+    // the module a path's segments before the last name (`crate::a::`, `self::`, `a::b::`)
+    let module_of_path = |scope: u32, krate: u32, segs: &[&[u8]]| -> Option<u32> {
+        let normal = prog.mods[scope as usize].normal;
+        let mut m = None;
+        for (k, seg) in segs.iter().enumerate() {
+            m = Some(match (*seg, m) {
+                (b"crate", None) => prog.crates[krate as usize].root_mod,
+                (b"self", None) => normal,
+                (b"super", None) => prog.mods[normal as usize].parent_mod?,
+                (b"super", Some(at)) => prog.mods[at as usize].parent_mod?,
+                (name, at) => {
+                    let sym = prog.syms.get(std::str::from_utf8(name).ok()?)?;
+                    let d = match at {
+                        None if k == 0 => prog.lookup_in_scope(scope, sym, true)?,
+                        None => return None,
+                        Some(at) => prog.lookup_in_module(at, sym, true, &mut Vec::new())?,
+                    };
+                    if prog.def(d).kind != DefKind::Mod {
+                        return None;
+                    }
+                    prog.def(d).sub
+                }
+            });
+        }
+        m
     };
     let mut out = Vec::new();
     for f in files {
@@ -1010,10 +1038,13 @@ fn decls_naming_removed(u: &Unit, removed: &[DefId], news: &[u32], visible: &[bo
                 continue;
             }
             // a type alias leaves no trace in the types it stood for: a name of a removed one
-            // that is not a generic parameter here and no longer resolves in the item's scope
+            // that is not a generic parameter here and no longer resolves in the item's scope.
+            // So does an alias's own type (its type is lowered at its uses): every removed name
+            // in it is checked so (its names are type paths)
             if !own(&i) {
                 continue;
             }
+            let alias_item = prog.def(d).kind == DefKind::TypeAlias;
             let mut params: Vec<&[u8]> = Vec::new();
             let mut k = Some(i);
             while let Some(x) = k {
@@ -1022,10 +1053,26 @@ fn decls_naming_removed(u: &Unit, removed: &[DefId], news: &[u32], visible: &[bo
                 }
                 k = parent.get(&x).copied();
             }
-            let scope = prog.def(d).scope;
-            if let Some((g, at)) = aliases.iter().find_map(|&(g, sym)| {
+            let (scope, krate) = (prog.def(d).scope, prog.def(d).krate);
+            // a use of it: the name alone, resolving to nothing in the item's scope now, or the
+            // last name of a module path whose module no longer has it (`a::Id`)
+            let gone_use = |k: usize, sym: crate::program::Sym| -> bool {
+                if !decl[k].2 {
+                    return !params.contains(&decl[k].1) && prog.lookup_in_scope(scope, sym, true).is_none();
+                }
+                let mut segs: Vec<&[u8]> = Vec::new();
+                let mut j = k;
+                while j >= 2 && decl[j].2 && decl[j - 1].1 == b"::" {
+                    segs.push(decl[j - 2].1);
+                    j -= 2;
+                }
+                segs.reverse();
+                let global = segs.first().is_some_and(|s| !s.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_'));
+                !global && module_of_path(scope, krate, &segs).is_some_and(|m| prog.lookup_in_module(m, sym, true, &mut Vec::new()).is_none())
+            };
+            if let Some((g, at)) = syms.iter().filter(|(g, _)| alias_item || prog.def(*g).kind == DefKind::TypeAlias).find_map(|&(g, sym)| {
                 let name = prog.syms.str(sym).as_bytes();
-                decl.iter().find(|(_, x, path)| *x == name && !*path && !params.contains(x)).filter(|_| prog.lookup_in_scope(scope, sym, true).is_none()).map(|(at, _, _)| (g, *at))
+                (0..decl.len()).find(|&k| decl[k].1 == name && gone_use(k, sym)).map(|k| (g, decl[k].0))
             }) {
                 out.push(report(g, at));
             }
