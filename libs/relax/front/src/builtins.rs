@@ -854,19 +854,36 @@ pub fn include_path(current: Option<&str>, rel: &str) -> String {
 }
 
 /// The paths (as written) of the `include_str!("..")` / `include_bytes!("..")` calls among token
-/// texts: a plain or raw string literal argument (a computed one, `concat!(..)`, is not seen).
+/// texts: a plain or raw string literal argument, or `concat!` of such literals (another computed
+/// one, `env!(..)`, is not seen).
 pub fn include_literals<'a>(texts: &[&'a [u8]]) -> Vec<String> {
-    let mut out = Vec::new();
-    for w in texts.windows(5) {
-        if !matches!(w[0], b"include_str" | b"include_bytes") || w[1] != b"!" || w[2] != b"(" || w[4] != b")" { continue; }
-        let lit = w[3];
+    let lit = |lit: &[u8]| -> Option<String> {
         let body = if let Some(raw) = lit.strip_prefix(b"r") {
             let hashes = raw.iter().take_while(|&&c| c == b'#').count();
             raw.get(hashes + 1..raw.len().saturating_sub(hashes + 1))
         } else if lit.first() == Some(&b'"') && !lit.contains(&b'\\') {
             lit.get(1..lit.len().saturating_sub(1))
         } else { None };
-        if let Some(body) = body.and_then(|b| std::str::from_utf8(b).ok()) { out.push(body.to_string()); }
+        body.and_then(|b| std::str::from_utf8(b).ok()).map(str::to_string)
+    };
+    let mut out = Vec::new();
+    for (i, w) in texts.windows(3).enumerate() {
+        if !matches!(w[0], b"include_str" | b"include_bytes") || w[1] != b"!" || w[2] != b"(" { continue; }
+        let at = |k: usize| texts.get(i + k).copied().unwrap_or(b"");
+        if at(4) == b")" {
+            if let Some(s) = lit(at(3)) { out.push(s); }
+            continue;
+        }
+        // `concat!` of literals (a macro's `include_str!(concat!($dir, $name))`, expanded)
+        if at(3) != b"concat" || at(4) != b"!" || at(5) != b"(" { continue; }
+        let (mut s, mut k, mut ok) = (String::new(), 6, false);
+        while let Some(part) = lit(at(k)) {
+            s.push_str(&part);
+            k += 1;
+            if at(k) == b"," { k += 1; }
+            if at(k) == b")" && at(k + 1) == b")" { ok = true; break; }
+        }
+        if ok { out.push(s); }
     }
     out
 }
