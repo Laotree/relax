@@ -123,10 +123,30 @@ PROBES += [
     ("field_enum", F, "A([u64; 2]),\n    B,\n}\nuse Pay::*;\n#[inline(never)]\npub fn pay_new() -> Pay {\n    if std::env::var(\"NEVER_SET\").is_ok() {\n        return B;\n    }\n    A([5; 2])",
      "A([u64; 3]),\n    B,\n}\nuse Pay::*;\n#[inline(never)]\npub fn pay_new() -> Pay {\n    if std::env::var(\"NEVER_SET\").is_ok() {\n        return B;\n    }\n    A([5; 3])", 3),
 ]
+# A body edit of the same file first: the const is then in that edit's version of the file, which
+# the keys' item graph (made from the boot text) did not have; the const edit said "no key shows its
+# readers there" and restarted.
+FIRST = {"const_after_body": (V, "pub fn late_tiny() -> u64 {\n    1\n", "pub fn late_tiny() -> u64 {\n    2 - 1\n")}
+PROBES += [("const_after_body", V, "CONST_DIRECT: u64 = 1;", "CONST_DIRECT: u64 = 2;", 2)]
+# An included file edited: a table of texts, one included through a macro's `concat!` path, read
+# whole and found by key (Fab's demo plates); and after a body edit of the including file. The
+# program prints the new text's length or the edit restarts: never "patched" with the old text.
+PROBES += [
+    ("include_macro", "src/doc_a.txt", "a", "aa", 3),
+    ("include_found", "src/doc_b.txt", "b", "bbb", 3),
+    ("include_after_body", "src/data.txt", "x", "xx", 2),
+    # a demo added to the table, found by key through a fn pointer stored at the start ("no demo")
+    ("include_added", V, 'doc!("doc_a"), Doc {', 'doc!("doc_a"), doc!("doc_c"), Doc {', 3),
+    # a path made by `env!`: no text names the file, so a restart applies its save
+    ("include_env", "src/doc_e.txt", "e", "eee", 3),
+]
+FIRST["include_after_body"] = (V, "pub fn late_tiny() -> u64 {\n    1\n", "pub fn late_tiny() -> u64 {\n    2 - 1\n")
 # every value a probe prints, when it is more than its own
 READS = {"const_every": {"every_direct": 2, "every_fn": 2, "every_inlined": 2, "every_generic": 2, "every_closure": 2, "every_assoc": 2, "every_derived": 3, "every_late": 2}}
 READS["field_every"] = {n: 47 for n in ("fe_method", "fe_free", "fe_pattern", "fe_closure", "fe_generic", "fe_inlined", "fe_macro", "fe_update", "fe_update_self", "fe_clone", "fe_nested", "fe_dyn", "fe_late")}
 READS["field_every"].update(fe_eq=1, fe_debug=4, fe_write=48, fe_held=40, fe_rest=3)
+READS["const_after_body"] = {"const_direct": 2}
+READS["include_after_body"] = {"const_include": 2}
 # (a new run makes the held value with the new layout)
 FRESH_READS = dict(READS, field_every=dict(READS["field_every"], fe_held=47))
 LAND = "landed"
@@ -150,6 +170,8 @@ MUST = {
     "field_nested": LAND, "field_const_read": EVALUATED, "field_const_fn": EVALUATED, "field_static": EVALUATED,
     "field_import": TYPE_NAMES, "field_offset": EVALUATED, "field_running_frame": STILL_RUNS, "field_blocked_frame": STILL_RUNS, "field_short_walk": STILL_RUNS,
     "const_other_new": LAND, "static_from_const": RUNS_ONCE, "static_through_fn": RUNS_ONCE, "static_through_new": RUNS_ONCE,
+    "const_after_body": LAND, "include_macro": LAND, "include_found": LAND, "include_after_body": LAND, "include_added": LAND,
+    "include_env": r"makes its path from other tokens",
 }
 # A second edit in the same session: the first one's evaluations must not read as a type's.
 SECOND = {"field_nested": ("pub v: [u64; 3],\n}\nimpl Inner {\n    pub fn new() -> Inner {\n        Inner { v: [5; 3] }", "pub v: [u64; 4],\n}\nimpl Inner {\n    pub fn new() -> Inner {\n        Inner { v: [5; 4] }", 45), "const_nonliteral": ("CONST_NONLIT: u64 = 2 + 0;", "CONST_NONLIT: u64 = 3 + 0;", 3), "const_direct": ("CONST_DIRECT: u64 = 2;", "CONST_DIRECT: u64 = 3;", 3)}
@@ -238,15 +260,31 @@ def session(probe, rel, old, new, want):
     def last():
         return next((l for l in reversed(out) if l.startswith("out tick ")), None)
     row = {"probe": probe, "outcome": "no start", "value": None, "patch": "", "trace": ""}
+    restore = []
     try:
         if not wait(lambda: last() is not None and os.path.exists(ready), 120):
             return row, err
         if not cold and not any("prelinked" in l for l in err) and not wait(lambda: any("prelinked" in l for l in err), 5):
             row["outcome"] = "not warm"
             return row, err
+        edited = base
+        if probe in FIRST:
+            first_rel, first_old, first_new = FIRST[probe]
+            first_path = os.path.join(pkg, first_rel)
+            first_base = open(first_path).read()
+            assert first_old in first_base, first_old
+            restore.append((first_path, first_base))
+            if first_path == path:
+                edited = base.replace(first_old, first_new)
+            mark = len(err)
+            save(first_path, first_base.replace(first_old, first_new))
+            if not wait(lambda: any(": patched (" in l for l in err[mark:]), 20):
+                row["outcome"] = "FIRST EDIT DID NOT LAND"
+                return row, err
         t_save = time.time()
-        save(path, base.replace(old, new))
-        said = lambda: next((l for l in err if ": patched (" in l or "a restart applies it" in l or "REFUSED" in l), None)
+        mark = len(err)
+        save(path, edited.replace(old, new))
+        said = lambda: next((l for l in err[mark:] if ": patched (" in l or "a restart applies it" in l or "REFUSED" in l), None)
         wait(lambda: said() is not None, 20)
         line = said() or ""
         restart = "a restart applies it" in line
@@ -306,6 +344,8 @@ def session(probe, rel, old, new, want):
             if not shows_new(line, probe, want, FRESH_READS):
                 row["outcome"] += " + FRESH RUN STALE"
         save(path, base)
+        for other, text in restore:
+            save(other, text)
 
 
 fails = 0

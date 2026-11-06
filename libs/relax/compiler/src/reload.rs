@@ -1477,13 +1477,36 @@ fn included_files(std_dir: &str) -> Vec<String> {
 }
 
 /// The files fn, const or static item `it` includes with include_str!/include_bytes! (`pf` is
-/// file `path`'s text). Its whole text: what `classify` compares as the item.
-fn item_includes(pf: &crate::parser::ParsedFile, path: &str, it: &crate::ast::Item) -> Vec<String> {
+/// file `path`'s text). Its whole text: what `classify` compares as the item, and the expansions
+/// of the macro calls in it (a macro's `include_str!(concat!($key, ".txt"))`: Fab's demo plates;
+/// a save of such a file said "patched" and the program kept the old text).
+/// `expanded`: `expansions_include(pf)`.
+fn item_includes(pf: &crate::parser::ParsedFile, path: &str, it: &crate::ast::Item, expanded: bool) -> Vec<String> {
     use crate::ast::ItemKind;
     if !matches!(it.kind, ItemKind::Fn(..) | ItemKind::Const(..) | ItemKind::Static(..)) { return Vec::new(); }
     // (most code includes nothing: one look for the macro name first)
-    if !pf.bytes(it.lo, it.hi).windows(8).any(|w| w == b"include_") { return Vec::new(); }
-    crate::builtins::include_literals(&toks(pf, it.lo, it.hi, &[])).iter().map(|rel| crate::builtins::include_path(Some(path), rel)).collect()
+    if !expanded && !pf.bytes(it.lo, it.hi).windows(8).any(|w| w == b"include_") { return Vec::new(); }
+    let mut texts = toks(pf, it.lo, it.hi, &[]);
+    if expanded {
+        // the expansions whose call is in the item, or in one of these
+        let mut regions: Vec<(u32, u32, u32)> = pf.exp_map.iter().collect();
+        for part in pf.parts() { regions.extend(part.exp_map.iter()); }
+        let mut inside: Vec<(u32, u32)> = vec![(it.lo, it.hi)];
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for &(a, b, call) in &regions {
+                if a < b && !inside.contains(&(a, b)) && inside.iter().any(|&(lo, hi)| lo <= call && call < hi) {
+                    inside.push((a, b));
+                    grew = true;
+                }
+            }
+        }
+        for &(a, b) in &inside[1..] {
+            texts.extend(toks(pf, a, b, &[]));
+        }
+    }
+    crate::builtins::include_literals(&texts).iter().map(|rel| crate::builtins::include_path(Some(path), rel)).collect()
 }
 
 /// The content hashes each included file was read with by the running code (one per crate that
@@ -1496,11 +1519,18 @@ fn include_base(records: &[(String, String, u128)]) -> IncludeBase {
     base
 }
 
+/// Whether the expansion text of file `pf` names include_str!/include_bytes! (`item_includes`
+/// then looks into the expansions of each item's macro calls).
+fn expansions_include(pf: &crate::parser::ParsedFile) -> bool {
+    let src: &[u8] = &pf.src[..];
+    !pf.exp_map.is_empty() && src.get(pf.src_len as usize..).is_some_and(|t| t.windows(8).any(|w| w == b"include_"))
+}
+
 /// Whether item `it`'s code includes a file whose content is not what the running code read
 /// (`base`; a file it never read is no part of running code).
-fn includes_moved(pf: &crate::parser::ParsedFile, path: &str, it: &crate::ast::Item, base: &IncludeBase) -> bool {
+fn includes_moved(pf: &crate::parser::ParsedFile, path: &str, it: &crate::ast::Item, base: &IncludeBase, expanded: bool) -> bool {
     if base.is_empty() { return false; }
-    item_includes(pf, path, it).iter().any(|p| base.get(p).is_some_and(|seen| {
+    item_includes(pf, path, it, expanded).iter().any(|p| base.get(p).is_some_and(|seen| {
         let now = crate::sip::late_hash(crate::vfs::read(p).ok().as_deref());
         seen.iter().any(|h| *h != now)
     }))
@@ -1516,12 +1546,31 @@ pub(crate) fn include_edits(prog: &crate::program::Program, changed: &[String], 
         if !own_source_file(prog, file) { continue; }
         let pf = &prog.files[file as usize];
         let src = &pf.src[..pf.src_len as usize];
-        if !src.windows(8).any(|w| w == b"include_") { continue; }
-        if pf.ast.items.iter().any(|it| item_includes(pf, &path, it).iter().any(|p| changed.contains(p))) {
+        let expanded = expansions_include(pf);
+        if !expanded && !src.windows(8).any(|w| w == b"include_") { continue; }
+        if pf.ast.items.iter().any(|it| item_includes(pf, &path, it, expanded).iter().any(|p| changed.contains(p))) {
             out.push(Edit { file, path, src: src.to_vec() });
         }
     }
     out
+}
+
+/// The saved included files (`changed`) no own source file's code names (`item_includes`): a path
+/// made by other tokens (`env!`, a macro of another file). Which code read them is not known.
+pub(crate) fn include_unmatched(prog: &crate::program::Program, changed: &[String]) -> Vec<String> {
+    let mut left: Vec<String> = changed.to_vec();
+    for (path, file) in prog.current_source_files(|_| true) {
+        if left.is_empty() { break; }
+        if !own_source_file(prog, file) { continue; }
+        let pf = &prog.files[file as usize];
+        let expanded = expansions_include(pf);
+        if !expanded && !pf.src[..pf.src_len as usize].windows(8).any(|w| w == b"include_") { continue; }
+        for it in pf.ast.items.iter() {
+            let named = item_includes(pf, &path, it, expanded);
+            left.retain(|p| !named.contains(p));
+        }
+    }
+    left
 }
 
 /// Classifies the items of one file version against the running one.
@@ -1551,6 +1600,7 @@ fn classify_moving(prog: &crate::program::Program, old_file: u32, new: &crate::p
     };
     let body_span = fn_body_span;
     let (mut pairs, mut removed, mut added) = pair_items(old, new);
+    let old_expanded = !base.is_empty() && expansions_include(old);
     trace_sub("classify_pair");
     // a fn whose signature changed (M2/M4): the old fn goes and a new one with the new signature
     // comes (its own slots: frames of the old code in flight keep calling the old one), and every
@@ -1780,7 +1830,7 @@ fn classify_moving(prog: &crate::program::Program, old_file: u32, new: &crate::p
         // produces a new provider; schedule its generated bodies without lowering them here.
         // The same text whose code includes a file that changed since the running code read it
         // changed too (include_str!: its body or initializer is classified as edited below).
-        if attrs_same && same_toks(old, la, a.hi, &ha, new, lb, b.hi, &hb) && !includes_moved(old, &prog.file_paths[old_file as usize], a, base) {
+        if attrs_same && same_toks(old, la, a.hi, &ha, new, lb, b.hi, &hb) && !includes_moved(old, &prog.file_paths[old_file as usize], a, base, old_expanded) {
             continue;
         }
         // derive output is expansion text: an authored item is never one
@@ -6059,7 +6109,10 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
                 let mut waiting = false;
                 let mut waits: Vec<String> = Vec::new();
                 for &id in &p.ids {
-                    match u.verdict_state(id) {
+                    // an unverified-mode twin is its base's body, never promoted: the base's verdict
+                    // is the one to wait for and report (it said "did not check" of every twin)
+                    let of = match u.fns[id as usize].key { FnKey::Plain(b) => b, _ => id };
+                    match u.verdict_state(of) {
                         Verdict::Clean => {}
                         Verdict::Failed(events) => failed.extend(events),
                         // never verified, never reported: the slots stay unverified (baseline)
@@ -7916,6 +7969,15 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 if let Some(k) = files.iter().position(|f| f.0 == e.path) {
                     edits.push(e);
                     which.push(k);
+                }
+            }
+            // one no code's text names: never "patched" while the program keeps what it read
+            let unmatched = crate::owner::call(crate::owner::Class::Program, || include_unmatched(&(*up).prog, &paths));
+            if !unmatched.is_empty() {
+                let names: Vec<&str> = unmatched.iter().map(|p| p.rsplit('/').next().unwrap_or("")).collect();
+                offer_restart(&format!("{}: changed, and the code that includes it makes its path from other tokens (no item's text or expansion names it): which code read it is not known", names.join(", ")));
+                if edits.is_empty() {
+                    continue;
                 }
             }
         }

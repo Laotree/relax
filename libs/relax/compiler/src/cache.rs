@@ -8655,7 +8655,14 @@ pub(crate) unsafe fn linked_code(up: *mut Unit) -> bool {
 pub(crate) unsafe fn const_closures(up: *mut Unit, consts: &[DefId]) -> Vec<(DefId, Option<u128>)> {
     let Some(c) = (&*up).cache.as_ref().map(|c| c.get()) else { return Vec::new() };
     let u = &*up;
-    let g = (&mut *c).deps_graph(u);
+    let c = &mut *c;
+    // a const in a file version an earlier edit made that left the keys where they were (a body
+    // edit): the graph has no node of it until the keys follow the running text, now
+    let g = c.deps_graph(u);
+    if consts.iter().any(|&d| !g.has_file(&u.prog, u.prog.def(d).file)) {
+        c.keys_follow_text(u);
+    }
+    let g = c.deps_graph(u);
     consts.iter().map(|&d| (d, g.def_closure(&u.prog, d))).collect()
 }
 
