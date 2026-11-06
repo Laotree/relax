@@ -94,6 +94,11 @@ pub fn cmd_live(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         return 1;
     }
     jit::enable_pipelining(options);
+    // the platform's start code runs the program's constructors before the harness (sections.rs)
+    if let Err(e) = unsafe { crate::sections::run_constructors(&mut *u, krate, None) } {
+        eprintln!("error: {e}");
+        return 101;
+    }
     println!("v0: first run (lazy compile on first call)");
     run_tests(&mut u, &tests);
     println!("v0: second run (all compiled)");
