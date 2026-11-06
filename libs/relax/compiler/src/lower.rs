@@ -5550,13 +5550,14 @@ impl<'a> Lcx<'a> {
                 // variants, fields and pointees of the evaluated constant, read at compile time
                 let args = self.b.res_args.get(&(p.0 | crate::typeck::PAT_KEY)).copied().unwrap_or_default();
                 let args = self.mono_list(args);
-                match self.u.const_addr_shared(d, args) {
+                match self.u.const_addr_shared(d, args.clone()) {
                     Some(addr) => {
                         let cs = self.u.data_sym(addr);
                         self.test_const_value(place, t, addr, Some(cs), fail, 0)
                     }
                     None => {
-                        self.err(self.pos, format!("could not evaluate constant {} -- see its own error", self.u.prog.def_path(d)));
+                        let e = self.const_use_error(d, &args);
+                        self.err(self.pos, e);
                     }
                 }
             }
@@ -7798,8 +7799,17 @@ impl<'a> Lcx<'a> {
         addr
     }
 
+    /// The error of a use of constant `d` that has no value: its own error says why. One whose body
+    /// has type errors is not evaluated (jit::const_refused): the build this use ends then fails
+    /// for errors the check reports, and that failure is not reported again (TAINTED_CONST_USE).
+    fn const_use_error(&self, d: DefId, args: &[TyId]) -> String {
+        let path = self.u.prog.def_path(d);
+        if crate::jit::const_refused(self.u, d, args) { format!("could not evaluate constant {}: {}", path, crate::jit::TAINTED_CONST_USE) }
+        else { format!("could not evaluate constant {} -- see its own error", path) }
+    }
+
     fn const_val(&mut self, d: DefId, args: Vec<TyId>, t: TyId) -> Val {
-        match self.u.const_addr_shared(d, args) {
+        match self.u.const_addr_shared(d, args.clone()) {
             Some(addr) => {
                 let addr = self.u.data_sym(addr);
                 let l = self.layout(t);
@@ -7823,7 +7833,8 @@ impl<'a> Lcx<'a> {
                 self.read_place(&Place::Mem(p, 0), t)
             }
             None => {
-                self.err(self.pos, format!("could not evaluate constant {} -- see its own error", self.u.prog.def_path(d)));
+                let e = self.const_use_error(d, &args);
+                self.err(self.pos, e);
                 self.dummy_val(t)
             }
         }
