@@ -9066,7 +9066,7 @@ mod watch_wait_tests {
     /// A restart in place ends the run first: the watcher leaves with it, and the run's end finds
     /// no thread of it left. (It waited on, out of the run's reach: the end left it behind with
     /// the unit, and it watched that ended unit again once the next run's restore completed the
-    /// recovery -- a fault outside JIT code, not contained, in a live makepad-fab session.)
+    /// recovery -- a fault outside JIT code, not contained, in a live app session.)
     #[test]
     fn a_watcher_awaiting_its_recovery_leaves_with_the_run() {
         isolated_test!(a_watcher_awaiting_its_recovery_leaves_with_the_run);

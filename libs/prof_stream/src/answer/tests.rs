@@ -173,12 +173,12 @@ fn why_slow_says_the_ui_wakes_apart_from_its_frames() {
 
 #[test]
 fn a_hosted_apps_heap_is_its_domain_arena_by_resident_pages() {
-    // a hosted Fab: the domain arena's committed bytes (whole chunks made writable) are 4x its
+    // a hosted app: the domain arena's committed bytes (whole chunks made writable) are 4x its
     // resident pages; malloc holds makepad run's own blocks
     let r = render(
         "memory",
         &lines(r#"{"freed_by_domain_teardown_bytes":0}
-{"domain":1,"package":"makepad-fab","state":"Running","arena_in_use_bytes":305500000,"arena_resident_bytes":302900000,"arena_committed_bytes":1244921856,"arena_touched_small_bytes":112027216,"arena_live_slot_bytes":83978032,"arena_large_bytes":227803136,"static_committed_bytes":163840,"threads":19,"thread_names":["domain-1-makepad-fab"]}
+{"domain":1,"package":"makepad-calc","state":"Running","arena_in_use_bytes":305500000,"arena_resident_bytes":302900000,"arena_committed_bytes":1244921856,"arena_touched_small_bytes":112027216,"arena_live_slot_bytes":83978032,"arena_large_bytes":227803136,"static_committed_bytes":163840,"threads":19,"thread_names":["domain-1-makepad-calc"]}
 {"measured":"memory now","at_ms":1,"source":"x","partial":[]}
 {"rss_mb":2271.8,"peak_rss_mb":5398.2,"footprint_mb":1690.2,"peak_footprint_mb":4218.0,"compressed_mb":0.0,"malloc_in_use_mb":372.3,"malloc_held_free_mb":103.6}
 {"trims":57,"last_trim_ms":221295}
@@ -186,7 +186,7 @@ fn a_hosted_apps_heap_is_its_domain_arena_by_resident_pages() {
 {"findings":[],"more":[]}"#),
     );
     assert!(r.contains("Program heap (domain 1 arena) 289 MB resident, 291 MB in use"), "{}", r);
-    assert!(r.contains("| app domain 1 arena (makepad-fab) | 289 |"), "{}", r);
+    assert!(r.contains("| app domain 1 arena (makepad-calc) | 289 |"), "{}", r);
     assert!(r.contains("resident; 291 MB in use, 1.16 GB committed address space, 19 threads"), "{}", r);
     assert!(r.contains("| malloc (makepad run, provided crates), in use | 372 |"), "{}", r);
     assert!(!r.contains("program heap (malloc"), "{}", r);
