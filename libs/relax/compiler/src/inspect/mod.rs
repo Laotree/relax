@@ -326,8 +326,10 @@ fn dispatch_command(req: &Req, out: &mut Out) {
                 Err(e) => out.err(&e),
             },
             None | Some("pending") => {
+                // and what each one is, oldest first (devhub's shows say the first beside the sha
+                // the show is listed at, which it does not wholly run)
                 let p = crate::reload::restart_pending();
-                out.line(&format!("{{\"restart_pending\":{},\"note\":\"edits that cannot apply live wait here; the app runs the code before them until `session relaunch`\"}}", p.len()));
+                out.line(&format!("{{\"restart_pending\":{},\"pending\":[{}],\"note\":\"edits that cannot apply live wait here; the app runs the code before them until `session relaunch`\"}}", p.len(), p.iter().map(|w| json_str(w)).collect::<Vec<_>>().join(",")));
                 {
                     use crate::reload::host;
                     let (phase, since) = host::status();
