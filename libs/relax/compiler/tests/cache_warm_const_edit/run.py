@@ -17,6 +17,9 @@ A probe that reads late first calls its reader after the edit: that code comes f
 A const that only values read must land, and a const a type uses must restart, saying why (MUST).
 const_every: one const of a dependency, every way code reads it, all from the warm cache.
 field_*: a struct's field list edited with no reader's text changing; field_every reads one field every way.
+dyn_*: a trait object made before the edit, its trait's method list edited: the edit restarts (MUST),
+its vtable linked from the disk cache as much as built by this run; dyn_impl_removed: the impl the
+object's vtable holds removed with the code that made it changed: lands (MUST), the object keeps its vtable.
 A stored entry can be older than the manifest of the run that reads it: the edited text's first run,
 reaching none of the late readers, writes its own manifest (its keys are "unchanged" from then on),
 and the next run's first late reads must still see that the entries they find are of the old text.
@@ -90,6 +93,10 @@ PROBES = [
     ("body_inlined", V, "pub fn tiny() -> u64 {\n    1\n", "pub fn tiny() -> u64 {\n    2\n", 2),
     ("body_late", V, "pub fn late_tiny() -> u64 {\n    1\n", "pub fn late_tiny() -> u64 {\n    2\n", 2),
     ("always_late", V, "pub fn late_always() -> u64 {\n    1\n", "pub fn late_always() -> u64 {\n    2\n", 2),
+    ("dyn_method_add", V, "pub trait Dm {\n    fn a(&self) -> u64;\n}\npub struct DmX;\nimpl Dm for DmX {\n    fn a(&self) -> u64 {\n        1\n", "pub trait Dm {\n    fn z(&self) -> u64 {\n        9\n    }\n    fn a(&self) -> u64;\n}\npub struct DmX;\nimpl Dm for DmX {\n    fn a(&self) -> u64 {\n        2\n", 2),
+    ("dyn_method_add_late", V, "pub trait Dm {\n    fn a(&self) -> u64;\n}\npub struct DmX;\nimpl Dm for DmX {\n    fn a(&self) -> u64 {\n        1\n", "pub trait Dm {\n    fn z(&self) -> u64 {\n        9\n    }\n    fn a(&self) -> u64;\n}\npub struct DmX;\nimpl Dm for DmX {\n    fn a(&self) -> u64 {\n        2\n", 2),
+    ("dyn_vtable_fresh", V, "pub trait Dv {\n    fn a(&self) -> u64;\n}\npub struct DvX;\nimpl Dv for DvX {\n    fn a(&self) -> u64 {\n        1\n    }\n}\npub fn dv_read() -> u64 {\n    dv_held().a()\n}\n", "pub trait Dv {\n    fn z(&self) -> u64 {\n        9\n    }\n    fn a(&self) -> u64;\n}\npub struct DvX;\nimpl Dv for DvX {\n    fn a(&self) -> u64 {\n        2\n    }\n}\npub fn dv_read() -> u64 {\n    dv_held().a() * 10 + dv_held().z() - 9\n}\n", 20),
+    ("dyn_impl_removed", V, "impl std::fmt::Display for Ri {\n    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {\n        write!(f, \"{}\", self.0)\n    }\n}\npub const RI_K: u64 = 0;\npub fn ri_make() -> Box<dyn std::fmt::Display + Send + Sync> {\n    Box::new(Ri(7))\n", "pub const RI_K: u64 = 1;\npub fn ri_make() -> Box<dyn std::fmt::Display + Send + Sync> {\n    Box::new(7u64)\n", 2),
     ("static_direct", V, "STATIC_DIRECT: u64 = 1;", "STATIC_DIRECT: u64 = 2;", 2),
     ("static_through", V, "STATIC_THROUGH: u64 = 1;", "STATIC_THROUGH: u64 = 2;", 2),
     ("static_late", V, "STATIC_LATE: u64 = 1;", "STATIC_LATE: u64 = 2;", 2),
@@ -172,6 +179,8 @@ MUST = {
     "const_other_new": LAND, "static_from_const": RUNS_ONCE, "static_through_fn": RUNS_ONCE, "static_through_new": RUNS_ONCE,
     "const_after_body": LAND, "include_macro": LAND, "include_found": LAND, "include_after_body": LAND, "include_added": LAND,
     "include_env": r"makes its path from other tokens",
+    # a trait object the program made holds the old method table: linked from the disk cache too
+    "dyn_method_add": r"old method table", "dyn_method_add_late": r"old method table", "dyn_vtable_fresh": r"old method table", "dyn_impl_removed": LAND,
 }
 # A second edit in the same session: the first one's evaluations must not read as a type's.
 SECOND = {"field_nested": ("pub v: [u64; 3],\n}\nimpl Inner {\n    pub fn new() -> Inner {\n        Inner { v: [5; 3] }", "pub v: [u64; 4],\n}\nimpl Inner {\n    pub fn new() -> Inner {\n        Inner { v: [5; 4] }", 45), "const_nonliteral": ("CONST_NONLIT: u64 = 2 + 0;", "CONST_NONLIT: u64 = 3 + 0;", 3), "const_direct": ("CONST_DIRECT: u64 = 2;", "CONST_DIRECT: u64 = 3;", 3)}

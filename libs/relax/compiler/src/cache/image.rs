@@ -1696,6 +1696,13 @@ impl Linker {
         let mut linked = vec![false; layout.len()];
         let live = u.prog.session.options.live;
         let mut guards: Vec<Vec<relax_backend::rir::Sym>> = vec![Vec::new(); if live { layout.len() } else { 0 }];
+        // the image's symbols that are vtables: a slot naming one makes trait objects with it
+        // (Unit::vtable_makers, what an impl's removal checks)
+        let vt_starts: std::collections::HashSet<u64> = u.syms.vtable_objs().into_iter().map(|(a, _)| a).collect();
+        let is_vt: Vec<bool> = if vt_starts.is_empty() { Vec::new() } else {
+            im.sym_sym.iter().map(|s| s.flatten().is_some_and(|s| s.off == 0 && matches!(u.syms.kind(s.id), Some(SymKind::Data(_))) && vt_starts.contains(&u.syms.value(s)))).collect()
+        };
+        let mut makes: Vec<Vec<u64>> = vec![Vec::new(); if is_vt.is_empty() { 0 } else { layout.len() }];
         {
             let env = &u.env;
             let syms = &u.syms;
@@ -1718,6 +1725,9 @@ impl Linker {
                                 IMG_SYM => im.fresh.get(&ri).copied().or_else(|| im.sym_sym.get(ix as usize).copied().flatten().flatten()).map(|s| {
                                     if live && (s.off == crate::jit::PATCH_FLAG_OFF || s.off == crate::jit::COPY_VER_OFF) {
                                         guards[k].push(s);
+                                    }
+                                    if is_vt.get(ix as usize).copied().unwrap_or(false) && !im.fresh.contains_key(&ri) {
+                                        makes[k].push(syms.value(s));
                                     }
                                     syms.value(s)
                                 }),
@@ -1756,6 +1766,9 @@ impl Linker {
             let inlined: Vec<u32> = im.flat[inl.0..inl.1].iter().filter_map(|&k| im.slot_of(k)).collect();
             if !u.aux { crate::harness::reach::note(id, inlined.iter().copied()); }
             let kind = im.keys[key as usize].first().copied().unwrap_or(u8::MAX);
+            for &a in makes.get(k).map_or(&[][..], |v| v.as_slice()) {
+                u.note_vtable_maker(a, id);
+            }
             let c = self.cache();
             c.linked.insert(id);
             c.linked_key.insert(id, entry);

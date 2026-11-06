@@ -6763,7 +6763,10 @@ impl<'a> Lcx<'a> {
                 }
                 let vt = self.f.vreg(Cls::I);
                 match self.u.vtable_shared(src, dy) {
-                    Ok(Some(addr)) => self.emit(Inst::Addr(vt, self.u.data_sym(addr))),
+                    Ok(Some(addr)) => {
+                        self.u.note_vtable_maker(addr, self.cur_fn);
+                        self.emit(Inst::Addr(vt, self.u.data_sym(addr)))
+                    }
                     // a front that goes on to note the body's other values; this lowering is dropped
                     Ok(None) => self.emit(Inst::Iconst(vt, 1)),
                     Err(m) => {

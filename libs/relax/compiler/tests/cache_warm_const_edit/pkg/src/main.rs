@@ -457,6 +457,10 @@ fn run() {
             ("static_late", static_late),
             ("body_late", body_late),
             ("always_late", always_late),
+            ("dyn_method_add", values::dm_held()),
+            ("dyn_method_add_late", if late { values::dm_late() } else { 0 }),
+            ("dyn_vtable_fresh", values::dv_read()),
+            ("dyn_impl_removed", values::ri_read()),
         ];
         let mut line = format!("out tick {n}");
         for (name, v) in row.into_iter().chain(readers::row(late)) {
