@@ -201,6 +201,7 @@ pub fn start(app: &str) {
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("session", "view [open|dismiss]", "the run's view over the app (compile errors, a parked panic, the JIT's state): what it shows, or open / dismiss it (the caption's JIT ring is display only)"),
     ("pin", "[on|off]", "pin the running app while an operation runs: no edit or landing reaches it and it does not restart; off: it catches up"),
+    ("hold", "[files=<path>=<blob id or ->, one a line> | off]", "hold back a landing (devhub's show, until its tip is proven): while a file says what the landing wrote (its git blob id, - when it removes the file) its change waits; every other save applies at once; off: the landing goes in; no words: how many files are held"),
     ("inputs", "[match=<path substring>] [of=<paths, one per line>]", "the live session's reload source files, workspace-relative, one path per line and a count; unloaded sources are excluded; of= answers only which of those paths are inputs, and which others lie in no package of the graph (`outside`)"),
     ("session", "relaunch", "apply the edits waiting for a restart: the process starts again (an app that restarts itself, std::relax::restart_supported, with its state and window frames)"),
     ("why-hung", "[probe_ms=200]", "is it stuck and why: verdict (deadlock / blocked / busy / idle), the wait chain or cycle, stacks of the threads in it"),
@@ -380,6 +381,24 @@ fn dispatch_command(req: &Req, out: &mut Out) {
             };
             out.line(&format!("{{\"pinned\":{on}}}"));
         }
+        "hold" => {
+            let held = match (req.pos.first().map(String::as_str), req.get("files")) {
+                (Some("off"), None) => {
+                    crate::reload::release_landing();
+                    Ok(0)
+                }
+                (None, Some(list)) => match hold_files(list) {
+                    Ok(files) => crate::reload::hold_landing(&files),
+                    Err(e) => Err(e),
+                },
+                (None, None) => Ok(crate::reload::landing_held()),
+                _ => Err("hold files=<path>=<blob id or ->, one a line | hold off".to_string()),
+            };
+            match held {
+                Ok(n) => out.line(&format!("{{\"held\":{n}}}")),
+                Err(e) => out.err(&e),
+            }
+        }
         "help" => help(req, out),
         "inputs" => {
             // `of`: the paths asked about, one per line (a live session's saves): only those are
@@ -524,6 +543,18 @@ pub(crate) fn owner_loading<T>(ms: u64, mut f: impl FnMut() -> Result<Result<T, 
             }
         }
     }
+}
+
+/// `hold files=`: one `<path>=<blob id>` a line (`-`: the landing removes the file).
+fn hold_files(list: &str) -> Result<Vec<(String, Option<[u8; 20]>)>, String> {
+    list.lines().filter(|l| !l.trim().is_empty()).map(|l| {
+        let (path, id) = l.trim().rsplit_once('=').ok_or_else(|| format!("hold files: `{l}` is no <path>=<blob id>"))?;
+        let id = match id {
+            "-" => None,
+            hex => Some(crate::gitstore::from_hex(hex).ok_or_else(|| format!("hold files: `{hex}` is no blob id"))?),
+        };
+        Ok((path.to_string(), id))
+    }).collect()
 }
 
 /// `req` with `word` put in front of its positional words (an alias for a subcommand).
@@ -1950,6 +1981,18 @@ mod tests {
             let req = super::Req::parse(line);
             assert!(req.validate_params(makepad_remote::params::jit(&req.cmd, req.pos.first().map(String::as_str).unwrap_or("")).unwrap()).is_ok(), "{line}");
         }
+    }
+
+    /// `hold files=`: one `<path>=<blob id>` a line, `-` for a file the landing removes.
+    #[test]
+    fn a_held_landing_names_each_file_with_its_blob_id() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let files = super::hold_files(&format!("apps/fab/src/a.rs={id}\n\napps/commercial/x=y/b.rs=-\n")).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!((files[0].0.as_str(), files[0].1.map(|o| crate::gitstore::hex(&o))), ("apps/fab/src/a.rs", Some(id.to_string())));
+        assert_eq!((files[1].0.as_str(), files[1].1), ("apps/commercial/x=y/b.rs", None), "a path may hold `=`; `-`: removed");
+        assert!(super::hold_files("apps/fab/src/a.rs").unwrap_err().contains("no <path>=<blob id>"));
+        assert!(super::hold_files("apps/fab/src/a.rs=xyz").unwrap_err().contains("no blob id"));
     }
 
     /// `inputs of=`: a saved path names an input at a whole path component, either separator.

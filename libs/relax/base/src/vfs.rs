@@ -1040,7 +1040,7 @@ fn save_seeded(dir: &std::path::Path, s: &BTreeMap<String, Oid>) -> io::Result<(
 }
 
 /// git's blob id of `data`.
-fn blob_oid(data: &[u8]) -> Oid {
+pub fn blob_oid(data: &[u8]) -> Oid {
     let mut bytes = format!("blob {}\0", data.len()).into_bytes();
     bytes.extend_from_slice(data);
     store::sha1(&bytes)
