@@ -1334,6 +1334,11 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         crate::relaxed::finish_check();
         return code;
     }
+    // a check that checks some crates (cold, after an edit) and stores the verdicts of all of them
+    // stores its output as the early record of the next check too, under the certificate of the
+    // graph its load writes (record_early): the next check of the same inputs needs no load
+    let early_next = (check && !watch && session.is_none() && !selftest && boundary.is_none() && crate::check::reuse_allowed(options))
+        .then(|| (pre.clone(), crate::check_reuse::graph_key(&g)));
     let tp = Instant::now();
     let root_dir = crate::unitgraph::manifest_dir_of(&g.crates[g.root].src_path);
     // the one app-crate rule (borrowck::event): check, serve and run share it
@@ -1690,7 +1695,11 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // answer the name lookups of the declarations collected next
         prog.own_crates = own.clone();
         relax_types::lint::enable();
+        let t = Instant::now();
         prog.run_import_sim(&own);
+        if std::env::var_os("MAKEPAD_RUN_CHECK_TIMES").is_some() {
+            eprintln!("makepad check: import resolution replayed over {} crates in {:.1} ms", checked.len(), t.elapsed().as_secs_f64() * 1e3);
+        }
     }
     // `makepad test`: the crates under test are checked as `cargo test` compiles them before any
     // test runs (test_subjects); marked before declaration collection, as a check marks its crates
@@ -1765,7 +1774,12 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // check its own crates' impls (cargo check), every other check all of them.
         let t = Instant::now();
         if selftest || watch || session.is_some() { u.tcx.check_coherence(&u.prog); }
-        else { u.tcx.check_coherence_of(&u.prog, Some(&checked)); }
+        else {
+            // (a crate whose verdict is reused had no coherence error: the check that stored it
+            // passed, and nothing its impls name changed since)
+            let fresh: Vec<u32> = checked.iter().copied().filter(|&k| !reuse.as_ref().is_some_and(|r| r.is_hit(k))).collect();
+            u.tcx.check_coherence_of(&u.prog, Some(&fresh));
+        }
         phase("coherence", t);
         for &k in &checked {
             pre.extend(crate::check::own_errors(&u.prog, k, &u.prog.errors, "resolve"));
@@ -1826,6 +1840,11 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         let t = Instant::now();
         if !selftest { record_check_front(&mut u, options); }
         phase("record check front", t);
+        if let (Some(r), Some((pre, graph))) = (reuse.as_ref().filter(|r| r.complete()), early_next.as_ref()) {
+            let t = Instant::now();
+            record_early(&u.prog, r, pre, *graph, args);
+            phase("record early", t);
+        }
         if crate::memstat::enabled() {
             crate::memstat::print("check complete", &crate::memreport::unit_sizes(&u));
         }
@@ -3988,6 +4007,18 @@ fn record_check_front(u: &mut Unit, options: &crate::options::Options) {
         let t = Instant::now();
         let r = c.record_collected(&u.prog, &u.tcx);
         verbose!("makepad check: collected program recorded ({:?}) in {:.0} ms", r.is_some(), t.elapsed().as_secs_f64() * 1e3);
+    }
+}
+
+/// The early record (check_reuse.rs Early) of a check that stored every verdict (`reuse`), under
+/// the certificate of the graph its load just wrote: what the next check of the same inputs prints
+/// with no load.
+fn record_early(prog: &crate::program::Program, reuse: &crate::check_reuse::Reuse, pre: &[crate::preload::PreCrate], graph: u128, args: &[String]) {
+    if !front_recordable() { return; }
+    let Some(images) = crate::cache::FrontImages::open(&prog.session.options) else { return };
+    match crate::check_reuse::Early::open(prog, &images, pre, graph, args) {
+        Some(e) => e.record(reuse, &reuse.reused_texts(prog), prog.session.options.verbose),
+        None => verbose!("makepad check: early record not stored: no current graph certificate"),
     }
 }
 
