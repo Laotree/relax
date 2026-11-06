@@ -1306,6 +1306,9 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
         }
         eprintln!("makepad check: {} crates type- and borrow-checked in {:.1} s", fresh_crates.len(), t_front.as_secs_f64());
     }
+    // MAKEPAD_RUN_SOLVER_WORK_TRACE: the solver's work counts and goal histograms of the check
+    crate::solver_work::report();
+    if crate::solver_work::enabled() { relax_types::next_solver::search_graph::goal_hist_report(); }
     let mut st = StepTimes::new("end:");
     if analyses_ok { relax_types::lint_levels::finish(&u.prog); }
     st.mark("lint_levels::finish");
