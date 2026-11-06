@@ -2365,6 +2365,25 @@ fn def_is_bound(prog: &crate::program::Program, d: DefId) -> bool {
     prog.mods.get(def.scope as usize).map_or(false, |m| m.values.get(&def.name) == Some(&d) || m.types.get(&def.name) == Some(&d))
 }
 
+/// The two types a vtable's data name gives (syms::VTABLE_NAME: `vtable:<type>#<hash>:<dyn
+/// type>#<hash>`, jit.rs Unit::vtable), as printed, without their hashes.
+fn vtable_name_types(name: &str) -> Option<(String, String)> {
+    let rest = name.strip_prefix(crate::syms::VTABLE_NAME)?;
+    let b = rest.as_bytes();
+    // (the last `#<hash>:`: the concrete type's end; the dyn type ends in its own hash)
+    let cut = (0..b.len()).rev().find(|&i| b[i] == b'#' && i + 9 < b.len() && b[i + 9] == b':' && b[i + 1..i + 9].iter().all(u8::is_ascii_hexdigit))?;
+    let bare = |t: &str| t.rsplit_once('#').map_or(t, |x| x.0).to_string();
+    Some((bare(&rest[..cut + 9]), bare(&rest[cut + 10..])))
+}
+
+/// "T` as `dyn Tr" from a vtable's data name, for a message's backquotes.
+fn vtable_types(name: &str) -> String {
+    match vtable_name_types(name) {
+        Some((t, d)) => format!("{t}` as `{d}"),
+        None => name.to_string(),
+    }
+}
+
 /// A fn of a trait impl that stays (not in `removed`): its impl and the trait's item it implements.
 fn override_of(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, d: DefId, removed: &[DefId]) -> Option<(DefId, DefId)> {
     let def = prog.def(d);
@@ -3886,10 +3905,28 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             restart.push(format!("`{}` returns `impl Trait` or a future: removing or replacing it in a trait is not applied live yet -- restart the app", u.prog.def_path(d)));
         }
         let subs: Vec<DefId> = u.tcx.trait_closure.iter().filter(|(k, v)| **k != td && v.contains(&td)).map(|(k, _)| *k).collect();
-        for ((src, dy), _) in u.vtables.snapshot() {
+        let lowered = u.vtables.snapshot();
+        let mut held = false;
+        for (&(src, dy), _) in &lowered {
             if let crate::types::TyKind::Dyn(p, ..) = u.tcx.tys.kind(dy) {
                 if *p == td || u.tcx.trait_closure.get(p).is_some_and(|v| v.contains(&td)) {
                     restart.push(format!("trait `{}` changes its methods, and trait objects of it (`{}` as `{}`) the running code made hold its old method table -- restart the app", u.prog.def_path(td), crate::syms::stable_ty(u, src), crate::syms::stable_ty(u, dy)));
+                    held = true;
+                    break;
+                }
+            }
+        }
+        // the vtables of code linked from the disk cache or placed from the startup image are
+        // not in Unit::vtables: their names say whose they are (a warm run patched the edit, and
+        // a reader built after it called the new method table's entries on the old one)
+        if !held {
+            let lowered: std::collections::HashSet<u64> = lowered.values().copied().collect();
+            let heads: Vec<String> = std::iter::once(td).chain(subs.iter().copied()).map(|t| format!("dyn {}", u.prog.def_path(t))).collect();
+            for (a, n) in u.syms.vtable_objs() {
+                if lowered.contains(&a) { continue; }
+                let Some((_, dy)) = vtable_name_types(&n) else { continue };
+                if heads.iter().any(|h| dy.strip_prefix(h.as_str()).is_some_and(|r| r.is_empty() || r.starts_with(['<', ' ']))) {
+                    restart.push(format!("trait `{}` changes its methods, and trait objects of it (`{}`) the running code made hold its old method table -- restart the app", u.prog.def_path(td), vtable_types(&n)));
                     break;
                 }
             }
@@ -3961,22 +3998,53 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             adts.extend(a);
         }
         let kept: Vec<DefId> = gone_impls.iter().copied().filter(|&imp| { let a = self_adts(u, imp); a.is_empty() || !a.iter().all(|d| removed_all.contains(d)) }).collect();
-        let held = slots_of_impls(u, &kept);
-        if !held.is_empty() {
-            for ((src, dy), addr) in u.vtables.snapshot() {
-                let mut thunks = Vec::new();
-                crate::syms::data_thunks(u, addr, &mut thunks);
-                if let Some(&s) = thunks.iter().find(|s| held.contains(s)) {
-                    restart.push(format!("`{}` of a removed impl is in trait objects (`{}` as `{}`) the running code made, and which code makes them is not known -- removing it is applied by a restart", u.fns[s as usize].name, crate::syms::stable_ty(u, src), crate::syms::stable_ty(u, dy)));
-                    break;
-                }
-            }
-        }
+        // the trait objects the running code made (every vtable: lowered, linked from the disk
+        // cache, placed from the startup image) and the methods each one calls (its drop glue is
+        // no method: a coercion to `dyn` needs no `Drop` impl)
+        let vts: Vec<(u64, String, Vec<u32>)> = if kept.is_empty() { Vec::new() } else {
+            u.syms.vtable_objs().into_iter().filter_map(|(a, n)| {
+                let mut t = Vec::new();
+                crate::syms::data_thunks(u, a, &mut t);
+                t.retain(|&s| !matches!(u.fns[s as usize].key, FnKey::Glue(..)));
+                (!t.is_empty()).then_some((a, n, t))
+            }).collect()
+        };
+        let mut vts_seen = vec![false; vts.len()];
         let gone = slots_of_impls(u, &gone_impls);
         let mut seen = gone.clone();
         let mut frontier = gone;
         while !frontier.is_empty() && restart.is_empty() {
             let mut users: Vec<u32> = frontier.iter().flat_map(|&s| u.fns[s as usize].history().inlined_into.iter().copied()).collect();
+            // A trait object holding the frontier's code was made by code no call shows (a
+            // coercion to `dyn`, at the type): that code is checked as a caller is
+            // (Unit::vtable_makers), and with it the code making the trait objects whose
+            // supertrait vtable it is. The objects themselves keep their vtable and its code. One
+            // whose maker this run does not know (code placed from the startup image, a constant's
+            // value) asks for a restart.
+            let hit: Vec<usize> = (0..vts.len()).filter(|&i| !vts_seen[i] && vts[i].2.iter().any(|s| frontier.contains(s))).collect();
+            if !hit.is_empty() {
+                let makers = u.vtable_makers.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let mut covered: std::collections::HashSet<u64> = std::collections::HashSet::new();
+                for &i in &hit {
+                    vts_seen[i] = true;
+                    if let Some(m) = makers.get(&vts[i].0) {
+                        users.extend(m.iter().copied());
+                        let mut todo = vec![vts[i].0];
+                        while let Some(a) = todo.pop() {
+                            for c in crate::syms::data_children(u, a) {
+                                if covered.insert(c) {
+                                    todo.push(c);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(&i) = hit.iter().find(|&&i| !makers.contains_key(&vts[i].0) && !covered.contains(&vts[i].0)) {
+                    let s = vts[i].2.iter().copied().find(|s| frontier.contains(s)).unwrap_or(vts[i].2[0]);
+                    restart.push(format!("`{}` of a removed impl is in trait objects (`{}`) the running code made, and which code makes them is not known -- removing it is applied by a restart", u.fns[s as usize].name, vtable_types(&vts[i].1)));
+                    break;
+                }
+            }
             for (i, f) in u.fns.iter().enumerate() {
                 trace_count("slot_visits", 1);
                 if f.rir_refs().iter().chain(f.calls.iter()).any(|c| frontier.contains(c)) {
@@ -4871,6 +4939,30 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     errs.push(format!("`{}` stops being `Copy` and gets a `Drop` impl: code compiled before copies its values -- restart the app", u.prog.def_path(d)));
                     as_restart = true;
                 }
+            }
+        }
+    }
+    // An impl added (or its header edited) for a type whose trait objects of that trait still
+    // hold a removed impl's methods -- the impl was removed while such objects lived, in this edit
+    // or an earlier one: a new coercion of the type takes the vtable this run built for it
+    // (Unit::vtables) and would run the removed code. Applied by a restart.
+    'readd: for &imp in &added_impls {
+        let Some(&td) = u.tcx.impl_trait.get(&imp) else { continue };
+        let mut adts = Vec::new();
+        if let Some(&t) = u.tcx.impl_self.get(&imp) { ty_adts(u, t, &mut adts, 0); }
+        for ((src, dy), addr) in u.vtables.snapshot() {
+            let crate::types::TyKind::Dyn(p, ..) = u.tcx.tys.kind(dy) else { continue };
+            if *p != td && !u.tcx.trait_closure.get(p).is_some_and(|v| v.contains(&td)) { continue; }
+            let mut a = Vec::new();
+            ty_adts(u, src, &mut a, 0);
+            if !adts.is_empty() && !a.iter().any(|d| adts.contains(d)) { continue; }
+            let mut thunks = Vec::new();
+            crate::syms::data_thunks(u, addr, &mut thunks);
+            if let Some(&s) = thunks.iter().find(|&&s| slot_instance(u, s).is_some_and(|(d, _)| removed_all.contains(&d) || !def_is_bound(&u.prog, d))) {
+                let ty = |t| crate::typeck::ty_to_string(false, &u.prog, &u.tcx, t);
+                errs.push(format!("`{}` gets an impl of `{}` again, and its trait objects (`{}` as `{}`) the running code made hold the removed impl's `{}` -- restart the app", ty(src), u.prog.def_path(td), ty(src), ty(dy), u.fns[s as usize].name));
+                as_restart = true;
+                break 'readd;
             }
         }
     }
@@ -8650,6 +8742,22 @@ mod split_operator_tests {
             }
             assert_eq!(super::toks_norm(&old, a.lo, a.hi, &[]), vec![expected], "item {} lost source text", i);
         }
+    }
+}
+
+#[cfg(test)]
+mod vtable_name_tests {
+    use super::{vtable_name_types, vtable_types};
+
+    /// A vtable linked from the disk cache is known by its data name only: the two types it gives
+    /// (the checks of a trait's method edit find the trait objects of it by the dyn type).
+    #[test]
+    fn a_vtables_name_gives_its_two_types() {
+        let t = |a: &str, b: &str| Some((a.to_string(), b.to_string()));
+        assert_eq!(vtable_name_types("vtable:my::Foo#0123abcd:dyn core::fmt::Display#89abcdef"), t("my::Foo", "dyn core::fmt::Display"));
+        assert_eq!(vtable_name_types("vtable:Vec<my::Foo>#0123abcd:dyn my::Tr<u8> + Send + Sync#89abcdef"), t("Vec<my::Foo>", "dyn my::Tr<u8> + Send + Sync"));
+        assert_eq!(vtable_types("vtable:my::Foo#0123abcd:dyn my::Tr#89abcdef"), "my::Foo` as `dyn my::Tr");
+        assert_eq!(vtable_name_types("const:my::K"), None);
     }
 }
 

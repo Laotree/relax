@@ -8659,6 +8659,12 @@ impl Linker {
         let pc = raw.into_iter().map(|(o, p)| (o, (*files.get(relax_backend::rir::pos_file(p) as usize).unwrap_or(&u32::MAX) as u64) << 32 | (p & 0xffff_ffff) | (p & !relax_backend::rir::pos_plain(u64::MAX)))).collect();
         self.cache().last_callees = callees;
         self.cache().last_thunks = thunks;
+        // trait objects this code makes: the vtables it names (an impl's removal checks their makers)
+        for &a in &data {
+            if u.syms.is_vtable(a) {
+                u.note_vtable_maker(a, id);
+            }
+        }
         self.cache().last_data = data;
         if !u.aux { crate::harness::reach::note(id, inl.iter().copied()); }
         if !is_o3 {

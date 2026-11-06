@@ -184,6 +184,63 @@ pub fn late_tiny() -> u64 {
 pub fn late_always() -> u64 {
     1
 }
+// dyn_method_add: a trait object made once, called through its vtable on every row; the edit adds
+// a method ahead of the one called (its vtable entry moves) and changes what it returns
+pub trait Dm {
+    fn a(&self) -> u64;
+}
+pub struct DmX;
+impl Dm for DmX {
+    fn a(&self) -> u64 {
+        1
+    }
+}
+pub static DM: std::sync::OnceLock<Box<dyn Dm + Send + Sync>> = std::sync::OnceLock::new();
+#[inline(never)]
+pub fn dm_held() -> u64 {
+    DM.get_or_init(|| Box::new(DmX)).a()
+}
+// (dyn_method_add_late: the same call, first made after the edit)
+#[inline(never)]
+pub fn dm_late() -> u64 {
+    DM.get_or_init(|| Box::new(DmX)).a()
+}
+// dyn_vtable_fresh: the trait object is made by code whose text the edit leaves; the edit adds a
+// method ahead of the one called and a reader calls both
+pub trait Dv {
+    fn a(&self) -> u64;
+}
+pub struct DvX;
+impl Dv for DvX {
+    fn a(&self) -> u64 {
+        1
+    }
+}
+pub fn dv_read() -> u64 {
+    dv_held().a()
+}
+pub static DV: std::sync::OnceLock<Box<dyn Dv + Send + Sync>> = std::sync::OnceLock::new();
+#[inline(never)]
+pub fn dv_held() -> &'static (dyn Dv + Send + Sync) {
+    &**DV.get_or_init(|| Box::new(DvX))
+}
+// dyn_impl_removed: an impl removed while a trait object of it lives, the code that made it edited
+// to make another one: the edit lands, the object keeps its vtable
+pub struct Ri(pub u64);
+impl std::fmt::Display for Ri {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+pub const RI_K: u64 = 0;
+pub fn ri_make() -> Box<dyn std::fmt::Display + Send + Sync> {
+    Box::new(Ri(7))
+}
+pub static RI: std::sync::OnceLock<Box<dyn std::fmt::Display + Send + Sync>> = std::sync::OnceLock::new();
+#[inline(never)]
+pub fn ri_read() -> u64 {
+    RI.get_or_init(ri_make).to_string().len() as u64 + RI_K
+}
 
 pub const CONST_NONLIT: u64 = 1 + 0;
 
