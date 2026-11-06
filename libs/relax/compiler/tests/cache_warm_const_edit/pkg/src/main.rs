@@ -8,6 +8,7 @@
 mod ballast;
 mod fields;
 mod readers;
+mod skipped;
 mod values;
 use std::hint::black_box;
 
@@ -36,6 +37,12 @@ fn const_direct() -> u64 {
 #[inline(never)]
 fn added_module_read() -> u64 {
     0
+}
+
+// const_skipped: a const of a module the boot skipped, read here and in its own file
+#[inline(never)]
+fn const_skipped() -> u64 {
+    skipped::SKIPPED_K
 }
 
 #[inline(never)]
@@ -498,6 +505,8 @@ fn run() {
             ("field_copy", values::cp_read()),
             ("field_copy_frame", held_copy.a as u64 + held_copy.b),
             ("const_added_module", added_module_read()),
+            ("const_skipped", const_skipped()),
+            ("skipped_own", skipped::skipped_own()),
         ];
         let mut line = format!("out tick {n}");
         for (name, v) in row.into_iter().chain(readers::row(late)) {

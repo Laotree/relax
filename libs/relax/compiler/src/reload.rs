@@ -4101,7 +4101,11 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     if linked_process {
         for (d, closure) in &const_before {
             if closure.is_none() {
-                restart.push(format!("const `{}` changed, and this run's code comes from the disk cache: no key shows its readers there -- restart the app", def_name(&u.prog, *d)));
+                restart.push(if crate::cache::in_skipped_file(&u.prog, *d) {
+                    format!("const `{}` changed in a module the boot skipped (loaded after it): this run's code from the disk cache is keyed by that module's text whole, not by its readers -- restart the app", def_name(&u.prog, *d))
+                } else {
+                    format!("const `{}` changed, and this run's code comes from the disk cache: no key shows its readers there -- restart the app", def_name(&u.prog, *d))
+                });
             }
         }
     }

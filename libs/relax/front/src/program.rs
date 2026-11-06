@@ -2236,6 +2236,12 @@ impl Program {
         false
     }
 
+    /// The file an edit's version `f` is a version of: the one loaded first (a boot file, or one
+    /// loaded after the boot); `f` itself when no edit made it.
+    pub fn first_version(&self, f: u32) -> u32 {
+        self.edit_boot.get(&f).copied().unwrap_or(f)
+    }
+
     /// Whether file `f` is the version current now: a boot file no edit replaced, or the version
     /// an edit made current (a replaced, refused or rolled-back version is not).
     pub fn is_current_version(&self, f: u32) -> bool {
