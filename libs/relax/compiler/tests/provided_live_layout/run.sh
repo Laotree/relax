@@ -26,17 +26,13 @@ finish() {
 }
 trap finish EXIT
 unset MAKEPAD_RUN_STD MAKEPAD_RUN_LOADER
-# the crate at framework/run/fixture of the workspace: not one of the framework's own directories
-# there (reload.rs gandalf_app_roots), and the file its fork_busy bin includes four levels up
-F="$T/ws/framework/run/fixture"
-mkdir -p "$F" "$T/ws/libs/relax/compiler/tests/std" "$T/home" "$T/tmp" "$T/reg" "$T/box"
+mkdir -p "$T/ws/fixture" "$T/home" "$T/tmp" "$T/reg" "$T/box"
 # the binary runs from a copy outside any cargo target directory (as devhub's boxes run theirs)
 cp "$BIN" "$T/box/makepad" || exit 1
-cp -R "$R/tools/run/fixture/Cargo.toml" "$R/tools/run/fixture/src" "$R/tools/run/fixture/tests" "$F/"
-cp "$R/libs/relax/compiler/tests/std/os_fork_busy.rs" "$T/ws/libs/relax/compiler/tests/std/"
+cp -R "$R/tools/run/fixture/Cargo.toml" "$R/tools/run/fixture/src" "$R/tools/run/fixture/tests" "$T/ws/fixture/"
 cat > "$T/ws/Cargo.toml" <<EOF
 [workspace]
-members = ["framework/run/fixture"]
+members = ["fixture"]
 resolver = "2"
 
 [workspace.dependencies]
