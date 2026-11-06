@@ -91,6 +91,14 @@ impl PendingPlan {
     pub fn new(crates: &[PreCrate], contexts: Vec<Arc<crate::source_context::Context>>, images: Option<&dyn crate::crate_image::CrateImages>, parallel: bool) -> Self {
         let image = if crates.iter().any(|c| c.cfg.session.runtime.lazy_verify) { None }
             else { images.and_then(|images| images.demand_image(crates, recipe_identity(crates))) };
+        // an edited start whose stored plan selected everything: that plan, not a new closure
+        // over every crate (nor its parts encoded again)
+        if image.is_none() && !crates.iter().any(|c| c.cfg.session.runtime.lazy_verify) {
+            if let Some(stored) = images.and_then(|images| images.carried_demand_image(crates)) {
+                if trace() { eprintln!("boot-trace: demand plan carried: its inputs changed, it selected every file"); }
+                return Self::carried(crates, contexts, stored);
+            }
+        }
         let parts = if image.is_none() && crates.first().is_some_and(|c| c.cfg.session.options.rs_lazy)
             && !crates.iter().any(|c| c.cfg.session.runtime.lazy_verify) {
             images.and_then(|i| i.demand_parts(crates, recipe_identity(crates)))

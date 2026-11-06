@@ -1676,7 +1676,7 @@ impl<'a> Parser<'a> {
         let mut full_path = mpath.clone();
         full_path.push(name.clone());
         let prelude_shadowed = STD_PRELUDE_MACROS.contains(&name.as_str())
-            && (m.builtin_macro_path(&self.krate, &module, &full_path, &mut Default::default()).is_some()
+            && (m.builtin_macro(&self.krate, &module, &full_path).is_some()
                 || (qual.is_none() && !path.global() && self.no_prelude == 0 && !self.name_imported(&name, self.pos)));
         let bdef = if prelude_shadowed {
             crate::builtins::builtin_macro_def(&name)
