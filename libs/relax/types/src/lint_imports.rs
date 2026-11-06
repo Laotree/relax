@@ -51,6 +51,31 @@ pub fn note_method(prog: &Program, tcx: &Tcx, krate: u32, d: DefId) {
     METHOD_TRAITS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(krate).or_default().insert(t);
 }
 
+/// The traits in scope at code of module `m` (its block scopes up to the item's module: what it
+/// binds, its `as _` imports, what its globs bring) that have an item `item` (rustc_resolve
+/// trait_may_have_item) are used by crate `krate`'s bodies.
+pub fn note_scope_traits(prog: &Program, krate: u32, m: u32, item: &str) {
+    let Some(item) = prog.syms.get(item) else { return };
+    let has_item = |t: DefId| prog.traits[prog.def(t).sub as usize].iter().any(|&v| prog.def(v).name == item);
+    let mut traits: Vec<DefId> = Vec::new();
+    let mut stack: Vec<u32> = Vec::new();
+    let mut s = Some(m);
+    while let Some(mi) = s {
+        stack.push(mi);
+        s = prog.mods[mi as usize].lexical_parent;
+    }
+    let mut seen: HashSet<u32> = HashSet::new();
+    while let Some(mi) = stack.pop() {
+        if !seen.insert(mi) { continue; }
+        let md = &prog.mods[mi as usize];
+        traits.extend(md.types.values().copied().filter(|&t| prog.def(t).kind == DefKind::Trait && has_item(t)));
+        traits.extend(md.anon_traits.iter().map(|&(t, _)| t).filter(|&t| has_item(t)));
+        for &(g, _) in &md.globs { if prog.def(g).kind == DefKind::Mod { stack.push(prog.def(g).sub); } }
+    }
+    let mut mt = METHOD_TRAITS.lock().unwrap_or_else(|e| e.into_inner());
+    mt.get_or_insert_with(HashMap::new).entry(krate).or_default().extend(traits);
+}
+
 /// An identifier token of a file and where it is written.
 struct Ident {
     /// the call site for tokens of macro expansions
@@ -395,6 +420,9 @@ pub fn check(prog: &Program, tcx: &Tcx, c: &crate::lint_dead::CrateItems, reach:
             };
             for l in &ls {
                 if dup_glob(l) { continue; }
+                // rustc_resolve finalize_imports: an import that did not resolve counts as used (its
+                // error is the report)
+                if ctx.unresolved(l, &c.unresolved) { continue; }
                 if exported && !(l.glob && ctx.glob_imports_nothing(l)) && !l.empty {
                     // check_import_as_underscore: an exported `as _` import of anything but a
                     // trait binds nothing a user can name
@@ -614,6 +642,17 @@ struct Ctx<'a, 'b> {
 }
 
 impl Ctx<'_, '_> {
+    /// The import of leaf `l` is one of the crate's reported `unresolved` imports.
+    fn unresolved(&self, l: &Leaf, unresolved: &[&crate::program::Import]) -> bool {
+        let prog = self.prog;
+        let pf = &prog.files[self.sc.file as usize];
+        unresolved.iter().any(|im| !im.ext && im.module == self.sc.module && im.glob == l.glob && if l.glob {
+            im.segs.len() == l.segs.len() && im.segs.iter().zip(&l.segs).all(|((_, s), ls)| prog.syms.str(*s) == pf.text(ls.name))
+        } else {
+            l.name.as_deref().is_some_and(|n| im.bind.is_some_and(|b| prog.syms.str(b) == n))
+        })
+    }
+
     /// A glob whose target has no name the importing module may use.
     fn glob_imports_nothing(&self, l: &Leaf) -> bool {
         let prog = self.prog;
