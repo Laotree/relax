@@ -125,11 +125,48 @@ fn a_dependency_body_edit_checks_only_that_dependency() {
         |d| std::fs::write(d.join("lib.rs"), "pub fn f() -> u32 {\n    2\n}\nfn unused_in_lib() {}\n").unwrap(), &[], 1);
 }
 
-/// A public item added to the library is in its interface: the binary above it is checked again.
+/// A public item added to the library, by a name nothing above it can have seen (no glob brings
+/// the library's names, no module it sees through globs binds the name): only the library is
+/// checked again.
 #[test]
-fn a_new_pub_item_checks_the_crates_above() {
+fn a_new_pub_item_nothing_can_see_checks_only_its_crate() {
     changed("pubitem", &[("lib.rs", LIB), ("bin.rs", BIN)], &[],
+        |d| std::fs::write(d.join("lib.rs"), format!("{LIB}pub fn g() {{}}\n")).unwrap(), &[], 1);
+}
+
+/// A glob import brings every name of its module: an item added there checks the crate with the
+/// glob again.
+#[test]
+fn a_new_pub_item_a_glob_brings_checks_the_crate_with_the_glob() {
+    let bin = format!("use pkg::*;\n{BIN}");
+    changed("pubglob", &[("lib.rs", LIB), ("bin.rs", &bin)], &[],
         |d| std::fs::write(d.join("lib.rs"), format!("{LIB}pub fn g() {{}}\n")).unwrap(), &[], 0);
+}
+
+/// An added item that shadows a name its module's glob import brought (`pkg::g` named the
+/// glob's `g`, now the new one): every crate above it is checked again.
+#[test]
+fn a_new_pub_item_shadowing_a_glob_name_checks_the_crates_above() {
+    let lib = format!("pub mod inner {{ pub fn g() -> u32 {{ 1 }} }}\npub use inner::*;\n{LIB}");
+    let bin = "fn main() { let x = pkg::f(); let y = pkg::g(); }\nfn unused_in_bin() {}\n";
+    changed("pubshadow", &[("lib.rs", &lib), ("bin.rs", bin)], &[],
+        |d| std::fs::write(d.join("lib.rs"), format!("{lib}pub fn g() -> u32 {{ 2 }}\n")).unwrap(), &[], 0);
+}
+
+/// An added item whose body defines an impl adds more than its name (the impl is global): the
+/// crates above it are checked again.
+#[test]
+fn a_new_pub_item_defining_an_impl_checks_the_crates_above() {
+    let lib = format!("{LIB}pub struct W;\n");
+    changed("pubimpl", &[("lib.rs", &lib), ("bin.rs", BIN)], &[],
+        |d| std::fs::write(d.join("lib.rs"), format!("{lib}pub fn g() {{ impl W {{ pub fn two(&self) -> u32 {{ 2 }} }} }}\n")).unwrap(), &[], 0);
+}
+
+/// A changed signature is no added item: the crates above it are checked again.
+#[test]
+fn a_changed_pub_item_checks_the_crates_above() {
+    changed("pubchange", &[("lib.rs", LIB), ("bin.rs", BIN)], &[],
+        |d| std::fs::write(d.join("lib.rs"), LIB.replace("-> u32 { 1 }", "-> u64 { 1 }")).unwrap(), &[], 0);
 }
 
 /// A feature is in the crate's cfg: flipped, the library (and so the binary) is checked again.

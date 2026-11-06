@@ -43,6 +43,7 @@ mod image;
 use image::{ManifestImage, IMAGE_MAGIC};
 pub(crate) use image::{prelink_unit, PrelinkedSlot};
 mod items;
+pub(crate) use items::{FileDigest, FileTable};
 mod deps;
 mod demand;
 mod front_run;
@@ -250,13 +251,11 @@ pub enum Mode {
     ReadOnly,
 }
 
-/// The interface hash (items.rs: the file's items outside the fn bodies that are holes) of each
-/// file of `want`, by file (None: not wanted), on several threads: `makepad check`'s verdict keys
-/// (check_reuse.rs).
-pub(crate) fn file_ifaces(prog: &crate::program::Program, want: &[usize]) -> Vec<Option<u128>> {
-    let mut out = vec![None; prog.files.len()];
-    items::file_digests_of(prog, want, &mut out);
-    out.into_iter().map(|d| d.map(|d| d.iface)).collect()
+/// The interface digest (items.rs: the file's items outside the fn bodies that are holes) and its
+/// table by item of each file of `want`, by file (None: not wanted), on several threads: `makepad
+/// check`'s verdict keys (check_reuse.rs).
+pub(crate) fn file_tables(prog: &crate::program::Program, want: &[usize]) -> Vec<Option<(FileDigest, FileTable)>> {
+    items::file_tables_of(prog, want)
 }
 
 /// File `f`'s interface text (holes marked `{..}`): check_reuse.rs traces.
