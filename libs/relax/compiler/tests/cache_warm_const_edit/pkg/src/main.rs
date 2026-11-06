@@ -5,6 +5,7 @@
 // startup manifest of its own.
 // Otherwise the late readers run once the file WARM_EDIT_LATE names exists: their stored code is
 // first linked after the edit.
+mod ballast;
 mod fields;
 mod readers;
 mod values;
@@ -383,6 +384,7 @@ fn main() {
 }
 
 fn run() {
+    black_box(ballast::ballast());
     let once = std::env::var("WARM_EDIT_ONCE").ok();
     if once.as_deref() == Some("many") {
         black_box(many());

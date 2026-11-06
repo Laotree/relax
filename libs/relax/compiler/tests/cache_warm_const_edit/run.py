@@ -28,6 +28,8 @@ holds restarts (MUST), naming the running fn.
 A stored entry can be older than the manifest of the run that reads it: the edited text's first run,
 reaching none of the late readers, writes its own manifest (its keys are "unchanged" from then on),
 and the next run's first late reads must still see that the entries they find are of the old text.
+fewer_definitions: a session whose crate has fewer definitions than the cache's image (a module the
+fill had is gone): the image's types still name the old crate's, past the program's; edits land.
 --cold: the same sessions with the disk cache off, for comparison.
 --window: the same program with a window (hidden), so a restart keeps the process and the window: the
 new value must show in the same pid.
@@ -418,6 +420,40 @@ def older_than_manifest():
         save(path, base)
 
 
+def fewer_definitions():
+    """A session that starts with fewer definitions than the cache's image: the fill's crate had
+    `mod ballast;` (300 definitions, its fn called), this text has neither. The restore keeps the
+    dependencies and collects the edited crate again, while the image's types, kept with their ids,
+    still name the old crate's definitions: its closures' owners sit past this program's. A body
+    edit, then a const edit, land as in any session; an ICE (the old crate's types read as this
+    program's) is the failure."""
+    path = os.path.join(pkg, M)
+    base = open(path).read()
+    call = "    black_box(ballast::ballast());\n"
+    assert base.count("mod ballast;\n") == 1 and base.count(call) == 1
+    save(path, base.replace("mod ballast;\n", "").replace(call, ""))
+    try:
+        row, err = session("const_after_body", V, "CONST_DIRECT: u64 = 1;", "CONST_DIRECT: u64 = 2;", 2)
+    finally:
+        save(path, base)
+    if not any(re.search(r"collected: retained \d+ crates; rebuilding", l) for l in err):
+        return "the session did not start from the image with the dependencies kept: " + next((l for l in err if "collected: restored" in l or "not restored" in l), "")[:200]
+    ice = next((l for l in err if "internal compiler error" in l), None)
+    if ice:
+        if "-v" in args:
+            for l in err:
+                if "panicked at" in l or re.search(r"^\s+\d+: ", l):
+                    print("    | " + l[:300])
+        return ice[:300]
+    if row["outcome"] != "landed":
+        return "%s %s" % (row["outcome"], row["patch"])
+    return ""
+
+
+if not cold and (not only or "fewer_definitions" in only):
+    why = fewer_definitions()
+    print("%-23s %s" % ("fewer_definitions", why or "ok"))
+    fails += 1 if why else 0
 if not cold and (not only or "older_than_manifest" in only):
     why = older_than_manifest()
     print("%-23s %s" % ("older_than_manifest", why or "ok"))
