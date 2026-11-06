@@ -301,6 +301,12 @@ impl ClosureOwners {
         for i in self.seen..end {
             let TyKind::Closure(file, _, a) = tcx.tys.kind(TyId(i as u32)) else { continue };
             let TyKind::FnDef(d, ..) = tcx.tys.kind(a.parent_args) else { continue };
+            // A warm start that collected the edited crate again keeps the image's types, ids and
+            // all (Tcx::retain_collected_prefix): a closure of the old text of a crate that now has
+            // fewer definitions names an owner past this program's. No code of this program has
+            // that type (one whose owner is in range at most adds an owner the caller's file check
+            // drops).
+            if d.0 as usize >= prog.defs.len() { continue; }
             let mut d = *d;
             while prog.def(d).kind == DefKind::Closure { d = prog.def(d).parent; }
             self.by_file.entry(*file).or_default().insert(d);
