@@ -3491,8 +3491,39 @@ fn item_mentions(prog: &crate::program::Program, d: DefId, names: &[&[u8]]) -> b
     toks(pf, it.lo, it.hi, &[]).iter().any(|t| names.contains(t))
 }
 
+/// item_mentions, where an impl's item also names what its impl's header names: its `Self`
+/// (a method's match on `Self` sees its enum's new variants).
+fn item_or_impl_mentions(prog: &crate::program::Program, d: DefId, names: &[&[u8]]) -> bool {
+    if item_mentions(prog, d, names) { return true; }
+    let p = prog.def(d).parent;
+    if p == crate::program::NO_DEF || prog.def(p).kind != DefKind::Impl { return false; }
+    let pf = &prog.files[prog.def(p).file as usize];
+    let it = pf.ast.item(prog.def(p).item);
+    let hi = pf.src.get(it.lo as usize..it.hi as usize).and_then(|t| t.iter().position(|b| *b == b'{')).map_or(it.hi, |at| it.lo + at as u32);
+    toks(pf, it.lo, hi, &[]).iter().any(|t| names.contains(t))
+}
+
 fn def_name(prog: &crate::program::Program, d: DefId) -> String {
     prog.syms.str(prog.def(d).name).to_string()
+}
+
+/// The checks `makepad check` and the app check at boot run on a type-checked body after its
+/// types (check.rs body_errors, in its order): type privacy, then E0004 / E0005 and the binding
+/// conflicts of `x @ pat`. For the crates whose errors refuse live edits (borrowck admit); run
+/// mode's unsafety errors are typeck's own (type_queries check_body). An internal failure of the
+/// pattern analysis reports nothing, as in a check.
+fn mir_phase_errors(prog: &Program, tcx: &crate::tcx::Tcx, d: DefId) -> Vec<String> {
+    if !crate::borrowck::event::admit(prog, prog.def(d).krate) { return Vec::new(); }
+    let _quiet = crate::lint::Suppress::new();
+    let body = tcx.typeck(prog, d);
+    if !body.errors.is_empty() { return body.errors.to_vec(); }
+    let privacy = relax_types::privacy_types::check_body(prog, tcx, &body);
+    if !privacy.is_empty() { return privacy; }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| relax_types::pattern_analysis::check_body(prog, tcx, &body))) {
+        Ok(r) if !r.errors.is_empty() => r.errors.into_iter().chain(r.at_patterns).collect(),
+        Ok(r) => r.at_patterns,
+        Err(_) => Vec::new(),
+    }
 }
 
 /// RELOAD' (lead design, round 33): whether the running value an initializer slot made (an
@@ -4143,19 +4174,22 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let mut moved_fields: Vec<(DefId, Vec<u32>)> = Vec::new();
     // the structs that take their new layout (fresh_layout_struct), each with the ADTs holding it
     let mut fresh_structs: Vec<(DefId, Vec<DefId>)> = Vec::new();
+    // what the running values (or the numbers and constants code read) cannot take: a restart
+    // decided after the commit, where the edit's text is type-checked -- its errors refuse it
+    let mut late_restart: Vec<String> = Vec::new();
     for &d in &layout_defs {
         // an enum's matches see the new variants
         if u.prog.def(d).kind == DefKind::Enum {
             set_names.push(def_name(&u.prog, d).into_bytes());
             if let Some(line) = enum_numbers_read(u, d, &versions, &visible_crates) {
-                restart.push(line);
+                late_restart.push(line);
             }
             continue;
         }
         if fresh_layout_struct(u, d) {
             let s = holding_adts(u, d);
             if let Some(line) = no_live_values(u, d, &s) {
-                restart.push(line);
+                late_restart.push(line);
             }
             fresh_structs.push((d, s));
         }
@@ -4188,7 +4222,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             let type_macros = through_macros(&u.prog, &visible_crates, &types);
             let type_macros: Vec<&[u8]> = type_macros.iter().map(|n| n.as_slice()).collect();
             if let Some(line) = const_code_using(u, d, &gone, &names, &visible_crates, &changes) {
-                restart.push(line);
+                late_restart.push(line);
             }
             let mut seen: crate::fxhash::HashSet<DefId> = Default::default();
             let mut named = 0usize;
@@ -4503,7 +4537,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     // (a fn returning an opaque type with a slot: compiled code built for the type
                     // it returns calls it, or will)
                     if (f.compiled || f.rir.is_some() || defines_opaque(&u.prog, *d)) && !std_crates.contains(&u.prog.def(*d).krate) && matches!(u.prog.def(*d).kind, DefKind::Fn | DefKind::AssocFn) && seen.insert(*d) {
-                        if !body_defs.contains(d) && def_is_bound(&u.prog, *d) && item_mentions(&u.prog, *d, &names) {
+                        if !body_defs.contains(d) && def_is_bound(&u.prog, *d) && item_or_impl_mentions(&u.prog, *d, &names) {
                             body_defs.push(*d);
                         }
                     }
@@ -4579,7 +4613,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     }
     if !restart.is_empty() {
         out.rung = Rung::Restart;
-        out.lines = restart;
+        out.lines = late_restart;
+        out.lines.extend(restart);
         out.ms[0] = ms(t0);
         return out;
     }
@@ -4627,6 +4662,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             if via_slot || item_mentions(&u.prog, c, &names) {
                 if u.tcx.const_was_evaluated(c) {
                     out.rung = Rung::Restart;
+                    out.lines.extend(late_restart.iter().cloned());
                     let named = if u.prog.def(c).kind == DefKind::AnonConst { consts_hit[0] } else { c };
                     out.lines.push(format!("const `{}` depends on a changed const and is used in a type -- restart the app", def_name(&u.prog, named)));
                     out.ms[0] = ms(t0);
@@ -4642,12 +4678,14 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     }
     if let Some(d) = const_read_by_a_type(u, &consts_hit) {
         out.rung = Rung::Restart;
+        out.lines.extend(late_restart.iter().cloned());
         out.lines.push(format!("const `{}` is used in a type (an array length or const generic argument): its users' types change -- restart the app", def_name(&u.prog, d)));
         out.ms[0] = ms(t0);
         return out;
     }
     if let Some(st) = static_of_changed_consts(u, &consts_hit) {
         out.rung = Rung::Restart;
+        out.lines.extend(late_restart.iter().cloned());
         out.lines.push(format!("the initializer of `{}` reads a changed const, and `{}` already holds the value the old one made (an initializer runs once) -- restart the app", def_name(&u.prog, st), def_name(&u.prog, st)));
         out.ms[0] = ms(t0);
         return out;
@@ -4831,7 +4869,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     trace_sub("gp_const_code");
     if !discr_restart.is_empty() {
         out.rung = Rung::Restart;
-        out.lines = discr_restart;
+        out.lines = late_restart;
+        out.lines.extend(discr_restart);
         out.ms[0] = ms(t0);
         return out;
     }
@@ -4927,7 +4966,11 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         let def = u.prog.def(d);
         (def.kind == DefKind::Enum).then(|| (d, u.prog.variants[def.sub as usize].clone()))
     }).collect();
-    let mut layout_restart: Vec<String> = Vec::new();
+    let mut layout_restart: Vec<String> = late_restart;
+    // a type edit the commit left at its running definition, or a trait's opaque types it does
+    // not apply live (its restart's reason says why): bodies checked against them would report
+    // errors the new text does not have
+    let mut types_unapplied = false;
     let mut added_defaults: Vec<(DefId, u32, DefId)> = Vec::new();
     let retry_sources: Vec<_> = if kept.is_some() && retries > 0 {
         versions.iter().map(|(v, _)| (v.old, v.path.clone(), v.pf.src[..v.pf.src_len as usize].to_vec())).collect()
@@ -5148,6 +5191,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 // RELOAD': folded values only (every query below then folds as well)
                 let Some(values) = fresh_adt.fold_discriminants(&u.tcx, &u.prog) else {
                     layout_restart.push(format!("enum `{}`: a discriminant is now computed by code -- restart the app", def_name(&u.prog, d)));
+                    types_unapplied = true;
                     continue;
                 };
                 after = values;
@@ -5185,7 +5229,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     }
                     out.lines.extend(notes);
                 }
-                Err(r) => layout_restart.push(r),
+                Err(r) => {
+                    layout_restart.push(r);
+                    types_unapplied = true;
+                }
             }
         }
         trace_sub("layout_fresh");
@@ -5201,6 +5248,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             let retyped = old.variants.iter().zip(&fresh_adt.variants).flat_map(|(o, n)| o.fields.iter().zip(&n.fields)).find(|(o, n)| o.ty != n.ty);
             if let Some((o, _)) = retyped {
                 layout_restart.push(format!("struct `{}`: field `{}` changed its type though its text did not (what the type names changed), and its readers are not known -- restart the app", def_name(&u.prog, d), u.prog.syms.str(o.name)));
+                types_unapplied = true;
             }
         }
         if !saved_adts.is_empty() {
@@ -5403,6 +5451,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         .map(|f| u.prog.file_paths[f as usize].clone()).chain(edit_paths).collect();
     let mut errs: Vec<String> = add_errs.into_iter().filter(|e| !(e.contains(".rs:")) || edited.iter().any(|p| e.starts_with(p.as_str()))).collect();
     errs.extend(removed_errs);
+    // The edit's own errors, as a fresh build of its text reports them: they refuse it even
+    // where a restart is also needed (a restart would only stop at them)
+    let mut real: Vec<String> = errs.clone();
     let mut as_restart = !layout_restart.is_empty();
     errs.extend(layout_restart);
     // `Copy` removed and `Drop` added for one type: code compiled for the copies it made copies
@@ -5474,17 +5525,21 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             if p != crate::program::NO_DEF && edited_traits.contains(&p) && u.prog.associated_types_for_impl_traits.get(&d).is_some_and(|v| !v.is_empty()) {
                 errs.push(format!("`{}` returns `impl Trait` or a future: adding it to a trait is not applied live yet -- restart the app", u.prog.def_path(d)));
                 as_restart = true;
+                types_unapplied = true;
             }
         }
         // the impls' items against their traits, as a fresh build checks them (E0046: a required
         // fn removed; E0053: an override's signature)
         for &imp in &impls {
-            errs.extend(u.tcx.check_impl_items_against_trait(&u.prog, imp));
+            let e = u.tcx.check_impl_items_against_trait(&u.prog, imp);
+            real.extend(e.iter().cloned());
+            errs.extend(e);
         }
         for &ti in &items {
             if u.prog.associated_types_for_impl_traits.get(&ti).is_some_and(|v| !v.is_empty()) {
                 errs.push(format!("`{}` returns `impl Trait` or a future: an override's is a type of its own, and the code compiled before holds the other one -- restart the app", u.prog.def_path(ti)));
                 as_restart = true;
+                types_unapplied = true;
             }
         }
         let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
@@ -5643,11 +5698,13 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 uniq.push(t);
             }
         }
-        // (a layout the running values cannot take: the restart's reasons alone)
-        if as_restart {
+        // (checked when a restart is also needed: their errors refuse the edit, and the restart
+        // would stop at them -- unless a type of the edit kept its running definition)
+        if as_restart && types_unapplied {
             uniq.clear();
         }
         trace_count("typecheck_items", uniq.len());
+        let mut mir_checked: Vec<DefId> = Vec::new();
         for (d, a) in uniq {
             // Derive code, not the program's items; whether running values can take a default
             // is decided by evaluating it below.
@@ -5655,13 +5712,22 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::checked_body(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, d, &a)));
             match r {
                 Ok(b) => {
-                    for e in &b.errors {
-                        if !errs.contains(e) { errs.push(e.clone()); }
+                    let mut found = b.errors.to_vec();
+                    // the MIR-phase checks of `makepad check` (and the app check at boot) on the
+                    // body's own text, once per item: those of its instances are the same
+                    if found.is_empty() && !mir_checked.contains(&d) {
+                        mir_checked.push(d);
+                        found = mir_phase_errors(&u.prog, &u.tcx, d);
+                    }
+                    for e in found {
+                        if !real.contains(&e) { real.push(e.clone()); }
+                        if !errs.contains(&e) { errs.push(e); }
                     }
                     // kept for the sandbox check and the borrow gate (which would type-check
                     // the same body again)
                     checked_bodies.push(b);
                 }
+                // (not the text's error: where a restart is needed, the restart builds it anew)
                 Err(p) => errs.push(format!("internal compiler error type-checking {} ({}) -- makepad run bug, report it", u.prog.def_path(d), crate::lifeline::panic_line(&*p))),
             }
         }
@@ -5674,14 +5740,23 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 checked.push(krate);
                 let bodies: Vec<_> = checked_bodies.iter().filter(|b| u.prog.file_crate[b.file as usize] == krate
                     && crate::sandbox::is_sandboxed_crate_key(&u.prog, &FnKey::Inst(b.def, b.args.to_vec()))).collect();
-                errs.extend(crate::modules::sandbox_check(&u.prog, &u.tcx, krate, &bodies));
+                let e = crate::modules::sandbox_check(&u.prog, &u.tcx, krate, &bodies);
+                real.extend(e.iter().cloned());
+                errs.extend(e);
             }
         }
     }
     if module {
         for &file in &olds {
-            errs.extend(crate::modules::check_orphans(u, u.prog.file_crate[file as usize], &added_defs));
+            let e = crate::modules::check_orphans(u, u.prog.file_crate[file as usize], &added_defs);
+            real.extend(e.iter().cloned());
+            errs.extend(e);
         }
+    }
+    // a restart that the edit's errors would stop: the errors alone refuse it
+    if as_restart && !real.is_empty() {
+        errs = real.clone();
+        as_restart = false;
     }
     // The running values cannot take such an initial value: a restart, unless the edit also
     // has real errors (those alone refuse it).
@@ -5826,7 +5901,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // Linked code's type-level uses show here, as its readers lower: an evaluation of the new text
     // (publish_reload dropped the evaluations of the old; a const no constant context names is not
     // read by one). The types of the code around them changed: none of it installs.
-    if linked_process && ctfe_relevant {
+    if linked_process && ctfe_relevant && real.is_empty() {
         let u = &*up;
         if let Some(d) = const_read_by_a_type(u, &consts_hit) {
             errs = vec![format!("const `{}` is used in a type (an array length or const generic argument): its users' types change -- restart the app", def_name(&u.prog, d))];
@@ -7326,6 +7401,11 @@ pub fn relaunch_asked() -> bool {
 /// The edits that wait for a relaunch, oldest first (cleared once a run loads the sources).
 pub fn restart_pending() -> Vec<String> {
     RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// One reason no longer waits for a restart (a rebuild of makepad that changed nothing).
+fn drop_restart_pending(why: &str) {
+    RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).retain(|p| p != why);
 }
 
 /// A run loaded the sources as they are (`domain_loaded`): no edit waits for a restart any more.
