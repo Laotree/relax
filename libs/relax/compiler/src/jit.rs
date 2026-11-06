@@ -9252,6 +9252,18 @@ pub(crate) unsafe fn install_patched(up: *mut Unit, id: u32, code: &[u8], map: V
     Ok(a)
 }
 
+/// Hot reload: slot `id`, which an earlier patch made a forwarder (install_forward), gets code of
+/// its own again in patch group `gen`: its instance is its own again (the override that took its
+/// place went). A rollback brings the forwarder back.
+pub(crate) unsafe fn install_unforwarded(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u64)>, relocs: &[relax_backend::rir::RelocAt], gen: u32) -> Result<u64, String> {
+    let u = &mut *up;
+    let t = if u.fns[id as usize].rir.as_ref().is_some_and(|r| r.baseline) { tier::BASELINE } else { tier::O1 };
+    let _as = code_as(CodeKind::new(t, origin::PATCH));
+    let a = u.install_code(id, code, relocs, map, gen)?;
+    u.arm_counter(id, a);
+    Ok(a)
+}
+
 /// Hot reload (reload.rs: closures and suspended bodies stored by a running version): slot `id`,
 /// an older version of a closure or async body, runs `target`'s code from now on. Its code becomes
 /// a jump to `target`'s thunk (as a foreign fn's veneer), installed in patch group `gen`: a rollback

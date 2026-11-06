@@ -589,6 +589,11 @@ fn recollect_impls(u: &mut Unit, removed: &[DefId], scope: Option<&[bool]>) {
         // (they were collected without errors before the edit)
         let _ = u.tcx.collect_added_in(&u.prog, &impls, false, scope);
     }
+    // a trait impl's fn back in its impl is linked to the trait's item again (the edit linked the
+    // impl's items without it: a fn replaced for a new signature left before its new one came)
+    if removed.iter().any(|&d| u.prog.def(d).kind == DefKind::AssocFn && u.tcx.impl_trait.contains_key(&u.prog.def(d).parent) && !u.prog.trait_item_def_id.contains_key(&d)) {
+        relax_front::assoc::collect_in(&mut u.prog, scope);
+    }
 }
 
 /// Rolls back an installed patch group (a panic or fault in its code, M7): the slots return
@@ -1647,6 +1652,9 @@ fn classify_moving(prog: &crate::program::Program, old_file: u32, new: &crate::p
                 Some(p) => match (&na.items[p as usize].kind, fwd.get(&p)) {
                     (ItemKind::Mod(Some(_)), Some(&op_)) if addable(new, &it.kind) => prog.item_defs.get(&(old_file, op_)).map(|d| Ok(prog.def(*d).sub)),
                     (ItemKind::Impl { .. }, Some(&op_)) if inherent_impl(new, p) && addable(new, &it.kind) && matches!(it.kind, ItemKind::Fn(..) | ItemKind::Const(..)) => prog.item_defs.get(&(old_file, op_)).map(|d| Err(*d)),
+                    // a fn of a trait impl (an override of a provided method, or one replaced for
+                    // a new signature): apply_locked resolves the instances the trait reaches anew
+                    (ItemKind::Impl { .. }, Some(&op_)) if !inherent_impl(new, p) && addable(new, &it.kind) && matches!(it.kind, ItemKind::Fn(..)) => prog.item_defs.get(&(old_file, op_)).map(|d| Err(*d)),
                     _ => None,
                 },
                 _ => None,
@@ -1704,6 +1712,9 @@ fn classify_moving(prog: &crate::program::Program, old_file: u32, new: &crate::p
                     ItemKind::Mod(Some(_)) => removable(&it.kind),
                     ItemKind::Impl(_) | ItemKind::Trait(..) if removed.contains(&p) => true,
                     ItemKind::Impl(r) if oa.row(*r).trait_.is_none() => matches!(it.kind, ItemKind::Fn(..) | ItemKind::Const(..)),
+                    // a trait impl's fn (not one whose callers hold the future or `impl Trait`
+                    // its body makes): the trait's provided one, if any, takes its place
+                    ItemKind::Impl(_) => matches!(it.kind, ItemKind::Fn(..)) && !prog.item_defs.get(&(old_file, i)).is_some_and(|d| moving.contains(d)),
                     _ => false,
                 },
             };
@@ -2256,6 +2267,15 @@ fn def_is_bound(prog: &crate::program::Program, d: DefId) -> bool {
         return prog.impls.get(prog.def(parent).sub as usize).map_or(false, |i| i.items.contains(&d));
     }
     prog.mods.get(def.scope as usize).map_or(false, |m| m.values.get(&def.name) == Some(&d) || m.types.get(&def.name) == Some(&d))
+}
+
+/// A fn of a trait impl that stays (not in `removed`): its impl and the trait's item it implements.
+fn override_of(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, d: DefId, removed: &[DefId]) -> Option<(DefId, DefId)> {
+    let def = prog.def(d);
+    if def.kind != DefKind::AssocFn || def.parent == crate::program::NO_DEF || prog.def(def.parent).kind != DefKind::Impl || !tcx.impl_trait.contains_key(&def.parent) || removed.contains(&def.parent) {
+        return None;
+    }
+    Some((def.parent, *prog.trait_item_def_id.get(&d)?))
 }
 
 /// The instance slot `s` is code of (a closure's: its fn's).
@@ -3706,7 +3726,12 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     }
     for (v, plan) in &versions {
         let na = &v.pf.ast;
-        for &(j, _) in &plan.added {
+        for &(j, at) in &plan.added {
+            // a fn added to a trait impl names nothing new: the code that reaches the trait's
+            // method calls it through the instances that resolve to it (after the commit)
+            if matches!(at, Err(imp) if u.tcx.impl_trait.contains_key(&imp)) {
+                continue;
+            }
             let it = &na.items[j as usize];
             set_names.push(v.pf.src[it.name.lo as usize..it.name.hi as usize].to_vec());
             // a trait impl's methods shadow nothing (the trait's own methods resolve as before
@@ -3720,6 +3745,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             }
         }
         for &d in &plan.removed {
+            // (a fn removed from a trait impl that stays: the same)
+            if override_of(&u.prog, &u.tcx, d, &plan.removed).is_some() {
+                continue;
+            }
             set_names.push(def_name(&u.prog, d).into_bytes());
             let items: &[DefId] = match u.prog.def(d).kind {
                 DefKind::Impl => &u.prog.impls[u.prog.def(d).sub as usize].items,
@@ -4224,6 +4253,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let mut scope: Option<Vec<bool>> = None;
     let saved_consts: Vec<((DefId, Vec<TyId>), u64)>;
     let saved_failed: Vec<(DefId, Vec<TyId>)>;
+    // the fns removed from trait impls that stay: (fn, impl, the trait's item), read before the
+    // commit unlinks them
+    let gone_overrides: Vec<(DefId, DefId, DefId)> = versions.iter().flat_map(|(_, p)| p.removed.iter().filter_map(|&d| override_of(&u.prog, &u.tcx, d, &p.removed).map(|(imp, ti)| (d, imp, ti)))).collect();
     // 4: commit the versions; check
     let t1 = Instant::now();
     out.ms[0] = (t1 - t0).as_secs_f64() * 1e3;
@@ -4320,6 +4352,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     // items added inside a paired body (a `use` in a closure) got their defs at the
                     // commit: the type context collects them with the other added items
                     added_defs.extend(u.prog.take_body_added());
+                    // a fn replaced in a trait impl (a new signature) leaves it before the new one
+                    // is linked to the trait's item (with both there it is E0201)
+                    let replaced: Vec<DefId> = removed.iter().copied().filter(|&d| override_of(&u.prog, &u.tcx, d, &removed).is_some()).collect();
+                    u.prog.unbind_defs(&replaced);
                     let first_added = u.prog.defs.len();
                     match u.prog.add_items(n, &items) {
                         Ok(ds) => added_defs.extend(ds),
@@ -4680,6 +4716,122 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 }
             }
         }
+    }
+    // A fn added to or removed from a trait impl that stays (an override of a provided method,
+    // or one replaced for a new signature): the instances of the trait's method resolve anew, as
+    // a fresh run of this text resolves them. A slot whose instance now resolves to another fn
+    // runs that fn's code from the install on, through a forwarder (jit::install_forward): the
+    // code that reaches it without naming it -- a trait object's vtable, a fn pointer, generic
+    // and std code -- runs the new one. The callers that inlined it are rebuilt, and a frame in a
+    // copy inlined before calls the forwarder at the copy's next run (its patch flag). A slot an
+    // earlier edit forwarded whose instance is its own again (the override went) gets its own
+    // code back.
+    let mut retarget: Vec<(u32, u32)> = Vec::new();
+    let mut homes: Vec<u32> = Vec::new();
+    {
+        let added_overrides: Vec<(DefId, DefId, DefId)> = added_defs.iter().filter_map(|&d| override_of(&u.prog, &u.tcx, d, &added_impls).map(|(imp, ti)| (d, imp, ti))).collect();
+        let mut items: Vec<DefId> = added_overrides.iter().chain(&gone_overrides).map(|x| x.2).collect();
+        items.sort_unstable();
+        items.dedup();
+        let mut impls: Vec<DefId> = added_overrides.iter().chain(&gone_overrides).map(|x| x.1).collect();
+        impls.sort_unstable();
+        impls.dedup();
+        // the impls' items against their traits, as a fresh build checks them (E0046: a required
+        // fn removed; E0053: an override's signature)
+        for &imp in &impls {
+            errs.extend(u.tcx.check_impl_items_against_trait(&u.prog, imp));
+        }
+        for &ti in &items {
+            if u.prog.associated_types_for_impl_traits.get(&ti).is_some_and(|v| !v.is_empty()) {
+                errs.push(format!("`{}` returns `impl Trait` or a future: an override's is a type of its own, and the code compiled before holds the other one -- restart the app", u.prog.def_path(ti)));
+                as_restart = true;
+            }
+        }
+        let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
+        for s in 0..u.fns.len() as u32 {
+            let (ti, targs): (DefId, Vec<TyId>) = match &u.fns[s as usize].key {
+                FnKey::Inst(d, args) if items.contains(d) => (*d, args.clone()),
+                FnKey::Inst(d, args) => {
+                    let Some(&(_, imp, ti)) = gone_overrides.iter().find(|x| x.0 == *d) else { continue };
+                    // the impl's args, then the method's: the trait's args, then the method's
+                    let ind = u.tcx.generic_indices_of(&u.prog, imp);
+                    let k = ind.types_consts.len();
+                    if args.len() < k {
+                        continue;
+                    }
+                    let regions = u.tcx.tys.intern_region_args(&vec![crate::types::RegionId::ERASED; ind.lifetimes.len()]);
+                    let full = u.tcx.complete_args(&u.prog, imp, &args[..k], regions);
+                    let tr = u.tcx.impl_trait_ref(&u.prog, imp, &full);
+                    use relax_types::consts::GenericArg;
+                    let mut t: Vec<TyId> = tr.args.iter().filter_map(|a| match *a {
+                        GenericArg::Type(t) => Some(t),
+                        GenericArg::Const(c) => Some(u.tcx.tys.intern(crate::types::TyKind::Const(c))),
+                        GenericArg::Lifetime(_) => None,
+                    }).collect();
+                    t.extend_from_slice(&args[k..]);
+                    (ti, t)
+                }
+                _ => continue,
+            };
+            let Ok(inst) = u.tcx.resolve_instance_raw(&u.prog, env, ti, &targs) else { continue };
+            let crate::instance::InstanceKind::Item(nd) = inst.def else { continue };
+            let key = FnKey::Inst(nd, inst.compact_args(&u.tcx));
+            if key == u.fns[s as usize].key {
+                if u.forward_of(s).is_some() {
+                    homes.push(s);
+                }
+                continue;
+            }
+            let t = u.fn_id(key);
+            if u.forward_of(s).map(|x| x.0) != Some(t) {
+                retarget.push((s, t));
+            }
+        }
+        for h in homes.clone() {
+            if !slots.contains(&h) && !fresh.contains(&h) {
+                slots.push(h);
+            }
+            // (its unverified-mode twin is built again with it: its own code too)
+            if let Some(tw) = u.plain_twin_of(h).filter(|&tw| u.forward_of(tw).is_some()) {
+                homes.push(tw);
+            }
+        }
+        let mut twins: Vec<(u32, u32)> = Vec::new();
+        for &(s, t) in &retarget {
+            if crate::sandbox::twin_of(s).is_some() {
+                errs.push(format!("`{}` has sandboxed code, which does not take a forwarder -- restart the app", u.fns[s as usize].name));
+                as_restart = true;
+            }
+            // an unverified-mode twin runs the target's twin
+            if let Some(tw) = u.plain_twin_of(s) {
+                twins.push((tw, u.plain_twin(t)));
+            }
+        }
+        // the callers that inlined a forwarded slot, and theirs
+        let mut work: Vec<u32> = retarget.iter().map(|x| x.0).collect();
+        let mut seen: std::collections::HashSet<u32> = work.iter().copied().collect();
+        while let Some(s) = work.pop() {
+            for c in u.fns[s as usize].history().inlined_into.clone() {
+                if !seen.insert(c) || in_flight_only(u, c, &removed_all) {
+                    continue;
+                }
+                if !slots.contains(&c) && !fresh.contains(&c) {
+                    if u.fns[c as usize].compiled {
+                        slots.push(c);
+                    } else if u.fns[c as usize].rir.is_some() {
+                        fresh.push(c);
+                    }
+                }
+                work.push(c);
+            }
+        }
+        for &(s, _) in &retarget {
+            if !flagged.contains(&s) {
+                flagged.push(s);
+            }
+        }
+        retarget.extend(twins);
+        trace_count("retargeted", retarget.len());
     }
     // The keys follow the text. What a new run of this text would not link is rebuilt with the
     // edit's slots, by the same walk as const_readers' readers before the commit.
@@ -5348,7 +5500,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
     }
     for (id, c) in staged {
-        match jit::install_patched(up, id, &c.0, c.1, &c.2, gen) {
+        let installed = if homes.contains(&id) { jit::install_unforwarded(up, id, &c.0, c.1, &c.2, gen) } else { jit::install_patched(up, id, &c.0, c.1, &c.2, gen) };
+        match installed {
             Ok(_) => {
                 let u = &*up;
                 out.names.push(u.fns[id as usize].name.to_string());
@@ -5359,6 +5512,16 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     }
     for (id, target, cell) in forwards {
         if let Err(e) = jit::install_forward(up, id, target, cell, gen) {
+            out.lines.push(format!("link error in {}: {}", (&*up).fns[id as usize].name, e));
+        }
+    }
+    // (the instances that resolve to another fn now: no lineage, each jumps to its fn)
+    for &(id, target) in &retarget {
+        let u = &*up;
+        if !matches!(u.fns[id as usize].key, FnKey::Plain(_)) {
+            out.lines.push(format!("forwarded: `{}` runs `{}`", u.fns[id as usize].name, u.fns[target as usize].name));
+        }
+        if let Err(e) = jit::install_forward(up, id, target, false, gen) {
             out.lines.push(format!("link error in {}: {}", (&*up).fns[id as usize].name, e));
         }
     }
