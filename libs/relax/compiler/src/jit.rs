@@ -417,6 +417,8 @@ pub struct Unit {
     /// the statics' storage by address: start -> (static, size), so a pointer into a static
     /// (`&S.field`, `&S[3]`) in constant data is that static's symbol plus an offset
     pub static_spans: std::collections::BTreeMap<u64, (DefId, u64)>,
+    /// the link sections laid out so far, by output section (sections.rs)
+    pub(crate) sections: crate::fxhash::HashMap<String, crate::sections::Section>,
     pub sites: relax_session::sync::Mutex<Vec<Site>>,
     /// one site per (file, position, message): every inlined copy of a panic location is one
     /// site and one symbol, whatever the compile order (one constant pool word)
@@ -443,6 +445,10 @@ pub struct Unit {
     /// hot reload: checked bodies of older file versions, by (slot, file): closures those
     /// versions made are lowered from them (put_body)
     pub old_bodies: crate::fxhash::HashMap<(u32, u32), std::sync::Arc<Body>>,
+    /// hot reload, for the report of a closure whose owner's body is gone: per replaced file
+    /// version, what the edit that replaced it did with its closure owners (preserve_closure_bodies);
+    /// the newest PRESERVE_LOG_VERSIONS versions'
+    pub(crate) preserve_log: std::collections::VecDeque<(u32, PreserveLog)>,
     /// coroutine poll functions lowered to find their state layout (coro_frame): the build of
     /// the slot takes this RIR, so the layout callers saw and the code agree
     pub coro_rir: crate::conc::MemoMap<u32, relax_backend::rir::Func>,
@@ -466,6 +472,9 @@ pub struct Unit {
     pub locations: relax_session::sync::Mutex<crate::fxhash::HashMap<(String, u32, u32), u64>>,
     /// constants whose evaluation failed (reported once, not re-run per use)
     pub const_failed: std::collections::HashSet<(DefId, Vec<TyId>)>,
+    /// `makepad check` (eval_items): the check-mode interpreter's verdicts on the checked crates'
+    /// constants and statics, computed ahead on the pool; check_initializer takes each
+    pub interp_ahead: std::collections::HashMap<DefId, relax_types::const_eval::interp::Outcome>,
     pub core_path_cache: crate::conc::MemoMap<String, Option<DefId>>,
     /// `T: Unpin` answers (noalias on `&mut T` params needs it)
     unpin_cache: crate::conc::MemoMap<TyId, bool>,
@@ -1453,6 +1462,10 @@ unsafe fn adopt_runtime_unit(u: *mut Unit) {
     }
 }
 /// Tokens identify calls, never a process-wide arm/disarm generation.
+/// MAKEPAD_RUN_CHECK_TIMES: where the check's constant evaluation goes (CPU ns): the check-mode
+/// interpreter, the value's evaluation to data, the initializers compiled and run, the rest of
+/// eval_init (layout, storage, final checks), the cache records (check.rs eval_items prints them).
+pub(crate) static INIT_NS: [AtomicU64; 5] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static WATCHDOG_ID: AtomicU64 = AtomicU64::new(1);
 struct WatchdogCall {
     token: u64,
@@ -4486,6 +4499,7 @@ impl Unit {
             const_certs: Default::default(),
             tls_places: Default::default(),
             static_spans: Default::default(),
+            sections: Default::default(),
             sites: Default::default(),
             site_ix: Default::default(),
             panic_hook: std::sync::atomic::AtomicUsize::new(0),
@@ -4498,6 +4512,7 @@ impl Unit {
             rt: Rt { fmt_str: 0, fmt_int: 0, fmt_float: 0, fmt_print: 0, panic_site: 0, panic_bounds: 0, str_eq: 0, fmod: 0, fmodf: 0, panic_impl: 0, thread_run: 0, catch_panic: 0, args: 0, memcpy: 0, memmove: 0, memset: 0, fmt_push: 0, fmt_pop: 0, resume: 0, land: 0, panicking: 0, rethrow: 0 },
             bodies: Default::default(),
             old_bodies: Default::default(),
+            preserve_log: Default::default(),
             coro_rir: Default::default(),
             coro_busy: Default::default(),
             spec_cached: Default::default(),
@@ -4507,6 +4522,7 @@ impl Unit {
             vtables: crate::conc::MemoMap::new_kept(16),
             locations: Default::default(),
             const_failed: std::collections::HashSet::new(),
+            interp_ahead: std::collections::HashMap::new(),
             core_path_cache: crate::conc::MemoMap::with_bits(8),
             unpin_cache: Default::default(),
             query_errors,
@@ -6952,14 +6968,18 @@ impl Unit {
         impl Drop for Pop { fn drop(&mut self) { let _ = CONST_STACK.try_with(|s| { s.borrow_mut().pop(); }); } }
         let _ = CONST_STACK.try_with(|s| s.borrow_mut().push((d, args.clone(), depth)));
         let cert = CertGuard::begin(FnKey::Inst(d, args.clone()));
+        let t_init = cpu_ns();
         let evaluated = { let _pop = Pop; self.eval_init(d, args.clone(), false) };
+        INIT_NS[3].fetch_add(cpu_ns() - t_init, Ordering::Relaxed);
         let cert = cert.finish();
         match evaluated {
             Some(a) => {
+                let t_rec = cpu_ns();
                 if let Some(mut cache) = self.cache.take() {
                     cache.record_const(self, d, &args, a, &cert);
                     self.cache = Some(cache);
                 }
+                INIT_NS[4].fetch_add(cpu_ns() - t_rec, Ordering::Relaxed);
                 crate::zone_alloc::kept_with(|| self.const_certs.insert((d, args.clone()), cert));
                 // the cache keeps the shared read-only image; the unit uses the per-domain one
                 // where the value reaches a static (domain.rs rehome_const)
@@ -7025,8 +7045,15 @@ impl Unit {
                 crate::domain::capture_static(self, sym);
                 crate::domain::materialize(self, sym);
             }
+            if self.prog.def(d).kind == DefKind::ForeignStatic {
+                crate::sections::retry_deferred(self, d);
+            }
             cert_note_value(self, d, &[]);
             return a;
+        }
+        // a static of a link section, or a bound of one: the section's block (sections.rs)
+        if let Some((group, bound)) = self.section_place(d) {
+            return crate::sections::place(self, d, &group, bound);
         }
         // A static has its address before its value (Reference items/static-items: statics may
         // refer to each other's addresses, also cyclically): record the address first, then run
@@ -7045,6 +7072,12 @@ impl Unit {
             self.statics.insert(d, buf);
             self.static_spans.insert(buf, (d, l.size as u64));
         });
+        self.init_static(d, t, buf, l.size as u64)
+    }
+
+    /// Runs static `d`'s initializer (type `t`, `size` bytes) into its storage `buf`, its address
+    /// already recorded; `buf`, or 0 when it has no value.
+    pub(crate) fn init_static(&mut self, d: DefId, t: TyId, buf: u64, size: u64) -> u64 {
         // Restore the initial value into this run's writable storage. The cached
         // object is an immutable snapshot taken immediately after pure CTFE,
         // never the static's later (possibly mutated) contents.
@@ -7063,7 +7096,7 @@ impl Unit {
             eprintln!("static-trace: {} {} {} {:.0} us", how, self.prog.syms.str(self.prog.crates[self.prog.def(d).krate as usize].name), self.prog.def_path(d), (cpu_ns() - t0) as f64 / 1e3);
         }
         if let Some(initial) = cached {
-            unsafe { std::ptr::copy_nonoverlapping(initial as *const u8, buf as *mut u8, l.size as usize); }
+            unsafe { std::ptr::copy_nonoverlapping(initial as *const u8, buf as *mut u8, size as usize); }
         } else if ran.as_ref().and_then(|r| r.0).is_none() {
             // needs a skipped module: evaluated again (same storage) once the outer compile
             // loaded it; the build using it fails meanwhile (DEFERRED_ABORT)
@@ -7136,7 +7169,8 @@ impl Unit {
         use relax_types::const_eval::interp::{check_item, Outcome};
         let def = self.prog.def(d);
         if !self.prog.crates[def.krate as usize].validate || !matches!(def.kind, DefKind::Const | DefKind::Static | DefKind::AnonConst) { return true; }
-        match check_item(&self.prog, &self.tcx, d) {
+        let outcome = match self.interp_ahead.remove(&d) { Some(o) => o, None => check_item(&self.prog, &self.tcx, d) };
+        match outcome {
             Outcome::Error(span, msg) => {
                 let e = if msg.starts_with('E') { self.prog.record_error(span.file, span.lo, "typeck", msg) } else { self.prog.record_uncoded_error(span.file, span.lo, "typeck", msg) };
                 self.errors.push(e);
@@ -7157,7 +7191,10 @@ impl Unit {
         // `makepad check`: the check-mode interpreter first (rustc's CTFE undefined-behaviour,
         // mutable-global and final-value checks; diagnostics only). An evaluation it rejects is not
         // run here, as rustc stops at the error.
-        if self.prog.session.options.const_fuel && args.is_empty() && !self.check_initializer(d) { return None; }
+        let t_interp = cpu_ns();
+        let checked = !(self.prog.session.options.const_fuel && args.is_empty()) || self.check_initializer(d);
+        INIT_NS[0].fetch_add(cpu_ns() - t_interp, Ordering::Relaxed);
+        if !checked { return None; }
         let _census_context = self.exec_context(false);
         let options = &self.prog.session.clone().options;
         // Initializers outside the CTFE subset already have cached executable
@@ -7206,11 +7243,15 @@ impl Unit {
         }
         let ok = self.ctfe_eval_into(d, &args, buf);
         self.stats.ctfe_ns += cpu_ns() - t0;
+        INIT_NS[1].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
         if ok {
             self.stats.ctfe_data += 1;
             return Some(buf);
         }
-        self.run_init_code(d, args, buf)
+        let t1 = cpu_ns();
+        let r = self.run_init_code(d, args, buf);
+        INIT_NS[2].fetch_add(cpu_ns() - t1, Ordering::Relaxed);
+        r
     }
 
     /// Records static `d`'s initial value (of type `t`, just evaluated into `buf`, by CTFE or by
@@ -9208,6 +9249,18 @@ pub(crate) unsafe fn install_patched(up: *mut Unit, id: u32, code: &[u8], map: V
     } else {
         u.arm_counter(id, a);
     }
+    Ok(a)
+}
+
+/// Hot reload: slot `id`, which an earlier patch made a forwarder (install_forward), gets code of
+/// its own again in patch group `gen`: its instance is its own again (the override that took its
+/// place went). A rollback brings the forwarder back.
+pub(crate) unsafe fn install_unforwarded(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u64)>, relocs: &[relax_backend::rir::RelocAt], gen: u32) -> Result<u64, String> {
+    let u = &mut *up;
+    let t = if u.fns[id as usize].rir.as_ref().is_some_and(|r| r.baseline) { tier::BASELINE } else { tier::O1 };
+    let _as = code_as(CodeKind::new(t, origin::PATCH));
+    let a = u.install_code(id, code, relocs, map, gen)?;
+    u.arm_counter(id, a);
     Ok(a)
 }
 
@@ -14039,7 +14092,7 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::
             }
             match u.body_of(*parent, *cfile) {
                 Some(b) => b.clone(),
-                None => return Err("internal compiler error: closure parent body missing".to_string()),
+                None => return Err(format!("internal compiler error: closure parent body missing: {}", missing_owner_facts(up, *parent, *cfile))),
             }
         }
         FnKey::Shim(_) | FnKey::Glue(..) => return Err("glue".to_string()),
@@ -25307,6 +25360,7 @@ pub(crate) unsafe fn preserve_closure_bodies(up: *mut Unit, files: &[u32]) -> Re
         }
     }
     let mut seen_tys: std::collections::HashSet<TyId> = Default::default();
+    let mut log: Vec<(u32, PreserveLog)> = files.iter().map(|&f| (f, PreserveLog::default())).collect();
     crate::reload::trace_sub("preserve_scan");
     crate::reload::trace_count("preserve_slotted", n_slotted);
     let mut i = 0;
@@ -25319,14 +25373,22 @@ pub(crate) unsafe fn preserve_closure_bodies(up: *mut Unit, files: &[u32]) -> Re
         if !(&*up).has_body(parent, file) {
             crate::reload::trace_count("preserve_checked", 1);
         }
+        let entry = log.iter_mut().find(|x| x.0 == file).map(|x| &mut x.1);
         match ensure_parent_body(up, parent, file, 0) {
             Ok(()) => {}
             Err(e) if i <= n_slotted => return Err(e),
-            Err(_) => continue,
+            Err(e) => {
+                if let Some(l) = entry { l.failed.push((parent, e.lines().next().unwrap_or("").chars().take(200).collect::<String>().into())); }
+                continue;
+            }
         }
         crate::reload::trace_sub("preserve_check");
         let u = &mut *up;
-        let Some(body) = u.body_of(parent, file).cloned() else { continue };
+        let Some(body) = u.body_of(parent, file).cloned() else {
+            if let Some(l) = entry { l.failed.push((parent, "no body after its check".into())); }
+            continue;
+        };
+        if let Some(l) = entry { l.kept.push(parent); }
         // Freeze shared identity tables before their definitions are replaced.
         // Old closures must never normalize an old alias against the new source.
         let body = if std::sync::Arc::ptr_eq(&body, &u.tcx.typeck(&u.prog, body.def)) {
@@ -25369,7 +25431,57 @@ pub(crate) unsafe fn preserve_closure_bodies(up: *mut Unit, files: &[u32]) -> Re
         }
         crate::reload::trace_sub("preserve_named");
     }
+    let u = &mut *up;
+    for entry in log {
+        if u.preserve_log.len() >= PRESERVE_LOG_VERSIONS { u.preserve_log.pop_front(); }
+        u.preserve_log.push_back(entry);
+    }
     Ok(())
+}
+
+/// What an edit that replaced a file version did with the closure owners of that version: the
+/// slots whose checked body it kept, and those it could not check again (the error's first line).
+#[derive(Default)]
+pub(crate) struct PreserveLog {
+    kept: Vec<u32>,
+    failed: Vec<(u32, Box<str>)>,
+}
+
+/// The replaced file versions whose PreserveLog is kept (the oldest goes).
+const PRESERVE_LOG_VERSIONS: usize = 64;
+
+/// The facts of a missing closure-owner body, for the report of the internal error (built only
+/// then): the owner, the version its closures belong to and the one that replaced it, which
+/// bodies of the owner are held, what the edit that replaced the version did with this owner,
+/// and the owner's code (tier, origin, inlining).
+unsafe fn missing_owner_facts(up: *mut Unit, id: u32, file: u32) -> String {
+    let u = &*up;
+    let f = &u.fns[id as usize];
+    let path = |v: u32| u.prog.file_paths.get(v as usize).map_or("?", |p| p.as_str());
+    let (now, at) = match &f.key {
+        FnKey::Inst(d, _) => {
+            let def = u.prog.def(*d);
+            (def.file, u.pos_str(def.file, u.prog.files[def.file as usize].ast.item(def.item).lo))
+        }
+        _ => (u32::MAX, "not a fn".to_string()),
+    };
+    let mut held: Vec<u32> = u.old_bodies.keys().filter(|k| k.0 == id).map(|k| k.1).collect();
+    held.extend(u.bodies.get(&id).map(|b| b.file));
+    held.sort_unstable();
+    let held = if held.is_empty() { "none".to_string() } else { held.iter().map(|v| format!("v{v}")).collect::<Vec<_>>().join(" ") };
+    let edit = match u.preserve_log.iter().rev().find(|(v, _)| *v == file) {
+        None => "no edit that replaced it is on record".to_string(),
+        Some((_, log)) => match (log.kept.contains(&id), log.failed.iter().find(|x| x.0 == id)) {
+            (true, _) => format!("the edit that replaced it kept this body (one of {}): it went after", log.kept.len()),
+            (_, Some((_, e))) => format!("the edit that replaced it could not check it again: {e}"),
+            _ => format!("the edit that replaced it did not see this owner (no closure slot or closure type named it; it kept {}, failed {})", log.kept.len(), log.failed.len()),
+        },
+    };
+    let code = u.code.try_read().ok().map(|t| t.kind_of(f.code)).unwrap_or_default();
+    // (the owner's position names its file: another one's path only when the closure's is not it)
+    let version = if path(file) == path(now) { format!("v{file}, replaced by v{now}") } else { format!("{} v{file}, replaced by {} v{now}", path(file), path(now)) };
+    format!("owner `{}` (slot {id}, {at}); the closure's version {version}; owner bodies held: {held}; {edit}; owner code {} {}, compiled {}, patched {}, patch gen {}, inlined into {} slot(s), RIR {}",
+        f.name, code.tier_name(), code.origin_name(), f.compiled, f.patched.load(Ordering::Relaxed), f.patch_gen, f.history().inlined_into.len(), if f.rir.is_some() { "held" } else { "none" })
 }
 
 /// The owners (file, def, args) of the closure types of `files` that type `t` names (closure
@@ -25424,7 +25536,7 @@ pub(crate) unsafe fn ensure_parent_body(up: *mut Unit, id: u32, file: u32, depth
         FnKey::Inst(d, args) => {
             let u = &mut *up;
             if file != u32::MAX && u.prog.def(d).file != file {
-                return Err("internal compiler error: closure parent body missing (its file version was replaced)".to_string());
+                return Err(format!("internal compiler error: closure parent body missing (its file version was replaced): {}", missing_owner_facts(up, id, file)));
             }
             let _o = crate::clock::origin("closure-owner");
             match take_ahead(&u.prog, &u.front, &u.tcx, d, &args) {
@@ -25446,7 +25558,7 @@ pub(crate) unsafe fn ensure_parent_body(up: *mut Unit, id: u32, file: u32, depth
             ensure_parent_body(up, grand, file, depth + 1)?;
             match (&*up).body_of(grand, file) {
                 Some(b) => b.clone(),
-                None => return Err("internal compiler error: closure parent body missing".to_string()),
+                None => return Err(format!("internal compiler error: closure parent body missing: {}", missing_owner_facts(up, grand, file))),
             }
         }
         FnKey::Shim(_) | FnKey::Glue(..) => return Err("internal compiler error: closure parent is glue".to_string()),

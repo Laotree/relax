@@ -1064,7 +1064,7 @@ impl<'a> Fcx<'a> {
         let obligations = self.fulfillment_cx.pending_obligations();
         self.fulfillment_cx = self.suspended_fulfillment.pop().expect("open snapshot");
         self.infcx.commit_from(snapshot.inference);
-        for obligation in obligations { self.fulfillment_cx.register_predicate_obligation(&self.infcx, obligation); }
+        for obligation in obligations { self.fulfillment_cx.register_predicate_obligation(&self.infcx, self.prog, obligation); }
     }
 
     fn fresh(&mut self, kind: u8) -> TyId {
@@ -1095,7 +1095,7 @@ impl<'a> Fcx<'a> {
             let at = self.infcx.at(self.prog, self.param_env.clone());
             let (ty, goals) = if use_lub { at.lub(b, a)? } else { (b, at.sub(a, b)?) };
             let mut engine = crate::next_solver::fulfill::FulfillmentCtxt::new(&self.infcx);
-            for goal in goals { engine.register_predicate_obligation(&self.infcx, crate::next_solver::fulfill::PredicateObligation { goal, recursion_depth: 0, cause: crate::next_solver::fulfill::ObligationCause { span: self.last_lo, body_id: self.b.def } }); }
+            for goal in goals { engine.register_predicate_obligation(&self.infcx, self.prog, crate::next_solver::fulfill::PredicateObligation { goal, recursion_depth: 0, cause: crate::next_solver::fulfill::ObligationCause { span: self.last_lo, body_id: self.b.def } }); }
             if !engine.try_evaluate_obligations(&self.infcx, self.prog).is_empty() { return Err(crate::infer::relate::TypeError::Mismatch); }
             // coercion.rs:164-211,1034-1055: only fn-item/pointer coercions
             // force the extra leak check; other relations keep their own checks.
@@ -1103,7 +1103,7 @@ impl<'a> Fcx<'a> {
             Ok((ty, engine.pending_obligations()))
         });
         match result {
-            Ok((ty, obligations)) => { for obligation in obligations { self.fulfillment_cx.register_predicate_obligation(&self.infcx, obligation); } Some(ty) },
+            Ok((ty, obligations)) => { for obligation in obligations { self.fulfillment_cx.register_predicate_obligation(&self.infcx, self.prog, obligation); } Some(ty) },
             Err(_) => None,
         }
     }
@@ -7714,7 +7714,7 @@ impl<'a> Fcx<'a> {
     }
 
     fn register_goal(&mut self, goal: Goal, lo: u32) {
-        self.fulfillment_cx.register_predicate_obligation(&self.infcx, crate::next_solver::fulfill::PredicateObligation { goal, recursion_depth: 0, cause: crate::next_solver::fulfill::ObligationCause { span: lo, body_id: self.b.def } });
+        self.fulfillment_cx.register_predicate_obligation(&self.infcx, self.prog, crate::next_solver::fulfill::PredicateObligation { goal, recursion_depth: 0, cause: crate::next_solver::fulfill::ObligationCause { span: lo, body_id: self.b.def } });
     }
 
     fn retry_goals(&mut self, final_: bool) {
@@ -8450,9 +8450,10 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
         }
         TyKind::FnDef(d, _, _) => format!("fn item {}", prog.def_path(*d)),
         TyKind::Param(i) => format!("T{}", i),
-        TyKind::Infer(v) => format!("?{}", v),
-        TyKind::IntVar(v) => format!("?I{}", v),
-        TyKind::FloatVar(v) => format!("?F{}", v),
+        // rustc_type_ir/src/ty_kind.rs `impl Display for InferTy`: messages name no variable
+        TyKind::Infer(_) => "_".to_string(),
+        TyKind::IntVar(_) => "{integer}".to_string(),
+        TyKind::FloatVar(_) => "{float}".to_string(),
         TyKind::Bound(d, b) => format!("^{}.{}:{:?}", d, b.var.0, b.kind),
         TyKind::Placeholder(p) => format!("!U{}.{}", p.universe.0, p.bound.0),
         TyKind::Closure(f, e, crate::types::ClosureArgs { parent_args: owner, .. }) => {

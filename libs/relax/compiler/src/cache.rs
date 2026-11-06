@@ -43,6 +43,7 @@ mod image;
 use image::{ManifestImage, IMAGE_MAGIC};
 pub(crate) use image::{prelink_unit, PrelinkedSlot};
 mod items;
+pub(crate) use items::{FileDigest, FileTable};
 mod deps;
 mod demand;
 mod front_run;
@@ -248,6 +249,18 @@ pub enum Mode {
     On,
     Verify,
     ReadOnly,
+}
+
+/// The interface digest (items.rs: the file's items outside the fn bodies that are holes) and its
+/// table by item of each file of `want`, by file (None: not wanted), on several threads: `makepad
+/// check`'s verdict keys (check_reuse.rs).
+pub(crate) fn file_tables(prog: &crate::program::Program, want: &[usize]) -> Vec<Option<(FileDigest, FileTable)>> {
+    items::file_tables_of(prog, want)
+}
+
+/// File `f`'s interface text (holes marked `{..}`): check_reuse.rs traces.
+pub(crate) fn file_iface_text(prog: &crate::program::Program, f: usize) -> Vec<u8> {
+    prog.files.get(f).map_or(Vec::new(), |pf| items::iface_text(pf))
 }
 
 /// MAKEPAD_RUN_CACHE: unset / `on` = on (the default), `off` / `0`, `verify`, `readonly`.
@@ -8207,7 +8220,8 @@ impl Linker {
             }
             3 => {
                 let def = self.cache().dec_def(u, d)?;
-                if u.prog.def(def).kind != DefKind::Static {
+                // a static, or a section bound (sections.rs)
+                if u.prog.def(def).kind != DefKind::Static && !u.is_section_bound(def) {
                     return None;
                 }
                 let s = u.static_sym(def);
@@ -8641,7 +8655,14 @@ pub(crate) unsafe fn linked_code(up: *mut Unit) -> bool {
 pub(crate) unsafe fn const_closures(up: *mut Unit, consts: &[DefId]) -> Vec<(DefId, Option<u128>)> {
     let Some(c) = (&*up).cache.as_ref().map(|c| c.get()) else { return Vec::new() };
     let u = &*up;
-    let g = (&mut *c).deps_graph(u);
+    let c = &mut *c;
+    // a const in a file version an earlier edit made that left the keys where they were (a body
+    // edit): the graph has no node of it until the keys follow the running text, now
+    let g = c.deps_graph(u);
+    if consts.iter().any(|&d| !g.has_file(&u.prog, u.prog.def(d).file)) {
+        c.keys_follow_text(u);
+    }
+    let g = c.deps_graph(u);
     consts.iter().map(|&d| (d, g.def_closure(&u.prog, d))).collect()
 }
 

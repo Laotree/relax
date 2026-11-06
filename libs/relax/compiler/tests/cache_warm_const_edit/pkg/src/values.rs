@@ -10,6 +10,19 @@ pub const CONST_PATTERN: u64 = 1;
 pub const CONST_LEN: usize = 1;
 pub const CONST_LATE: u64 = 1;
 pub const CONST_INCLUDE: &str = include_str!("data.txt");
+// a table of included texts, one through a macro's `concat!` path (Fab's demo plates)
+pub struct Doc {
+    pub key: &'static str,
+    pub text: &'static str,
+}
+macro_rules! doc {
+    ($key:literal) => {
+        Doc { key: $key, text: include_str!(concat!($key, ".txt")) }
+    };
+}
+pub const DOCS: &[Doc] = &[doc!("doc_a"), Doc { key: "doc_b", text: include_str!("doc_b.txt") }];
+// an include whose path no text names (`env!`): its save asks for a restart
+pub const DOC_E: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/doc_e.txt"));
 pub const CONST_SAME: u64 = 1;
 pub const CONST_MACRO: u64 = 1;
 pub static STATIC_DIRECT: u64 = 1;

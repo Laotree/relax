@@ -2364,7 +2364,7 @@ impl<'a> Lcx<'a> {
         self.foreign[li as usize] = false;
         self.own_local(li);
         // A precise capture owns only its captured paths, at any depth.
-        if let Some(paths) = self.capture_paths(ce, i) {
+        if let Some(paths) = self.capture_paths(ce, i, li) {
             let lt = self.monomorphize(self.b.locals[li as usize].ty);
             self.exclude_uncaptured_fields(li, lt, &paths, &mut Vec::new());
         }
@@ -2402,7 +2402,17 @@ impl<'a> Lcx<'a> {
             let pl = self.local_place(*li);
             if self.capture_by_value(ce, i, *li) {
                 let v = self.read_place(&pl, lt);
-                self.moved_local(*li);
+                // a precise capture takes only the fields the block uses, as a closure's does: the
+                // rest stays this body's and drops here (`async move { f(&req.body) }` leaves req.parts)
+                match self.capture_paths(ce, i, *li) {
+                    Some(fs) => {
+                        for path in fs {
+                            let path: Vec<_> = path.into_iter().map(|fi| (0, fi)).collect();
+                            self.moved_field(*li, &path);
+                        }
+                    }
+                    None => self.moved_local(*li),
+                }
                 vals.push((v, lt));
             } else {
                 let a = self.place_addr(&pl, lt);
@@ -7496,7 +7506,7 @@ impl<'a> Lcx<'a> {
                         let v = self.read_place(&pl, lt);
                         // a precise capture takes only the fields the body uses: those are
                         // moved out, the rest stays this body's (and drops here)
-                        match self.capture_paths(e.0, i) {
+                        match self.capture_paths(e.0, i, li) {
                             Some(fs) => {
                                 for path in fs {
                                     let path: Vec<_> = path.into_iter().map(|fi| (0, fi)).collect();
@@ -7716,6 +7726,12 @@ impl<'a> Lcx<'a> {
                 if !self.u.provided.is_empty() {
                     self.check_provided_static(d, t);
                 }
+                let p = self.static_ptr(d);
+                self.read_place(&Place::Mem(p, 0), t)
+            }
+            // a section bound the linker defines (`__start_<name>`): the program's own static
+            // memory, the end of its laid-out section (sections.rs)
+            DefKind::ForeignStatic if self.u.is_section_bound(d) => {
                 let p = self.static_ptr(d);
                 self.read_place(&Place::Mem(p, 0), t)
             }
@@ -8057,6 +8073,10 @@ impl<'a> Lcx<'a> {
                     if !self.u.provided.is_empty() {
                         self.check_provided_static(d, t);
                     }
+                    let p = self.static_ptr(d);
+                    (Place::Mem(p, 0), t)
+                }
+                Some(Res::Def(d)) if self.u.prog.def(d).kind == DefKind::ForeignStatic && self.u.is_section_bound(d) => {
                     let p = self.static_ptr(d);
                     (Place::Mem(p, 0), t)
                 }
@@ -9823,8 +9843,28 @@ impl<'a> Lcx<'a> {
         &self.closure_storage[&ce]
     }
 
-    fn capture_paths(&self, ce: u32, i: usize) -> Option<Vec<Vec<u32>>> {
-        self.storage_for_closure(ce).owned_paths.get(i).cloned().flatten()
+    /// The fields capture `i` (local `li`) of closure or async block `ce` takes from its local
+    /// (None: the whole local). A by-value capture of a Copy place copies it and takes nothing: the
+    /// local keeps it, and a Drop value it sits in drops with the local (rustc upvar.rs leaves such
+    /// a capture untruncated, `move || req.parts.path.0.len()`).
+    fn capture_paths(&mut self, ce: u32, i: usize, li: u32) -> Option<Vec<Vec<u32>>> {
+        let paths = self.storage_for_closure(ce).owned_paths.get(i).cloned().flatten()?;
+        let lt = self.monomorphize(self.b.locals[li as usize].ty);
+        Some(paths.into_iter().filter(|path| self.path_ty(lt, path).is_none_or(|t| !self.u.is_copy(t))).collect())
+    }
+
+    /// The type of field path `path` (struct and tuple field indices) inside a value of type `ty`.
+    fn path_ty(&self, ty: TyId, path: &[u32]) -> Option<TyId> {
+        let mut t = ty;
+        for &fi in path {
+            t = match self.kind(t) {
+                TyKind::Tuple(args) => *self.u.tcx.tys.list(args).get(fi as usize)?,
+                TyKind::Adt(d, args, _) => self.u.tcx.field_ty(&self.u.prog,
+                    crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), d, 0, fi, self.u.tcx.tys.list(args)),
+                _ => return None,
+            };
+        }
+        Some(t)
     }
 
     /// The root-slot environment copies the root's bytes, but only captured

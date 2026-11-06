@@ -1780,11 +1780,18 @@ impl Tcx {
         let env = self.item_env(prog, d);
         let state = EvalState::new();
         state.errors.replace(Some(Vec::new()));
+        state.declaration_check.set(true);
         let cx = EvalCx::new(prog, self, TypingEnv::fully_monomorphized(prog), &state);
         let mut param_wf = Vec::new();
-        for param in ast.list(generics.params) {
+        let params = ast.list(generics.params).iter().filter(|p| !matches!(p.kind, GenericParamKind::Lifetime(_)));
+        for (i, param) in params.enumerate() {
             match param.kind {
-                GenericParamKind::Type(_, Some(ty)) => { self.lower_ty(&cx, prog, def.file, def.scope, &env, ty); }
+                // the default's lowering starts at this parameter, as fill_type_defaults does
+                GenericParamKind::Type(_, Some(ty)) => {
+                    state.lowering.borrow_mut().push(Lowering::Default(d, i));
+                    self.lower_ty(&cx, prog, def.file, def.scope, &env, ty);
+                    state.lowering.borrow_mut().pop();
+                }
                 GenericParamKind::Const(ty, default) => {
                     let ty = self.lower_ty(&cx, prog, def.file, def.scope, &env, ty);
                     if let Some(value) = default { self.lower_const_arg(prog, def.file, &env, value, ty); }
@@ -1798,11 +1805,7 @@ impl Tcx {
         // a type alias's right-hand side is lowered where it is written (rustc type_of of the alias),
         // used or not
         if def.kind == DefKind::TypeAlias {
-            if let Some(TypeAliasItem { ty: Some(t), .. }) = ast.as_alias(&ast.item(def.item).kind) {
-                let mut env = self.item_env(prog, d);
-                env.regions.enabled = true;
-                self.lower_ty(&cx, prog, def.file, self.item_module(prog, d), &env, *t);
-            }
+            self.alias_ty(&cx, prog, d);
         }
         // the types the where clauses bound name existing types (rustc resolves them whether or
         // not the item is used: late resolution of the generics' predicates)
@@ -3105,12 +3108,13 @@ impl Tcx {
         env.regions.enabled = regions.is_some();
         let module = self.item_module(prog, d);
         for i in args.len()..params.len() {
-            if cx.state.default_inprog.borrow().contains(&(d, i)) {
-                self.err(cx, prog, def.file, params[i].name.lo, format!("E0391: cycle detected when computing the default of generic parameter `{}`", prog.def_path(d)));
+            let key = Lowering::Default(d, i);
+            if cx.state.lowering.borrow().contains(&key) {
+                self.lowering_cycle(cx, prog, key);
                 args.push(self.tys.error);
                 continue;
             }
-            cx.state.default_inprog.borrow_mut().push((d, i));
+            cx.state.lowering.borrow_mut().push(key);
             let t = match &params[i].kind {
                 GenericParamKind::Type(_, Some(dt)) => {
                     let lt = self.lower_ty(cx, prog, def.file, module, &env, *dt);
@@ -3125,7 +3129,7 @@ impl Tcx {
                 }
                 _ => { missing = true; self.tys.error }
             };
-            cx.state.default_inprog.borrow_mut().pop();
+            cx.state.lowering.borrow_mut().pop();
             args.push(t);
         }
         missing
@@ -3205,23 +3209,69 @@ impl Tcx {
     }
 
     pub fn alias_ty(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, d: DefId) -> TyId {
-        if let Some(t) = self.alias_tys.get(&(cx.typing_env, d)) {
-            return t;
+        let memo = !cx.state.declaration_check.get();
+        if memo {
+            if let Some(t) = self.alias_tys.get(&(cx.typing_env, d)) {
+                return t;
+            }
         }
-        let ik = (cx.typing_env, d);
-        if cx.state.alias_inprog.borrow().contains(&ik) {
+        let key = Lowering::Alias(cx.typing_env, d);
+        if cx.state.lowering.borrow().contains(&key) {
+            self.lowering_cycle(cx, prog, key);
             return self.tys.error;
         }
-        cx.state.alias_inprog.borrow_mut().insert(ik.clone());
+        cx.state.lowering.borrow_mut().push(key);
         let read0 = cx.state.impl_read.replace(false);
         let t = self.lower_alias_rhs(cx, prog, d);
-        cx.state.alias_inprog.borrow_mut().remove(&ik);
+        cx.state.lowering.borrow_mut().pop();
         let read = cx.state.impl_read.get();
         cx.state.impl_read.set(read0 || read);
-        if !(read && cx.state.par_impls.get()) {
+        if memo && !(read && cx.state.par_impls.get()) {
             self.alias_tys.insert((cx.typing_env, d), t);
         }
         t
+    }
+
+    /// The lowering met `key` again: the cycle is the stack from `key`'s entry on. rustc reports
+    /// a query cycle where its query system finds it, and in a parallel check that depends on
+    /// which evaluation gets there first (alias_tys keeps the first expansion, and an expansion
+    /// read from it shows no cycle). Here one member answers for the cycle: its first generic
+    /// parameter default, else its first type alias. The check of that declaration starts its
+    /// lowering at that member, with no memoized expansions, and reports the cycle. Every
+    /// other evaluation only cuts the cycle (the error type). So the cycle is reported once, and
+    /// the same way in every run.
+    fn lowering_cycle(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, key: Lowering) {
+        if !cx.state.declaration_check.get() { return; }
+        let speaker = {
+            let stack = cx.state.lowering.borrow();
+            let Some(p) = stack.iter().position(|k| *k == key) else { return };
+            let cycle = &stack[p..];
+            let first = cycle.iter().filter_map(|k| match *k { Lowering::Default(d, i) => Some((d.0, i)), Lowering::Alias(..) => None }).min()
+                .map(|(d, i)| Lowering::Default(DefId(d), i))
+                .or_else(|| cycle.iter().filter_map(|k| match *k { Lowering::Alias(_, d) => Some(d.0), Lowering::Default(..) => None }).min()
+                    .and_then(|d| cycle.iter().copied().find(|k| matches!(*k, Lowering::Alias(_, a) if a.0 == d))));
+            if stack.first() != first.as_ref() { return; }
+            first
+        };
+        match speaker {
+            Some(Lowering::Default(d, i)) => {
+                let def = prog.def(d);
+                let ast = &prog.files[def.file as usize].ast;
+                let Some(g) = ast.kind_generics(&ast.item(def.item).kind) else { return };
+                let Some(param) = ast.list(g.params).iter().filter(|p| !matches!(p.kind, GenericParamKind::Lifetime(_))).nth(i) else { return };
+                self.err(cx, prog, def.file, param.name.lo, format!("E0391: cycle detected when computing the default of generic parameter `{}`", prog.def_path(d)));
+            }
+            Some(Lowering::Alias(_, d)) => {
+                let def = prog.def(d);
+                let ast = &prog.files[def.file as usize].ast;
+                let pos = match ast.as_alias(&ast.item(def.item).kind) {
+                    Some(TypeAliasItem { ty: Some(t), .. }) => crate::lint_late::ast_ty_pos(ast, *t),
+                    _ => None,
+                };
+                self.err(cx, prog, def.file, pos.unwrap_or(ast.item(def.item).name.lo), format!("E0391: cycle detected when expanding type alias `{}`", prog.def_path(d)));
+            }
+            None => {}
+        }
     }
 
     /// The (type/const, lifetime) parameters a path's last segment can name for the type-like item
@@ -4258,9 +4308,13 @@ pub struct EvalState {
     /// const_eval::fold_without_execution: named constants fold without the query cache
     pub(crate) fold_only: std::cell::Cell<bool>,
     pub(crate) const_generic_frame: std::cell::RefCell<Option<(GenEnv, Vec<TyId>)>>,
-    alias_inprog: std::cell::RefCell<crate::fxhash::HashSet<(TypingEnv, DefId)>>,
-    /// generic parameter defaults being lowered: (item, parameter position)
-    default_inprog: std::cell::RefCell<Vec<(DefId, usize)>>,
+    /// the declarations this evaluation is lowering, outermost first: one met again is a query
+    /// cycle (rustc_query_system cycle_error, E0391; see Tcx::lowering_cycle)
+    lowering: std::cell::RefCell<Vec<Lowering>>,
+    /// a declaration's own check (check_item_type_defaults): type aliases are expanded here, not
+    /// read from alias_tys, so the check meets every cycle through its declaration even when
+    /// another evaluation's memoized expansion would hide it
+    declaration_check: std::cell::Cell<bool>,
     pub tc_depth: std::cell::Cell<u32>,
 }
 
@@ -4268,6 +4322,15 @@ impl EvalState {
     pub fn new() -> Self {
         Self::default()
     }
+}
+
+/// A declaration being lowered (EvalState::lowering).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lowering {
+    /// a type alias's right-hand side (rustc type_of of the alias)
+    Alias(TypingEnv, DefId),
+    /// the default of a generic parameter: (item, position among its type and const parameters)
+    Default(DefId, usize),
 }
 
 impl<'p> EvalCx<'p> {

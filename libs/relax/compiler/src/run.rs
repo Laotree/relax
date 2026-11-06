@@ -1037,6 +1037,12 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             crate::inspect::start(&package);
         }
     }
+    // a check answers too when asked (MAKEPAD_RUN_INSPECT=1): `makepad inspect <pid> prof
+    // threads=run-check` profiles its body checks, host frames walked by their CFI; a check
+    // otherwise starts no listener (an unchanged one ends in a second)
+    if check && session.is_none() && std::env::var("MAKEPAD_RUN_INSPECT").is_ok_and(|v| v == "1") {
+        crate::inspect::start(&package);
+    }
     let mut prog_args: Vec<Vec<u8>> = vec![package.clone().into_bytes()];
     let mut k = i + 1;
     while k < args.len() && args[k] != "--" {
@@ -1561,6 +1567,32 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let checked = if check {
         crate::check::checked_crates(&prog, root, watch || root_only || session.is_some(), selftest || workspace_check, &also)
     } else { Vec::new() };
+    // a one-shot check reuses the verdicts of the crates whose inputs did not change since a
+    // check that passed (check_reuse.rs); when none changed, that check's diagnostics are all
+    // this one prints
+    let mut reuse = if check && !watch && session.is_none() && !selftest && boundary.is_none() && crate::check::reuse_allowed(options) {
+        crate::check_reuse::Reuse::open(&prog, root, &checked)
+    } else { None };
+    if let Some(r) = &reuse {
+        if std::env::var_os("MAKEPAD_RUN_CHECK_TIMES").is_some() {
+            eprintln!("makepad check: verdict keys of {} crates in {:.1} ms ({} + {} files skipped): {} unchanged ({} beside added items), run record {}", r.crates(), r.t_keys.as_secs_f64() * 1e3, r.skipped.0, r.skipped.1, r.hits(), r.added_hits(), r.full());
+        }
+        // (a load that parsed or collected anything records it with the check: run it)
+        if r.full() && prog.front_restored.iter().all(|x| *x) && !CHECK_RECORDS_COLLECTED.load(Ordering::Relaxed) {
+            let code = r.print_reused(&prog);
+            crate::relaxed::finish_check();
+            if front_recordable() {
+                let r = crate::cache::Cache::flush_front_graphs();
+                verbose!("makepad check: front graph {:?}", r.err());
+            }
+            return code;
+        }
+    }
+    // a check presents nothing: the boot's crate records and front graph (queued by a load that
+    // parsed) are written now, on the writer's thread beside the check, as a run's are after its
+    // first present -- not after the check, which then waited seconds for them at its end
+    // (record_check_front)
+    if check && !selftest && front_recordable() { crate::cache::start_deferred_front(); }
     if check {
         let mut own = vec![false; prog.crates.len()];
         for &k in &checked { prog.crates[k as usize].validate = true; own[k as usize] = true; }
@@ -1612,6 +1644,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         tcx.collect_declarations(&prog);
     }
     phase("signatures", t);
+    // (a check that printed a signature error stores no run record: check_reuse.rs)
+    if let Some(r) = reuse.as_mut() { r.sig_clean = tcx.errors.is_empty() && deferred_errors.is_empty(); }
     if !tcx.errors.is_empty() {
         for e in &tcx.errors {
             if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(e, "typeck")); }
@@ -1692,7 +1726,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             let mut session = crate::serve::Session::new(u, root, pre);
             return session.watch(deep);
         }
-        let code = crate::check::check_crate(&mut u, root, &checked, pre, selftest);
+        let code = match reuse.as_mut() {
+            Some(r) => crate::check::check_crate_reusing(&mut u, root, &checked, pre, r),
+            None => crate::check::check_crate(&mut u, root, &checked, pre, selftest),
+        };
         // the parsed files go to the cache's front images as a run's do (one store shared with
         // `makepad run`): the next check (or run) of the package maps them instead of parsing
         // every file again (Stage: 6 s of a warm check was parsing)
@@ -2177,6 +2214,14 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if runtime.boot_only && std::env::var_os("MAKEPAD_RUN_BUILD_SCRIPT").is_none() {
         crate::why::event("boundary", "boot-done-before-main", 0, "", Some(crate::why::Cause::new("", 0, "boot-only", "application main has not run")));
         std::process::exit(0);
+    }
+    // the platform's start code runs the program's constructors before its entry (sections.rs)
+    if !entry_defs.is_empty() || harness || !exports_mode && !HAL_RUN.load(Ordering::Acquire) {
+        if let Err(e) = unsafe { crate::sections::run_constructors(up, root, None) } {
+            eprintln!("makepad-run: {e}");
+            std::mem::forget(u);
+            return crate::check::finish_test_deps(1);
+        }
     }
     for (k, d) in entry_defs.iter().enumerate() {
         // speculative workers may be compiling (they add slots): the owner thread around fn_id
