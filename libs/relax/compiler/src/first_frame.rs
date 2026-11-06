@@ -113,14 +113,22 @@ pub(crate) fn app_started() {
     if let Some(t) = THREAD.get() { t.unpark(); }
 }
 
+/// The program presented its first frame (`relax_first_present`): it is an app.
+pub(crate) fn presented() {
+    if let Some(t) = THREAD.get() { t.unpark(); }
+}
+
 /// Until the program shows what it is: an app (`app_started`, the first thing `app_main!`'s main
-/// reaches: lazy compiles on the way there keep the quiet from ending) or a batch program, whose
-/// main goes quiet without it. A batch program draws no frame: no deadline, no load screen. Should
-/// it start an app after all, the app has its deadline (and makes its own window).
+/// reaches: lazy compiles on the way there keep the quiet from ending; or a frame it presented) or
+/// a batch program, whose main goes quiet without either. A batch program draws no frame: no
+/// deadline, no load screen. Should it start an app after all, the app has its deadline (and makes
+/// its own window). A program that presented is never taken for one: an app whose own main skipped
+/// `app_started` lost the window it drew in when its compiles went quiet (Scope, 11-06).
 fn watch_app() -> f64 {
     let mut batch = false;
     loop {
         if let Some(ms) = APP_STARTED_MS.get() { return *ms; }
+        if crate::jit::presented() { return crate::clock::ms_since_process_start(); }
         if crate::run_threads::ending() { return 0.0; }
         match MAIN_ENTERED_NS.get().filter(|_| !batch).map(|at| crate::jit::quiet_left(*at)) {
             None => std::thread::park(),
@@ -294,4 +302,29 @@ pub(crate) unsafe fn reset_statics() {
     reset(&MAIN_ENTERED_NS, OnceLock::new());
     reset(&APP_STARTED_MS, OnceLock::new());
     reset(&CACHE_STATE, AtomicU8::new(0));
+}
+
+#[cfg(test)]
+mod tests {
+    /// An app whose own entry never says it is one (no `app_main!`, so no `app_started`) but has
+    /// presented is an app when its main goes quiet: never a batch program, whose run lets the
+    /// window go. Scope wrote its entry out by hand, and the run closed the window it drew in once
+    /// its compiles went quiet (28-109 s after each start, 11-06).
+    #[test]
+    fn a_program_that_presented_is_never_a_batch_program() {
+        isolated_test!(a_program_that_presented_is_never_a_batch_program);
+        // main entered long ago, and no demand compile since: the quiet is over
+        super::main_entered();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(super::APP_STARTED_MS.get().is_none(), "the entry never said it is an app");
+        crate::jit::FIRST_PRESENT.store(true, std::sync::atomic::Ordering::Release);
+        let watch = std::thread::spawn(super::watch_app);
+        let t0 = std::time::Instant::now();
+        while !watch.is_finished() && t0.elapsed() < std::time::Duration::from_secs(20) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(watch.is_finished(), "it presented: the watch knows an app at once");
+        assert!(watch.join().unwrap() > 0.0, "an app's start");
+        assert!(!crate::jit::past_startup_headless(), "not a batch program");
+    }
 }

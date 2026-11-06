@@ -907,3 +907,44 @@ fn a_run_with_a_deep_tmpdir_is_reached() {
     assert!(!sock.exists(), "its socket goes with it");
     std::fs::remove_dir_all(&base).unwrap();
 }
+
+/// A command over the Unix socket knows the process that sent it, from the socket's credentials
+/// (not from anything the client says): a `session relaunch` names who asked (Scope, Fab and
+/// Story restarted for a landing and nothing said by whom, 11-06).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_command_names_the_process_that_sent_it() {
+    fn asked(_: &Req, out: &mut Out) {
+        out.line(&format!("{{\"asker\":{}}}", crate::cmd::asker().unwrap_or(0)));
+    }
+    let ep = Endpoint::new("makepad-remote-asker-test");
+    ep.register_cmd(asked);
+    let sock = std::env::temp_dir().join(format!("mpr-asker-{}.sock", std::process::id()));
+    crate::carrier::unix::listen_at(&ep, &sock).unwrap();
+    let c = Client::new(Target::Unix(sock.clone()), "asker-test");
+    let line = c.cmd("who").unwrap().next().unwrap().unwrap();
+    assert_eq!(line, format!("{{\"asker\":{}}}", std::process::id()), "this process sent it");
+    assert_eq!(crate::cmd::asker(), None, "no command is answered on this thread");
+    drop(c);
+    let _ = std::fs::remove_file(&sock);
+}
+
+/// Who a process is, natively: its name and its parents' (a quit signal's sender and an inspect
+/// client are said so), and a process that is gone says so.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_process_is_said_with_its_parents() {
+    let me = crate::procs::process(std::process::id()).expect("this process runs");
+    let exe = std::env::current_exe().unwrap();
+    let file = exe.file_name().unwrap().to_string_lossy().into_owned();
+    // (the kernel's name is the executable's file name, cut to its length)
+    assert!(!me.name.is_empty() && file.starts_with(&me.name), "{} is {file}", me.name);
+    assert_eq!(me.ppid, std::os::unix::process::parent_id());
+    let said = crate::procs::said(std::process::id());
+    assert!(said.starts_with(&format!("pid {} {}", std::process::id(), me.name)), "{said}");
+    assert!(said.contains(&format!(", from {} ", me.ppid)) || me.ppid <= 1, "its parent is named: {said}");
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let gone = child.id();
+    child.wait().unwrap();
+    assert_eq!(crate::procs::said(gone), format!("pid {gone} (gone already)"));
+}
