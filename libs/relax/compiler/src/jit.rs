@@ -468,6 +468,10 @@ pub struct Unit {
     pub unwind_drop_cache: crate::conc::MemoMap<TyId, bool>,
     /// (concrete type, dyn type) -> vtable address
     pub vtables: crate::conc::MemoMap<(TyId, TyId), u64>,
+    /// vtable address -> the slots whose code makes trait objects with it: an unsizing coercion
+    /// this run lowered, or code linked from the disk cache that names it (note_vtable_maker).
+    /// What an impl's removal checks (reload.rs); code placed from the startup image is not here.
+    pub vtable_makers: relax_session::sync::Mutex<crate::fxhash::HashMap<u64, Vec<u32>>>,
     /// static `Location` data per (file, line, col) (#[track_caller] arguments)
     pub locations: relax_session::sync::Mutex<crate::fxhash::HashMap<(String, u32, u32), u64>>,
     /// constants whose evaluation failed (reported once, not re-run per use)
@@ -4545,6 +4549,7 @@ impl Unit {
             coro_relower: Default::default(),
             unwind_drop_cache: Default::default(),
             vtables: crate::conc::MemoMap::new_kept(16),
+            vtable_makers: Default::default(),
             locations: Default::default(),
             const_failed: std::collections::HashSet::new(),
             interp_ahead: std::collections::HashMap::new(),
@@ -5877,6 +5882,16 @@ impl Unit {
         if self.ptr_bytes() == 4 { (v as u32).to_le_bytes().to_vec() } else { v.to_le_bytes().to_vec() }
     }
 
+    /// Slot `slot`'s code makes trait objects with the vtable at `addr` (Unit::vtable_makers).
+    pub(crate) fn note_vtable_maker(&self, addr: u64, slot: u32) {
+        let mut g = self.vtable_makers.lock().unwrap_or_else(|e| e.into_inner());
+        let _k = crate::zone_alloc::kept();
+        let v = g.entry(addr).or_default();
+        if !v.contains(&slot) {
+            v.push(slot);
+        }
+    }
+
     /// vtable of `src` as `dy` (built once): [drop, size, align, methods...]
     /// `vtable` from shared lowering. None: a background build's front, which notes it for the
     /// owner (its entries take the addresses of slots only the owner makes, one per method) and
@@ -5959,7 +5974,7 @@ impl Unit {
             bytes.extend_from_slice(&self.ptr_word(*w));
         }
         let a = self.data(&bytes, pb as u64, crate::syms::DataKind::Words(wsyms));
-        self.syms.set_data_name(a, format!("vtable:{}:{}", crate::syms::stable_ty(self, src), crate::syms::stable_ty(self, dy)));
+        self.syms.set_data_name(a, format!("{}{}:{}", crate::syms::VTABLE_NAME, crate::syms::stable_ty(self, src), crate::syms::stable_ty(self, dy)));
         // a racing builder of the same vtable: everyone uses the first (one symbol per vtable)
         let a = self.vtables.insert_first((src, dy), a);
         // real-time code calls through this trait-object type: the new vtable's methods are
