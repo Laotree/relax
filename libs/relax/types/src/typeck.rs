@@ -5588,8 +5588,12 @@ impl<'a> Fcx<'a> {
                 self.tcx.tys.never
             }
             ExprKind::Return(x) => {
+                // expr.rs check_expr_return: outside a fn body there is no return type; the value
+                // is still type-checked (#86188), against nothing
                 if self.in_const && self.closure_depth.is_empty() {
                     self.err(lo, "E0572: return statement outside of function body".to_string());
+                    if let Some(v) = x.get() { self.check_expr(v, None); }
+                    return self.tcx.tys.never;
                 }
                 let rt = *self.ret_stack.last().unwrap();
                 match &x.get() {
@@ -5744,10 +5748,12 @@ impl<'a> Fcx<'a> {
                     // field access autoderef never goes through a raw pointer (Autoderef without include_raw_pointers)
                     if matches!(self.tcx.tys.kind(cur), TyKind::Ptr(..)) { break; }
                     match self.tcx.tys.kind(cur).clone() {
+                        // expr.rs check_expr_field: a tuple without that field is no match (E0609 below)
                         TyKind::Tuple(v) => {
+                            let Some(&field) = self.tcx.tys.list(v).get(*idx as usize) else { break };
                             self.b.field_idx.insert(e.0, (derefs as u32, *idx));
                             self.set_operand_derefs(e.0, derefs);
-                            return self.tcx.tys.list(v).get(*idx as usize).copied().unwrap_or(error);
+                            return field;
                         }
                         TyKind::Adt(d, args, regions) => {
                             let adt = self.tcx.adts.get(&d);

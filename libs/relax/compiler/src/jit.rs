@@ -4329,12 +4329,15 @@ fn const_eval_to_valtree(context: usize, _env: crate::tcx::TypingEnv, def: DefId
     }
     // a unit call: the value, and whether this evaluation (not an earlier one of the same
     // build) deferred -- the flag belongs to the evaluation's own frame
-    let (value, deferred) = owner::call(owner::Class::Job, || {
+    let (value, deferred, refused) = owner::call(owner::Class::Job, || {
         let prev = DEFERRED_ABORT.with(|a| a.replace(false));
+        let refusal = RefusalFrame::enter();
         let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let addr = unsafe { (&mut *u.self_ptr.0).const_addr(def, compact) }.ok_or_else(evaluation_error)?;
             crate::valtrees::const_to_valtree(u, addr, ty)
         }));
+        let refused = refusal.refused();
+        drop(refusal);
         // served nested and blocked by an earlier request: the request is posted again
         let value = match value {
             Err(p) if p.is::<crate::preempt::OwnerBusy>() || p.is::<crate::preempt::PublishBail>() => std::panic::resume_unwind(p),
@@ -4342,7 +4345,7 @@ fn const_eval_to_valtree(context: usize, _env: crate::tcx::TypingEnv, def: DefId
         };
         let deferred = DEFERRED_ABORT.with(|a| a.get());
         DEFERRED_ABORT.with(|a| a.set(prev || deferred));
-        (value, deferred)
+        (value, deferred, refused)
     });
     match value {
         // The initializer needs a module the post-boot loader has not loaded yet: that is no
@@ -4350,6 +4353,8 @@ fn const_eval_to_valtree(context: usize, _env: crate::tcx::TypingEnv, def: DefId
         // leaves this query (and every query above it) as a cancellation, and the build that
         // asked fails with DEFERRED_RETRY (build_rir); its outer compile loads and rebuilds.
         Ok(Err(_)) if deferred && BUILD_DEPTH.with(|d| d.get()) > 0 => std::panic::resume_unwind(Box::new(crate::preempt::NeedsLoad)),
+        // it read a constant whose body has type errors: those are the report (refuses_tainted)
+        Ok(Err(_)) if refused => Err(ErrorHandled::Reported(relax_types::const_eval::ValTreeCreationError::Tainted)),
         Ok(value) => value,
         Err(payload) => {
             if crate::preempt::is_cancelled(&*payload) { std::panic::resume_unwind(payload); }
@@ -6926,6 +6931,7 @@ impl Unit {
             cert_note_value(self, d, &args);
             return Some(a);
         }
+        if refuses_tainted(self, d) { return None; }
         // a constant that failed to evaluate is not re-run by every use (u64::MAX marks it)
         if self.const_failed.contains(&(d, args.clone())) {
             if crate::ctfe::trace_on() {
@@ -6969,7 +6975,10 @@ impl Unit {
         let _ = CONST_STACK.try_with(|s| s.borrow_mut().push((d, args.clone(), depth)));
         let cert = CertGuard::begin(FnKey::Inst(d, args.clone()));
         let t_init = cpu_ns();
+        let refusal = RefusalFrame::enter();
         let evaluated = { let _pop = Pop; self.eval_init(d, args.clone(), false) };
+        let refused = refusal.refused();
+        drop(refusal);
         INIT_NS[3].fetch_add(cpu_ns() - t_init, Ordering::Relaxed);
         let cert = cert.finish();
         match evaluated {
@@ -6991,8 +7000,10 @@ impl Unit {
                 if crate::ctfe::trace_on() {
                     eprintln!("ctfe: {}: no value (deferred: {})", self.prog.def_path(d), DEFERRED_ABORT.with(|a| a.get()));
                 }
-                // a module the post-boot loader has still to load: evaluated again later
-                if !DEFERRED_ABORT.with(|a| a.get()) { self.const_failed.insert((d, args)); }
+                // a module the post-boot loader has still to load: evaluated again later. Nor is a
+                // failure for a constant it read whose body has type errors kept: each use meets
+                // that refusal again, and fails as already reported.
+                if !DEFERRED_ABORT.with(|a| a.get()) && !refused { self.const_failed.insert((d, args)); }
                 None
             }
         }
@@ -9296,8 +9307,12 @@ pub static CHECK_FAILURES: relax_session::sync::Mutex<Option<Vec<(u32, String)>>
 
 /// A slot whose build failed: the error is reported and the slot panics when called.
 unsafe fn install_error(up: *mut Unit, id: u32, e: &str) -> u64 {
-    if let Some(v) = CHECK_FAILURES.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
-        v.push((id, e.to_string()));
+    // (a build that ended at a constant whose body has type errors: those are the report)
+    let follow_on = e.contains(TAINTED_CONST_USE);
+    if !follow_on {
+        if let Some(v) = CHECK_FAILURES.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+            v.push((id, e.to_string()));
+        }
     }
     // a program thread's call of it parks (PARK_COMPILE_ERRORS): no stub, the slot stays lazy with
     // its failure kept (a live patch clears it), the error reported once
@@ -9310,7 +9325,7 @@ unsafe fn install_error(up: *mut Unit, id: u32, e: &str) -> u64 {
         let name = f.name.to_string();
         u.reload_errors.insert(id);
         let mut noted = PARK_NOTED.lock().unwrap_or_else(|p| p.into_inner());
-        if !noted.iter().any(|(s, t)| *s == id && **t == *e) {
+        if !follow_on && !noted.iter().any(|(s, t)| *s == id && **t == *e) {
             crate::zone_alloc::kept_with(|| noted.push((id, Box::from(e))));
             drop(noted);
             u.note_error(format!("compile error in {}: {}", name, e));
@@ -9330,7 +9345,7 @@ unsafe fn install_error(up: *mut Unit, id: u32, e: &str) -> u64 {
             }
             // a startup image slot whose key does not decode is not the program's error: no
             // identity to rebuild, only the stub that reports it if the slot is ever called
-            if !matches!(u.fns[id as usize].key, FnKey::Glue(GLUE_UNNAMED, _)) {
+            if !follow_on && !matches!(u.fns[id as usize].key, FnKey::Glue(GLUE_UNNAMED, _)) {
                 u.note_error(format!("compile error in {}: {}", name, e));
             }
             // a body that failed to compile panics when called, with the error's first line
@@ -13477,6 +13492,47 @@ thread_local! {
     static DEFERRED_ABORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Builds in progress on this thread (a static evaluated outside any build cannot defer).
     static BUILD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// An evaluation on this thread met a constant whose body has type errors (refuses_tainted):
+    /// the evaluations it is part of fail as already reported.
+    static TAINTED_REFUSAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// rustc_const_eval interpret/eval_context.rs load_mir: a constant whose body has type errors is
+/// not evaluated (AlreadyReported), also when another evaluation reads it. The check reports its
+/// errors (relax_types::const_eval::tainted_body), so the evaluation that read it fails with
+/// nothing of its own to report.
+pub(crate) fn refuses_tainted(u: &Unit, d: DefId) -> bool {
+    let tainted = relax_types::const_eval::tainted_body(&u.tcx, &u.prog, d);
+    if tainted { TAINTED_REFUSAL.with(|t| t.set(true)); }
+    tainted
+}
+
+/// The lowering error of a use of a constant refused by refuses_tainted. The build it ends fails
+/// for type errors the check reports: that failure is not reported again (install_error).
+pub(crate) const TAINTED_CONST_USE: &str = "its body has type errors";
+
+/// Whether the use of constant `d` at `args` meets refuses_tainted (a trait's associated
+/// constant: the impl's, as const_addr resolves it).
+pub(crate) fn const_refused(u: &Unit, d: DefId, args: &[TyId]) -> bool {
+    let d = if u.prog.def(d).kind == DefKind::AssocConst && u.prog.def(u.prog.def(d).parent).kind == DefKind::Trait {
+        let args: Vec<TyId> = args.iter().map(|t| u.tcx.tys.erase_regions(*t)).collect();
+        match Instance::expect_resolve(&u.tcx, &u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, &args).def {
+            InstanceKind::Item(def) => def,
+            _ => return false,
+        }
+    } else { d };
+    relax_types::const_eval::tainted_body(&u.tcx, &u.prog, d)
+}
+
+/// One evaluation's view of TAINTED_REFUSAL: it starts clear, and the enclosing evaluation learns
+/// of a refusal when it ends (also when it unwinds).
+struct RefusalFrame(bool);
+impl RefusalFrame {
+    fn enter() -> Self { RefusalFrame(TAINTED_REFUSAL.with(|t| t.replace(false))) }
+    fn refused(&self) -> bool { TAINTED_REFUSAL.with(|t| t.get()) }
+}
+impl Drop for RefusalFrame {
+    fn drop(&mut self) { let prev = self.0; let _ = TAINTED_REFUSAL.try_with(|t| t.set(prev || t.get())); }
 }
 
 /// One build on this thread (build_rir_inner): it starts with no miss notes of its own;
