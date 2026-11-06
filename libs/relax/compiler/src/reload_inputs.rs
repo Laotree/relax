@@ -224,12 +224,16 @@ impl Inputs {
         self.paths.iter().filter(|(p, (_, k))| !matches!(k, Kind::Source | Kind::SourceDirectory(_)) && keep(p)).map(|(p, _)| p.clone()).collect()
     }
 
+    /// The folder workspace-relative paths start at (the graph's workspace, else the run's).
+    pub(super) fn workspace(&self) -> String {
+        crate::vfs::normalize_path(&self.graph.as_ref().map(|g| g.workspace.clone()).unwrap_or_else(crate::run::workspace_dir))
+    }
+
     /// Files that can produce a reload event: unloaded sources are read only when loaded.
     /// Keep absent inputs too (a deleted source or a lockfile that has not been created yet).
     /// `keep` picks paths before any is looked at (a live session asks about its few saves).
     pub(super) fn source_paths(&self, loaded: impl Iterator<Item = String>, keep: &dyn Fn(&str) -> bool) -> Vec<String> {
-        let workspace = self.graph.as_ref().map(|g| g.workspace.clone()).unwrap_or_else(crate::run::workspace_dir);
-        let workspace = crate::vfs::normalize_path(&workspace);
+        let workspace = self.workspace();
         let roots: Vec<_> = Path::new(&workspace).ancestors().map(|p| p.to_string_lossy().into_owned()).collect();
         let paths = self.process_paths(keep).into_iter().chain(loaded).chain(crate::native_macros::paths().into_iter().filter(|p| keep(p)));
         paths.filter(|p| !crate::vfs::is_dir(p)).map(|p| {
@@ -243,8 +247,7 @@ impl Inputs {
     /// Whether a workspace-relative path lies in no package of the app's graph, nor in std: no
     /// crate's own folder holds it (a lane's scratch file in its worktree).
     pub(super) fn outside_packages(&self, rel: &str, std_dir: &str) -> bool {
-        let workspace = self.graph.as_ref().map(|g| g.workspace.clone()).unwrap_or_else(crate::run::workspace_dir);
-        let path = format!("{workspace}/{rel}");
+        let path = format!("{}/{rel}", self.workspace());
         !self.packages.iter().map(String::as_str).chain([std_dir]).any(|dir| crate::vfs::relative_path(&path, dir).is_some())
     }
 

@@ -6489,6 +6489,59 @@ pub(crate) fn set_pinned(on: bool) -> bool {
 pub(crate) fn pinned() -> bool {
     PINNED.load(std::sync::atomic::Ordering::Acquire)
 }
+
+/// A landing the train holds back (`inspect hold`: devhub's show of the app, until the landed tip
+/// is proven for it): each of its files (absolute) -> the git blob id the landing wrote there (None:
+/// it removed the file), and whether the watch said it waits. A change that leaves a file saying
+/// just that waits; any other content of it, and every other file, is the person's own save and
+/// applies at once. `hold off` lets the landing in (one whole scan). A run's end in place drops it:
+/// the restarted run reads every file as it is.
+static LANDING_HOLD: relax_session::sync::Mutex<std::collections::BTreeMap<String, (Option<[u8; 20]>, bool)>> = relax_session::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// `inspect hold files=...`: holds back these files of a landing (workspace-relative, each with
+/// the blob id it lands at, None when it removes the file), with those it holds already. Returns
+/// how many it holds.
+pub(crate) fn hold_landing(files: &[(String, Option<[u8; 20]>)]) -> Result<usize, String> {
+    let workspace = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|v| v.inputs.workspace())
+        .ok_or("this run watches no sources (not a live session, or its watcher ended)")?;
+    let mut held = LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner());
+    for (rel, oid) in files {
+        held.insert(crate::vfs::normalize_path(&format!("{workspace}/{rel}")), (*oid, false));
+    }
+    eprintln!("makepad live: a landing is held back: {} file(s) wait while they say what it wrote; other saves apply", held.len());
+    Ok(held.len())
+}
+
+/// `inspect hold off`: the held landing goes in (one whole scan). Returns how many files it held.
+pub(crate) fn release_landing() -> usize {
+    let n = std::mem::take(&mut *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner())).len();
+    if n > 0 {
+        eprintln!("makepad live: the held landing goes in ({n} file(s))");
+        CATCH_UP.store(true, std::sync::atomic::Ordering::Release);
+        watch_events::kick();
+    }
+    n
+}
+
+pub(crate) fn landing_held() -> usize {
+    LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
+
+/// Whether the change of `path` waits: it says what a held landing wrote there. Its stamp stays,
+/// so the scan after `hold off` sees it changed.
+fn held_back(path: &str) -> bool {
+    let key = crate::vfs::normalize_path(path);
+    let Some((landed, _)) = LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied() else { return false };
+    if crate::vfs::read(path).ok().map(|data| crate::vfs::blob_oid(&data)) != landed {
+        return false;
+    }
+    let mut held = LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, said)) = held.get_mut(&key).filter(|h| !h.1) {
+        *said = true;
+        eprintln!("makepad live: {path} waits: it says what the held landing wrote (`inspect hold off` lets it in)");
+    }
+    true
+}
 static RESTART_REASON: relax_session::sync::Mutex<String> = relax_session::sync::Mutex::new(String::new());
 /// When the edit that asked for the restart was saved (unix ms): the restarted run's report
 /// measures save -> back on screen from it (MAKEPAD_RUN_RESTART_T0).
@@ -8501,6 +8554,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             traced = true;
             eprintln!("makepad live: one watch round: {} files in {:.2} ms; hot set {} files", files.len(), t_round.elapsed().as_secs_f64() * 1e3, hot.len());
         }
+        // a held landing's files wait (`hold_landing`); the person's saves go on
+        changed.retain(|&k| !held_back(&files[k].0));
         let mut quiet_retry = changed.is_empty() && retry_due;
         if changed.is_empty() && !quiet_retry {
             continue;
@@ -8596,6 +8651,11 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // retry, a domain's inputs): one more round sees what it was for
         if waited { watch_events::kick(); }
         let settled_stamps = last;
+        // (what settled may be a held landing's: it waits, the rest applies)
+        changed.retain(|&k| !held_back(&files[k].0));
+        if changed.is_empty() && !quiet_retry {
+            continue;
+        }
         // A moved lockfile or manifest (any landing moves the checkout's) is this app's only when
         // its own resolved graph moved; else there is nothing to rebuild or restart.
         let manifests: Vec<usize> = changed.iter().copied().filter(|&k| inputs.is_manifest(&files[k].0)).collect();
@@ -9940,6 +10000,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&RESTART_REQUESTED, std::sync::atomic::AtomicBool::new(false));
     reset(&PINNED, std::sync::atomic::AtomicBool::new(false));
     reset(&CATCH_UP, std::sync::atomic::AtomicBool::new(false));
+    reset(&LANDING_HOLD, relax_session::sync::Mutex::new(std::collections::BTreeMap::new()));
     reset(&RETRY_NOW, std::sync::atomic::AtomicBool::new(false));
     reset(&RESTART_REASON, relax_session::sync::Mutex::new(String::new()));
     reset(&RESTART_SAVED_MS, std::sync::atomic::AtomicU64::new(0));
