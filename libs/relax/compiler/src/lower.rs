@@ -5782,11 +5782,12 @@ impl<'a> Lcx<'a> {
         }
     }
 
-    /// The discriminant of the enum value at `place: t`, decoded (one vreg, two for a 128-bit tag).
+    /// The enum value at `place: t`'s tag decoded as variant tests compare it (`variant_key`; one
+    /// vreg, two for a 128-bit tag).
     fn read_tag(&mut self, place: &Place, t: TyId) -> Option<Vec<VReg>> {
         let l = self.layout(t);
         match place {
-            Place::Mem(b, o) => self.load_disc(*b, *o, t),
+            Place::Mem(b, o) => self.load_disc(*b, *o, t, false),
             // A zero-sized enum can still have one inhabited variant. Its discriminant
             // comes from TagEnc::Single, even though the value has no registers.
             Place::Regs(r) if !r.is_empty() || matches!(l.enc, crate::layout::TagEnc::Single(_)) => {
@@ -5805,7 +5806,7 @@ impl<'a> Lcx<'a> {
                     Some(adt) => {
                         let pos = ((self.b.file as u64) << 32) | self.pos as u64;
                         let cur = self.cur;
-                        emit_decode_tag(self.u, &mut self.f, cur, pos, raw, &l, &adt)
+                        emit_decode_tag(self.u, &mut self.f, cur, pos, raw, &l, &adt, false)
                     }
                     None => Some(raw),
                 }
@@ -5826,7 +5827,8 @@ impl<'a> Lcx<'a> {
         if adt.variants.len() <= 1 {
             return;
         }
-        let Some(discr) = adt.discriminant_for_variant(&self.u.tcx, &self.u.prog, vi) else { return; };
+        let l = self.layout(t);
+        let Some(discr) = variant_key(self.u, &l, &adt, vi) else { return; };
         let disc128 = discr.signed_value();
         let disc = disc128 as i64;
         let Some(tag) = self.read_tag(place, t) else { return; };
@@ -6670,8 +6672,8 @@ impl<'a> Lcx<'a> {
     }
 
     /// Discriminant of the enum value of type `t` at `base + off` (tag decoded, a single
-    /// variant's constant).
-    fn load_disc(&mut self, base: VReg, off: i32, t: TyId) -> Option<Vec<VReg>> {
+    /// variant's constant); `remap`: emit_decode_tag.
+    fn load_disc(&mut self, base: VReg, off: i32, t: TyId, remap: bool) -> Option<Vec<VReg>> {
         self.check_provided_opaque_enum(t, "matched on");
         let l = self.layout(t);
         let adt = match self.kind(t) {
@@ -6683,7 +6685,7 @@ impl<'a> Lcx<'a> {
         }
         let pos = ((self.b.file as u64) << 32) | self.pos as u64;
         let cur = self.cur;
-        emit_load_disc(self.u, &mut self.f, cur, pos, base, off, &l, &adt)
+        emit_load_disc(self.u, &mut self.f, cur, pos, base, off, &l, &adt, remap)
     }
 
     /// Writes variant `vi`'s discriminant of an enum of type `t` at `base + off`.
@@ -7898,7 +7900,7 @@ impl<'a> Lcx<'a> {
             return self.build_record(t, 0, vals);
         }
         let l = self.layout(t);
-        let Some(discr) = adt.discriminant_for_variant(&self.u.tcx, &self.u.prog, vi) else { return self.unit(); };
+        let Some(discr) = adt.tag_for_variant(&self.u.tcx, &self.u.prog, vi) else { return self.unit(); };
         let disc128 = discr.signed_value();
         let disc = disc128 as i64;
         if l.tag == Some((0, l.leaves.as_ref().and_then(|v| v.first()).map_or(Mem::Int(0, false), |x| x.mem))) && l.enc == crate::layout::TagEnc::Direct && l.leaves.as_ref().map_or(false, |v| v.len() == 1) {
@@ -9408,7 +9410,7 @@ impl<'a> Lcx<'a> {
             if self.u.tcx.adts.get(&d).is_some_and(|a| a.is_enum) {
                 let place = self.val_to_place(v);
                 let addr = self.place_addr(&place, from);
-                let Some(mut words) = self.load_disc(addr, 0, from) else { return self.unit(); };
+                let Some(mut words) = self.load_disc(addr, 0, from, true) else { return self.unit(); };
                 let repr = self.u.tcx.adts[&d].repr_int.unwrap_or(Prim::Isize);
                 let signed = self.u.tcx.tys.int_info(repr).1;
                 if self.is_wide(to) {
@@ -11505,7 +11507,7 @@ impl<'a> Lcx<'a> {
                 let l = self.layout(g);
                 // the tag holds the discriminant itself
                 let _ = &l;
-                match self.load_disc(p[0], 0, g) {
+                match self.load_disc(p[0], 0, g, true) {
                     Some(d) if matches!(self.kind(g), TyKind::Adt(..)) => Val::L(d),
                     _ => Val::L(vec![self.iconst(0)]),
                 }
@@ -13089,24 +13091,64 @@ pub fn variant_disc(u: &Unit, adt: &crate::tcx::AdtT, vi: u32) -> Option<i64> {
     Some(adt.discriminant_for_variant(&u.tcx, &u.prog, vi)?.signed_value() as i64)
 }
 
+/// What a variant test compares the enum's tag, read with `remap` off, with: a Direct tag's own
+/// value for variant `vi` (its discriminant, or the tag a live edit kept for it: AdtT::live_tags),
+/// else the discriminant.
+pub fn variant_key(u: &Unit, l: &Layout, adt: &crate::tcx::AdtT, vi: u32) -> Option<crate::tcx::Discr> {
+    match l.enc {
+        crate::layout::TagEnc::Direct => adt.tag_for_variant(&u.tcx, &u.prog, vi),
+        _ => adt.discriminant_for_variant(&u.tcx, &u.prog, vi),
+    }
+}
+
 /// The discriminant from the tag field's value `raw` (loaded with the tag's Mem): Direct tags
 /// hold it; a niche encoding maps tag values to variants (rustc_codegen_ssa codegen_get_discr:
 /// relative = tag - niche_start, in the niche variants' range when relative <= hi - lo).
-/// Uninhabited layouts have no discriminant.
-pub fn emit_decode_tag(u: &Unit, f: &mut Func, b: u32, pos: u64, raw: Vec<VReg>, l: &Layout, adt: &crate::tcx::AdtT) -> Option<Vec<VReg>> {
+/// Uninhabited layouts have no discriminant. `remap` off: a Direct tag's own value (what
+/// variant tests compare with `variant_key`); on: the discriminant, which differs from it once
+/// a live edit inserted a variant (AdtT::live_tags).
+pub fn emit_decode_tag(u: &Unit, f: &mut Func, b: u32, pos: u64, raw: Vec<VReg>, l: &Layout, adt: &crate::tcx::AdtT, remap: bool) -> Option<Vec<VReg>> {
     use crate::layout::TagEnc;
     if l.uninhabited { return None; }
     Some(match l.enc {
-        TagEnc::Direct => match l.tag {
-            // rustc_codegen_ssa/src/mir/operand.rs::OperandRef::codegen_get_discr:
-            // intcast the tag scalar, not the whole register carrying it.
-            Some((_, Mem::Int(bytes, signed))) if bytes < 8 && raw.len() == 1 => {
-                let d = f.vreg(Cls::I);
-                push_at(f, b, pos, Inst::Conv(Conv::IntToInt(IntTy { bits: bytes * 8, signed }), d, raw[0]));
-                vec![d]
+        TagEnc::Direct => {
+            let tag = match l.tag {
+                // rustc_codegen_ssa/src/mir/operand.rs::OperandRef::codegen_get_discr:
+                // intcast the tag scalar, not the whole register carrying it.
+                Some((_, Mem::Int(bytes, signed))) if bytes < 8 && raw.len() == 1 => {
+                    let d = f.vreg(Cls::I);
+                    push_at(f, b, pos, Inst::Conv(Conv::IntToInt(IntTy { bits: bytes * 8, signed }), d, raw[0]));
+                    vec![d]
+                }
+                _ => raw,
+            };
+            if !remap || adt.live_tags.is_empty() || tag.len() != 1 {
+                return Some(tag);
             }
-            _ => raw,
-        },
+            // a live edit kept the running values' tags (M10): each tag is mapped to its variant's
+            // discriminant (the last variant's when no other tag matches)
+            let n = adt.variants.len() as u32;
+            let mut d = f.vreg(Cls::I);
+            push_at(f, b, pos, Inst::Iconst(d, variant_disc(u, adt, n.checked_sub(1)?)?));
+            for v in (0..n - 1).rev() {
+                let c = f.vreg(Cls::I);
+                let tv = adt.tag_for_variant(&u.tcx, &u.prog, v)?.signed_value() as i64;
+                if tv == tv as i32 as i64 {
+                    push_at(f, b, pos, Inst::ICmpI(Cond::Eq, false, c, tag[0], tv));
+                } else {
+                    // the back ends' compare-immediate is a sign-extended imm32
+                    let kr = f.vreg(Cls::I);
+                    push_at(f, b, pos, Inst::Iconst(kr, tv));
+                    push_at(f, b, pos, Inst::ICmp(Cond::Eq, false, c, tag[0], kr));
+                }
+                let k = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::Iconst(k, variant_disc(u, adt, v)?));
+                let nd = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::Sel(nd, c, k, d));
+                d = nd;
+            }
+            vec![d]
+        }
         TagEnc::Single(v) => {
             let d = f.vreg(Cls::I);
             let discr = adt.discriminant_for_variant(&u.tcx, &u.prog, v)?;
@@ -13204,8 +13246,8 @@ pub fn emit_decode_tag(u: &Unit, f: &mut Func, b: u32, pos: u64, raw: Vec<VReg>,
     })
 }
 
-/// The discriminant of the enum at `p + off` (layout `l`).
-pub fn emit_load_disc(u: &Unit, f: &mut Func, b: u32, pos: u64, p: VReg, off: i32, l: &Layout, adt: &crate::tcx::AdtT) -> Option<Vec<VReg>> {
+/// The discriminant of the enum at `p + off` (layout `l`); `remap`: emit_decode_tag.
+pub fn emit_load_disc(u: &Unit, f: &mut Func, b: u32, pos: u64, p: VReg, off: i32, l: &Layout, adt: &crate::tcx::AdtT, remap: bool) -> Option<Vec<VReg>> {
     if l.uninhabited { return None; }
     let mut raw = Vec::new();
     if let Some((toff, tmem)) = l.tag {
@@ -13220,7 +13262,7 @@ pub fn emit_load_disc(u: &Unit, f: &mut Func, b: u32, pos: u64, p: VReg, off: i3
             raw.push(r);
         }
     }
-    emit_decode_tag(u, f, b, pos, raw, l, adt)
+    emit_decode_tag(u, f, b, pos, raw, l, adt, remap)
 }
 
 /// The tag store that marks the enum at `p + off` as variant `vi` (none for the untagged
@@ -13232,7 +13274,7 @@ pub fn emit_store_disc(u: &Unit, f: &mut Func, b: u32, pos: u64, p: VReg, off: i
         None => return,
     };
     let v = match l.enc {
-        TagEnc::Direct => match adt.discriminant_for_variant(&u.tcx, &u.prog, vi) {
+        TagEnc::Direct => match adt.tag_for_variant(&u.tcx, &u.prog, vi) {
             Some(discr) => discr.val,
             None => return,
         },
@@ -13260,6 +13302,16 @@ pub fn decode_tag_const(u: &Unit, raw: i128, l: &Layout, adt: &crate::tcx::AdtT)
     use crate::layout::TagEnc;
     if l.uninhabited { return None; }
     Some(match l.enc {
+        TagEnc::Direct if !adt.live_tags.is_empty() => {
+            // the tags a live edit kept (M10): the variant whose tag it is
+            let bytes = match l.tag {
+                Some((_, Mem::Int(n, _))) => n as u32,
+                _ => 8,
+            };
+            let m: u128 = if bytes >= 16 { u128::MAX } else { (1u128 << (bytes * 8)) - 1 };
+            let v = (0..adt.variants.len() as u32).find(|&v| adt.live_tags[v as usize] & m == raw as u128 & m)?;
+            adt.discriminant_for_variant(&u.tcx, &u.prog, v)?.signed_value()
+        }
         TagEnc::Direct => {
             let ty = adt.repr_int.unwrap_or(Prim::Isize);
             crate::tcx::Discr { val: raw as u128, ty, bytes: u.tcx.tys.int_info(ty).0 }.signed_value()
@@ -13599,7 +13651,7 @@ fn glue_drop_enum(u: &mut Unit, f: &mut Func, cur: &mut u32, p: VReg, t: TyId, u
     if l.tag.is_none() && !matches!(l.enc, crate::layout::TagEnc::Single(_)) {
         return;
     }
-    let Some(tag) = emit_load_disc(u, f, *cur, 0, p, 0, &l, &adt) else { return; };
+    let Some(tag) = emit_load_disc(u, f, *cur, 0, p, 0, &l, &adt, false) else { return; };
     let join = f.block();
     for (vi, v) in adt.variants.iter().enumerate() {
         let fields: Vec<_> = (0..v.fields.len()).filter_map(|fi| {
@@ -13610,7 +13662,7 @@ fn glue_drop_enum(u: &mut Unit, f: &mut Func, cur: &mut u32, p: VReg, t: TyId, u
             continue;
         }
         let c = f.vreg(Cls::I);
-        let discr = adt.discriminant_for_variant(&u.tcx, &u.prog, vi as u32).expect("existing drop variant").signed_value() as u128;
+        let discr = variant_key(u, &l, &adt, vi as u32).expect("existing drop variant").signed_value() as u128;
         push(f, *cur, Inst::ICmpI(Cond::Eq, false, c, tag[0], discr as i64));
         let c = if tag.len() == 2 {
             let hi = f.vreg(Cls::I); let both = f.vreg(Cls::I);

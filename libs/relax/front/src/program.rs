@@ -2388,40 +2388,47 @@ impl Program {
     /// Hot reload: collects items a new file version added. `items`: (item, where it goes):
     /// `Ok(module)` for a module-level item, `Err(impl def)` for an associated item of an existing
     /// impl. Returns the new defs (names bound in their modules, impls registered).
-    /// A live edit added variants at the end of enum `d` (M10): their defs, after the running
-    /// ones. Returns how many variants the enum had (for `truncate_variants` on a refusal).
-    pub fn add_variants(&mut self, d: DefId) -> usize {
+    /// The variant defs of enum `d` from its item's text (a live edit, M10): a running variant
+    /// keeps its def by name wherever the text now puts it (its index, `sub`, follows; code
+    /// type-checked before the edit names a variant by its def), and an added one gets a new def.
+    /// Reload compares the result with its running AdtT snapshot. Returns the list the enum had,
+    /// for `restore_variants` on a refusal.
+    pub fn add_variants(&mut self, d: DefId) -> Vec<DefId> {
         let (file, item, sub, dkrate, dscope) = {
             let df = self.def(d);
             (df.file, df.item, df.sub, df.krate, df.scope)
         };
         let li = sub as usize;
-        let had = self.variants.get(li).map_or(0, |v| v.len());
+        let had: Vec<DefId> = self.variants.get(li).cloned().unwrap_or_default();
         let names: Vec<Ident> = match &self.files[file as usize].ast.item(item).kind {
             ItemKind::Enum(r) => { let ast = &self.files[file as usize].ast; ast.list(ast.row(*r).variants).iter().map(|x| x.name).collect() }
             _ => return had,
         };
-        let (krate, scope) = self.variants.get(li).and_then(|v| v.first()).map_or((dkrate, dscope), |&v0| (self.def(v0).krate, self.def(v0).scope));
-        // The definition table describes the published source, including renamed
-        // or reordered variants. Reload compares it with its running AdtT snapshot.
-        for vi in 0..had.min(names.len()) {
-            let name = self.ident(file, names[vi]);
-            let vd = self.variants[li][vi];
-            self.defs[vd.0 as usize].name = name;
+        let Some(_) = self.variants.get(li) else { return had };
+        let (krate, scope) = had.first().map_or((dkrate, dscope), |&v0| (self.def(v0).krate, self.def(v0).scope));
+        let mut list: Vec<DefId> = Vec::with_capacity(names.len());
+        for (vi, n) in names.iter().enumerate() {
+            let name = self.ident(file, *n);
+            let vd = match had.iter().copied().find(|v| self.defs[v.0 as usize].name == name && !list.contains(v)) {
+                Some(v) => v,
+                None => self.add_def(Def { kind: DefKind::Variant, name, parent: d, file, item, sub: vi as u32, is_pub: true, krate, scope }),
+            };
+            self.defs[vd.0 as usize].sub = vi as u32;
+            list.push(vd);
         }
-        for vi in had..names.len() {
-            let vname = self.ident(file, names[vi]);
-            let vd = self.add_def(Def { kind: DefKind::Variant, name: vname, parent: d, file, item, sub: vi as u32, is_pub: true, krate, scope });
-            self.variants[li].push(vd);
-        }
+        self.variants[li] = list;
         had
     }
 
-    /// Undoes `add_variants` (a refused edit): enum `d` has `n` variants again.
-    pub fn truncate_variants(&mut self, d: DefId, n: usize) {
+    /// Undoes `add_variants` (a refused edit): enum `d` has the variant defs `had` again, each at
+    /// its index.
+    pub fn restore_variants(&mut self, d: DefId, had: &[DefId]) {
         let li = self.def(d).sub as usize;
+        for (vi, v) in had.iter().enumerate() {
+            self.defs[v.0 as usize].sub = vi as u32;
+        }
         if let Some(v) = self.variants.get_mut(li) {
-            v.truncate(n);
+            *v = had.to_vec();
         }
     }
 

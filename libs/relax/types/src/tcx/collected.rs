@@ -11,7 +11,7 @@ crate::collected_fields!(FieldT, name, ty, is_pub, vis_mod);
 crate::collected_fields!(VariantT, def, name, shape, fields, discr);
 crate::collected_fields!(AdtT, region_contract, generic_indices, flags, region_params,
     is_enum, is_union, n_generics, variants, repr_c, repr_int, repr_align, repr_packed,
-    valid_start, valid_end, no_niche, param_maybe_unsized, ext_from, ext_conv);
+    valid_start, valid_end, no_niche, param_maybe_unsized, ext_from, ext_conv, live_tags);
 crate::collected_id!(AdtFlags);
 crate::collected_fields!(Destructor, did);
 crate::collected_fields!(OpaqueDecl, region_contract, bounds);
