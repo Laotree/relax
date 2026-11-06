@@ -344,6 +344,17 @@ impl Write for ChanWriter {
     }
 }
 
+std::thread_local! {
+    /// The process that sent the command this thread answers now (0: not known, or none).
+    static ASKER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The process that sent the command being answered on this thread, where its carrier knows it
+/// (a local client over the Unix socket): what a log names as who asked.
+pub fn asker() -> Option<u32> {
+    Some(ASKER.with(|a| a.get())).filter(|pid| *pid != 0)
+}
+
 /// The `cmd` service served by `dispatch`.
 pub fn service(dispatch: fn(&Req, &mut Out), end_fields: EndFields) -> Factory {
     Arc::new(move |conn, open| {
@@ -379,8 +390,10 @@ fn serve(ch: crate::conn::Channel, dispatch: fn(&Req, &mut Out), end_fields: End
             let gone: Gone = Arc::new(move || conn.is_closed());
             let mut out = Out { w: &mut w, bytes: 0, limit: if req.get("full") == Some("1") { usize::MAX } else { LIMIT }, truncated: false, ok: true, gone: Some(gone) };
             let cmd = req.cmd.clone();
+            ASKER.with(|a| a.set(ch.conn().peer().pid));
             // a panic in a command (a bug in the host) answers as an error, the session goes on
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(&req, &mut out)));
+            ASKER.with(|a| a.set(0));
             if r.is_err() {
                 out.err("internal error in this command (inspect bug)");
             }

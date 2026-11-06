@@ -7447,15 +7447,35 @@ fn note_restart_pending(why: &str) {
 }
 
 /// `session relaunch`: applies the edits waiting for a restart (restart_in_place). Returns how.
-pub fn relaunch_pending() -> Result<&'static str, String> {
+/// `who` asked, said in the log with every request: a click in the run window, or the inspect
+/// client's process ([`inspect_asker`]). A restart nobody could name read as the person's own
+/// click (Scope, Fab and Story restarted for a landing, 11-06).
+pub fn relaunch_pending(who: &str) -> Result<&'static str, String> {
     RELAUNCH_ASKED.store(true, Ordering::SeqCst);
     let why = RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).join("; ");
-    // (a repeat while it is on its way changes nothing, and says nothing)
-    if !host::restart_asked() {
-        eprintln!("makepad live: session relaunch: {}", if why.is_empty() { "nothing waits" } else { why.as_str() });
-    }
+    eprintln!("{}", relaunch_line(who, &why, host::restart_asked()));
     if let Some(result) = host::relaunch() { return result; }
     restart_in_place(if why.is_empty() { "session relaunch".into() } else { why })
+}
+
+/// The log's line of a `session relaunch` that `who` asked for, `why` the edits it applies (a
+/// repeat while the restart is on its way changes nothing, and says so).
+fn relaunch_line(who: &str, why: &str, again: bool) -> String {
+    let what = if why.is_empty() { "nothing waits" } else { why };
+    if again {
+        format!("makepad live: session relaunch, asked by {who} again: the restart is on its way ({what})")
+    } else {
+        format!("makepad live: session relaunch, asked by {who}: {what}")
+    }
+}
+
+/// Who sent the `session relaunch` an inspect command answers: the client's process and its
+/// parents, from its socket's credentials ([`makepad_remote::cmd::asker`]).
+pub fn inspect_asker() -> String {
+    match makepad_remote::cmd::asker() {
+        Some(pid) => format!("an inspect client, {}", makepad_remote::procs::said(pid)),
+        None => "an inspect client whose process its connection does not name".into(),
+    }
 }
 
 /// `session relaunch` (a click on the ring's dot) asked for this restart: the window shows it
@@ -9284,6 +9304,17 @@ mod watch_wait_tests {
         let log = std::fs::read_to_string(home.join("live.jsonl")).unwrap_or_default();
         assert!(log.contains("\"event\":\"restart_offered\""), "the offer is in the live log (the WM's toast): {log}");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Every `session relaunch` says who asked, a repeat too: the run window's click or key, or
+    /// the inspect client's process, which the command's connection names (this test's own, here).
+    #[test]
+    fn a_relaunch_says_who_asked() {
+        let why = "the Splash VM changed";
+        assert_eq!(relaunch_line("a click on the ring's dot (Update ready)", why, false), "makepad live: session relaunch, asked by a click on the ring's dot (Update ready): the Splash VM changed");
+        assert_eq!(relaunch_line("the R key in the run window", "", true), "makepad live: session relaunch, asked by the R key in the run window again: the restart is on its way (nothing waits)");
+        // no command is answered on this thread: its asker is not known
+        assert_eq!(inspect_asker(), "an inspect client whose process its connection does not name");
     }
 }
 

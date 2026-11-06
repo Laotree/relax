@@ -20577,6 +20577,17 @@ pub(crate) static FIRST_PRESENT: AtomicBool = AtomicBool::new(false);
 /// when it goes quiet without starting an app (`batch_program`).
 static HEADLESS: AtomicBool = AtomicBool::new(false);
 
+/// The program presented a frame (`relax_first_present`): it is an app, never a batch program.
+pub(crate) fn presented() -> bool {
+    FIRST_PRESENT.load(Ordering::Acquire)
+}
+
+/// Whether the program was taken for a batch program (`batch_program`).
+#[cfg(test)]
+pub(crate) fn past_startup_headless() -> bool {
+    HEADLESS.load(Ordering::Acquire)
+}
+
 /// Past startup: the first present, or the main of a headless program. Tier-up (O3 burst workers, O2
 /// full builds, prebuilt callees) and the cheapest-code rule for lazy compiles follow it.
 pub(crate) fn past_startup() -> bool {
@@ -20699,6 +20710,7 @@ pub extern "C" fn relax_first_present() {
     crate::jit::host_boundary("relax_first_present", move || {
         crate::domain::first_present();
         if !FIRST_PRESENT.swap(true, Ordering::AcqRel) {
+            crate::first_frame::presented();
             if EXEC_CHECK.load(Ordering::Relaxed) {
                 exec_check_now("first frame");
             }
