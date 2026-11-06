@@ -884,6 +884,156 @@ fn restart_reason(k: &crate::ast::ItemKind) -> &'static str {
     }
 }
 
+/// A fn item's body, as a byte range of its file (a lazily parsed one's too).
+fn fn_body_span(pf: &crate::parser::ParsedFile, kind: &crate::ast::ItemKind) -> Option<(u32, u32)> {
+    use crate::ast::ItemKind;
+    match kind {
+        ItemKind::Fn(_, Some(b), _) => { let b = pf.ast.block(*b); Some((b.lo, b.hi)) }
+        ItemKind::Fn(sig, None, _) => pf.ast.fn_sig(*sig).lazy_body.map(|r| (pf.tok(r.lo - 1).lo, pf.tok(r.hi).hi)),
+        _ => None,
+    }
+}
+
+/// Whether type `t` names one of `ds`: an ADT, a foreign type, a trait object's trait, a
+/// type alias, or the trait of a projection.
+fn ty_names_def(u: &Unit, t: TyId, ds: &[DefId], depth: u32) -> bool {
+    use crate::types::TyKind::*;
+    if depth > 24 {
+        return false;
+    }
+    let any = |l: &[TyId]| l.iter().any(|a| ty_names_def(u, *a, ds, depth + 1));
+    match u.tcx.tys.kind(t).clone() {
+        Adt(d, args, _) => ds.contains(&d) || any(u.tcx.tys.list(args)),
+        Foreign(d) => ds.contains(&d),
+        Ref(_, x, _) | Ptr(_, x) | Slice(x) | Array(x, _) => ty_names_def(u, x, ds, depth + 1),
+        Tuple(v) => any(u.tcx.tys.list(v)),
+        FnPtr(ps, r, ..) => any(u.tcx.tys.list(ps)) || ty_names_def(u, r, ds, depth + 1),
+        Dyn(tr, args, binds, _, _, _, autos) => ds.contains(&tr) || u.tcx.tys.list(autos).iter().any(|a| ds.contains(a)) || any(u.tcx.tys.list(args))
+            || u.tcx.tys.list(binds).iter().any(|&(_, x, _)| ty_names_def(u, x, ds, depth + 1)),
+        Alias(_, a) => {
+            let d = a.kind.def_id();
+            ds.contains(&d) || ds.contains(&u.prog.def(d).parent) || any(u.tcx.tys.list(a.args))
+        }
+        _ => false,
+    }
+}
+
+/// The declarations of the current files the edit reaches (`visible` crates; `news`: the edit's
+/// new versions) that still name a type or trait the edit removed: a fn's signature or bounds,
+/// an impl's header or bounds, a field's, const's or static's type. They kept the removed def,
+/// and a fresh build of the new text does not resolve the name (E0412, E0405): one error each,
+/// at the name.
+fn decls_naming_removed(u: &Unit, removed: &[DefId], news: &[u32], visible: &[bool]) -> Vec<String> {
+    let prog = &u.prog;
+    let gone: Vec<DefId> = removed.iter().copied().filter(|d| matches!(prog.def(*d).kind, DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::TypeAlias | DefKind::Trait)).collect();
+    if gone.is_empty() {
+        return Vec::new();
+    }
+    let names: Vec<Vec<u8>> = gone.iter().map(|d| def_name(prog, *d).into_bytes()).filter(|n| !n.is_empty()).collect();
+    let aliases: Vec<(DefId, crate::program::Sym)> = gone.iter().filter(|d| prog.def(**d).kind == DefKind::TypeAlias).map(|&d| (d, prog.def(d).name)).collect();
+    // the live modules' files (Program::current_source_file_sets) and the edit's new versions
+    let mut live = Vec::with_capacity(prog.mods.len());
+    let mut files: Vec<u32> = news.to_vec();
+    for m in prog.mods.iter() {
+        let ok = m.parent_mod.is_none_or(|p| live[p as usize] && (m.lexical_parent.is_some() || prog.mods[p as usize].types.get(&prog.def(m.def).name) == Some(&m.def)));
+        live.push(ok);
+        if ok { files.push(m.file); }
+    }
+    files.sort_unstable();
+    files.dedup();
+    files.retain(|&f| prog.is_current_version(f) && prog.file_crate.get(f as usize).is_some_and(|&k| visible.get(k as usize).copied().unwrap_or(false)));
+    let named_by = |d: DefId| -> Option<DefId> {
+        let of = |t: TyId| gone.iter().copied().find(|g| ty_names_def(u, t, &[*g], 0));
+        let tr = |t: DefId| gone.contains(&t).then_some(t);
+        match prog.def(d).kind {
+            DefKind::Fn | DefKind::AssocFn => {
+                let sig = u.tcx.fn_sig(prog, d)?;
+                sig.params.iter().chain([&sig.ret]).find_map(|&t| of(t))
+                    .or_else(|| u.tcx.fn_trait_bounds(prog, d).and_then(|b| b.iter().find_map(|(_, t, a)| tr(*t).or_else(|| a.iter().find_map(|&x| of(x))))))
+                    .or_else(|| u.tcx.fn_ty_bounds(prog, d).and_then(|b| b.iter().find_map(|(s, t, a)| tr(*t).or_else(|| of(*s)).or_else(|| a.iter().find_map(|&x| of(x))))))
+            }
+            DefKind::Impl => u.tcx.impl_trait.get(&d).and_then(|t| tr(*t))
+                .or_else(|| u.tcx.impl_self.get(&d).and_then(|t| of(*t)))
+                .or_else(|| u.tcx.impl_trait_bounds.get(&d).and_then(|b| b.iter().find_map(|(_, t, a)| tr(*t).or_else(|| a.iter().find_map(|&x| of(x)))))),
+            DefKind::Struct | DefKind::Enum | DefKind::Union => u.tcx.adts.get(&d).and_then(|a| a.variants.iter().flat_map(|v| v.fields.iter()).find_map(|f| of(f.ty))),
+            DefKind::Const | DefKind::Static | DefKind::AssocConst => u.tcx.const_ty(prog, d).and_then(of),
+            _ => None,
+        }
+    };
+    let mut out = Vec::new();
+    for f in files {
+        let pf = &prog.files[f as usize];
+        let src = &pf.src[..pf.src_len as usize];
+        if !names.iter().any(|n| src.windows(n.len()).any(|w| w == n.as_slice())) {
+            continue;
+        }
+        // an item a macro made (a derive's impl) only when the file's own text names it nowhere
+        // else: the derive's struct field is the use site rustc reports
+        let reported = out.len();
+        let n = pf.ast.items.len();
+        let parent: std::collections::HashMap<usize, usize> = (0..n).flat_map(|p| child_items(&pf.ast, &pf.ast.items[p].kind).into_iter().map(move |c| (c.0 as usize, p))).collect();
+        let own = |i: &usize| pf.ast.items[*i].lo < pf.src_len;
+        for i in (0..n).filter(own).chain((0..n).filter(|i| !own(i))) {
+            let it = &pf.ast.items[i];
+            if !own(&i) && out.len() > reported {
+                break;
+            }
+            let Some(&d) = prog.item_defs.get(&(f, i as u32)) else { continue };
+            if removed.contains(&d) {
+                continue;
+            }
+            // the declaration's own text: not a fn's body, nor the items it holds
+            let mut holes: Vec<(u32, u32)> = fn_body_span(pf, &it.kind).into_iter().collect();
+            holes.extend(child_items(&pf.ast, &it.kind).into_iter().map(|c| { let c = pf.ast.item(c); (c.lo, c.hi) }));
+            let in_hole = |at: u32| holes.iter().any(|&(a, b)| a <= at && at < b);
+            // the declaration's tokens: (position, text, whether a `::` precedes it)
+            let mut decl: Vec<(u32, &[u8], bool)> = Vec::new();
+            let mut prev: &[u8] = b"";
+            for t in pf.toks.iter_from(first_tok_at(&pf.toks, it.lo)).take_while(|t| t.hi <= it.hi) {
+                let text = pf.src.get(t.lo as usize..t.hi as usize).unwrap_or(b"");
+                if !in_hole(t.lo) {
+                    decl.push((t.lo, text, prev == b"::"));
+                }
+                prev = text;
+            }
+            let at_name = |name: &[u8]| decl.iter().find(|(_, x, _)| *x == name).map(|(at, _, _)| *at);
+            if !names.iter().any(|n| at_name(n).is_some()) {
+                continue;
+            }
+            let report = |g: DefId, at: u32| {
+                let name = def_name(prog, g);
+                let (code, what) = if prog.def(g).kind == DefKind::Trait { ("E0405", "trait") } else { ("E0412", "type") };
+                format!("{}: {}: cannot find {} `{}` in this scope (this edit removes it)", u.pos_str(f, pf.call_site(at)), code, what, name)
+            };
+            if let Some(g) = named_by(d) {
+                out.push(report(g, at_name(def_name(prog, g).as_bytes()).unwrap_or(it.lo)));
+                continue;
+            }
+            // a type alias leaves no trace in the types it stood for: a name of a removed one
+            // that is not a generic parameter here and no longer resolves in the item's scope
+            if !own(&i) {
+                continue;
+            }
+            let mut params: Vec<&[u8]> = Vec::new();
+            let mut k = Some(i);
+            while let Some(x) = k {
+                if let Some(g) = pf.ast.kind_generics(&pf.ast.items[x].kind) {
+                    params.extend(pf.ast.list(g.params).iter().map(|p| pf.src.get(p.name.lo as usize..p.name.hi as usize).unwrap_or(b"")));
+                }
+                k = parent.get(&x).copied();
+            }
+            let scope = prog.def(d).scope;
+            if let Some((g, at)) = aliases.iter().find_map(|&(g, sym)| {
+                let name = prog.syms.str(sym).as_bytes();
+                decl.iter().find(|(_, x, path)| *x == name && !*path && !params.contains(x)).filter(|_| prog.lookup_in_scope(scope, sym, true).is_none()).map(|(at, _, _)| (g, *at))
+            }) {
+                out.push(report(g, at));
+            }
+        }
+    }
+    out
+}
+
 fn child_items(ast: &crate::ast::Ast, k: &crate::ast::ItemKind) -> Vec<crate::ast::ItemId> {
     use crate::ast::ItemKind::*;
     match k {
@@ -1347,13 +1497,7 @@ fn classify_moving(prog: &crate::program::Program, old_file: u32, new: &crate::p
         let (l, c) = pf.line_col(at);
         format!("{}:{}:{}", path, l, c)
     };
-    let body_span = |pf: &crate::parser::ParsedFile, kind: &ItemKind| -> Option<(u32, u32)> {
-        match kind {
-            ItemKind::Fn(_, Some(b), _) => { let b = pf.ast.block(*b); Some((b.lo, b.hi)) }
-            ItemKind::Fn(sig, None, _) => pf.ast.fn_sig(*sig).lazy_body.map(|r| (pf.tok(r.lo - 1).lo, pf.tok(r.hi).hi)),
-            _ => None,
-        }
-    };
+    let body_span = fn_body_span;
     let (mut pairs, mut removed, mut added) = pair_items(old, new);
     trace_sub("classify_pair");
     // a fn whose signature changed (M2/M4): the old fn goes and a new one with the new signature
@@ -4089,7 +4233,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     }
     let carry = gandalf_carries(&changes, versions.iter().map(|(_, p)| p));
     let mut use_undo: Vec<crate::program::UseUndo> = Vec::new();
-    let mut import_errs: Vec<String> = Vec::new();
+    let mut removed_errs: Vec<String> = Vec::new();
     let errors0 = u.prog.errors.len();
     trace_stage("gate_prepare");
     {
@@ -4188,8 +4332,11 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             let (undo, unresolved) = u.prog.reresolve_imports_of(&removed_defs);
             use_undo.extend(undo);
             for (file, pos, path) in unresolved {
-                import_errs.push(format!("{}: E0432: unresolved import `{}`: what it named is removed by this edit", u.pos_str(file, pos), path));
+                removed_errs.push(format!("{}: E0432: unresolved import `{}`: what it named is removed by this edit", u.pos_str(file, pos), path));
             }
+            // and the declarations whose unchanged text names a removed type or trait
+            let new_files: Vec<u32> = news.iter().map(|&(_, n)| n).collect();
+            removed_errs.extend(decls_naming_removed(u, &removed_defs, &new_files, &visible_crates));
         }
         trace_sub("imports");
         let lowered = if body_only {
@@ -4468,7 +4615,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         .chain(added_defs.iter().map(|&d| u.prog.def(d).file))
         .map(|f| u.prog.file_paths[f as usize].clone()).collect();
     let mut errs: Vec<String> = add_errs.into_iter().filter(|e| !(e.contains(".rs:")) || edited.iter().any(|p| e.starts_with(p.as_str()))).collect();
-    errs.extend(import_errs);
+    errs.extend(removed_errs);
     let mut as_restart = !layout_restart.is_empty();
     errs.extend(layout_restart);
     // `Copy` removed and `Drop` added for one type: code compiled for the copies it made copies
