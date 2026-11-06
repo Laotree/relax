@@ -4391,7 +4391,7 @@ impl Unit {
         self.errors.push(m);
     }
 
-    pub fn new(prog: Program, tcx: Tcx, core_crate: u32) -> Box<Unit> {
+    pub fn new(mut prog: Program, tcx: Tcx, core_crate: u32) -> Box<Unit> {
         crate::borrowck::lazy::set_panic_sink(crate::hot_failure::checker_panic);
         owner::start();
         let query_errors = tcx.dcx.clone();
@@ -4458,6 +4458,10 @@ impl Unit {
         // identity state below (the provided crates' shims, the slot table, the unit itself) is
         // built in the kept heap; the compile state (prog, tcx, layouts, front) stays as built
         let provided = crate::zone_alloc::kept_with(|| crate::provided::take_for(&prog));
+        // before anything is laid out: their types keep rustc's layout in a live session too
+        for (k, _) in &provided {
+            prog.crates[*k as usize].rustc_laid = true;
+        }
         let (provided_types, opaque_layouts, check_layouts, handles) = provided_type_tables(&prog, &provided);
         let provided_types = crate::zone_alloc::kept_clone(&provided_types);
         let provided_offsets = crate::zone_alloc::kept_with(|| handles.iter().map(|(d, _, _, offs)| (*d, *offs)).collect::<HashMap<DefId, &'static [u64]>>());
@@ -27889,6 +27893,9 @@ impl Unit {
     pub(crate) unsafe fn bind_added_provided(&mut self, new: &[u32]) {
         let added = crate::provided::take_for_crates(&self.prog, new);
         if added.is_empty() { return; }
+        for (k, _) in &added {
+            self.prog.crates[*k as usize].rustc_laid = true;
+        }
         let (types, opaque, check_layouts, handles) = provided_type_tables(&self.prog, &added);
         crate::zone_alloc::kept_with(|| {
             self.provided.extend(added.iter().cloned());
