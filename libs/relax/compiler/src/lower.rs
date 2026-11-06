@@ -2402,7 +2402,17 @@ impl<'a> Lcx<'a> {
             let pl = self.local_place(*li);
             if self.capture_by_value(ce, i, *li) {
                 let v = self.read_place(&pl, lt);
-                self.moved_local(*li);
+                // a precise capture takes only the fields the block uses, as a closure's does: the
+                // rest stays this body's and drops here (`async move { f(&req.body) }` leaves req.parts)
+                match self.capture_paths(ce, i) {
+                    Some(fs) => {
+                        for path in fs {
+                            let path: Vec<_> = path.into_iter().map(|fi| (0, fi)).collect();
+                            self.moved_field(*li, &path);
+                        }
+                    }
+                    None => self.moved_local(*li),
+                }
                 vals.push((v, lt));
             } else {
                 let a = self.place_addr(&pl, lt);
