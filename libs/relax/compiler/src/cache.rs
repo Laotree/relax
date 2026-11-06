@@ -5648,11 +5648,11 @@ impl FrontImages {
     /// (a file recorded without it is parsed). Taking one maps it as a crate image's file is
     /// (its lazily parsed part is not taken: the bodies are parsed on demand in this crate's
     /// scope). The record's late inputs are noted for the crate's next record.
-    fn previous_files_of(&self, c: &crate::preload::PreCrate, deps: Option<&[u128]>, proc_fps: Option<u128>) -> Option<crate::crate_image::PreviousFiles> {
+    fn previous_files_of(&self, c: &crate::preload::PreCrate, deps: Option<&[u128]>, proc_fps: &[u128]) -> Option<crate::crate_image::PreviousFiles> {
         use crate::crate_image::{decode, FileMeta, Record};
         let tr = |path: &std::path::Path, why: &str| if crate::preload::trace() { eprintln!("boot-trace: {}: earlier record {} not taken: {}", c.name, path.display(), why); };
         let deps = deps.and_then(|d| self.full_deps(c, d));
-        if deps.is_none() && proc_fps.is_none() {
+        if deps.is_none() && proc_fps.is_empty() {
             tr(&self.dir, "dependency fingerprints");
             return None;
         }
@@ -5674,13 +5674,13 @@ impl FrontImages {
             let Some((KIND_FRONT_CRATE, b)) = st.get(front_crate_key(&c.name, &c.root)) else { continue };
             let Some(rec) = decode::<Record>(b) else { tr(&path, "decode"); continue };
             let same = rec.name == c.name && rec.root == c.root && rec.edition == c.edition && rec.cfg == cfg && rec.proc_macro == c.proc_macro
-                && rec.deps == c.image_dep_names && (deps.as_ref().is_some_and(|d| rec.dep_fps == *d) || proc_fps.is_some() && rec.proc_fps == proc_fps) && rec.lazy_auto == crate::parser::lazy_auto()
+                && rec.deps == c.image_dep_names && (deps.as_ref().is_some_and(|d| rec.dep_fps == *d) || rec.proc_fps.is_some_and(|p| proc_fps.contains(&p))) && rec.lazy_auto == crate::parser::lazy_auto()
                 && rec.parse_options == crate::crate_image::parse_options(options) && rec.ahead.complete;
             if !same {
                 if crate::preload::trace() {
                     let checks = [rec.name == c.name, rec.root == c.root, rec.edition == c.edition, rec.cfg == cfg, rec.proc_macro == c.proc_macro, rec.deps == c.image_dep_names,
-                        deps.as_ref().is_some_and(|d| rec.dep_fps == *d), proc_fps.is_some() && rec.proc_fps == proc_fps, rec.lazy_auto == crate::parser::lazy_auto(), rec.ahead.complete];
-                    eprintln!("boot-trace: {}: earlier record {} not taken: identity {:?} (proc {:?} recorded {:?})", c.name, path.display(), checks, proc_fps.map(|x| x as u64), rec.proc_fps.map(|x| x as u64));
+                        deps.as_ref().is_some_and(|d| rec.dep_fps == *d), rec.proc_fps.is_some_and(|p| proc_fps.contains(&p)), rec.lazy_auto == crate::parser::lazy_auto(), rec.ahead.complete];
+                    eprintln!("boot-trace: {}: earlier record {} not taken: identity {:?} (proc {:?} recorded {:?})", c.name, path.display(), checks, proc_fps.iter().map(|&x| x as u64).collect::<Vec<_>>(), rec.proc_fps.map(|x| x as u64));
                 }
                 continue;
             }
@@ -5893,6 +5893,12 @@ impl crate::crate_image::CrateImages for FrontImages {
         for (c, kind, name, _, content) in late { crate::sip::note_late_input(c, kind, name, content.as_deref()); }
         Some(image)
     }
+    fn carried_demand_image(&self, crates: &[crate::preload::PreCrate]) -> Option<std::sync::Arc<crate::preload::DemandImage>> {
+        let recipe = crate::crate_image::GraphRecipe::new(crates);
+        let saved = self.front_graph(recipe.identity)?;
+        if saved.identity != recipe.identity || saved.crates.iter().map(|(key, _)| key).ne(recipe.crates.iter()) { return None; }
+        self.carried_demand(&saved, crates, None)
+    }
     fn take_demand_plan(&self, crates: &[crate::preload::PreCrate]) -> Option<std::sync::Arc<crate::preload::DemandPlan>> {
         let (identity, plan) = self.pending_plan.lock().unwrap().take()?;
         (identity == crate::crate_image::GraphRecipe::new(crates).identity).then_some(plan)
@@ -5988,7 +5994,7 @@ impl crate::crate_image::CrateImages for FrontImages {
     fn crate_image(&self, c: &crate::preload::PreCrate, deps: &[u128]) -> Option<crate::crate_image::CrateImage> {
         self.selected_image(c, deps, None)
     }
-    fn previous_files(&self, c: &crate::preload::PreCrate, deps: Option<&[u128]>, proc_fps: Option<u128>) -> Option<crate::crate_image::PreviousFiles> {
+    fn previous_files(&self, c: &crate::preload::PreCrate, deps: Option<&[u128]>, proc_fps: &[u128]) -> Option<crate::crate_image::PreviousFiles> {
         self.previous_files_of(c, deps, proc_fps)
     }
     fn retained_proc_macros(&self) -> Vec<(String, u128)> {

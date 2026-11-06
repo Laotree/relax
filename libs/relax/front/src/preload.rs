@@ -1432,17 +1432,24 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
         if image.is_none() { wants_previous.push((ci, deps)); }
         restored.push(image);
     }
-    // a parsed crate's unchanged files: earlier records' images (the proc-macro crates of the
-    // whole program known by now: those this load restores and those a partial restore kept)
+    // a parsed crate's unchanged files: earlier records' images. The proc-macro crates known by
+    // now (those a partial restore kept and those this load restores) as a record hashes them:
+    // those loaded up to its crate (a record written as its crate loaded) or the whole
+    // program's (one written at the end of the load). Either holds every proc macro its crate
+    // can reach, the loads being in dependency order.
     if let Some(i) = images {
-        let mut procs: Vec<(String, Option<u128>)> = crates.iter().enumerate().filter(|(_, c)| c.proc_macro).map(|(k, c)| (c.name.clone(), fps[k])).collect();
-        procs.extend(i.retained_proc_macros().into_iter().map(|(n, f)| (n, Some(f))));
-        let proc = crate::crate_image::proc_fps(procs.into_iter());
+        let retained: Vec<(String, Option<u128>)> = i.retained_proc_macros().into_iter().map(|(n, f)| (n, Some(f))).collect();
+        let procs: Vec<(usize, String, Option<u128>)> = crates.iter().enumerate().filter(|(_, c)| c.proc_macro).map(|(k, c)| (k, c.name.clone(), fps[k])).collect();
+        let upto = |last: usize| crate::crate_image::proc_fps(retained.iter().cloned()
+            .chain(procs.iter().filter(|(k, _, _)| *k <= last).map(|(_, n, f)| (n.clone(), *f))));
+        let whole = upto(n);
         for (ci, deps) in wants_previous {
             let c = &crates[ci];
-            previous[ci] = if deps.is_some() || proc.is_some() { i.previous_files(c, deps.as_deref(), proc) } else { None };
+            let mut proc: Vec<u128> = upto(ci).into_iter().chain(whole).collect();
+            proc.dedup();
+            previous[ci] = if deps.is_some() || !proc.is_empty() { i.previous_files(c, deps.as_deref(), &proc) } else { None };
             if trace() {
-                eprintln!("boot-trace: {}: parsed; earlier images: {}", c.name, if previous[ci].is_some() { "yes" } else if deps.is_none() && proc.is_none() { "dependencies not restored" } else { "none" });
+                eprintln!("boot-trace: {}: parsed; earlier images: {}", c.name, if previous[ci].is_some() { "yes" } else if deps.is_none() && proc.is_empty() { "dependencies not restored" } else { "none" });
             }
         }
     }
