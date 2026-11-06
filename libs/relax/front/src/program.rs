@@ -2634,9 +2634,99 @@ impl Program {
         out
     }
 
-    /// Undoes `unbind_use` (a refused edit).
+    /// Hot reload: the imports that bound one of `defs` (defs an edit removed, a fn's old def
+    /// that a new signature replaced among them) resolve again from their paths, as a fresh run
+    /// resolves them: to the def at the path now, or to nothing. Returns the undo record
+    /// (`rebind_use`) and the imports that no longer resolve: (file, position, path).
+    pub fn reresolve_imports_of(&mut self, defs: &[DefId]) -> (Vec<UseUndo>, Vec<(u32, u32, String)>) {
+        let gone_defs: crate::fxhash::HashSet<DefId> = defs.iter().copied().collect();
+        let (mut undo, mut again) = (Vec::new(), Vec::new());
+        for i in 0..self.imports.len() {
+            let im = &self.imports[i];
+            let (true, false, Some(name)) = (im.done, im.glob, im.bind) else { continue };
+            let (m, bound) = (im.module, im.bound);
+            let md = &self.mods[m as usize];
+            let hit = (bound & BOUND_TYPES != 0 && md.types.get(&name).is_some_and(|d| gone_defs.contains(d)))
+                || (bound & BOUND_VALUES != 0 && md.values.get(&name).is_some_and(|d| gone_defs.contains(d)));
+            if !hit {
+                continue;
+            }
+            let mut gone = Vec::new();
+            for (is_type, bit) in [(true, BOUND_TYPES), (false, BOUND_VALUES)] {
+                if bound & bit == 0 {
+                    continue;
+                }
+                let md = &mut self.mods[m as usize];
+                let d = if is_type { md.types.remove(&name) } else { md.values.remove(&name) };
+                let flags = md.import_pub.remove(&(name, is_type)).unwrap_or(0);
+                if let Some(d) = d {
+                    gone.push((is_type, name, d, flags));
+                }
+            }
+            undo.push(UseUndo { index: i, module: m, bind: Some(name), done: true, glob: false, bound, gone });
+            self.imports[i].done = false;
+            self.imports[i].bound &= !(BOUND_TYPES | BOUND_VALUES);
+            again.push(i);
+        }
+        if again.is_empty() {
+            return (undo, Vec::new());
+        }
+        self.forget_bindings();
+        self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
+        // strict passes while they make progress, then one that settles (resolve_imports_passes)
+        for settle in [false, true] {
+            self.import_settle = settle;
+            loop {
+                let mut progress = false;
+                for &i in &again {
+                    if !self.imports[i].done && self.try_import(i) {
+                        self.imports[i].done = true;
+                        progress = true;
+                    }
+                }
+                if !progress {
+                    break;
+                }
+            }
+        }
+        self.import_settle = false;
+        self.forget_bindings();
+        self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
+        let unresolved = again.iter().filter(|&&i| !self.imports[i].done).map(|&i| (self.imports[i].file, self.imports[i].pos, self.import_path(i))).collect();
+        (undo, unresolved)
+    }
+
+    /// An import's path as written (`crate::w::f`, `w::*`).
+    fn import_path(&self, i: usize) -> String {
+        let im = &self.imports[i];
+        let mut p = String::new();
+        for (k, s) in &im.segs {
+            if !p.is_empty() {
+                p.push_str("::");
+            }
+            p.push_str(match k {
+                SegKind::Crate => "crate",
+                SegKind::SelfValue => "self",
+                SegKind::Super => "super",
+                _ => self.syms.str(*s),
+            });
+        }
+        if im.glob {
+            p.push_str("::*");
+        }
+        p
+    }
+
+    /// Undoes `unbind_use` and `reresolve_imports_of` (a refused or rolled-back edit): what the
+    /// import binds now goes, what it bound before comes back.
     pub fn rebind_use(&mut self, undo: Vec<UseUndo>) {
-        for u in undo {
+        for u in undo.into_iter().rev() {
+            let im = &self.imports[u.index];
+            if let (true, Some(name)) = (im.done, im.bind) {
+                let md = &mut self.mods[u.module as usize];
+                if im.bound & BOUND_TYPES != 0 { md.types.remove(&name); md.import_pub.remove(&(name, true)); }
+                if im.bound & BOUND_VALUES != 0 { md.values.remove(&name); md.import_pub.remove(&(name, false)); }
+            }
             let im = &mut self.imports[u.index];
             im.bind = u.bind;
             im.done = u.done;
@@ -4038,22 +4128,8 @@ impl Program {
         let reportable: Vec<usize> = pending.into_iter().filter(|&i| self.import_reportable(i, &mut macro_binds)).collect();
         for i in reportable {
             if !deferred.contains(&i) {
+                let p = self.import_path(i);
                 let im = &self.imports[i];
-                let mut p = String::new();
-                for (k, s) in &im.segs {
-                    if !p.is_empty() {
-                        p.push_str("::");
-                    }
-                    p.push_str(match k {
-                        SegKind::Crate => "crate",
-                        SegKind::SelfValue => "self",
-                        SegKind::Super => "super",
-                        _ => self.syms.str(*s),
-                    });
-                }
-                if im.glob {
-                    p.push_str("::*");
-                }
                 let f = &self.files[im.file as usize];
                 let source_pos = f.diagnostic_pos(im.pos);
                 let source_pos = source_pos.min(f.src_len);
