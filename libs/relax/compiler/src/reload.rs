@@ -7403,6 +7403,11 @@ pub fn restart_pending() -> Vec<String> {
     RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// One reason no longer waits for a restart (a rebuild of makepad that changed nothing).
+fn drop_restart_pending(why: &str) {
+    RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).retain(|p| p != why);
+}
+
 /// A run loaded the sources as they are (`domain_loaded`): no edit waits for a restart any more.
 fn clear_restart_pending() {
     let old = std::mem::take(&mut *RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()));

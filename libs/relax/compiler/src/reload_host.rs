@@ -739,7 +739,6 @@ fn build_loop() {
         // build), so there is nothing to restart into
         if STATE.lock().unwrap_or_else(|e| e.into_inner()).provided.is_none()
             && LOADED.get().copied().flatten().is_some_and(|id| identity(&loader).is_some_and(|now| now == id)) {
-            eprintln!("makepad live: {why}: makepad is unchanged (built in {secs:.0} s); no restart");
             let what = "rebuild produced no change: cargo left the makepad this process runs as it was (the edit is not in what makepad is built from, or was undone)".to_string();
             // a live test session's tests already ran on this binary: no run answers it but this
             if crate::harness::live::enabled() { super::patch_refused_event(&why, true, std::slice::from_ref(&what)); }
@@ -749,10 +748,21 @@ fn build_loop() {
             if st.again { drop(st); continue; }
             st.phase = Phase::Idle;
             st.since = Some(Instant::now());
-            RESTART_AFTER_BUILD.store(false, std::sync::atomic::Ordering::SeqCst);
+            let asked = RESTART_AFTER_BUILD.swap(false, std::sync::atomic::Ordering::SeqCst);
             drop(st);
-            // the offer the click answered: nothing is left to update to
-            super::clear_restart_pending();
+            // makepad's own change: nothing is left to update to. The edits that wait for the
+            // app's restart still wait (a struct's layout, a const in a type).
+            super::drop_restart_pending(&why);
+            if !asked {
+                eprintln!("makepad live: {why}: makepad is unchanged (built in {secs:.0} s); no restart");
+                return;
+            }
+            // the relaunch the person asked for restarts the app, as one with no makepad change
+            let rest = super::restart_pending().join("; ");
+            let rest = if rest.is_empty() { "session relaunch".to_string() } else { rest };
+            eprintln!("makepad live: {why}: makepad is unchanged (built in {secs:.0} s); restarting the app as asked ({rest})");
+            drop(at_the_run);
+            if let Err(e) = super::restart_in_place(rest) { fail(format!("the relaunch cannot restart the app: {e}")); }
             return;
         }
         super::live_log(&format!("{{\"event\":\"host_rebuild\",\"ok\":true,\"s\":{secs:.1}}}"));
