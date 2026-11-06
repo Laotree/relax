@@ -50,6 +50,8 @@ pub fn is_binding_site(file: u32, pos: u32) -> bool {
     BINDING_SITES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&(file, pos)))
 }
 
+/// Each body owner's references, from a check's `reset` to its `finish` (None otherwise: a body
+/// linted outside a check -- a live save's -- adds nothing).
 static BODY_REFS: Mutex<Option<HashMap<DefId, BodyInfo>>> = Mutex::new(None);
 
 pub fn reset() {
@@ -445,7 +447,8 @@ pub fn collect_body(prog: &Program, tcx: &Tcx, body: &Body) {
     out.append(&mut b.tw.out);
     let mut notes = std::mem::take(&mut b.notes);
     let mut g = BODY_REFS.lock().unwrap_or_else(|e| e.into_inner());
-    let info = g.get_or_insert_with(HashMap::new).entry(holder).or_default();
+    let Some(g) = g.as_mut() else { return };
+    let info = g.entry(holder).or_default();
     info.refs.append(&mut out);
     info.notes.append(&mut notes);
 }

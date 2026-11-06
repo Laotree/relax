@@ -63,9 +63,10 @@ const KIND_BORROWCK: u32 = 4;
 pub const BORROWCK_VERSION: u32 = 2;
 /// the coherence check's own version: bump when its rules change
 const COHERENCE_VERSION: u32 = 2;
-/// `makepad test`'s up-front body check (check_body_key): bump when what a body's verdict rests
-/// on changes
-const CHECK_BODY_VERSION: u32 = 1;
+/// the whole-crate checks' verdicts (crate_check_key, dep_check_key): bump when what a crate's
+/// verdict rests on changes (2: a test check's clean verdict means no warnings -- one with
+/// warnings stores them, KIND_TEST_WARNINGS)
+const CRATE_CHECK_VERSION: u32 = 2;
 
 /// Immutable driver view for Gandalf's generic owner discovery. No Unit/cache
 /// callbacks under the front read lock, and no need to construct an instance key
@@ -169,6 +170,10 @@ const KIND_WARM_OUTCOME: u32 = 10;
 /// making it again from its own start: parked -> final, queued -> its counted build at once, no
 /// verdict (it counted and never turned hot) -> final
 const KIND_TIER: u32 = 20;
+/// `makepad test`'s check of its crates under test that passed with warnings (run.rs
+/// check_test_subjects): the warnings it printed, under the key of their check keys together
+/// (test_warnings_key). The crates' clean verdicts are not stored then: a rerun prints these.
+const KIND_TEST_WARNINGS: u32 = 21;
 const TIER_PARKED_SALT: u128 = 0x7469_6572_2d76_6572_6469_6374_2d70_6b64;
 const TIER_QUEUED_SALT: u128 = 0x7469_6572_2d71_7565_7565_642d_7261_7465;
 /// stores a front image was mapped from: kept for the rest of the process (the arrays point
@@ -2798,82 +2803,56 @@ impl Cache {
         Some(h.finish128())
     }
 
-    /// `makepad test`'s up-front check (check.rs check_subjects): what every body verdict of subject
-    /// crate `c` rests on besides the body's own text -- the Relax build and options (cfg), the
-    /// check's mode, the crate as rustc is invoked on it (name, root, edition, cfg with
-    /// cfg(test) and features, its context: env and the macros' outside inputs), its dependencies
-    /// whole (their fingerprints, which cover theirs), and its own text outside the fn bodies
-    /// that are holes (items.rs), every file of it: the check loaded the ones the boot skipped,
-    /// so this is not the boot-only interface fingerprint. None: a file without a digest.
-    pub fn check_crate_inputs(&mut self, u: &Unit, c: u32, mode: u8) -> Option<u128> {
-        let prog = &u.prog;
-        let ci = prog.crates.get(c as usize)?;
-        let mut h = Sip128::new();
-        h.str("check-crate");
-        h.u32(CHECK_BODY_VERSION);
-        h.u128(self.cfg);
-        h.u8(mode);
-        h.u128(crate::crate_image::fingerprint_head(prog.syms.str(ci.name), ci.root_path(), ci.edition, ci.proc_macro, &ci.cfg.set).finish128());
-        h.u128(ci.context.fingerprint());
-        let mut deps: Vec<u128> = Vec::new();
-        for &(_, d) in &ci.deps {
-            if d != c { deps.push(*self.fps.get(d as usize)?); }
-        }
-        deps.sort_unstable();
-        deps.dedup();
-        h.u32(deps.len() as u32);
-        for d in deps { h.u128(d); }
-        for f in 0..prog.files.len() {
-            if prog.file_crate.get(f) != Some(&c) || prog.front_macro_fragments.contains(&f) { continue; }
-            let dg = self.digest_of(u, f)?;
-            h.str(prog.file_paths.get(f).map_or("", |p| p.as_str()));
-            h.u128(dg.iface);
-        }
-        Some(h.finish128())
-    }
-
-    /// The key of body owner `d`'s verdict in `makepad test`'s up-front check: its crate's inputs
-    /// (`check_crate_inputs`), its identity, and its body's text when the body is a hole (else
-    /// the body is in the crate's text outside the holes, in the inputs already). A clean
-    /// verdict under it is a borrowck-kind entry (record_borrowck), in its crate's store.
-    pub fn check_body_key(&mut self, u: &Unit, inputs: u128, d: DefId) -> Option<u128> {
-        let def = u.prog.def(d);
-        let (file, item, krate) = (def.file, def.item, def.krate);
-        let dg = self.digest_of(u, file as usize)?;
-        let mut h = Sip128::new();
-        h.str("check-body");
-        h.u128(inputs);
-        h.u128(self.def_key(u, d));
-        match items::body_hash(&u.prog.files[file as usize], &dg, item) {
-            Some(b) => { h.u8(1); h.u128(b); }
-            None => h.u8(0),
-        }
-        let k = h.finish128();
-        self.key_crate.insert(k, krate);
-        Some(k)
-    }
-
     /// A whole-crate check's clean verdict for crate `c`: `mode` 0, `makepad run`'s type check of
     /// its every body (run.rs up front for the app's crates, typeck_bg.rs after the first present
     /// for the others); 1 and 2, `makepad test`'s up-front check of a test subject (check.rs
     /// subjects_mode: a plain program, a libtest harness; run.rs check_test_subjects). The test
     /// dependency check keys by its dependencies' interfaces instead (`dep_check_key`). The key:
-    /// the Relax build and options (cfg), the crate's fingerprint, which covers its loaded files
-    /// and its dependencies' fingerprints, as the code keys rest on, and `skipped`, the text of
-    /// its files the boot's selection did not load (check.rs skipped_text_hash): every file of
-    /// it. A borrowck-kind entry (record_borrowck).
+    /// the Relax build and options (cfg), the crate's fingerprint with the text of the files the
+    /// boot skipped (fp_now: its loaded files, those a restored image holds past its boot's, and
+    /// its dependencies'), as the code keys rest on, and `skipped`, the text of its files this
+    /// boot's selection did not load (check.rs skipped_text_hash): every file of it. A
+    /// borrowck-kind entry (record_borrowck).
     pub fn crate_check_key(&mut self, c: u32, skipped: u128, mode: u8) -> Option<u128> {
-        let fp = *self.fps.get(c as usize)?;
+        let fp = self.fp_now(c as usize)?;
         let mut h = Sip128::new();
         h.str(if mode == 0 { "run-typeck-crate" } else { "test-check-crate" });
         h.u8(mode);
-        h.u32(CHECK_BODY_VERSION);
+        h.u32(CRATE_CHECK_VERSION);
         h.u128(self.cfg);
         h.u128(fp);
         h.u128(skipped);
         let k = h.finish128();
         self.key_crate.insert(k, c);
         Some(k)
+    }
+
+    /// The key of the warnings of `makepad test`'s check of the crates whose check keys
+    /// (crate_check_key) are `keys`, in the order checked.
+    fn test_warnings_key(keys: &[u128]) -> u128 {
+        let mut h = Sip128::new();
+        h.str("test-check-warnings");
+        for &k in keys { h.u128(k); }
+        h.finish128()
+    }
+
+    /// Records the warnings of a passing test check of the crates whose check keys are `keys`.
+    pub fn record_test_warnings(&mut self, keys: &[u128], lines: &[String]) {
+        let key = Self::test_warnings_key(keys);
+        if !self.pending_keys.insert(key) { return; }
+        let mut e = E::default();
+        e.u32(lines.len() as u32);
+        for l in lines { e.str(l); }
+        let kc = keys.first().and_then(|k| self.key_crate.get(k)).copied().unwrap_or(0);
+        self.push_pending(kc, NewEntry { key, kind: KIND_TEST_WARNINGS, payload: e.0 });
+    }
+
+    /// The warnings a passing test check of the crates whose check keys are `keys` printed
+    /// (record_test_warnings); None: no such check is stored.
+    pub fn test_warnings(&self, keys: &[u128]) -> Option<Vec<String>> {
+        let Some((KIND_TEST_WARNINGS, p)) = self.get(Self::test_warnings_key(keys)) else { return None };
+        let mut d = D { b: p, p: 0 };
+        (0..d.u32()?).map(|_| d.str().map(str::to_owned)).collect()
     }
 
     /// The test dependency check's clean verdict for crate `c` (every body type- and
@@ -2890,7 +2869,7 @@ impl Cache {
     pub fn dep_check_key(&mut self, c: u32, own: u128, skipped: u128, closure: impl Iterator<Item = (u32, u128)>) -> Option<u128> {
         let mut h = Sip128::new();
         h.str("test-deps-check-crate");
-        h.u32(CHECK_BODY_VERSION);
+        h.u32(CRATE_CHECK_VERSION);
         h.u128(self.cfg);
         h.u128(own);
         h.u128(skipped);

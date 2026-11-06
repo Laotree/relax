@@ -1051,7 +1051,7 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         for error in enum_errors { eprintln!("error: {}", error); }
         return 1;
     }
-    let check_errors = run::check_test_subjects(&mut u, krate, &[krate], true);
+    let check_errors = run::check_test_subjects(&mut u, krate, &[krate], true, true);
     if check_errors > 0 {
         eprintln!("error: could not compile `{root}` (test) due to {check_errors} previous error{}: no test ran", if check_errors == 1 { "" } else { "s" });
         return 101;

@@ -2012,8 +2012,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mut app_check = None;
     if !test_subjects.is_empty() {
         let t_check = Instant::now();
-        // after the cache is open: a body whose stored verdict is clean is not checked again
-        let n = check_test_subjects(&mut u, root, &test_subjects, harness);
+        // after the cache is open: subjects whose check is stored are not checked again
+        // (a test's run of its own binary prints no warnings: its parent printed them)
+        let n = check_test_subjects(&mut u, root, &test_subjects, harness, !self_exec);
         phase("test check", t_check);
         if n > 0 {
             let names: Vec<String> = test_subjects.iter().map(|&k| u.prog.syms.str(u.prog.crates[k as usize].name).to_string()).collect();
@@ -2688,7 +2689,7 @@ static HARNESS_RUN: AtomicBool = AtomicBool::new(false);
 /// them first: an unresolved import or a type error anywhere in them fails the run, not only the
 /// test that reaches it (a test whose body did not compile used to fail alone at run time while
 /// the others passed). Prints the errors as `makepad check` does; returns their count.
-pub(crate) fn check_test_subjects(u: &mut Unit, root: u32, subjects: &[u32], harness: bool) -> usize {
+pub(crate) fn check_test_subjects(u: &mut Unit, root: u32, subjects: &[u32], harness: bool, show_warnings: bool) -> usize {
     use crate::borrowck::lazy::StoredVerdict;
     let t0 = Instant::now();
     u.tcx.check_coherence_of(&u.prog, Some(subjects));
@@ -2702,7 +2703,7 @@ pub(crate) fn check_test_subjects(u: &mut Unit, root: u32, subjects: &[u32], har
     // subjects whose every input -- their every file, their dependencies, the Relax build and its
     // options -- is a clean check's (cache.rs crate_check_key) are not checked again: a test's run
     // of its own binary (each child of a test that spawns itself), a run after an edit elsewhere.
-    // Not with a command-line lint level (not in the key). A clean test check prints nothing.
+    // Not with a command-line lint level (not in the key).
     let mode = if harness { 2 } else { 1 };
     let keys: Option<Vec<u128>> = match u.cache.as_ref() {
         Some(c) if crate::check::BOOT_SKIPPED.get().is_some() && !relax_types::lint::cmdline_set() => {
@@ -2715,18 +2716,35 @@ pub(crate) fn check_test_subjects(u: &mut Unit, root: u32, subjects: &[u32], har
     let files = u.prog.files.len();
     unsafe { jit::load_skipped_of(&mut *u, subjects) };
     let t2 = Instant::now();
-    let stored = pre.is_empty() && keys.as_ref().zip(u.cache.as_ref()).is_some_and(|(keys, c)| {
-        let c = unsafe { &*c.get() };
-        keys.iter().all(|&k| matches!(c.borrowck_stored(k), Some(StoredVerdict::Clean)))
-    });
-    let n = if stored { 0 } else { crate::check::check_subjects(u, root, subjects, pre, harness) };
+    // (a check that passed with warnings stored them, as cargo replays a fresh crate's: printed
+    // again here)
+    let stored: Option<Vec<String>> = if !pre.is_empty() { None } else {
+        keys.as_ref().zip(u.cache.as_ref()).and_then(|(keys, c)| {
+            let c = unsafe { &*c.get() };
+            if keys.iter().all(|&k| matches!(c.borrowck_stored(k), Some(StoredVerdict::Clean))) { Some(Vec::new()) } else { c.test_warnings(keys) }
+        })
+    };
+    let (n, warnings) = match &stored {
+        Some(w) => (0, w.clone()),
+        None => crate::check::check_subjects(u, root, subjects, pre, harness),
+    };
+    if show_warnings && !crate::diag::enabled() {
+        for w in &warnings { stderr_line!("{}", w); }
+        // (what it leaves out, said each time: no warning of those is no verdict on them)
+        let counted = match warnings.len() { 0 => "no warnings".to_string(), 1 => "1 warning".to_string(), n => format!("{n} warnings") };
+        stderr_line!("makepad test: {} ({})", counted, crate::check::TEST_UNCHECKED);
+    }
     verbose!("makepad-run: test check: coherence {:.0} ms, skipped files' load {:.0} ms ({} files), check {:.0} ms{}",
         (t1 - t0).as_secs_f64() * 1e3, (t2 - t1).as_secs_f64() * 1e3, u.prog.files.len() - files, t2.elapsed().as_secs_f64() * 1e3,
-        if stored { " (its crates' clean verdicts are stored)" } else { "" });
-    if n == 0 && !stored {
+        match &stored { Some(w) if w.is_empty() => " (its crates' clean verdicts are stored)", Some(_) => " (its crates' verdicts are stored, with their warnings)", None => "" });
+    if n == 0 && stored.is_none() {
         if let (Some(keys), Some(c)) = (keys, u.cache.as_ref()) {
             let c = unsafe { &mut *c.get() };
-            for k in keys { c.record_borrowck(k, StoredVerdict::Clean); }
+            if warnings.is_empty() {
+                for k in keys { c.record_borrowck(k, StoredVerdict::Clean); }
+            } else {
+                c.record_test_warnings(&keys, &warnings);
+            }
         }
     }
     n
