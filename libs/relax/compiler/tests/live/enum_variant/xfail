@@ -1,1 +1,0 @@
-M10: a variant whose payload does not fit the running values' layout takes the restart rung (X(u64, u64) makes Mode 24 bytes; its running values are 8 in place); an inserted variant that fits applies in place (enum_variant_insert). v2: a removed variant a running value may hold restarts (hotreload.md 13; the restart names HELD), where the case wants refuse
