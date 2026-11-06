@@ -680,6 +680,12 @@ pub struct Cache {
     /// per crate: its view (items.rs crate_views, bound crates folded in): what code keys and
     /// store names take from the crate besides its items
     view: Vec<u128>,
+    /// per crate: the text of its files the boot's selection skipped (items.rs late_texts), and
+    /// that of it and its dependencies (late_views: what its code keys take in); 0: none
+    late: Vec<u128>,
+    late_view: Vec<u128>,
+    /// the hash of each file version late_texts took in
+    late_memo: HashMap<u32, u128>,
     /// the program's item graph (cache/deps.rs), built on the first key that needs it
     deps: Option<std::sync::Arc<deps::Deps>>,
     /// the crates the loader binds, as they went into `iface` and `view`
@@ -1047,6 +1053,9 @@ impl Cache {
             iface: Vec::new(),
             iface_plain: Vec::new(),
             view: Vec::new(),
+            late: Vec::new(),
+            late_view: Vec::new(),
+            late_memo: HashMap::new(),
             deps: None,
             bound: Vec::new(),
             keys_moved: 0,
@@ -1171,6 +1180,11 @@ impl Cache {
         let mut view = items::crate_views(prog, &c.iface_plain, &deps::atomic_crates(prog, ncr));
         view.truncate(ncr);
         c.view = items::apply_bound(prog, &view, &provided);
+        // and the text the boot's selection skipped (a restored image's files past its boot's)
+        c.late = items::late_texts(prog, &mut c.late_memo);
+        c.late.truncate(ncr);
+        c.late_view = items::late_views(prog, &c.late);
+        c.late_view.truncate(ncr);
         c.stats.iface_ns = t_if.elapsed().as_nanos() as u64;
         // MAKEPAD_RUN_CACHE_IFACE=<file>: every file's interface hash and crate's interface
         // fingerprint (which file made an edit's crate recompile)
@@ -2425,6 +2439,11 @@ impl Cache {
                 for &c in &crates {
                     h.u128(*self.view.get(c as usize)?);
                     h.u128(g.always(c));
+                    // the text of its and its dependencies' files the boot skipped, whole
+                    if let Some(&late) = self.late_view.get(c as usize).filter(|l| **l != 0) {
+                        h.str("late");
+                        h.u128(late);
+                    }
                 }
                 // the items the identity names (the definition, the types of its arguments): what
                 // they reach of the program's interfaces; one with no node (an item a fn body
@@ -3430,7 +3449,7 @@ impl Cache {
         for i in idents {
             let c = *self.crate_by_ident.get(i)?;
             h.u128(*i);
-            h.u128(*self.fps.get(c as usize)?);
+            h.u128(self.fp_now(c as usize)?);
             // a const edit reached it: no entry's hash matches, read or written, and each
             // key the entry names is compared
             if self.keys_moved_crates.get(c as usize) == Some(&true) {
@@ -3676,10 +3695,28 @@ impl Cache {
         let mut h = Sip128::new();
         h.str("sources");
         h.u128(self.cfg);
-        for &fp in &self.fps {
-            h.u128(fp);
+        for c in 0..self.fps.len() {
+            h.u128(self.fp_now(c).unwrap_or(0));
         }
         h.finish128()
+    }
+
+    /// Crate `c`'s fingerprint (of the files the boot loaded and its dependencies') with the text
+    /// of its and their files the boot's selection skipped (late_view): what says whether code
+    /// keys recorded earlier hold -- the startup manifest's sources, the image's crates, a
+    /// certificate's fast path. The fingerprint itself when there is no such text.
+    pub(super) fn fp_now(&self, c: usize) -> Option<u128> {
+        let fp = *self.fps.get(c)?;
+        Some(match self.late_view.get(c).copied().unwrap_or(0) {
+            0 => fp,
+            late => {
+                let mut h = Sip128::new();
+                h.str("fp-late");
+                h.u128(fp);
+                h.u128(late);
+                h.finish128()
+            }
+        })
     }
 
     /// The settle rebuild's new cache (opened as a warm start opens it, from the same stores) takes
@@ -3752,7 +3789,7 @@ impl Cache {
                     let crates = if same { Some(None) } else {
                         self.image.as_ref().and_then(|im| image::image_crates(im.bytes())).map(|recorded| {
                             let recorded: HashMap<u128, u128> = recorded.into_iter().collect();
-                            Some(self.crate_ident.iter().zip(&self.fps).map(|(id, fp)| recorded.get(id) == Some(fp)).collect())
+                            Some(self.crate_ident.iter().enumerate().map(|(c, id)| recorded.get(id).is_some_and(|fp| self.fp_now(c) == Some(*fp))).collect())
                         })
                     };
                     if let Some(crates) = crates.filter(|_| missing == 0 && self.mode != Mode::Verify) {
@@ -8786,7 +8823,23 @@ pub(crate) unsafe fn const_closures(up: *mut Unit, consts: &[DefId]) -> Vec<(Def
         c.keys_follow_text(u);
     }
     let g = c.deps_graph(u);
-    consts.iter().map(|&d| (d, g.def_closure(&u.prog, d))).collect()
+    let out: Vec<(DefId, Option<u128>)> = consts.iter().map(|&d| (d, g.def_closure(&u.prog, d))).collect();
+    if crate::reload::reload_trace() {
+        for &(d, k) in &out {
+            if k.is_some() { continue; }
+            let def = u.prog.def(d);
+            eprintln!("reload-trace: const {} has no node: file {} {:?} (boot files {}, in the graph's files {}, edit-added {:?}), crate {} in the graph {}",
+                u.prog.def_path(d), def.file, u.prog.file_paths.get(def.file as usize), u.prog.boot_files, g.has_file(&u.prog, def.file),
+                u.prog.edit_added_files(), def.krate, g.in_graph(&u.prog, d));
+        }
+    }
+    out
+}
+
+/// Whether definition `d` is in a file the boot's selection skipped (loaded after the boot): the
+/// item graph has no node of it, and the code keys take that file's text in whole.
+pub(crate) fn in_skipped_file(prog: &crate::program::Program, d: DefId) -> bool {
+    items::outside_boot_text(prog, prog.def(d).file)
 }
 
 /// What a const edit's re-key found.
@@ -8920,6 +8973,14 @@ impl Cache {
         self.deps = Some(crate::zone_alloc::slots_with(|| std::sync::Arc::new(g)));
         self.iface = items::apply_bound(prog, &plain, &self.bound);
         self.iface_plain = plain;
+        // and the text of the files the boot skipped, as it is now
+        let mut late = items::late_texts(prog, &mut self.late_memo);
+        late.truncate(ncr);
+        if late != self.late {
+            self.late_view = items::late_views(prog, &late);
+            self.late_view.truncate(ncr);
+            self.late = late;
+        }
         self.name_memo.clear();
         self.body_names.clear();
         self.def_bodies.clear();
