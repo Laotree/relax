@@ -3325,6 +3325,12 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             }
         }
     }
+    // a laid-out link section is one block of the statics it had (sections.rs)
+    for (v, _) in &versions {
+        if let Some(why) = crate::sections::edit_moves_a_section(u, v.old, &v.pf) {
+            restart.push(why);
+        }
+    }
     if !restart.is_empty() {
         out.rung = Rung::Restart;
         out.lines = restart;

@@ -417,6 +417,8 @@ pub struct Unit {
     /// the statics' storage by address: start -> (static, size), so a pointer into a static
     /// (`&S.field`, `&S[3]`) in constant data is that static's symbol plus an offset
     pub static_spans: std::collections::BTreeMap<u64, (DefId, u64)>,
+    /// the link sections laid out so far, by output section (sections.rs)
+    pub(crate) sections: crate::fxhash::HashMap<String, crate::sections::Section>,
     pub sites: relax_session::sync::Mutex<Vec<Site>>,
     /// one site per (file, position, message): every inlined copy of a panic location is one
     /// site and one symbol, whatever the compile order (one constant pool word)
@@ -4497,6 +4499,7 @@ impl Unit {
             const_certs: Default::default(),
             tls_places: Default::default(),
             static_spans: Default::default(),
+            sections: Default::default(),
             sites: Default::default(),
             site_ix: Default::default(),
             panic_hook: std::sync::atomic::AtomicUsize::new(0),
@@ -7042,8 +7045,15 @@ impl Unit {
                 crate::domain::capture_static(self, sym);
                 crate::domain::materialize(self, sym);
             }
+            if self.prog.def(d).kind == DefKind::ForeignStatic {
+                crate::sections::retry_deferred(self, d);
+            }
             cert_note_value(self, d, &[]);
             return a;
+        }
+        // a static of a link section, or a bound of one: the section's block (sections.rs)
+        if let Some((group, bound)) = self.section_place(d) {
+            return crate::sections::place(self, d, &group, bound);
         }
         // A static has its address before its value (Reference items/static-items: statics may
         // refer to each other's addresses, also cyclically): record the address first, then run
@@ -7062,6 +7072,12 @@ impl Unit {
             self.statics.insert(d, buf);
             self.static_spans.insert(buf, (d, l.size as u64));
         });
+        self.init_static(d, t, buf, l.size as u64)
+    }
+
+    /// Runs static `d`'s initializer (type `t`, `size` bytes) into its storage `buf`, its address
+    /// already recorded; `buf`, or 0 when it has no value.
+    pub(crate) fn init_static(&mut self, d: DefId, t: TyId, buf: u64, size: u64) -> u64 {
         // Restore the initial value into this run's writable storage. The cached
         // object is an immutable snapshot taken immediately after pure CTFE,
         // never the static's later (possibly mutated) contents.
@@ -7080,7 +7096,7 @@ impl Unit {
             eprintln!("static-trace: {} {} {} {:.0} us", how, self.prog.syms.str(self.prog.crates[self.prog.def(d).krate as usize].name), self.prog.def_path(d), (cpu_ns() - t0) as f64 / 1e3);
         }
         if let Some(initial) = cached {
-            unsafe { std::ptr::copy_nonoverlapping(initial as *const u8, buf as *mut u8, l.size as usize); }
+            unsafe { std::ptr::copy_nonoverlapping(initial as *const u8, buf as *mut u8, size as usize); }
         } else if ran.as_ref().and_then(|r| r.0).is_none() {
             // needs a skipped module: evaluated again (same storage) once the outer compile
             // loaded it; the build using it fails meanwhile (DEFERRED_ABORT)

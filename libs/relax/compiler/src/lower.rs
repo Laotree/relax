@@ -7729,6 +7729,12 @@ impl<'a> Lcx<'a> {
                 let p = self.static_ptr(d);
                 self.read_place(&Place::Mem(p, 0), t)
             }
+            // a section bound the linker defines (`__start_<name>`): the program's own static
+            // memory, the end of its laid-out section (sections.rs)
+            DefKind::ForeignStatic if self.u.is_section_bound(d) => {
+                let p = self.static_ptr(d);
+                self.read_place(&Place::Mem(p, 0), t)
+            }
             DefKind::ForeignStatic => match self.u.foreign_sym(d) {
                 // `extern { static X: T; }`: the C global's current value
                 Some(addr) => {
@@ -8067,6 +8073,10 @@ impl<'a> Lcx<'a> {
                     if !self.u.provided.is_empty() {
                         self.check_provided_static(d, t);
                     }
+                    let p = self.static_ptr(d);
+                    (Place::Mem(p, 0), t)
+                }
+                Some(Res::Def(d)) if self.u.prog.def(d).kind == DefKind::ForeignStatic && self.u.is_section_bound(d) => {
                     let p = self.static_ptr(d);
                     (Place::Mem(p, 0), t)
                 }
