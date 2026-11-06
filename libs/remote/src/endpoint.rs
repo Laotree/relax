@@ -155,7 +155,7 @@ impl Endpoint {
 
     /// As [`serve_checked`](Self::serve_checked), for a peer whose process the carrier knows
     /// (`pid`, from a Unix socket's credentials): [`Hello::pid`] of the connection's peer, which a
-    /// command's log names as who asked ([`crate::cmd::asker`]).
+    /// command's log names as who asked ([`crate::cmd::asked_by`]).
     pub fn serve_peer(&self, mut reader: FrameReader, mut writer: Box<dyn Write + Send>, shutdown: Box<dyn Fn() + Send + Sync>, token: &str, pid: u32) -> Result<Conn, HandshakeError> {
         reader.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
         let own = Hello { name: self.0.app.clone(), caps: self.caps(), token: token.to_string(), ..Hello::default() };

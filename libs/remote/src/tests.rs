@@ -908,24 +908,28 @@ fn a_run_with_a_deep_tmpdir_is_reached() {
     std::fs::remove_dir_all(&base).unwrap();
 }
 
-/// A command over the Unix socket knows the process that sent it, from the socket's credentials
-/// (not from anything the client says): a `session relaunch` names who asked (Scope, Fab and
-/// Story restarted for a landing and nothing said by whom, 11-06).
+/// A command over the Unix socket names who sent it: the agent its client says it is, and its
+/// process, from the socket's credentials (not from anything the client says). A `session
+/// relaunch` and a click injected into a window's caption name who asked (Scope, Fab and Story
+/// restarted for a landing, and apps closed by their caption, and nothing said by whom, 11-06).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn a_command_names_the_process_that_sent_it() {
+fn a_command_names_the_agent_that_sent_it() {
     fn asked(_: &Req, out: &mut Out) {
-        out.line(&format!("{{\"asker\":{}}}", crate::cmd::asker().unwrap_or(0)));
+        out.line(&crate::cmd::asked_by().unwrap_or_default());
     }
-    let ep = Endpoint::new("makepad-remote-asker-test");
+    let ep = Endpoint::new("makepad-remote-agent-test");
     ep.register_cmd(asked);
-    let sock = std::env::temp_dir().join(format!("mpr-asker-{}.sock", std::process::id()));
+    let sock = std::env::temp_dir().join(format!("mpr-agent-{}.sock", std::process::id()));
     crate::carrier::unix::listen_at(&ep, &sock).unwrap();
-    let c = Client::new(Target::Unix(sock.clone()), "asker-test");
-    let line = c.cmd("who").unwrap().next().unwrap().unwrap();
-    assert_eq!(line, format!("{{\"asker\":{}}}", std::process::id()), "this process sent it");
-    assert_eq!(crate::cmd::asker(), None, "no command is answered on this thread");
-    drop(c);
+    let me = crate::procs::said(std::process::id());
+    let agent = Client::new(Target::Unix(sock.clone()), &format!("{}LANE7", crate::cmd::AGENT_CLIENT));
+    assert_eq!(agent.cmd("who").unwrap().next().unwrap().unwrap(), format!("agent LANE7, {me}"));
+    let other = Client::new(Target::Unix(sock.clone()), "client");
+    assert_eq!(other.cmd("who").unwrap().next().unwrap().unwrap(), me);
+    assert_eq!(crate::cmd::asked_by(), None, "no command is answered on this thread");
+    assert!(me.starts_with(&format!("pid {} ", std::process::id())), "{me}");
+    drop((agent, other));
     let _ = std::fs::remove_file(&sock);
 }
 
