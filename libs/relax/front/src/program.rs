@@ -2439,12 +2439,14 @@ impl Program {
                     let (dir, mod_rs) = self.module_source_directory(module);
                     self.collect_items(file, &[iid], module, &dir, mod_rs)?;
                 }
-                Err(imp) => {
-                    let krate = self.defs[imp.0 as usize].krate;
-                    let module = self.defs[imp.0 as usize].scope;
-                    if let Some(ad) = self.collect_assoc(file, iid, imp, krate, module)? {
-                        let ii = self.defs[imp.0 as usize].sub as usize;
-                        self.impls[ii].items.push(ad);
+                Err(owner) => {
+                    let krate = self.defs[owner.0 as usize].krate;
+                    let module = self.defs[owner.0 as usize].scope;
+                    if let Some(ad) = self.collect_assoc(file, iid, owner, krate, module)? {
+                        // an impl's item, or a trait's: after the items it has (their places in
+                        // the trait's vtable stay)
+                        let sub = self.defs[owner.0 as usize].sub as usize;
+                        if self.defs[owner.0 as usize].kind == DefKind::Trait { self.traits[sub].push(ad); } else { self.impls[sub].items.push(ad); }
                         self.collect_body_items(file, iid, module, Some(ad))?;
                         crate::def_collector::collect_definitions(self, ad)?;
                     }
@@ -2590,6 +2592,11 @@ impl Program {
                 if ii < self.impls.len() && self.impls[ii].def == parent {
                     self.impls[ii].items.retain(|x| *x != d);
                 }
+            }
+            // a trait's item leaves its trait (a trait that goes keeps its list: it is unbound)
+            if parent.0 != u32::MAX && (parent.0 as usize) < self.defs.len() && self.defs[parent.0 as usize].kind == DefKind::Trait && !defs.contains(&parent) {
+                let ti = self.defs[parent.0 as usize].sub as usize;
+                if let Some(items) = self.traits.get_mut(ti) { items.retain(|x| *x != d); }
             }
         }
         self.forget_bindings();
@@ -2779,11 +2786,15 @@ impl Program {
                 DefKind::Fn | DefKind::Const | DefKind::Static => self.define(scope, false, name, d),
                 DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::TypeAlias | DefKind::Trait | DefKind::Mod => self.define(scope, true, name, d),
                 DefKind::AssocFn | DefKind::AssocConst | DefKind::AssocTy => {
-                    if self.defs[parent.0 as usize].kind == DefKind::Impl {
-                        let ii = self.defs[parent.0 as usize].sub as usize;
-                        if !self.impls[ii].items.contains(&d) {
-                            self.impls[ii].items.push(d);
-                        }
+                    let sub = self.defs[parent.0 as usize].sub as usize;
+                    let items = match self.defs[parent.0 as usize].kind {
+                        DefKind::Impl => Some(&mut self.impls[sub].items),
+                        // (the caller restores the trait's order: its vtable's)
+                        DefKind::Trait => self.traits.get_mut(sub),
+                        _ => None,
+                    };
+                    if let Some(items) = items.filter(|v| !v.contains(&d)) {
+                        items.push(d);
                     }
                 }
                 _ => {}

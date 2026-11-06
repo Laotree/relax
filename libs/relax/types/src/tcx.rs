@@ -1112,6 +1112,21 @@ impl Tcx {
         } else {
             self.collect_adt_destructors(prog);
         }
+        // an added trait's supertraits, as `collect` records every trait's
+        for &d in defs {
+            if prog.def(d).kind == DefKind::Trait {
+                let mut all = Vec::new();
+                let mut todo = vec![d];
+                while let Some(x) = todo.pop() {
+                    if !all.contains(&x) {
+                        all.push(x);
+                        todo.extend(self.trait_supers(prog, x));
+                    }
+                }
+                self.trait_closure.insert(d, all);
+            }
+        }
+        self.flush_errs();
         self.errors[n0..].to_vec()
     }
 
@@ -1168,11 +1183,6 @@ impl Tcx {
         for &d in defs {
             let errors = self.signature_errors(prog, d).to_vec();
             self.errors.extend(errors);
-            if prog.def(d).kind == DefKind::Trait {
-                let mut all = Vec::new(); let mut todo = vec![d];
-                while let Some(x) = todo.pop() { if !all.contains(&x) { all.push(x); todo.extend(self.trait_supers(prog, x)); } }
-                self.trait_closure.insert(d, all);
-            }
         }
         self.flush_errs();
         self.publish_collected();
