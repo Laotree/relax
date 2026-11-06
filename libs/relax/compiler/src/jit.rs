@@ -3526,12 +3526,12 @@ fn park_compile_error(up: usize, slot: u32) -> u64 {
 }
 
 /// A program thread's call of a slot whose compile hit an internal compiler error: no error of
-/// the program, so no edit of it resumes the call, and it never parks (zero hot failures). After
-/// live edits it is a failed hot load (reload.rs recover_compile_ice): recorded, and a fresh
-/// process replaces this one -- now when this is the app's main thread, else at the app's next
-/// event, with its state, while this call waits for it. Otherwise (no edit ran, a recovery
-/// failed or runs already: the replacement's own error, reported as the JIT's) the call fails as
-/// the error's panic.
+/// the program, so no edit of it resumes the call. After live edits the update failed in this
+/// call: in an app the person runs it is recorded and the call parks for the person, the window
+/// and the app's state kept, until they restart or stop it (reload.rs update_failed_at_call); a
+/// live test session's tests restart at once (reload.rs recover_compile_ice). Otherwise (no edit
+/// ran, a recovery failed or runs already: the replacement's own error, reported as the JIT's)
+/// the call fails as the error's panic.
 #[cold]
 #[inline(never)]
 fn compile_ice(up: usize, message: &str) -> u64 {
@@ -3550,6 +3550,31 @@ fn compile_ice(up: usize, message: &str) -> u64 {
 /// panic of the program, so nothing parks it as one.
 pub(crate) fn ice_at_call(message: &str) -> bool {
     let on_main = os::thread::current() == MAIN_TID.load(Ordering::Relaxed);
+    // the live update failed in this call of an app the person runs: it parks for them, and the
+    // app is never restarted by itself (it was: a landing restarted the person's app in place)
+    if crate::reload::update_failed_at_call(message) {
+        let mut frames = [0u64; crate::inspect::heap::DEPTH];
+        let n = crate::inspect::heap::capture_host(&mut frames) as usize;
+        let why = format!("The live update failed in this call: {message} -- a makepad run bug, report it. Restart starts the app again with the update");
+        let ends = match crate::inspect::events::park_update_failed(&why, &frames[..n]) {
+            crate::inspect::events::UpdateParked::Restart => match crate::reload::restart_run(&why) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("makepad-run: the restart after a failed update did not start: {e}");
+                    crate::hot_failure::restart_failed(&e);
+                    false
+                }
+            },
+            crate::inspect::events::UpdateParked::Stop => {
+                eprintln!("makepad-run: stopped at a call the live update could not build ({message})");
+                std::process::exit(101)
+            }
+            crate::inspect::events::UpdateParked::Ending => true,
+        };
+        // the call ends with this run (or, the restart did not start, fails as the error's panic)
+        if ends { crate::run_end::leave(); }
+        return false;
+    }
     // (a recovery this process asked for already: its restart is this call's end too)
     let restarting = crate::reload::recover_compile_ice(message, on_main) || crate::reload::unit_suspect().is_some() && crate::hot_failure::recovering();
     if restarting {

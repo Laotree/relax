@@ -99,13 +99,6 @@ impl Tcx {
             .filter(|d| matches!(prog.def(*d).kind, DefKind::AssocFn | DefKind::Trait)).collect();
         defs.extend((first..prog.defs.len()).map(|d| DefId(d as u32)));
         self.collect_added(prog, &defs, true);
-        for d in defs {
-            if prog.def(d).kind == DefKind::Trait {
-                let mut all = Vec::new(); let mut todo = vec![d];
-                while let Some(x) = todo.pop() { if !all.contains(&x) { all.push(x); todo.extend(self.trait_supers(prog, x)); } }
-                self.trait_closure.insert(d, all);
-            }
-        }
         self.flush_errs();
         self.seal_collected_diagnostics();
         self.publish_collected();
