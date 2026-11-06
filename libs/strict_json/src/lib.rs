@@ -697,6 +697,18 @@ mod tests {
         assert!(!value.to_json().bytes().any(|b| b"XYZ".contains(&b)));
         assert_eq!(calls.get(), 9, "one pick per visited value, including the root");
         assert_eq!(parse_picked(bytes, 8, false, &|_| Pick::Keep), parse_depth(bytes, 8));
+        // Projected leaves are built as the ordinary parser builds them.
+        let mixed = br#"{"a":"\ud83d\ude00\n","b":1.5,"c":[-2,1e3,null,true],"secret":{"a":"XYZ"}}"#;
+        let whole = parse_depth(mixed, 8).unwrap();
+        let projected = parse_picked(mixed, 8, false, &|path| match path {
+            [] => Pick::Open,
+            [Key("a" | "b" | "c")] => Pick::Keep,
+            _ => Pick::Skip,
+        }).unwrap();
+        for key in ["a", "b", "c"] {
+            assert_eq!(projected.get(key), whole.get(key), "{key}");
+        }
+        assert!(projected.get("secret").is_none());
         assert_eq!(parse_picked(b"true", 8, false, &|_| Pick::Open).unwrap(), Value::Null);
         assert_eq!(parse_picked(br#"{"secret":"XYZ"}"#, 8, false, &|_| Pick::KeepString).unwrap(), Value::Null);
     }
