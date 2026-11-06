@@ -9739,7 +9739,8 @@ pub fn src_size(u: &Unit, id: u32) -> u32 {
     (b - a) as u32
 }
 
-/// Inline attributes of callee slot `c` for the inliner, None when it may not be inlined:
+/// Inline attributes of callee slot `c` for the inliner, or why it may not be inlined (a
+/// why-tier note):
 /// #[inline]/#[inline(always)], rule 4 (core instances made for a closure / fn item), and
 /// with `core_hint` the implicit #[inline] of Relax core's functions (real std marks its
 /// small methods #[inline]). User code only with `inline_all`.
@@ -9747,30 +9748,33 @@ pub fn src_size(u: &Unit, id: u32) -> u32 {
 /// `into_unverified`: the build is unverified code itself (an O3 build of an unverified body or of
 /// a twin: never cached, rebuilt once verified): it may take in unverified callees too, and then
 /// stays unverified (O3Assembled::unverified_in). A verified build never holds unverified code.
-fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &crate::conc::AppendVec<FnEntry>, core_crate: u32, c: u32, inline_all: bool, core_hint: bool, into_unverified: bool) -> Option<u8> {
+fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &crate::conc::AppendVec<FnEntry>, core_crate: u32, c: u32, inline_all: bool, core_hint: bool, into_unverified: bool) -> Result<u8, &'static str> {
     let options = &prog.session.clone().options;
     // a sandboxed module's code is never inlined into host code (it runs only as twins)
     if crate::sandbox::is_sandboxed_crate_key(prog, &fns[c as usize].key) {
-        return None;
+        return Err("not inlinable: sandboxed");
     }
     // SPEC-V: unverified code is inlined only into unverified code
     if !into_unverified && fns[c as usize].unverified.load(Ordering::Relaxed) {
-        return None;
+        return Err("not inlinable: unverified");
     }
     // makepad inspect: an instrumented or pinned fn runs as its own code (a copy would run
     // unprobed, or at another tier than its pin)
     if crate::inspect::patches::no_inline(c) {
-        return None;
+        return Err("not inlinable: probed or pinned");
     }
     // a live patch replaced it: a copy would always take its guard's slot call (set_patched)
     if fns[c as usize].patched.load(Ordering::Relaxed) {
-        return None;
+        return Err("not inlinable: patched");
     }
-    Some(match &fns[c as usize].key {
+    Ok(match &fns[c as usize].key {
         FnKey::Inst(d, args) => {
             let core = prog.def(*d).krate == core_crate;
-            if !inline_all && !core || inline_never(prog, *d) {
-                return None;
+            if !inline_all && !core {
+                return Err("not inlinable: user code without inline_all");
+            }
+            if inline_never(prog, *d) {
+                return Err("not inlinable: #[inline(never)]");
             }
             let mut a = inline_attrs(prog, *d);
             // core's small fns (real std marks them #[inline]) and, at O3, user fns too:
@@ -9811,7 +9815,7 @@ fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &cra
         // the base builds it again. Never into verified code (which never calls twins).
         FnKey::Plain(b) if into_unverified => return callee_attrs(prog, tcx, fns, core_crate, *b, inline_all, core_hint, true),
         // sandbox twins are never inlined into anything (their callers are twins built from RIR)
-        FnKey::Sandbox(_) | FnKey::Plain(_) => return None,
+        FnKey::Sandbox(_) | FnKey::Plain(_) => return Err("not inlinable: twin"),
     })
 }
 
@@ -12334,6 +12338,10 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                 FnKey::Sandbox(_) | FnKey::Plain(_) => continue,
             };
             if !builtin && (!cfg.inline_all || matches!(u.fns[*c as usize].key, FnKey::Closure(..))) {
+                if relax_codegen::opt::inline_trace(&u.fns[id as usize].name) && !matches!(u.fns[*c as usize].key, FnKey::Closure(..)) {
+                    let why = if unverified { "the caller is unverified: baseline" } else if baseline { "baseline" } else { "user code without inline_all" };
+                    eprintln!("inline-trace-o1 {}: out fn#{} {} ({})", u.fns[id as usize].name, c, u.fns[*c as usize].name, why);
+                }
                 continue;
             }
             if baseline && !base_inline_wanted(u, *c) {
@@ -12341,9 +12349,15 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             }
             // refused callees (#[inline(never)], sandboxed, user code without inline_all,
             // MAKEPAD_RUN_NOINL) are not built for inlining: decided before the build, not after
+            let attrs = callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false);
             let want = (baseline && matches!(u.fns[*c as usize].key, FnKey::Glue(..)) || inline_source_wanted(u, *c, full))
-                && callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false).is_some()
+                && attrs.is_ok()
                 && !noinl_callee.is_some_and(|p| name_matches(&u.fns[*c as usize].name, p));
+            if let Err(why) = attrs.as_ref() {
+                if !builtin && relax_codegen::opt::inline_trace(&u.fns[id as usize].name) {
+                    eprintln!("inline-trace-o1 {}: out fn#{} {} ({})", u.fns[id as usize].name, c, u.fns[*c as usize].name, why);
+                }
+            }
             if want && O2_SNAPSHOT.try_with(|c| c.get()).unwrap_or(false) {
                 // a snapshot O2 build makes no front end under the lock: candidates with RIR only
                 if u.fns[*c as usize].rir.is_some() {
@@ -12400,7 +12414,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                     if let Ok(Front::Opt(p, _)) = r {
                         let u = &*up;
                         // built (its RIR is stored) but not inlined when it calls this fn back
-                        let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false) };
+                        let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false).ok() };
                         if attrs.is_none() && sig_dir().is_some() && inline_cycle(u, id, *c) {
                             skipped.push((*c, "cycle"));
                         }
@@ -12419,7 +12433,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                     // (off the owner); its RIR replaces the baseline RIR at the finish
                     if let Some(Some(p)) = collect_fronts(&mut needs, || split_upgrade(up, *c)) {
                         let u = &*up;
-                        let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false) };
+                        let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false).ok() };
                         deferred.push((*c, attrs, p));
                     }
                 } else {
@@ -12436,9 +12450,8 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             if !wanted.contains(&c) || deferred.iter().any(|x| x.0 == c) {
                 continue;
             }
-            let attrs = match callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, c, inline_all, core_hint, false) {
-                Some(a) => a,
-                None => continue,
+            let Ok(attrs) = callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, c, inline_all, core_hint, false) else {
+                continue;
             };
             if let Some(p) = noinl_callee {
                 if name_matches(&u.fns[c as usize].name, p) {
@@ -19996,8 +20009,12 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                             notes.push((c, if unverified_left.contains(&c) { "unverified: again at its verdict" } else { "unverified: again only with the root's verdict" }));
                             continue;
                         }
-                        if f.build_err.is_some() || callee_attrs(&u.prog, &u.tcx, &u.fns, core, c, inline_all, true, root_unverified).is_none() {
-                            notes.push((c, "not inlinable (build error or attributes)"));
+                        if f.build_err.is_some() {
+                            notes.push((c, "not inlinable: build error"));
+                            continue;
+                        }
+                        if let Err(why) = callee_attrs(&u.prog, &u.tcx, &u.fns, core, c, inline_all, true, root_unverified) {
+                            notes.push((c, why));
                             continue;
                         }
                         if !f.compiled && !f.ran_before.load(Ordering::Relaxed) && f.rir.is_none() {
@@ -21583,10 +21600,10 @@ unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), id: u32, rir
             continue;
         };
         let attrs = match callee_attrs(prog, tcx, fns, core, c, inline_all, true, root_unverified) {
-            Some(a) if xcrate_unavailable(prog, fns, core, id, c) => (a & !relax_codegen::opt::ATTR_HINT) | relax_codegen::opt::ATTR_XCRATE,
-            Some(a) => a,
-            None => {
-                if trace { eprintln!("inline-trace-snap {}: out fn#{} {} (not inlinable)", fns[id as usize].name, c, fns[c as usize].name); }
+            Ok(a) if xcrate_unavailable(prog, fns, core, id, c) => (a & !relax_codegen::opt::ATTR_HINT) | relax_codegen::opt::ATTR_XCRATE,
+            Ok(a) => a,
+            Err(why) => {
+                if trace { eprintln!("inline-trace-snap {}: out fn#{} {} ({})", fns[id as usize].name, c, fns[c as usize].name, why); }
                 if fns[c as usize].unverified.load(Ordering::Relaxed) { unverified_left.push(c); }
                 continue;
             }
