@@ -14458,6 +14458,9 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
         relax_backend::passes::live_dce(func);
         slot_cleanup(options, func, ro, cfg);
     }
+    // a live session's guards: the constant loops of the copies are gone (and the calls the
+    // passes removed), so more of them share one copy version read
+    relax_codegen::opt::share_copy_ver_reads(options, func);
     // a copy of a stepped pointer's previous value (partition's gap, insertion's hole) read as
     // the pointer minus its step: accesses through both share one base (load forwarding)
     if cfg.fold && relax_codegen::version::prev_iv_copies(options, func) {
