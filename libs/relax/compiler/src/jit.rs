@@ -443,6 +443,10 @@ pub struct Unit {
     /// hot reload: checked bodies of older file versions, by (slot, file): closures those
     /// versions made are lowered from them (put_body)
     pub old_bodies: crate::fxhash::HashMap<(u32, u32), std::sync::Arc<Body>>,
+    /// hot reload, for the report of a closure whose owner's body is gone: per replaced file
+    /// version, what the edit that replaced it did with its closure owners (preserve_closure_bodies);
+    /// the newest PRESERVE_LOG_VERSIONS versions'
+    pub(crate) preserve_log: std::collections::VecDeque<(u32, PreserveLog)>,
     /// coroutine poll functions lowered to find their state layout (coro_frame): the build of
     /// the slot takes this RIR, so the layout callers saw and the code agree
     pub coro_rir: crate::conc::MemoMap<u32, relax_backend::rir::Func>,
@@ -4505,6 +4509,7 @@ impl Unit {
             rt: Rt { fmt_str: 0, fmt_int: 0, fmt_float: 0, fmt_print: 0, panic_site: 0, panic_bounds: 0, str_eq: 0, fmod: 0, fmodf: 0, panic_impl: 0, thread_run: 0, catch_panic: 0, args: 0, memcpy: 0, memmove: 0, memset: 0, fmt_push: 0, fmt_pop: 0, resume: 0, land: 0, panicking: 0, rethrow: 0 },
             bodies: Default::default(),
             old_bodies: Default::default(),
+            preserve_log: Default::default(),
             coro_rir: Default::default(),
             coro_busy: Default::default(),
             spec_cached: Default::default(),
@@ -14043,7 +14048,7 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::
             }
             match u.body_of(*parent, *cfile) {
                 Some(b) => b.clone(),
-                None => return Err("internal compiler error: closure parent body missing".to_string()),
+                None => return Err(format!("internal compiler error: closure parent body missing: {}", missing_owner_facts(up, *parent, *cfile))),
             }
         }
         FnKey::Shim(_) | FnKey::Glue(..) => return Err("glue".to_string()),
@@ -25266,6 +25271,7 @@ pub(crate) unsafe fn preserve_closure_bodies(up: *mut Unit, files: &[u32]) -> Re
         }
     }
     let mut seen_tys: std::collections::HashSet<TyId> = Default::default();
+    let mut log: Vec<(u32, PreserveLog)> = files.iter().map(|&f| (f, PreserveLog::default())).collect();
     crate::reload::trace_sub("preserve_scan");
     crate::reload::trace_count("preserve_slotted", n_slotted);
     let mut i = 0;
@@ -25278,14 +25284,22 @@ pub(crate) unsafe fn preserve_closure_bodies(up: *mut Unit, files: &[u32]) -> Re
         if !(&*up).has_body(parent, file) {
             crate::reload::trace_count("preserve_checked", 1);
         }
+        let entry = log.iter_mut().find(|x| x.0 == file).map(|x| &mut x.1);
         match ensure_parent_body(up, parent, file, 0) {
             Ok(()) => {}
             Err(e) if i <= n_slotted => return Err(e),
-            Err(_) => continue,
+            Err(e) => {
+                if let Some(l) = entry { l.failed.push((parent, e.lines().next().unwrap_or("").chars().take(200).collect::<String>().into())); }
+                continue;
+            }
         }
         crate::reload::trace_sub("preserve_check");
         let u = &mut *up;
-        let Some(body) = u.body_of(parent, file).cloned() else { continue };
+        let Some(body) = u.body_of(parent, file).cloned() else {
+            if let Some(l) = entry { l.failed.push((parent, "no body after its check".into())); }
+            continue;
+        };
+        if let Some(l) = entry { l.kept.push(parent); }
         // Freeze shared identity tables before their definitions are replaced.
         // Old closures must never normalize an old alias against the new source.
         let body = if std::sync::Arc::ptr_eq(&body, &u.tcx.typeck(&u.prog, body.def)) {
@@ -25328,7 +25342,57 @@ pub(crate) unsafe fn preserve_closure_bodies(up: *mut Unit, files: &[u32]) -> Re
         }
         crate::reload::trace_sub("preserve_named");
     }
+    let u = &mut *up;
+    for entry in log {
+        if u.preserve_log.len() >= PRESERVE_LOG_VERSIONS { u.preserve_log.pop_front(); }
+        u.preserve_log.push_back(entry);
+    }
     Ok(())
+}
+
+/// What an edit that replaced a file version did with the closure owners of that version: the
+/// slots whose checked body it kept, and those it could not check again (the error's first line).
+#[derive(Default)]
+pub(crate) struct PreserveLog {
+    kept: Vec<u32>,
+    failed: Vec<(u32, Box<str>)>,
+}
+
+/// The replaced file versions whose PreserveLog is kept (the oldest goes).
+const PRESERVE_LOG_VERSIONS: usize = 64;
+
+/// The facts of a missing closure-owner body, for the report of the internal error (built only
+/// then): the owner, the version its closures belong to and the one that replaced it, which
+/// bodies of the owner are held, what the edit that replaced the version did with this owner,
+/// and the owner's code (tier, origin, inlining).
+unsafe fn missing_owner_facts(up: *mut Unit, id: u32, file: u32) -> String {
+    let u = &*up;
+    let f = &u.fns[id as usize];
+    let path = |v: u32| u.prog.file_paths.get(v as usize).map_or("?", |p| p.as_str());
+    let (now, at) = match &f.key {
+        FnKey::Inst(d, _) => {
+            let def = u.prog.def(*d);
+            (def.file, u.pos_str(def.file, u.prog.files[def.file as usize].ast.item(def.item).lo))
+        }
+        _ => (u32::MAX, "not a fn".to_string()),
+    };
+    let mut held: Vec<u32> = u.old_bodies.keys().filter(|k| k.0 == id).map(|k| k.1).collect();
+    held.extend(u.bodies.get(&id).map(|b| b.file));
+    held.sort_unstable();
+    let held = if held.is_empty() { "none".to_string() } else { held.iter().map(|v| format!("v{v}")).collect::<Vec<_>>().join(" ") };
+    let edit = match u.preserve_log.iter().rev().find(|(v, _)| *v == file) {
+        None => "no edit that replaced it is on record".to_string(),
+        Some((_, log)) => match (log.kept.contains(&id), log.failed.iter().find(|x| x.0 == id)) {
+            (true, _) => format!("the edit that replaced it kept this body (one of {}): it went after", log.kept.len()),
+            (_, Some((_, e))) => format!("the edit that replaced it could not check it again: {e}"),
+            _ => format!("the edit that replaced it did not see this owner (no closure slot or closure type named it; it kept {}, failed {})", log.kept.len(), log.failed.len()),
+        },
+    };
+    let code = u.code.try_read().ok().map(|t| t.kind_of(f.code)).unwrap_or_default();
+    // (the owner's position names its file: another one's path only when the closure's is not it)
+    let version = if path(file) == path(now) { format!("v{file}, replaced by v{now}") } else { format!("{} v{file}, replaced by {} v{now}", path(file), path(now)) };
+    format!("owner `{}` (slot {id}, {at}); the closure's version {version}; owner bodies held: {held}; {edit}; owner code {} {}, compiled {}, patched {}, patch gen {}, inlined into {} slot(s), RIR {}",
+        f.name, code.tier_name(), code.origin_name(), f.compiled, f.patched.load(Ordering::Relaxed), f.patch_gen, f.history().inlined_into.len(), if f.rir.is_some() { "held" } else { "none" })
 }
 
 /// The owners (file, def, args) of the closure types of `files` that type `t` names (closure
@@ -25383,7 +25447,7 @@ pub(crate) unsafe fn ensure_parent_body(up: *mut Unit, id: u32, file: u32, depth
         FnKey::Inst(d, args) => {
             let u = &mut *up;
             if file != u32::MAX && u.prog.def(d).file != file {
-                return Err("internal compiler error: closure parent body missing (its file version was replaced)".to_string());
+                return Err(format!("internal compiler error: closure parent body missing (its file version was replaced): {}", missing_owner_facts(up, id, file)));
             }
             let _o = crate::clock::origin("closure-owner");
             match take_ahead(&u.prog, &u.front, &u.tcx, d, &args) {
@@ -25405,7 +25469,7 @@ pub(crate) unsafe fn ensure_parent_body(up: *mut Unit, id: u32, file: u32, depth
             ensure_parent_body(up, grand, file, depth + 1)?;
             match (&*up).body_of(grand, file) {
                 Some(b) => b.clone(),
-                None => return Err("internal compiler error: closure parent body missing".to_string()),
+                None => return Err(format!("internal compiler error: closure parent body missing: {}", missing_owner_facts(up, grand, file))),
             }
         }
         FnKey::Shim(_) | FnKey::Glue(..) => return Err("internal compiler error: closure parent is glue".to_string()),
