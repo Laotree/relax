@@ -1674,6 +1674,20 @@ pub extern "C" fn relax_register_inspect(name: *const u8, len: usize, query: Pro
     p.push((name, query, scope));
 }
 
+/// Who sent the command the program answers now on this thread (`cmd_provided` runs it on the
+/// endpoint's thread): the agent and the process ([`makepad_remote::cmd::asked_by`]), written into
+/// `buf` as far as `cap` bytes reach; its whole length (0: not known). The program's injected
+/// input says it with what it reaches (a window's close or caption button).
+pub extern "C" fn relax_inspect_asker(buf: *mut u8, cap: usize) -> usize {
+    let Some(who) = makepad_remote::cmd::asked_by() else { return 0 };
+    let n = who.len().min(cap);
+    if n > 0 && !buf.is_null() {
+        // SAFETY: the program passes a buffer of `cap` writable bytes
+        unsafe { std::ptr::copy_nonoverlapping(who.as_ptr(), buf, n) };
+    }
+    who.len()
+}
+
 fn provider(cmd: &str) -> Option<(ProgramQuery, crate::domain::Callback)> {
     PROVIDERS.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|x| x.0 == cmd).min_by_key(|x| x.2.domain()).map(|x| (x.1, x.2))
 }

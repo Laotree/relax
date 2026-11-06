@@ -7401,11 +7401,11 @@ fn relaunch_line(who: &str, why: &str, again: bool) -> String {
     }
 }
 
-/// Who sent the `session relaunch` an inspect command answers: the client's process and its
-/// parents, from its socket's credentials ([`makepad_remote::cmd::asker`]).
+/// Who sent the `session relaunch` an inspect command answers: the agent its client says it is,
+/// and its process and parents from its socket's credentials ([`makepad_remote::cmd::asked_by`]).
 pub fn inspect_asker() -> String {
-    match makepad_remote::cmd::asker() {
-        Some(pid) => format!("an inspect client, {}", makepad_remote::procs::said(pid)),
+    match makepad_remote::cmd::asked_by() {
+        Some(who) => format!("an inspect client, {who}"),
         None => "an inspect client whose process its connection does not name".into(),
     }
 }
