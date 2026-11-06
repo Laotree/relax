@@ -8450,9 +8450,10 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
         }
         TyKind::FnDef(d, _, _) => format!("fn item {}", prog.def_path(*d)),
         TyKind::Param(i) => format!("T{}", i),
-        TyKind::Infer(v) => format!("?{}", v),
-        TyKind::IntVar(v) => format!("?I{}", v),
-        TyKind::FloatVar(v) => format!("?F{}", v),
+        // rustc_type_ir/src/ty_kind.rs `impl Display for InferTy`: messages name no variable
+        TyKind::Infer(_) => "_".to_string(),
+        TyKind::IntVar(_) => "{integer}".to_string(),
+        TyKind::FloatVar(_) => "{float}".to_string(),
         TyKind::Bound(d, b) => format!("^{}.{}:{:?}", d, b.var.0, b.kind),
         TyKind::Placeholder(p) => format!("!U{}.{}", p.universe.0, p.bound.0),
         TyKind::Closure(f, e, crate::types::ClosureArgs { parent_args: owner, .. }) => {
