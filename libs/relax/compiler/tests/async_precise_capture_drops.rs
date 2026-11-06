@@ -105,7 +105,7 @@ fn moved_by_let(req: Req) -> BoxFuture<u8> {
         parts.path.0.len() as u8
     })
 }
-// a field of a field: the rest at both depths stays here
+// a Copy field inside a Drop value: copied, nothing moves (the request drops here, before the block runs)
 fn nested_field(req: Req) -> BoxFuture<u8> {
     Box::pin(async move {
         Yield(false).await;
@@ -120,9 +120,20 @@ fn whole(req: Req) -> BoxFuture<u8> {
         r.parts.ok as u8
     })
 }
-// a closure's precise capture, for comparison
+// a field of a field, not Copy: the rest at both depths stays here
+fn nested_moved(req: Req) -> BoxFuture<u8> {
+    Box::pin(async move {
+        Yield(false).await;
+        let p = req.parts.path;
+        p.0.len() as u8
+    })
+}
+// a closure's precise captures, for comparison
 fn closure_field(req: Req) -> impl FnOnce() -> u8 {
     move || eat(req.body)
+}
+fn closure_copy(req: Req) -> impl Fn() -> u8 {
+    move || req.parts.path.0.len() as u8
 }
 
 #[test]
@@ -141,10 +152,16 @@ fn async_block_takes_only_used_fields() {
     say("async_block_takes_only_used_fields", "moved by let, dropped at the await");
     log(&format!("={}", block_on(nested_field(req(true)))));
     say("async_block_takes_only_used_fields", "nested field");
+    log(&format!("={}", block_on(nested_moved(req(true)))));
+    say("async_block_takes_only_used_fields", "nested moved field");
     log(&format!("={}", block_on(whole(req(true)))));
     say("async_block_takes_only_used_fields", "whole");
     log(&format!("={}", closure_field(req(true))()));
     say("async_block_takes_only_used_fields", "closure");
+    let c = closure_copy(req(true));
+    log(&format!("={}", c() + c()));
+    drop(c);
+    say("async_block_takes_only_used_fields", "closure, Copy field");
 }
 
 // an extractor chain: destructure, rebuild, hand the request to a precise block
