@@ -5338,8 +5338,13 @@ impl FrontImages {
     /// Whether the stored graph of `pre` is current (its certificate holds): a restore of it then
     /// reads its collected image and stores only.
     pub(crate) fn certified(&self, pre: &[crate::preload::PreCrate]) -> bool {
+        self.certificate(pre).is_some()
+    }
+    /// The stored graph of `pre` when it is current: its certificate (begin_load validates it;
+    /// a load of `pre` after this one does not again).
+    pub(crate) fn certificate(&self, pre: &[crate::preload::PreCrate]) -> Option<std::sync::Arc<crate::crate_image::GraphImage>> {
         crate::crate_image::CrateImages::begin_load(self, pre);
-        self.certificate.lock().unwrap().is_some()
+        self.certificate.lock().unwrap().clone()
     }
     /// What writes the images of the files and parts a program parses (Program::front_sink).
     pub fn sink(&self) -> Option<std::sync::Arc<dyn crate::parser::ImageSink>> {
