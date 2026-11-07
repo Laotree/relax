@@ -7341,6 +7341,22 @@ pub(crate) fn next_run_env(state: Option<&[u8]>) -> Result<Vec<(&'static str, Op
     Ok(vec![("MAKEPAD_JIT_RECOVERY", recovery), ("MAKEPAD_RUN_RESTORE", restore), ("MAKEPAD_RUN_RESTART_T0", Some(saved.into()))])
 }
 
+/// A restart that waited out the run's boot (run_end::restart) and hands no state of its own: the
+/// next run gets the state this run was started with, which its program barely began with (a
+/// relaunch 3 s after a restart with the app's state dropped it). Read already by the domain's
+/// load ([`domain_loaded`]), it goes in a file of its own again; else its file is still there.
+pub(crate) fn carry_restore(next: &mut [(&'static str, Option<std::ffi::OsString>)]) {
+    let Some(slot) = next.iter_mut().find(|(k, v)| *k == "MAKEPAD_RUN_RESTORE" && v.is_none()) else { return };
+    let loaded = DOMAIN_RESTORED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    slot.1 = match loaded {
+        Some(text) => restart_state_file(text.as_bytes()).map_err(|e| eprintln!("makepad live: the state this run was started with is lost: {e}")).ok().map(|p| p.into_os_string()),
+        None => crate::run_end::run_input("MAKEPAD_RUN_RESTORE").filter(|p| std::path::Path::new(p).exists()),
+    };
+    if slot.1.is_some() {
+        eprintln!("makepad live: the state this run was started with goes to the next run");
+    }
+}
+
 /// The app's state for the next run (MAKEPAD_RUN_RESTORE), in a file of its own, which that run
 /// removes when it reads it: made new in this user's own directory (makepad_remote's socket dir),
 /// so no other user can read it, put it there first or point it elsewhere.
@@ -7396,6 +7412,26 @@ fn a_restarts_state_file_is_made_new_never_through_a_link() {
     assert_eq!(std::fs::metadata(&state).unwrap().permissions().mode() & 0o777, 0o600);
     assert_eq!(std::fs::read(&state).unwrap(), b"state");
     std::fs::remove_file(&state).unwrap();
+}
+
+/// A restart that waited out the run's boot and has no state of its own hands on the state the
+/// run was started with (a relaunch 3 s after a restart with the app's state dropped it): read
+/// by the domain's load already, it goes in a file of its own again. A restart's own state stays.
+#[cfg(all(test, unix))]
+#[test]
+fn a_run_ended_in_its_boot_hands_on_the_state_it_was_started_with() {
+    isolated_test!(a_run_ended_in_its_boot_hands_on_the_state_it_was_started_with);
+    *DOMAIN_RESTORED.lock().unwrap_or_else(|e| e.into_inner()) = Some("tick 41".into());
+    let mut next = vec![("MAKEPAD_JIT_RECOVERY", None), ("MAKEPAD_RUN_RESTORE", None)];
+    carry_restore(&mut next);
+    let carried = next[1].1.clone().expect("the state the run was started with goes on");
+    assert_eq!(std::fs::read_to_string(&carried).unwrap(), "tick 41");
+    assert_eq!(next[0].1, None, "only the state is handed on");
+    std::fs::remove_file(&carried).unwrap();
+    let own = std::ffi::OsString::from("its own state");
+    let mut next = vec![("MAKEPAD_RUN_RESTORE", Some(own.clone()))];
+    carry_restore(&mut next);
+    assert_eq!(next[0].1, Some(own), "a restart with a state of its own hands that on");
 }
 
 /// A run with no app domain starts again as a process: the loader binary with the same command

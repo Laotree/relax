@@ -932,6 +932,9 @@ fn kick_threads(unit: usize) -> bool {
 ///
 /// A thread that does not leave within `grace` (a native wait nobody ends) does not hold up the
 /// caller: it is named and kicked on until it goes.
+///
+/// `up` null: the run's boot ended before its unit was in (its build failed), so it has no code
+/// and no program threads; nothing is ended.
 pub fn end_run(up: *mut Unit, grace: std::time::Duration) -> RunEnd {
     let unit = up as usize;
     let (threads, bases) = {
@@ -952,7 +955,9 @@ pub fn end_run(up: *mut Unit, grace: std::time::Duration) -> RunEnd {
     let start = std::time::Instant::now();
     // (first: from here a signal, a fork or a thread's exit calls nothing of the run's)
     let callbacks = crate::domain_res::take_back_callbacks(&bases);
-    unsafe { (*up).end_code() };
+    if !up.is_null() {
+        unsafe { (*up).end_code() };
+    }
     let mut backoff = std::time::Duration::from_millis(1);
     let end = |left, ms| RunEnd {
         threads,
