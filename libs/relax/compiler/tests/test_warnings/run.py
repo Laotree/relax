@@ -16,6 +16,11 @@ use (a test run once called them unused: it recorded no import uses).
 6. `makepad test <file.rs>` (a single file, as `rustc --test`): an import its code uses is not
    reported (that form once recorded no import uses and called every import unused), one it
    does not use is.
+7. A package of several test targets, each with an import that only a fn's `use Matrix as M`
+   reads, and one also with an import nothing reads: cold, unchanged and after an edit of the lib,
+   only that one is reported. (Each target's process loaded only the graph's root again and took
+   the others from the collected image, whose import resolution records no uses: every target but
+   the root called those imports unused.)
 Prints "test_warnings: ok" or "test_warnings: FAILED (...)"."""
 import os
 from pathlib import Path
@@ -126,4 +131,27 @@ with tempfile.TemporaryDirectory(prefix="test-warnings-") as tmp:
         fail("a single file: no %s" % ", ".join(missing(out, ["warning: unused import: `std::collections::BTreeMap`", "makepad test: 1 warning"])), out)
     if any("black_box" in line and "warning" in line for line in out.splitlines()):
         fail("a single file: its used import reported unused", out)
+
+    multi = Path(tmp) / "multi"
+    (multi / "src").mkdir(parents=True)
+    (multi / "tests").mkdir()
+    (multi / "Cargo.toml").write_text('[package]\nname = "test-warnings-multi"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n')
+    (multi / "src" / "lib.rs").write_text("pub mod video {\n    pub enum Matrix { A, B }\n    pub enum Range { Full, Limited }\n"
+                                          "    pub fn g(m: Matrix, r: Range) -> u32 { m as u32 * 2 + r as u32 }\n}\n")
+    target = ("use test_warnings_multi::video::{g, Matrix, Range};\n%s\nfn pick() -> u32 {\n    use Matrix as M;\n    use Range as R;\n"
+              "    g(M::B, R::Full)\n}\n\n#[test]\nfn t() {\n    assert_eq!(pick(), 2);\n}\n")
+    for name, extra in [("a", ""), ("b", "use std::collections::BTreeSet;"), ("c", "")]:
+        (multi / "tests" / ("%s.rs" % name)).write_text(target % extra)
+    want = ["warning: unused import: `std::collections::BTreeSet`"]
+    for step in ["several targets: a first run", "several targets: its unchanged rerun", "several targets: a run after an edit of lib.rs"]:
+        if step.endswith("lib.rs"):
+            lib = multi / "src" / "lib.rs"
+            lib.write_text(lib.read_text().replace("m as u32 * 2", "(m as u32) << 1"))
+        p = sp.run([binary, "test", "test-warnings-multi"], cwd=multi, env=env, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
+        out = p.stdout
+        if p.returncode != 0 or sum(1 for line in out.splitlines() if "test result: ok. 1 passed" in line) != 3:
+            fail("%s: the 3 targets' tests did not pass" % step, out)
+        warnings = [line for line in out.splitlines() if ": warning: " in line]
+        if missing(out, want) or len(warnings) != 1:
+            fail("%s: %d warnings, want only %s" % (step, len(warnings), want[0]), out)
 print("test_warnings: ok")

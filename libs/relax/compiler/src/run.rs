@@ -1351,9 +1351,15 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // as a run's does -- their resolution and expansion record what the check's lints read
     // (import and macro uses). The others parse every crate.
     let check_restore = check && !watch && !root_only && !selftest && !workspace_check && session.is_none();
-    // `makepad test`: the crate under test loads again too, for the same uses
+    // `makepad test`: the crate under test loads again too, for the same uses. In a graph of
+    // several test targets that is each of them, not only the graph's root: every process's
+    // subject is one of them, and the one image they share keeps them last. A target restored
+    // from the image has its imports resolved already, so the uses that resolution made (a fn's
+    // `use Matrix as M`, through the file's `use ..::Matrix`) were recorded nowhere, and its
+    // lint read those imports as unused
     if check_restore || test_lints {
-        let mut roots: Vec<String> = vec![crate::vfs::normalize_path(&g.crates[g.root].src_path)];
+        let mut roots: Vec<String> = vec![crate::vfs::normalize_path(&g.crates[subject_ci].src_path)];
+        if test_lints { roots.extend(g.bins.iter().map(|&ci| crate::vfs::normalize_path(&g.crates[ci].src_path))); }
         if check_restore {
             roots.extend(crate::reload::gandalf_app_roots(&units, &crate::unitgraph::manifest_dir_of(&g.crates[g.root].src_path)));
             let own_dir = &g.pkg[g.root].0;
