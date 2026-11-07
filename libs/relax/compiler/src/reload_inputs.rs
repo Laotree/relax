@@ -32,6 +32,10 @@ pub struct Inputs {
     graph: Option<ResolvedGraph>,
     /// the folders of the graph's packages, downloaded ones aside
     packages: BTreeSet<String>,
+    /// the checkouts the inputs are in, each with the commit its HEAD named when they were
+    /// stamped (the workspace's own first: Repositories::heads), and when (unix ms): the
+    /// sources the run reads are these (None outside git, or during a git operation)
+    pub(super) heads: Option<(Vec<(String, String)>, u64)>,
 }
 
 /// Whether `path` lies in another OS's source tree (`src/backend/linux/..`, `src/os/windows/..`):
@@ -124,6 +128,9 @@ impl Inputs {
         let mut files = Vec::new();
         crate::srchash::files(Path::new(std_dir), "", &mut files);
         for (_, path) in files { inputs.protected(&path, Path::new(std_dir), Kind::Std); }
+        let mut repos = super::git::Repositories::default();
+        repos.include(inputs.paths.keys().map(String::as_str));
+        inputs.heads = repos.heads(workspace).map(|h| (h, super::unix_ms(std::time::SystemTime::now()) as u64));
         inputs
     }
 

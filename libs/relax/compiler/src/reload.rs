@@ -7774,7 +7774,7 @@ pub const CRASHED_SOURCES_CHANGED: &str = "the sources changed since the app cra
 /// the person's save does. Offered once until a run loads them (every save says it again).
 pub fn offer_restart_after_crash() {
     let why = CRASHED_SOURCES_CHANGED;
-    if RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p == why) { return; }
+    if RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p.0 == why) { return; }
     note_restart_pending(why);
     eprintln!("makepad live: {why}: Restart runs them; offered (the run window's Restart, the WM's toast, or `makepad inspect <app> session relaunch`)");
     live_log(&format!("{{\"event\":\"restart_offered\",\"pid\":{},\"why\":{}}}", std::process::id(), json_str(why)));
@@ -7784,13 +7784,14 @@ pub fn offer_restart_after_crash() {
 /// waiting rebuilt makepad may take it (`host::restart_now`).
 pub(crate) static RESTART_CONFIRMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Edits waiting for a relaunch (`session` in inspect lists them).
-static RESTART_PENDING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// Edits waiting for a relaunch (`session` in inspect lists them), each with when it began to
+/// wait (unix ms).
+static RESTART_PENDING: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
 
 fn note_restart_pending(why: &str) {
     let mut p = RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    if !p.iter().any(|x| x == why) {
-        p.push(why.to_string());
+    if !p.iter().any(|x| x.0 == why) {
+        p.push((why.to_string(), unix_ms(std::time::SystemTime::now()) as u64));
     }
 }
 
@@ -7800,7 +7801,7 @@ fn note_restart_pending(why: &str) {
 /// click (Scope, Fab and Story restarted for a landing, 11-06).
 pub fn relaunch_pending(who: &str) -> Result<&'static str, String> {
     RELAUNCH_ASKED.store(true, Ordering::SeqCst);
-    let why = RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).join("; ");
+    let why = restart_pending().join("; ");
     eprintln!("{}", relaunch_line(who, &why, host::restart_asked()));
     if let Some(result) = host::relaunch() { return result; }
     restart_in_place(if why.is_empty() { "session relaunch".into() } else { why })
@@ -7836,12 +7837,27 @@ pub fn relaunch_asked() -> bool {
 
 /// The edits that wait for a relaunch, oldest first (cleared once a run loads the sources).
 pub fn restart_pending() -> Vec<String> {
-    RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|p| p.0.clone()).collect()
+}
+
+/// The oldest edit that waits for a relaunch: since when (unix ms), and why.
+pub fn restart_pending_since() -> Option<(u64, String)> {
+    RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).first().map(|p| (p.1, p.0.clone()))
 }
 
 /// One reason no longer waits for a restart (a rebuild of makepad that changed nothing).
 fn drop_restart_pending(why: &str) {
-    RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).retain(|p| p != why);
+    RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).retain(|p| p.0 != why);
+}
+
+/// The checkouts' commits the run's sources were read at (its start or its last restart): each
+/// repository's worktree with its HEAD commit, the workspace's own first, and when (unix ms).
+/// `inspect live` says them (loaded_sha), beside the edits that wait for a restart: an app's show
+/// listed a checkout's tip while the app ran code nine hours older (11-07).
+static LOADED_HEADS: std::sync::Mutex<Option<(Vec<(String, String)>, u64)>> = std::sync::Mutex::new(None);
+
+pub fn loaded_heads() -> Option<(Vec<(String, String)>, u64)> {
+    LOADED_HEADS.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// A run loaded the sources as they are (`domain_loaded`): no edit waits for a restart any more.
@@ -8631,6 +8647,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     // a body that includes a file for the first time: the watcher watches it from now on
     crate::sip::on_late_new(watch_events::kick);
     inputs.add_runner();
+    *LOADED_HEADS.lock().unwrap_or_else(|e| e.into_inner()) = inputs.heads.clone();
     let std_dir = std::env::var("MAKEPAD_RUN_STD").unwrap_or_default();
     // (path, running file index, last stamp)
     // the program's own source files (not std, registry or git dependencies), loaded so far
@@ -8763,6 +8780,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             if let Some(next) = DOMAIN_INPUTS.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 inputs = next;
                 inputs.add_runner();
+                *LOADED_HEADS.lock().unwrap_or_else(|e| e.into_inner()) = inputs.heads.clone();
             }
             let loaded = crate::owner::call(crate::owner::Class::Program, || own_files(&*up));
             files = inputs.paths.iter().map(|(p, (s, _))| (p.clone(), u32::MAX, *s)).collect();
@@ -10438,6 +10456,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&SOURCES_WAIT, std::sync::atomic::AtomicBool::new(false));
     reset(&RESTART_CONFIRMED, std::sync::atomic::AtomicBool::new(false));
     reset(&RESTART_PENDING, std::sync::Mutex::new(Vec::new()));
+    reset(&LOADED_HEADS, std::sync::Mutex::new(None));
     reset(&RELAUNCH_ASKED, std::sync::atomic::AtomicBool::new(false));
     reset(&STREAMS, relax_session::sync::Mutex::new(Vec::new()));
     reset(&STD, std::sync::OnceLock::new());

@@ -330,6 +330,14 @@ fn dispatch_command(req: &Req, out: &mut Out) {
                 // the show is listed at, which it does not wholly run)
                 let p = crate::reload::restart_pending();
                 out.line(&format!("{{\"restart_pending\":{},\"pending\":[{}],\"note\":\"edits that cannot apply live wait here; the app runs the code before them until `session relaunch`\"}}", p.len(), p.iter().map(|w| json_str(w)).collect::<Vec<_>>().join(",")));
+                // in one line, what the app does not run yet, and what it does
+                if let Some((since, why)) = crate::reload::restart_pending_since() {
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+                    let secs = now.saturating_sub(since) / 1000;
+                    out.line(&format!("{{\"waiting\":{}}}", json_str(&format!("{} edit{} wait{} for a restart since {} s ago (oldest: {}); the app runs the code before {}",
+                        p.len(), if p.len() == 1 { "" } else { "s" }, if p.len() == 1 { "s" } else { "" }, secs, why, if p.len() == 1 { "it" } else { "them" }))));
+                }
+                out.line(&format!("{{{}}}", runs_what()));
                 {
                     use crate::reload::host;
                     let (phase, since) = host::status();
@@ -1375,11 +1383,12 @@ fn cmd_live(req: &Req, out: &mut Out) {
         None => flightrec::frames_head(),
     };
     out.line(&format!(
-        "{{\"now_ms\":{:.1},\"frames\":{frames},\"patches\":{},\"frame_patch\":{},\"restart_pending\":{},\"lazy\":{},\"ahead\":{},\"o2\":{},\"o3\":{},\"linked\":{},\"q\":[{},{},{}],\"ui_wait_ms\":{},\"next\":{next},\"ft\":[{ft}]}}",
+        "{{\"now_ms\":{:.1},\"frames\":{frames},\"patches\":{},\"frame_patch\":{},\"restart_pending\":{},{},\"lazy\":{},\"ahead\":{},\"o2\":{},\"o3\":{},\"linked\":{},\"q\":[{},{},{}],\"ui_wait_ms\":{},\"next\":{next},\"ft\":[{ft}]}}",
         now as f64 / 1e6,
         crate::reload::patches_installed(),
         crate::postframe::FRAME_PATCH.load(Relaxed),
         crate::reload::restart_pending().len(),
+        runs_what(),
         a.demand(),
         a.ahead_done,
         a.o2_done,
@@ -1390,6 +1399,20 @@ fn cmd_live(req: &Req, out: &mut Out) {
         a.o3 + a.o3_running,
         a.ui_wait_ns / 1_000_000
     ));
+}
+
+/// What the run runs, for `live` (devhub's shows report it): `loaded_sha`/`loaded_ms`, the
+/// checkout's commit its sources were read at (its start or last restart) and when (unix ms);
+/// `loaded_heads`, each repository its sources are in (worktree and commit, the workspace's own
+/// first, whose commit is the sha); the oldest edit waiting for a restart (`pending_since_ms`,
+/// `pending_why`). A run outside git, or one that read its sources during a git operation, has no
+/// loaded_sha.
+fn runs_what() -> String {
+    let h = crate::reload::loaded_heads();
+    let sha = h.as_ref().and_then(|(v, _)| v.first()).map_or("null".to_string(), |(_, s)| json_str(s));
+    let all = h.as_ref().map_or(String::new(), |(v, _)| v.iter().map(|(r, s)| format!("[{},{}]", json_str(r), json_str(s))).collect::<Vec<_>>().join(","));
+    let (since, why) = crate::reload::restart_pending_since().unwrap_or((0, String::new()));
+    format!("\"loaded_sha\":{sha},\"loaded_ms\":{},\"loaded_heads\":[{all}],\"pending_since_ms\":{since},\"pending_why\":{}", h.as_ref().map_or(0, |(_, t)| *t), json_str(&why))
 }
 
 /// The `jit` answer from two looks `ms` apart.
