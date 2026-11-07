@@ -2169,7 +2169,7 @@ fn layout_edit(u: &Unit, d: DefId, fresh: &crate::tcx::AdtT, running_discriminan
         u.tcx.tys.intern(crate::types::TyKind::Adt(d, u.tcx.tys.mk_list(&args), crate::types::RegionArgsId::EMPTY))
     };
     if !u.lay.live_editable(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, d, old, t) {
-        return Err(format!("struct `{}` keeps its first layout in a live session only when it is in the app scope, has named fields, Rust's repr and no Copy impl -- restart the app", name));
+        return Err(struct_layout_refusal(u, d, old, &name));
     }
     trace_sub("layout_edit_live_editable");
     // An outer type that holds the struct by value (`Option<App>` of the platform, anywhere) keeps
@@ -3118,6 +3118,55 @@ fn niche_fields(u: &Unit, d: DefId) -> Vec<usize> {
 /// each concrete instantiation known to the session, matching the widget registry's keys.
 
 
+/// Crates a layout edit of this run was refused in only because they are outside the app scope
+/// (layout_scope_refusal): the session's next run lays them out for live edits, with this run's
+/// (live_crates_next, MAKEPAD_RUN_LIVE_CRATES).
+static LIVE_CRATES_NEXT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The crates outside the app scope the session's next run lays out for live edits: this run's
+/// (layout::live_crates) and those a refusal of this run added.
+pub(crate) fn live_crates_next() -> Vec<String> {
+    let mut all = crate::layout::live_crates();
+    for c in LIVE_CRATES_NEXT.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        if !all.contains(c) {
+            all.push(c.clone());
+        }
+    }
+    all
+}
+
+/// The restart reason of a layout edit of `what` `name`, an ADT of crate `krate` outside the app
+/// scope: the crate goes to the next run (live_crates_next), whose edits of it apply live.
+fn layout_scope_refusal(u: &Unit, krate: u32, what: &str, name: &str) -> String {
+    let root = crate::vfs::normalize_path(u.prog.crates[krate as usize].root_path());
+    {
+        let _k = crate::zone_alloc::kept();
+        let mut next = LIVE_CRATES_NEXT.lock().unwrap_or_else(|e| e.into_inner());
+        if !next.contains(&root) {
+            next.push(root);
+        }
+    }
+    format!("{what} `{name}` kept its first layout: its crate `{}` is outside the app scope; the restart lays the crate out for live edits, and its next edits apply live -- restart the app",
+        u.prog.syms.str(u.prog.crates[krate as usize].name))
+}
+
+/// Why struct `d` (its running definition `adt`) cannot take a layout edit in place, naming the
+/// condition it fails (Layouts::live_editable): a provided crate's, its form, its crate's scope,
+/// its Copy impl.
+fn struct_layout_refusal(u: &Unit, d: DefId, adt: &crate::tcx::AdtT, name: &str) -> String {
+    let krate = u.prog.def(d).krate;
+    if u.prog.crates[krate as usize].rustc_laid {
+        return format!("struct `{name}` is a provided crate's, laid out as rustc lays it (its values are rustc's bytes): it keeps its first layout -- restart the app");
+    }
+    if !crate::layout::Layouts::struct_form(adt) {
+        return format!("struct `{name}` keeps its first layout in a live session only with named fields and Rust's repr -- restart the app");
+    }
+    if !crate::layout::live_laid(&u.prog, krate) {
+        return layout_scope_refusal(u, krate, "struct", name);
+    }
+    format!("struct `{name}` is Copy, and a bitwise copy would share the extension block of added fields: it keeps its first layout -- restart the app")
+}
+
 /// An enum's edit in a live session (M10): the running variants keep their names, fields and
 /// order among themselves, and a variant may be added anywhere (or a discriminant change). Every
 /// value keeps its representation -- live enums are always tagged and give outer types no niche
@@ -3128,8 +3177,18 @@ fn niche_fields(u: &Unit, d: DefId) -> Vec<usize> {
 /// is asked before the commit (enum_numbers_read).
 fn enum_edit(u: &Unit, d: DefId, old: &crate::tcx::AdtT, fresh: &crate::tcx::AdtT, running_discriminants: &[u128], fresh_discriminants: &[u128]) -> Result<(crate::tcx::AdtT, Vec<String>), String> {
     let name = u.prog.def_path(d);
-    if !u.lay.live_editable_enum(&crate::layout::LayoutCx::new(&u.prog), d, old) || !fresh.is_enum || fresh.n_generics != old.n_generics {
-        return Err(format!("enum `{}` keeps its first layout in a live session only when it is the program's own with Rust's repr -- restart the app", name));
+    if !fresh.is_enum || fresh.n_generics != old.n_generics {
+        return Err(format!("enum `{}`: its kind or its generics changed -- restart the app", name));
+    }
+    if !u.lay.live_editable_enum(&crate::layout::LayoutCx::new(&u.prog), d, old) {
+        let krate = u.prog.def(d).krate;
+        return Err(if u.prog.crates[krate as usize].rustc_laid {
+            format!("enum `{}` is a provided crate's, laid out as rustc lays it (its values are rustc's bytes): it keeps its first layout -- restart the app", name)
+        } else if !crate::layout::Layouts::enum_form(old) {
+            format!("enum `{}` keeps its first layout in a live session only with Rust's repr -- restart the app", name)
+        } else {
+            layout_scope_refusal(u, krate, "enum", &name)
+        });
     }
     let at = running_variants_at(old, fresh).map_err(|v| match v {
         Some(v) => format!("enum `{}`: variant `{}` was removed; a running value may hold it{} -- restart the app", name, u.prog.syms.str(v), holders_note(u, d)),
@@ -7338,7 +7397,11 @@ pub(crate) fn next_run_env(state: Option<&[u8]>) -> Result<Vec<(&'static str, Op
         None => None,
     };
     let saved = RESTART_SAVED_MS.load(std::sync::atomic::Ordering::Relaxed).to_string();
-    Ok(vec![("MAKEPAD_JIT_RECOVERY", recovery), ("MAKEPAD_RUN_RESTORE", restore), ("MAKEPAD_RUN_RESTART_T0", Some(saved.into()))])
+    // the crates the next run lays out for live edits beyond the app scope (live_crates_next), one
+    // root path a line
+    let live = live_crates_next();
+    let live = (!live.is_empty()).then(|| std::ffi::OsString::from(live.join("\n")));
+    Ok(vec![("MAKEPAD_JIT_RECOVERY", recovery), ("MAKEPAD_RUN_RESTORE", restore), ("MAKEPAD_RUN_RESTART_T0", Some(saved.into())), ("MAKEPAD_RUN_LIVE_CRATES", live)])
 }
 
 /// A restart that waited out the run's boot (run_end::restart) and hands no state of its own: the
@@ -10104,6 +10167,7 @@ mod commit_tests {
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     host::reset_statics();
+    reset(&LIVE_CRATES_NEXT, std::sync::Mutex::new(Vec::new()));
     reset(&EDITED_CRATES, relax_session::sync::Mutex::new(Vec::new()));
     reset(&INCLUDES_EDITED, relax_session::sync::Mutex::new(Vec::new()));
     reset(&PROGRAM_EDITS, std::sync::atomic::AtomicU64::new(0));

@@ -848,7 +848,7 @@ fn gandalf_scope_uses_package_source_and_project_boundaries() {
 fn app_scope_live_layout_edits() {
     const CHILD: &str = "MAKEPAD_RUN_APP_LAYOUT_TEST";
     let Ok(case) = std::env::var(CHILD) else {
-        for case in ["app_lib", "path_crate", "framework", "embedded", "generic_embedded", "pointer", "bound_template", "bound_template_embedded", "derive_default"] {
+        for case in ["app_lib", "path_crate", "framework", "embedded", "generic_embedded", "pointer", "bound_template", "bound_template_embedded", "derive_default", "live_crate"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "lazy_reload_tests::app_scope_live_layout_edits", "--nocapture", "--test-threads=1"])
                 .env(CHILD, case).output().unwrap();
@@ -902,8 +902,11 @@ fn app_scope_live_layout_edits() {
     let value = def("value", lib);
     let name = def("name", lib);
     let mut roots = vec![bin_path.to_string_lossy().into_owned()];
-    if case != "framework" { roots.push(path.to_string_lossy().into_owned()); }
+    if case != "framework" && case != "live_crate" { roots.push(path.to_string_lossy().into_owned()); }
     crate::borrowck::event::set_app_scope(roots);
+    // a crate outside the scope that an earlier run of the session handed on (a refused layout
+    // edit of it: the "framework" case below) takes live layouts: its edits patch
+    if case == "live_crate" { crate::layout::set_live_crates(vec![path.to_string_lossy().into_owned()]); }
     crate::layout::set_root_crate(bin);
     crate::layout::LIVE_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut tcx = crate::tcx::Tcx::new();
@@ -981,7 +984,12 @@ fn app_scope_live_layout_edits() {
     // framework type (`Holder`, like the platform's `Option<App>`) patches: its first layout stays.
     if case == "framework" {
         assert_eq!(patch.rung, Rung::Restart, "{:?}", patch.lines);
-        assert!(patch.lines.iter().any(|l| l.contains("in the app scope") && l.contains("restart the app")), "{:?}", patch.lines);
+        assert!(patch.lines.iter().any(|l| l.contains("`app_lib` is outside the app scope") && l.contains("restart the app")), "{:?}", patch.lines);
+        // the refusal hands the crate to the session's next run, which lays it out for live edits
+        let root = crate::vfs::normalize_path(&path.to_string_lossy());
+        assert_eq!(crate::reload::live_crates_next(), vec![root.clone()]);
+        let next = crate::reload::next_run_env(None).unwrap();
+        assert!(next.iter().any(|(k, v)| *k == "MAKEPAD_RUN_LIVE_CRATES" && v.as_deref() == Some(std::ffi::OsStr::new(&root))), "{next:?}");
         call(value, old_value.as_mut_ptr() as u64);
     } else {
         assert_eq!(patch.rung, Rung::Patch, "{:?}", patch.lines);
