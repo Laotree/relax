@@ -9,16 +9,22 @@ use std::time::Duration;
 
 pub(crate) static THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
 
-type Sample = (String, String, u64);
+/// A measured first frame: package, state (warm / cold), ms, and the codegen identity (hex) of
+/// the JIT build that ran it (`jit_id`)
+type Sample = (String, String, u64, String);
 
 fn samples(text: &str) -> Vec<Sample> {
     text.lines().filter_map(|line| {
         let mut words = line.split_whitespace();
-        let (package, state, ms) = (words.next()?, words.next()?, words.next()?);
+        let (package, state, ms, jit) = (words.next()?, words.next()?, words.next()?, words.next()?);
         if !matches!(state, "warm" | "cold") || words.next().is_some() { return None; }
-        Some((package.into(), state.into(), ms.parse().ok()?))
+        Some((package.into(), state.into(), ms.parse().ok()?, jit.into()))
     }).collect()
 }
+
+/// This JIT build: its codegen identity, what decides whether stored code links (codegen_id.rs).
+/// A warm start is one of a build that has code stored: another build's warm runs say nothing of it.
+fn jit_id() -> String { format!("{:032x}", crate::codegen_id::id()) }
 
 fn history() -> std::path::PathBuf { crate::gitstore::relax_home().join("first-frame.txt") }
 
@@ -41,17 +47,20 @@ fn remember(package: &str, state: &str, ms: u64) -> std::io::Result<()> {
     file.lock()?;
     let mut text = String::new();
     file.read_to_string(&mut text)?;
+    let jit = jit_id();
     let mut rows = samples(&text);
-    rows.push((package.into(), state.into(), ms));
+    rows.push((package.into(), state.into(), ms, jit.clone()));
     let mut counts = std::collections::HashMap::new();
     let mut keep = Vec::new();
+    // the last 9 of each package and state; warm runs of this build only
     for row in rows.into_iter().rev() {
+        if row.1 == "warm" && row.3 != jit { continue; }
         let n = counts.entry((row.0.clone(), row.1.clone())).or_insert(0);
         *n += 1;
         if *n <= 9 { keep.push(row); }
     }
     let mut text = String::new();
-    for (package, state, ms) in keep.into_iter().rev() { text.push_str(&format!("{package} {state} {ms}\n")); }
+    for (package, state, ms, jit) in keep.into_iter().rev() { text.push_str(&format!("{package} {state} {ms} {jit}\n")); }
     file.rewind()?;
     file.write_all(text.as_bytes())?;
     file.set_len(text.len() as u64)?;
@@ -61,11 +70,23 @@ fn remember(package: &str, state: &str, ms: u64) -> std::io::Result<()> {
 /// The deadline of a start in `state` (warm / cold): 3x the median of its measured first frames,
 /// at least the state's floor; and its basis in words.
 fn deadline(package: &str, state: &str) -> (u64, String) {
-    let floor = if state == "warm" { 30u64 } else { 180 };
-    let mut runs: Vec<_> = measured().unwrap_or_else(|e| {
+    let rows = measured().unwrap_or_else(|e| {
         eprintln!("makepad: cannot read first-frame history {}: {e}", history().display());
         Vec::new()
-    }).into_iter().filter(|s| s.0 == package && s.1 == state).map(|s| s.2).collect();
+    });
+    deadline_of(&rows, package, state, &jit_id())
+}
+
+/// `deadline` over measured `rows` for the JIT build `jit`: a warm start counts this build's warm
+/// runs; with none (a new JIT build relaunched onto its stored code: what links, and what it
+/// compiles lazily, is unmeasured) it is judged as a cold start.
+fn deadline_of(rows: &[Sample], package: &str, state: &str, jit: &str) -> (u64, String) {
+    let mut runs: Vec<u64> = rows.iter().filter(|s| s.0 == package && s.1 == state && (state == "cold" || s.3 == jit)).map(|s| s.2).collect();
+    if state == "warm" && runs.is_empty() {
+        let (secs, basis) = deadline_of(rows, package, "cold", jit);
+        return (secs, format!("warm, but no measured warm start of this JIT build: {basis}"));
+    }
+    let floor = if state == "warm" { 30u64 } else { 180 };
     runs.sort_unstable();
     let median = if runs.is_empty() { None } else {
         let (a, b) = (runs[(runs.len() - 1) / 2], runs[runs.len() / 2]);
@@ -77,6 +98,19 @@ fn deadline(package: &str, state: &str) -> (u64, String) {
         None => format!("{state}: no measured runs, floor {floor} s"),
     };
     (secs, basis)
+}
+
+/// Past its deadline a start that is still compiling is not hung: the timeout is for hangs, not
+/// slow compiles (a relaunch onto a rebuilt JIT compiled lazily past a warm deadline and was
+/// killed, 11-07). Still compiling: a demand compile finished in the last 2 s, or one runs and
+/// began (or the last finished) less than a minute ago -- one compile running longer is a hang.
+fn still_compiling(running: bool, age_ns: u64) -> bool {
+    age_ns < if running { 60_000_000_000 } else { 2_000_000_000 }
+}
+
+fn compiling() -> bool {
+    let (running, age) = crate::jit::demand_compile_age();
+    still_compiling(running, age)
 }
 
 /// A start counted warm (its cache holds a startup manifest) that compiled most of its code
@@ -201,13 +235,22 @@ pub(crate) fn arm_window(package: &str) {
 }
 
 fn watch_window(package: &str) {
+    let mut said = false;
     let (secs, basis) = loop {
         if WINDOW_OPEN.load(Acquire) || crate::run_threads::ending() { return; }
         // a warm start that compiles most of its code fresh is judged as a cold one (`watch`)
         let state = if CACHE_STATE.load(Acquire) == 2 && !cold_like() { "warm" } else { "cold" };
         let (secs, basis) = deadline(package, state);
         let left = secs as f64 * 1000.0 - crate::clock::ms_since_process_start();
-        if left <= 0.0 { break (secs, basis); }
+        if left <= 0.0 {
+            if !compiling() { break (secs, basis); }
+            if !said {
+                said = true;
+                if !crate::run::silent() { eprintln!("makepad: first-frame: {secs} s passed ({basis}) and the JIT is still compiling: no timeout while it compiles"); }
+            }
+            std::thread::park_timeout(Duration::from_millis(500));
+            continue;
+        }
         // woken by the window's open and the cache's classification; a warm start's
         // compile-or-link verdict is looked at again each second
         std::thread::park_timeout(Duration::from_secs_f64((left / 1000.0).min(1.0)));
@@ -226,6 +269,7 @@ fn watch(package: &str, state: &str, started: f64, secs: u64, basis: &str) {
     let (mut state, mut secs, mut basis) = (state, secs, basis.to_string());
     let mut deadline_ms = started + secs as f64 * 1000.0;
     let mut wm = false;
+    let mut said = false;
     loop {
         if crate::run_threads::ending() { return; }
         if let Some(ms) = snapshot::first_present_ms().filter(|ms| *ms <= deadline_ms) {
@@ -252,7 +296,16 @@ fn watch(package: &str, state: &str, started: f64, secs: u64, basis: &str) {
                 eprintln!("makepad: first-frame: the warm start took cached code for {linked} slots and missed {miss} lookups (an edit reached most of the program, or its entries are gone): it starts cold, timeout {secs} s ({basis})");
             }
         }
-        if left <= 0.0 { break; }
+        if left <= 0.0 {
+            if !compiling() { break; }
+            if !said {
+                said = true;
+                if !crate::run::silent() { eprintln!("makepad: first-frame: {secs} s passed ({basis}) and the JIT is still compiling: no timeout while it compiles"); }
+            }
+            // (a first present from now on still counts: the deadline moves with the compiles)
+            deadline_ms = crate::clock::ms_since_process_start() + 500.0;
+            continue;
+        }
         if crate::jit::first_present_seen() {
             if !crate::run_threads::sleep(Duration::from_secs_f64((left / 1000.0).min(0.1))) { return; }
         } else {
@@ -306,6 +359,35 @@ pub(crate) unsafe fn reset_statics() {
 
 #[cfg(test)]
 mod tests {
+    /// A warm start's deadline counts this JIT build's warm runs only: a relaunch onto a rebuilt
+    /// JIT (whose warm runs are another build's) is judged as a cold start, as one with no warm
+    /// runs at all is; cold runs count whichever build measured them. A history row names its build.
+    #[test]
+    fn a_warm_start_of_a_new_jit_build_has_the_cold_deadline() {
+        let rows = super::samples("app warm 4000 aaaa\napp cold 70000 aaaa\napp warm 5000\nother warm 9000 bbbb\n");
+        assert_eq!(rows.len(), 3, "a row without its build is no sample");
+        // a new build: no warm run of its own -- the cold deadline (3x the cold median, above the floor)
+        let (secs, basis) = super::deadline_of(&rows, "app", "warm", "bbbb");
+        assert_eq!(secs, 210, "{basis}");
+        assert!(basis.starts_with("warm, but no measured warm start of this JIT build"), "{basis}");
+        // the build that measured it: the warm floor (3x 4 s is below it)
+        assert_eq!(super::deadline_of(&rows, "app", "warm", "aaaa").0, 30);
+        // cold runs count whichever build measured them
+        assert_eq!(super::deadline_of(&rows, "app", "cold", "bbbb").0, 210);
+        assert_eq!(super::deadline_of(&rows, "new", "warm", "aaaa").0, 180);
+    }
+
+    /// The timeout is for hangs: past its deadline a start whose demand compiles still make
+    /// progress (one finished in the last 2 s, or one runs that began under a minute ago) waits.
+    #[test]
+    fn a_start_still_compiling_is_not_hung() {
+        let s = 1_000_000_000u64;
+        assert!(super::still_compiling(false, s), "a compile finished a second ago");
+        assert!(!super::still_compiling(false, 3 * s), "quiet for 3 s: hung");
+        assert!(super::still_compiling(true, 30 * s), "a compile runs");
+        assert!(!super::still_compiling(true, 61 * s), "one compile running past a minute is a hang");
+    }
+
     /// An app whose own entry never says it is one (no `app_main!`, so no `app_started`) but has
     /// presented is an app when its main goes quiet: never a batch program, whose run lets the
     /// window go. Scope wrote its entry out by hand, and the run closed the window it drew in once

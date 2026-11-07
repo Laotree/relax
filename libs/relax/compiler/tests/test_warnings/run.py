@@ -13,6 +13,9 @@ use (a test run once called them unused: it recorded no import uses).
    `let` to the test prints the test's warnings with its patch line, the new one among them.
 5. With the warnings fixed, a run prints "makepad test: 0 warnings" (a clean run reads differently
    from one that did not check), and so does its unchanged rerun (the stored clean verdict).
+6. `makepad test <file.rs>` (a single file, as `rustc --test`): an import its code uses is not
+   reported (that form once recorded no import uses and called every import unused), one it
+   does not use is.
 Prints "test_warnings: ok" or "test_warnings: FAILED (...)"."""
 import os
 from pathlib import Path
@@ -113,4 +116,14 @@ with tempfile.TemporaryDirectory(prefix="test-warnings-") as tmp:
             fail("%s: no \"makepad test: 0 warnings\" line" % step, out)
         if any(": warning: " in line for line in out.splitlines()):
             fail("%s: a warning printed" % step, out)
+    one = Path(tmp) / "one.rs"
+    one.write_text("use std::hint::black_box as bb;\nuse std::collections::BTreeMap;\n\n#[test]\nfn a() {\n    assert_eq!(bb(2) + 2, 4);\n}\n")
+    p = sp.run([binary, "test", str(one)], cwd=tmp, env=env, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
+    out = p.stdout
+    if p.returncode != 0 or "test result: 1 passed; 0 failed" not in out:
+        fail("a single file: the test did not pass", out)
+    if missing(out, ["warning: unused import: `std::collections::BTreeMap`", "makepad test: 1 warning"]):
+        fail("a single file: no %s" % ", ".join(missing(out, ["warning: unused import: `std::collections::BTreeMap`", "makepad test: 1 warning"])), out)
+    if any("black_box" in line and "warning" in line for line in out.splitlines()):
+        fail("a single file: its used import reported unused", out)
 print("test_warnings: ok")
