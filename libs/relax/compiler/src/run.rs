@@ -2008,7 +2008,12 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
         phase("provided sources", t);
     }
-    let mut u = Unit::new(prog, tcx, core);
+    // the program's unit is named from here on (syms below, the workers that compile ahead,
+    // RUN_UNIT once the window is up, the run's threads): no way out of this function frees it,
+    // a return's or an unwinding panic's (the cache's quit write walked a unit an unwound boot
+    // had freed: a fault at the run's end). A run's end frees it once no thread can reach it
+    // (run_end::end, jit::end_unit); the process's exit leaves it.
+    let u: &'static mut Unit = Box::leak(Unit::new(prog, tcx, core));
     // the program's unit names itself for the diagnostics that have no unit at hand (an
     // auxiliary unit -- the proc-macro world -- never takes it over)
     crate::syms::set_unit(&mut *u as *mut Unit);
@@ -2076,7 +2081,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         let t_check = Instant::now();
         // after the cache is open: subjects whose check is stored are not checked again, nor
         // are a test's run of its own binary's (its parent checked them and printed the warnings)
-        let n = check_test_subjects(&mut u, root, &test_subjects, harness, self_exec);
+        let n = check_test_subjects(u, root, &test_subjects, harness, self_exec);
         // (what the tests' own code resolves and expands from now on is no lint's input)
         if test_lints { relax_types::macros::uses::record(false); relax_front::program::set_record_import_uses(false); }
         phase("test check", t_check);
@@ -2084,7 +2089,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             let names: Vec<String> = test_subjects.iter().map(|&k| u.prog.syms.str(u.prog.crates[k as usize].name).to_string()).collect();
             eprintln!("error: could not compile {} (test) due to {} previous error{}: no test ran (`makepad test` fails as `cargo test` does on code rustc rejects; if `cargo test` builds it, this is a makepad run bug)",
                 names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", "), n, if n == 1 { "" } else { "s" });
-            std::mem::forget(u);
             return 101;
         }
         if !self_exec {
@@ -2151,7 +2155,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             }
             eprintln!("error: could not compile `{}` due to {} previous error{}: not started (`makepad run` checks the app's own crates whole before they run, as cargo builds them)",
                 u.prog.syms.str(u.prog.crates[root as usize].name), errors.len(), if errors.len() == 1 { "" } else { "s" });
-            std::mem::forget(u);
             return 101;
         }
     }
@@ -2211,6 +2214,12 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         AT_EXIT.call_once(|| unsafe {
             atexit(at_exit);
         });
+    }
+    // MAKEPAD_RUN_TEST_BOOT_PANIC=1: the boot panics here, its unit published and the exit's
+    // work registered (fixture/boot_panic.sh: the run's end and the exit's cache write meet the
+    // unit an unwinding boot leaves, never a freed one)
+    if std::env::var_os("MAKEPAD_RUN_TEST_BOOT_PANIC").is_some() {
+        panic!("MAKEPAD_RUN_TEST_BOOT_PANIC: forced panic of the boot after its unit was published");
     }
     start_monitor(runtime, options);
     // MAKEPAD_RUN_MEM_AT_MS=n[,m..]: the memory report (MAKEPAD_RUN_MEM_REPORT=1) n ms after main starts,
@@ -2394,7 +2403,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         boot_over();
         if let Err(e) = unsafe { crate::sections::run_constructors(up, root, None) } {
             eprintln!("makepad-run: {e}");
-            std::mem::forget(u);
             return crate::check::finish_test_deps(1);
         }
     }
@@ -2415,7 +2423,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
     }
     if !entry_defs.is_empty() {
-        std::mem::forget(u);
         return 0;
     }
     if exports_mode {
@@ -2433,7 +2440,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         *EXPORTS.lock().unwrap() = addrs;
         // the host calls these from its own threads, not through call_jit
         unsafe { jit::set_runtime_unit(up) };
-        std::mem::forget(u);
         return 0;
     }
     if harness {
@@ -2446,10 +2452,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             let is_test_target = units.units.iter().any(|u| &u.src_path == p && u.kind.iter().any(|k| k == "test"));
             if is_test_target { rel.to_string() } else { format!("unittests {rel}") }
         };
-        let code = crate::harness::run(&mut u, up, &[(label(subject_ci), root)]);
+        let code = crate::harness::run(u, up, &[(label(subject_ci), root)]);
         let code = crate::check::finish_test_deps(code);
         flush_errors(true);
-        std::mem::forget(u);
         return code;
     }
     let main_def = main_def.expect("a run without --exports has main");
@@ -2461,20 +2466,16 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         let spec = crate::domain::AppSpec { package, cargo_flags, units_json, argv: Some(prog_args), ..Default::default() };
         let result = (MAIN_HOST.get().expect("run host").start)(spec);
         if result.is_ok() && !domain_packages.is_empty() { crate::domain::run_vehicle(up, domain_packages); }
-        std::mem::forget(u);
         return match result {
             Ok(()) => 0,
             Err(e) => { eprintln!("makepad-run: {e}"); 1 }
         };
     }
     if !domain_packages.is_empty() { crate::domain::run_vehicle(up, domain_packages); }
-    let r = match main_call(&mut u, main_def, entry) {
+    let r = match main_call(u, main_def, entry) {
         Ok((target, arg)) => unsafe { jit::call_jit(up, target, arg) },
         Err(e) => {
             eprintln!("makepad-run: {e}");
-            // Workers already hold this unit's pointer. Its Drop waits
-            // for the front end and O3; process shutdown owns it now.
-            std::mem::forget(u);
             return crate::check::finish_test_deps(1);
         }
     };
@@ -2489,12 +2490,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             101
         }
     };
-    let code = crate::check::finish_test_deps(code);
-    // threads the program spawned may still run (and compile) until the process exits, as
-    // under rustc where returning from main exits with detached threads still running: the
-    // unit must outlive cmd_run (dropping it here freed it under them)
-    std::mem::forget(u);
-    code
+    // (threads the program spawned may still run, and compile, until the process exits, as under
+    // rustc where returning from main exits with detached threads still running: the unit stays)
+    crate::check::finish_test_deps(code)
 }
 
 /// The booted program's crates: (crate name, package dir), in graph order.
