@@ -11,6 +11,8 @@ use (a test run once called them unused: it recorded no import uses).
 3. A run after an edit elsewhere in the crate checks it again and prints them.
 4. `makepad test --live`: the first verdict's check prints them, and a save that adds an unused
    `let` to the test prints the test's warnings with its patch line, the new one among them.
+5. With the warnings fixed, a run prints "makepad test: 0 warnings" (a clean run reads differently
+   from one that did not check), and so does its unchanged rerun (the stored clean verdict).
 Prints "test_warnings: ok" or "test_warnings: FAILED (...)"."""
 import os
 from pathlib import Path
@@ -99,4 +101,16 @@ with tempfile.TemporaryDirectory(prefix="test-warnings-") as tmp:
         except sp.TimeoutExpired:
             os.killpg(p.pid, signal.SIGKILL)
             p.wait()
+
+    t = pkg / "src" / "t.rs"
+    t.write_text("#[test]\nfn a() {\n    let _ = super::parse(\"4\");\n    assert_eq!(super::half(4), 2);\n}\n")
+    for step in ["a clean run", "its unchanged rerun"]:
+        p = sp.run([binary, "test", "test-warnings"], cwd=pkg, env=env, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
+        out = p.stdout
+        if p.returncode != 0 or "test result: ok. 1 passed" not in out:
+            fail("%s: the test did not pass" % step, out)
+        if not any("makepad test: 0 warnings" in line for line in out.splitlines()):
+            fail("%s: no \"makepad test: 0 warnings\" line" % step, out)
+        if any(": warning: " in line for line in out.splitlines()):
+            fail("%s: a warning printed" % step, out)
 print("test_warnings: ok")
