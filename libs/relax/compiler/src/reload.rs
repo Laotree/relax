@@ -6798,9 +6798,15 @@ pub(crate) fn pinned() -> bool {
 /// just that waits; any other content of it, and every other file, is the person's own save and
 /// applies at once (the file is the person's from then on). Meanwhile a read of a held file (a
 /// module loaded late, an include a save reads again) gives its text from before the landing
-/// (`vfs::hold_read`): a held app never runs the landed code. `hold off` lets the landing in (one
-/// whole scan). A run's end in place drops it: the restarted run reads every file as it is.
-static LANDING_HOLD: relax_session::sync::Mutex<std::collections::BTreeMap<String, (Option<[u8; 20]>, bool)>> = relax_session::sync::Mutex::new(std::collections::BTreeMap::new());
+/// (`vfs::hold_read`): a held app never runs the landed code. `hold take` moves what a held file
+/// reads to a proven tip's text, which the next round applies (the third field, until then).
+/// `hold off` lets the landing in (one whole scan). A run's end in place drops it: the restarted
+/// run reads every file as it is.
+static LANDING_HOLD: relax_session::sync::Mutex<std::collections::BTreeMap<String, (Option<[u8; 20]>, bool, bool)>> = relax_session::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Files a take or a release of a held landing names: the watch's next round looks at each, whatever
+/// its stamp says (a taken file's text applied under the stamp the landing left on disk).
+static LANDING_FORCED: relax_session::sync::Mutex<Vec<String>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// `inspect hold files=...`: holds back these files of a landing (workspace-relative, each with
 /// the blob id it lands at, None when it removes the file), with those it holds already. It comes
@@ -6822,22 +6828,76 @@ pub(crate) fn hold_landing(files: &[(String, Option<[u8; 20]>)]) -> Result<usize
             };
             crate::vfs::hold_read(&path, before);
         }
-        held.insert(path, (*oid, false));
+        let take = held.get(&path).is_some_and(|h| h.2);
+        held.insert(path, (*oid, false, take));
     }
     eprintln!("makepad live: a landing is held back: {} file(s) wait while they say what it wrote; other saves apply", held.len());
     Ok(held.len())
 }
 
+/// `inspect hold take dir=... files=...`: the held landing moves to a proven tip P (devhub's show,
+/// while newer landings wait): each file (workspace-relative) with its blob id at P (None: P has
+/// no such file), P's text at `<dir>/<file>`, read here. A file the landing writes as P has it is
+/// held no more (its disk text applies); any other reads P's text (or is gone), which the next
+/// round applies, and stays held at what it lands at: `hold off` brings the rest in. A file not
+/// held is the person's and skipped; a file not listed keeps its text. Returns (held, taken).
+pub(crate) fn take_landing(dir: &str, files: &[(String, Option<[u8; 20]>)]) -> Result<(usize, usize), String> {
+    let workspace = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|v| v.inputs.workspace())
+        .ok_or("this run watches no sources (not a live session, or its watcher ended)")?;
+    // every text read and checked first: an error takes nothing
+    let mut texts = Vec::new();
+    for (rel, oid) in files {
+        let text = match oid {
+            None => None,
+            Some(id) => {
+                let data = std::fs::read(format!("{dir}/{rel}")).map_err(|e| format!("{rel}: {e}"))?;
+                if crate::vfs::blob_oid(&data) != *id { return Err(format!("{rel}: its text in {dir} is not the blob id given")); }
+                Some(std::sync::Arc::<[u8]>::from(data))
+            }
+        };
+        texts.push((crate::vfs::normalize_path(&format!("{workspace}/{rel}")), *oid, text));
+    }
+    let mut held = LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner());
+    let mut taken = Vec::new();
+    for (path, oid, text) in texts {
+        let Some(h) = held.get_mut(&path) else { continue };
+        if h.0 == oid {
+            held.remove(&path);
+            crate::vfs::release_read(Some(&path));
+        } else {
+            crate::vfs::hold_read(&path, text);
+            h.2 = true;
+        }
+        taken.push(path);
+    }
+    let n = held.len();
+    drop(held);
+    eprintln!("makepad live: the held landing takes {} file(s) at a proven tip; {n} still held", taken.len());
+    let t = taken.len();
+    if t > 0 {
+        LANDING_FORCED.lock().unwrap_or_else(|e| e.into_inner()).extend(taken);
+        watch_events::kick();
+    }
+    Ok((n, t))
+}
+
 /// `inspect hold off`: the held landing goes in (one whole scan). Returns how many files it held.
 pub(crate) fn release_landing() -> usize {
-    let n = std::mem::take(&mut *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner())).len();
+    let held = std::mem::take(&mut *LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()));
     crate::vfs::release_read(None);
+    let n = held.len();
     if n > 0 {
         eprintln!("makepad live: the held landing goes in ({n} file(s))");
+        LANDING_FORCED.lock().unwrap_or_else(|e| e.into_inner()).extend(held.into_keys());
         CATCH_UP.store(true, std::sync::atomic::Ordering::Release);
         watch_events::kick();
     }
     n
+}
+
+/// A taken file's text goes into this round (`hold take`): whether `path` had one waiting.
+fn untake(path: &str) -> bool {
+    LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&crate::vfs::normalize_path(path)).is_some_and(|h| std::mem::take(&mut h.2))
 }
 
 pub(crate) fn landing_held() -> usize {
@@ -6849,7 +6909,7 @@ pub(crate) fn landing_held() -> usize {
 /// on other text, the file is the person's: it is held no more.
 fn held_back(path: &str, settled: bool) -> bool {
     let key = crate::vfs::normalize_path(path);
-    let Some((landed, _)) = LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied() else { return false };
+    let Some((landed, _, take)) = LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied() else { return false };
     if crate::vfs::read_unheld(path).ok().map(|data| crate::vfs::blob_oid(&data)) != landed {
         if settled {
             LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
@@ -6858,8 +6918,10 @@ fn held_back(path: &str, settled: bool) -> bool {
         }
         return false;
     }
+    // its reads moved to a proven tip's text (`hold take`): that applies, the landing still waits
+    if take { return false; }
     let mut held = LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, said)) = held.get_mut(&key).filter(|h| !h.1) {
+    if let Some((_, said, _)) = held.get_mut(&key).filter(|h| !h.1) {
         *said = true;
         eprintln!("makepad live: {path} waits: it says what the held landing wrote (`inspect hold off` lets it in)");
     }
@@ -8951,6 +9013,14 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         }
         let look = Look::new();
         let mut changed: Vec<usize> = ids.into_iter().filter(|&k| look.stamp(&virt, k, &files[k].0) != files[k].2).collect();
+        // what a held landing's take or release names, whatever its stamp says
+        let forced = std::mem::take(&mut *LANDING_FORCED.lock().unwrap_or_else(|e| e.into_inner()));
+        if !forced.is_empty() {
+            let forced: std::collections::HashSet<String> = forced.into_iter().collect();
+            changed.extend((0..files.len()).filter(|&k| forced.contains(&crate::vfs::normalize_path(&files[k].0))));
+            changed.sort_unstable();
+            changed.dedup();
+        }
         // a round that looked at something: when it woke, what woke it and what it found (the
         // 5 ms polls while a verdict is pending look at nothing and print nothing)
         if live_trace() && scanned > 0 {
@@ -9224,6 +9294,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         for &k in &changed {
             let f = &mut files[k];
             let current = settled_stamps[k];
+            // a taken file reads its proven tip's text now, never a stalled read of before
+            if untake(&f.0) { stalled.remove(&k); }
             if crate::native_macros::owns_path(&f.0) { f.2 = current; continue; }
             if f.1 == u32::MAX && included.contains(&f.0) {
                 f.2 = current;
@@ -10440,6 +10512,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&PINNED, std::sync::atomic::AtomicBool::new(false));
     reset(&CATCH_UP, std::sync::atomic::AtomicBool::new(false));
     reset(&LANDING_HOLD, relax_session::sync::Mutex::new(std::collections::BTreeMap::new()));
+    reset(&LANDING_FORCED, relax_session::sync::Mutex::new(Vec::new()));
     reset(&RETRY_NOW, std::sync::atomic::AtomicBool::new(false));
     reset(&RESTART_REASON, relax_session::sync::Mutex::new(String::new()));
     reset(&RESTART_SAVED_MS, std::sync::atomic::AtomicU64::new(0));

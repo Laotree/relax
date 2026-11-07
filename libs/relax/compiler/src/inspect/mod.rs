@@ -201,7 +201,7 @@ pub fn start(app: &str) {
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("session", "view [open|dismiss]", "the run's view over the app (compile errors, a parked panic, the JIT's state): what it shows, or open / dismiss it (the caption's JIT ring is display only)"),
     ("pin", "[on|off]", "pin the running app while an operation runs: no edit or landing reaches it and it does not restart; off: it catches up"),
-    ("hold", "[files=<path>=<blob id or ->, one a line> | off]", "hold back a landing (devhub's show, until its tip is proven): while a file says what the landing wrote (its git blob id, - when it removes the file) its change waits; every other save applies at once; off: the landing goes in; no words: how many files are held"),
+    ("hold", "[files=<path>=<blob id or ->, one a line> | take dir=<dir> files=... | off]", "hold back a landing (devhub's show, until its tip is proven): while a file says what the landing wrote (its git blob id, - when it removes the file) its change waits; every other save applies at once; take: the held files move to a proven tip's text (<dir>/<path>, of that blob id; -: gone), the rest stays held; off: the landing goes in; no words: how many files are held"),
     ("inputs", "[match=<path substring>] [of=<paths, one per line>]", "the live session's reload source files, workspace-relative, one path per line and a count; unloaded sources are excluded; of= answers only which of those paths are inputs, and which others lie in no package of the graph (`outside`)"),
     ("session", "relaunch", "apply the edits waiting for a restart: the process starts again (an app that restarts itself, std::relax::restart_supported, with its state and window frames)"),
     ("why-hung", "[probe_ms=200]", "is it stuck and why: verdict (deadlock / blocked / busy / idle), the wait chain or cycle, stacks of the threads in it"),
@@ -392,20 +392,23 @@ fn dispatch_command(req: &Req, out: &mut Out) {
             out.line(&format!("{{\"pinned\":{on}}}"));
         }
         "hold" => {
+            // (held, taken: Some for a take)
             let held = match (req.pos.first().map(String::as_str), req.get("files")) {
                 (Some("off"), None) => {
                     crate::reload::release_landing();
-                    Ok(0)
+                    Ok((0, None))
                 }
-                (None, Some(list)) => match hold_files(list) {
-                    Ok(files) => crate::reload::hold_landing(&files),
-                    Err(e) => Err(e),
+                (None, Some(list)) => hold_files(list).and_then(|files| crate::reload::hold_landing(&files)).map(|n| (n, None)),
+                (Some("take"), Some(list)) => match req.get("dir") {
+                    Some(dir) => hold_files(list).and_then(|files| crate::reload::take_landing(dir, &files)).map(|(n, t)| (n, Some(t))),
+                    None => Err("hold take dir=<dir> files=<path>=<blob id or ->, one a line".to_string()),
                 },
-                (None, None) => Ok(crate::reload::landing_held()),
-                _ => Err("hold files=<path>=<blob id or ->, one a line | hold off".to_string()),
+                (None, None) => Ok((crate::reload::landing_held(), None)),
+                _ => Err("hold files=<path>=<blob id or ->, one a line | hold take dir=<dir> files=... | hold off".to_string()),
             };
             match held {
-                Ok(n) => out.line(&format!("{{\"held\":{n}}}")),
+                Ok((n, None)) => out.line(&format!("{{\"held\":{n}}}")),
+                Ok((n, Some(t))) => out.line(&format!("{{\"held\":{n},\"took\":{t}}}")),
                 Err(e) => out.err(&e),
             }
         }
