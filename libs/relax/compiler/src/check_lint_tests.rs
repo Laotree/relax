@@ -177,6 +177,23 @@ fn a_binary_built_as_a_test_keeps_its_main() {
     assert_eq!(warnings, ["function `unused_in_bin` is never used [dead_code]"]);
 }
 
+/// A fn only a `global_asm!`'s `sym` operand names is used, and so is a constant of its `const`
+/// operand (rustc_passes dead.rs: the global_asm item is live, its operands' paths with it); a fn
+/// nothing names still is dead. The check had reported the unwinder's native raise (jit.rs
+/// native_raise, which only its stub calls) as never used.
+#[test]
+fn what_a_global_asm_names_is_used() {
+    let Some(warnings) = warnings_in_child("check_lint_tests::what_a_global_asm_names_is_used") else {
+        return check_package(r#"
+            extern "C" fn named_by_asm() {}
+            const ALIGN: usize = 3;
+            fn unused() {}
+            std::arch::global_asm!(".data", ".p2align {a}", ".quad {f}", ".text", f = sym named_by_asm, a = const ALIGN);
+        "#, &[]);
+    };
+    assert_eq!(warnings, ["function `unused` is never used [dead_code]"]);
+}
+
 /// WARNZERO class 6 (994 warnings in 24 packages: apps/flow's makepad-flow-server.rs:96, ai-llm's
 /// 18 bins, ..): every binary target's `main` is live (rustc_passes dead.rs
 /// create_and_seed_worklist, per crate), not only the one the check is rooted at, so neither it
