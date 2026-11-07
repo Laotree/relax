@@ -3662,12 +3662,27 @@ pub(crate) fn rt_thread_run(entry: u64, arg: u64) -> u64 {
 }
 }
 
+thread_local! {
+    /// The next recovery point this thread enters is std's catch_unwind (relax_catch_caught).
+    static CATCH_CAUGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `__relax_catch_caught`, which std's catch_unwind calls just before its recovery point: the
+/// panic that point catches goes back to the program, and its report line says so
+/// (`report (caught):`). A panic that ends a thread or a test keeps `report:`, and a log's readers
+/// (land_gate.sh's test_failures, jit_misses) count only those: untagged, a test run's deliberate
+/// panics read as its failures (11-07).
+pub extern "C" fn relax_catch_caught() {
+    let _ = CATCH_CAUGHT.try_with(|c| c.set(true));
+}
+
 rt_fn! {
 /// core::intrinsics_rt::catch_panic: `f(data)` under a recovery point (std::panic::
 /// catch_unwind, std::thread's start routine). The panic message itself was printed by
 /// std's hook; the report adds where it happened.
 pub(crate) fn rt_catch_panic(f: u64, data: u64) -> u64 {
     ensure_altstack();
+    let caught = CATCH_CAUGHT.try_with(|c| c.replace(false)).unwrap_or(false);
     let u = cur_unit();
     match unsafe { call_jit_nested(u, f, data) } {
         Ok(_) => 0,
@@ -3681,7 +3696,7 @@ pub(crate) fn rt_catch_panic(f: u64, data: u64) -> u64 {
             let r = owner::call(owner::Class::Job, || unsafe { (&*u).report(&p) });
             fatal_compile_error(&p, &r);
             // std's hook already printed the panic message (as rustc's does); add where
-            eprintln!("  report: {}", r);
+            eprintln!("  report{}: {}", if caught { " (caught)" } else { "" }, r);
             1
         }
     }
@@ -22570,6 +22585,7 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_domain_id" => Some(crate::domain::relax_domain_id as *const () as usize),
         b"__relax_thread_spawn" => Some(crate::domain_threads::spawn as *const () as usize),
         b"__relax_domain_name" => Some(crate::domain::relax_domain_name as *const () as usize),
+        b"__relax_catch_caught" => Some(relax_catch_caught as *const () as usize),
         b"__relax_test_inherit" => Some(crate::harness::reach::inherit as *const () as usize),
         b"__relax_test_adopt" => Some(crate::harness::reach::adopt as *const () as usize),
         b"__relax_test_cancel" => Some(crate::harness::reach::cancel as *const () as usize),
