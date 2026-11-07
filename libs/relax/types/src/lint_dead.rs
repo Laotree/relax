@@ -1342,10 +1342,12 @@ fn late_lints(cx: &CrateCx<'_>, reach: &Reach, pt: &mut PartTimes) {
     let mut unsolved: Vec<DefId> = Vec::new();
     // rustc_passes dead.rs create_and_seed_worklist: a binary's `main` is live. Cargo checks each
     // target as a crate of its own, so every binary of the check seeds its entry: a package's
-    // `src/bin/*.rs` and `[[bin]]` targets beside the one the check is rooted at.
+    // `src/bin/*.rs` and `[[bin]]` targets beside the one the check is rooted at. A binary built
+    // with `--test` too: libtest's harness marks its own `main` #[allow(dead_code)]
+    // (rustc_builtin_macros test_harness.rs EntryPointCleaner), and dead.rs seeds what it allows.
     let main = prog.syms.intern_late("main");
     let ci = &prog.crates[c.krate as usize];
-    let executable = if c.krate == root { is_executable(prog, root) } else { ci.is_bin && !ci.harness && is_executable(prog, c.krate) };
+    let executable = if c.krate == root { is_executable(prog, root) } else { ci.is_bin && is_executable(prog, c.krate) };
     if executable {
         if let Some(m) = prog.lookup_in_container(prog.mods[ci.root_mod as usize].def, main, false) {
             if prog.def(m).kind == DefKind::Fn { s.worklist.push(Work { id: m, propagated: false, own: false }); }

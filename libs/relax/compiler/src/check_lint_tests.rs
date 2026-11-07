@@ -47,8 +47,8 @@ fn check_package_code(lib: &str, bins: &[&str]) -> i32 {
     check_code(lib, bins, false)
 }
 
-/// The check of `lib` and `bins`; `harness`: the library is built with `--test` (cfg(test),
-/// libtest's generated main), as `makepad check --test <name>` builds a test target.
+/// The check of `lib` and `bins`; `harness`: every target is built with `--test` (cfg(test),
+/// libtest's generated main), as `makepad check --tests` builds them.
 fn check_code(lib: &str, bins: &[&str], harness: bool) -> i32 {
     check_code_uses(lib, bins, harness, Uses::Recorded)
 }
@@ -94,8 +94,11 @@ fn check_code_uses(lib: &str, bins: &[&str], harness: bool, uses: Uses) -> i32 {
         std::fs::write(&path, src).unwrap();
         let mut deps = std_deps.clone();
         deps.push((prog.syms.intern("pkg"), root));
-        let k = prog.load_crate_deferred(&format!("bin{i}"), path.to_str().unwrap(), 2021, crate::program_cfg(&sess, &[]), deps).unwrap();
+        let mut bin_cfg = crate::program_cfg(&sess, &[]);
+        if harness { bin_cfg.set.push("test".to_string()); }
+        let k = prog.load_crate_deferred(&format!("bin{i}"), path.to_str().unwrap(), 2021, bin_cfg, deps).unwrap();
         prog.crates[k as usize].is_bin = true;
+        prog.crates[k as usize].harness = harness;
         crates.push(k);
         files.push(path);
     }
@@ -160,6 +163,18 @@ fn a_test_targets_test_fns_are_used() {
         "#, &[], true), 0);
     };
     assert_eq!(warnings, ["function `unused` is never used [dead_code]"]);
+}
+
+/// `makepad check --tests` had reported a binary's `main` and all it calls as never used when it
+/// builds the binary with `--test`: libtest's harness marks that `main` #[allow(dead_code)]
+/// (rustc_builtin_macros test_harness.rs EntryPointCleaner), so it stays live; an item nothing
+/// reaches still is dead.
+#[test]
+fn a_binary_built_as_a_test_keeps_its_main() {
+    let Some(warnings) = warnings_in_child("check_lint_tests::a_binary_built_as_a_test_keeps_its_main") else {
+        return assert_eq!(check_code("pub fn shared() -> u32 { 1 }", &["fn helper() -> u32 { 2 }\nfn unused_in_bin() {}\nfn main() { let _ = pkg::shared() + helper(); }\n"], true), 0);
+    };
+    assert_eq!(warnings, ["function `unused_in_bin` is never used [dead_code]"]);
 }
 
 /// WARNZERO class 6 (994 warnings in 24 packages: apps/flow's makepad-flow-server.rs:96, ai-llm's
