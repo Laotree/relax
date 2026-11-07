@@ -910,7 +910,7 @@ fn a_run_with_a_deep_tmpdir_is_reached() {
 
 /// A command over the Unix socket names who sent it: the agent its client says it is, and its
 /// process, from the socket's credentials (not from anything the client says). A `session
-/// relaunch` and a click injected into a window's caption name who asked (Scope, Fab and Story
+/// relaunch` and a click injected into a window's caption name who asked (three apps
 /// restarted for a landing, and apps closed by their caption, and nothing said by whom, 11-06).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
