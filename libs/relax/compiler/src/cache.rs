@@ -768,8 +768,12 @@ pub struct Cache {
     data_addr: HashMap<u128, u64>,
     /// data object key -> its per-domain copy this run (link_symbol tag 10)
     const_copy: HashMap<u128, u64>,
-    /// data object index -> its entry key (None: cannot be stored)
-    data_key: HashMap<u32, Option<u128>>,
+    /// (data object index, the crate whose store the entry naming it goes to) -> its entry key
+    /// (None: cannot be stored). Per crate: the data entry goes where that crate's readers find it
+    /// (`data_reaches`), and its pointer words' objects with it
+    data_key: HashMap<(u32, u32), Option<u128>>,
+    /// data entry key -> the crates whose stores this run recorded it to
+    data_crates: HashMap<u128, Vec<u32>>,
     /// why a data object cannot be stored (memo of data_entry's reason)
     data_why: HashMap<u32, &'static str>,
     /// slots whose code came from the cache this run (not recorded again)
@@ -1103,6 +1107,7 @@ impl Cache {
             data_addr: HashMap::new(),
             const_copy: HashMap::new(),
             data_key: HashMap::new(),
+            data_crates: HashMap::new(),
             data_why: HashMap::new(),
             linked: HashSet::new(),
             missed: HashSet::new(),
@@ -3043,7 +3048,8 @@ impl Cache {
     /// The content key of data object `idx` (bytes, alignment, pointer words), recording its
     /// entry; None when it cannot be stored (mutable, opaque, unattributed pointers).
     fn data_entry(&mut self, u: &Unit, idx: u32) -> Option<u128> {
-        if let Some(&k) = self.data_key.get(&idx) {
+        let memo = (idx, self.cur_crate);
+        if let Some(&k) = self.data_key.get(&memo) {
             if k.is_none() {
                 let w = self.data_why.get(&idx).copied().unwrap_or("data object: cycle");
                 self.why(w);
@@ -3051,7 +3057,7 @@ impl Cache {
             return k;
         }
         // a cycle through this object (only statics can be cyclic; they are not data objects)
-        self.data_key.insert(idx, None);
+        self.data_key.insert(memo, None);
         let r = (|| {
             let (start, len, align, mutable) = u.syms.obj_info(idx)?;
             if mutable {
@@ -3114,8 +3120,10 @@ impl Cache {
                     eprintln!("makepad-run cache: DATA {} key {:032x} ptrs {:?} enc {}", n, key, ws, hex);
                 }
             }
-            if self.mode != Mode::ReadOnly && !self.has_index(&key) && self.pending_keys.insert(key) {
-                let kc = self.cur_crate;
+            let kc = self.cur_crate;
+            if self.mode != Mode::ReadOnly && !self.data_reaches(key, kc) {
+                self.pending_keys.insert(key);
+                self.data_crates.entry(key).or_default().push(kc);
                 self.push_pending(kc, NewEntry { key, kind: KIND_DATA, payload: e.0 });
             }
             Some(key)
@@ -3123,8 +3131,28 @@ impl Cache {
         if r.is_none() && !self.data_why.contains_key(&idx) {
             self.data_why.insert(idx, self.last_why);
         }
-        self.data_key.insert(idx, r);
+        self.data_key.insert(memo, r);
         r
+    }
+
+    /// Whether data entry `key` is where every program that links crate `kc`'s code entries finds
+    /// it: in the store of `kc` or of a crate `kc` depends on (a program that has `kc` opens
+    /// theirs), on disk or recorded by this run. Not only where this program finds it: an object
+    /// a build script's own code named first went to that script's store, and the std code naming
+    /// it after failed to link in every other program
+    fn data_reaches(&self, key: u128, kc: u32) -> bool {
+        let closure = self.crate_closure.get(kc as usize).map_or(&[][..], |set| &set[..]);
+        let reaches = |c: usize| closure.get(c / 64).is_some_and(|w| w >> (c % 64) & 1 == 1);
+        if self.data_crates.get(&key).is_some_and(|cs| cs.iter().any(|&c| reaches(c as usize))) {
+            return true;
+        }
+        // where the index has it (one store of those holding it), or `kc`'s own store
+        let store_crate = |p: u32| self.code_path.iter().position(|cp| *cp == self.stores[p as usize].path);
+        if self.index_at(key).is_some_and(|(p, _)| store_crate(p).is_some_and(reaches)) {
+            return true;
+        }
+        let own = self.code_path.get(kc as usize);
+        self.stores.iter().any(|st| Some(&st.path) == own && st.index.binary_search_by(|e| { let k = e.key; k.cmp(&key) }).is_ok())
     }
 
     /// Records slot `id`'s freshly compiled O1 code (on the owner thread).
@@ -3710,6 +3738,7 @@ impl Cache {
         self.data_addr = old.data_addr.clone();
         self.const_copy = old.const_copy.clone();
         self.data_key = old.data_key.clone();
+        self.data_crates = old.data_crates.clone();
         self.linked = old.linked.clone();
         self.linked_key = old.linked_key.clone();
         self.base_linked = old.base_linked.clone();
@@ -5190,6 +5219,25 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
     out.into_iter().map(|r| r.into_inner().unwrap().expect("par_map result")).collect()
 }
 
+/// Where a test puts the time a graph's stats are recorded at (0: the clock's). The racy rule
+/// measures from it, so a test places a recording a known distance from an edit, whatever the
+/// load before the recording took
+#[cfg(test)]
+static RECORD_NOW_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The time a graph's input stats are recorded at: an input changed within `STAT_RACY_NS` of it
+/// gets no stat (source_context::input_stamp)
+fn record_now_ns() -> u64 {
+    #[cfg(test)]
+    {
+        let t = RECORD_NOW_NS.load(std::sync::atomic::Ordering::Relaxed);
+        if t != 0 {
+            return t;
+        }
+    }
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
+}
+
 fn write_front_graph(job: &FrontGraphWrite) -> Option<()> {
     let _profile = crate::load_profile::span(job.profile, "front-graph-write", "graph writer");
     // MAKEPAD_RUN_BOOT_TRACE: where a graph write's time goes (one line per recorded graph)
@@ -5237,7 +5285,7 @@ fn write_front_graph(job: &FrontGraphWrite) -> Option<()> {
     let _stamps = crate::load_profile::span(job.profile, "front-graph-stamps", "graph writer");
     // each input's stat, taken only where the recorded hash is the file's hash right now and the
     // file has been quiet for a while: validation then trusts an equal stat (see begin_load)
-    let now_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    let now_ns = record_now_ns();
     // read and hashed on the loader's worker count (1600 Calculator inputs: 0.2 s on one)
     graph.stamps = par_map(&graph.inputs, |(p, h)| crate::source_context::input_stamp(p, *h, now_ns));
     graph.probes = probes.into_iter().collect();
@@ -5362,7 +5410,7 @@ pub(crate) fn record_added_crates(prog: &crate::program::Program, dir: &std::pat
     let mut probes: std::collections::BTreeMap<String, bool> = base.probes.iter().cloned().collect();
     for (p, exists) in &prog.module_probes { probes.entry(p.clone()).or_insert(*exists); }
     // the added inputs' stats (the boot's are its graph's)
-    let now_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    let now_ns = record_now_ns();
     let fresh: Vec<(String, u128)> = inputs.iter().filter(|(p, _)| base.inputs.binary_search_by(|(q, _)| q.as_str().cmp(p.as_str())).is_err())
         .map(|(p, (h, _))| (p.clone(), *h)).collect();
     for ((p, _), stamp) in fresh.iter().zip(par_map(&fresh, |(p, h)| crate::source_context::input_stamp(p, *h, now_ns))) {
@@ -6598,6 +6646,14 @@ mod cold_tests {
         std::fs::write(&root, "mod called; pub use called::value;").unwrap();
         let called = dir.join("called.rs");
         std::fs::write(&called, "pub fn value() -> u32 { 7 }").unwrap();
+        // an hour old, as a checkout leaves it: an edit that restores this mtime is racy by its
+        // change time alone
+        let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&called).unwrap().set_modified(mtime).unwrap();
+        // each recording's time is set a known distance from the files' changes, however long
+        // the load before it takes
+        let record_at = |ns: u64| RECORD_NOW_NS.store(ns, std::sync::atomic::Ordering::Relaxed);
+        let epoch_ns = |t: std::time::SystemTime| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
         let pre = vec![crate::preload::PreCrate {  name: "quiet".into(), root, edition: 2021, cfg,
             deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![] }];
         let store = std::env::temp_dir().join(format!("relax-stat-graph-cache-{}-{}", std::process::id(), crate::clock::wall_ns()));
@@ -6613,8 +6669,8 @@ mod cold_tests {
             prog.resolve_imports();
             prog
         };
-        // the files must be older than the racy window when the graph is recorded
-        std::thread::sleep(std::time::Duration::from_millis(2300));
+        // every file changed more than the racy window before the graph is recorded
+        record_at(epoch_ns(std::time::SystemTime::now()) + crate::vfs::STAT_RACY_NS + 1_000_000_000);
         let mut cold = load(None, true);
         ColdFront::default().finish_in(&mut cold, store.clone());
         let identity = cold.front_graph.as_ref().unwrap().identity;
@@ -6626,7 +6682,6 @@ mod cold_tests {
         assert_eq!(images.content_hashes.load(std::sync::atomic::Ordering::Relaxed), 0, "an unchanged warm start hashes no file");
         // same size, mtime restored: the stat alone differs only in ctime (and the inode when
         // an editor replaces the file), so it is still caught
-        let mtime = std::fs::metadata(&called).unwrap().modified().unwrap();
         std::fs::write(&called, "pub fn value() -> u32 { 8 }").unwrap();
         std::fs::File::options().write(true).open(&called).unwrap().set_modified(mtime).unwrap();
         let edited = load(Some(&images), false);
@@ -6634,7 +6689,11 @@ mod cold_tests {
         let parsed = |p: &crate::program::Program| p.files.iter().zip(&p.file_paths).find(|(_, path)| path.ends_with("called.rs")).is_some_and(|(f, _)| !f.src.is_mapped());
         assert!(parsed(&edited), "an edit with the same size and mtime is detected");
         assert!(images.content_hashes.load(std::sync::atomic::Ordering::Relaxed) > 0);
-        // a graph recorded within the racy window of the edit carries no stat for that file
+        // a graph recorded within the racy window of the edit (its change time: the mtime is an
+        // hour old) carries no stat for that file
+        let edit = crate::vfs::file_stat(&called.to_string_lossy()).unwrap();
+        assert!(edit.mtime_ns + crate::vfs::STAT_RACY_NS < edit.ctime_ns, "{edit:?}");
+        record_at(edit.ctime_ns + crate::vfs::STAT_RACY_NS / 2);
         let mut edited = edited;
         ColdFront::default().finish_in(&mut edited, store.clone());
         let racy = read_front_graph(&store, identity).unwrap();
@@ -8247,9 +8306,11 @@ mod data_tests {
         assert_eq!(linked_ptrs[0].1.off, 2);
         assert_eq!(&linked_ptrs[1..], &[(9, rt), (17, static_sym), (25, thunk), (33, foreign)]);
         assert!(matches!(crate::syms::read_obj(&u, Sym { id: u.data_sym(linked).id, off: 1 }, 8), relax_backend::passes::RoRead::Ptr(s) if s == linked_ptrs[0].1));
-        // Force recording instead of returning a memoized key / existing disk entry.
+        // Force recording instead of returning a memoized key / existing disk entry / this run's
+        // record of it for the crate.
         c.index.clear();
         c.pending_keys.clear();
+        c.data_crates.clear();
         assert_eq!(c.data_entry(&u, linked_idx), Some(key));
         assert_eq!(c.pending.iter().find(|(_, e)| e.key == key).unwrap().1.payload, expected);
         drop(c);
@@ -9182,7 +9243,7 @@ impl Cache {
         if self.pending_keys.contains(&key) || (self.has_index(&key) && !self.const_stale.contains(&key)) { return Some(()); }
         let SymKind::Data(idx) = u.syms.kind(u.data_sym(addr).id)? else { return None; };
         // A recursive compile can inspect this object before its initializer finishes.
-        self.data_key.remove(&idx);
+        self.data_key.retain(|&(i, _), _| i != idx);
         self.data_why.remove(&idx);
         let previous = self.cur_crate;
         self.cur_crate = krate;
