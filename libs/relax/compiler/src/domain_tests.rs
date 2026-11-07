@@ -1410,3 +1410,14 @@ fn a_fault_deeper_in_native_code_ends_the_process_at_once() {
     #[cfg(unix)]
     assert!(std::os::unix::process::ExitStatusExt::signal(&status).is_some(), "{status:?}\n{told}");
 }
+
+/// A run whose boot ended before its unit was in (its build failed) has no code and no program
+/// threads: its end, for a restart asked meanwhile (`session relaunch`), ends nothing and reads no
+/// unit (the end read through the missing unit and the process died, 11-07).
+#[test]
+fn a_run_with_no_unit_ends_with_nothing_to_end() {
+    isolated_test!(a_run_with_no_unit_ends_with_nothing_to_end);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let end = end_run(std::ptr::null_mut(), Duration::from_millis(100));
+    assert_eq!((end.threads, end.left.len()), (0, 0), "{}", end.line());
+}

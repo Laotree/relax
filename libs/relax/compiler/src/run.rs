@@ -207,10 +207,53 @@ pub(crate) fn host_end_app() {
     }
 }
 
-/// The host starts the next run in this process (`run_end`).
+/// The host starts the next run in this process (`run_end`), whose boot is due (`boot_begins`):
+/// a host that starts none ends the gate.
 pub(crate) fn host_next_run() {
-    if let Some(host) = MAIN_HOST.get().filter(|_| HOSTED_RUN.load(Ordering::Acquire)) {
-        (host.next_run)();
+    let started = MAIN_HOST.get().filter(|_| HOSTED_RUN.load(Ordering::Acquire)).is_some_and(|host| (host.next_run)());
+    if !started {
+        boot_over();
+    }
+}
+
+/// A hosted run's boot is on: its program has not started, and the boot may still be building
+/// the unit a run's end takes away. From the moment a boot is due (`cmd_run`, a restart's next
+/// run, the run window's retry of a failed build) until the boot hands the run to its program
+/// (the app's domain started, or its main called on the compile thread) or returns without one.
+/// A restart in place waits it out (`run_end::restart`): a `session relaunch` 3 s into a
+/// restarted run ended it with no unit in yet, and the restart's thread faulted on it (11-07).
+static BOOTING: AtomicBool = AtomicBool::new(false);
+
+/// A hosted run's boot is due ([`BOOTING`]): the host's retry of a failed build says so as it
+/// decides it, before its compile thread wakes.
+pub fn boot_begins() {
+    BOOTING.store(true, Ordering::SeqCst);
+}
+
+/// The boot handed the run to its program, or ended without one ([`BOOTING`]).
+pub(crate) fn boot_over() {
+    BOOTING.store(false, Ordering::SeqCst);
+}
+
+/// A hosted run's boot is on ([`BOOTING`]).
+pub(crate) fn booting() -> bool {
+    BOOTING.load(Ordering::SeqCst)
+}
+
+/// One boot of the host's compile closure: the gate is on while it runs and off however it
+/// returns, a panic included ([`BOOTING`]).
+pub(crate) struct Boot;
+
+impl Boot {
+    pub(crate) fn on() -> Self {
+        boot_begins();
+        Boot
+    }
+}
+
+impl Drop for Boot {
+    fn drop(&mut self) {
+        boot_over();
     }
 }
 
@@ -234,7 +277,10 @@ pub fn cmd_run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         HOSTED_RUN.store(true, Ordering::Release);
         let sess = sess.clone();
         let args = args.to_vec();
+        // (due from here: the inspect endpoint takes a relaunch before the compile thread runs)
+        boot_begins();
         (host.run)(Box::new(move || {
+            let _boot = Boot::on();
             start_console(&args);
             cmd_run_inner(&sess, &args, None)
         }))
@@ -270,7 +316,9 @@ pub fn cmd_run_app(package: &str, args: Vec<String>, mut prepare: Box<dyn FnMut(
     let package = package.to_string();
     let words = args.clone();
     let mut sess = None;
+    boot_begins();
     let code = (host.run)(Box::new(move || {
+        let _boot = Boot::on();
         if sess.is_none() {
             *SOURCE_FAILURE.lock().unwrap() = None;
             if let Err(e) = (host.open)(&package, "") {
@@ -2334,6 +2382,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     // the platform's start code runs the program's constructors before its entry (sections.rs)
     if !entry_defs.is_empty() || harness || !exports_mode && !HAL_RUN.load(Ordering::Acquire) {
+        // the program's own code runs on this thread from here (its constructors, then its
+        // main): the boot is over, and a restart's end meets that code as it meets any of it
+        boot_over();
         if let Err(e) = unsafe { crate::sections::run_constructors(up, root, None) } {
             eprintln!("makepad-run: {e}");
             std::mem::forget(u);
@@ -2675,8 +2726,9 @@ pub struct MainHost {
     /// A run's threads have ended (`run_end`): the app's session goes, with what it held of the
     /// GPU, and the window back to the host.
     pub end_app: fn(),
-    /// A run ended in place (`run_end`): the host starts the next one, its window stays.
-    pub next_run: fn(),
+    /// A run ended in place (`run_end`): the host starts the next one, its window stays. False:
+    /// it started none (it has no run window).
+    pub next_run: fn() -> bool,
 }
 
 /// The host's half of a batch program (`MainHost::batch`).
