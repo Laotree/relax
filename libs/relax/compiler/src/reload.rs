@@ -1786,6 +1786,18 @@ pub(crate) fn include_unmatched(prog: &crate::program::Program, changed: &[Strin
     left
 }
 
+/// Where item `it`'s text has its expression, which starts at `e`: an expression a macro made
+/// (`const T: &str = include_str!("t.txt");`) lies in the expansion text past the file's, and its
+/// call is where the item's text has it. The item's head (its type) is the text up to there: up to
+/// the expansion it took in the file's text after the item and every expansion before this one,
+/// a body's `format!` above it among them, so an edit of the included file alone said "the type
+/// of const `T` changed" (an app's two `include_str!` consts, 11-07).
+fn expr_at(pf: &crate::parser::ParsedFile, it: &crate::ast::Item, e: u32) -> u32 {
+    if (it.lo..=it.hi).contains(&e) { return e; }
+    let call = pf.call_site(e);
+    if (it.lo..=it.hi).contains(&call) { call } else { e }
+}
+
 /// Classifies the items of one file version against the running one.
 /// Ok: the item pairing (old item -> new item) and the changes that apply live.
 /// Err: the restart reasons (one line each).
@@ -2122,12 +2134,12 @@ fn classify_moving(prog: &crate::program::Program, old_file: u32, new: &crate::p
                 }
             }
             (ItemKind::Const(_, ea), ItemKind::Const(_, eb)) if ea.is_some() && eb.is_some() => {
-                let (ea, eb) = (oa.expr(ea.get().unwrap()), na.expr(eb.get().unwrap()));
-                if !attrs_same || toks_norm(old, la, ea.lo, &[]) != toks_norm(new, lb, eb.lo, &[]) {
+                let (ea, eb) = (expr_at(old, a, oa.expr(ea.get().unwrap()).lo), expr_at(new, b, na.expr(eb.get().unwrap()).lo));
+                if !attrs_same || toks_norm(old, la, ea, &[]) != toks_norm(new, lb, eb, &[]) {
                     if reload_trace() {
                         let sh = |v: Vec<Vec<u8>>| v.iter().map(|x| String::from_utf8_lossy(x).into_owned()).collect::<Vec<_>>().join(" ");
-                        eprintln!("reload: type of const `{}` (attrs same {}; old {}..{} of {}, new {}..{} of {}):\n  old: {}\n  new: {}", name, attrs_same, la, ea.lo, old.src_len, lb, eb.lo, new.src_len,
-                            sh(toks_norm(old, la, ea.lo, &[])).chars().take(600).collect::<String>(), sh(toks_norm(new, lb, eb.lo, &[])).chars().take(600).collect::<String>());
+                        eprintln!("reload: type of const `{}` (attrs same {}; old {}..{} of {}, new {}..{} of {}):\n  old: {}\n  new: {}", name, attrs_same, la, ea, old.src_len, lb, eb, new.src_len,
+                            sh(toks_norm(old, la, ea, &[])).chars().take(600).collect::<String>(), sh(toks_norm(new, lb, eb, &[])).chars().take(600).collect::<String>());
                     }
                     why.push(format!("{}: the type of const `{}` changed -- restart the app", pos(new, b.lo), name));
                     continue;
@@ -2138,15 +2150,15 @@ fn classify_moving(prog: &crate::program::Program, old_file: u32, new: &crate::p
                 }
             }
             (ItemKind::Static(_, _, ea), ItemKind::Static(_, _, eb)) if ea.is_some() && eb.is_some() => {
-                let (ea, eb) = (oa.expr(ea.get().unwrap()), na.expr(eb.get().unwrap()));
-                if !attrs_same || toks_norm(old, la, ea.lo, &[]) != toks_norm(new, lb, eb.lo, &[]) {
+                let (ea, eb) = (expr_at(old, a, oa.expr(ea.get().unwrap()).lo), expr_at(new, b, na.expr(eb.get().unwrap()).lo));
+                if !attrs_same || toks_norm(old, la, ea, &[]) != toks_norm(new, lb, eb, &[]) {
                     // its declared type as each version spells it (between the name and the `=`)
                     let ty = |pf: &crate::parser::ParsedFile, it: &crate::ast::Item, e: u32| -> String {
                         let t = pf.src.get(it.name.hi as usize..e as usize).map(String::from_utf8_lossy).unwrap_or_default();
                         let t = t.trim().trim_start_matches(':').trim_end().trim_end_matches('=');
                         t.split_whitespace().collect::<Vec<_>>().join(" ")
                     };
-                    let (ta, tb) = (ty(old, a, ea.lo), ty(new, b, eb.lo));
+                    let (ta, tb) = (ty(old, a, ea), ty(new, b, eb));
                     if ta != tb {
                         why.push(format!("{}: static `{}` changed its type from `{}` to `{}`: its storage holds a value of the old type -- restart the app", pos(new, b.lo), name, ta, tb));
                     } else {
