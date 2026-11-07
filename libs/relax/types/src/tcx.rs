@@ -2295,6 +2295,32 @@ impl Tcx {
         }
     }
 
+    /// An anonymous constant's type is fed by the lowering that meets it (lower_const_arg, as
+    /// hir_ty_lowering's feed_anon_const_type): its holder's declared type, signature or body,
+    /// which a cold run lowers before anything types the constant. A warm `makepad run` takes
+    /// the holder's code and the constant's from the disk cache, and nothing need lower the
+    /// holder before the checker types the constant (gandalf after a relaunch: "anonymous const
+    /// type of `app::MAKEPAD_FONT_ASSETS_V1::{constant#0}` (its holder never fed it)", a static's
+    /// array length). Lowers the holder of anonymous constant `d` whose type was not fed: the
+    /// body that holds it, else the declared type of the const or static, or the fn's signature
+    /// and clauses. Before the constant's typeck query starts (Tcx::typeck), so a body that
+    /// evaluates the constant meets no cycle.
+    pub(crate) fn feed_anon_const_from_holder(&self, prog: &Program, d: DefId) {
+        use crate::def_collector::NodeId;
+        if prog.def(d).kind != DefKind::AnonConst || self.const_tys.fed_type(&d).is_some() { return; }
+        let Some(&(file, NodeId::AnonConst(e))) = prog.def_id_to_node_id.get(&d) else { return };
+        let owner = crate::borrowck::body::root_owner(prog, d);
+        if crate::borrowck::body::in_body(prog, owner, file, prog.files[file as usize].ast.expr(e).lo) {
+            let _ = self.typeck(prog, owner);
+            return;
+        }
+        match prog.def(owner).kind {
+            DefKind::Const | DefKind::AssocConst | DefKind::Static => { let _ = self.const_ty(prog, owner); }
+            DefKind::Fn | DefKind::AssocFn => { let _ = self.fn_item_sig(prog, owner); let _ = self.clauses_of(prog, owner); }
+            _ => {}
+        }
+    }
+
     /// The region contract of a const/static item's declared type (None: not one, or no type).
     pub fn const_region_contract(&self, prog: &Program, d: DefId) -> Option<&outlives::RegionContract> {
         let cell = self.const_tys.declaration(&d)?;
