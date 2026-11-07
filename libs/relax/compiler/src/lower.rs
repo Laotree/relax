@@ -687,8 +687,9 @@ impl<'a> Lcx<'a> {
         if std_owner && RAW.iter().any(|r| path.ends_with(r)) {
             // an object of a type no bound fn's signature reaches is JIT code's own, as a value of
             // it built here is (check_provided_built): rustc's side never hands one over. The
-            // panic a caller-side trampoline boxed (a `Box<dyn Any + Send>` behind a `*mut u8`)
-            // is freed by the caller's side (script std's ScriptVmCall::resume_if_panicked).
+            // panic a caller-side trampoline boxed behind a `*mut u8` is freed by the caller's
+            // side (script std's ScriptVmCall::resume_if_panicked): its box is of a type of the
+            // crate's own (`Caught`), where a `Box<dyn Any + Send>` is shared once an op carries one.
             if cargs.first().is_some_and(|t| self.relax_only_instance(*t)) {
                 return;
             }
