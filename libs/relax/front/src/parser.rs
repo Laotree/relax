@@ -5726,6 +5726,8 @@ pub struct ParsedFile {
     pub src_len: u32,
     /// Cached path/source identity, shared by file metadata and front-image lookups.
     pub source_hash: std::sync::OnceLock<(String, u128)>,
+    /// How this parse numbers the file (ParsedFile::numbering): on its first use, or its image's.
+    pub numbering: std::sync::OnceLock<u128>,
     /// substituted fragment tokens -> their origin (Parser::tok_origin)
     pub tok_origin: Table<Maps>,
     pub token_origins: Table<Origins>,
@@ -5941,6 +5943,32 @@ impl ParsedFile {
     pub fn source_hash(&self, path: &str) -> u128 {
         let (cached_path, hash) = self.source_hash.get_or_init(|| (path.to_string(), crate::crate_image::file_hash(path, &self.src[..self.src_len as usize])));
         if cached_path == path { *hash } else { crate::crate_image::file_hash(path, &self.src[..self.src_len as usize]) }
+    }
+
+    /// How this parse numbered the file's expressions, patterns, blocks and the rest (the ids a
+    /// closure slot, a site or a type names): the arena ends of its tree, the fn bodies it
+    /// skipped, and what parsing those (ParsedFile::part) takes besides the file and its crate:
+    /// the part numbers them after the tree's ends, in source order. The same text is not
+    /// always parsed the same way: which macro calls a load expands into the tree and which
+    /// bodies it skips depend on the load (a demand load's outline, the macro names in scope),
+    /// so two programs can number one text differently. An id is only meaningful with the
+    /// numbering it was made in.
+    pub fn numbering(&self) -> u128 {
+        *self.numbering.get_or_init(|| {
+            let mut h = crate::sip::Sip128::new();
+            h.str("parse-numbering");
+            for end in self.ast.ends() { h.u32(end); }
+            for it in self.ast.items.iter() {
+                if let ItemKind::Fn(sig, None, _) = it.kind {
+                    if let Some(r) = self.ast.fn_sig(sig).lazy_body { h.u32(r.lo); h.u32(r.hi); }
+                }
+            }
+            match self.lazy.as_ref() {
+                Some(ctx) => { h.u8(1); h.u8(ctx.s2_fmt as u8); }
+                None => h.u8(0),
+            }
+            h.finish128()
+        })
     }
 
     /// An impl item's header text (up to its first item, whitespace dropped) and its ordinal
@@ -6447,7 +6475,7 @@ pub(crate) fn parse_owned_input(sess: &std::sync::Arc<crate::Session>, mut src: 
     };
     src.reserve_exact(ext.len());
     src.extend_from_slice(&ext);
-    let mut pf = ParsedFile { src: src.into(), toks: toks.into(), ast, edition, exp_map: Table::from_rows(&exp_map), line_starts: std::sync::OnceLock::new(), src_len, source_hash: Default::default(), tok_origin: Table::from_rows(&tok_origin), token_origins: Table::from_rows(&token_origins), token_input, sources, rules_exp: Table::from_rows(&rules_exp), body_origin: Table::from_rows(&body_origin), pm_editions: Table::from_rows(&pm_editions), lazy: lazy.into(), part: std::sync::OnceLock::new(), impl_heads: std::sync::OnceLock::new(), image: None, sink: None };
+    let mut pf = ParsedFile { src: src.into(), toks: toks.into(), ast, edition, exp_map: Table::from_rows(&exp_map), line_starts: std::sync::OnceLock::new(), src_len, source_hash: Default::default(), numbering: Default::default(), tok_origin: Table::from_rows(&tok_origin), token_origins: Table::from_rows(&token_origins), token_input, sources, rules_exp: Table::from_rows(&rules_exp), body_origin: Table::from_rows(&body_origin), pm_editions: Table::from_rows(&pm_editions), lazy: lazy.into(), part: std::sync::OnceLock::new(), impl_heads: std::sync::OnceLock::new(), image: None, sink: None };
     pf.shrink();
     Ok((pf, used))
 }

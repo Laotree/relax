@@ -1660,7 +1660,8 @@ impl Cache {
                 // crates, and rules that depend on the crate (the live layout of the root crate's
                 // enums) make their code differ. The owner is part of the identity.
                 let owner = u.prog.file_crate.get(file as usize).and_then(|&c| self.crate_ident.get(c as usize)).copied().unwrap_or(0);
-                e.u128(file_ident(p, u.prog.files[file as usize].source_hash(p), owner));
+                let pf = &u.prog.files[file as usize];
+                e.u128(file_ident(p, pf.source_hash(p), owner, pf.numbering()));
             }
             None => e.u128(0),
         }
@@ -1716,7 +1717,8 @@ impl Cache {
                 let p = &u.prog.file_paths[i];
                 // the first file with this content keeps the key (later identical copies are the same text)
                 let owner = u.prog.file_crate.get(i).and_then(|&c| self.crate_ident.get(c as usize)).copied().unwrap_or(0);
-                self.file_ids.entry(file_ident(p, u.prog.files[i].source_hash(p), owner)).or_insert(i as u32);
+                let pf = &u.prog.files[i];
+                self.file_ids.entry(file_ident(p, pf.source_hash(p), owner, pf.numbering())).or_insert(i as u32);
             }
             self.file_ids_n = u.prog.file_paths.len();
         }
@@ -4953,14 +4955,16 @@ pub(crate) fn closure_identity_ok(u: &Unit, file: u32, expr: u32) -> bool {
 
 /// Reads the nounwind inputs and the dependency certificate; returns the nounwind section (for
 /// verification).
-/// A file version's identity in an entry: a hash of its path, source and owning crate (one
-/// 16-byte id where the path string and two hashes were stored per file and entry).
-fn file_ident(path: &str, source: u128, owner: u128) -> u128 {
+/// A file version's identity in an entry: a hash of its path, source, owning crate and how its
+/// parse numbered it (one 16-byte id where the path string and two hashes were stored per file
+/// and entry).
+fn file_ident(path: &str, source: u128, owner: u128, numbering: u128) -> u128 {
     let mut h = Sip128::new();
     h.str("file-ident");
     h.str(path);
     h.u128(source);
     h.u128(owner);
+    h.u128(numbering);
     h.finish128()
 }
 
@@ -7182,6 +7186,39 @@ mod cold_tests {
         assert_fingerprints(&cold, &warm);
         for (a, b) in prog.files.iter().zip(&warm.files) { crate::front::verify_file(a, b); }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// One text, two parses that number it differently (one skipped a body the other parsed in
+    /// its tree): their ids name other expressions, so the file's identity in an entry differs
+    /// and an entry made from one is never decoded by a program with the other (a warm std entry
+    /// named `{closure#802}` of a file whose body this program had in its tree: lowering read past
+    /// the tree, "its lazily parsed body part is missing"). The same parse twice: one identity.
+    #[test]
+    fn a_files_identity_holds_how_its_parse_numbered_it() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let path = "/numbering/lib.rs";
+        let text = b"pub fn f(x: u32) -> u32 { let c = |y: u32| y + x; c(3) }\npub fn g() -> u32 { let d = || 4; d() }\n".to_vec();
+        let cfg = crate::cfg::CfgSet::host(sess, &[]);
+        let ctx = std::rc::Rc::new(crate::builtins::FileCtx::new("test", path, "test", &cfg));
+        let parse = |lazy: bool| {
+            let table = std::sync::Arc::new(crate::macros::MacroTable::default());
+            let (mut f, _) = crate::parser::parse_owned_ctx(sess, text.clone(), None, 2021,
+                Some(crate::macros::MacroScope::new(table)), "test", Some(ctx.clone()), lazy).unwrap();
+            crate::program::prepare_file(&mut f, &cfg);
+            f
+        };
+        let (skipped, eager) = (parse(true), parse(false));
+        assert!(skipped.lazy.is_some() && eager.lazy.is_none());
+        assert_eq!(skipped.numbering(), parse(true).numbering());
+        assert_ne!(skipped.numbering(), eager.numbering());
+        let ident = |pf: &crate::parser::ParsedFile| file_ident(path, pf.source_hash(path), 7, pf.numbering());
+        assert_eq!(skipped.source_hash(path), eager.source_hash(path));
+        assert_ne!(ident(&skipped), ident(&eager));
+        // a parse whose skipped bodies were parsed before its identity was first taken numbers
+        // the file as one whose bodies are not parsed yet: one identity either way
+        let parted = parse(true);
+        assert!(parted.part(&cfg).is_some());
+        assert_eq!(ident(&parted), ident(&skipped));
     }
 
     #[test]

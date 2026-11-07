@@ -14187,6 +14187,19 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::
                 ensure_parent_body(up, *parent, *cfile, 0)?;
             }
             let u = &mut *up;
+            // the closure's expression is in this parse of its file: in a body the load skipped,
+            // the file's skipped bodies are parsed now (the parent's own body may have been in
+            // the load's tree, its closure's code named from elsewhere); an id this parse does
+            // not have is refused, never read past the tree
+            if let FnKey::Closure(_, ce, _) = &key {
+                if !closure_in_parse(u, *cfile, *ce) {
+                    u.prog.part_idents(*cfile);
+                }
+                if !closure_in_parse(u, *cfile, *ce) {
+                    return Err(format!("{}: names expression {} of {}, which this parse of the file does not have (code made from another numbering of the file)",
+                        u.fns[id as usize].name, ce & !crate::tcx::ASYNC_FN_BODY, u.prog.file_paths.get(*cfile as usize).map_or("?", |p| p.as_str())));
+                }
+            }
             // a cache entry linked this run named this expression as a closure with another
             // identity (made from another parse of the file): refuse it rather than build
             // whatever the id names here
@@ -14299,6 +14312,17 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::
         }
     }
     Ok(func)
+}
+
+/// Closure slot `ce` (an expression id, or an async body's block with ASYNC_FN_BODY) is in the
+/// parse of `file` this program has, its lazily parsed part included.
+fn closure_in_parse(u: &Unit, file: u32, ce: u32) -> bool {
+    let Some(pf) = u.prog.files.get(file as usize) else { return false };
+    if ce & crate::tcx::ASYNC_FN_BODY != 0 {
+        pf.ast.has_block(crate::ast::BlockId(ce & !crate::tcx::ASYNC_FN_BODY))
+    } else {
+        pf.ast.has_expr(crate::ast::ExprId(ce))
+    }
 }
 
 /// Bodies the owner type-checked or lowered itself before the first present (no lowering ahead to

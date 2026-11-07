@@ -181,6 +181,10 @@ type ScanPriority = (usize, u64);
 struct PoolState {
     stopped: bool,
     planning: bool,
+    /// Work the pool's threads owned ended in a panic (the plan, a scan, a parse): what it would
+    /// have published never comes, so the loader's waits fail with this (take_ahead, wait_inner)
+    /// and the workers end, rather than wait for work nobody owns.
+    failed: Option<String>,
     /// Crates whose parse scope has dependency imports and their own scan publication.
     parse_ready: HashSet<u32>,
     /// Crates successfully collected and sealed by the loader.
@@ -307,6 +311,11 @@ impl Pool {
                 WAIT_NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 return a;
             }
+            if let Some(why) = st.failed.clone() {
+                // (not under the lock: the pool's teardown takes it on the way out)
+                drop(st);
+                panic!("the load of crate {} cannot complete: {why}", self.crates[ci as usize].name);
+            }
             // the loader thread helps with scans (never with a parse: those must not wait on it)
             if let Some(key) = Self::next_scan(&st, Some(ci as usize)) {
                 let key = st.scans.remove(&key).unwrap();
@@ -339,6 +348,10 @@ impl Pool {
         loop {
             if let Some(x) = st.done.remove(key) {
                 return Some(x);
+            }
+            if let Some(why) = st.failed.clone() {
+                drop(st);
+                panic!("the parse of {} cannot complete: {why}", key.1);
             }
             if !st.running.contains(key) {
                 let k = st.jobs.iter().find(|(_, j)| j.krate == key.0 && j.path == key.1).map(|(k, _)| *k);
@@ -376,7 +389,8 @@ impl Pool {
     }
 
     pub fn stop(&self) {
-        self.st.lock().unwrap().stopped = true;
+        // (also on the way out of a failed load)
+        self.st.lock().unwrap_or_else(|e| e.into_inner()).stopped = true;
         self.cv.notify_all();
     }
 
@@ -660,13 +674,21 @@ impl Pool {
         Publication { ahead, jobs, done }
     }
 
+    /// The work a thread of the pool owns ends in a panic (`what`): the pool fails (`failed`).
+    fn fail(&self, what: &str) {
+        let mut st = self.st.lock().unwrap_or_else(|e| e.into_inner());
+        st.failed.get_or_insert_with(|| format!("{what} panicked on its thread"));
+        drop(st);
+        self.cv.notify_all();
+    }
+
     fn work(&self, sess: &std::sync::Arc<crate::Session>, _worker: usize) {
         let _reads = self.contexts.first().map(|c| c.bind_source_reads());
         loop {
             let w = {
                 let mut st = self.st.lock().unwrap();
                 loop {
-                    if st.stopped { return; }
+                    if st.stopped || st.failed.is_some() { return; }
                     let scan = Self::next_scan(&st, None);
                     // Syntax, derives and file preparation run on workers. The loader
                     // validates recorded macro lookups in its exact textual environment
@@ -688,6 +710,7 @@ impl Pool {
                     st = self.cv.wait(st).unwrap();
                 }
             };
+            let _owned = OwnedWork(self, match &w { Work::Scan(k) => format!("the scan of {}", k.1), Work::Parse(j) => format!("the parse of {}", j.path) });
             match w {
                 Work::Scan(k) => self.scan(k),
                 Work::Parse(job) => {
@@ -701,6 +724,24 @@ impl Pool {
                     self.cv.notify_all();
                 }
             }
+        }
+    }
+}
+
+/// Work a worker of the pool owns (a scan, a parse): a panic that ends it fails the pool.
+struct OwnedWork<'a>(&'a Pool, String);
+impl Drop for OwnedWork<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() { self.0.fail(&self.1); }
+    }
+}
+
+/// The planning thread's plan: a panic that ends it fails the pool (if the load still has it).
+struct OwnedPlan(std::sync::Weak<Pool>);
+impl Drop for OwnedPlan {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            if let Some(pool) = self.0.upgrade() { pool.fail("the demand plan"); }
         }
     }
 }
@@ -1468,6 +1509,7 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
     let mut st = PoolState {
         stopped: false,
         planning,
+        failed: None,
         parse_ready: Default::default(),
         loaded: vec![false; n],
         images: restored,
@@ -1528,7 +1570,10 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
         let in_world = crate::macro_reg::in_world();
         let _ = relax_base::run_threads::spawn("run-demand-select", move || { let _z = crate::zone_alloc::compiler_thread();
             crate::macro_reg::set_in_world(in_world);
-            plan.complete();
+            {
+                let _owned = OwnedPlan(weak.clone());
+                plan.complete();
+            }
             if let Some(pool) = weak.upgrade() {
                 let mut st = pool.st.lock().unwrap();
                 st.planning = false;

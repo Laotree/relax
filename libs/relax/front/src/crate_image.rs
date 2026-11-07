@@ -10,8 +10,8 @@ use crate::{
 };
 use std::sync::Arc;
 
-// Macro definitions record the invocation position that orders a generated definition.
-pub const VERSION: u32 = 25;
+// A file's metadata records how its parse numbered it (FileMeta::numbering).
+pub const VERSION: u32 = 26;
 
 pub(crate) mod strings;
 
@@ -427,6 +427,10 @@ pub struct FileMeta {
     pub path: String,
     pub module: String,
     pub hash: u128,
+    /// how the parse this metadata was captured from numbered the file (ParsedFile::numbering):
+    /// its lazy bodies and prepared blocks hold that parse's ids, so it is restored over an
+    /// image of that parse only (front.rs restore)
+    pub numbering: u128,
     pub shared: bool,
     pub edition: u16,
     pub src_len: u32,
@@ -438,7 +442,7 @@ pub struct FileMeta {
     /// crate's unchanged file takes its image when they replay in the loader's scope
     pub replay: Blob,
 }
-fields!(FileMeta, path, module, hash, shared, edition, src_len, token_input, lazy, used, prep, replay);
+fields!(FileMeta, path, module, hash, numbering, shared, edition, src_len, token_input, lazy, used, prep, replay);
 
 /// Bytes, encoded as a length and the bytes (one copy, not a decode per byte)
 #[derive(Clone, Default)]
@@ -459,6 +463,7 @@ pub fn file_meta(path: &str, module: &str, pf: &ParsedFile, used: &MacroUse, pre
     path.to_string().put(&mut w);
     module.to_string().put(&mut w);
     pf.source_hash(path).put(&mut w);
+    pf.numbering().put(&mut w);
     shared.put(&mut w);
     pf.edition.put(&mut w);
     pf.src_len.put(&mut w);
