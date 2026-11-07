@@ -915,7 +915,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     let mut st = StepTimes::new("item_checks");
     errors.extend(staged(Stage::new(Phase::Resolve, 0), relax_types::item_checks::duplicate_items(&u.prog, &own))); st.mark("duplicate_items");
     errors.extend(staged(Stage::new(Phase::Resolve, 0), relax_types::item_checks::duplicate_exported_macros(&u.prog, &own))); st.mark("duplicate_exported_macros");
-    errors.extend(staged(Stage::new(Phase::Resolve, 2), relax_types::item_checks::super_paths(&u.prog, &own))); st.mark("super_paths");
+    errors.extend(staged(Stage::new(Phase::Resolve, 3), relax_types::item_checks::super_paths(&u.prog, &own))); st.mark("super_paths");
     errors.extend(staged(Stage::new(Phase::Late, crate::check_order::LATE_PRIVATE_IN_PUBLIC), relax_types::item_checks::impl_trait_path_privacy(&u.prog, &u.tcx, &own))); st.mark("impl_trait_path_privacy");
     errors.extend(staged(Stage::new(Phase::Late, crate::check_order::LATE_PRIVATE_IN_PUBLIC), relax_types::item_checks::private_assoc_types(&u.prog, &u.tcx, &own))); st.mark("private_assoc_types");
     errors.extend(staged(Stage::new(Phase::Early, 1), relax_types::item_checks::gated_syntax(&u.prog, &own))); st.mark("gated_syntax");
@@ -936,7 +936,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     relax_types::lint_dead::reset();
     let privacy = u.prog.import_privacy_errors(&own);
     erroneous_imports.extend(privacy.iter().filter_map(|(i, _)| *i));
-    errors.extend(staged(Stage::new(Phase::Resolve, 5), privacy.into_iter().map(|(_, e)| e))); st.mark("import_privacy");
+    errors.extend(staged(Stage::new(Phase::Resolve, 6), privacy.into_iter().map(|(_, e)| e))); st.mark("import_privacy");
     errors.extend(staged(Stage::new(Phase::Attrs, 0), u.prog.attribute_errors(&own))); st.mark("attribute_errors");
     errors.extend(staged(Stage::new(Phase::Early, 0), u.prog.ast_validation_errors(&own))); st.mark("ast_validation");
     let d_items = t_items0.elapsed();

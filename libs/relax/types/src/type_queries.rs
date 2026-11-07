@@ -577,7 +577,7 @@ impl Providers<'_> {
         }, &|id| self.force(id))
     }
 
-    fn typeck(&self, def: DefId) -> Result<std::sync::Arc<crate::typeck::Body>, QueryError> {
+    pub(crate) fn typeck(&self, def: DefId) -> Result<std::sync::Arc<crate::typeck::Body>, QueryError> {
         let q = &self.tcx.queries;
         let (_, body) = q.typeck.get(&q.engine, def, &mut |def| {
             q.read_owner(self.prog, def)?;
