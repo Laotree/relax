@@ -2890,9 +2890,12 @@ impl Program {
                     renames.push((DefId(di as u32), self.syms.intern(&n)));
                 }
             }
+            // a module's visibility is its text's (an edit may widen it: reload::classify)
+            let vis_pub = (d.kind == DefKind::Mod && matches!(it.kind, ItemKind::Mod(_))).then(|| !matches!(it.vis, Vis::Private));
             let d = &mut self.defs[di];
             d.file = to;
             d.item = ItemId(ni);
+            if let Some(p) = vis_pub { d.is_pub = p; }
         }
         if !renames.is_empty() { self.scope_cache.clear(); }
         for (d, name) in renames {

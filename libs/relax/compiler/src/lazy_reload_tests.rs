@@ -1995,3 +1995,50 @@ pub fn value(out: &mut u32) {{
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// An inline module's body is its items, classified one by one as a file's are: an edit of the
+/// text between them (an item macro's arguments, an item its cfg leaves out, a test fn added to
+/// a test module) patches, and so does a module made more visible. A module made less visible,
+/// or given other attributes, restarts and says so (each said "a module's item list changed").
+#[test]
+fn module_bodies_classify_by_item() {
+    use crate::reload::{classify, Change};
+    let session = Arc::new(crate::Session::default());
+    let mut cfg = crate::cfg::CfgSet::host(&session, &[]);
+    cfg.set.push("test".into());
+    let dir = std::env::temp_dir().join(format!("relax-module-bodies-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let a_src = "mod other;\nmacro_rules! mk { ($n:ident, $v:expr) => { pub fn $n() -> u32 { $v } } }\npub fn f() -> u32 { 1 }\npub mod inner {\n    pub fn g() -> u32 { 2 }\n    mk!(h, 3);\n    #[cfg(any())]\n    fn off() -> u32 { 4 }\n    thread_local! { static T: u32 = 5; }\n}\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn one() { assert_eq!(f(), 1); }\n}\n";
+    let a_path = dir.join("a.rs");
+    std::fs::write(&a_path, a_src).unwrap();
+    std::fs::write(dir.join("other.rs"), "pub fn o() -> u32 { 9 }\n").unwrap();
+    let a_path = a_path.to_str().unwrap().to_string();
+    let mut p = Program::new(&session);
+    let a = p.load_crate("module_bodies", &a_path, 2021, cfg, vec![]).unwrap();
+    p.resolve_imports();
+    let file = p.mods[p.crates[a as usize].root_mod as usize].file;
+    let plan_of = |src: String| {
+        let v = p.parse_snapshot(file, &a_path).parse(src.into_bytes()).unwrap();
+        classify(&p, file, &v.pf, &a_path, &Default::default())
+    };
+    let name = |c: &Change| match c { Change::Body(d) | Change::Const(d) | Change::StaticInit(d) | Change::Vis(d) => p.name(*d).to_string(), _ => String::new() };
+    let patched = |what: &str, src: String| plan_of(src).unwrap_or_else(|why| panic!("{what}: {why:?}"));
+    let macro_arg = patched("an item macro's argument", a_src.replace("mk!(h, 3)", "mk!(h, 33)"));
+    assert_eq!(macro_arg.changes.iter().map(name).collect::<Vec<_>>(), ["h"], "the macro's fn has a new body");
+    let off = patched("an item its cfg leaves out", a_src.replace("{ 4 }", "{ 44 }"));
+    assert!(off.changes.is_empty() && off.added.is_empty() && off.removed.is_empty());
+    let tls = patched("a thread_local! initializer", a_src.replace("= 5;", "= 55;"));
+    assert!(!tls.changes.is_empty());
+    let test = patched("a test fn added to a test module", a_src.replace("    fn one() { assert_eq!(f(), 1); }\n", "    fn one() { assert_eq!(f(), 1); }\n    #[test]\n    fn two() { assert_eq!(f(), 1); }\n"));
+    assert_eq!((test.added.len(), test.changes.len()), (1, 0));
+    let wider = patched("a module in a file of its own made public", a_src.replace("mod other;", "pub mod other;"));
+    assert_eq!(wider.changes.iter().map(name).collect::<Vec<_>>(), ["other"]);
+    assert!(matches!(wider.changes[0], Change::Vis(_)));
+    let restart = |what: &str, src: String, says: &str| {
+        let why = plan_of(src).err().unwrap_or_else(|| panic!("{what}: patched"));
+        assert!(why.len() == 1 && why[0].contains(says), "{what}: {why:?}");
+    };
+    restart("a module made less visible", a_src.replace("pub mod inner {", "pub(crate) mod inner {"), "mod `inner` is less visible than before (`pub` to `pub(crate)`)");
+    restart("a module given an attribute", a_src.replace("pub mod inner {", "#[allow(dead_code)]\npub mod inner {"), "mod `inner` changed: its attributes changed");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

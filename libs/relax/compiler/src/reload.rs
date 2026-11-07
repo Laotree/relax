@@ -697,6 +697,9 @@ pub(crate) enum Change {
     /// a `macro_rules!` changed: the fns of this file that invoke it are rebuilt from their new
     /// expansions (a macro used from another file takes the restart rung)
     Macro(u32),
+    /// a module is more visible than before: it takes its new visibility with the commit, and
+    /// the fns naming it are checked again
+    Vis(DefId),
 }
 
 /// One file's edit as the classifier sees it.
@@ -913,11 +916,28 @@ fn restart_reason(k: &crate::ast::ItemKind) -> &'static str {
         Use { .. } | ExternCrate(_) => "imports changed (name resolution is not re-run live yet)",
         Trait { .. } | TraitAlias(..) => "a trait's items or bounds changed (method resolution is not re-run live yet)",
         Impl { .. } => "an impl header or its item list changed (method resolution is not re-run live yet)",
-        Mod(_) | ForeignMod(..) => "a module's item list changed",
+        ForeignMod(..) => "an extern block's item list changed",
         MacroRules(_) => "a macro changed; its expansion sites are not re-expanded live yet",
         Mac(_) => "an item macro changed",
         _ => "this kind of edit is not applied live yet",
     }
+}
+
+/// A module item's head as written: its visibility's tokens (none: private) and the rest
+/// (`mod name`, and the `;` of a module in a file of its own).
+fn mod_head<'a>(pf: &'a crate::parser::ParsedFile, it: &crate::ast::Item) -> (Vec<&'a [u8]>, Vec<&'a [u8]>) {
+    let end = if matches!(it.kind, crate::ast::ItemKind::Mod(Some(_))) { it.name.hi } else { it.hi };
+    let head = toks(pf, it.lo, end, &[]);
+    let k = head.iter().position(|t| *t == b"mod").unwrap_or(0);
+    (head[..k].to_vec(), head[k..].to_vec())
+}
+
+/// Whether visibility `new` reaches everywhere `old` does: from private (`pub(self)`) to any,
+/// from any to `pub`, from `pub(super)` or `pub(in ..)` to `pub(crate)`.
+fn vis_widens(old: &crate::ast::Vis, new: &crate::ast::Vis) -> bool {
+    use crate::ast::Vis;
+    let rank = |v: &Vis| match v { Vis::Private | Vis::SelfMod => 0, Vis::Super | Vis::In(_) => 1, Vis::Crate => 2, Vis::Pub => 3 };
+    rank(old) < rank(new)
 }
 
 /// A fn item's body, as a byte range of its file (a lazily parsed one's too).
@@ -1866,8 +1886,14 @@ fn classify_moving(prog: &crate::program::Program, old_file: u32, new: &crate::p
                 (lo, it.hi)
             }).collect()
         };
-        let ha = holes(old, &a.kind);
-        let hb = holes(new, &b.kind);
+        // A module's body is its items, each paired, added or removed on its own as a file's
+        // are. The text between them is not the module's: an item its cfg leaves out, an item
+        // macro's call (its expansion is items), the `#[test]` a test build takes off a fn.
+        // Compared as text, an edit of any of them restarted the app; the module's own text is
+        // its head (its inner attributes are among its attributes).
+        let body = |it: &crate::ast::Item| matches!(it.kind, ItemKind::Mod(Some(_))).then(|| vec![(it.name.hi, it.hi)]);
+        let ha = body(a).unwrap_or_else(|| holes(old, &a.kind));
+        let hb = body(b).unwrap_or_else(|| holes(new, &b.kind));
         // attributes are part of the item (cfg, derive, repr, inline)
         // normalized like signatures: an expansion region held as text in one version and as
         // tokens in the other compares alike (a generated `#[allow(..)]` on Scope's derived
@@ -2003,6 +2029,23 @@ fn classify_moving(prog: &crate::program::Program, old_file: u32, new: &crate::p
                 Some(d) => out.push(Change::Layout(d)),
                 None => why.push(format!("{}: struct `{}` has no definition -- restart the app", pos(new, b.lo), name)),
             },
+            // A module whose visibility is all that changed (`mod m;` to `pub mod m;`). A wider
+            // one breaks no code that compiled: it takes the new text's (Program::retarget_file),
+            // and the code naming it is checked again. A narrower one would need every path
+            // through it checked again, `use` items included.
+            (ItemKind::Mod(x), ItemKind::Mod(y)) if attrs_same && x.is_some() == y.is_some() && mod_head(old, a).1 == mod_head(new, b).1 => {
+                let (va, vb) = (mod_head(old, a).0.join(&b' '), mod_head(new, b).0.join(&b' '));
+                let shown = |v: &[u8]| if v.is_empty() { "private".to_string() } else { format!("`{}`", spacing_free(&String::from_utf8_lossy(v))) };
+                match def {
+                    Some(d) if vis_widens(&a.vis, &b.vis) => out.push(Change::Vis(d)),
+                    Some(_) => why.push(format!("{}: mod `{}` is less visible than before ({} to {}): the paths through it are not checked again live yet -- restart the app", pos(new, b.lo), name, shown(&va), shown(&vb))),
+                    None => why.push(format!("{}: mod `{}` has no definition -- restart the app", pos(new, b.lo), name)),
+                }
+            }
+            (ItemKind::Mod(x), ItemKind::Mod(y)) => {
+                let what = if !attrs_same { "its attributes changed" } else if x.is_some() != y.is_some() { "it moved between a file of its own and its parent's text" } else { "its head changed" };
+                why.push(format!("{}: mod `{}` changed: {} -- restart the app", pos(new, b.lo), name, what));
+            }
             (_, k) => {
                 if reload_trace() {
                     let sh = |v: Vec<Vec<u8>>| v.iter().map(|x| String::from_utf8_lossy(x).into_owned()).collect::<Vec<_>>().join(" ");
@@ -4229,6 +4272,11 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         if let Change::Macro(n) = c {
             set_names.push(u.prog.syms.str(*n).as_bytes().to_vec());
         }
+        // a module more visible than before: what its name resolves to can change (a glob
+        // import that now reaches it)
+        if let Change::Vis(d) = c {
+            set_names.push(def_name(&u.prog, *d).into_bytes());
+        }
     }
     // names a removed or edited `use` bound: every fn naming one is type-checked against what
     // the name means now (M13)
@@ -4982,7 +5030,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         v
     };
     trace_sub("gp_enum_before");
-    let same_scopes = layout_defs.is_empty() && !changes.iter().any(|c| matches!(c, Change::Macro(_)));
+    let same_scopes = layout_defs.is_empty() && !changes.iter().any(|c| matches!(c, Change::Macro(_) | Change::Vis(_)));
     // Round-45 lead design: a change to any resolution input invalidates every
     // legacy owner. Body-only transactions leave signature-owned RPITITs alone.
     let body_only = same_scopes && versions.iter().all(|(_, p)| p.added.is_empty()
