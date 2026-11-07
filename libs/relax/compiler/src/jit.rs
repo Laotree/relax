@@ -20623,6 +20623,15 @@ fn headless_started() {
 /// its startup phase ends (startup_main).
 const STARTUP_QUIET_NS: u64 = 2_000_000_000;
 
+/// The demand (foreground) compiles' last sign of progress: whether one runs now, and the ns since
+/// the last one finished or the open stretch of them began, whichever is later (first_frame: a
+/// start that is still compiling is not hung).
+pub(crate) fn demand_compile_age() -> (bool, u64) {
+    let running = DEMAND_COMPILES.load(Ordering::SeqCst) != 0;
+    let last = DEMAND_LAST.load(Ordering::SeqCst).max(if running { DEMAND_SINCE.load(Ordering::SeqCst) } else { 0 });
+    (running, wall_ns().saturating_sub(last))
+}
+
 /// What is left (ns) of the quiet that counts from `from` (a `wall_ns`): 0 once no demand compile
 /// has run for STARTUP_QUIET_NS.
 pub(crate) fn quiet_left(from: u64) -> u64 {
