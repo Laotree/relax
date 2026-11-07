@@ -14646,9 +14646,9 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut relax_backend::r
     if cfg.fold {
         relax_codegen::opt::fold_post_increments(func);
     }
-    // Rust min/max with an operand that is never NaN: one minss/maxss (bounding boxes)
+    // Rust min/max whose second operand is never NaN: one minss/maxss (bounding boxes)
     if cfg.fold {
-        relax_codegen::opt::min_max_non_nan(func);
+        relax_codegen::opt::min_max_non_nan(options, func);
     }
     // compares value ranges decide (bounds checks of masked / branch-limited indices)
     if cfg.fold && relax_codegen::ranges::fold_ranges(options, func) {
