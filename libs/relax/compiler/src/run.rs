@@ -1410,6 +1410,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         verbose!("makepad-run: gandalf app scope ({} crates): {}", app_roots.len(), app_roots.join(" "));
     }
     crate::borrowck::event::set_app_scope(app_roots);
+    // the crates outside the scope an earlier run of this live session refused a layout edit in
+    // for their scope alone (reload::live_crates_next): laid out for live edits from this run on
+    if let Some(live) = crate::run_end::run_input("MAKEPAD_RUN_LIVE_CRATES") {
+        let live: Vec<String> = live.to_string_lossy().lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+        verbose!("makepad-run: {} crates laid out for live edits beyond the app scope: {}", live.len(), live.join(" "));
+        crate::layout::set_live_crates(live);
+    }
     // `makepad check` and `makepad test`'s up-front check borrow-check crates outside the app
     // scope (a package under libs/): they keep their user-written types
     if check || harness || plain_test { crate::borrowck::event::set_check_scope(); }
