@@ -923,6 +923,26 @@ fn restart_reason(k: &crate::ast::ItemKind) -> &'static str {
     }
 }
 
+/// Whether item `j` of `pf` is a type alias written in a body (a fn's, a const's or a
+/// static's) that no other item of that body names: it is part of the body, which is all that
+/// names it. An item beside it naming it (a nested fn's signature) would keep its old type.
+fn body_local_alias(pf: &crate::parser::ParsedFile, reached: &[bool], j: u32) -> bool {
+    use crate::ast::ItemKind;
+    let items = &pf.ast.items;
+    let it = &items[j as usize];
+    if !matches!(it.kind, ItemKind::TypeAlias(_)) || reached[j as usize] || it.lo >= pf.src_len {
+        return false;
+    }
+    // the item whose body holds it: the narrowest one around it in the module tree
+    let around = |k: usize, at: u32| items[k].lo < at && at < items[k].hi;
+    let Some(h) = (0..items.len()).filter(|&k| reached[k] && matches!(items[k].kind, ItemKind::Fn(..) | ItemKind::Const(..) | ItemKind::Static(..)) && around(k, it.lo))
+        .min_by_key(|&k| items[k].hi - items[k].lo) else { return false };
+    let name = &pf.src[it.name.lo as usize..it.name.hi as usize];
+    // (an item a macro call in the body made is at the call)
+    !(0..items.len()).any(|k| k != j as usize && !reached[k] && around(h, pf.call_site(items[k].lo))
+        && toks(pf, items[k].lo, items[k].hi, &[]).iter().any(|t| *t == name))
+}
+
 /// A module item's head as written: its visibility's tokens (none: private) and the rest
 /// (`mod name`, and the `;` of a module in a file of its own).
 fn mod_head<'a>(pf: &'a crate::parser::ParsedFile, it: &crate::ast::Item) -> (Vec<&'a [u8]>, Vec<&'a [u8]>) {
@@ -1679,7 +1699,8 @@ fn classify_moving(prog: &crate::program::Program, old_file: u32, new: &crate::p
         };
         // a trait's fn: its trait item (the vtable's entry, what impls implement) is replaced when
         // its signature changes or it gains or loses its default body
-        let (old_parent, _) = item_parents(old);
+        let (old_parent, old_reached) = item_parents(old);
+        let new_reached = item_parents(new).1;
         let in_trait = |i: u32| old_parent[i as usize].is_some_and(|p| matches!(oa.items[p as usize].kind, ItemKind::Trait(..)));
         let mut k = 0;
         while k < pairs.len() {
@@ -1688,6 +1709,11 @@ fn classify_moving(prog: &crate::program::Program, old_file: u32, new: &crate::p
             let moved = match (&a.kind, &b.kind) {
                 // an edited `use`: its old imports go, the new ones resolve (M13)
                 (ItemKind::Use { .. }, ItemKind::Use { .. }) => !same_toks(old, a.lo, a.hi, &[], new, b.lo, b.hi, &[]),
+                // an edited type alias in a body (`type Found = ..;` in a fn): part of the edit of
+                // the body holding it. It goes and a new one comes with that body
+                // (Program::collect_new_body_blocks), and the body is checked against its type.
+                (ItemKind::TypeAlias(_), ItemKind::TypeAlias(_)) => body_local_alias(old, &old_reached, i) && body_local_alias(new, &new_reached, j)
+                    && !(attr_toks(old, a) == attr_toks(new, b) && same_toks(old, a.lo, a.hi, &[], new, b.lo, b.hi, &[])),
                 (ItemKind::Fn(sa, _, _), ItemKind::Fn(sb, _, _)) if !skip_name(new, b) && attr_toks(old, a) == attr_toks(new, b) => {
                     let def = prog.item_defs.get(&(old_file, i)).copied();
                     let opaque = (oa.fn_sig(*sa).asyncness && na.fn_sig(*sb).asyncness) || def.is_some_and(|d| defines_opaque(prog, d));

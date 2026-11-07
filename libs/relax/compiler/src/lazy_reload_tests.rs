@@ -1996,6 +1996,37 @@ pub fn value(out: &mut u32) {{
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A type alias in a fn body is part of that body: its edit is the body's edit (the alias
+/// goes and a new one comes with the body). An alias a nested item names restarts as before:
+/// the nested item would keep the old type.
+#[test]
+fn body_type_aliases_are_part_of_their_body() {
+    use crate::reload::{classify, Change};
+    let session = Arc::new(crate::Session::default());
+    let cfg = crate::cfg::CfgSet::host(&session, &[]);
+    let dir = std::env::temp_dir().join(format!("relax-body-aliases-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let a_src = "pub fn f() -> u64 {\n    type Found = (u64, u64);\n    let p: Found = (1, 2);\n    p.0 + p.1\n}\npub struct S;\nimpl S {\n    pub fn g(&self) -> u64 {\n        type Pair = [u64; 2];\n        fn first(p: Pair) -> u64 { p[0] }\n        first([3, 4])\n    }\n}\n";
+    let a_path = dir.join("a.rs");
+    std::fs::write(&a_path, a_src).unwrap();
+    let a_path = a_path.to_str().unwrap().to_string();
+    let mut p = Program::new(&session);
+    let a = p.load_crate("body_aliases", &a_path, 2021, cfg, vec![]).unwrap();
+    p.resolve_imports();
+    let file = p.mods[p.crates[a as usize].root_mod as usize].file;
+    let plan_of = |src: String| {
+        let v = p.parse_snapshot(file, &a_path).parse(src.into_bytes()).unwrap();
+        classify(&p, file, &v.pf, &a_path, &Default::default())
+    };
+    let body = plan_of(a_src.replace("type Found = (u64, u64);\n    let p: Found = (1, 2);", "type Found = (u64, u64, u64);\n    let p: Found = (1, 2, 3);")).unwrap_or_else(|why| panic!("{why:?}"));
+    let names: Vec<String> = body.changes.iter().map(|c| match c { Change::Body(d) => p.name(*d).to_string(), c => format!("{c:?}") }).collect();
+    assert_eq!(names, ["f"], "the holder's body edit");
+    assert!(body.added.is_empty() && body.removed.is_empty(), "the alias comes and goes with the body");
+    let named = plan_of(a_src.replace("type Pair = [u64; 2];", "type Pair = [u64; 3];").replace("first([3, 4])", "first([3, 4, 5])")).err().expect("a nested fn names the alias");
+    assert!(named.iter().any(|w| w.contains("type alias `Pair` changed")), "{named:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// An inline module's body is its items, classified one by one as a file's are: an edit of the
 /// text between them (an item macro's arguments, an item its cfg leaves out, a test fn added to
 /// a test module) patches, and so does a module made more visible. A module made less visible,
