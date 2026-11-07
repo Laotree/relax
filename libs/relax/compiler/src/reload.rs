@@ -1398,17 +1398,7 @@ fn compose_partial(prog: &Program, old_file: u32, new_src: &[u8]) -> Option<(Vec
     let keys = item_keys(&parsed.pf);
     let keys: std::collections::HashSet<_> = parsed.pf.ast.root_items.iter().map(|i| &keys[i.0 as usize]).collect();
     let old_keys = item_keys(old);
-    let mut positions: Vec<_> = old.ast.root_items.iter().map(|i| {
-        let mut pos = old.ast.item(*i).lo;
-        // Expanded roots belong to their authored macro invocation.
-        for _ in 0..32 {
-            let Some((_, _, call)) = old.exp_map.iter_rev().find(|&(a, b, _)| a <= pos && pos < b) else { break };
-            if call == pos { break; }
-            pos = call;
-        }
-        (pos as usize, i.0 as usize)
-    }).collect();
-    positions.sort_unstable();
+    let positions = root_positions(old);
     let mut kept = 0;
     // Spans come from authored text, preserving attributes and macro invocations (AST spans
     // may point into expansion text). Match all root identities produced by that span.
@@ -1427,6 +1417,146 @@ fn compose_partial(prog: &Program, old_file: u32, new_src: &[u8]) -> Option<(Vec
         eprintln!("makepad-run stream: compose_partial {} bytes {:.3} ms", new_src.len(), ms(started));
     }
     Some((text, kept))
+}
+
+/// A whole save's transaction applied again with items held back (hold_back): restart lines and
+/// refusals go back to the hold-back that asked, which may hold more.
+const HOLD_ROUND: u8 = 3;
+/// How many times a save is applied again with more items held back before it restarts whole.
+const HOLD_ROUNDS: usize = 4;
+/// An outcome line of an item held back: the restart it waits for gives it its new text.
+pub(crate) const HELD: &str = "held for a restart: ";
+/// An outcome line of an item held back because the rest of the edit reaches a held one: its
+/// error against the held item's running form.
+const HELD_REACHES: &str = "held, as it needs a held item: ";
+
+/// The byte offset in `src` (file `path`'s text) of a diagnostic line's `path:line:col:` position.
+fn line_at(line: &str, path: &str, src: &[u8]) -> Option<usize> {
+    let rest = line.strip_prefix(path)?.strip_prefix(':')?;
+    let mut parts = rest.split(':');
+    let l: usize = parts.next()?.parse().ok()?;
+    let c: usize = parts.next()?.parse().ok()?;
+    let start = if l <= 1 { 0 } else { src.iter().enumerate().filter(|(_, b)| **b == b'\n').nth(l - 2)?.0 + 1 };
+    Some(start + c.saturating_sub(1))
+}
+
+/// "path:line:col: " of def `d`'s item in the edit's new texts (`versions`), "" if they lack it: a
+/// restart line that names where its item is lets hold_back keep that item alone.
+fn new_pos(u: &Unit, versions: &[(crate::program::FileVersion, Plan)], d: DefId) -> String {
+    let file = u.prog.def(d).file;
+    for (v, plan) in versions.iter().filter(|(v, _)| v.old == file) {
+        if let Some(&(_, j)) = plan.pairs.iter().find(|&&(i, _)| u.prog.item_defs.get(&(v.old, i)) == Some(&d)) {
+            let (l, c) = v.pf.line_col(v.pf.call_site(v.pf.ast.items[j as usize].lo));
+            return format!("{}:{}:{}: ", v.path, l, c);
+        }
+    }
+    String::new()
+}
+
+/// File `file`'s new text `src` (`path`) with the authored items at the positions `at` kept as
+/// they run: each top-level span holding one is blanked (its newlines kept, so every other
+/// position of the text stays where the file has it: diagnostics and line tables name the file
+/// as saved), and the running version's spans of the same items (by identity: item_keys) go at
+/// the end of the text. An item the running version lacks goes. With the number of spans kept;
+/// None if the text made does not parse.
+fn keep_running(prog: &Program, file: u32, path: &str, src: &[u8], at: &[usize]) -> Option<(Vec<u8>, usize)> {
+    let old = &prog.files[file as usize];
+    let new = prog.parse_version(file, path, src.to_vec()).ok()?;
+    let (new_keys, old_keys) = (item_keys(&new.pf), item_keys(old));
+    let (new_roots, old_roots) = (root_positions(&new.pf), root_positions(old));
+    let old_spans = rust_spans(&old.src[..old.src_len as usize], old.edition);
+    let mut used = vec![false; old_spans.len()];
+    let mut out = src.to_vec();
+    let mut tail = Vec::new();
+    let mut kept = 0;
+    for (lo, hi) in rust_spans(src, old.edition) {
+        if !at.iter().any(|&p| lo <= p && p < hi) { continue; }
+        kept += 1;
+        let keys: std::collections::HashSet<&str> = new_roots.iter().filter(|r| lo <= r.0 && r.0 < hi).map(|r| new_keys[r.1].as_str()).collect();
+        for b in &mut out[lo..hi] {
+            if *b != b'\n' && *b != b'\r' { *b = b' '; }
+        }
+        for (k, &(olo, ohi)) in old_spans.iter().enumerate() {
+            if !used[k] && old_roots.iter().any(|r| olo <= r.0 && r.0 < ohi && keys.contains(old_keys[r.1].as_str())) {
+                used[k] = true;
+                tail.push(b'\n');
+                tail.extend_from_slice(&old.src[olo..ohi]);
+            }
+        }
+    }
+    if kept == 0 { return None; }
+    out.push(b'\n');
+    out.extend_from_slice(&tail);
+    prog.parse_version(file, path, out.clone()).ok()?;
+    Some((out, kept))
+}
+
+/// The root items of `pf` by the authored position of each (an expanded root at its macro call),
+/// sorted: (position, item index).
+fn root_positions(pf: &crate::parser::ParsedFile) -> Vec<(usize, usize)> {
+    let mut positions: Vec<_> = pf.ast.root_items.iter().map(|i| {
+        let mut pos = pf.ast.item(*i).lo;
+        // Expanded roots belong to their authored macro invocation.
+        for _ in 0..32 {
+            let Some((_, _, call)) = pf.exp_map.iter_rev().find(|&(a, b, _)| a <= pos && pos < b) else { break };
+            if call == pos { break; }
+            pos = call;
+        }
+        (pos as usize, i.0 as usize)
+    }).collect();
+    positions.sort_unstable();
+    positions
+}
+
+/// Restart-only items hold back only themselves and what needs them. An edit with one took the
+/// restart rung whole, and so did every later one while it waited (an app, 11-07: a type alias, a
+/// layout a static holds, two consts in one landing, and nine hours of landings and saves after
+/// it waited with them). The items the restart lines name (`lines`: each at `path:line:col` of the
+/// edit's text) keep their running text, and the edit applies again without them; an item the
+/// rest of it cannot type-check without a held one's new form is held too (its error names it),
+/// and so are the restart-only items a round finds, round by round. The held items' reasons wait
+/// for the restart as before ([`HELD`] lines: the watcher offers it). None: a line names no item
+/// of the edit's text (its reason is the whole program's), or the rounds ran out: the edit
+/// restarts whole.
+unsafe fn hold_back(up: *mut Unit, edits: &[Edit], lines: &[String], t0: Instant, retries: usize, base: &IncludeBase) -> Option<Outcome> {
+    const SUMMARY: &str = "type checking failed due to previous errors";
+    let mut srcs: Vec<Edit> = edits.iter().map(|e| Edit { file: e.file, path: e.path.clone(), src: e.src.clone() }).collect();
+    // the held items' running texts go past each file's own end
+    let ends: Vec<usize> = srcs.iter().map(|e| e.src.len()).collect();
+    let (mut reasons, mut reached) = (lines.to_vec(), Vec::new());
+    let mut named: Vec<String> = lines.to_vec();
+    let mut held = 0;
+    for round in 0..HOLD_ROUNDS.min(retries) {
+        let mut at: Vec<Vec<usize>> = vec![Vec::new(); srcs.len()];
+        for l in named.iter().filter(|l| !l.ends_with(SUMMARY)) {
+            let (k, p) = srcs.iter().enumerate().find_map(|(k, e)| line_at(l, &e.path, &e.src).map(|p| (k, p)))?;
+            if p >= ends[k] { return None; }
+            at[k].push(p);
+        }
+        for (k, e) in srcs.iter_mut().enumerate() {
+            if at[k].is_empty() { continue; }
+            let (next, n) = keep_running(&(*up).prog, e.file, &e.path, &e.src, &at[k])?;
+            e.src = next;
+            held += n;
+        }
+        let again: Vec<Edit> = srcs.iter().map(|e| Edit { file: e.file, path: e.path.clone(), src: e.src.clone() }).collect();
+        let mut r = apply_locked(up, again, Vec::new(), t0, HOLD_ROUND, retries - 1 - round, false, base);
+        match r.rung {
+            Rung::Patch => {
+                r.kept += held;
+                r.lines.retain(|l| !l.starts_with("incomplete:"));
+                r.lines.push(format!("incomplete: {held} item(s) kept at their running version"));
+                r.lines.extend(reasons.iter().map(|l| format!("{HELD}{l}")));
+                r.lines.extend(reached.iter().map(|l| format!("{HELD_REACHES}{l}")));
+                return Some(r);
+            }
+            Rung::Restart => reasons.extend(r.lines.iter().cloned()),
+            Rung::Refuse if internal_failure(&r.lines) => return None,
+            Rung::Refuse => reached.extend(r.lines.iter().filter(|l| !l.ends_with(SUMMARY)).cloned()),
+        }
+        named = r.lines;
+    }
+    None
 }
 
 /// Each item's container item (impl, trait, inline mod) in the tree walked from the root items;
@@ -4148,14 +4278,17 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let mut changes = Vec::new();
     let mut restart = Vec::new();
     let mut kept = None;
-    for (i, e) in edits.into_iter().enumerate() {
+    // a whole save holds back its restart-only items alone (hold_back): its texts stay at hand. A
+    // live test session takes its restart at once, the whole edit with it: nothing waits there
+    let hold = partial == 0 && !module && retries > 0 && !crate::harness::live::enabled();
+    for (i, e) in edits.iter().enumerate() {
         let initial = if partial == 2 {
             Err("incomplete".to_string())
         } else if let Some(p) = pre.get_mut(i).and_then(Option::take) {
             p
         } else { u.prog.parse_version(e.file, &e.path, e.src.clone()) };
         let parsed = initial.or_else(|err| {
-            if partial != 0 && e.path.ends_with(".rs") {
+            if partial != 0 && partial != HOLD_ROUND && e.path.ends_with(".rs") {
                 if let Some((src, n)) = compose_partial(&u.prog, e.file, &e.src) {
                     kept = Some(kept.unwrap_or(0) + n);
                     return u.prog.parse_version(e.file, &e.path, src);
@@ -4207,7 +4340,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             let pf = &u.prog.files[d.file as usize];
             if let crate::ast::ItemKind::Fn(sig, _, _) = pf.ast.item(d.item).kind {
                 if pf.ast.fn_sig(sig).konst {
-                    restart.push(format!("const fn `{}` changed: checking its users requires the new code -- restart the app", def_name(&u.prog, def)));
+                    restart.push(format!("{}const fn `{}` changed: checking its users requires the new code -- restart the app", new_pos(u, &versions, def), def_name(&u.prog, def)));
                 }
             }
         }
@@ -4216,7 +4349,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     for c in &changes {
         if let Change::Const(d) = c {
             if u.tcx.const_was_evaluated(*d) {
-                restart.push(format!("const `{}` is used in a type (an array length or const generic argument): its users' types change -- restart the app", def_name(&u.prog, *d)));
+                restart.push(format!("{}const `{}` is used in a type (an array length or const generic argument): its users' types change -- restart the app", new_pos(u, &versions, *d), def_name(&u.prog, *d)));
             }
         }
     }
@@ -4232,9 +4365,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         for (d, closure) in &const_before {
             if closure.is_none() {
                 restart.push(if crate::cache::in_skipped_file(&u.prog, *d) {
-                    format!("const `{}` changed in a module the boot skipped (loaded after it): this run's code from the disk cache is keyed by that module's text whole, not by its readers -- restart the app", def_name(&u.prog, *d))
+                    format!("{}const `{}` changed in a module the boot skipped (loaded after it): this run's code from the disk cache is keyed by that module's text whole, not by its readers -- restart the app", new_pos(u, &versions, *d), def_name(&u.prog, *d))
                 } else {
-                    format!("const `{}` changed, and this run's code comes from the disk cache: no key shows its readers there -- restart the app", def_name(&u.prog, *d))
+                    format!("{}const `{}` changed, and this run's code comes from the disk cache: no key shows its readers there -- restart the app", new_pos(u, &versions, *d), def_name(&u.prog, *d))
                 });
             }
         }
@@ -4244,7 +4377,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     for c in &changes {
         if let Change::Const(d) | Change::StaticInit(d) = *c {
             if let Some(s) = placed_storage(u, d) {
-                restart.push(format!("the initializer of `{}` changed, and `{}` already holds the value the old one made (an initializer runs once) -- restart the app", def_name(&u.prog, d), def_name(&u.prog, s)));
+                restart.push(format!("{}the initializer of `{}` changed, and `{}` already holds the value the old one made (an initializer runs once) -- restart the app", new_pos(u, &versions, d), def_name(&u.prog, d), def_name(&u.prog, s)));
             }
         }
     }
@@ -4255,6 +4388,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
     }
     if !restart.is_empty() {
+        if hold {
+            if let Some(r) = hold_back(up, &edits, &restart, t0, retries, base) { return r; }
+        }
         out.rung = Rung::Restart;
         out.lines = restart;
         out.ms[0] = ms(t0);
@@ -4340,7 +4476,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         if fresh_layout_struct(u, d) {
             let s = holding_adts(u, d);
             if let Some(line) = no_live_values(u, d, &s) {
-                late_restart.push(line);
+                late_restart.push(format!("{}{line}", new_pos(u, &versions, d)));
             }
             fresh_structs.push((d, s));
         }
@@ -6391,6 +6527,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
         out.rung = if as_restart { Rung::Restart } else { Rung::Refuse };
         out.lines.extend(errs);
+        if as_restart && hold {
+            if let Some(r) = hold_back(up, &edits, &out.lines, t0, retries, base) { return r; }
+        }
         // A complete item may still fail checking. Remove only items located by diagnostics,
         // restore their running identities, and retry through the same transaction gate.
         // Every retry drops authored items; a fixed bound also caps pathological diagnostics.
@@ -8978,42 +9117,56 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             }
             // a change the running process cannot take: offered, and the person's restart builds
             // makepad in the background and restarts into it; the app keeps running (and
-            // patching) meanwhile. A live test session builds now: its verdict is the restarted run
-            let what = if changed.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };
-            let names: Vec<String> = changed.iter().take(3).map(|&k| short(&files[k].0)).collect();
-            let why = format!("{} {what} changed ({}{}): {reason}", changed.len(), names.join(", "), if changed.len() > 3 { ", ..." } else { "" });
+            // patching) meanwhile. A live test session builds now: its verdict is the restarted run,
+            // which takes the whole batch. Offered, only makepad's inputs wait for the restart: the
+            // program's own sources of the batch patch now, as a dock app's synced batch's do. (They
+            // went with the offer, marked seen and never patched: a landing moves makepad's inputs
+            // and an app's sources at once, so a later edit of their users read them half-new, and
+            // an app refused E0425 on a const a swallowed file added, 11-07.)
+            let harness = crate::harness::live::enabled();
+            let (host_side, rest): (Vec<usize>, Vec<usize>) = if harness { (changed.clone(), Vec::new()) } else {
+                changed.iter().partition(|&&k| inputs.process_input(&files[k].0))
+            };
+            let what = if host_side.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };
+            let names: Vec<String> = host_side.iter().take(3).map(|&k| short(&files[k].0)).collect();
+            let why = format!("{} {what} changed ({}{}): {reason}", host_side.len(), names.join(", "), if host_side.len() > 3 { ", ..." } else { "" });
             let paths = inputs.process_paths(&|_| true);
-            match if crate::harness::live::enabled() { host::request(why.clone(), paths) } else { host::offer(why.clone(), paths) } {
+            let offered = match if harness { host::request(why.clone(), paths) } else { host::offer(why.clone(), paths) } {
                 Ok(()) => {
                     // answered at once (a restart follows the build); the build's end answers
                     // again: refused with its errors, no change, or the restart into it
                     patch_refused_event(&why, false, std::slice::from_ref(&why));
-                    host_edit = changed.iter().map(|&k| files[k].0.clone()).collect();
-                    for &k in &changed { files[k].2 = settled_stamps[k]; }
-                    continue;
+                    host_edit = host_side.iter().map(|&k| files[k].0.clone()).collect();
+                    for &k in &host_side { files[k].2 = settled_stamps[k]; }
+                    true
                 }
-                Err(e) => eprintln!("makepad live: cannot rebuild and restart makepad here: {e}"),
-            }
-            let package = std::env::var("MAKEPAD_RUN_PACKAGE").unwrap_or_else(|_| "<pkg>".into());
-            let what = if changed.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };
-            // provided crates and std are built into this binary: cargo rebuilds it on the way
-            let restart = if inputs.host_restart_required(changed.iter().map(|&k| files[k].0.as_str())) {
-                host::note_cannot_build();
-                format!("needs a JIT rebuild: restart it through cargo (which rebuilds makepad): {}", crate::srchash::rebuild_command(&std::env::args().skip(1).collect::<Vec<_>>()))
-            } else {
-                format!("restart `makepad run {package}`")
+                Err(e) => { eprintln!("makepad live: cannot rebuild and restart makepad here: {e}"); false }
             };
-            let message = format!("{} {what} changed: {reason}; {restart} (or `makepad inspect <app> session relaunch`) to pick them up; keeping the running code", changed.len());
-            note_restart_pending(&message);
-            eprintln!("makepad live: {message}");
-            live_log(&format!("{{\"restart_required\":true,\"message\":{}}}", json_str(&message)));
-            // The edit's one verdict, at once. A live test session cannot restart into it (the
-            // restarted tests would run this binary again): there it is refused.
-            patch_refused_event(&message, crate::harness::live::enabled(), std::slice::from_ref(&message));
-            for &k in &changed { files[k].2 = settled_stamps[k]; }
-            restart_message = message;
-            restart_required = true;
-            continue;
+            if offered {
+                if rest.is_empty() { continue; }
+                changed = rest;
+            } else {
+                let package = std::env::var("MAKEPAD_RUN_PACKAGE").unwrap_or_else(|_| "<pkg>".into());
+                let what = if changed.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };
+                // provided crates and std are built into this binary: cargo rebuilds it on the way
+                let restart = if inputs.host_restart_required(changed.iter().map(|&k| files[k].0.as_str())) {
+                    host::note_cannot_build();
+                    format!("needs a JIT rebuild: restart it through cargo (which rebuilds makepad): {}", crate::srchash::rebuild_command(&std::env::args().skip(1).collect::<Vec<_>>()))
+                } else {
+                    format!("restart `makepad run {package}`")
+                };
+                let message = format!("{} {what} changed: {reason}; {restart} (or `makepad inspect <app> session relaunch`) to pick them up; keeping the running code", changed.len());
+                note_restart_pending(&message);
+                eprintln!("makepad live: {message}");
+                live_log(&format!("{{\"restart_required\":true,\"message\":{}}}", json_str(&message)));
+                // The edit's one verdict, at once. A live test session cannot restart into it (the
+                // restarted tests would run this binary again): there it is refused.
+                patch_refused_event(&message, crate::harness::live::enabled(), std::slice::from_ref(&message));
+                for &k in &changed { files[k].2 = settled_stamps[k]; }
+                restart_message = message;
+                restart_required = true;
+                continue;
+            }
         }
         let _reloading = jit::Reloading::begin();
         let macro_changes: Vec<_> = changed.iter().map(|&k| (files[k].0.as_str(), None)).collect();
@@ -9253,6 +9406,11 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             // an edit the patcher cannot absorb: makepad restarts for real (the app is asked at its
             // next safe point and keeps its state); it runs the previous code until then
             Rung::Restart => restart_for_edit(&what, &o.lines),
+        }
+        // what of it the patch held back waits for the restart (hold_back)
+        let held: Vec<String> = o.lines.iter().filter_map(|l| l.strip_prefix(HELD)).map(str::to_string).collect();
+        if o.rung == Rung::Patch && !held.is_empty() {
+            restart_for_edit(&what, &held);
         }
         for l in &o.lines {
             eprintln!("makepad live:   {}", l);
