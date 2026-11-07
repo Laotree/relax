@@ -1061,7 +1061,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let hosted = !entries.is_empty() || !export_names.is_empty() || harness || plain_test;
     // the `unused_macros` lints need the macro uses of the whole load (and `unused_imports` the
     // import uses): a check's, and `makepad test`'s check of the crates under test (not a test's
-    // run of its own binary: it prints no warnings)
+    // run of its own binary: it checks nothing again, check_test_subjects)
     let test_lints = (harness || plain_test) && !check && !self_exec;
     if check || test_lints { relax_types::macros::uses::record(true); relax_front::program::set_record_import_uses(true); }
     // Android: stderr is the embedder's pipe into logcat, line by line; the session-log tee in
@@ -2074,9 +2074,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mut app_check = None;
     if !test_subjects.is_empty() {
         let t_check = Instant::now();
-        // after the cache is open: subjects whose check is stored are not checked again
-        // (a test's run of its own binary prints no warnings: its parent printed them)
-        let n = check_test_subjects(&mut u, root, &test_subjects, harness, !self_exec);
+        // after the cache is open: subjects whose check is stored are not checked again, nor
+        // are a test's run of its own binary's (its parent checked them and printed the warnings)
+        let n = check_test_subjects(&mut u, root, &test_subjects, harness, self_exec);
         // (what the tests' own code resolves and expands from now on is no lint's input)
         if test_lints { relax_types::macros::uses::record(false); relax_front::program::set_record_import_uses(false); }
         phase("test check", t_check);
@@ -2757,7 +2757,7 @@ static HARNESS_RUN: AtomicBool = AtomicBool::new(false);
 /// them first: an unresolved import or a type error anywhere in them fails the run, not only the
 /// test that reaches it (a test whose body did not compile used to fail alone at run time while
 /// the others passed). Prints the errors as `makepad check` does; returns their count.
-pub(crate) fn check_test_subjects(u: &mut Unit, root: u32, subjects: &[u32], harness: bool, show_warnings: bool) -> usize {
+pub(crate) fn check_test_subjects(u: &mut Unit, root: u32, subjects: &[u32], harness: bool, self_exec: bool) -> usize {
     use crate::borrowck::lazy::StoredVerdict;
     let t0 = Instant::now();
     u.tcx.check_coherence_of(&u.prog, Some(subjects));
@@ -2768,13 +2768,17 @@ pub(crate) fn check_test_subjects(u: &mut Unit, root: u32, subjects: &[u32], har
         pre.extend(crate::check::own_errors(&u.prog, k, &u.tcx.errors, "typeck"));
         pre.extend(crate::check::own_errors(&u.prog, k, &derive, "macro"));
     }
-    // subjects whose every input -- their every file, their dependencies, the Relax build and its
-    // options -- is a clean check's (cache.rs crate_check_key) are not checked again: a test's run
-    // of its own binary (each child of a test that spawns itself), a run after an edit elsewhere.
-    // Not with a command-line lint level (not in the key).
+    // a test's run of its own binary (each child of a test that spawns itself) is the program its
+    // parent's check passed before any test ran, as a test binary cargo built runs again with
+    // nothing compiled: it checks nothing again, whatever lint level its environment names then
+    // (a test sets one for a check of its own), and its load records no uses for the lints
+    // (run.rs test_lints). Else subjects whose every input -- their every file, their
+    // dependencies, the Relax build and its options -- is a clean check's (cache.rs
+    // crate_check_key) are not checked again: a run after an edit elsewhere. Not with a
+    // command-line lint level (not in the key).
     let mode = if harness { 2 } else { 1 };
     let keys: Option<Vec<u128>> = match u.cache.as_ref() {
-        Some(c) if crate::check::BOOT_SKIPPED.get().is_some() && !relax_types::lint::cmdline_set() => {
+        Some(c) if !self_exec && crate::check::BOOT_SKIPPED.get().is_some() && !relax_types::lint::cmdline_set() => {
             let c = unsafe { &mut *c.get() };
             subjects.iter().map(|&k| c.crate_check_key(k, crate::check::skipped_text_hash(k), mode)).collect()
         }
@@ -2786,7 +2790,7 @@ pub(crate) fn check_test_subjects(u: &mut Unit, root: u32, subjects: &[u32], har
     let t2 = Instant::now();
     // (a check that passed with warnings stored them, as cargo replays a fresh crate's: printed
     // again here)
-    let stored: Option<Vec<String>> = if !pre.is_empty() { None } else {
+    let stored: Option<Vec<String>> = if !pre.is_empty() { None } else if self_exec { Some(Vec::new()) } else {
         keys.as_ref().zip(u.cache.as_ref()).and_then(|(keys, c)| {
             let c = unsafe { &*c.get() };
             if keys.iter().all(|&k| matches!(c.borrowck_stored(k), Some(StoredVerdict::Clean))) { Some(Vec::new()) } else { c.test_warnings(keys) }
@@ -2798,7 +2802,7 @@ pub(crate) fn check_test_subjects(u: &mut Unit, root: u32, subjects: &[u32], har
     };
     // the summary on every run, a clean one too ("0 warnings"), so a run that checked and found
     // nothing reads differently from one that did not check (a stored verdict is a check's)
-    if show_warnings {
+    if !self_exec {
         if !crate::diag::enabled() {
             for w in &warnings { stderr_line!("{}", w); }
         }
@@ -2809,7 +2813,7 @@ pub(crate) fn check_test_subjects(u: &mut Unit, root: u32, subjects: &[u32], har
     }
     verbose!("makepad-run: test check: coherence {:.0} ms, skipped files' load {:.0} ms ({} files), check {:.0} ms{}",
         (t1 - t0).as_secs_f64() * 1e3, (t2 - t1).as_secs_f64() * 1e3, u.prog.files.len() - files, t2.elapsed().as_secs_f64() * 1e3,
-        match &stored { Some(w) if w.is_empty() => " (its crates' clean verdicts are stored)", Some(_) => " (its crates' verdicts are stored, with their warnings)", None => "" });
+        match &stored { Some(_) if self_exec => " (its parent's)", Some(w) if w.is_empty() => " (its crates' clean verdicts are stored)", Some(_) => " (its crates' verdicts are stored, with their warnings)", None => "" });
     if n == 0 && stored.is_none() {
         if let (Some(keys), Some(c)) = (keys, u.cache.as_ref()) {
             let c = unsafe { &mut *c.get() };
@@ -2822,6 +2826,13 @@ pub(crate) fn check_test_subjects(u: &mut Unit, root: u32, subjects: &[u32], har
     }
     n
 }
+
+/// The variables a run sets for its program that name that run: its start, when main was
+/// called, its cache's state, its session log, the file its first frame is reported in. A
+/// program's children inherit them (a test's run of its own binary, a `makepad check` it starts);
+/// they steer no check (check_reuse.rs env_key).
+pub(crate) const RUN_STATE_VARS: [&str; 5] = ["MAKEPAD_RUN_STARTUP_T0", "MAKEPAD_RUN_MAIN_MS", "MAKEPAD_RUN_CACHE_STATE", "MAKEPAD_RUN_LIVE_LOG", "MAKEPAD_RUN_REPORT_TO"];
+
 static HAL_RUN: AtomicBool = AtomicBool::new(false);
 static APP_DOMAIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 

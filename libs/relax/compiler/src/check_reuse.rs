@@ -187,7 +187,8 @@ pub(crate) struct Reuse {
 }
 
 /// What a check's crates' keys rest on beyond the crates: the Relax build and options, the
-/// variables that steer the check.
+/// variables that steer the check (every `MAKEPAD_RUN_*` one but those naming the run a check
+/// runs under, run.rs RUN_STATE_VARS).
 fn env_key(prog: &Program) -> u128 {
     let mut h = Sip128::new();
     h.str("relax-check-env");
@@ -196,7 +197,7 @@ fn env_key(prog: &Program) -> u128 {
     h.u128(prog.session.options.fingerprint());
     let mut vars: Vec<(String, String)> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.to_string_lossy().into_owned())))
-        .filter(|(k, _)| k.starts_with("MAKEPAD_RUN_"))
+        .filter(|(k, _)| k.starts_with("MAKEPAD_RUN_") && !crate::run::RUN_STATE_VARS.contains(&k.as_str()))
         .collect();
     vars.sort();
     h.u32(vars.len() as u32);

@@ -614,6 +614,9 @@ pub struct Program {
     /// glob target) a name resolution went through (rustc_resolve `record_use`); recorded only
     /// while `record_import_uses` is on (`makepad check`)
     import_used: relax_session::sync::Mutex<crate::fxhash::HashSet<(u32, Sym, bool)>>,
+    /// the stretch of `record_import_uses` this program was made in (RECORD_STRETCH), None when
+    /// it was off then: its uses are whole only while that stretch lasts (`import_uses_recorded`)
+    uses_stretch: Option<u64>,
     glob_used: relax_session::sync::Mutex<crate::fxhash::HashSet<(u32, DefId)>>,
     /// extern prelude entries (crate, name) a path resolved through (recorded like `import_used`)
     extern_used: relax_session::sync::Mutex<crate::fxhash::HashSet<(u32, Sym)>>,
@@ -956,6 +959,7 @@ impl Program {
             glob_used: Default::default(),
             extern_used: Default::default(),
             body_memos: Default::default(),
+            uses_stretch: RECORD_IMPORT_USES.load(std::sync::atomic::Ordering::Relaxed).then(|| RECORD_STRETCH.load(std::sync::atomic::Ordering::Relaxed)),
             trait_bind_cache: Default::default(),
             prelexed: Default::default(),
             ahead: Default::default(),
@@ -4563,6 +4567,13 @@ impl Program {
         }
     }
 
+    /// Whether this program's name resolutions recorded every import use they went through:
+    /// it was made while `record_import_uses` was on, and it has been on since. The lints that
+    /// read the uses (`unused_imports`) run only then: without them every import reads unused.
+    pub fn import_uses_recorded(&self) -> bool {
+        RECORD_IMPORT_USES.load(std::sync::atomic::Ordering::Relaxed) && self.uses_stretch == Some(RECORD_STRETCH.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     /// Whether a resolution went through the import binding `name` of module `m`.
     pub fn import_binding_used(&self, m: u32, name: Sym) -> bool {
         let u = self.import_used.lock().unwrap_or_else(|e| e.into_inner());
@@ -5802,6 +5813,9 @@ pub struct SharedParse {
 /// `makepad check` records which imports its name resolutions go through (the lint
 /// `unused_imports`); a run does not.
 static RECORD_IMPORT_USES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The stretches of recording, counted: each switch of `set_record_import_uses` from off to on
+/// starts one. A program made in one has every use of its name resolutions while it lasts.
+static RECORD_STRETCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub fn record_import_uses() -> bool { RECORD_IMPORT_USES.load(std::sync::atomic::Ordering::Relaxed) && !quiet_lookups() }
 
 thread_local! {
@@ -5822,7 +5836,13 @@ impl Drop for QuietLookups {
     fn drop(&mut self) { QUIET_LOOKUPS.with(|q| q.set(q.get() - 1)); }
 }
 fn quiet_lookups() -> bool { QUIET_LOOKUPS.with(|q| q.get() != 0) }
-pub fn set_record_import_uses(on: bool) { RECORD_IMPORT_USES.store(on, std::sync::atomic::Ordering::Relaxed); }
+pub fn set_record_import_uses(on: bool) {
+    if !RECORD_IMPORT_USES.swap(on, std::sync::atomic::Ordering::Relaxed) && on { RECORD_STRETCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+}
+/// The import replay's own lookups are no uses (rsim.rs run_import_sim): it holds the recording
+/// back while it runs, within the stretch. Returns whether it was on, for `resume_import_uses`.
+fn pause_import_uses() -> bool { RECORD_IMPORT_USES.swap(false, std::sync::atomic::Ordering::Relaxed) }
+fn resume_import_uses(was: bool) { RECORD_IMPORT_USES.store(was, std::sync::atomic::Ordering::Relaxed); }
 
 static SHARED_STD: relax_session::sync::Mutex<Option<HashMap<String, std::sync::Arc<SharedParse>>>> = relax_session::sync::Mutex::new(None);
 
@@ -6645,6 +6665,7 @@ mod deferred_load_tests {
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     reset(&RECORD_IMPORT_USES, std::sync::atomic::AtomicBool::new(false));
+    reset(&RECORD_STRETCH, std::sync::atomic::AtomicU64::new(0));
     reset(&SHARED_STD, relax_session::sync::Mutex::new(None));
     reset(&SHARING, std::sync::atomic::AtomicBool::new(false));
     reset(&WORLD_WAITERS, std::sync::atomic::AtomicUsize::new(0));

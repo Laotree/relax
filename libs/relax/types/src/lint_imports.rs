@@ -311,8 +311,11 @@ fn macro_closure(prog: &Program, names: &mut HashSet<String>) {
 
 /// One checked crate's imports (`c`: its modules and definitions; `traits`: the traits its bodies
 /// call methods of).
+///
+/// Only when the program recorded its import uses (`import_uses_recorded`): a check whose load
+/// did not (a test's run of its own binary, a run) has no unused import to tell.
 pub fn check(prog: &Program, tcx: &Tcx, c: &crate::lint_dead::CrateItems, reach: &crate::lint_dead::Reach, traits: &HashSet<DefId>) {
-    if !lint::enabled() { return; }
+    if !lint::enabled() || !prog.import_uses_recorded() { return; }
     let mut scopes: Vec<Scope> = Vec::new();
     for &m in &c.mods {
         let md = &prog.mods[m as usize];
