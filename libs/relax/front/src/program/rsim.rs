@@ -198,8 +198,7 @@ impl Program {
     /// errors Relax's own resolution found (see the module comment); the glob ambiguities it
     /// found become the answer of `glob_ambiguity` for the checked modules.
     pub fn run_import_sim(&mut self, own: &[bool]) {
-        let prev = record_import_uses();
-        set_record_import_uses(false);
+        let prev = super::pause_import_uses();
         let (out, amb, macros) = {
             let mut sim = Sim::new(self, own);
             sim.init(false);
@@ -212,7 +211,7 @@ impl Program {
             (out, sim.ambiguity_table(&chains), sim.macro_table(&chains))
         };
         self.sim_macros = Some(macros);
-        set_record_import_uses(prev);
+        super::resume_import_uses(prev);
         self.sim_ambiguity = Some(amb);
         self.sim_diags = Some(out);
         self.glob_amb_cache.clear();

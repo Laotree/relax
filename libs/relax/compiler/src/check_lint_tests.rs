@@ -10,6 +10,11 @@ const CHILD: &str = "RELAX_CHECK_LINT_CHILD";
 /// "message [lint]" (no position), and its errors, as "error: message [lint]". In the child: None
 /// (the caller checks the package).
 fn warnings_in_child(name: &str) -> Option<Vec<String>> {
+    warnings_in_child_with(name, &[])
+}
+
+/// `warnings_in_child`, the child's variables `env` set.
+fn warnings_in_child_with(name: &str, env: &[(&str, &str)]) -> Option<Vec<String>> {
     if std::env::var_os(CHILD).is_some() {
         return None;
     }
@@ -17,6 +22,7 @@ fn warnings_in_child(name: &str) -> Option<Vec<String>> {
         .args(["--exact", name, "--nocapture", "--test-threads=1", "--format=terse"])
         .env(CHILD, "1")
         .env_remove("MAKEPAD_RUN_LINT_FLAGS")
+        .envs(env.iter().copied())
         .output()
         .unwrap();
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -44,6 +50,23 @@ fn check_package_code(lib: &str, bins: &[&str]) -> i32 {
 /// The check of `lib` and `bins`; `harness`: the library is built with `--test` (cfg(test),
 /// libtest's generated main), as `makepad check --test <name>` builds a test target.
 fn check_code(lib: &str, bins: &[&str], harness: bool) -> i32 {
+    check_code_uses(lib, bins, harness, Uses::Recorded)
+}
+
+/// How a check's load records its import uses (`check_code_uses`).
+#[derive(PartialEq)]
+enum Uses {
+    /// on from before the load to the end of the check, as `makepad check` records them
+    Recorded,
+    /// never on (a test's run of its own binary, a run)
+    Off,
+    /// on at the load, then off and on again before the check: a new stretch, without the uses
+    /// of the load
+    Restarted,
+}
+
+/// `check_code`, the import uses recorded as `uses` says.
+fn check_code_uses(lib: &str, bins: &[&str], harness: bool, uses: Uses) -> i32 {
     crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
     std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     // `makepad check`'s session (run.rs): constants go through the check-mode interpreter first
@@ -53,7 +76,7 @@ fn check_code(lib: &str, bins: &[&str], harness: bool) -> i32 {
     // as run.rs sets up a check: import and macro uses are recorded, every crate keeps the
     // user types its borrow check reads (the mutable-place fixups included)
     relax_types::macros::uses::record(true);
-    relax_front::program::set_record_import_uses(true);
+    relax_front::program::set_record_import_uses(uses != Uses::Off);
     crate::borrowck::event::set_check_scope();
     let dir = std::env::temp_dir().join(format!("relax-check-lints-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -83,12 +106,40 @@ fn check_code(lib: &str, bins: &[&str], harness: bool) -> i32 {
     let mut tcx = crate::tcx::Tcx::new();
     tcx.collect(&prog);
     let mut u = crate::jit::Unit::new(prog, tcx, core);
+    if uses == Uses::Restarted {
+        relax_front::program::set_record_import_uses(false);
+        relax_front::program::set_record_import_uses(true);
+    }
     let code = crate::check::check_crate(&mut u, root, &crates, pre, false);
     for f in &files {
         std::fs::remove_file(f).unwrap();
     }
     std::fs::remove_dir(&dir).unwrap();
     code
+}
+
+/// A check whose load did not record its import uses reports no import unused: it cannot tell
+/// one (`Program::import_uses_recorded`). A test's run of its own binary, the variable
+/// `MAKEPAD_RUN_LINT_FLAGS=-D warnings` set by the test, had checked its crate again with no
+/// uses recorded: every import of relax-compiler read unused, each an error. The used and the
+/// unused import alike are left out here; the other lints stay.
+#[test]
+fn a_check_whose_load_recorded_no_import_uses_reports_none_unused() {
+    let lib = "use std::io::Write;\nuse std::collections::HashMap;\npub fn f(m: &HashMap<u8, u8>) -> usize { m.len() }\nfn unused() {}\n";
+    const USES: &str = "RELAX_CHECK_LINT_USES";
+    for (case, uses) in [("off", Uses::Off), ("restarted", Uses::Restarted), ("recorded", Uses::Recorded)] {
+        if std::env::var(USES).as_deref() == Ok(case) {
+            return assert_eq!(check_code_uses(lib, &[], false, uses), 0);
+        }
+    }
+    for (case, expected) in [
+        ("off", vec!["function `unused` is never used [dead_code]"]),
+        ("restarted", vec!["function `unused` is never used [dead_code]"]),
+        ("recorded", vec!["function `unused` is never used [dead_code]", "unused import: `std::io::Write` [unused_imports]"]),
+    ] {
+        let Some(warnings) = warnings_in_child_with("check_lint_tests::a_check_whose_load_recorded_no_import_uses_reports_none_unused", &[(USES, case)]) else { return };
+        assert_eq!(warnings, expected, "{case}");
+    }
 }
 
 /// `makepad check --test <name>` had reported every test of a test target and every helper they

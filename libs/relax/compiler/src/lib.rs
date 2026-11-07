@@ -1056,7 +1056,7 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         for error in enum_errors { eprintln!("error: {}", error); }
         return 1;
     }
-    let check_errors = run::check_test_subjects(&mut u, krate, &[krate], true, true);
+    let check_errors = run::check_test_subjects(&mut u, krate, &[krate], true, false);
     // (what the tests' own code resolves and expands from now on is no lint's input)
     relax_types::macros::uses::record(false);
     relax_front::program::set_record_import_uses(false);
