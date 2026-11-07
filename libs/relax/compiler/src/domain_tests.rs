@@ -111,21 +111,13 @@ fn heap_in_use() -> u64 {
 }
 
 /// The heap check counts the whole process, so what grows it besides the fixture is settled first.
-/// Each of these is one-off process state that the cycles would otherwise create in whichever
-/// cycle first needs it, which depends on how the threads interleave (and so on machine load):
-/// lazy compiles of the fixture's code, and the symbol tables of the images a teardown stack
-/// dump names (it runs only when a thread outlives its domain's stop).
+/// The lazy compiles of the fixture's code are one-off process state that the cycles would
+/// otherwise make in whichever cycle first needs them, which depends on how the threads
+/// interleave (and so on machine load). (Nothing in the cycles reads symbol tables: a stop
+/// reports no thread that is on its way out, so no stack is dumped.)
 #[cfg(target_os = "linux")]
 fn warm_process_state(u: &mut Unit, entry: u64) {
-    extern "C" {
-        fn getpid() -> i32;
-    }
     crate::jit::precompile_reachable(u, entry);
-    assert!(crate::inspect::symbols::host_symbol(getpid as *const () as usize as u64).is_some());
-    // This test's own code is in a host image only in a rustc build: under the JIT it is JIT
-    // code, which no image's symbol table holds (a stack dump names it from the JIT's tables).
-    #[cfg(not(relax))]
-    assert!(crate::inspect::symbols::host_symbol(warm_process_state as *const () as usize as u64).is_some());
 }
 
 #[test]
@@ -224,6 +216,9 @@ fn teardown_fixture_cycles_and_retiring_thread() {
     assert!(freed_by_teardown() > freed);
     next_flags[1].store(1, Ordering::SeqCst);
     stop(replacement, Stop::Quit).unwrap();
+    // its main returned long ago, so the stop does not wait for the worker: the worker ends (its
+    // TLS destructor on the replacement's heap) before the record and that heap go
+    wait_thread_done(replacement);
     domains().retain(|d| d.info.id != domain && d.info.id != replacement);
     drop(u);
     std::fs::remove_dir_all(root).unwrap();
