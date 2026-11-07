@@ -2737,10 +2737,13 @@ pub(crate) fn check_test_subjects(u: &mut Unit, root: u32, subjects: &[u32], har
         Some(w) => (0, w.clone()),
         None => crate::check::check_subjects(u, root, subjects, pre, harness),
     };
-    if show_warnings && !crate::diag::enabled() {
-        for w in &warnings { stderr_line!("{}", w); }
+    // the summary on every run, a clean one too ("0 warnings"), so a run that checked and found
+    // nothing reads differently from one that did not check (a stored verdict is a check's)
+    if show_warnings {
+        if !crate::diag::enabled() {
+            for w in &warnings { stderr_line!("{}", w); }
+        }
         match warnings.len() {
-            0 => {}
             1 => stderr_line!("makepad test: 1 warning"),
             n => stderr_line!("makepad test: {n} warnings"),
         }
