@@ -170,7 +170,7 @@ extern "C" {
 }
 
 fn usage() -> i32 {
-    eprintln!("usage: makepad run [--units <unit-graph.json>] [--ahead=minimal|balanced|aot-max|aot-min] [--quiet] [--verbose] [--no-asm] [--allow-c] <package> [cargo flags] [-- program args]");
+    eprintln!("usage: makepad run [--units <unit-graph.json>] [--ahead=minimal|balanced|aot-max|aot-min] [--quiet] [--verbose] [--no-asm] [--allow-c] [--no-live] [--unattended] <package> [cargo flags] [-- program args]");
     2
 }
 
@@ -981,6 +981,14 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             }
             "--quiet" => QUIET.store(true, Ordering::Relaxed),
             "--no-live" => no_live = true,
+            // a run no one attends (an app a test starts, makepad_test launch_package): no live
+            // session, and nothing parks -- a compile error is its call's panic, a panic unwinds at
+            // once, a crash ends the run -- so the test fails with the text instead of waiting
+            // for a resume that never comes (Fab's test apps parked at a compile error for an hour)
+            "--unattended" => {
+                no_live = true;
+                crate::inspect::events::unattended();
+            }
             // non-lazy Gandalf: no body runs before the borrow checker accepted it (jit::CHECK_FIRST)
             "--check-first" => jit::CHECK_FIRST.store(true, Ordering::Relaxed),
             // the parent run's relax dir (dirs.rs): a build script it runs shares it

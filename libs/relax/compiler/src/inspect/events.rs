@@ -340,6 +340,14 @@ static PANIC_IDS: AtomicU64 = AtomicU64::new(0);
 /// sites that parked already with nobody watching (the next panic there does not wait again)
 static SITES_SEEN: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
 
+/// The run is one no one attends (`makepad run --unattended`): no panic parks, not even briefly.
+static UNATTENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Marks this run as one no one attends ([`UNATTENDED`]).
+pub fn unattended() {
+    UNATTENDED.store(true, Relaxed);
+}
+
 fn park_secs_unwatched() -> u64 {
     std::env::var("MAKEPAD_RUN_PANIC_PARK").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
 }
@@ -370,7 +378,7 @@ pub fn release_domain(domain: crate::domain::DomainId) {
 pub fn on_panic(info: &crate::jit::PanicInfo, regs: *const u64) {
     let unwinds = !regs.is_null();
     let _k = crate::zone_alloc::kept();
-    if !super::STARTED.load(Relaxed) || super::TEST_RUN.load(Relaxed) || crate::owner::is_owner() || super::probes::in_probe() || super::eval::in_eval() {
+    if !super::STARTED.load(Relaxed) || super::TEST_RUN.load(Relaxed) || UNATTENDED.load(Relaxed) || crate::owner::is_owner() || super::probes::in_probe() || super::eval::in_eval() {
         return;
     }
     let domain = crate::domain::current_app_domain();
