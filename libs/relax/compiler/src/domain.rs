@@ -633,9 +633,9 @@ struct Domain {
     compiling: bool,
     reclaiming: bool,
     cancel: bool,
-    /// `retire` ran (a quit retires twice: the HAL's stop of the domain, then hal_run's
-    /// `domain::stop`): the threads it keeps for are reported by the first
-    retired: bool,
+    /// the threads that still held the domain when a relaunch could not reuse it were reported
+    /// (report_retained: once)
+    reported: bool,
     /// the unit whose code it runs (0: not started on one yet)
     unit: usize,
     threads: Vec<DomainThread>,
@@ -705,7 +705,7 @@ pub(crate) fn register_boot(package: &str, base: u64) {
         started: std::time::Instant::now(),
         args: Vec::new(),
         thread_done: false,
-        compiling: false, reclaiming: false, cancel: false, retired: false, unit: 0, threads: Vec::new(), heap: None,
+        compiling: false, reclaiming: false, cancel: false, reported: false, unit: 0, threads: Vec::new(), heap: None,
     });
     let token = relax_domain_reserve(base);
     relax_domain_enter(base, token);
@@ -809,18 +809,31 @@ pub enum Stop {
 /// retire this run. Its thread registrations are the completion latch: the
 /// last TLS exit reclaims the mapping, never a clock or a forced termination.
 /// The host may launch a fresh id while this latch is still outstanding.
+/// The threads still there now are on their way out (a pool's worker, a thread
+/// in its TLS destructors): no report. One that holds the domain when it is
+/// wanted again is (report_retained), as is one a run's end leaves (end_run).
 pub fn retire(id: DomainId) -> Result<(), String> {
     if id == 0 { return Err("domain 0 is the process's own app".into()); }
-    let names = {
+    {
         let mut ds = domains();
         let d = ds.iter_mut().find(|d| d.info.id == id).ok_or_else(|| format!("no domain {id}"))?;
         d.cancel = true;
-        if std::mem::replace(&mut d.retired, true) { Vec::new() } else { d.threads.iter().map(|t| t.name.clone()).collect::<Vec<_>>() }
-    };
+    }
     CHANGED.notify_all();
     teardown(id);
-    if !names.is_empty() { report_teardown_threads(id, &names); }
     Ok(())
+}
+
+/// A relaunch could not reuse domain `id` (still_owned): the threads that hold its mapping since
+/// its stop are reported, once.
+pub fn report_retained(id: DomainId) {
+    let names = {
+        let mut ds = domains();
+        let Some(d) = ds.iter_mut().find(|d| d.info.id == id) else { return };
+        if std::mem::replace(&mut d.reported, true) { return; }
+        d.threads.iter().map(|t| t.name.clone()).collect::<Vec<_>>()
+    };
+    if !names.is_empty() { report_teardown_threads(id, &names); }
 }
 
 /// The app's end at quit: admission closes, its pools and workers are cancelled (`retire`),
@@ -1371,7 +1384,7 @@ pub fn prepare(spec: &AppSpec) -> Result<DomainId, Vec<String>> {
             started: t0,
             args: spec.argv.clone().unwrap_or_else(|| std::iter::once(spec.package.clone().into_bytes()).chain(spec.args.iter().map(|a| a.clone().into_bytes())).collect()),
             thread_done: false,
-            compiling: true, reclaiming: false, cancel: false, retired: false, threads: Vec::new(), unit: 0, heap: None,
+            compiling: true, reclaiming: false, cancel: false, reported: false, threads: Vec::new(), unit: 0, heap: None,
         });
         id
     };
