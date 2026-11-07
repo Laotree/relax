@@ -12824,7 +12824,8 @@ pub fn takes_caller_loc(u: &Unit, id: u32) -> bool {
 /// the caller's copy already is, for arguments passed by address), the slot addresses go in an
 /// array, the shim moves them out and writes the result to the result slot (or the caller's
 /// result address). A shim that caught a panic returns 1: its text is read through the crate's
-/// `__host_last_panic` and raised here as a Relax panic.
+/// `__host_last_panic` and raised here as a Relax panic. One that caught this thread's own panic
+/// on its way through the op's frames (makepad_relax_api::CallerPanic) returns 2: it goes on.
 pub fn bridge_func(u: &Unit, d: DefId, name: String, shim: relax_backend::rir::Sym, last_panic: relax_backend::rir::Sym) -> Option<Func> {
     let s = u.tcx.fn_sig(&u.prog, d).cloned()?;
     let ps: Vec<TyId> = s.params.iter().map(|p| u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), *p)).collect();
@@ -12897,6 +12898,14 @@ pub fn bridge_func_sig(u: &Unit, ps: &[TyId], ret: TyId, name: String, shim: rel
         push(&mut f, ok, Inst::Load(lf.mem, *r, ret_addr, lf.off as i32));
     }
     f.blocks[ok as usize].term = Term::Ret(rets);
+    // 2: this thread's own panic, which unwound through the op's frames (unwind_walk's native
+    // raise) to the shim's catch, goes on from this frame as a pad's Term::Resume does
+    let ours = f.vreg(Cls::I);
+    let (resume, raise) = (f.block(), f.block());
+    push(&mut f, bad, Inst::ICmpI(Cond::Eq, false, ours, status, 2));
+    f.blocks[bad as usize].term = Term::Branch(ours, resume, raise);
+    f.blocks[resume as usize].term = Term::Resume;
+    let bad = raise;
     // the shim's panic text, raised as this thread's panic
     let out_slot = f.slot(16, 8);
     let out = f.vreg(Cls::I);
