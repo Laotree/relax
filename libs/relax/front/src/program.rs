@@ -2085,7 +2085,7 @@ impl Program {
                         ItemKind::Mac(m) => f.ast.segs(f.ast.row(*m).path.segs).last().map(|sg| f.text(sg.name).to_string()).unwrap_or_default(),
                         _ => String::new(),
                     };
-                    self.errors.push(self.record_error(file, it.lo, "macro", format!("cannot find macro `{}` in this scope", name)));
+                    self.errors.push(self.record_uncoded_error(file, it.lo, "macro", format!("cannot find macro `{}` in this scope", name)));
                 }
                 return;
             }
@@ -4217,11 +4217,13 @@ impl Program {
                 } else {
                     std::str::from_utf8(&f.src[source_pos as usize..end as usize]).ok().and_then(|s| s.rfind(name)).map_or(source_pos, |n|source_pos+n as u32)
                 };
-                let mut d = self.diagnostic(im.file, pos, "resolve", format!("unresolved import `{}`", p));
-                self.suggest(&mut d, &self.source_location(im.file, pos), im.module);
-                let location = self.source_location(im.file, im.pos);
-                let (line, _) = location.source.line_col(location.span.lo);
-                let human = format!("{}:{}: unresolved import `{}`", location.source.path(), line, p);
+                let mut d = self.diagnostic(im.file, pos, "resolve", format!("E0432: unresolved import `{}`", p));
+                let location = self.source_location(im.file, pos);
+                self.suggest(&mut d, &location, im.module);
+                // (where rustc puts it: the segment that does not resolve, with rustc's code -- a
+                // line without a code is a makepad run bug to the check, check.rs is_internal)
+                let (line, col) = location.source.line_col(location.span.lo);
+                let human = format!("{}:{}:{}: E0432: unresolved import `{}`", location.source.path(), line, col, p);
                 self.errors.push(crate::diag::record(human,d));
             }
         }
