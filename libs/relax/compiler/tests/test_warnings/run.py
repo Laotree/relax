@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """`makepad test` prints the warnings of the code under test, as `cargo test` does: run.py
-/absolute/path/to/makepad.
+[/path/to/makepad] (without one, from the workspace root: `cargo run --profile host` of makepad).
 
 src/t.rs's test has an unused import, an unused `let` and an unused `Result`: `cargo test` prints
 3 warnings (the JIT printed none), and none for src/a.rs, whose imports its fn's body and signature
@@ -21,6 +21,10 @@ use (a test run once called them unused: it recorded no import uses).
    only that one is reported. (Each target's process loaded only the graph's root again and took
    the others from the collected image, whose import resolution records no uses: every target but
    the root called those imports unused.)
+8. A test target whose imports of a dependency's macros (one direct, one through a re-export)
+   only a `#[test]` fn's macro calls read, and an import nothing reads: only that one is reported.
+   (The lint's scopes left `#[test]` fns out in a test build too: an app's
+   `use ..::script_eval;`, read only by a test's `script_eval!(..)`, was called unused.)
 Prints "test_warnings: ok" or "test_warnings: FAILED (...)"."""
 import os
 from pathlib import Path
@@ -31,7 +35,10 @@ import sys
 import tempfile
 import time
 
-binary = str(Path(sys.argv[1]).resolve())
+if len(sys.argv) > 1:
+    jit = [str(Path(sys.argv[1]).resolve())]
+else:
+    jit = ["cargo", "run", "--profile", "host", "-q", "--manifest-path", str(Path.cwd() / "Cargo.toml"), "-p", "makepad-run", "--bin", "makepad", "--"]
 here = Path(__file__).resolve().parent
 WANT = ["warning: unused import: `std::collections::HashMap`", "warning: unused variable: `unused`",
          "warning: unused `Result` that must be used", "makepad test: 3 warnings"]
@@ -55,7 +62,7 @@ with tempfile.TemporaryDirectory(prefix="test-warnings-") as tmp:
     env = dict(os.environ, MAKEPAD_RUN_CACHE_DIR=str(Path(tmp) / "cache"))
 
     def run(step):
-        p = sp.run([binary, "test", "test-warnings"], cwd=pkg, env=env, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
+        p = sp.run(jit + ["test", "test-warnings"], cwd=pkg, env=env, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
         out = p.stdout
         if p.returncode != 0 or "test result: ok. 1 passed" not in out:
             fail("%s: the test did not pass" % step, out)
@@ -73,7 +80,7 @@ with tempfile.TemporaryDirectory(prefix="test-warnings-") as tmp:
 
     log = Path(tmp) / "live.log"
     with open(log, "w") as f:
-        p = sp.Popen([binary, "test", "--live", "test-warnings"], cwd=pkg, env=env, stdout=f, stderr=sp.STDOUT, start_new_session=True)
+        p = sp.Popen(jit + ["test", "--live", "test-warnings"], cwd=pkg, env=env, stdout=f, stderr=sp.STDOUT, start_new_session=True)
     try:
         def wait(cond, secs):
             end = time.time() + secs
@@ -113,7 +120,7 @@ with tempfile.TemporaryDirectory(prefix="test-warnings-") as tmp:
     t = pkg / "src" / "t.rs"
     t.write_text("#[test]\nfn a() {\n    let _ = super::parse(\"4\");\n    assert_eq!(super::half(4), 2);\n}\n")
     for step in ["a clean run", "its unchanged rerun"]:
-        p = sp.run([binary, "test", "test-warnings"], cwd=pkg, env=env, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
+        p = sp.run(jit + ["test", "test-warnings"], cwd=pkg, env=env, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
         out = p.stdout
         if p.returncode != 0 or "test result: ok. 1 passed" not in out:
             fail("%s: the test did not pass" % step, out)
@@ -123,7 +130,7 @@ with tempfile.TemporaryDirectory(prefix="test-warnings-") as tmp:
             fail("%s: a warning printed" % step, out)
     one = Path(tmp) / "one.rs"
     one.write_text("use std::hint::black_box as bb;\nuse std::collections::BTreeMap;\n\n#[test]\nfn a() {\n    assert_eq!(bb(2) + 2, 4);\n}\n")
-    p = sp.run([binary, "test", str(one)], cwd=tmp, env=env, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
+    p = sp.run(jit + ["test", str(one)], cwd=tmp, env=env, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
     out = p.stdout
     if p.returncode != 0 or "test result: 1 passed; 0 failed" not in out:
         fail("a single file: the test did not pass", out)
@@ -147,11 +154,28 @@ with tempfile.TemporaryDirectory(prefix="test-warnings-") as tmp:
         if step.endswith("lib.rs"):
             lib = multi / "src" / "lib.rs"
             lib.write_text(lib.read_text().replace("m as u32 * 2", "(m as u32) << 1"))
-        p = sp.run([binary, "test", "test-warnings-multi"], cwd=multi, env=env, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
+        p = sp.run(jit + ["test", "test-warnings-multi"], cwd=multi, env=env, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
         out = p.stdout
         if p.returncode != 0 or sum(1 for line in out.splitlines() if "test result: ok. 1 passed" in line) != 3:
             fail("%s: the 3 targets' tests did not pass" % step, out)
         warnings = [line for line in out.splitlines() if ": warning: " in line]
         if missing(out, want) or len(warnings) != 1:
             fail("%s: %d warnings, want only %s" % (step, len(warnings), want[0]), out)
+
+    mac = Path(tmp) / "mac"
+    (mac / "src").mkdir(parents=True)
+    (mac / "tests").mkdir()
+    (mac / "Cargo.toml").write_text('[package]\nname = "test-warnings-mac"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n')
+    (mac / "src" / "lib.rs").write_text("#[macro_export]\nmacro_rules! twice {\n    ($e:expr) => { $e * 2 };\n}\n\n"
+                                        "#[macro_export]\nmacro_rules! thrice {\n    ($e:expr) => { $e * 3 };\n}\n\n"
+                                        "pub mod kit {\n    pub use crate::thrice;\n}\n")
+    (mac / "tests" / "m.rs").write_text("use std::collections::BTreeSet;\nuse test_warnings_mac::kit::thrice;\nuse test_warnings_mac::twice;\n\n"
+                                        "#[test]\nfn t() {\n    let f = |x: u32| twice!(x) + thrice!(x);\n    assert_eq!(f(1), 5);\n}\n")
+    p = sp.run(jit + ["test", "test-warnings-mac"], cwd=mac, env=env, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
+    out = p.stdout
+    if p.returncode != 0 or "test result: ok. 1 passed" not in out:
+        fail("macros read by a test: its test did not pass", out)
+    warnings = [line for line in out.splitlines() if ": warning: " in line]
+    if missing(out, ["warning: unused import: `std::collections::BTreeSet`"]) or len(warnings) != 1:
+        fail("macros read by a test: %d warnings, want only BTreeSet's" % len(warnings), out)
 print("test_warnings: ok")

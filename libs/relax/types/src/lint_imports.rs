@@ -326,13 +326,16 @@ pub fn check(prog: &Program, tcx: &Tcx, c: &crate::lint_dead::CrateItems, reach:
         // each kept item's range reaches back to the end of the one before it: its attributes
         // (`#[derive(Widget)]`) and doc comments are part of the scope
         let mut prev_hi = if md.parent_mod.is_none() { 0 } else { ast_item_lo(prog, md.def) };
+        let test_build = prog.crates[md.krate as usize].cfg.set.iter().any(|s| s == "test");
         for &it in &items {
             let item = ast.item(it);
             match item.kind {
                 // child modules have scopes of their own; `use` items are checked, not scanned
                 ItemKind::Mod(_) | ItemKind::Use(_) => {}
-                // a `#[test]` fn is not part of the program outside a test build
-                ItemKind::Fn(..) if lint::has_attr(prog, file, ast.list(item.attrs), "test") => {}
+                // a `#[test]` fn is part of the program only in a test build: there the macros it
+                // calls are uses of their imports (`use ..::script_eval;` read only by a test's
+                // `script_eval!(..)`; a test run called it unused)
+                ItemKind::Fn(..) if !test_build && lint::has_attr(prog, file, ast.list(item.attrs), "test") => {}
                 _ => ranges.push((prev_hi.min(item.lo), item.hi)),
             }
             prev_hi = item.hi;
