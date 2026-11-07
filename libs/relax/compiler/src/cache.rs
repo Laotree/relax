@@ -167,8 +167,8 @@ const KIND_WARM_OUTCOME: u32 = 10;
 /// payload: its counted window showed too little work for O3, jit.rs pgo_poll) or queued for O3
 /// (TIER_QUEUED_SALT, payload: the cost rate it was queued at, 8 bytes LE: jit.rs tier_drain). A
 /// launch that links the entry starts from that decision (jit.rs stored_tier_verdict) instead of
-/// making it again from its own start: parked -> final, queued -> its counted build at once, no
-/// verdict (it counted and never turned hot) -> final
+/// making it again from its own start: parked -> final, queued -> it counts as fresh code does
+/// (never final at link), no verdict (it counted and never turned hot) -> final
 const KIND_TIER: u32 = 20;
 /// `makepad test`'s check of its crates under test that passed with warnings (run.rs
 /// check_test_subjects): the warnings it printed, under the key of their check keys together

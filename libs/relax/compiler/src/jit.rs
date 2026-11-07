@@ -10837,12 +10837,15 @@ unsafe fn settle_final(u: &Unit, id: u32) -> bool {
 /// earlier run stored for that code (Cache::tier_verdict), not one made again from this run's
 /// start -- a warm launch's faster code crossed the O3 bar where the run that stored it had not,
 /// and its counted builds parked them again (warm Fab: ~150 slots, the launch never settled).
-/// Parked: final, its loops included (STORED_PARKED). Queued (and no verdict since): its counted
-/// build now (Q_STORED). Neither (it counted and never turned hot): final. Baseline code without a
-/// parked verdict counts on: it gets its O2 build by running (base_running, the settle sweep), and
-/// that install applies the verdict. Final code counts again when the settled state re-arms
-/// (settle_tier_tick), and without a parked verdict when one of its loops turns hot (rt_loop_hot).
-/// Unit lock held.
+/// Parked: final, its loops included (STORED_PARKED). Neither queued nor parked (it counted and
+/// never turned hot): final. Queued (and no verdict since): it counts as this run's code does,
+/// and this run's counts queue it. (Queued at link, every slot an earlier run had queued was built
+/// whether this run ran it or not: a short process -- a test -- ends before that backlog is built,
+/// so each launch queued the backlogs of all before it, and the compiler's test children waited
+/// behind them for their own builds, 11-07.) Baseline code without a parked verdict counts on: it
+/// gets its O2 build by running (base_running, the settle sweep), and that install applies the
+/// verdict. Final code counts again when the settled state re-arms (settle_tier_tick), and without
+/// a parked verdict when one of its loops turns hot (rt_loop_hot). Unit lock held.
 unsafe fn stored_tier_verdict(u: &Unit, id: u32, v: crate::cache::TierVerdict, base: bool) {
     use crate::cache::TierVerdict;
     match v {
@@ -10853,11 +10856,10 @@ unsafe fn stored_tier_verdict(u: &Unit, id: u32, v: crate::cache::TierVerdict, b
                 w5.fetch_and(!STORED_PARKED, Ordering::Relaxed);
             }
         }
-        _ if base => {}
-        TierVerdict::Queued(rate) => queue_now(u, id, Q_STORED, rate),
-        TierVerdict::None => {
+        TierVerdict::None if !base => {
             settle_final(u, id);
         }
+        _ => {}
     }
 }
 
@@ -16058,7 +16060,7 @@ pub(crate) static TIER1_ENABLED: std::sync::atomic::AtomicBool = std::sync::atom
 static TIER_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Queues slot `id` for its O3 build now, ahead of its counts (if it is still counting): marked
-/// `#[relax(O3)]` (Q_MARKED, rate 0) or by its stored verdict (Q_STORED, the rate it was queued at).
+/// `#[relax(O3)]` (Q_MARKED, rate 0).
 unsafe fn queue_now(u: &Unit, id: u32, why: u8, rate: u64) {
     let rec = tier_rec(&u.slots, id);
     let code = (*rec.add(1)).load(Ordering::Relaxed);
@@ -16917,8 +16919,9 @@ fn drain_tier_inbox() {
 
 /// Slot `id`, queued for O3 by its calls or loops at cost rate `rate`, stays queued: a worker took
 /// it for its build, or the run ends with it queued and not gone cold (record_queued_at_exit). Its
-/// queued verdict goes into the cache: a later launch that links its code builds it at once
-/// (stored_tier_verdict), unless a verdict after this one parked it or its O3 code was stored.
+/// queued verdict goes into the cache: a later launch that links its code counts it rather than
+/// making it final (stored_tier_verdict), unless a verdict after this one parked it or its O3 code
+/// was stored.
 /// Unit lock held.
 unsafe fn record_queued(up: *mut Unit, id: u32, rate: u64) {
     let u = &mut *up;
@@ -16992,15 +16995,12 @@ const Q_RETIER: u8 = 2;
 const Q_MARKED: u8 = 3;
 /// PGO: a counted build's window is over (pgo_poll)
 const Q_PROFILED: u8 = 4;
-/// an earlier run queued the code linked from the cache and stored no verdict after (Cache::
-/// tier_verdict): its counted build at once, as Q_CALLS's, never counted again (tier_revalidate)
-const Q_STORED: u8 = 5;
-const Q_WHY: [&str; 6] = ["calls", "loop", "retier", "marked", "profiled", "stored"];
+const Q_WHY: [&str; 5] = ["calls", "loop", "retier", "marked", "profiled"];
 
-/// Queued by how the slot runs (rt_hot: its calls, its loops) or by its stored verdict: its O2
-/// build (o2_hot), then its counted build
+/// Queued by how the slot runs (rt_hot: its calls, its loops): its O2 build (o2_hot), then its
+/// counted build
 fn queued_hot(why: u8) -> bool {
-    matches!(why, Q_CALLS | Q_LOOP | Q_STORED)
+    matches!(why, Q_CALLS | Q_LOOP)
 }
 
 fn prep_verify() -> bool {
@@ -17830,11 +17830,11 @@ pub(crate) mod busy {
     /// an O3 queue push: + its reason (Q_*)
     pub const PUSH: usize = 2;
     /// O3 code installed
-    pub const O3: usize = 8;
+    pub const O3: usize = 7;
     /// an O2 or verified-O1 build finished (background: counted, but it does not restart the quiet)
-    pub const O2: usize = 9;
-    const KINDS: usize = 10;
-    const NAMES: [&str; KINDS] = ["lazy", "spec", "push calls", "push loop", "push retier", "push marked", "push profiled", "push stored", "O3 installed", "O2 built (no restart)"];
+    pub const O2: usize = 8;
+    const KINDS: usize = 9;
+    const NAMES: [&str; KINDS] = ["lazy", "spec", "push calls", "push loop", "push retier", "push marked", "push profiled", "O3 installed", "O2 built (no restart)"];
     const SECS: usize = 128;
     static AT: [[AtomicU32; KINDS]; SECS] = [const { [const { AtomicU32::new(0) }; KINDS] }; SECS];
     /// every event so far that restarts the quiet (the latch compares it tick to tick)
@@ -19196,14 +19196,11 @@ fn run_o3(entry: (u32, u8, u64, u64)) {
         if queued_hot(why) {
             owner::publish(|| unsafe {
                 o2_hot(up, id);
-                // taken for its build: its queued verdict (a stored one's is in the cache)
-                if why != Q_STORED {
-                    record_queued(up, id, rate);
-                }
+                // taken for its build: its queued verdict
+                record_queued(up, id, rate);
             });
             // a threshold's cost that came slower than CALL_FAST_NS into code bigger than SMALL_CODE:
-            // lukewarm until its counts show the work (a hot loop under it queues it as Q_LOOP instead;
-            // a stored verdict's rate is the one an earlier run queued it at)
+            // lukewarm until its counts show the work (a hot loop under it queues it as Q_LOOP instead)
             let lukewarm = why != Q_LOOP && unsafe {
                 let u = &*up;
                 let threshold = u.tier1.as_ref().map_or(0, |t| t.threshold);
