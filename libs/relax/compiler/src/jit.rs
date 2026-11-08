@@ -26658,7 +26658,7 @@ mod front_yield_tests {
     /// build waits for nothing that job holds, so this is no hang.
     #[test]
     fn a_build_below_the_jit_floor_finishes_and_the_last_job_runs_after_it() {
-        isolated_test!(a_build_below_the_jit_floor_finishes_and_the_last_job_runs_after_it);
+        isolated_test!(a_build_below_the_jit_floor_finishes_and_the_last_job_runs_after_it, cores = 12);
         use makepad_cpu_budget as budget;
         use std::sync::Arc;
         // (a small machine has no floor for the build to be below)
@@ -26709,7 +26709,7 @@ mod front_yield_tests {
 
     #[test]
     fn jobs_on_every_token_do_not_hang_on_a_build_that_needs_one() {
-        isolated_test!(jobs_on_every_token_do_not_hang_on_a_build_that_needs_one);
+        isolated_test!(jobs_on_every_token_do_not_hang_on_a_build_that_needs_one, cores = 8);
         use std::sync::Arc;
         let (u, f, g, path) = two_fn_unit("budget_lock");
         let up = &*u as *const Unit as usize;
