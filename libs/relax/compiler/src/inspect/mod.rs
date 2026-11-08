@@ -645,7 +645,10 @@ fn role(name: &str, os_id: u64, handle: u64) -> &'static str {
     if handle != 0 && handle == crate::owner::owner_tid() {
         return "owner";
     }
-    let _ = os_id;
+    // a hosted run's process main thread: the host's main loop, its window
+    if os_id != 0 && os_id == crate::run::host_thread() {
+        return "host";
+    }
     match name {
         n if n.starts_with("run-inspect") || n.starts_with("makepad-remote") => "inspect",
         n if n.starts_with("run-jit-") || n.starts_with("gandalf") || n.starts_with("run-check") => "compiler",
@@ -1137,7 +1140,7 @@ pub fn thread_label(handle: u64, threads: &[threads::Thread]) -> String {
 /// A thread's name as a report shows it. One nobody named (no name, or on Linux the one it took
 /// over from the process's first thread: the binary's, which read like the JIT's own) is the
 /// program thread its domain knows it as, when it is one, and `unnamed` otherwise.
-fn shown_name(t: &threads::Thread, threads: &[threads::Thread]) -> String {
+pub(crate) fn shown_name(t: &threads::Thread, threads: &[threads::Thread]) -> String {
     let first = std::process::id() as u64;
     let unnamed = t.name.is_empty() || t.os_id != first && threads.iter().any(|p| p.os_id == first && p.name == t.name);
     if !unnamed {
@@ -1176,6 +1179,10 @@ fn cmd_threads(out: &mut Out) {
         }
         if let Some(r) = jit_rows.iter().find(|r| r.os_id == t.os_id) {
             wait.push_str(&lifeline_fields(r));
+        }
+        // held by a pause (or for good: a frame in code a layout patch replaced)
+        if instrument::held_now(t.os_id) {
+            wait.push_str(",\"held\":true");
         }
         out.line(&format!(
             "{{\"id\":\"{}\",\"name\":{},\"role\":\"{}\",\"state\":\"{}\",\"cpu_ms\":{}{}}}",
