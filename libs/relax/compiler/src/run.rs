@@ -986,7 +986,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             // a run no one attends (an app a test starts, makepad_test launch_package): no live
             // session, and nothing parks -- a compile error is its call's panic, a panic unwinds at
             // once, a crash ends the run -- so the test fails with the text instead of waiting
-            // for a resume that never comes (Fab's test apps parked at a compile error for an hour)
+            // for a resume that never comes (test apps parked at a compile error for an hour)
             "--unattended" => {
                 no_live = true;
                 crate::inspect::events::unattended();

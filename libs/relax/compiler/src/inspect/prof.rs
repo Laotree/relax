@@ -219,8 +219,8 @@ mod imp {
 
     /// Rings for `tids` (busiest first), one size for all: the largest at which each of the
     /// first `first` (the threads seen running) gets one, then the rest at that size while the
-    /// budget lasts. Greedy 2 MB rings for the first few spent the budget on 8 of Fab's ~100
-    /// threads and left its slicing workers none. Returns the rings, the indices of the threads
+    /// budget lasts. Greedy 2 MB rings for the first few spent the budget on 8 of an app's ~100
+    /// threads and left its workers none. Returns the rings, the indices of the threads
     /// whose event did not open (and the last errno) and of those left without a ring.
     fn open_rings(tids: &[u64], first: usize, hz: u64, ev: super::Ev) -> (Vec<Ring>, Vec<usize>, i64, Vec<usize>) {
         let (mut no_event, mut errno) = (Vec::new(), 0);

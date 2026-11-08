@@ -941,7 +941,6 @@ fn a_thread_held_for_good_leaves_with_its_run() {
     let held = crate::inspect::threads::list().into_iter().find(|t| t.name == "held-for-good").expect("the fixture's thread");
     assert!(crate::inspect::instrument::hold_for_good(&held), "the thread is held");
     let end = end_run(up, Duration::from_secs(10));
-    eprintln!("{}", end.line());
     assert!(end.left.is_empty(), "left: {:?}", end.left);
     main.join().unwrap();
     wait_thread_done(domain);
