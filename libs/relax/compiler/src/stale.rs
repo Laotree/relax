@@ -210,9 +210,16 @@ pub unsafe fn on_fault(f: &crate::os::fault::Fault, r: &'static Range, walk: imp
             let _ = write(w, b"s".as_ptr().cast(), 1);
         }
     }
-    while !crate::domain::current_is_ending() {
+    leave_when(crate::domain::current_is_ending);
+}
+
+/// Parks the faulted thread until `ending` says its run ends, then counts it out of
+/// [`stuck_threads`]: once it leaves, the program can hand its state over again.
+fn leave_when(ending: impl Fn() -> bool) {
+    while !ending() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    STUCK.fetch_sub(1, Ordering::AcqRel);
 }
 
 /// "makepad-run: stale access ..." on stderr from the handler (a stack buffer, write(2)).
@@ -610,5 +617,22 @@ mod tests {
         assert!(crate::inspect::events::parked_now().is_empty(), "nothing waits for a decision");
         assert_eq!(super::stuck_threads(), 0, "the app can still hand its state over");
         assert!(crate::reload::restart_pending().iter().any(|p| p == &held[0]), "the restart is offered: {:?}", crate::reload::restart_pending());
+    }
+
+    /// A thread parked at a stale access blocks the handover while it waits, and no longer once
+    /// its run ended: the count was never undone, so the handover stayed blocked for the rest of
+    /// the process (11-08).
+    #[test]
+    fn a_parked_thread_blocks_the_handover_only_while_it_waits() {
+        isolated_test!(a_parked_thread_blocks_the_handover_only_while_it_waits);
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static ENDED: AtomicBool = AtomicBool::new(false);
+        // (as `on_fault` counts the thread in when it faults)
+        super::STUCK.fetch_add(1, Ordering::AcqRel);
+        let parked = std::thread::spawn(|| super::leave_when(|| ENDED.load(Ordering::Acquire)));
+        assert_eq!(super::stuck_threads(), 1, "parked: the handover waits");
+        ENDED.store(true, Ordering::Release);
+        parked.join().unwrap();
+        assert_eq!(super::stuck_threads(), 0, "its run ended: the state can be handed over");
     }
 }
