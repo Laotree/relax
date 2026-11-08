@@ -22281,10 +22281,33 @@ fn run_spec(unit: usize, id: u32) {
             // gave way to a program thread: first in line again
             Ok(false) => queue::spec(unit, id),
             Ok(true) => {}
-            Err(_) => {
+            Err(p) => {
                 SPEC_PANICS.fetch_add(1, Ordering::Relaxed);
+                spec_dropped(unit, id, || format!("a panic escaped its build: {}", payload_text(&*p)));
             }
         }
+}
+
+/// A speculative build of slot `id` ended without its code (`why`, made only when someone looks):
+/// nothing builds it again until something calls it. A flight recorder event; and (tests) the
+/// answer to a test waiting for that build at BACK_END_GATE that it will not come.
+fn spec_dropped(unit: usize, id: u32, why: impl FnOnce() -> String) {
+    #[cfg(test)]
+    if BACK_END_GATE.load(Ordering::SeqCst) == 1 {
+        BACK_END_STOPPED.0.lock().unwrap_or_else(|e| e.into_inner()).push((unit, id, why()));
+        BACK_END_STOPPED.1.notify_all();
+        return;
+    }
+    if crate::inspect::flightrec::on() {
+        crate::inspect::flightrec::event("compile.spec_dropped", &format!("#{id} {}", why()), id as u64, unit as u64);
+    }
+}
+
+/// spec_build's take gave up (take_prefronted, its reason in TAKE_DROP): counted by the reason.
+fn spec_take_dropped(unit: usize, id: u32) {
+    let (td, af, slot) = TAKE_DROP.try_with(|d| d.get()).unwrap_or((TD_ROUNDS, AF_OK, u32::MAX));
+    SPEC_TAKE_DROPS[td as usize].fetch_add(1, Ordering::Relaxed);
+    spec_dropped(unit, id, || format!("its take gave up: {} {} (slot #{})", TD_NAMES[td as usize], if td == TD_FRONT { PREFRONT_FAIL_NAMES[af as usize] } else { "" }, slot));
 }
 
 /// speculative workers stop taking work (exit summary, Unit drop)
@@ -22307,6 +22330,20 @@ pub fn stop_background_tiers() {
 }
 /// background jobs that panicked outside their build's own recovery (lock released)
 pub static SPEC_PANICS: AtomicU64 = AtomicU64::new(0);
+/// Speculative builds whose take gave up and that were dropped whole (spec_take_dropped), by the
+/// take's reason (TD_NAMES)
+pub static SPEC_TAKE_DROPS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// The run summary's count of the speculative builds that ended without their code: the takes
+/// that gave up, by reason, and the panics.
+pub fn spec_drops_summary() -> String {
+    let mut parts: Vec<String> = TD_NAMES.iter().zip(SPEC_TAKE_DROPS.iter()).map(|(name, n)| (name, n.load(Ordering::Relaxed))).filter(|(_, n)| *n > 0).map(|(name, n)| format!("take {name} {n}")).collect();
+    let panics = SPEC_PANICS.load(Ordering::Relaxed);
+    if panics > 0 {
+        parts.push(format!("panics {panics}"));
+    }
+    parts.join(", ")
+}
 
 /// The process is ending on this thread: stops the background compilers (speculative workers,
 /// O3, preemptible checks); from now on the owner serves only this thread's requests (and its
@@ -23391,6 +23428,11 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
 static BACK_END_GATE: AtomicU32 = AtomicU32::new(0);
 #[cfg(test)]
 static BACK_END_THREAD: AtomicU64 = AtomicU64::new(0);
+/// (tests) A back end stopped at BACK_END_GATE, or a speculative build that will not come to it
+/// (spec_dropped: its unit, slot and why): the condvar wakes `back_end_at_gate`'s wait (the back
+/// end itself spins there, keeping its token).
+#[cfg(test)]
+static BACK_END_STOPPED: (std::sync::Mutex<Vec<(usize, u32, String)>>, std::sync::Condvar) = (std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new());
 
 impl BackWork {
     /// Optimises and generates the code (any thread, no unit state).
@@ -23398,7 +23440,11 @@ impl BackWork {
         #[cfg(test)]
         if BACK_END_GATE.load(Ordering::SeqCst) == 1 {
             BACK_END_THREAD.store(me(), Ordering::SeqCst);
-            BACK_END_GATE.store(2, Ordering::SeqCst);
+            {
+                let _seen = BACK_END_STOPPED.0.lock().unwrap_or_else(|e| e.into_inner());
+                BACK_END_GATE.store(2, Ordering::SeqCst);
+            }
+            BACK_END_STOPPED.1.notify_all();
             while BACK_END_GATE.load(Ordering::SeqCst) != 0 {
                 std::thread::yield_now();
             }
@@ -23626,7 +23672,15 @@ unsafe fn spec_build(up: *mut Unit, id: u32) -> bool {
             true
         }
         Some(Begin::Done(Split::Failed(e))) if e == YIELDED => false,
-        Some(Begin::Done(_)) | None => true,
+        Some(Begin::Done(Split::Failed(e))) => {
+            spec_dropped(up as usize, id, || format!("its build failed: {e}"));
+            true
+        }
+        Some(Begin::Done(_)) => true,
+        None => {
+            spec_take_dropped(up as usize, id);
+            true
+        }
     }
 }
 
@@ -26495,14 +26549,32 @@ mod front_yield_tests {
         (job, thread)
     }
 
-    /// Waits for a state these tests' threads reach by themselves: one that does not come is a plain
-    /// failure, not a test that spins for good.
-    fn reached(what: &str, state: impl Fn() -> bool) {
-        let t0 = std::time::Instant::now();
+    /// Blocks until `state`, a state of the CPU budget (who holds a token, who waits for one) or
+    /// one that comes with a change of it, holds: looked at again at each change, never by the
+    /// clock. One that never comes holds the test (a hung test).
+    fn on_budget_change(state: impl Fn() -> bool) {
+        let mut seen = makepad_cpu_budget::changes();
         while !state() {
-            assert!(t0.elapsed().as_secs() < 60, "{what} did not come: {}", makepad_cpu_budget::report_string());
-            std::thread::yield_now();
+            seen = makepad_cpu_budget::wait_for_change(seen);
         }
+    }
+
+    /// Blocks until the speculative build of `slot` (unit `up`) queued with BACK_END_GATE at 1
+    /// stopped at its gate. One that ended without its back end (spec_dropped) fails the test with
+    /// its reason.
+    fn back_end_at_gate(up: usize, slot: u32) {
+        let mut seen = BACK_END_STOPPED.0.lock().unwrap_or_else(|e| e.into_inner());
+        while BACK_END_GATE.load(Ordering::SeqCst) != 2 {
+            if let Some((_, _, why)) = seen.iter().find(|d| d.0 == up && d.1 == slot) {
+                panic!("the speculative build of #{slot} will not come to its gate: {why}");
+            }
+            seen = BACK_END_STOPPED.1.wait(seen).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// The budget's rows of these tests' pool jobs (`label`), lent ones too.
+    fn pool_jobs(label: &str) -> usize {
+        makepad_cpu_budget::tokens().holders.iter().filter(|h| h.label == label).count()
     }
 
     /// As many jobs as CPU tokens, each with its token, all calling one fn whose speculative build
@@ -26517,18 +26589,16 @@ mod front_yield_tests {
         use std::sync::Arc;
         BACK_END_GATE.store(1, Ordering::SeqCst);
         queue::spec(up, slot);
-        reached("the build at its gate", || BACK_END_GATE.load(Ordering::SeqCst) == 2);
-        let (admitted, go, left) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(callers)));
+        back_end_at_gate(up, slot);
+        let (go, left) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(callers)));
         let handles = (0..jobs).map(|i| {
-            let (admitted, go, left) = (admitted.clone(), go.clone(), left.clone());
+            let (go, left) = (go.clone(), left.clone());
             std::thread::spawn(move || {
                 // (the wait's own code compiled first: under the JIT a thread waiting for a compile
                 // lends its token, and the build would get it)
-                admitted.fetch_add(0, Ordering::SeqCst);
                 let _ = go.load(Ordering::SeqCst);
                 std::thread::yield_now();
                 let permit = budget::admit(budget::VISIBLE, budget::APP, "a pool job");
-                admitted.fetch_add(1, Ordering::SeqCst);
                 while !go.load(Ordering::SeqCst) {
                     std::thread::yield_now();
                 }
@@ -26547,13 +26617,13 @@ mod front_yield_tests {
             })
         }).collect();
         // the build's token is the one the last job waits for: its first checkpoint yields it
-        reached("the last job waiting for a token", || budget::tokens().waiting.iter().any(|w| w.class == budget::VISIBLE && w.client == budget::APP));
+        on_budget_change(|| budget::tokens().waiting.iter().any(|w| w.class == budget::VISIBLE && w.client == budget::APP));
         BACK_END_GATE.store(0, Ordering::SeqCst);
-        reached("every job admitted", || admitted.load(Ordering::SeqCst) >= jobs);
+        on_budget_change(|| pool_jobs("a pool job") >= jobs);
         // (a build that no longer stops here would pass without showing anything; asked of the budget,
         // which every JIT in the process shares: under the JIT the wait hook is the loader's)
         let building = BACK_END_THREAD.load(Ordering::SeqCst);
-        reached("the build waiting for a token", || {
+        on_budget_change(|| {
             assert!(queue::running_class(up, slot).is_some(), "the build sits out its checkpoint for the last job");
             budget::tokens().waiting.iter().any(|w| w.thread == building)
         });
@@ -26575,7 +26645,6 @@ mod front_yield_tests {
     fn a_build_below_the_jit_floor_finishes_and_the_last_job_runs_after_it() {
         isolated_test!(a_build_below_the_jit_floor_finishes_and_the_last_job_runs_after_it);
         use makepad_cpu_budget as budget;
-        use std::sync::atomic::AtomicUsize;
         use std::sync::Arc;
         // (a small machine has no floor for the build to be below)
         if budget::jit_floor() < 2 {
@@ -26588,28 +26657,29 @@ mod front_yield_tests {
         let (other, _) = other_compile_job(stop.clone());
         BACK_END_GATE.store(1, Ordering::SeqCst);
         queue::spec(up, f);
-        reached("the build at its gate", || BACK_END_GATE.load(Ordering::SeqCst) == 2);
-        let (admitted, done) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
+        back_end_at_gate(up, f);
+        let done = Arc::new(AtomicBool::new(false));
         let handles: Vec<_> = (0..jobs).map(|_| {
-            let (admitted, done) = (admitted.clone(), done.clone());
+            let done = done.clone();
             std::thread::spawn(move || {
                 // (compiled before it holds a token, as in `jobs_on_every_token`)
-                admitted.fetch_add(0, Ordering::SeqCst);
                 let _ = done.load(Ordering::SeqCst);
                 std::thread::yield_now();
                 let permit = budget::admit(budget::VISIBLE, budget::APP, "a pool job");
-                admitted.fetch_add(1, Ordering::SeqCst);
                 while !done.load(Ordering::SeqCst) {
                     std::thread::yield_now();
                 }
                 budget::release(permit);
             })
         }).collect();
-        reached("the last job waiting for a token", || budget::tokens().waiting.iter().any(|w| w.class == budget::VISIBLE && w.client == budget::APP));
+        on_budget_change(|| budget::tokens().waiting.iter().any(|w| w.class == budget::VISIBLE && w.client == budget::APP));
         BACK_END_GATE.store(0, Ordering::SeqCst);
-        // (the jobs keep their tokens until the end: a build that gave its own up would stand still here)
-        reached("the build finished on its own token", || queue::running_class(up, f).is_none());
-        reached("the last job running after it", || admitted.load(Ordering::SeqCst) >= jobs);
+        // (the jobs keep their tokens until the end: a build that gave its own up would stand still
+        // here. Its worker leaves the queue's running list before it gives the build's token back,
+        // a change of the budget: with the last job waiting for one it keeps none for a next job.)
+        on_budget_change(|| queue::running_class(up, f).is_none());
+        // the last job running after it
+        on_budget_change(|| pool_jobs("a pool job") >= jobs);
         done.store(true, Ordering::SeqCst);
         for job in handles {
             job.join().unwrap();
@@ -28481,6 +28551,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&SPEC_STOP, AtomicBool::new(false));
     reset(&DRAIN_ANYWAY, AtomicBool::new(false));
     reset(&SPEC_PANICS, AtomicU64::new(0));
+    reset(&SPEC_TAKE_DROPS, [const { AtomicU64::new(0) }; 7]);
     reset(&BG_DRAINED, AtomicBool::new(false));
     reset(&BG_PAUSE, AtomicBool::new(false));
     reset(&BG_PAUSER, AtomicU64::new(0));
