@@ -1129,9 +1129,21 @@ pub fn thread_label(handle: u64, threads: &[threads::Thread]) -> String {
         return "?".into();
     }
     match threads.iter().find(|t| t.handle == handle) {
-        Some(t) => format!("{} ({})", if t.name.is_empty() { "-" } else { &t.name }, tid_label(t.os_id)),
+        Some(t) => format!("{} ({})", shown_name(t, threads), tid_label(t.os_id)),
         None => format!("thread {:#x}", handle),
     }
+}
+
+/// A thread's name as a report shows it. One nobody named (no name, or on Linux the one it took
+/// over from the process's first thread: the binary's, which read like the JIT's own) is the
+/// program thread its domain knows it as, when it is one, and `unnamed` otherwise.
+fn shown_name(t: &threads::Thread, threads: &[threads::Thread]) -> String {
+    let first = std::process::id() as u64;
+    let unnamed = t.name.is_empty() || t.os_id != first && threads.iter().any(|p| p.os_id == first && p.name == t.name);
+    if !unnamed {
+        return t.name.clone();
+    }
+    crate::domain::program_thread_name(t.os_id).unwrap_or_else(|| "unnamed".into())
 }
 
 /// The thread whose stack holds the page a mutex holder tag names (Relax std's RawMutex tag:
