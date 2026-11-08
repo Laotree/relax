@@ -645,7 +645,10 @@ fn role(name: &str, os_id: u64, handle: u64) -> &'static str {
     if handle != 0 && handle == crate::owner::owner_tid() {
         return "owner";
     }
-    let _ = os_id;
+    // a hosted run's process main thread: the host's main loop, its window
+    if os_id != 0 && os_id == crate::run::host_thread() {
+        return "host";
+    }
     match name {
         n if n.starts_with("run-inspect") || n.starts_with("makepad-remote") => "inspect",
         n if n.starts_with("run-jit-") || n.starts_with("gandalf") || n.starts_with("run-check") => "compiler",
@@ -1176,6 +1179,10 @@ fn cmd_threads(out: &mut Out) {
         }
         if let Some(r) = jit_rows.iter().find(|r| r.os_id == t.os_id) {
             wait.push_str(&lifeline_fields(r));
+        }
+        // held by a pause (or for good: a frame in code a layout patch replaced)
+        if instrument::held_now(t.os_id) {
+            wait.push_str(",\"held\":true");
         }
         out.line(&format!(
             "{{\"id\":\"{}\",\"name\":{},\"role\":\"{}\",\"state\":\"{}\",\"cpu_ms\":{}{}}}",

@@ -1231,6 +1231,11 @@ pub(crate) fn program_thread(t: &super::threads::Thread) -> bool {
     !(t.name.starts_with("run-") || t.name.starts_with("gandalf") || (t.handle != 0 && t.handle == crate::owner::owner_tid()))
 }
 
+/// Whether the pause holds thread `os_id` now (held for good included): `makepad inspect threads`.
+pub(crate) fn held_now(os_id: u64) -> bool {
+    pause_imp::holds(os_id)
+}
+
 #[cfg(target_vendor = "apple")]
 mod pause_imp {
     static HELD: relax_session::sync::Mutex<Vec<crate::inspect::threads::Thread>> = relax_session::sync::Mutex::new(Vec::new());
@@ -1329,6 +1334,9 @@ mod pause_imp {
         }
         ok
     }
+    pub fn holds(os_id: u64) -> bool {
+        HELD.lock().unwrap_or_else(|e| e.into_inner()).iter().chain(KEPT.lock().unwrap_or_else(|e| e.into_inner()).iter()).any(|t| t.os_id == os_id)
+    }
     pub fn release_kept() -> usize {
         let kept = std::mem::take(&mut *KEPT.lock().unwrap_or_else(|e| e.into_inner()));
         let n = kept.len();
@@ -1411,6 +1419,9 @@ mod pause_imp {
         drop(held);
         crate::inspect::threads::hold_for_good(t.os_id).is_ok()
     }
+    pub fn holds(os_id: u64) -> bool {
+        crate::inspect::threads::is_held(os_id)
+    }
     pub fn release_kept() -> usize {
         crate::inspect::threads::release_held_for_good()
     }
@@ -1425,6 +1436,9 @@ mod pause_imp {
         0
     }
     pub fn keep(_t: &crate::inspect::threads::Thread) -> bool {
+        false
+    }
+    pub fn holds(_os_id: u64) -> bool {
         false
     }
     pub fn release_kept() -> usize {

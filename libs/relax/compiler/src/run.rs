@@ -275,6 +275,7 @@ pub fn cmd_run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     let host = run_host(sess.runtime.boot_only, args).filter(|_| hosted_program(sess, args));
     let code = if let Some(host) = host {
         HOSTED_RUN.store(true, Ordering::Release);
+        HOST_THREAD.store(crate::inspect::threads::self_os_id(), Ordering::Release);
         let sess = sess.clone();
         let args = args.to_vec();
         // (due from here: the inspect endpoint takes a relaunch before the compile thread runs)
@@ -312,6 +313,7 @@ pub fn cmd_run_app(package: &str, args: Vec<String>, mut prepare: Box<dyn FnMut(
     crate::run_end::leftovers::mark();
     let start = std::time::Instant::now();
     HOSTED_RUN.store(true, Ordering::Release);
+    HOST_THREAD.store(crate::inspect::threads::self_os_id(), Ordering::Release);
     APP_START.store(true, Ordering::Release);
     let package = package.to_string();
     let words = args.clone();
@@ -2766,6 +2768,15 @@ pub(crate) fn batch_program() {
 
 static MAIN_HOST: std::sync::OnceLock<MainHost> = std::sync::OnceLock::new();
 static HOSTED_RUN: AtomicBool = AtomicBool::new(false);
+/// The host's UI thread (its OS id): the one `cmd_run` hands to the host's main loop (`MainHost::run`)
+/// in a hosted run, the process's main thread, which runs the window: its drawing, its input, the
+/// run's own screens. 0: no run is hosted.
+static HOST_THREAD: AtomicU64 = AtomicU64::new(0);
+
+/// The host's UI thread ([`HOST_THREAD`]); 0 when no run is hosted.
+pub(crate) fn host_thread() -> u64 {
+    HOST_THREAD.load(Ordering::Acquire)
+}
 /// `makepad run --harness` (`makepad test`): the program is a test harness.
 static HARNESS_RUN: AtomicBool = AtomicBool::new(false);
 
