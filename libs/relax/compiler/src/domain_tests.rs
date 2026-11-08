@@ -896,7 +896,6 @@ fn a_run_ends_with_every_thread_wherever_it_is() {
     let (domain, _base, main) = launch(&mut u, entry, None, &flags);
     wait_at_place(domain, &flags);
     let end = end_run(up, Duration::from_secs(10));
-    eprintln!("{}", end.line());
     assert!(end.left.is_empty(), "left: {:?}", end.left);
     main.join().unwrap();
     wait_thread_done(domain);
@@ -1024,7 +1023,6 @@ fn a_run_ends_with_native_frames_in_it_and_no_host_lock_stays_held() {
     });
     wait(|| flags[0].load(Ordering::SeqCst) == 1);
     let end = end_run(up, Duration::from_millis(300));
-    eprintln!("{}", end.line());
     assert!(end.left.iter().any(|l| l.1 == "in-native"), "the call is never cut off: {:?}", end.left);
     assert!(!caller.join().unwrap(), "the callback's call came back saying the run ended");
     assert!(CALLER_LOCK.try_lock().is_ok());
@@ -1328,7 +1326,6 @@ fn a_run_ends_with_what_it_held_given_back() {
             flags[0].load(Ordering::SeqCst) == 1
         });
         let end = end_run(up, Duration::from_secs(10));
-        eprintln!("{}", end.line());
         assert!(end.left.is_empty(), "left: {:?}", end.left);
         main.join().unwrap();
         wait_thread_done(domain);
@@ -1368,7 +1365,6 @@ fn a_run_ends_with_what_it_held_given_back() {
         drop(u);
         std::fs::remove_dir_all(root).unwrap();
     }
-    eprintln!("left open by each round: {counts:?}");
     // (the first round's lazy compiles open what stays open for the whole process)
     assert_eq!(&counts[1..], &[0, 0], "left open: {lefts:?}");
 }
