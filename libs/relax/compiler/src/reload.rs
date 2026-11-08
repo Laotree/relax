@@ -297,6 +297,8 @@ pub struct Undo {
     uses: Vec<crate::program::UseUndo>,
     /// the items of the traits the edit changed, in their order before it
     traits: Vec<(usize, Vec<DefId>)>,
+    /// the fns the edit declared again (a type their signature names moved)
+    redeclared: Vec<DefId>,
 }
 
 // Lead decision 51: classify both versions using the definition collector's
@@ -594,6 +596,17 @@ fn restore_traits(u: &mut Unit, saved: &[(usize, Vec<DefId>)], scope: Option<&[b
 
 /// A refused or rolled-back edit's removed impls go back into the impl tables (the edit took
 /// them out: apply_locked's commit).
+/// Fns declared again against the program as it is now: a type their unchanged signature names
+/// moved, so the name means another type (decls_naming_removed); and back when the edit is
+/// refused or rolled back. The collection's errors (none for the running text).
+fn redeclare(u: &mut Unit, fns: &[DefId], scope: Option<&[bool]>) -> Vec<String> {
+    if fns.is_empty() {
+        return Vec::new();
+    }
+    u.tcx.invalidate_check(fns);
+    u.tcx.collect_added_in(&u.prog, fns, false, scope)
+}
+
 fn recollect_impls(u: &mut Unit, removed: &[DefId], scope: Option<&[bool]>) {
     let impls: Vec<DefId> = removed.iter().copied().filter(|d| u.prog.def(*d).kind == DefKind::Impl).collect();
     if !impls.is_empty() {
@@ -644,6 +657,7 @@ pub unsafe fn rollback(up: *mut Unit, undo: Undo, why: &str) -> Vec<String> {
             }
             recollect_impls(u, &undo.removed, undo.scope.as_deref());
             restore_traits(u, &undo.traits, undo.scope.as_deref());
+            let _ = redeclare(u, &undo.redeclared, undo.scope.as_deref());
             for (d, had) in &undo.variants { u.prog.restore_variants(*d, had); }
             for (d, adt) in &undo.adts {
                 if adt.is_enum { u.tcx.insert_ctor_sigs(*d, adt); }
@@ -996,14 +1010,16 @@ fn ty_names_def(u: &Unit, t: TyId, ds: &[DefId], depth: u32) -> bool {
 
 /// The declarations of the current files the edit reaches (`visible` crates; `news`: the edit's
 /// new versions) that still name a type or trait the edit removed: a fn's signature or bounds,
-/// an impl's header or bounds, a field's, const's or static's type. They kept the removed def,
-/// and a fresh build of the new text does not resolve the name (E0412, E0405): one error each,
-/// at the name.
-fn decls_naming_removed(u: &Unit, removed: &[DefId], news: &[u32], visible: &[bool]) -> Vec<String> {
+/// an impl's header or bounds, a field's, const's or static's type. They kept the removed def.
+/// Where a fresh build of the new text does not resolve the name: E0412 / E0405, one error each,
+/// at the name. Where every use of the name resolves now (the type moved: `use decode::Pic`), the
+/// declaration means the new type, which its collection from before the edit does not know: the
+/// second list, `(declaration, removed def)`.
+fn decls_naming_removed(u: &Unit, removed: &[DefId], news: &[u32], visible: &[bool]) -> (Vec<String>, Vec<(DefId, DefId)>) {
     let prog = &u.prog;
     let gone: Vec<DefId> = removed.iter().copied().filter(|d| matches!(prog.def(*d).kind, DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::TypeAlias | DefKind::Trait)).collect();
     if gone.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let names: Vec<Vec<u8>> = gone.iter().map(|d| def_name(prog, *d).into_bytes()).filter(|n| !n.is_empty()).collect();
     let syms: Vec<(DefId, crate::program::Sym)> = gone.iter().map(|&d| (d, prog.def(d).name)).collect();
@@ -1065,6 +1081,7 @@ fn decls_naming_removed(u: &Unit, removed: &[DefId], news: &[u32], visible: &[bo
         m
     };
     let mut out = Vec::new();
+    let mut moved = Vec::new();
     for f in files {
         let pf = &prog.files[f as usize];
         let src = &pf.src[..pf.src_len as usize];
@@ -1109,18 +1126,6 @@ fn decls_naming_removed(u: &Unit, removed: &[DefId], news: &[u32], visible: &[bo
                 let (code, what) = if prog.def(g).kind == DefKind::Trait { ("E0405", "trait") } else { ("E0412", "type") };
                 format!("{}: {}: cannot find {} `{}` in this scope (this edit removes it)", u.pos_str(f, pf.call_site(at)), code, what, name)
             };
-            if let Some(g) = named_by(d) {
-                out.push(report(g, at_name(def_name(prog, g).as_bytes()).unwrap_or(it.lo)));
-                continue;
-            }
-            // a type alias leaves no trace in the types it stood for: a name of a removed one
-            // that is not a generic parameter here and no longer resolves in the item's scope.
-            // So does an alias's own type (its type is lowered at its uses): every removed name
-            // in it is checked so (its names are type paths)
-            if !own(&i) {
-                continue;
-            }
-            let alias_item = prog.def(d).kind == DefKind::TypeAlias;
             let mut params: Vec<&[u8]> = Vec::new();
             let mut k = Some(i);
             while let Some(x) = k {
@@ -1146,6 +1151,26 @@ fn decls_naming_removed(u: &Unit, removed: &[DefId], news: &[u32], visible: &[bo
                 let global = segs.first().is_some_and(|s| !s.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_'));
                 !global && module_of_path(scope, krate, &segs).is_some_and(|m| prog.lookup_in_module(m, sym, true, &mut Vec::new()).is_none())
             };
+            if let Some(g) = named_by(d) {
+                // where a use of the name resolves to something now (the type moved), the
+                // declaration is not an error but means that
+                let name = def_name(prog, g);
+                let uses: Vec<usize> = (0..decl.len()).filter(|&k| decl[k].1 == name.as_bytes()).collect();
+                match uses.iter().find(|&&k| gone_use(k, prog.def(g).name)) {
+                    Some(&k) => out.push(report(g, decl[k].0)),
+                    None if !uses.is_empty() => moved.push((d, g)),
+                    None => out.push(report(g, it.lo)),
+                }
+                continue;
+            }
+            // a type alias leaves no trace in the types it stood for: a name of a removed one
+            // that is not a generic parameter here and no longer resolves in the item's scope.
+            // So does an alias's own type (its type is lowered at its uses): every removed name
+            // in it is checked so (its names are type paths)
+            if !own(&i) {
+                continue;
+            }
+            let alias_item = prog.def(d).kind == DefKind::TypeAlias;
             if let Some((g, at)) = syms.iter().filter(|(g, _)| alias_item || prog.def(*g).kind == DefKind::TypeAlias).find_map(|&(g, sym)| {
                 let name = prog.syms.str(sym).as_bytes();
                 (0..decl.len()).find(|&k| decl[k].1 == name && gone_use(k, sym)).map(|k| (g, decl[k].0))
@@ -1154,7 +1179,7 @@ fn decls_naming_removed(u: &Unit, removed: &[DefId], news: &[u32], visible: &[bo
             }
         }
     }
-    out
+    (out, moved)
 }
 
 fn child_items(ast: &crate::ast::Ast, k: &crate::ast::ItemKind) -> Vec<crate::ast::ItemId> {
@@ -5289,6 +5314,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let carry = gandalf_carries(&changes, versions.iter().map(|(_, p)| p));
     let mut use_undo: Vec<crate::program::UseUndo> = Vec::new();
     let mut removed_errs: Vec<String> = Vec::new();
+    // fns declared again: a type their unchanged signature names moved (decls_naming_removed)
+    let mut redeclared: Vec<DefId> = Vec::new();
     let errors0 = u.prog.errors.len();
     trace_stage("gate_prepare");
     {
@@ -5403,7 +5430,24 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             }
             // and the declarations whose unchanged text names a removed type or trait
             let new_files: Vec<u32> = news.iter().map(|&(_, n)| n).collect();
-            removed_errs.extend(decls_naming_removed(u, &removed_defs, &new_files, &visible_crates));
+            let (errs, moved) = decls_naming_removed(u, &removed_defs, &new_files, &visible_crates);
+            removed_errs.extend(errs);
+            // a declaration naming a type the edit moves (its text unchanged, the name resolving
+            // to the moved type now): a fn is declared again, as a fresh build declares it, so
+            // the edit's code checks against what its text means. Code built for it before the
+            // edit, or any other declaration (read as it was collected), is not rebuilt live
+            for (d, g) in moved {
+                let is_fn = matches!(u.prog.def(d).kind, DefKind::Fn | DefKind::AssocFn);
+                if is_fn {
+                    redeclared.push(d);
+                }
+                if !is_fn || !u.slots_of_defs([d]).is_empty() {
+                    let now = u.prog.lookup_in_scope(u.prog.def(d).scope, u.prog.def(g).name, true).map_or_else(|| def_name(&u.prog, g), |n| u.prog.def_path(n));
+                    layout_restart.push(format!("`{}` names `{}`, which this edit moves (the name means `{}` now), and what was built from its declaration before the edit is not rebuilt live -- restart the app", u.prog.def_path(d), def_name(&u.prog, g), now));
+                }
+            }
+            let errs = redeclare(u, &redeclared, Some(&visible_crates));
+            removed_errs.extend(errs);
         }
         trace_sub("imports");
         let lowered = if body_only {
@@ -6481,6 +6525,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
         recollect_impls(u, &removed_defs, scope.as_deref());
         restore_traits(u, &saved_traits, scope.as_deref());
+        let _ = redeclare(u, &redeclared, scope.as_deref());
         publish_reload(u, &news, full_inputs, scope.as_deref());
         if carry && !ctfe_relevant {
             let files: Vec<u32> = news.iter().flat_map(|&(a, b)| [a, b]).collect();
@@ -6721,7 +6766,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
     }
     out.files = olds.iter().map(|o| news.iter().find(|(x, _)| x == o).map_or(*o, |(_, n)| *n)).collect();
-    out.undo = Some(Undo { rekeyed, group: gen, versions: news.clone(), pairs: news_pairs.clone(), added: added_defs.clone(), removed: removed_defs.clone(), consts: saved_consts, consts_hit: consts_hit.clone(), adts: saved_adts, variants: saved_variants, const_failed: saved_failed, full_inputs, scope: scope.clone(), uses: std::mem::take(&mut use_undo), traits: saved_traits });
+    out.undo = Some(Undo { rekeyed, group: gen, versions: news.clone(), pairs: news_pairs.clone(), added: added_defs.clone(), removed: removed_defs.clone(), consts: saved_consts, consts_hit: consts_hit.clone(), adts: saved_adts, variants: saved_variants, const_failed: saved_failed, full_inputs, scope: scope.clone(), uses: std::mem::take(&mut use_undo), traits: saved_traits, redeclared });
     out.rung = Rung::Patch;
     if let Some(fv_cx) = fv_cx { fv_session_keep(transaction, fv_cx); }
     trace_count("inlining_callers", inlining_callers.len());
@@ -9708,38 +9753,83 @@ mod use_edit_tests {
 mod moved_type_tests {
     use super::*;
 
-    /// A type moved out of a file whose kept fns still name it, now through a `use` (an image
-    /// decoder moved to a crate of its own, 11-08). The edit looks for declarations that name
-    /// the removed type, which reads the kept fn's signature in the file's new version, and
-    /// with a lifetime in that signature it resolves the fn's bound variables. Those read the
-    /// new version's file input, which must exist by then: the edit stopped with an internal
-    /// compiler error (a missing query input), and the program it left half-made failed later
-    /// compiles the same way.
-    #[test]
-    fn moving_a_type_its_lifetime_signatures_name_patches() {
-        isolated_test!(moving_a_type_its_lifetime_signatures_name_patches);
+    /// A type moved out of a file whose kept fn still names it, now through a `use` (an image
+    /// decoder moved to a crate of its own, 11-08): `read`, the fn's signature was asked before
+    /// the edit; `built`, code for the fn exists. The edit's outcome and lines.
+    fn move_type(name: &str, read: bool, built: bool) -> (Rung, Vec<String>) {
         std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
         crate::borrowck::lazy::disable_gandalf();
         let old = "pub struct Pic { pub w: u32 }\npub fn width<'a>(p: &'a Pic) -> &'a u32 { &p.w }\nfn main() { let p = Pic { w: 1 }; let _ = *width(&p); }\n";
         let new = "mod decode { pub struct Pic { pub w: u32 } }\nuse decode::Pic;\npub fn width<'a>(p: &'a Pic) -> &'a u32 { &p.w }\nfn main() { let p = Pic { w: 2 }; let _ = *width(&p); }\n";
-        let path = std::env::temp_dir().join(format!("relax-moved-type-{}.rs", std::process::id()));
+        let path = std::env::temp_dir().join(format!("relax-moved-type-{}-{}.rs", name, std::process::id()));
         std::fs::write(&path, old).unwrap();
         let mut session = crate::Session::default();
         session.options.ctfe = crate::options::Ctfe::Off;
         let session = std::sync::Arc::new(session);
         let (prog, core, krate) = crate::load_with_std(&session, path.to_str().unwrap(), "moved_type", false).unwrap();
         let file = prog.defs.iter().find(|d| d.krate == krate && d.kind == DefKind::Fn).map(|d| d.file).unwrap();
+        let width = (0..prog.defs.len() as u32).map(DefId).find(|d| prog.def(*d).krate == krate && prog.name(*d) == "width").unwrap();
         let mut tcx = crate::tcx::Tcx::new();
         tcx.collect(&prog);
+        if read {
+            assert!(tcx.fn_sig(&prog, width).is_some());
+        }
         crate::layout::set_root_crate(krate);
         crate::layout::LIVE_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
         let mut unit = Unit::new(prog, tcx, core);
+        if built {
+            unit.fn_id(FnKey::Inst(width, Vec::new()));
+        }
         let up = &mut *unit as *mut Unit;
         let outcome = unsafe { apply(up, vec![Edit { file, path: path.to_string_lossy().into_owned(), src: new.as_bytes().to_vec() }]) };
         assert!(!outcome.lines.iter().any(|l| l.contains("internal compiler error")), "{:?}", outcome.lines);
-        assert_eq!(outcome.rung, Rung::Patch, "{:?}", outcome.lines);
+        if outcome.rung == Rung::Patch {
+            // the kept fn is declared with the moved type, as a fresh build declares it
+            let param = unit.tcx.fn_sig(&unit.prog, width).unwrap().params[0];
+            let moved = (0..unit.prog.defs.len() as u32).map(DefId).find(|d| unit.prog.def(*d).krate == krate && unit.prog.def_path(*d).ends_with("decode::Pic")).unwrap();
+            assert!(ty_names_def(&unit, param, &[moved], 0), "width takes the moved type");
+        } else {
+            // nothing installed: the running declaration is back, the type before the move
+            let param = unit.tcx.fn_sig(&unit.prog, width).unwrap().params[0];
+            let running = (0..unit.prog.defs.len() as u32).map(DefId).find(|d| unit.prog.def(*d).krate == krate && unit.prog.def(*d).kind == DefKind::Struct && !unit.prog.def_path(*d).contains("decode")).unwrap();
+            assert!(ty_names_def(&unit, param, &[running], 0), "width takes the running type again");
+        }
         std::mem::forget(unit);
         std::fs::remove_file(path).unwrap();
+        (outcome.rung, outcome.lines)
+    }
+
+    /// The edit's check of the declarations naming the removed type reads the kept fn's signature
+    /// in the file's new version; with a lifetime in it, that resolves the fn's bound variables,
+    /// which read the new version's file input. It must exist by then: the edit stopped with an
+    /// internal compiler error (a missing query input), and the program it left half-made failed
+    /// later compiles the same way.
+    #[test]
+    fn moving_a_type_its_lifetime_signatures_name_patches() {
+        isolated_test!(moving_a_type_its_lifetime_signatures_name_patches);
+        let (rung, lines) = move_type("unread", false, false);
+        assert_eq!(rung, Rung::Patch, "{lines:?}");
+    }
+
+    /// A signature collected before the edit names the removed type, though the name means the
+    /// moved one now: no E0412 for the name and no E0308 at the call. With no code built for the
+    /// fn, it is declared again and the edit patches.
+    #[test]
+    fn a_signature_read_before_a_type_moved_is_declared_again() {
+        isolated_test!(a_signature_read_before_a_type_moved_is_declared_again);
+        let (rung, lines) = move_type("read", true, false);
+        assert_eq!(rung, Rung::Patch, "{lines:?}");
+    }
+
+    /// The same with code built for the fn: built against the old declaration, it is not
+    /// rebuilt live, so the edit asks for a restart (and refuses nothing).
+    #[test]
+    fn a_type_moved_under_built_code_asks_for_a_restart() {
+        isolated_test!(a_type_moved_under_built_code_asks_for_a_restart);
+        let (rung, lines) = move_type("built", true, true);
+        assert_eq!(rung, Rung::Restart, "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("names `Pic`, which this edit moves")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("E0412") || l.contains("E0308")), "{lines:?}");
     }
 }
 
