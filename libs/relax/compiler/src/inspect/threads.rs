@@ -903,6 +903,10 @@ mod x64_walk {
     /// Why a walk ends at a frame of the runtime that runs this compiler when the frame pointer is
     /// not known (a thread blocked in a syscall, walked from its sp and pc): that runtime's frame
     /// sizes are its own, and no frame is taken from stack contents.
+    /// Why a walk ends at a JIT frame whose frame pointer is no address of its stack (a garbage
+    /// rbp, as code without frame pointers leaves it, restored by a callee's unwind tables)
+    pub const FP_NOT_IN_STACK: &str = "it is JIT code and its frame pointer is not in its stack";
+
     pub const HOST_NO_FP: &str = "it is JIT code of the runtime that runs this compiler, and its frame pointer is not known (a thread blocked in a syscall is walked from its sp and pc only)";
 
     /// Each step is proven or the walk ends there, saying why (`raw.stop`): a JIT frame by its
@@ -962,7 +966,7 @@ mod x64_walk {
                     }
                 }
                 if r.rbp < sp0 || r.rbp - sp0 > 1 << 20 {
-                    raw.stop = Some("it is JIT code and its frame pointer is not in its stack");
+                    raw.stop = Some(FP_NOT_IN_STACK);
                     break;
                 }
                 let (Some(ra), Some(next)) = (read(r.rbp.wrapping_add(8)), read(r.rbp)) else {
@@ -1206,7 +1210,7 @@ mod imp {
 /// pointer is needed and says so (a libc built with them).
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 mod tests {
-    use super::{capture, imp::BLOCKED_NO_FP, list, x64_walk::{host, HOST_NO_FP}, Raw};
+    use super::{capture, imp::BLOCKED_NO_FP, list, x64_walk::{host, FP_NOT_IN_STACK, HOST_NO_FP}, Raw};
     use std::io::Write;
     use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicU64, Ordering::{Acquire, Release}};
@@ -1291,9 +1295,11 @@ mod tests {
         if cfg!(relax) {
             // under the JIT, `park_in_poll` is JIT code of the runtime that runs this test, which
             // the walk asks about: it steps libc's frames by their CFI, reaches `park_in_poll`, and
-            // ends there, since a thread blocked in a syscall gives no frame pointer, saying so
+            // ends there, saying why: the garbage rbp, when poll's unwind tables restore it (a poll
+            // that saves rbp), or no frame pointer at all (one that leaves it alone: a thread
+            // blocked in a syscall gives none)
             let pcs = raw.frames();
-            assert_eq!(raw.stop, Some(HOST_NO_FP), "{names:?}");
+            assert!(raw.stop == Some(FP_NOT_IN_STACK) || raw.stop == Some(HOST_NO_FP), "{names:?} {:?}", raw.stop);
             assert!(pcs.len() >= 2 && names[pcs.len() - 2].contains("poll"), "poll's frame comes before the last: {names:?}");
             let last = pcs[pcs.len() - 1];
             assert!(host::jit_code(last - 1) && last > park_in_poll as fn(i32, u64, &AtomicU64) as usize as u64, "the last frame is park_in_poll's, the runtime's JIT code: {names:?}");
