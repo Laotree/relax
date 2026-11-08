@@ -401,6 +401,8 @@ pub(crate) fn hold_old_frames(u: &Unit, gen: u32, layout: &str, paused: bool) ->
 pub(crate) fn frame_in(u: &Unit, slots: &crate::fxhash::HashSet<u32>) -> Result<Option<String>, String> {
     let caps = crate::inspect::capture_all(&crate::inspect::instrument::program_thread)?;
     let code = u.code.read().unwrap_or_else(|e| e.into_inner());
+    // (a thread is named as reports name it: one nobody named is its program thread, or `unnamed`)
+    let listed: Vec<crate::inspect::threads::Thread> = caps.iter().map(|c| c.t.clone()).collect();
     let mut unread = None;
     for c in caps {
         if let Some(e) = c.err {
@@ -420,7 +422,7 @@ pub(crate) fn frame_in(u: &Unit, slots: &crate::fxhash::HashSet<u32>) -> Result<
                 at.push(u64::from_le_bytes(w[..8].try_into().unwrap()).wrapping_sub(1));
             }
         }
-        let thread = if c.t.name.is_empty() { format!("tid {}", c.t.os_id) } else { format!("`{}` (tid {})", c.t.name, c.t.os_id) };
+        let thread = format!("`{}` (tid {})", crate::inspect::shown_name(&c.t, &listed), c.t.os_id);
         for a in at {
             let Some((start, _, slot)) = code.entry_at(a) else { continue };
             let f = &u.fns[slot as usize];

@@ -1137,7 +1137,7 @@ pub fn thread_label(handle: u64, threads: &[threads::Thread]) -> String {
 /// A thread's name as a report shows it. One nobody named (no name, or on Linux the one it took
 /// over from the process's first thread: the binary's, which read like the JIT's own) is the
 /// program thread its domain knows it as, when it is one, and `unnamed` otherwise.
-fn shown_name(t: &threads::Thread, threads: &[threads::Thread]) -> String {
+pub(crate) fn shown_name(t: &threads::Thread, threads: &[threads::Thread]) -> String {
     let first = std::process::id() as u64;
     let unnamed = t.name.is_empty() || t.os_id != first && threads.iter().any(|p| p.os_id == first && p.name == t.name);
     if !unnamed {
