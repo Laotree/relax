@@ -3657,7 +3657,7 @@ fn enum_variant_names<'a>(pf: &'a crate::parser::ParsedFile, it: &crate::ast::It
 /// Live sessions (M10), before the commit of an edit of enum `d` that moves where its running
 /// variants are or a discriminant (a variant added before running ones; a discriminant written
 /// out): code that ran and read them as numbers -- an `as` cast, `mem::discriminant`,
-/// `discriminant_value`, a derived `Hash` (it hashes the variant's position) -- may have kept what
+/// `discriminant_value`, a derived `Hash` (it hashes the discriminant) -- may have kept what
 /// it made (a hash table's keys, an index), which the new numbers read differently: the restart
 /// rung, naming it. A derived `PartialEq`, `PartialOrd` or `Ord` of the enum compares them only:
 /// equal stays equal and the running variants keep their order, by position and by discriminant
@@ -3744,8 +3744,8 @@ fn enum_numbers_read(u: &Unit, d: DefId, versions: &[(crate::program::FileVersio
             continue;
         }
         let derived = derived_of_it(fd);
-        if positions_move && derived == Some("Hash") {
-            return Some(format!("enum `{}`: {}, and its derived `Hash` (which hashes the variant's position) ran: a hash table may hold the hashes it made -- restart the app", name, moves));
+        if derived == Some("Hash") {
+            return Some(format!("enum `{}`: {}, and its derived `Hash` (which hashes the discriminant) ran: a hash table may hold the hashes it made -- restart the app", name, moves));
         }
         if matches!(derived, Some("PartialEq" | "PartialOrd" | "Ord")) || !reads(fd, at_it) {
             continue;
