@@ -48,21 +48,28 @@ fn echo() -> Factory {
 
 /// Connects a client `Conn` to `ep` over an in-process socket pair.
 pub(crate) fn pair(ep: &Endpoint) -> Conn {
+    pair_served(ep).0
+}
+
+/// As [`pair`], returning the endpoint's side as well: (client, served). The endpoint's accept
+/// hook has seen the served side by the time this returns.
+pub(crate) fn pair_served(ep: &Endpoint) -> (Conn, Conn) {
     let (a, b) = UnixStream::pair().unwrap();
     let ep = ep.clone();
-    std::thread::spawn(move || {
+    let served = std::thread::spawn(move || {
         let (r, w, s) = (a.try_clone().unwrap(), a.try_clone().unwrap(), a);
-        let _ = ep.serve(FrameReader::new(Box::new(r)), Box::new(w), Box::new(move || {
+        ep.serve(FrameReader::new(Box::new(r)), Box::new(w), Box::new(move || {
             let _ = s.shutdown(std::net::Shutdown::Both);
-        }));
+        }))
     });
     let (r, w, s) = (b.try_clone().unwrap(), b.try_clone().unwrap(), b);
     let mut reader = FrameReader::new(Box::new(r));
     let mut writer: Box<dyn Write + Send> = Box::new(w);
     let ok = hello::client_handshake(&mut reader, &mut *writer, &Hello { name: "test".into(), link_id: "t".into(), ..Hello::default() }).unwrap();
-    Conn::start(Io { reader, writer, shutdown: Box::new(move || {
+    let client = Conn::start(Io { reader, writer, shutdown: Box::new(move || {
         let _ = s.shutdown(std::net::Shutdown::Both);
-    }) }, ok, true, None, Hooks::default())
+    }) }, ok, true, None, Hooks::default());
+    (client, served.join().unwrap().unwrap())
 }
 
 fn data(ch: &Channel) -> Vec<u8> {
