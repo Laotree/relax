@@ -22641,6 +22641,19 @@ extern "C" fn relax_allocator_swap(phase: u32) {
     })
 }
 
+/// For a compiler this one runs (`makepad test` of relax-compiler): whether `pc` is this runtime's
+/// JIT code. That compiler's stack walks (inspect/threads.rs x64_walk) meet this code in every
+/// frame of its own, and step it as JIT code (by its frame records).
+extern "C" fn relax_host_jit_code(pc: u64) -> u32 {
+    in_jit_code(pc) as u32
+}
+
+/// For a compiler this one runs: the return address of this runtime's program stack switch
+/// (relax_base::stack), which that compiler's walks step by the switch record.
+extern "C" fn relax_host_switch_return_pc() -> u64 {
+    crate::stack::switch_return_pc()
+}
+
 /// The program's std::process::exit on Windows (Relax std process_windows.rs): the end of the
 /// process without the exiting thread's fiber-local destructors (os::proc::exit): ExitProcess ran
 /// them into JIT code whose lazy compile waited forever for the unit lock of a thread ExitProcess
@@ -22757,6 +22770,8 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_test_adopt" => Some(crate::harness::reach::adopt as *const () as usize),
         b"__relax_test_cancel" => Some(crate::harness::reach::cancel as *const () as usize),
         b"__relax_tls_fixed" => Some(os::tls::relax_tls_fixed as *const () as usize),
+        b"__relax_host_jit_code" => Some(relax_host_jit_code as *const () as usize),
+        b"__relax_host_switch_return_pc" => Some(relax_host_switch_return_pc as *const () as usize),
         b"__relax_sstack" => Some(crate::sstack::relax_sstack as *const () as usize),
         b"__relax_sstack_grow" => Some(crate::sstack::relax_sstack_grow as *const () as usize),
         b"__relax_sstack_trim" => Some(crate::sstack::relax_sstack_trim as *const () as usize),
