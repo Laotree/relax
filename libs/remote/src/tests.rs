@@ -178,6 +178,24 @@ fn different_major_version_is_refused_with_both_versions() {
     assert!(h.join().unwrap().unwrap().contains("9.2"));
 }
 
+/// A dial learns who answers it: the endpoint's process and when that endpoint began, so a
+/// client tells a live endpoint from the one before it (an exec keeps the pid, not the start).
+#[test]
+fn a_dial_is_told_which_process_answers_it() {
+    let before = crate::cmd::wall_ms();
+    let ep = Endpoint::new("t");
+    let after = crate::cmd::wall_ms();
+    let (client, served) = pair_served(&ep);
+    let who = client.peer();
+    assert_eq!(who.serving_pid, std::process::id());
+    assert!((before..=after).contains(&who.serving_since_ms), "{} not in {before}..={after}", who.serving_since_ms);
+    // the endpoint's own start, whichever connection asks
+    let (again, _) = pair_served(&ep);
+    assert_eq!(again.peer().serving_since_ms, who.serving_since_ms);
+    // a client claims no process of its own: what the endpoint knows of it is its carrier's
+    assert_eq!((served.peer().serving_pid, served.peer().serving_since_ms), (0, 0));
+}
+
 #[test]
 fn unknown_service_is_refused() {
     let ep = Endpoint::new("t");
