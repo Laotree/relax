@@ -18,13 +18,11 @@ fn warnings_in_child_with(name: &str, env: &[(&str, &str)]) -> Option<Vec<String
     if std::env::var_os(CHILD).is_some() {
         return None;
     }
-    let out = std::process::Command::new(std::env::current_exe().unwrap())
+    let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture", "--test-threads=1", "--format=terse"])
         .env(CHILD, "1")
         .env_remove("MAKEPAD_RUN_LINT_FLAGS")
-        .envs(env.iter().copied())
-        .output()
-        .unwrap();
+        .envs(env.iter().copied()));
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}\n{stderr}");
     // (the check prints its diagnostics on stderr; stdout has the test harness's lines)

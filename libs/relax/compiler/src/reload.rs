@@ -9665,14 +9665,12 @@ mod round32_tests {
 
     #[test]
     fn enum_reload_snapshots() {
-        isolated_test!(enum_reload_snapshots);
         const CHILD: &str = "MAKEPAD_RUN_ENUM_RELOAD_CASE";
         let Ok(case) = std::env::var(CHILD) else {
             for case in ["same", "changed", "order", "removed", "reordered", "added", "larger", "named", "executable", "callee", "named_code", "unrelated"] {
-                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "reload::round32_tests::enum_reload_snapshots", "--nocapture", "--test-threads=1"])
-                    .env(CHILD, case).env("MAKEPAD_RUN_CTFE", "0").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0")
-                    .output().unwrap();
+                    .env(CHILD, case).env("MAKEPAD_RUN_CTFE", "0").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0"));
                 assert!(output.status.success(), "{case}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
             }
             return;
@@ -9747,14 +9745,12 @@ mod use_edit_tests {
     /// takes its old bindings out: no E0252 against its own earlier binding, and the edit patches.
     #[test]
     fn editing_a_use_of_a_same_module_item_patches() {
-        isolated_test!(editing_a_use_of_a_same_module_item_patches);
         const CHILD: &str = "MAKEPAD_RUN_USE_EDIT_CASE";
         let Ok(case) = std::env::var(CHILD) else {
             for case in ["enum_variants", "fn_rename", "use_in_closure", "closure_added"] {
-                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "reload::use_edit_tests::editing_a_use_of_a_same_module_item_patches", "--nocapture", "--test-threads=1"])
-                    .env(CHILD, case).env("MAKEPAD_RUN_CTFE", "0").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0")
-                    .output().unwrap();
+                    .env(CHILD, case).env("MAKEPAD_RUN_CTFE", "0").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0"));
                 assert!(output.status.success(), "{case}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
             }
             return;
