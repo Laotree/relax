@@ -7631,7 +7631,22 @@ fn restart_in_place(why: String) -> Result<&'static str, String> {
         eprintln!("makepad live: the restart does not wait for the app's state: {blocked}; the next run starts without it");
         return next_run(&why, None).map(|_| "restart without the program's state");
     }
-    next_run(&why, None).map(|_| "restart")
+    match start_state() {
+        Some(state) => next_run(&why, Some(state.as_bytes())).map(|_| "restart with the state the run was started with"),
+        None => next_run(&why, None).map(|_| "restart"),
+    }
+}
+
+/// The state this run was started with, while its program has not said that it restarts with its
+/// own: an app says so at its first event (std::relax::restart_supported), and until then that
+/// state is all of the app's state. A relaunch between a restart's boot and the app's first event
+/// took the app for a program with no state and dropped it (restart_in_place.py, 11-08). None:
+/// the run was started with none, or the program said (it hands its own).
+fn start_state() -> Option<String> {
+    if RESTART_SUPPORTED.load(std::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
+    DOMAIN_RESTORED.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Why the program cannot hand its state over to a restart now (None: it can): a thread of it
