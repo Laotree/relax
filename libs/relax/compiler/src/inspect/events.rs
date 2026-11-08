@@ -798,6 +798,7 @@ pub fn start() {
         super::heap::exclude_this_thread();
         let hang_ms: u64 = std::env::var("MAKEPAD_RUN_INSPECT_HANG_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
         let mut last_cycle: Vec<u64> = Vec::new();
+        let mut last_rows: Vec<(u64, u64, u64)> = Vec::new();
         let mut base_rss = 0u64;
         let mut tick = 0u64;
         let (mut marked_main, mut marked_present) = (false, false);
@@ -830,15 +831,20 @@ pub fn start() {
             }
             // a cycle among registry waits (thread -> holder handle)
             let cycle = super::hang::registry_cycle(&waits);
-            if !cycle.is_empty() && cycle == last_cycle {
+            // each cycle thread's row: a deadlock is the same waits in both looks, not a new short
+            // wait each time that happens to close a cycle again
+            let rows: Vec<(u64, u64, u64)> = cycle.iter().filter_map(|h| waits.iter().find(|w| w.thread == *h).map(|w| (w.thread, w.object, w.since_ns))).collect();
+            if !cycle.is_empty() && cycle == last_cycle && rows == last_rows {
                 let mut list = super::threads::list();
                 super::name_handles(&mut list);
                 let names: Vec<String> = cycle.iter().map(|h| json_str(&super::thread_label(*h, &list))).collect();
+                let what: Vec<String> = cycle.iter().filter_map(|h| waits.iter().find(|w| w.thread == *h)).map(|w| json_str(&format!("{} waits: {}", super::thread_label(w.thread, &list), super::wait_text(w, &list)))).collect();
                 let mut key = cycle.clone();
                 key.sort_unstable();
-                emit("deadlock", &format!("{:?}", key), &format!("\"cycle\":[{}],\"more\":[\"why-hung\"]", names.join(",")));
+                emit("deadlock", &format!("{:?}", key), &format!("\"cycle\":[{}],\"waits\":[{}],\"more\":[\"why-hung\"]", names.join(","), what.join(",")));
             }
             last_cycle = cycle;
+            last_rows = rows;
             super::heap::expire();
             // the memory timeline and its phase markers
             let rss = crate::memstat::resident();

@@ -687,6 +687,19 @@ fn domains() -> Registry {
     Registry { guard: DOMAINS.lock().unwrap_or_else(|e| e.into_inner()), _kept: kept }
 }
 
+/// The program thread `os_id` as its domain knows it -- `<package> thread-<n>`, or the name it gave
+/// itself -- for a thread the OS names by its creator (Linux: one spawned unnamed takes its
+/// creator's name, often the binary's: a deadlock read `makepad.jit-e85 (T41)`). None: no domain
+/// has it, or the registry is busy (a reader never waits for it).
+pub fn program_thread_name(os_id: u64) -> Option<String> {
+    let ds = match DOMAINS.try_lock() {
+        Ok(ds) => ds,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    ds.iter().find_map(|d| d.threads.iter().find(|t| t.os_id == os_id && os_id != 0).map(|t| format!("{} {}", d.info.package, t.name)))
+}
+
 /// The host's callback for state changes (compiling phases, running, crashed, exited).
 pub fn set_observer(f: impl Fn(DomainId, &DomainState) + Send + Sync + 'static) {
     *OBSERVER.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(f));
