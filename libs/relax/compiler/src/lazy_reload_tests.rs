@@ -1996,6 +1996,81 @@ pub fn value(out: &mut u32) {{
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A closure stored by the running version whose captures change keeps its old code (its values
+/// hold the old environment). The edit lands, and the stored closure waits for a restart: a HELD
+/// line, so the watcher offers the restart and `session view` lists it. A closure only called in
+/// its parent's frame takes the new code with its parent and holds nothing back.
+#[test]
+fn a_stored_closure_whose_captures_change_waits_for_a_restart() {
+    const CHILD: &str = "MAKEPAD_RUN_STORED_CAPTURES_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::a_stored_closure_whose_captures_change_waits_for_a_restart", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
+            .output().unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    use crate::jit::{FnKey, Unit};
+    use crate::reload::{apply, Edit, Rung, HELD};
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-stored-captures-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    let src = |made: &str, summed: &str| format!(r#"use std::cell::RefCell;
+thread_local! {{ static H: RefCell<Option<Box<dyn Fn(u32) -> u32>>> = RefCell::new(None); }}
+#[inline(never)]
+fn make() -> Box<dyn Fn(u32) -> u32> {{
+    let k = 3;
+    {made}
+}}
+#[inline(never)]
+fn sum() -> u32 {{
+    let k = 2;
+    {summed}
+}}
+pub fn value(out: &mut u32) {{
+    H.with(|h| {{
+        if h.borrow().is_none() {{ *h.borrow_mut() = Some(make()); }}
+        *out = (h.borrow().as_ref().unwrap())(5) * 100 + sum();
+    }});
+}}
+"#);
+    std::fs::write(dir.join("app/src/lib.rs"), src("Box::new(move |x| x * k + 1)", "(0..3u32).map(|x| x * k).sum()")).unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "stored_captures_app", false).unwrap();
+    let value = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == "value").then_some(id)
+    }).unwrap();
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    let entry = crate::owner::call(crate::owner::Class::Program, || { let f = u.fn_id(FnKey::Inst(value, vec![])); u.entry(f) });
+    let run = || {
+        let mut result = 0u32;
+        unsafe { crate::jit::call_jit(up, entry, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        result
+    };
+    // 16 from the stored closure, 0 + 2 + 4 summed
+    assert_eq!(run(), 1606);
+    let file = u.prog.def(value).file;
+    let edited = src("let j = 4;\n    Box::new(move |x| x * k + j)", "let j = 1;\n    (0..3u32).map(|x| x * k + j).sum()");
+    let o = unsafe { apply(up, vec![Edit { file, path: app.clone(), src: edited.into_bytes() }]) };
+    assert_eq!(o.rung, Rung::Patch, "{:?}", o.lines);
+    let held: Vec<&String> = o.lines.iter().filter(|l| l.starts_with(HELD)).collect();
+    assert!(held.len() == 1 && held[0].contains("make`") && held[0].contains("keep its old code (its captures or signature changed)"), "the stored closure, and only it, waits for a restart: {:?}", o.lines);
+    // the stored box keeps its old code; `sum` runs its new one
+    assert_eq!(run(), 1609);
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A type alias in a fn body is part of that body: its edit is the body's edit (the alias
 /// goes and a new one comes with the body). An alias a nested item names restarts as before:
 /// the nested item would keep the old type.
