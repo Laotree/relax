@@ -358,7 +358,8 @@ fn apply_ready(why: String) -> Result<&'static str, String> {
         }
     }
     let h = take().ok_or("the rebuilt makepad is not ready")?;
-    restart(h, None);
+    // (an app before its first event: the state its run was started with)
+    restart(h, super::start_state().as_deref().map(str::as_bytes));
     Ok("restart into the rebuilt makepad")
 }
 
