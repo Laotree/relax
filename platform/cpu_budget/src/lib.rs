@@ -614,8 +614,8 @@ fn global() -> &'static Budget {
 /// The cores the process may use: its machine's `machine`, or fewer where its run was given
 /// fewer (`MAKEPAD_CPU_CORES`: a gate's share of its lease for each of the units it runs side by
 /// side): every pool and the JIT's workers then size from that share, not the box. A tests shard
-/// granted 12 of a 16-core box ran three units at once, each unit's pools and JIT workers sized
-/// from all 16, on a box at load 34-36 (11-08).
+/// ran three units at once, each unit's pools and JIT workers sized from the whole box, and its
+/// box ran well over its cores (11-08).
 fn granted_cores(machine: usize, jobs: Option<&str>) -> usize {
     jobs.and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0).map_or(machine, |n| n.min(machine))
 }
