@@ -541,3 +541,14 @@ fn idle_thread_stays_below_background() {
     let ui = thread::spawn(|| { set_ui_thread(); (set_thread_idle(), thread_idle(), unsafe { sched_getscheduler(0) }) }).join().unwrap();
     assert_eq!(ui, (false, false, 0), "the UI thread stays SCHED_OTHER");
 }
+
+/// A run given fewer cores than its machine's (`MAKEPAD_CPU_CORES`) sizes the budget from them;
+/// never more than the machine's, and an unset or unreadable count is the machine's.
+#[test]
+fn a_granted_run_sizes_the_budget_from_its_grant() {
+    assert_eq!(granted_cores(16, Some("4")), 4);
+    assert_eq!(granted_cores(16, Some("64")), 16);
+    assert_eq!(granted_cores(16, None), 16);
+    assert_eq!(granted_cores(16, Some("0")), 16);
+    assert_eq!(granted_cores(16, Some("four")), 16);
+}
