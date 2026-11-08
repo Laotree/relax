@@ -1163,11 +1163,20 @@ pub fn pause_for_patch() -> bool {
     true
 }
 
-/// Thread `t` (a program thread) stays held for good, past any `resume`: it has a frame in code
-/// that never runs again (stale.rs `park_held`). A thread the pause did not hold (blocked in a
-/// system call) is held now. False: it could not be held (it ended, or this platform cannot).
+/// Thread `t` (a program thread) stays held for good, past any `resume`, until the run's end
+/// (`release_held_for_good`): it has a frame in code that never runs again (stale.rs `park_held`).
+/// A thread the pause did not hold (blocked in a system call) is held now. False: it could not be
+/// held (it ended, or this platform cannot).
 pub fn hold_for_good(t: &super::threads::Thread) -> bool {
     pause_imp::keep(t)
+}
+
+/// A run's end, once its code is gone (domain::end_run): the threads held for good go on. Their
+/// frames in code that never runs again are as gone as every other frame of the run's code, so they
+/// leave as every thread of the run does (kicked out of a wait, ended at their next instruction of
+/// that code), and the run's memory goes with them. Returns how many went on.
+pub(crate) fn release_held_for_good() -> usize {
+    pause_imp::release_kept()
 }
 
 /// A run's end began: the program's threads go on so they can be ended, and a parked hit stops
@@ -1206,10 +1215,13 @@ pub(crate) fn program_thread(t: &super::threads::Thread) -> bool {
 #[cfg(target_vendor = "apple")]
 mod pause_imp {
     static HELD: relax_session::sync::Mutex<Vec<crate::inspect::threads::Thread>> = relax_session::sync::Mutex::new(Vec::new());
+    /// The threads held for good (`keep`): suspended until the run's end lets them go (`release_kept`).
+    static KEPT: relax_session::sync::Mutex<Vec<crate::inspect::threads::Thread>> = relax_session::sync::Mutex::new(Vec::new());
 
     /// What this module holds of a run, as a fresh process has it (`run_end`).
     pub(crate) unsafe fn reset_statics() {
         relax_session::reset_static(&HELD, relax_session::sync::Mutex::new(Vec::new()));
+        relax_session::reset_static(&KEPT, relax_session::sync::Mutex::new(Vec::new()));
     }
     extern "C" {
         static mach_task_self_: u32;
@@ -1281,27 +1293,30 @@ mod pause_imp {
         }
         n
     }
-    /// Out of the pause's set: never resumed (its Mach suspension stays); suspended now when the
-    /// pause did not hold it.
+    /// Out of the pause's set: no resume reaches it (its Mach suspension stays until the run's end,
+    /// `release_kept`); suspended now when the pause did not hold it.
     pub fn keep(t: &crate::inspect::threads::Thread) -> bool {
         let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(k) = held.iter().position(|h| h.os_id == t.os_id) {
-            // (its port stays with this never-dropped entry)
-            std::mem::forget(held.remove(k));
-            return true;
-        }
-        drop(held);
-        let list = crate::inspect::threads::list();
-        let ok = list.iter().find(|x| x.os_id == t.os_id).is_some_and(|x| crate::inspect::threads::suspend(x));
-        if ok {
-            // (the listed original owns the port: kept, never released)
-            for x in list {
-                if x.os_id == t.os_id {
-                    std::mem::forget(x);
-                }
+        let kept = match held.iter().position(|h| h.os_id == t.os_id) {
+            Some(k) => Some(held.remove(k)),
+            None => {
+                drop(held);
+                crate::inspect::threads::list().into_iter().find(|x| x.os_id == t.os_id).filter(|x| crate::inspect::threads::suspend(x))
             }
+        };
+        let ok = kept.is_some();
+        if let Some(x) = kept {
+            crate::zone_alloc::kept_with(|| KEPT.lock().unwrap_or_else(|e| e.into_inner()).push(x));
         }
         ok
+    }
+    pub fn release_kept() -> usize {
+        let kept = std::mem::take(&mut *KEPT.lock().unwrap_or_else(|e| e.into_inner()));
+        let n = kept.len();
+        for t in kept {
+            crate::inspect::threads::resume(&t);
+        }
+        n
     }
 }
 
@@ -1377,6 +1392,9 @@ mod pause_imp {
         drop(held);
         crate::inspect::threads::hold_for_good(t.os_id).is_ok()
     }
+    pub fn release_kept() -> usize {
+        crate::inspect::threads::release_held_for_good()
+    }
 }
 
 #[cfg(any(windows, target_os = "android"))]
@@ -1389,6 +1407,9 @@ mod pause_imp {
     }
     pub fn keep(_t: &crate::inspect::threads::Thread) -> bool {
         false
+    }
+    pub fn release_kept() -> usize {
+        0
     }
 
     pub(crate) unsafe fn reset_statics() {}

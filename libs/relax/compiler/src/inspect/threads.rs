@@ -121,17 +121,24 @@ pub fn hold_paused(tid: u64) -> Result<&'static HoldSlot, &'static str> {
 }
 
 /// Holds thread `tid` in its handler for good (a thread with a frame in code that never runs
-/// again: stale.rs `park_held`); a blocked thread is signalled too (it never returns from the
-/// handler, so an interrupted system call never comes back to its caller). Linux.
+/// again: stale.rs `park_held`); a blocked thread is signalled too (it leaves the handler only at
+/// the run's end, `release_held_for_good`, when no code of the run runs any more). Linux.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub fn hold_for_good(tid: u64) -> Result<&'static HoldSlot, &'static str> {
     imp::hold(tid, imp::HOLD_FOREVER)
 }
 
-/// A pause's hold of a thread becomes a hold for good (`release_hold` is never called for it).
+/// A pause's hold of a thread becomes a hold for good (no resume releases it: the run's end does).
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub fn keep_held(s: &HoldSlot) {
     imp::keep(s)
+}
+
+/// The run's end, once its code is gone: every thread held for good leaves its handler (it faults
+/// out of that code at its next instruction there). Returns how many. Linux.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn release_held_for_good() -> usize {
+    imp::release_forever()
 }
 
 /// Whether thread `tid` stands still in its handler now (held by a pause or for good). Linux.
@@ -535,7 +542,7 @@ mod imp {
         /// then the pthread handle
         regs: [AtomicU64; 9],
         /// HOLD_CAPTURE (one walk, at most 5 s), HOLD_PAUSE (until `resume`, at most 10 minutes),
-        /// HOLD_FOREVER (a thread that must never run on: stale.rs `park_held`)
+        /// HOLD_FOREVER (a thread that must not run on while its run does: stale.rs `park_held`)
         mode: AtomicU32,
     }
     static HOLDS: [Slot; SLOTS] = [const { Slot { state: AtomicU32::new(0), tid: AtomicI32::new(0), regs: [const { AtomicU64::new(0) }; 9], mode: AtomicU32::new(0) } }; SLOTS];
@@ -660,6 +667,17 @@ mod imp {
     #[cfg(target_arch = "x86_64")]
     pub fn keep(slot: &Slot) {
         slot.mode.store(HOLD_FOREVER, Relaxed);
+    }
+
+    /// Lets every thread held for good go (`release_held_for_good`).
+    #[cfg(target_arch = "x86_64")]
+    pub fn release_forever() -> usize {
+        let mut n = 0;
+        for slot in HOLDS.iter().filter(|h| h.mode.load(Relaxed) == HOLD_FOREVER && h.state.load(Acquire) == 2) {
+            release(slot);
+            n += 1;
+        }
+        n
     }
 
     /// The slot holding `tid` now (a paused thread), if any.

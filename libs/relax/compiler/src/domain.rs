@@ -970,6 +970,9 @@ pub fn end_run(up: *mut Unit, grace: std::time::Duration) -> RunEnd {
     let callbacks = crate::domain_res::take_back_callbacks(&bases);
     if !up.is_null() {
         unsafe { (*up).end_code() };
+        // (a thread held for good at a layout patch leaves as the others do now: no frame of it
+        // can run the code it was held out of)
+        crate::inspect::instrument::release_held_for_good();
     }
     let mut backoff = std::time::Duration::from_millis(1);
     let end = |left, ms| RunEnd {

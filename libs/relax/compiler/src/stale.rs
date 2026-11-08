@@ -36,6 +36,16 @@ pub struct Range {
 
 /// `register_run_end`s so far: none, and a thread's exit asks nothing of the table.
 static RUN_ENDS: AtomicUsize = AtomicUsize::new(0);
+/// Threads of the run that cannot go on until it ends: parked at a stale access (`on_fault`) or
+/// held for good at a layout patch (`park_held`).
+static STUCK: AtomicUsize = AtomicUsize::new(0);
+
+/// How many threads of the run cannot go on until it ends (parked at a stale access, held for good
+/// at a layout patch). While one is, the program is paused for its report and never reaches the
+/// point that hands its state over to a restart.
+pub fn stuck_threads() -> usize {
+    STUCK.load(Ordering::Acquire)
+}
 const CAP: usize = 1 << 14;
 static RANGES: [AtomicPtr<Range>; CAP] = [const { AtomicPtr::new(std::ptr::null_mut()) }; CAP];
 static N: AtomicUsize = AtomicUsize::new(0);
@@ -164,6 +174,7 @@ extern "C" {
 /// the run when this returns. A thread of no run stays parked.
 /// Signal-safe: atomic stores and loads, write(2), nanosleep(2).
 pub unsafe fn on_fault(f: &crate::os::fault::Fault, r: &'static Range, walk: impl FnOnce(&mut [u64]) -> usize) {
+    STUCK.fetch_add(1, Ordering::AcqRel);
     let os_id = crate::inspect::threads::self_os_id();
     let base = if crate::jit::current_unit().is_null() { 0 } else { crate::domain::current() };
     if let Some(rec) = REC.iter().find(|x| x.state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed).is_ok()) {
@@ -311,6 +322,9 @@ static HELD: relax_session::sync::Mutex<Vec<Held>> = relax_session::sync::Mutex:
 /// once (the watcher thread reports and waits for the decision). `held` false: the thread could
 /// not be held; the process ends after the report (it must not run that code).
 pub fn park_held(os_id: u64, frames: Vec<u64>, at: usize, what: String, reason: String, held: bool) {
+    if held {
+        STUCK.fetch_add(1, Ordering::AcqRel);
+    }
     start_watcher();
     crate::inspect::flightrec::event("stale.held", &format!("tid {}: frame in {}: {}", os_id, what, reason), os_id, frames.get(at).copied().unwrap_or(0));
     crate::zone_alloc::kept_with(|| HELD.lock().unwrap_or_else(|e| e.into_inner()).push(Held { os_id, frames, at, what, reason, held }));
@@ -528,6 +542,7 @@ pub(crate) unsafe fn reset_statics() {
         }
     }; RECS]);
     reset(&HELD, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&STUCK, AtomicUsize::new(0));
     reset(&ANSWERS, relax_session::sync::Mutex::new(Vec::new()));
     // Of the ended runs each stays one range, its code as a whole: what was retired of it, as of
     // anything else that went with its Unit, is inside or gone.

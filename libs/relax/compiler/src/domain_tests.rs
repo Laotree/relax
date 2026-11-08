@@ -911,6 +911,47 @@ fn a_run_ends_with_every_thread_wherever_it_is() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+// flags[0]: the thread to hold runs
+const HELD_RUN: &str = r#"
+use std::sync::atomic::{AtomicU64, Ordering};
+fn flags(a: usize) -> &'static [AtomicU64; 4] { unsafe { &*(a as *const [AtomicU64; 4]) } }
+fn fixture(p: *mut u64) {
+    let a = p as usize;
+    std::thread::Builder::new().name("held-for-good".into()).spawn(move || {
+        flags(a)[0].fetch_add(1, Ordering::SeqCst);
+        loop { std::thread::sleep(std::time::Duration::from_millis(20)); }
+    }).unwrap();
+    loop { std::thread::park(); }
+}
+"#;
+
+/// A thread held for good (a frame of it in code a layout patch replaced: stale.rs `park_held`)
+/// leaves with its run: once the run's code is gone the end lets it go, and it ends as every other
+/// thread of the run does, its domain's memory back.
+#[test]
+fn a_thread_held_for_good_leaves_with_its_run() {
+    isolated_test!(a_thread_held_for_good_leaves_with_its_run);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut u, entry, root) = fixture_of(HELD_RUN, "fixture");
+    let up = &mut *u as *mut Unit;
+    let flags: [AtomicU64; 4] = Default::default();
+    let (domain, _base, main) = launch(&mut u, entry, None, &flags);
+    wait(|| flags[0].load(Ordering::SeqCst) == 1);
+    let held = crate::inspect::threads::list().into_iter().find(|t| t.name == "held-for-good").expect("the fixture's thread");
+    assert!(crate::inspect::instrument::hold_for_good(&held), "the thread is held");
+    let end = end_run(up, Duration::from_secs(10));
+    eprintln!("{}", end.line());
+    assert!(end.left.is_empty(), "left: {:?}", end.left);
+    main.join().unwrap();
+    wait_thread_done(domain);
+    let dead = info(domain).unwrap();
+    assert_eq!((dead.threads, dead.base), (0, 0));
+    assert_eq!(dead.state, DomainState::Stopped);
+    domains().retain(|d| d.info.id != domain);
+    drop(u);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 // A thread of the run in a native call (flags[2]), and the callback flags[3] hands native code.
 const NATIVE_CROSSINGS: &str = r#"
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -351,8 +351,11 @@ fn apply_ready(why: String) -> Result<&'static str, String> {
     *super::RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()) = why.clone();
     if super::pinned() { return Ok("restart waits until unpinned"); }
     if super::RESTART_SUPPORTED.load(std::sync::atomic::Ordering::SeqCst) {
-        // This asks AppMain::can_restart and the unsaved registry at the next app event.
-        return super::restart_in_place(why);
+        match super::handover_blocked() {
+            // This asks AppMain::can_restart and the unsaved registry at the next app event.
+            None => return super::restart_in_place(why),
+            Some(blocked) => eprintln!("makepad live: the restart into the rebuilt makepad does not wait for the app's state: {blocked}"),
+        }
     }
     let h = take().ok_or("the rebuilt makepad is not ready")?;
     restart(h, None);

@@ -7245,6 +7245,9 @@ pub fn restart_with_state(why: String) -> Result<(), String> {
     if !restart_keeps_state() {
         return Err("the app does not restart with its state (std::relax::restart_supported)".into());
     }
+    if let Some(blocked) = handover_blocked() {
+        return Err(format!("the app cannot hand its state over: {blocked}"));
+    }
     restart_in_place(why).map(|_| ())
 }
 
@@ -7580,9 +7583,10 @@ static RESTORED_STATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock
 
 /// Restarts the program to apply `why`, in this process and its window: a program that restarts
 /// with its state (std::relax::restart_supported) is asked to at its next safe point and its next
-/// run starts with the state; any other program's run ends and the next starts right away. The
-/// program's sources are compiled by the new run; the loader itself is current (a change of its own
-/// inputs goes through host::request), so nothing is rebuilt. Returns how, or why it cannot.
+/// run starts with the state; any other program's run ends and the next starts right away, as does
+/// one that cannot reach that point ([`handover_blocked`]). The program's sources are compiled by
+/// the new run; the loader itself is current (a change of its own inputs goes through
+/// host::request), so nothing is rebuilt. Returns how, or why it cannot.
 fn restart_in_place(why: String) -> Result<&'static str, String> {
     if crate::harness::live::enabled() {
         return restart_run(&why).map(|_| "test restart");
@@ -7590,11 +7594,24 @@ fn restart_in_place(why: String) -> Result<&'static str, String> {
     *RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()) = why.clone();
     RESTART_CONFIRMED.store(true, std::sync::atomic::Ordering::SeqCst);
     if RESTART_SUPPORTED.load(std::sync::atomic::Ordering::SeqCst) {
-        RESTART_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
-        wake_program();
-        return Ok("restart with the program's state");
+        let Some(blocked) = handover_blocked() else {
+            RESTART_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+            wake_program();
+            return Ok("restart with the program's state");
+        };
+        eprintln!("makepad live: the restart does not wait for the app's state: {blocked}; the next run starts without it");
+        return next_run(&why, None).map(|_| "restart without the program's state");
     }
     next_run(&why, None).map(|_| "restart")
+}
+
+/// Why the program cannot hand its state over to a restart now (None: it can): a thread of it
+/// cannot go on until the run ends -- parked at a stale access, or held for good at a layout patch
+/// (stale.rs) -- and the program is paused for that report, so it never reaches the safe point
+/// that would. Its restart is the next run without the state, as `resume P<n> restart` is.
+fn handover_blocked() -> Option<String> {
+    let stuck = crate::stale::stuck_threads();
+    (stuck > 0).then(|| format!("{stuck} thread(s) of it cannot go on (a stale access, or a frame in code a layout patch replaced: `makepad inspect {} stale`)", std::process::id()))
 }
 
 /// The next run starts now, without the app's state (the app is not asked: a test run of `makepad
