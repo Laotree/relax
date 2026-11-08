@@ -9705,6 +9705,45 @@ mod use_edit_tests {
 }
 
 #[cfg(test)]
+mod moved_type_tests {
+    use super::*;
+
+    /// A type moved out of a file whose kept fns still name it, now through a `use` (an image
+    /// decoder moved to a crate of its own, 11-08). The edit looks for declarations that name
+    /// the removed type, which reads the kept fn's signature in the file's new version, and
+    /// with a lifetime in that signature it resolves the fn's bound variables. Those read the
+    /// new version's file input, which must exist by then: the edit stopped with an internal
+    /// compiler error (a missing query input), and the program it left half-made failed later
+    /// compiles the same way.
+    #[test]
+    fn moving_a_type_its_lifetime_signatures_name_patches() {
+        isolated_test!(moving_a_type_its_lifetime_signatures_name_patches);
+        std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+        crate::borrowck::lazy::disable_gandalf();
+        let old = "pub struct Pic { pub w: u32 }\npub fn width<'a>(p: &'a Pic) -> &'a u32 { &p.w }\nfn main() { let p = Pic { w: 1 }; let _ = *width(&p); }\n";
+        let new = "mod decode { pub struct Pic { pub w: u32 } }\nuse decode::Pic;\npub fn width<'a>(p: &'a Pic) -> &'a u32 { &p.w }\nfn main() { let p = Pic { w: 2 }; let _ = *width(&p); }\n";
+        let path = std::env::temp_dir().join(format!("relax-moved-type-{}.rs", std::process::id()));
+        std::fs::write(&path, old).unwrap();
+        let mut session = crate::Session::default();
+        session.options.ctfe = crate::options::Ctfe::Off;
+        let session = std::sync::Arc::new(session);
+        let (prog, core, krate) = crate::load_with_std(&session, path.to_str().unwrap(), "moved_type", false).unwrap();
+        let file = prog.defs.iter().find(|d| d.krate == krate && d.kind == DefKind::Fn).map(|d| d.file).unwrap();
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        crate::layout::set_root_crate(krate);
+        crate::layout::LIVE_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut unit = Unit::new(prog, tcx, core);
+        let up = &mut *unit as *mut Unit;
+        let outcome = unsafe { apply(up, vec![Edit { file, path: path.to_string_lossy().into_owned(), src: new.as_bytes().to_vec() }]) };
+        assert!(!outcome.lines.iter().any(|l| l.contains("internal compiler error")), "{:?}", outcome.lines);
+        assert_eq!(outcome.rung, Rung::Patch, "{:?}", outcome.lines);
+        std::mem::forget(unit);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod watch_wait_tests {
     use super::*;
 
