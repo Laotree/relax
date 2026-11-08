@@ -3961,6 +3961,35 @@ fn closure_ident(u: &Unit, slot: u32) -> Option<(u32, TyId, Vec<TyId>, TyId)> {
     }
 }
 
+/// The line of an old closure that keeps its code (`why` its new version does not take over).
+/// When a trait object was made of a value holding it (a boxed handler or callback, a spawned
+/// thread's entry), values of it may be stored and run the old code: the edit waits for a restart
+/// for it ([`HELD`]: the restart is offered and `session view` lists it). A closure only called
+/// in its parent's frame is not run again once its parent's new code runs: that line only says so.
+fn kept_closure_line(u: &Unit, slot: u32, why: &str) -> String {
+    let FnKey::Closure(file, ce, parent) = u.fns[slot as usize].key else {
+        return format!("kept: closure {} keeps its old code ({why})", u.fns[slot as usize].name);
+    };
+    let stored = u.vtables.snapshot().into_iter().any(|((src, _), _)| holds_closure(&u.tcx.tys, src, (file, ce)));
+    if stored {
+        format!("{HELD}stored values of a closure of `{}` ({}) keep its old code ({why})", u.fns[parent as usize].name, u.fns[slot as usize].name)
+    } else {
+        format!("kept: closure {} keeps its old code where it runs on ({why})", u.fns[slot as usize].name)
+    }
+}
+
+/// Whether a value of type `t` holds a value of closure `at` (its file and expression): the
+/// closure itself, or a field, element or capture of `t` that holds it.
+fn holds_closure(tys: &crate::types::Types, t: TyId, at: (u32, u32)) -> bool {
+    use crate::types::TyKind;
+    match *tys.kind(t) {
+        TyKind::Closure(file, ce, args) => (file, ce) == at || holds_closure(tys, args.tupled_upvars_ty, at),
+        TyKind::Tuple(v) | TyKind::Adt(_, v, _) => tys.list(v).iter().any(|&x| holds_closure(tys, x, at)),
+        TyKind::Array(e, _) | TyKind::Slice(e) => holds_closure(tys, e, at),
+        _ => false,
+    }
+}
+
 unsafe fn compile_guarded(up: *mut Unit, id: u32) -> Result<Code, String> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| jit::compile_fn(up, id))) {
         Ok(r) => r,
@@ -6306,7 +6335,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // closures stored by the running version (handlers, callbacks): an old closure whose parent
     // was rebuilt runs the new version of itself when the new parent has a closure at the same
     // place with the same signature and captures (same environment layout); otherwise it keeps
-    // its own code (memory-safe; reported). The new code is built now if the edit's precompile
+    // its own code (memory-safe; reported, and waiting for a restart when values of it may be
+    // stored: kept_closure_line). The new code is built now if the edit's precompile
     // did not reach it. An older version that forwards to its lineage's cell (install_forward)
     // follows the cell and is not looked at again: an edit's work stays the same however many
     // edits came before.
@@ -6350,7 +6380,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 Some((n, _)) => pairs.push((o, *n)),
                 None => {
                     if oi.is_some() && new_ids.iter().any(|(n, ni)| matches!(&u.fns[*n as usize].key, FnKey::Closure(_, _, p) if *p == parent) && ni.as_ref().map(|x| x.0) == oi.as_ref().map(|x| x.0)) {
-                        out.lines.push(format!("kept: stored values of closure {} keep its old code (its captures or signature changed)", u.fns[o as usize].name));
+                        out.lines.push(kept_closure_line(u, o, "its captures or signature changed"));
                     }
                 }
             }
@@ -6361,8 +6391,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 match compile_guarded(up, n) {
                     Ok(c) => pre.push((n, Ok(c))),
                     Err(_) => {
-                        let u = &*up;
-                        out.lines.push(format!("kept: stored values of closure {} keep its old code (its new code did not build)", u.fns[o as usize].name));
+                        out.lines.push(kept_closure_line(&*up, o, "its new code did not build"));
                         continue;
                     }
                 }
@@ -8866,7 +8895,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     let short = |p: &str| -> String { let v: Vec<&str> = p.rsplit('/').take(2).collect(); v.into_iter().rev().collect::<Vec<_>>().join("/") };
     crate::harness::live::wait_initial();
     crate::run_threads::on_end(watch_events::kick);
-    while !crate::run_threads::ending() {
+    // (from a run's first step of its end no edit goes into it: what the edit queues would keep its
+    // end waiting, and the next run reads the sources anyway)
+    while !crate::run_threads::ending() && !crate::run_threads::run_ending() {
         crate::hot_failure::pump();
         if crate::hot_failure::recovering() {
             std::thread::sleep(std::time::Duration::from_millis(100));

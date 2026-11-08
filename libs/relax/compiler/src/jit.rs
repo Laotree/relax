@@ -17153,9 +17153,10 @@ pub(crate) fn stop_compiling() {
     tier_wake_all();
 }
 
-/// The compile queue's workers leave (`run_end`). False: some were still in a job after `give_up`.
-pub(crate) fn stop_queue_workers(give_up: std::time::Duration) -> bool {
-    queue::stop_workers(give_up)
+/// The compile queue's workers leave (`run_end`): returns once none is in a job, saying every
+/// `report` which jobs it waits for.
+pub(crate) fn stop_queue_workers(report: std::time::Duration) {
+    queue::stop_workers(report)
 }
 
 /// The run's unit goes: nothing of the run calls it any more (`run_end`), the owner thread still serves.
