@@ -900,13 +900,13 @@ mod x64_walk {
         }
     }
 
-    /// Why a walk ends at a frame of the runtime that runs this compiler when the frame pointer is
-    /// not known (a thread blocked in a syscall, walked from its sp and pc): that runtime's frame
-    /// sizes are its own, and no frame is taken from stack contents.
     /// Why a walk ends at a JIT frame whose frame pointer is no address of its stack (a garbage
     /// rbp, as code without frame pointers leaves it, restored by a callee's unwind tables)
     pub const FP_NOT_IN_STACK: &str = "it is JIT code and its frame pointer is not in its stack";
 
+    /// Why a walk ends at a frame of the runtime that runs this compiler when the frame pointer is
+    /// not known (a thread blocked in a syscall, walked from its sp and pc): that runtime's frame
+    /// sizes are its own, and no frame is taken from stack contents.
     pub const HOST_NO_FP: &str = "it is JIT code of the runtime that runs this compiler, and its frame pointer is not known (a thread blocked in a syscall is walked from its sp and pc only)";
 
     /// Each step is proven or the walk ends there, saying why (`raw.stop`): a JIT frame by its
