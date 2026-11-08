@@ -220,7 +220,7 @@ MUST = {
     # a trait object the program made holds the old method table: linked from the disk cache too
     "dyn_method_add": r"old method table", "dyn_method_add_late": r"old method table", "dyn_vtable_fresh": r"old method table", "dyn_impl_removed": LAND,
     # a variant inserted before a held one: lands; restarts when code that ran read the numbers it moves
-    "enum_insert": LAND, "field_copy": LAND, "field_copy_frame": r"is running: its frame may hold", "enum_insert_cast": r"read them as numbers", "enum_insert_hash": r"derived `Hash`",
+    "enum_insert": LAND, "field_copy": LAND, "field_copy_frame": r"is running on thread .+: its frame may hold", "enum_insert_cast": r"read them as numbers", "enum_insert_hash": r"derived `Hash`",
 }
 # (--cold: the session compiled that module's code itself, so its readers are known: it lands)
 if cold:
