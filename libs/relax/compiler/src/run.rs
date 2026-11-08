@@ -4035,6 +4035,8 @@ static ONCE: AtomicBool = AtomicBool::new(false);
 
 fn quit_mark() {
     jit::QUIT_SEEN.store(true, Ordering::Relaxed);
+    // nothing parked waits for a decision now, and a paused program goes on to its quit
+    crate::inspect::events::quit_releases();
     // the quit write and the exit's commit without waiting on the disk (store.rs Slot::tail)
     crate::store::set_exiting();
     if ONCE.swap(true, Ordering::SeqCst) || unsafe { RUN_UNIT }.is_null() { return; }

@@ -4524,6 +4524,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // added one, or one that only moved in the declaration, concerns only code that names it
     // (its text changed)
     let layout_defs: Vec<DefId> = changes.iter().filter_map(|c| if let Change::Layout(d) = c { Some(*d) } else { None }).collect();
+    // where each is in the edit's text: a restart its running frames ask for names it, so that
+    // hold_back keeps it alone at its running text
+    let layout_pos: Vec<(DefId, String)> = layout_defs.iter().map(|&d| (d, new_pos(u, &versions, d))).collect();
     let mut moved_fields: Vec<(DefId, Vec<u32>)> = Vec::new();
     // the structs that take their new layout (fresh_layout_struct), each with the ADTs holding it
     let mut fresh_structs: Vec<(DefId, Vec<DefId>)> = Vec::new();
@@ -6517,18 +6520,30 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let t3 = Instant::now();
     out.ms[2] = (t3 - t2).as_secs_f64() * 1e3;
     let u = &mut *up;
-    // A struct taking its new layout: no program thread may be in code built for the old one.
-    // The threads stand still from here to the install (pause_for_patch), so none enters it
-    // before the patch is in; one in it, or a stack not read to its end, restarts.
+    // A layout that changes under the running code: an enum's variants (code built before can
+    // meet a variant it does not know, a match falls through, and the discriminants it reads may
+    // have moved) or a struct taking its new layout. A struct edit (M10) otherwise keeps the
+    // running layout -- its first fields stay where they are and added fields live in the
+    // extension block -- so code built before it stays valid for every value and its frames run
+    // on. No program thread may be in code the patch rebuilds (built for the old layout) when it
+    // installs. The threads stand still from here to the install (pause_for_patch), so none enters
+    // that code before the patch is in; one in it, or a stack not read to its end, makes the edit a
+    // restart: nothing installs, the running code goes on as it was, and the restart is offered.
+    // (An enum patch installed first and held such a thread for good: its report paused the whole
+    // app with nobody told, and a quit waited for the paused main forever, 11-08.)
+    let breaking: Vec<DefId> = saved_adts.iter().filter(|(d, old)| old.is_enum || fresh_structs.iter().any(|x| x.0 == *d)).map(|(d, _)| *d).collect();
     let mut pre_paused = false;
-    if !fresh_structs.is_empty() && errs.is_empty() {
+    if !breaking.is_empty() && errs.is_empty() {
         pre_paused = crate::inspect::instrument::pause_for_patch();
         let rebuilt: crate::fxhash::HashSet<u32> = slots.iter().copied().collect();
-        let names: Vec<String> = fresh_structs.iter().map(|x| def_name(&u.prog, x.0)).collect();
+        let pos = layout_pos.iter().find(|x| x.0 == breaking[0]).map_or("", |x| x.1.as_str());
+        let enums = saved_adts.iter().any(|(d, old)| old.is_enum && breaking.contains(d));
+        let (what, holds) = if enums { ("enum", "was built for its old variants") } else { ("struct", "may hold values of it in the old layout") };
+        let names: Vec<String> = breaking.iter().map(|&d| def_name(&u.prog, d)).collect();
         let why = match crate::invalid::frame_in(u, &rebuilt) {
             Ok(None) => None,
-            Ok(Some(running)) => Some(format!("struct `{}` changed its layout, and {}: its frame may hold values of it in the old one -- restart the app", names.join("`, `"), running)),
-            Err(e) => Some(format!("struct `{}` changed its layout, and the program's stacks could not be read to see that no frame holds values of it in the old one ({}) -- restart the app", names.join("`, `"), e)),
+            Ok(Some(running)) => Some(format!("{pos}{what} `{}` changed its layout, and {running}: its frame {holds} -- restart the app", names.join("`, `"))),
+            Err(e) => Some(format!("{pos}{what} `{}` changed its layout, and the program's stacks could not be read to see that no frame runs code built for the old one ({e}) -- restart the app", names.join("`, `"))),
         };
         if let Some(why) = why {
             errs.push(why);
@@ -6694,16 +6709,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         cells
     };
     trace_count("forwarders", forwards.len());
-    // An enum layout edit (variants added): code built before it can meet a variant it does not
-    // know (a match falls through), so it never runs again. A struct edit (M10) does not change
-    // the running layout -- its first fields stay where they are and added fields live in the
-    // extension block -- so code built before it stays valid for every value and its frames run on
-    // (a hold there stopped every loop that holds such a struct: the UI thread). The program
-    // threads stand still while an enum edit installs, so their stacks show every frame in code it
-    // replaces (invalid::hold_old_frames, after the install).
-    // (a struct that took its new layout is one too: its frames were asked, under this pause)
-    let breaking: Vec<DefId> = saved_adts.iter().filter(|(d, old)| old.is_enum || fresh_structs.iter().any(|x| x.0 == *d)).map(|(d, _)| *d).collect();
-    let paused = pre_paused || (!breaking.is_empty() && crate::inspect::instrument::pause_for_patch());
+    // (a layout patch installs under the pause its frames were asked in: `breaking` above)
+    let paused = pre_paused;
     for (id, r) in pre {
         match r {
             Ok(c) => {
@@ -6763,10 +6770,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         if out.names.len() > 4 { shown.push(".."); }
         crate::invalid::patch_event(gen, format!("gen {}: {} fn(s) [{}]{}", gen, out.names.len(), shown.join(", "), if layout_names.is_empty() { String::new() } else { format!("; layout of {}", layout_names.join(", ")) }));
     }
-    // an enum layout patch: the earlier patch versions of the slots it rebuilt were built for the
-    // old variants and never run again (invalid.rs; a slot's first code shares pages with
-    // other code and is not invalidated: only frames live at the patch can still reach it, and their
-    // threads are held for good, found in the stacks captured while the program is paused)
+    // a layout patch: the earlier patch versions of the slots it rebuilt were built for the old
+    // layout and never run again (invalid.rs; a slot's first code shares pages with other code and
+    // is not invalidated: only frames live at the patch can still reach it -- none was, asked under
+    // this pause, but a thread the pause did not stop may have entered it since: held for good)
     if !breaking.is_empty() {
         let breaking_names: Vec<String> = breaking.iter().map(|d| def_name(&u.prog, *d)).collect();
         let rebuilt: std::collections::HashSet<u32> = u.patch_log.iter().filter(|(_, g)| *g == gen).map(|(id, _)| *id).collect();
@@ -6774,7 +6781,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         crate::invalid::invalidate(u, |g| matches!(g, crate::invalid::Group::Patch { slot, gen: g0 } if g0 < gen && rebuilt.contains(&slot)), gen, "invalidated code", None, &why);
         let held = crate::invalid::hold_old_frames(u, gen, &breaking_names.join(", "), paused);
         if held > 0 {
-            out.lines.push(format!("held: {} thread(s) with a frame in the first-version code of a rebuilt fn (makepad inspect {} stale; resume restart | stop)", held, std::process::id()));
+            out.lines.push(format!("held: {} thread(s) with a frame in the first-version code of a rebuilt fn: the app runs on without them, the restart is offered (makepad inspect {} stale)", held, std::process::id()));
         }
     }
     let u = &mut *up;
@@ -7649,13 +7656,14 @@ fn start_state() -> Option<String> {
     DOMAIN_RESTORED.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Why the program cannot hand its state over to a restart now (None: it can): a thread of it
-/// cannot go on until the run ends -- parked at a stale access, or held for good at a layout patch
-/// (stale.rs) -- and the program is paused for that report, so it never reaches the safe point
-/// that would. Its restart is the next run without the state, as `resume P<n> restart` is.
+/// Why the program cannot hand its state over to a restart now (None: it can): a thread of it is
+/// parked at a stale access (stale.rs) and the program is paused for that report, so it never
+/// reaches the safe point that would. Its restart is the next run without the state, as `resume
+/// P<n> restart` is. (A thread held for good at a layout patch does not stop the rest: the app
+/// hands its state over, and the run's end lets that thread go.)
 fn handover_blocked() -> Option<String> {
     let stuck = crate::stale::stuck_threads();
-    (stuck > 0).then(|| format!("{stuck} thread(s) of it cannot go on (a stale access, or a frame in code a layout patch replaced: `makepad inspect {} stale`)", std::process::id()))
+    (stuck > 0).then(|| format!("{stuck} thread(s) of it are parked at a stale access and the app is paused for the report (`makepad inspect {} stale`)", std::process::id()))
 }
 
 /// The next run starts now, without the app's state (the app is not asked: a test run of `makepad

@@ -367,6 +367,19 @@ pub fn panic_parked(os_id: u64) -> bool {
     PARKED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p.os_id == os_id)
 }
 
+/// A quit was asked for (a signal, the app's own quit): nothing parked waits for a decision any
+/// more, whatever its domain -- each ends as its domain's stop ends it (`release_domain`), a stale
+/// access's report resumes the program it paused -- and a program paused for an inspection goes
+/// on: the quit waits for the app's main to return, and a paused main never did (a quit waited
+/// forever behind a stale report's pause that named no domain, 11-08).
+pub fn quit_releases() {
+    for p in PARKED.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let _ = p.decision.compare_exchange(0, 1, SeqCst, SeqCst);
+    }
+    RESUME.notify_all();
+    super::instrument::quit_resumes();
+}
+
 /// A domain is stopping: let its parked panics unwind so its ordinary cleanup can run.
 pub fn release_domain(domain: crate::domain::DomainId) {
     for p in PARKED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|p| p.domain == Some(domain)) {
@@ -931,6 +944,17 @@ mod tests {
         assert!(parked(), "the stale access parked");
         release_domain(domain);
         assert_eq!(caller.join().unwrap(), StaleDecision::Ending, "its domain stops: no restart");
+        // a quit ends one of no domain too, and a program paused for its report goes on: the quit
+        // waits for the app's main (a park that named no domain outlived its domain's stop, and
+        // the quit waited for the paused main forever, 11-08)
+        let caller = std::thread::spawn(|| park_stale(1, None, "stale access: test", &[]));
+        assert!(parked(), "the stale access parked");
+        crate::inspect::instrument::pause_program();
+        assert!(crate::inspect::instrument::paused(), "paused for the report");
+        quit_releases();
+        assert_eq!(caller.join().unwrap(), StaleDecision::Ending, "a quit: no restart");
+        assert!(!crate::inspect::instrument::paused(), "a quit resumes the paused program");
+        assert!(parked_now().is_empty(), "nothing stays parked at a quit");
         let _ = std::fs::remove_dir_all(&home);
     }
 }

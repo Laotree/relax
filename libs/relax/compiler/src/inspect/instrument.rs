@@ -1159,8 +1159,26 @@ pub fn pause_for_patch() -> bool {
     if PAUSED.swap(true, SeqCst) {
         return false;
     }
+    PATCH_PAUSE.store(true, SeqCst);
     pause_imp::pause(&program_thread);
     true
+}
+
+/// The pause is a patch's (`pause_for_patch`): its install resumes the program in a moment.
+static PATCH_PAUSE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the program is paused for a report or an inspection (not a patch's moment).
+pub fn paused() -> bool {
+    PAUSED.load(SeqCst) && !PATCH_PAUSE.load(SeqCst)
+}
+
+/// A quit was asked for (inspect::events::quit_releases): a program paused for a report or an
+/// inspection goes on, so its quit runs to the end. A patch's pause ends with its install.
+pub(crate) fn quit_resumes() {
+    if paused() {
+        eprintln!("makepad: a quit: the paused program goes on so that it can quit");
+        resume_program();
+    }
 }
 
 /// Thread `t` (a program thread) stays held for good, past any `resume`, until the run's end
@@ -1188,6 +1206,7 @@ pub(crate) fn run_ends() {
 
 /// Ends a pause (as `resume`).
 pub fn resume_program() -> usize {
+    PATCH_PAUSE.store(false, SeqCst);
     PAUSED.store(false, SeqCst);
     let n = pause_imp::resume();
     super::mem::mark("resume");
@@ -1584,4 +1603,5 @@ pub(crate) unsafe fn reset_statics() {
     reset(&SNAPS, Mutex::new(std::collections::VecDeque::new()));
     reset(&PARKED, Mutex::new(Vec::new()));
     reset(&PAUSED, AtomicBool::new(false));
+    reset(&PATCH_PAUSE, AtomicBool::new(false));
 }
