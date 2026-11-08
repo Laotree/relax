@@ -8,11 +8,10 @@ fn deferred_reexport_signatures() {
     const CHILD: &str = "MAKEPAD_RUN_REEXPORT_SIGNATURE_TEST";
     let Ok(case) = std::env::var(CHILD) else {
         for case in ["plain", "partial"] {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "lazy_reload_tests::deferred_reexport_signatures", "--nocapture", "--test-threads=1"])
                 .env(CHILD, case)
-                .env("MAKEPAD_RUN_LAZY_DEFER", "lazy_reexport/child.rs,lazy_reexport/other.rs")
-                .output().unwrap();
+                .env("MAKEPAD_RUN_LAZY_DEFER", "lazy_reexport/child.rs,lazy_reexport/other.rs"));
             assert!(output.status.success(), "{case}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         }
         return;
@@ -77,10 +76,9 @@ fn gandalf_live_edit_guard_and_reporting() {
     const CHILD: &str = "MAKEPAD_RUN_GANDALF_GATE_TEST";
     let Ok(case) = std::env::var(CHILD) else {
         for case in ["app", "framework", "all", "std", "std_all", "lazy"] {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "lazy_reload_tests::gandalf_live_edit_guard_and_reporting", "--nocapture", "--test-threads=1", "--format=terse"])
-                .env(CHILD, case).env("MAKEPAD_RUN_GANDALF_ALL", if case.ends_with("all") { "1" } else { "0" })
-                .output().unwrap();
+                .env(CHILD, case).env("MAKEPAD_RUN_GANDALF_ALL", if case.ends_with("all") { "1" } else { "0" }));
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(output.status.success(), "{case}: {stdout}\n{stderr}");
@@ -207,10 +205,9 @@ fn a_background_check_panic_leaves_the_query_to_the_apps_compile() {
         for (case, panics_in) in [("check", "target:gandalf"), ("both", "target")] {
             // (its own home: the injected panics are no record for this machine's ledger)
             let home = std::env::temp_dir().join(format!("relax-check-panic-home-{}-{case}", std::process::id()));
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "lazy_reload_tests::a_background_check_panic_leaves_the_query_to_the_apps_compile", "--nocapture", "--test-threads=1"])
-                .env(CHILD, case).env("MAKEPAD_RUN_TEST_TYPECK_PANIC", panics_in).env("MAKEPAD_RUN_PANIC_PARK", "0").env("MAKEPAD_HOME", &home)
-                .output().unwrap();
+                .env(CHILD, case).env("MAKEPAD_RUN_TEST_TYPECK_PANIC", panics_in).env("MAKEPAD_RUN_PANIC_PARK", "0").env("MAKEPAD_HOME", &home));
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(output.status.success(), "{case}: {}\n{stderr}", String::from_utf8_lossy(&output.stdout));
             std::fs::remove_dir_all(&home).unwrap();
@@ -286,10 +283,9 @@ fn specv_patch_before_verdict() {
     const CHILD: &str = "MAKEPAD_RUN_SPECV_TEST";
     let Ok(case) = std::env::var(CHILD) else {
         for case in ["bad", "clean"] {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "lazy_reload_tests::specv_patch_before_verdict", "--nocapture", "--test-threads=1", "--format=terse"])
-                .env(CHILD, case).env("MAKEPAD_RUN_GANDALF_ALL", "0")
-                .output().unwrap();
+                .env(CHILD, case).env("MAKEPAD_RUN_GANDALF_ALL", "0"));
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(output.status.success(), "{case}: {stdout}\n{stderr}");
@@ -402,10 +398,9 @@ fn specv_patch_before_verdict() {
 fn specv_aliased_call_from_unverified_body() {
     const CHILD: &str = "MAKEPAD_RUN_SPECV_ALIAS_TEST";
     if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "lazy_reload_tests::specv_aliased_call_from_unverified_body", "--nocapture", "--test-threads=1", "--format=terse"])
-            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
-            .output().unwrap();
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0"));
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         return;
     }
@@ -545,7 +540,7 @@ fn specv_verified_rebuild_runs_twin_code_not_lazy_compiles() {
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
             cmd.args(["--exact", "lazy_reload_tests::specv_verified_rebuild_runs_twin_code_not_lazy_compiles", "--nocapture", "--test-threads=1", "--format=terse"])
                 .env(CHILD, case).env("MAKEPAD_RUN_GANDALF_ALL", "0");
-            let output = cmd.output().unwrap();
+            let output = crate::test_child::output(&mut cmd);
             assert!(output.status.success(), "{case}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         }
         return;
@@ -636,7 +631,7 @@ fn specv_base_o3_takes_its_twins_counts() {
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
             cmd.args(["--exact", "lazy_reload_tests::specv_base_o3_takes_its_twins_counts", "--nocapture", "--test-threads=1", "--format=terse"])
                 .env(CHILD, case).env("MAKEPAD_RUN_GANDALF_ALL", "0");
-            let output = cmd.output().unwrap();
+            let output = crate::test_child::output(&mut cmd);
             assert!(output.status.success(), "{case}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         }
         return;
@@ -724,10 +719,9 @@ fn d3_disjoint_check_lowered_from_the_verdict() {
     const CHILD: &str = "MAKEPAD_RUN_D3_TEST";
     let Ok(case) = std::env::var(CHILD) else {
         for case in ["relaxed", "strict", "check-first"] {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "lazy_reload_tests::d3_disjoint_check_lowered_from_the_verdict", "--nocapture", "--test-threads=1", "--format=terse"])
-                .env(CHILD, case).env("MAKEPAD_RUN_GANDALF_ALL", "0")
-                .output().unwrap();
+                .env(CHILD, case).env("MAKEPAD_RUN_GANDALF_ALL", "0"));
             assert!(output.status.success(), "{case}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         }
         return;
@@ -849,9 +843,9 @@ fn app_scope_live_layout_edits() {
     const CHILD: &str = "MAKEPAD_RUN_APP_LAYOUT_TEST";
     let Ok(case) = std::env::var(CHILD) else {
         for case in ["app_lib", "path_crate", "framework", "embedded", "generic_embedded", "pointer", "bound_template", "bound_template_embedded", "derive_default", "live_crate"] {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "lazy_reload_tests::app_scope_live_layout_edits", "--nocapture", "--test-threads=1"])
-                .env(CHILD, case).output().unwrap();
+                .env(CHILD, case));
             assert!(output.status.success(), "{case}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         }
         return;
@@ -1061,9 +1055,9 @@ fn restored_images_take_live_edits() {
     const CHILD: &str = "MAKEPAD_RUN_RESTORED_EDIT_TEST";
     if std::env::var(CHILD).is_err() {
         // the unit and its runtime are process-global
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "lazy_reload_tests::restored_images_take_live_edits", "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1").output().unwrap();
+            .env(CHILD, "1"));
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         return;
     }
@@ -1150,10 +1144,9 @@ fn restored_images_take_live_edits() {
 fn realtime_strict_ready_lazy_and_patch_freeze() {
     const CHILD: &str = "MAKEPAD_RUN_RT_FREEZE_TEST";
     if std::env::var(CHILD).is_err() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "lazy_reload_tests::realtime_strict_ready_lazy_and_patch_freeze", "--nocapture", "--test-threads=1", "--format=terse"])
-            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
-            .output().unwrap();
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0"));
         let out = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
         return;
@@ -1246,10 +1239,9 @@ fn realtime_thread_marks_the_calling_thread() {
 fn realtime_reach_follows_vtables_made_after_the_mark() {
     const CHILD: &str = "MAKEPAD_RUN_RT_DYN_TEST";
     if std::env::var(CHILD).is_err() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "lazy_reload_tests::realtime_reach_follows_vtables_made_after_the_mark", "--nocapture", "--test-threads=1", "--format=terse"])
-            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
-            .output().unwrap();
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0"));
         let out = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
         return;
@@ -1338,10 +1330,9 @@ fn realtime_reach_follows_vtables_made_after_the_mark() {
 fn realtime_reach_follows_trait_objects_held_deep_in_the_roots_value() {
     const CHILD: &str = "MAKEPAD_RUN_RT_DEEP_DYN_TEST";
     if std::env::var(CHILD).is_err() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "lazy_reload_tests::realtime_reach_follows_trait_objects_held_deep_in_the_roots_value", "--nocapture", "--test-threads=1", "--format=terse"])
-            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
-            .output().unwrap();
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0"));
         let out = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
         return;
@@ -1412,10 +1403,9 @@ fn realtime_reach_follows_trait_objects_held_deep_in_the_roots_value() {
 fn realtime_reach_skips_trait_objects_it_only_makes_itself() {
     const CHILD: &str = "MAKEPAD_RUN_RT_OWN_DYN_TEST";
     if std::env::var(CHILD).is_err() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "lazy_reload_tests::realtime_reach_skips_trait_objects_it_only_makes_itself", "--nocapture", "--test-threads=1", "--format=terse"])
-            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
-            .output().unwrap();
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0"));
         let out = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
         return;
@@ -1489,10 +1479,9 @@ fn realtime_reach_skips_trait_objects_it_only_makes_itself() {
 fn realtime_reach_walks_code_that_ran_before_the_mark() {
     const CHILD: &str = "MAKEPAD_RUN_RT_WARM_TEST";
     if std::env::var(CHILD).is_err() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "lazy_reload_tests::realtime_reach_walks_code_that_ran_before_the_mark", "--nocapture", "--test-threads=1", "--format=terse"])
-            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
-            .output().unwrap();
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0"));
         let out = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
         return;
@@ -1566,10 +1555,9 @@ fn realtime_reach_walks_code_that_ran_before_the_mark() {
 fn realtime_reach_covers_float_formatting_and_container_drops() {
     const CHILD: &str = "MAKEPAD_RUN_RT_FMT_TEST";
     if std::env::var(CHILD).is_err() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "lazy_reload_tests::realtime_reach_covers_float_formatting_and_container_drops", "--nocapture", "--test-threads=1", "--format=terse"])
-            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
-            .output().unwrap();
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0"));
         let out = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
         return;
@@ -1641,10 +1629,9 @@ fn realtime_reach_covers_float_formatting_and_container_drops() {
 fn live_new_module_types_edit() {
     const CHILD: &str = "MAKEPAD_RUN_NEW_MODULE_EDIT_TEST";
     if std::env::var(CHILD).is_err() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "lazy_reload_tests::live_new_module_types_edit", "--nocapture", "--test-threads=1", "--format=terse"])
-            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
-            .output().unwrap();
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0"));
         let out = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
         return;
@@ -1755,10 +1742,9 @@ impl RtPath {
 fn a_renamed_field_reads_generic_fns_as_typeck_left_them() {
     const CHILD: &str = "MAKEPAD_RUN_RENAMED_FIELD_EDIT_TEST";
     if std::env::var(CHILD).is_err() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "lazy_reload_tests::a_renamed_field_reads_generic_fns_as_typeck_left_them", "--nocapture", "--test-threads=1", "--format=terse"])
-            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
-            .output().unwrap();
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0"));
         let out = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
         return;
@@ -1820,10 +1806,9 @@ pub fn value(out: &mut u32) {
 fn a_live_edit_reaches_both_crates_of_a_lib_test_root() {
     const CHILD: &str = "MAKEPAD_RUN_TWIN_CRATE_EDIT_TEST";
     if std::env::var(CHILD).is_err() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "lazy_reload_tests::a_live_edit_reaches_both_crates_of_a_lib_test_root", "--nocapture", "--test-threads=1", "--format=terse"])
-            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
-            .output().unwrap();
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0"));
         let out = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
         return;
@@ -1892,10 +1877,9 @@ fn a_live_edit_reaches_both_crates_of_a_lib_test_root() {
 fn stored_closure_follows_edits_with_flat_work() {
     const CHILD: &str = "MAKEPAD_RUN_STORED_CLOSURE_TEST";
     if std::env::var(CHILD).is_err() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "lazy_reload_tests::stored_closure_follows_edits_with_flat_work", "--nocapture", "--test-threads=1", "--format=terse"])
-            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
-            .output().unwrap();
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0"));
         let out = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
         return;
@@ -2004,10 +1988,9 @@ pub fn value(out: &mut u32) {{
 fn a_stored_closure_whose_captures_change_waits_for_a_restart() {
     const CHILD: &str = "MAKEPAD_RUN_STORED_CAPTURES_TEST";
     if std::env::var(CHILD).is_err() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "lazy_reload_tests::a_stored_closure_whose_captures_change_waits_for_a_restart", "--nocapture", "--test-threads=1", "--format=terse"])
-            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0")
-            .output().unwrap();
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0"));
         let out = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
         return;

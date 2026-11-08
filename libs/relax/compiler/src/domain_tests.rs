@@ -402,11 +402,12 @@ fn a_build_script_start_under_a_loading_domain_finishes() {
         });
         let _ = done_tx.send(status.map(|s| s.map(|s| s.success())));
     });
-    // a deadline only to report the deadlock (the threads stay stuck when it is there)
-    match done_rx.recv_timeout(Duration::from_secs(60)) {
+    // (a process start that waits for the loader's compile job, the deadlock this is about,
+    // holds the test here, a hung test)
+    match done_rx.recv() {
         Ok(Ok(Ok(true))) => {}
         Ok(r) => panic!("the build script did not run: {:?}", r.map(|r| r.map_err(|e| e.to_string()))),
-        Err(_) => panic!("a process start under a loading domain's compile job never finished (fork waits for the loader's job)"),
+        Err(_) => panic!("the process start's thread ended without an answer"),
     }
     drop(u);
     std::fs::remove_dir_all(root).unwrap();
@@ -1444,25 +1445,15 @@ fn a_fault_deeper_in_native_code_ends_the_process_at_once() {
         return;
     }
     let log = std::env::temp_dir().join(format!("relax-native-fault-{}.log", std::process::id()));
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", THIS, "--test-threads=1", "--nocapture"])
-        .env(CHILD, "1")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::fs::File::create(&log).unwrap())
-        .spawn()
-        .unwrap();
-    let since = std::time::Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        // (the fixture's compile comes first, on a loaded machine; the end is what is bounded)
-        if since.elapsed().as_secs() >= 300 {
-            child.kill().unwrap();
-            panic!("the process stayed up after its fault:\n{}", std::fs::read_to_string(&log).unwrap_or_default());
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    // (the fixture's compile comes first; a process that stayed up after its fault holds the
+    // test here, a hung test)
+    let status = crate::test_child::status(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", THIS, "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap()),
+    );
     let told = std::fs::read_to_string(&log).unwrap();
     std::fs::remove_file(&log).unwrap();
     assert!(told.contains("the process ends"), "{status:?}\n{told}");
