@@ -8866,7 +8866,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     let short = |p: &str| -> String { let v: Vec<&str> = p.rsplit('/').take(2).collect(); v.into_iter().rev().collect::<Vec<_>>().join("/") };
     crate::harness::live::wait_initial();
     crate::run_threads::on_end(watch_events::kick);
-    while !crate::run_threads::ending() {
+    // (from a run's first step of its end no edit goes into it: what the edit queues would keep its
+    // end waiting, and the next run reads the sources anyway)
+    while !crate::run_threads::ending() && !crate::run_threads::run_ending() {
         crate::hot_failure::pump();
         if crate::hot_failure::recovering() {
             std::thread::sleep(std::time::Duration::from_millis(100));
