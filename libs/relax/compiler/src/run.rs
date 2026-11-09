@@ -1734,7 +1734,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // ---- signatures, layouts, impl tables
     let t = Instant::now();
     // A check reports validation errors of its crates' impl headers and field types, which
-    // declaration collection lowers: the crates are marked before it runs (a run marks none).
+    // declaration collection lowers: the crates are marked before it runs (a run marks its app's
+    // crates below).
     let checked = if check {
         crate::check::checked_crates(&prog, root, watch || root_only || session.is_some(), selftest || workspace_check, &also)
     } else { Vec::new() };
@@ -1788,6 +1789,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         prog.own_crates = own.clone();
         relax_types::lint::enable();
         prog.run_import_sim(&own);
+    }
+    // A run refuses what rustc refuses in the app's own crates (their whole check before main), so
+    // the validation-only checks run for them too: without them a body like
+    // `Variant { a, ..base }` (E0436) compiled and ran, and the run said nothing. Neither the
+    // import replay nor the lints: those are the check's.
+    if !check && !harness && !plain_test {
+        for k in crate::check::app_crates(&prog, root) { prog.crates[k as usize].validate = true; }
     }
     let mut tcx = collected_tcx.take().unwrap_or_else(crate::tcx::Tcx::new);
     // MAKEPAD_RUN_PERTURB: type ids shift (code must not depend on them; syms.rs reloc_sig)
