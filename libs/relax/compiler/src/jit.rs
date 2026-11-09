@@ -28083,7 +28083,7 @@ impl Drop for WantConsts {
 /// Constants a background build's lowering ahead needed and nobody had evaluated in this run (with
 /// the collect epoch they were named under): a warm run links its code from the disk cache, so the
 /// owner's lowerings that evaluate them in a cold run never happen, and every O3 build whose body
-/// names one (`EPS`, `usize::MAX`, `Vec::ZERO`) bailed on its own front for the whole run (mickey:
+/// names one (`EPS`, `usize::MAX`, `Vec::ZERO`) bailed on its own front for the whole run (a game's
 /// mirror::walk_hurt_changed / reconcile ran their warm-cache baseline code). Rule I-PURE keeps
 /// CTFE on the owner: it evaluates them between requests (const_drain), nobody waits for it.
 /// The same holds for a `#[thread_local]` static nobody placed in this run (Unit::thread_local_place
