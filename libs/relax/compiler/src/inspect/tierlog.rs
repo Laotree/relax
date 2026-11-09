@@ -64,8 +64,7 @@ pub const ARM_WHY: [&str; 5] = ["new code", "new code under the open window", "c
 pub const WIN_DONE: u8 = 0;
 pub const WIN_IDLE: u8 = 1;
 pub const WIN_WORK: u8 = 2;
-pub const WIN_CREDITED: u8 = 3;
-pub const WIN_WHY: [&str; 4] = ["entries/blocks/time reached", "went idle (built with what it has)", "lukewarm code showed work", "a hot loop ran under it"];
+pub const WIN_WHY: [&str; 3] = ["entries/blocks/time reached", "went idle (built with what it has)", "lukewarm code showed work"];
 
 pub const DROP_PANIC: u8 = 0;
 pub const DROP_CODEGEN: u8 = 1;

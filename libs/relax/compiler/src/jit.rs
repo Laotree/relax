@@ -16593,8 +16593,8 @@ fn rt_loop_hot(counter: u64, fp: u64) {
             if c != at {
                 let crec = tier_rec(&u.slots, c);
                 let st = (*crec.add(3)).load(Ordering::Relaxed);
-                // a lukewarm slot in its counting window: the loop under it is its work (credited:
-                // pgo_poll ends its window); any other slot that turned hot ends the walk
+                // a lukewarm slot in its counting window: the walk goes on past it (credited: pgo_poll
+                // looks at its own work now); any other slot that turned hot ends the walk
                 if st == T_QUEUED && !pgo_credit(c) {
                     break;
                 }
@@ -16949,6 +16949,32 @@ mod tier_cost_tests {
         assert!(drive(60 * 894, 894, 10).is_some(), "the race's Hud::draw_walk (weight 894) tiers up within 10 s");
         let t = drive(1_000_000_000, 20, 10).unwrap();
         assert!(t < 0.01, "a burst tiers up at once ({t} s)");
+    }
+
+    /// Why: every UI handler on a hot loop's stack went to O3 (rt_loop_hot credits each lukewarm
+    /// frame it walks past, and a credited window skipped the work test): in a slicing session 94%
+    /// of the compile CPU went to code no sample saw. A credited window is looked at at once, on
+    /// its own work: with too little it stays parked, with enough it goes to O3.
+    #[test]
+    fn a_lukewarm_slot_a_hot_loop_ran_under_needs_work_of_its_own() {
+        isolated_test!(a_lukewarm_slot_a_hot_loop_ran_under_needs_work_of_its_own);
+        let now = 100 * PGO_WORK_NS;
+        let weights: &'static [u32] = Box::leak(vec![8u32; 4].into_boxed_slice());
+        // its own code over the window since its last look: 4 blocks of 8 instructions, `runs` times
+        let window = |id: u32, runs: u64| {
+            let counters: &'static [AtomicU64] = Box::leak((0..4).map(|_| AtomicU64::new(runs)).collect());
+            Counting { id, counters, weights, at: now - 10 * PGO_WORK_NS, lukewarm: true, mark: (0, now - 2 * PGO_MS * 1_000_000), parked: true, credited: false }
+        };
+        // a handler: a few calls a second; a loop driver: the bar's work over the window, twice over
+        let per_window = (2 * PGO_MIN_WORK * 2 * PGO_MS / 1000).div_ceil(4 * 8);
+        let (handler, driver, untouched) = (u32::MAX - 1, u32::MAX - 2, u32::MAX - 3);
+        COUNTING.lock().unwrap().extend([window(handler, 3), window(driver, per_window), window(untouched, per_window)]);
+        assert!(pgo_credit(handler) && pgo_credit(driver), "both are lukewarm counting slots");
+        pgo_poll_at(now);
+        let left = |id: u32| COUNTING.lock().unwrap().iter().find(|e| e.id == id).map(|e| (e.parked, e.credited));
+        assert_eq!(left(handler), Some((true, false)), "the handler stays parked in its counted code: a loop under it is not its work");
+        assert_eq!(left(driver), None, "the driver's own work takes it to O3");
+        assert_eq!(left(untouched), Some((true, false)), "a parked window no loop ran under waits for its PGO_WORK_NS look");
     }
 
     /// Idle code decays to nothing (no work while it is idle: the decay is applied at its next check).
@@ -18939,7 +18965,8 @@ struct Counting {
     /// a lukewarm slot whose last window showed too little work: it stays in its counted code
     /// (not pending for O3_PROGRESS, looked at on the usual poll)
     parked: bool,
-    /// a hot loop ran under one of its frames (rt_loop_hot): the work is its callees'
+    /// a hot loop ran under one of its frames (rt_loop_hot): its window is looked at on the next
+    /// poll, parked or not (its own work still decides)
     credited: bool,
 }
 /// slots running counted code
@@ -18992,8 +19019,11 @@ static PGO_LOOP_UNFINALS: AtomicU64 = AtomicU64::new(0);
 
 /// Queues O3 for the counting slots whose window is over (first O3 worker, no lock held).
 fn pgo_poll() {
+    pgo_poll_at(wall_ns());
+}
+
+fn pgo_poll_at(now: u64) {
     profiled_heat();
-    let now = wall_ns();
     let mut ready: Vec<(u32, u64, &'static [AtomicU64], &'static [u32])> = Vec::new();
     let mut parked_now: Vec<u32> = Vec::new();
     {
@@ -19014,17 +19044,14 @@ fn pgo_poll() {
                 let work: u64 = ctr.iter().zip(e.weights).map(|(c, w)| c.load(Ordering::Relaxed).saturating_mul(*w as u64)).fold(0, u64::saturating_add);
                 (work as u128 * 1_000_000_000 / el.max(1) as u128).min(u64::MAX as u128) as u64
             };
-            if e.lukewarm && e.credited {
-                crate::inspect::tierlog::note(e.id, crate::inspect::tierlog::ev::WINDOW_END, crate::inspect::tierlog::WIN_CREDITED, rate, 0);
-                ready.push((e.id, work_rate(), e.counters, e.weights));
-                return false;
-            }
             if e.lukewarm {
-                // (a parked slot is looked at once per PGO_WORK_NS window)
+                // (a parked slot is looked at once per PGO_WORK_NS window, one a hot loop ran under
+                // at once: its own work decides, not the loop's)
                 let win = now.saturating_sub(e.mark.1);
-                if win < if e.parked { PGO_WORK_NS } else { PGO_MS * 1_000_000 } {
+                if win < if e.parked && !e.credited { PGO_WORK_NS } else { PGO_MS * 1_000_000 } {
                     return true;
                 }
+                e.credited = false;
                 let work: u64 = ctr.iter().zip(e.weights).map(|(c, w)| c.load(Ordering::Relaxed).saturating_mul(*w as u64)).fold(0, u64::saturating_add);
                 let per_s = ((work - e.mark.0.min(work)) as u128 * 1_000_000_000 / win as u128) as u64;
                 if per_s >= PGO_MIN_WORK {
@@ -19147,7 +19174,7 @@ fn profiled_heat() {
 }
 
 /// A hot loop ran under a frame of slot `id` (rt_loop_hot, no unit lock): true if `id` is a
-/// lukewarm counting slot, whose window that credit ends. A program thread never waits on the
+/// lukewarm counting slot, whose window is looked at on the next poll. A program thread never waits on the
 /// lock (rule I-CALL): busy, no credit (the walk stops there; the next run-out looks again).
 fn pgo_credit(id: u32) -> bool {
     let Ok(mut g) = COUNTING.try_lock() else { return false };
