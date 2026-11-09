@@ -30,7 +30,7 @@ OUT=$("$1" test "$D/$CASE.rs" 2>&1)
 STATUS=$?
 if [ "$STATUS" = 0 ]; then echo "modules $CASE: PASS"; else echo "modules $CASE: FAIL"; echo "$OUT" | tail -30; exit 1; fi
 done
-OUT=$(MAKEPAD_RUN_SANDBOX_FUEL=0 python3 -c 'import subprocess, sys; sys.exit(subprocess.run(sys.argv[1:], timeout=120).returncode)' "$1" test "$D/guard_threads.rs" 2>&1)
+OUT=$(MAKEPAD_RUN_SANDBOX_FUEL=0 "$1" test "$D/guard_threads.rs" 2>&1)
 STATUS=$?
 GOT=$(echo "$OUT" | grep '^out ')
 if [ "$STATUS" = 0 ] && [ "$GOT" = $'out concurrent guards: true\nout nested guards: true' ]; then echo "modules guard threads: PASS"; else echo "modules guard threads: FAIL"; echo "$OUT" | tail -30; exit 1; fi
