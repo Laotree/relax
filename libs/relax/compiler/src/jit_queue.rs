@@ -358,7 +358,7 @@ fn key(e: &Entry, now: &HeatNow) -> i64 {
     if matches!(e.job, Job::Check(..)) { return if crate::check::check_waited() { CHECK_WAITED_KEY } else { i64::MIN }; }
     let (heat, ui) = match &e.job {
         Job::O2(u, id, _) => now.heat(*u, *id),
-        Job::O3(t) => now.heat(0, t.0),
+        Job::O3(t) => now.tier_heat(t),
         _ => (0, false),
     };
     // log2 heat buckets, with one doubling per four seconds of age. Adding the
@@ -965,7 +965,7 @@ pub(super) fn view(n: usize) -> Vec<String> {
         let e = &q.entries[i];
         let (heat, ui) = match &e.job {
             Job::O2(unit, id, _) => now.heat(*unit, *id),
-            Job::O3(t) => now.heat(0, t.0),
+            Job::O3(t) => now.tier_heat(t),
             _ => (0, false),
         };
         let why = match &e.job {
@@ -984,6 +984,20 @@ pub(super) fn view(n: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_queued_slot_keeps_the_heat_it_was_queued_at() {
+        const S: u64 = 1_000_000_000;
+        let mut q = Queue::new();
+        let now = 1000 * S;
+        let (cold, hot, old_cold) = ((u32::MAX - 1, 0, now, 1 << 15), (u32::MAX - 2, 0, now, 1 << 34), (u32::MAX - 3, 0, now - 40 * S, 1 << 15));
+        for e in [cold, hot, old_cold] {
+            q.push(Job::O3(e), e.2);
+        }
+        let keys = [0, 1, 2].map(|i| q.entries[i].key);
+        assert!(keys[1] > keys[2] && keys[2] > keys[0], "the hottest first, then what waited longest: {keys:?}");
+        q.drop_tiers(&[cold, hot, old_cold].into_iter().collect());
+    }
 
     #[test]
     fn a_slot_queued_again_keeps_its_new_entry() {

@@ -10720,7 +10720,7 @@ fn o2_hottest_queued(offered: &std::collections::HashSet<(usize, u32)>) -> Optio
     let seen = O2_SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let now = HeatNow::take();
     candidates.iter().filter(|e| !seen.as_ref().is_some_and(|s| s.contains(&(up as usize, e.0))))
-        .max_by_key(|e| (now.key(0, e.0, e.2), std::cmp::Reverse(e.2)))
+        .max_by_key(|e| (now.tier_key(e), std::cmp::Reverse(e.2)))
         .map(|e| (up, e.0))
 }
 
@@ -16762,10 +16762,19 @@ impl HeatNow {
         HeatNow { hu: heat_unit(), wall: wall_ns(), tier: tier_clock() }
     }
 
-    fn key(&self, unit: usize, id: u32, at: u64) -> u64 {
-        let (heat, ui) = self.heat(unit, id);
-        if at == O2_FRONT_AT { queue::heat_key(heat, ui, 0) + 64 * 1024 }
-        else { queue::heat_key(heat, ui, self.wall.saturating_sub(at)) }
+    /// An O3 queue entry's place among the others: its heat, and the time it waited.
+    fn tier_key(&self, e: &queue::TierEntry) -> u64 {
+        let (heat, ui) = self.tier_heat(e);
+        queue::heat_key(heat, ui, self.wall.saturating_sub(e.2))
+    }
+
+    /// An O3 queue entry's heat and UI mark. A queued slot's calls are not counted (rt_hot takes its
+    /// stub out), so its record only decays, and all that tells it from any other entry is the rate
+    /// it was queued at (the cost per second that reached the threshold). Its loops and counted code
+    /// may show more since.
+    fn tier_heat(&self, e: &queue::TierEntry) -> (u64, bool) {
+        let (heat, ui) = self.heat(0, e.0);
+        (heat.max(e.3), ui)
     }
 
     /// Slot `id`'s heat and UI mark (`unit` 0: the tiering unit; another unit's slot: none).
