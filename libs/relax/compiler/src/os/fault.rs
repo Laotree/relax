@@ -85,6 +85,18 @@ mod unix {
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     pub use abort::{report_abort, start_reporter};
 
+    /// Raises SIGABRT again on this thread, from its SIGABRT handler once the default action is
+    /// back: the signal stays blocked until the handler returns, and the process ends there.
+    /// abort() would raise it again itself; a SIGABRT from outside would not, and the process
+    /// went on after its report. Async-signal-safe.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    pub unsafe fn raise_abort() {
+        extern "C" {
+            fn raise(sig: i32) -> i32;
+        }
+        raise(SIGABRT);
+    }
+
     /// SIGABRT's report, made off the aborting thread. glibc's malloc checks call abort() with
     /// the thread's arena locked, and a report on that thread reaches glibc's malloc again:
     /// besides its own blocks, its first block in the compiler arena and its first wait on the
@@ -277,7 +289,7 @@ mod unix {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::unix::{kind, report_abort, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV};
+    use super::unix::{kind, raise_abort, report_abort, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV};
     use super::{Action, Fault, Hooks};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -323,6 +335,7 @@ mod imp {
             if sig == SIGABRT {
                 report_abort(*gregs.add(16), *gregs.add(10));
                 default_action(SIGABRT);
+                raise_abort();
                 return;
             }
             // MAKEPAD_RUN_COMPILE_WATCH: the watcher asks a thread stuck in one step where it is
@@ -663,7 +676,7 @@ mod imp {
 /// (Chromium's in CefInitialize) stay chained.
 #[cfg(target_vendor = "apple")]
 mod imp {
-    use super::unix::{kind, report_abort, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
+    use super::unix::{kind, raise_abort, report_abort, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
     use super::{Action, Fault, Hooks};
     use crate::jit::cur_unit;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -803,8 +816,8 @@ mod imp {
                 let mc = *(uc.add(UC_MCONTEXT) as *const *mut u8);
                 let reg = |off: usize| -> *mut u64 { mc.add(off) as *mut u64 };
                 report_abort(*reg(SS_PC), *reg(SS_FP));
-                // back to the default action: abort() raises again and the process ends
                 default_action(SIGABRT);
+                raise_abort();
                 return;
             }
             if sig == SIG_WATCHDOG && crate::jit::WATCH_DUMP.load(Ordering::Relaxed) {
@@ -1245,4 +1258,51 @@ pub fn die_by(sig: i32) -> ! {
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
 pub(crate) unsafe fn reset_statics() {
     imp::reset_statics();
+}
+
+#[cfg(all(test, any(target_os = "linux", target_vendor = "apple")))]
+mod abort_tests {
+    use std::io::BufRead;
+    use std::os::unix::process::ExitStatusExt;
+
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+        fn setrlimit(resource: i32, limit: *const [u64; 2]) -> i32;
+    }
+
+    /// A SIGABRT sent from outside ends the process after its report line, as abort()'s does. A JIT
+    /// parked at a compile error took one, reported it and stayed parked for good.
+    #[test]
+    fn a_sigabrt_from_outside_ends_the_process() {
+        const CHILD: &str = "MAKEPAD_RUN_OUTSIDE_SIGABRT_CHILD";
+        const READY: &str = "waiting for the signal";
+        if std::env::var_os(CHILD).is_some() {
+            // (no core file: writing one is most of the time an abort takes; RLIMIT_CORE)
+            unsafe { setrlimit(4, &[0, 0]) };
+            super::install();
+            super::start_abort_reporter();
+            println!("{READY}");
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            std::process::exit(7);
+        }
+        let _slot = crate::test_child::slot();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "os::fault::abort_tests::a_sigabrt_from_outside_ends_the_process", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        while !line.contains(READY) {
+            line.clear();
+            assert!(out.read_line(&mut line).unwrap() > 0, "the child ended before it waited for the signal");
+        }
+        assert_eq!(unsafe { kill(child.id() as i32, 6) }, 0);
+        let output = child.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.signal(), Some(6), "status {:?}:\n{err}", output.status);
+        assert!(err.contains("SIGABRT on thread"), "no report line:\n{err}");
+    }
 }
