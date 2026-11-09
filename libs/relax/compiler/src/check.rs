@@ -617,6 +617,65 @@ fn jobs() -> usize {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()).min(16))
 }
 
+/// How one definition's work in the whole check's item passes ended.
+enum DefWork<R> {
+    Done(R),
+    /// The error to report: a fatal diagnostic, or an internal error saying what the panic said.
+    Failed(String),
+    /// A constant it evaluates needs a file the check left unloaded (`settled_defs`).
+    NeedsLoad,
+}
+
+/// One definition's work on a worker of the whole check's item passes. A constant it evaluates may
+/// find the compiler's owner held up (owner.rs): that work unwinds with no result and no message
+/// and is no failure, so it is asked again, as the body checks do. Only a panic is an internal
+/// error, and `ice` gets what it said.
+fn def_work<R>(ice: impl Fn(&str) -> String, mut f: impl FnMut() -> R) -> DefWork<R> {
+    loop {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut f)) {
+            Ok(v) => return DefWork::Done(v),
+            Err(p) if p.is::<crate::preempt::NeedsLoad>() => return DefWork::NeedsLoad,
+            Err(p) if crate::preempt::is_preempted(&*p) || p.is::<crate::preempt::OwnerBusy>() => std::thread::yield_now(),
+            Err(p) => {
+                if let Some(fatal) = p.downcast_ref::<relax_types::infer::diagnostics::FatalError>() {
+                    return DefWork::Failed(fatal.0.clone());
+                }
+                let said = p.downcast_ref::<String>().map(String::as_str).or_else(|| p.downcast_ref::<&str>().copied());
+                return DefWork::Failed(ice(said.unwrap_or("a panic with no text")));
+            }
+        }
+    }
+}
+
+/// An item pass's internal error, at the definition and saying what went wrong.
+fn def_ice(prog: &crate::program::Program, d: crate::program::DefId, what: &str, said: &str) -> String {
+    let def = prog.def(d);
+    let pos = prog.files[def.file as usize].ast.item(def.item).lo;
+    prog.record_error(def.file, pos, "typeck", format!("internal compiler error while checking {} of {}: {}{} -- makepad run bug, report it", what, prog.def_path(d), said, jit::take_ice_location()))
+}
+
+/// `f` on `defs`, on the check's workers, in `defs`' order.
+fn def_round<R: Send>(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, defs: &[crate::program::DefId], what: &str, f: &(impl Fn(&crate::program::Program, &crate::tcx::Tcx, crate::program::DefId) -> R + Sync)) -> Vec<DefWork<R>> {
+    par_map(defs, jobs(), |&d| def_work(|said| def_ice(prog, d, what, said), || f(prog, tcx, d)))
+}
+
+/// A pass's results once no definition waits for a file: nothing else runs here, so the check's
+/// skipped files load and the definitions that wanted one are asked again, as the body checks do.
+fn settled_defs<R: Send>(u: &mut Unit, defs: &[crate::program::DefId], what: &str, mut work: Vec<DefWork<R>>, f: &(impl Fn(&crate::program::Program, &crate::tcx::Tcx, crate::program::DefId) -> R + Sync)) -> Vec<Result<R, String>> {
+    loop {
+        let left: Vec<usize> = (0..work.len()).filter(|&i| matches!(work[i], DefWork::NeedsLoad)).collect();
+        if left.is_empty() || u.prog.skipped_files.is_empty() { break; }
+        unsafe { jit::load_all_skipped(u) };
+        let again: Vec<crate::program::DefId> = left.iter().map(|&i| defs[i]).collect();
+        for (i, w) in left.into_iter().zip(def_round(&u.prog, &u.tcx, &again, what, f)) { work[i] = w; }
+    }
+    work.into_iter().zip(defs).map(|(w, &d)| match w {
+        DefWork::Done(r) => Ok(r),
+        DefWork::Failed(e) => Err(e),
+        DefWork::NeedsLoad => Err(def_ice(&u.prog, d, what, "it needs a file to be loaded and none is left")),
+    }).collect()
+}
+
 fn par_map<T: Sync, R: Send>(items: &[T], jobs: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let out: relax_session::sync::Mutex<Vec<(usize, R)>> = relax_session::sync::Mutex::new(Vec::with_capacity(items.len()));
@@ -883,32 +942,32 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
         let check_times = std::env::var_os("MAKEPAD_RUN_CHECK_TIMES").is_some();
         let defs: Vec<crate::program::DefId> = (0..u.prog.defs.len()).filter(|&i| own[u.prog.defs[i].krate as usize]).map(|i| crate::program::DefId(i as u32)).filter(|&d| !is_live_default(&u.prog, d)).collect();
         let (prog, tcx) = (&u.prog, &u.tcx);
+        let signature = |prog: &crate::program::Program, tcx: &crate::tcx::Tcx, d: crate::program::DefId| {
+            let t0 = std::time::Instant::now();
+            let mut e = tcx.check_def_signature(prog, d);
+            let dt_sig = t0.elapsed();
+            if prog.def(d).kind == DefKind::Impl { e.extend(relax_types::unsafety::check_impl(prog, tcx, d)); }
+            let dt = t0.elapsed();
+            if check_times && dt.as_millis() >= 500 {
+                stderr_line!("makepad check: slow sig {:.2} s (check_def_sig {:.2} s): {:?} {}", dt.as_secs_f64(), dt_sig.as_secs_f64(), prog.def(d).kind, prog.def_path(d));
+            }
+            e
+        };
         // the item lint passes meanwhile, on a thread of their own: they report lints only (no
         // error of the check's), and the lints are ordered when printed (check_order.rs)
-        let sigs = std::thread::scope(|sc| {
+        let first = std::thread::scope(|sc| {
             let lints = std::thread::Builder::new().name("run-check-lints".into()).stack_size(256 << 20).spawn_scoped(sc, || {
                 let _z = crate::zone_alloc::compiler_thread();
                 let t0 = std::time::Instant::now();
                 relax_types::lint_pass::check_items(prog, tcx, own);
                 if check_times { stderr_line!("makepad check: lint_pass::check_items {:.2} s (beside the signatures)", t0.elapsed().as_secs_f64()); }
             }).expect("check lints");
-            let sigs = par_map(&defs, jobs(), |&d| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let t0 = std::time::Instant::now();
-                    let mut e = tcx.check_def_signature(prog, d);
-                    let dt_sig = t0.elapsed();
-                    if prog.def(d).kind == DefKind::Impl { e.extend(relax_types::unsafety::check_impl(prog, tcx, d)); }
-                    let dt = t0.elapsed();
-                    if check_times && dt.as_millis() >= 500 {
-                        stderr_line!("makepad check: slow sig {:.2} s (check_def_sig {:.2} s): {:?} {}", dt.as_secs_f64(), dt_sig.as_secs_f64(), prog.def(d).kind, prog.def_path(d));
-                    }
-                    e
-                }))
-                .unwrap_or_else(|_| vec![format!("internal compiler error while checking the signature of {} -- makepad run bug, report it", prog.def_path(d))]));
+            let first = def_round(prog, tcx, &defs, "the signature", &signature);
             if let Err(p) = lints.join() { std::panic::resume_unwind(p); }
-            sigs
+            first
         });
-        for e in sigs {
-            errors.extend(staged(Stage::new(Phase::Wf, 0), e));
+        for e in settled_defs(u, &defs, "the signature", first, &signature) {
+            errors.extend(staged(Stage::new(Phase::Wf, 0), e.unwrap_or_else(|failed| vec![failed])));
         }
     }
     let d_sigs = t_sigs0.elapsed();
@@ -951,31 +1010,21 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
         let check_times = std::env::var_os("MAKEPAD_RUN_CHECK_TIMES").is_some();
         let defs: Vec<crate::program::DefId> = (0..u.prog.defs.len()).filter(|&i| own[u.prog.defs[i].krate as usize]).map(|i| crate::program::DefId(i as u32)).filter(|&d| !is_live_default(&u.prog, d)).collect();
         let (prog, tcx) = (&u.prog, &u.tcx);
-        // (a constant a well-formedness check evaluates may find the compiler's owner busy: preempted
-        // work is asked again, as the body checks do)
-        for e in par_map(&defs, jobs(), |&d| {
-            let mut tries = 0;
-            loop {
-                let t0 = std::time::Instant::now();
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let v = relax_types::wfcheck::obligations::check_def(prog, tcx, d);
-                    let dt_wf = t0.elapsed();
-                    // rustc_privacy check_mod_privacy: the types of the item's signature
-                    let privacy = relax_types::privacy_types::check_item(prog, tcx, d);
-                    let dt = t0.elapsed();
-                    if check_times && dt.as_millis() >= 500 {
-                        stderr_line!("makepad check: slow wf {:.2} s (check_def {:.2} s, tries {}): {:?} {}", dt.as_secs_f64(), dt_wf.as_secs_f64(), tries, prog.def(d).kind, prog.def_path(d));
-                    }
-                    (v, privacy)
-                }));
-                match r {
-                    Ok(v) => break v,
-                    Err(p) if (crate::preempt::is_preempted(&*p) || p.is::<crate::preempt::NeedsLoad>() || p.is::<crate::preempt::OwnerBusy>()) && tries < 100 => { tries += 1; std::thread::yield_now(); }
-                    Err(p) => break (if let Some(fatal) = p.downcast_ref::<relax_types::infer::diagnostics::FatalError>() { vec![fatal.0.clone()] } else { vec![format!("internal compiler error while checking the well-formedness of {} ({}) -- makepad run bug, report it", prog.def_path(d),
-                        p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default())] }, Vec::new()),
-                }
+        let well_formed = |prog: &crate::program::Program, tcx: &crate::tcx::Tcx, d: crate::program::DefId| {
+            let t0 = std::time::Instant::now();
+            let v = relax_types::wfcheck::obligations::check_def(prog, tcx, d);
+            let dt_wf = t0.elapsed();
+            // rustc_privacy check_mod_privacy: the types of the item's signature
+            let privacy = relax_types::privacy_types::check_item(prog, tcx, d);
+            let dt = t0.elapsed();
+            if check_times && dt.as_millis() >= 500 {
+                stderr_line!("makepad check: slow wf {:.2} s (check_def {:.2} s): {:?} {}", dt.as_secs_f64(), dt_wf.as_secs_f64(), prog.def(d).kind, prog.def_path(d));
             }
-        }) {
+            (v, privacy)
+        };
+        let first = def_round(prog, tcx, &defs, "the well-formedness", &well_formed);
+        for e in settled_defs(u, &defs, "the well-formedness", first, &well_formed) {
+            let e = e.unwrap_or_else(|failed| (vec![failed], Vec::new()));
             errors.extend(staged(Stage::new(Phase::Wf, 0), e.0));
             errors.extend(staged(Stage::new(Phase::Late, crate::check_order::LATE_PRIVACY), e.1));
         }
@@ -1907,4 +1956,48 @@ pub(crate) unsafe fn reset_statics() {
     reset(&CHECK_WAITED, std::sync::atomic::AtomicBool::new(false));
     reset(&BESIDE, (relax_session::sync::Mutex::new(0), relax_session::sync::Condvar::new()));
     reset(&RUN_CHECK, [const { std::sync::atomic::AtomicU64::new(0) }; 5]);
+}
+
+#[cfg(test)]
+mod def_work_tests {
+    use super::{def_work, DefWork};
+
+    fn ice(said: &str) -> String {
+        format!("ice: {said}")
+    }
+
+    /// (the signature pass reported any unwind as an internal error, these silent ones too)
+    #[test]
+    fn work_that_found_the_owner_busy_or_was_preempted_is_asked_again() {
+        let mut tries = 0;
+        let r = def_work(ice, || {
+            tries += 1;
+            match tries {
+                1 => std::panic::resume_unwind(Box::new(crate::preempt::OwnerBusy)),
+                2 => std::panic::resume_unwind(Box::new(crate::preempt::Preempted)),
+                _ => tries,
+            }
+        });
+        assert!(matches!(r, DefWork::Done(3)));
+    }
+
+    #[test]
+    fn work_that_needs_a_file_says_so() {
+        let r = def_work(ice, || -> u32 { std::panic::resume_unwind(Box::new(crate::preempt::NeedsLoad)) });
+        assert!(matches!(r, DefWork::NeedsLoad));
+    }
+
+    #[test]
+    fn a_fatal_diagnostic_is_the_definitions_error() {
+        let r = def_work(ice, || -> u32 { std::panic::resume_unwind(Box::new(relax_types::infer::diagnostics::FatalError("overflow".to_string()))) });
+        assert!(matches!(r, DefWork::Failed(e) if e == "overflow"));
+    }
+
+    #[test]
+    fn a_panic_is_an_internal_error_and_says_what_it_said() {
+        let r = def_work(ice, || -> u32 { panic!("the query's table has no {}", "entry") });
+        assert!(matches!(r, DefWork::Failed(e) if e == "ice: the query's table has no entry"));
+        let r = def_work(ice, || -> u32 { panic!("plain") });
+        assert!(matches!(r, DefWork::Failed(e) if e == "ice: plain"));
+    }
 }
