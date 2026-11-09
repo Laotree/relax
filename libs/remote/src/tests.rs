@@ -937,11 +937,16 @@ fn a_run_with_a_deep_tmpdir_is_reached() {
 /// process, from the socket's credentials (not from anything the client says). A `session
 /// relaunch` and a click injected into a window's caption name who asked (three apps
 /// restarted for a landing, and apps closed by their caption, and nothing said by whom, 11-06).
+/// A client of the endpoint's own process is known as that process (`asker_pid`): a run's end
+/// turns away at once what the ending run asks its own inspect.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_command_names_the_agent_that_sent_it() {
-    fn asked(_: &Req, out: &mut Out) {
-        out.line(&crate::cmd::asked_by().unwrap_or_default());
+    fn asked(req: &Req, out: &mut Out) {
+        match req.cmd.as_str() {
+            "pid" => out.line(&crate::cmd::asker_pid().to_string()),
+            _ => out.line(&crate::cmd::asked_by().unwrap_or_default()),
+        }
     }
     let ep = Endpoint::new("makepad-remote-agent-test");
     ep.register_cmd(asked);
@@ -952,7 +957,9 @@ fn a_command_names_the_agent_that_sent_it() {
     assert_eq!(agent.cmd("who").unwrap().next().unwrap().unwrap(), format!("agent LANE7, {me}"));
     let other = Client::new(Target::Unix(sock.clone()), "client");
     assert_eq!(other.cmd("who").unwrap().next().unwrap().unwrap(), me);
+    assert_eq!(other.cmd("pid").unwrap().next().unwrap().unwrap(), std::process::id().to_string());
     assert_eq!(crate::cmd::asked_by(), None, "no command is answered on this thread");
+    assert_eq!(crate::cmd::asker_pid(), 0);
     assert!(me.starts_with(&format!("pid {} ", std::process::id())), "{me}");
     drop((agent, other));
     let _ = std::fs::remove_file(&sock);
