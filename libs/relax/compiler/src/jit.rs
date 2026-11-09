@@ -2935,11 +2935,25 @@ unsafe fn stale_how_in(u: &Unit, pc: u64, sp_top: u64, sp_below: u64, lr: u64) -
 }
 
 fn frames_from_raw(pc: u64, pc_is_ret: bool, raw: &[u64]) -> Vec<u64> {
+    frames_from_raw_in(cur_unit(), pc, pc_is_ret, raw)
+}
+
+/// The return addresses of the calling thread's frame chain from `fp` (signal-safe: no
+/// allocation, no lock, no thread-local with a destructor), for `frames_from_raw_in` on another
+/// thread: os/fault.rs's abort report.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+pub(crate) fn raw_frames_here(fp: u64, out: &mut [u64]) -> usize {
+    let here = &fp as *const u64 as u64;
+    walk_fp_bounded(fp, here.min(fp), out)
+}
+
+/// `frames_from_raw` of the thread whose unit is `up`, on any thread.
+pub(crate) fn frames_from_raw_in(up: *mut Unit, pc: u64, pc_is_ret: bool, raw: &[u64]) -> Vec<u64> {
     let mut frames = vec![pc.wrapping_sub(pc_is_ret as u64)];
-    if cur_unit().is_null() {
+    if up.is_null() {
         return frames;
     }
-    let u = unsafe { &*cur_unit() };
+    let u = unsafe { &*up };
     // a stop inside C code (a libc abort/trap): its frames (frame pointers are kept on both
     // targets) are skipped up to the JIT code that called it
     let mut in_c = u.find_fn(frames[0]).is_none();
