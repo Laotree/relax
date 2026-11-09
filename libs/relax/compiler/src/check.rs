@@ -647,6 +647,32 @@ fn def_work<R>(ice: impl Fn(&str) -> String, mut f: impl FnMut() -> R) -> DefWor
     }
 }
 
+/// A test's stand-in for preempted work: the next body checks of the fn named `.0` unwind with no
+/// result, `.1` times.
+#[cfg(test)]
+static FORCED_BODY_UNWINDS: std::sync::Mutex<(String, u32)> = std::sync::Mutex::new((String::new(), 0));
+
+#[cfg(test)]
+pub(crate) fn force_body_unwinds(name: &str, times: u32) {
+    *FORCED_BODY_UNWINDS.lock().unwrap() = (name.to_string(), times);
+}
+
+/// How many of them are still to come: a test that forced none shows nothing.
+#[cfg(test)]
+pub(crate) fn forced_body_unwinds_left() -> u32 {
+    FORCED_BODY_UNWINDS.lock().unwrap().1
+}
+
+#[cfg(test)]
+fn forced_body_unwind(prog: &crate::program::Program, d: crate::program::DefId) {
+    let mut forced = FORCED_BODY_UNWINDS.lock().unwrap();
+    if forced.1 > 0 && prog.def_path(d).ends_with(forced.0.as_str()) {
+        forced.1 -= 1;
+        drop(forced);
+        std::panic::resume_unwind(Box::new(crate::preempt::Preempted));
+    }
+}
+
 /// An item pass's internal error, at the definition and saying what went wrong.
 fn def_ice(prog: &crate::program::Program, d: crate::program::DefId, what: &str, said: &str) -> String {
     let def = prog.def(d);
@@ -674,6 +700,19 @@ fn settled_defs<R: Send>(u: &mut Unit, defs: &[crate::program::DefId], what: &st
         DefWork::Failed(e) => Err(e),
         DefWork::NeedsLoad => Err(def_ice(&u.prog, d, what, "it needs a file to be loaded and none is left")),
     }).collect()
+}
+
+/// `settled_defs` for one definition, on the check's own thread: nothing else runs here either.
+fn settled_def<R>(up: *mut Unit, d: crate::program::DefId, what: &str, mut f: impl FnMut() -> R) -> Result<R, String> {
+    loop {
+        let u = unsafe { &*up };
+        match def_work(|said| def_ice(&u.prog, d, what, said), &mut f) {
+            DefWork::Done(r) => return Ok(r),
+            DefWork::Failed(e) => return Err(e),
+            DefWork::NeedsLoad if u.prog.skipped_files.is_empty() => return Err(def_ice(&u.prog, d, what, "it needs a file to be loaded and none is left")),
+            DefWork::NeedsLoad => unsafe { jit::load_all_skipped(up) },
+        }
+    }
 }
 
 fn par_map<T: Sync, R: Send>(items: &[T], jobs: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
@@ -844,7 +883,7 @@ fn body_errors(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, options: &
         match pats {
             Ok(r) if !r.errors.is_empty() => { let mut e = r.errors; e.extend(r.at_patterns); return (staged(patterns, e).collect(), Vec::new()) }
             Ok(r) => at_patterns = r.at_patterns,
-            Err(p) if p.is::<crate::preempt::NeedsLoad>() || crate::preempt::is_preempted(&*p) => std::panic::resume_unwind(p),
+            Err(p) if crate::preempt::is_cancelled(&*p) => std::panic::resume_unwind(p),
             Err(_) => {
                 if check_trace() { stderr_line!("makepad check: pattern analysis failed in {}", prog.def_path(d)); }
             }
@@ -1096,31 +1135,29 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     // typeck-audit 1.27: anonymous constants outside bodies are body owners of their own (typed
     // and checked on MAKEPAD_RUN_JOBS threads; their results, and the evaluations, in order)
     let anons: Vec<crate::program::DefId> = fresh_crates.iter().flat_map(|&k| crate::borrowck::body::signature_anon_consts(&u.prog, &u.tcx, k)).filter(|&anon| !is_live_default(&u.prog, anon)).collect();
-    let checked_anons = {
-        let (prog, tcx) = (&u.prog, &u.tcx);
-        par_map(&anons, jobs(), |&anon| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let body = tcx.typeck(prog, anon);
-            let errs = body.errors.to_vec();
-            let mut diags = Vec::new();
-            if errs.is_empty() {
-                relax_types::lint::check_literals(prog, tcx, &body);
-                relax_types::lint_pass::check_body(prog, tcx, &body);
-            }
-            // rustc check_consts: an anonymous constant is a const context of its own
-            if errs.is_empty() && crate::borrowck::enabled(options) {
-                if let Some((_, relax_front::def_collector::NodeId::AnonConst(expr))) = prog.def_id_to_node_id.get(&anon) {
-                    let state = crate::tcx::EvalState::new();
-                    let cx = crate::tcx::EvalCx::new(prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &state);
-                    let errs = crate::borrowck::check_anon_const(&cx, prog, tcx, &body, *expr);
-                    if !errs.is_empty() {
-                        diags.extend(crate::borrowck::lazy::report_checked(prog, 0, tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), anon, &body.args, errs, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()));
-                    }
+    let check_anon = |prog: &crate::program::Program, tcx: &crate::tcx::Tcx, anon: crate::program::DefId| {
+        let body = tcx.typeck(prog, anon);
+        let errs = body.errors.to_vec();
+        let mut diags = Vec::new();
+        if errs.is_empty() {
+            relax_types::lint::check_literals(prog, tcx, &body);
+            relax_types::lint_pass::check_body(prog, tcx, &body);
+        }
+        // rustc check_consts: an anonymous constant is a const context of its own
+        if errs.is_empty() && crate::borrowck::enabled(options) {
+            if let Some((_, relax_front::def_collector::NodeId::AnonConst(expr))) = prog.def_id_to_node_id.get(&anon) {
+                let state = crate::tcx::EvalState::new();
+                let cx = crate::tcx::EvalCx::new(prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &state);
+                let errs = crate::borrowck::check_anon_const(&cx, prog, tcx, &body, *expr);
+                if !errs.is_empty() {
+                    diags.extend(crate::borrowck::lazy::report_checked(prog, 0, tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), anon, &body.args, errs, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()));
                 }
             }
-            (errs, diags)
-        })))
+        }
+        (errs, diags)
     };
-    for (anon, r) in anons.into_iter().zip(checked_anons) {
+    let first = def_round(&u.prog, &u.tcx, &anons, "the constant", &check_anon);
+    for (&anon, r) in anons.iter().zip(settled_defs(u, &anons, "the constant", first, &check_anon)) {
         match r {
             Ok((e, diags)) => {
                 let e_ok = e.is_empty() && diags.is_empty();
@@ -1129,19 +1166,18 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
                 // or not): one that fails is reported there (E0080)
                 if e_ok && u.tcx.generic_indices_of(&u.prog, anon).types_consts.is_empty() && !matches!(u.prog.def(u.prog.def(anon).parent).kind, DefKind::Trait | DefKind::TypeAlias) {
                     let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
-                    let before = u.tcx.dcx.err_count();
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.tcx.const_eval_resolve(&u.prog, env, anon, &[])));
-                    let _ = before;
+                    let evaluated = settled_def(up, anon, "the constant", || { let _ = u.tcx.const_eval_resolve(&u.prog, env, anon, &[]); });
+                    if let Err(failed) = evaluated { errors.push((Stage::of(Phase::Typeck, 0, anon), failed)); }
                 }
                 errors.extend(staged(Stage::of(Phase::Typeck, 0, anon), e))
             }
-            Err(_) => errors.push((Stage::of(Phase::Typeck, 0, anon), format!("internal compiler error while checking {}", u.prog.def_path(anon)))),
+            Err(failed) => errors.push((Stage::of(Phase::Typeck, 0, anon), failed)),
         }
     }
     // every body owner type- and borrow-checked on MAKEPAD_RUN_JOBS threads: typeck and the borrow
     // checker are queries over the shared program and type context (as the run's typeck-ahead
     // workers use them); results are merged in owner order
-    struct Outcome { errors: Vec<(Stage, String)>, diags: Vec<crate::diag::Diagnostic>, seed: Option<crate::program::DefId>, needs_load: bool, preempted: bool }
+    struct Outcome { errors: Vec<(Stage, String)>, diags: Vec<crate::diag::Diagnostic>, seed: Option<crate::program::DefId>, needs_load: bool, unchecked: bool }
     let jobs = jobs();
     let upn = up as usize;
     let check_one = move |owner: &crate::borrowck::body::CheckedBody, generic: bool| -> Outcome {
@@ -1149,30 +1185,26 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
         let (prog, tcx) = (&uu.prog, &uu.tcx);
         let d = owner.owner;
         if check_trace() { stderr_line!("makepad check: body {}", prog.def_path(d)); }
-        let mut out = Outcome { errors: Vec::new(), diags: Vec::new(), seed: None, needs_load: false, preempted: false };
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut out = Outcome { errors: Vec::new(), diags: Vec::new(), seed: None, needs_load: false, unchecked: false };
+        // (work that unwound with no result is asked again in there, until it has an answer)
+        let r = def_work(|said| def_ice(prog, d, "the body", said), || {
+            #[cfg(test)]
+            forced_body_unwind(prog, d);
             let (errors, events) = body_errors(prog, tcx, options, owner, generic, true);
             (errors, events.iter().map(|ev| ev.error.to_diagnostic()).collect())
-        }));
+        });
         match r {
-            Ok((errs, diags)) => {
+            DefWork::Done((errs, diags)) => {
                 if errs.is_empty() && owner.kind == crate::borrowck::body::BodyKind::Function && !generic {
                     out.seed = Some(d);
                 }
                 out.errors = errs;
                 out.diags = diags;
             }
-            // a module the check did not load (another crate's skipped file): checked again
-            // once every file is loaded
-            Err(p) if p.is::<crate::preempt::NeedsLoad>() => out.needs_load = true,
-            // a constant it needed was asked of the compiler's owner thread while an earlier
-            // request held it up (owner.rs): checked again
-            Err(p) if crate::preempt::is_preempted(&*p) => out.preempted = true,
-            Err(_) => {
-                let def = prog.def(d);
-                let pos = prog.files[def.file as usize].ast.item(def.item).lo;
-                out.errors.push((Stage::of(Phase::Typeck, 0, d), prog.record_error(def.file, pos, "typeck", format!("internal compiler error while checking {} -- makepad run bug, report it{}", prog.def_path(d), jit::take_ice_location()))));
-            }
+            // a module the check did not load (another crate's skipped file): no answer yet,
+            // checked again once every file is loaded
+            DefWork::NeedsLoad => { out.needs_load = true; out.unchecked = true; }
+            DefWork::Failed(e) => out.errors.push((Stage::of(Phase::Typeck, 0, d), e)),
         }
         // an error may be a name in a file the app check left unloaded: settled with all loaded
         if !out.errors.is_empty() { out.needs_load = true; }
@@ -1205,8 +1237,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     body_times_report();
     outcomes.sort_by_key(|(i, _)| *i);
     // owners that failed or met an unloaded module: every skipped file loaded, checked again
-    // (only when some other crate's file is still skipped: else the first answer stands);
-    // owners preempted by OwnerBusy are always retried in parallel.
+    // (only when some other crate's file is still skipped: else the first answer stands)
     let skipped_left = unsafe { !(&*up).prog.skipped_files.is_empty() };
     if skipped_left && outcomes.iter().any(|(_, o)| o.needs_load) {
         let t_skip = std::time::Instant::now();
@@ -1216,7 +1247,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
         }
     }
     let retry_idxs: Vec<usize> = outcomes.iter().enumerate()
-        .filter(|(_, (_, o))| (skipped_left && o.needs_load) || o.preempted)
+        .filter(|(_, (_, o))| skipped_left && o.needs_load)
         .map(|(idx, _)| idx)
         .collect();
     if !retry_idxs.is_empty() {
@@ -1236,7 +1267,13 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     let mut seeds = Vec::new();
     // rustc: an item whose body failed its checks (borrowck included) is tainted: it is never evaluated
     let mut tainted: std::collections::HashSet<crate::program::DefId> = std::collections::HashSet::new();
-    for (i, o) in outcomes {
+    for (i, mut o) in outcomes {
+        // a body with no answer is no clean body
+        if o.unchecked {
+            let d = fns[i].0.owner;
+            let e = def_ice(unsafe { &(*up).prog }, d, "the body", "it needs a file to be loaded and none is left");
+            o.errors.push((Stage::of(Phase::Typeck, 0, d), e));
+        }
         if !o.errors.is_empty() || !o.diags.is_empty() { tainted.insert(fns[i].0.owner); }
         errors.extend(o.errors);
         borrow_diagnostics.extend(o.diags);
@@ -1255,7 +1292,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
         let uu = unsafe { &*up };
         for (anon, owner, e) in crate::borrowck::body::body_anon_consts(&uu.prog, &uu.tcx, k) {
             if is_live_default(&uu.prog, owner) { continue; }
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let errs = settled_def(up, anon, "the constant", || {
                 let outer = uu.tcx.typeck(&uu.prog, owner);
                 let owner_typed = outer.has_expr(e) && outer.expr_typed.get(outer.expr_ix(e));
                 let body = uu.tcx.typeck(&uu.prog, anon);
@@ -1264,8 +1301,8 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
                     relax_types::lint_dead::collect_body(&uu.prog, &uu.tcx, &body);
                 }
                 body.errors.to_vec()
-            }));
-            if let Ok(errs) = r { errors.extend(staged(Stage::of(Phase::Typeck, 0, anon), errs)); }
+            }).unwrap_or_else(|failed| vec![failed]);
+            errors.extend(staged(Stage::of(Phase::Typeck, 0, anon), errs));
         }
     }
     st.mark("body anon consts");
