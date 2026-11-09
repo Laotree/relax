@@ -133,13 +133,16 @@ fn a_plate_loads_visible_work_passes_the_builds_above_the_jits_floor() {
     let waits = worker(&b, VISIBLE, APP, 1, &tx);
     until(&b, |s| s.waiters.len() == 1);
     assert!(rx.try_recv().is_err(), "the floor's tokens count: Visible's limit is the old one less those");
-    // the builds leave for it down to the floor, and no further
+    // the builds leave down to the cores, and no further: the token of one past the floor would not
+    // let the waiter in (Visible does not count it), nor would one of the floor's
     while jit.len() > floor {
         b.release(jit.pop().unwrap());
+        let over = b.state.lock().unwrap().running > 16;
+        assert!(jit.iter().all(|p| b.should_yield(*p) == over), "{} builds: they leave only over the cores", jit.len());
     }
     assert!(rx.try_recv().is_err(), "the load holds what it may next to the JIT's floor");
     load.push(b.admit(INTERACTIVE, APP, "a click"));
-    assert!(jit.iter().all(|p| b.should_yield(*p)));
+    assert!(jit.iter().all(|p| !b.should_yield(*p) && !b.contended(*p)), "the floor's builds keep their tokens: no waiter could have them");
     b.release(load.pop().unwrap());
     b.release(load.pop().unwrap());
     assert_eq!(rx.recv().unwrap(), 1, "a token below the limit goes to the load");

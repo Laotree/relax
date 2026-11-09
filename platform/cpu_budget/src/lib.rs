@@ -33,6 +33,13 @@ const RECENT_NS: u64 = 60_000_000_000;
 /// A row's word in `Budget::classes`: its class and these.
 const CLASS_BITS: u8 = 3;
 const NEVER_YIELDS: u8 = 0x40;
+/// A JIT Background build's row: it reads the JIT_BUILDS bit, not its class's.
+const JIT_BUILD: u8 = 0x20;
+/// The yield and contended words' bit for the JIT's Background builds (the classes have 0-2). A
+/// build's token lets no waiter of a more urgent class in: a person's work does not count the
+/// builds past the JIT's floor, and the floor's own keep theirs. So a build gives its token up
+/// only when the CPU is over its cores, and at the end of a job only to a Background waiter.
+const JIT_BUILDS: u8 = 1 << 3;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Label {
@@ -209,11 +216,15 @@ impl Budget {
             { contended |= 1 << class; }
         }
         if s.running >= self.limit && self.jit_short(s).min(s.jit_waiting) > 0 { bits |= 1 << VISIBLE; }
+        let over = self.over_cores(s, BACKGROUND);
+        if over { bits |= JIT_BUILDS; }
+        if over || s.waiting & (1 << BACKGROUND) != 0 { contended |= JIT_BUILDS; }
         self.yield_classes.store(bits, Relaxed);
         self.contended_classes.store(contended, Relaxed);
         for (index, job) in s.slots.iter().enumerate() {
             if let Some(job) = job {
-                self.classes[index].store(job.class | if job.above { NEVER_YIELDS } else { 0 }, Relaxed);
+                let build = job.client == JIT && job.class == BACKGROUND;
+                self.classes[index].store(job.class | if job.above { NEVER_YIELDS } else { 0 } | if build { JIT_BUILD } else { 0 }, Relaxed);
             }
         }
         if let Some(i) = self.first(s) {
@@ -294,11 +305,15 @@ impl Budget {
     }
     fn should_yield(&self, permit: u32) -> bool {
         let class = self.classes[permit as usize].load(Relaxed);
-        class & NEVER_YIELDS == 0 && self.yield_classes.load(Relaxed) & (1 << (class & CLASS_BITS)) != 0
+        class & NEVER_YIELDS == 0 && self.yield_classes.load(Relaxed) & Self::bit(class) != 0
     }
     fn contended(&self, permit: u32) -> bool {
         let class = self.classes[permit as usize].load(Relaxed);
-        self.contended_classes.load(Relaxed) & (1 << (class & CLASS_BITS)) != 0
+        self.contended_classes.load(Relaxed) & Self::bit(class) != 0
+    }
+    /// A row's bit in the yield and contended words.
+    fn bit(class: u8) -> u8 {
+        if class & JIT_BUILD != 0 { JIT_BUILDS } else { 1 << (class & CLASS_BITS) }
     }
     fn span(s: &mut State, label: Label, ns: u64) {
         if let Some(span) = s.spans.iter_mut().find(|span| span.label == label) {

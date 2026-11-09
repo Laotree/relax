@@ -26748,8 +26748,8 @@ mod front_yield_tests {
     /// build (Background, in flight) sits out a checkpoint for them: the build needs a token and they
     /// wait for the build. Budget::acquire held it for good: nothing moved until the process died.
     /// `callers` of the jobs call; the others keep their tokens, running.
-    /// `jobs` is what Visible lets in beside the compile jobs at the JIT's floor (it does not count
-    /// the JIT's builds past the floor, so the build's token is not among them).
+    /// `jobs` is what Visible lets in beside the compile jobs past the JIT's floor (it does not count
+    /// the JIT's builds past the floor): with the build, the CPU is over its cores.
     /// Returns once the callers are on their way: the jobs, and the callers still to end.
     fn jobs_on_every_token(up: usize, slot: u32, jobs: usize, callers: usize) -> (Vec<std::thread::JoinHandle<u64>>, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use makepad_cpu_budget as budget;
@@ -26759,7 +26759,7 @@ mod front_yield_tests {
         queue::spec(up, slot);
         back_end_at_gate(up, slot);
         let (go, left) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(callers)));
-        let mut handles: Vec<_> = (0..jobs).map(|i| {
+        let handles = (0..jobs).map(|i| {
             let (go, left) = (go.clone(), left.clone());
             std::thread::spawn(move || {
                 // (the wait's own code compiled first: under the JIT a thread waiting for a compile
@@ -26784,33 +26784,26 @@ mod front_yield_tests {
                 code
             })
         }).collect();
+        // the jobs in, the CPU is over its cores: the build's first checkpoint yields its token
         on_budget_change(|| pool_jobs("a pool job") >= jobs);
-        // one more Visible job waits for a token: the build's first checkpoint yields its token for
-        // it. That lets it in no sooner (Visible never counted the build's token); it gives up any
-        // token it gets at once, so a token the callers lend goes on to the build.
-        handles.push(std::thread::spawn(|| {
-            let permit = budget::admit(budget::VISIBLE, budget::APP, "a job waiting for a token");
-            budget::release(permit);
-            1
-        }));
-        on_budget_change(|| budget::tokens().waiting.iter().any(|w| w.class == budget::VISIBLE && w.client == budget::APP));
         BACK_END_GATE.store(0, Ordering::SeqCst);
         // (a build that no longer stops here would pass without showing anything; asked of the budget,
         // which every JIT in the process shares: under the JIT the wait hook is the loader's)
         let building = BACK_END_THREAD.load(Ordering::SeqCst);
         on_budget_change(|| {
-            assert!(queue::running_class(up, slot).is_some(), "the build sits out its checkpoint for the waiting job");
+            assert!(queue::running_class(up, slot).is_some(), "the build sits out its checkpoint over the cores");
             budget::tokens().waiting.iter().any(|w| w.thread == building)
         });
         go.store(true, Ordering::SeqCst);
         (handles, left)
     }
 
-    /// Other compile jobs up to the JIT's floor, so the build is past it: a Visible job waiting for a
-    /// token takes the build's at its checkpoint, and the build needs another. (Below the floor it
-    /// keeps its token: `a_build_below_the_jit_floor_finishes_and_the_last_job_runs_after_it`.)
-    fn compile_jobs_at_the_floor(stop: &std::sync::Arc<AtomicBool>) -> (Vec<std::thread::JoinHandle<()>>, Vec<u64>) {
-        (0..makepad_cpu_budget::jit_floor().max(1)).map(|_| other_compile_job(stop.clone())).unzip()
+    /// Other compile jobs one past the JIT's floor: with the build and the jobs Visible lets in, the
+    /// CPU is one over its cores, and the build gives its token up at its checkpoint and needs
+    /// another. (A build gives its token up only then: a job waiting for a token could not have it.
+    /// At the floor it keeps its token: `a_build_below_the_jit_floor_finishes_and_the_last_job_runs_after_it`.)
+    fn compile_jobs_past_the_floor(stop: &std::sync::Arc<AtomicBool>) -> (Vec<std::thread::JoinHandle<()>>, Vec<u64>) {
+        (0..makepad_cpu_budget::jit_floor() + 1).map(|_| other_compile_job(stop.clone())).unzip()
     }
 
     /// With the JIT short of its floor, Visible work leaves it the token: the build keeps its own
@@ -26880,7 +26873,7 @@ mod front_yield_tests {
         // chain says so when it does not: a plain failure, as it stands still. (A second of age: a
         // job between its wait's row and giving its token up looks stuck for that moment.)
         let stop = Arc::new(AtomicBool::new(false));
-        let (others, _) = compile_jobs_at_the_floor(&stop);
+        let (others, _) = compile_jobs_past_the_floor(&stop);
         let (jobs, left) = jobs_on_every_token(up, f, jobs_beside, jobs_beside);
         while left.load(Ordering::SeqCst) != 0 {
             if let Some(chain) = crate::inspect::budget_deadlock(1_000_000_000) {
@@ -26897,7 +26890,7 @@ mod front_yield_tests {
         // one job calls and the others run on: only its token comes free, and Background is not let
         // in below its limit. The build takes the class of who waits for it.
         let stop = Arc::new(AtomicBool::new(false));
-        let (others, other_threads) = compile_jobs_at_the_floor(&stop);
+        let (others, other_threads) = compile_jobs_past_the_floor(&stop);
         let (jobs, left) = jobs_on_every_token(up, g, jobs_beside, 1);
         let building = BACK_END_THREAD.load(Ordering::SeqCst);
         let waiter = || crate::waits::snapshot().into_iter().find(|w| !other_threads.contains(&w.thread) && w.holder == building && matches!(w.kind, crate::waits::Kind::Pump | crate::waits::Kind::Build)).map(|w| (w.thread, w.since_ns));
