@@ -301,7 +301,9 @@ impl Conn {
         self.0.work.notify_one();
     }
 
-    /// Says goodbye and closes once everything queued before it is written.
+    /// Says goodbye and closes. The goodbye goes ahead of queued channel data and the peer ends the
+    /// link on reading it, so data still queued may never reach it: to end after its data, close
+    /// the channel ([`ChannelTx::close`]).
     pub fn close(&self, reason: &str) {
         self.0.closing.store(true, Relaxed);
         let mut st = self.0.st.lock().unwrap();

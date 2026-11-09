@@ -347,7 +347,8 @@ fn a_request_sees_its_client_go() {
 fn a_request_says_what_it_waits_on_ahead_of_its_answer() {
     let ep = Endpoint::new("makepad-remote-says");
     ep.register("slow", 1, crate::lines::service("slow", std::sync::Arc::new(move |_, out| {
-        crate::lines::say("waits for \"room\"");
+        crate::lines::say_waiting("waits for \"room\"");
+        crate::lines::wait_over();
         out.push("{\"answer\":1}".to_string());
     })));
     let conn = pair(&ep);
@@ -362,8 +363,9 @@ fn a_request_says_what_it_waits_on_ahead_of_its_answer() {
         }
     }
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines[..2], ["{\"say\":\"waits for \\\"room\\\"\"}", "{\"answer\":1}"]);
-    crate::lines::say("nothing outside a request");
+    assert_eq!(lines[..3], ["{\"say\":\"waits for \\\"room\\\"\",\"waiting\":true}", "{\"say\":\"\",\"waiting\":false}", "{\"answer\":1}"]);
+    crate::lines::say_waiting("nothing outside a request");
+    crate::lines::wait_over();
 }
 
 /// A late follower gets what came before it only when it asks from there, and once.
