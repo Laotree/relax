@@ -18168,6 +18168,7 @@ pub(crate) fn start_cpu_budget() {
     let mut activity = SAMPLER_ACTIVITY.lock().unwrap();
     *activity = Some((sampler_activity(), std::time::Instant::now()));
     makepad_cpu_budget::begin_warmup();
+    makepad_cpu_budget::set_jit_settled(false);
     SAMPLER_SETTLED.store(false, Ordering::Relaxed);
     BUDGET_RUN.store(true, Ordering::Release);
 }
@@ -18197,6 +18198,9 @@ fn update_sampler_settled() -> bool {
     if first && quiet.as_millis() as u64 > busy::QUIET_MS.load(Ordering::Relaxed) {
         busy::QUIET_MS.store(quiet.as_millis() as u64, Ordering::Relaxed);
         busy::QUIET_AT.store(crate::clock::ms_since_start() as u64, Ordering::Relaxed);
+    }
+    if BUDGET_RUN.load(Ordering::Acquire) {
+        makepad_cpu_budget::set_jit_settled(quiet >= SETTLED_AFTER);
     }
     let settled = settle_on && quiet >= SETTLED_AFTER;
     if settled != SAMPLER_SETTLED.load(Ordering::Relaxed) {

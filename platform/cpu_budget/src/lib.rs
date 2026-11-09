@@ -10,7 +10,7 @@ use makepad_relax_api::relax_api;
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, Thread};
 use std::time::Instant;
@@ -534,7 +534,7 @@ impl Budget {
         if total > self.limit { let _ = write!(out, " (+{} over)", total - self.limit); }
         if lent != 0 { let _ = write!(out, ", {lent} lent by sleeping threads"); }
         if above != 0 { let _ = write!(out, ", {above} JIT job above the budget"); }
-        let _ = write!(out, ", warming: {}", if warm { "yes" } else { "no" });
+        let _ = write!(out, ", warming: {}, jit settled: {}", if warm { "yes" } else { "no" }, if jit_settled() { "yes" } else { "no" });
         if let Some(w) = worst {
             let _ = write!(out, ", worst: {} {:?} waited {}", CLASSES[w.class as usize], w.label.text(), human(w.ns));
             if let Some((class, span)) = w.culprit {
@@ -913,6 +913,13 @@ pub fn begin_warmup() { global().begin_warmup(); }
 pub fn end_warmup() { global().end_warmup(); }
 #[relax_api]
 pub fn warming() -> bool { global().warming() }
+static JIT_UNSETTLED: AtomicBool = AtomicBool::new(false);
+/// The JIT has compiled nothing for a while, or there is none (a compiled build). Unlike
+/// [`warming`], first input doesn't end it, and it goes back when the JIT compiles again.
+#[relax_api]
+pub fn jit_settled() -> bool { !JIT_UNSETTLED.load(Relaxed) }
+#[relax_api]
+pub fn set_jit_settled(settled: bool) { JIT_UNSETTLED.store(!settled, Relaxed); }
 #[relax_api]
 pub fn report(out: &mut [u8]) -> usize { fill(out, &global().report()) }
 /// Native convenience wrapper; strings do not cross the Relax op boundary.
