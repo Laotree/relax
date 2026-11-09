@@ -18145,8 +18145,7 @@ static BUDGET_RUN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 static SAMPLER_ACTIVITY: std::sync::Mutex<Option<(u64, std::time::Instant)>> = std::sync::Mutex::new(None);
 
 /// The settled latch's sources (update_sampler_settled: a compile, an O3 queue push or an O3 install
-/// restarts its 3 s of quiet; its first settle ends the CPU budget's warm-up), counted per second
-/// of the run and by kind. A speculative job that builds nothing (the slot has code, or its stored
+/// restarts its 3 s of quiet), counted per second of the run and by kind. A speculative job that builds nothing (the slot has code, or its stored
 /// entry links) is no compile, and neither is a first call that links its stored code: they do not
 /// restart the quiet (a warm run reaching new code links it in microseconds). The verbose exit
 /// line says when the JIT first settled, or what held it open: `makepad-run: the JIT settled ...`.
@@ -18242,15 +18241,13 @@ fn sampler_activity() -> u64 {
 pub(crate) fn start_cpu_budget() {
     let mut activity = SAMPLER_ACTIVITY.lock().unwrap();
     *activity = Some((sampler_activity(), std::time::Instant::now()));
-    makepad_cpu_budget::begin_warmup();
     makepad_cpu_budget::set_jit_settled(false);
     SAMPLER_SETTLED.store(false, Ordering::Relaxed);
     BUDGET_RUN.store(true, Ordering::Release);
 }
 
-// Ordinary runs have no PC sampler. Reuse the existing monitor's tick so they still settle (the
-// budget's warm-up ends; a test harness, which drives no budget, still reports when it settled),
-// without enabling profiling or adding a polling thread.
+// Ordinary runs have no PC sampler. Reuse the existing monitor's tick so they still report
+// when they settle, without enabling profiling or adding a polling thread.
 pub(crate) fn poll_settled() {
     if !sampling_on() {
         update_sampler_settled();
@@ -18282,9 +18279,6 @@ fn update_sampler_settled() -> bool {
         SAMPLER_SETTLED.store(settled, Ordering::Relaxed);
         if settled && first {
             busy::SETTLED_AT.store((crate::clock::ms_since_start() as u64).max(1), Ordering::Relaxed);
-        }
-        if settled && BUDGET_RUN.load(Ordering::Acquire) {
-            makepad_cpu_budget::end_warmup();
         }
         let ms = if settled { SETTLED_MS } else { SAMPLE_MS };
         for (_, _, h) in SAMPLED.lock().unwrap().iter() {

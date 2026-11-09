@@ -33,7 +33,6 @@ const RECENT_NS: u64 = 60_000_000_000;
 /// A row's word in `Budget::classes`: its class and these.
 const CLASS_BITS: u8 = 3;
 const NEVER_YIELDS: u8 = 0x40;
-const FORCED_YIELD: u8 = 0x80;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Label {
@@ -131,8 +130,6 @@ struct Budget {
     // ... and per class that a waiter of its own class or above (or a budget over its cores) wants
     // a slot of: `contended`.
     contended_classes: AtomicU8,
-    // 0: not begun, 1: startup warm-up, 2: permanently ended.
-    warmup: AtomicU8,
     queued: [[AtomicI64; 3]; 3],
     waits: [[AtomicU64; BUCKETS]; 3],
     max_wait: [AtomicU64; 3],
@@ -159,7 +156,7 @@ impl Budget {
             }),
             changed: Condvar::new(),
             classes: (0..ROWS).map(|_| AtomicU8::new(INTERACTIVE)).collect(),
-            yield_classes: AtomicU8::new(0), contended_classes: AtomicU8::new(0), warmup: AtomicU8::new(0),
+            yield_classes: AtomicU8::new(0), contended_classes: AtomicU8::new(0),
             queued: std::array::from_fn(|_| std::array::from_fn(|_| AtomicI64::new(0))),
             waits: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             max_wait: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -196,7 +193,7 @@ impl Budget {
     }
     fn room(&self, s: &State, class: u8, client: u8) -> bool {
         client == JIT && s.jit_running == 0
-            || s.running < self.class_limit(s, class, client) && (class != BACKGROUND || client != APP || !self.warming() || s.background == 0)
+            || s.running < self.class_limit(s, class, client)
     }
     fn first(&self, s: &State) -> Option<usize> {
         s.waiters.iter().enumerate().filter(|(_, w)| self.room(s, w.class, w.client)).min_by_key(|(_, w)| (w.class, w.ticket)).map(|(i, _)| i)
@@ -216,8 +213,7 @@ impl Budget {
         self.contended_classes.store(contended, Relaxed);
         for (index, job) in s.slots.iter().enumerate() {
             if let Some(job) = job {
-                self.classes[index].store(job.class | if job.class == BACKGROUND && job.client == APP
-                    && self.warming() && s.background > 1 { FORCED_YIELD } else { 0 } | if job.above { NEVER_YIELDS } else { 0 }, Relaxed);
+                self.classes[index].store(job.class | if job.above { NEVER_YIELDS } else { 0 }, Relaxed);
             }
         }
         if let Some(i) = self.first(s) {
@@ -298,11 +294,11 @@ impl Budget {
     }
     fn should_yield(&self, permit: u32) -> bool {
         let class = self.classes[permit as usize].load(Relaxed);
-        class & NEVER_YIELDS == 0 && (class & FORCED_YIELD != 0 || self.yield_classes.load(Relaxed) & (1 << (class & CLASS_BITS)) != 0)
+        class & NEVER_YIELDS == 0 && self.yield_classes.load(Relaxed) & (1 << (class & CLASS_BITS)) != 0
     }
     fn contended(&self, permit: u32) -> bool {
         let class = self.classes[permit as usize].load(Relaxed);
-        class & FORCED_YIELD != 0 || self.contended_classes.load(Relaxed) & (1 << (class & CLASS_BITS)) != 0
+        self.contended_classes.load(Relaxed) & (1 << (class & CLASS_BITS)) != 0
     }
     fn span(s: &mut State, label: Label, ns: u64) {
         if let Some(span) = s.spans.iter_mut().find(|span| span.label == label) {
@@ -451,7 +447,6 @@ impl Budget {
                 }
             }
         }
-        self.warmup.store(0, Relaxed);
         self.refresh(&mut s);
     }
     fn release(&self, permit: u32) {
@@ -481,21 +476,6 @@ impl Budget {
         s.jit_tokens -= usize::from(old == BACKGROUND && client == JIT && !above);
         s.jit_tokens += usize::from(class == BACKGROUND && client == JIT && !above);
         self.classes[permit as usize].store(class, Relaxed);
-        self.refresh(&mut s);
-    }
-    fn warming(&self) -> bool { self.warmup.load(Relaxed) == 1 }
-    fn begin_warmup(&self) {
-        let mut s = self.lock();
-        // Only JIT startup may begin it. Input before startup also closes the latch.
-        if self.warmup.compare_exchange(0, 1, Relaxed, Relaxed).is_ok() {
-            self.refresh(&mut s);
-        }
-    }
-    fn end_warmup(&self) {
-        // Input dispatch stays atomic-only after the first interaction/settle.
-        if self.warmup.load(Relaxed) == 2 { return; }
-        let mut s = self.lock();
-        self.warmup.store(2, Relaxed);
         self.refresh(&mut s);
     }
     fn waited(&self, class: u8, client: u8, ns: u64, label: &str) {
@@ -543,7 +523,6 @@ impl Budget {
             }
         }
         let total = s.running;
-        let warm = self.warming();
         let worst = s.worst.iter().find(|w| now.saturating_sub(w.when) <= RECENT_NS).copied();
         let strand_worst = s.strand_worst.iter().find(|w| now.saturating_sub(w.when) <= RECENT_NS).copied();
         let parked = s.parked;
@@ -557,7 +536,7 @@ impl Budget {
         if total > self.limit { let _ = write!(out, " (+{} over)", total - self.limit); }
         if lent != 0 { let _ = write!(out, ", {lent} lent by sleeping threads"); }
         if above != 0 { let _ = write!(out, ", {above} JIT job above the budget"); }
-        let _ = write!(out, ", warming: {}, jit settled: {}", if warm { "yes" } else { "no" }, if jit_settled() { "yes" } else { "no" });
+        let _ = write!(out, ", jit settled: {}", if jit_settled() { "yes" } else { "no" });
         if let Some(w) = worst {
             let _ = write!(out, ", worst: {} {:?} waited {}", CLASSES[w.class as usize], w.label.text(), human(w.ns));
             if let Some((class, span)) = w.culprit {
@@ -929,16 +908,9 @@ pub fn waited(class: u8, client: u8, ns: u64, label: &str) { global().waited(cla
 /// A strand's job waited `ns` behind the strand's earlier jobs: reported apart from waits for a worker.
 #[relax_api]
 pub fn strand_waited(class: u8, ns: u64, label: &str) { global().strand_waited(class, ns, label); }
-#[relax_api]
-pub fn begin_warmup() { global().begin_warmup(); }
-/// Permanently restore the normal budget at first settle or real user input.
-#[relax_api]
-pub fn end_warmup() { global().end_warmup(); }
-#[relax_api]
-pub fn warming() -> bool { global().warming() }
 static JIT_UNSETTLED: AtomicBool = AtomicBool::new(false);
-/// The JIT has compiled nothing for a while, or there is none (a compiled build). Unlike
-/// [`warming`], first input doesn't end it, and it goes back when the JIT compiles again.
+/// The JIT has compiled nothing for a while, or there is none (a compiled build); it goes back
+/// when the JIT compiles again.
 #[relax_api]
 pub fn jit_settled() -> bool { !JIT_UNSETTLED.load(Relaxed) }
 #[relax_api]
