@@ -19,8 +19,8 @@
 //! (cache/front_run.rs), which the stores named by the crate fingerprint refer to (front.rs).
 //!
 //! MAKEPAD_RUN_CACHE=on (default) | off | verify | readonly;
-//! The stores live in the workspace's `<target>/relax/cache` (dirs.rs; MAKEPAD_RUN_CACHE_DIR replaces
-//! `<target>/relax` for tests and measurement); MAKEPAD_RUN_CACHE_MAX (MB) caps them (default: twice
+//! Stores live in `<cargo target dir>/makepad-run/cache` (dirs.rs); MAKEPAD_RUN_CACHE_DIR replaces
+//! the run dir for tests and measurement. MAKEPAD_RUN_CACHE_MAX (MB) caps them (default: twice
 //! what the run uses, at least 4096; prune_root).
 
 use crate::borrowck::lazy::StoredVerdict;

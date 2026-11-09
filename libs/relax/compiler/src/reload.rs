@@ -6,11 +6,10 @@
 //! 1. Parse every edited file as a new version (nothing the running program reads changes).
 //! 2. Classify each item against the running version: body edits (class B), const value
 //!    edits (B, with the readers recompiled) and initializer edits of statics not placed yet
-//!    apply; everything else takes the restart rung with a one-line reason, never a silent
-//!    stale result (a static or `thread_local!` that already holds its value, signature,
-//!    layout, item set, macro, declarative edits until their mechanisms exist). The restart
-//!    rung restarts the program in place on its own (restart_in_place), and a patch whose old
-//!    code keeps running in a frame that never returns takes it too (the landing check).
+//!    apply, as do supported layout, macro and visibility edits. Eligible named-field structs
+//!    keep existing field slots and add defaulted fields in extension blocks. Unsupported edits
+//!    offer a restart with a reason; the app keeps running until `session relaunch` is requested.
+//!    The landing check also offers a restart when old code remains on a thread's stack.
 //! 3. Freeze: closures of the functions about to be rebuilt that were never compiled are
 //!    compiled now, from the version their stored values were made by.
 //! 4. Commit the versions (each a new file index: old code, closure and coroutine types and
