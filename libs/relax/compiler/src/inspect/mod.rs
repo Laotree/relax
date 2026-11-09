@@ -1800,7 +1800,7 @@ fn cmd_provided(req: &Req, out: &mut Out) {
     }
     let mut reply = ProvidedReply { out, pending: Vec::new() };
     let Some(truncated) = scope.call(|| query(line.as_ptr(), line.len(), sink, &mut reply as *mut ProvidedReply as *mut std::ffi::c_void)) else {
-        reply.out.err("the app domain is not running");
+        reply.out.err("the app domain is not running (or its run ended while it answered)");
         return;
     };
     if !reply.pending.is_empty() {
