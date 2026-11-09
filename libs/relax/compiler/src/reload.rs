@@ -4362,7 +4362,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             p
         } else { u.prog.parse_version(e.file, &e.path, e.src.clone()) };
         let parsed = initial.or_else(|err| {
-            if partial != 0 && partial != HOLD_ROUND && e.path.ends_with(".rs") {
+            if partial != 0 && partial != HOLD_ROUND && (e.path.ends_with(".rs") || module) {
                 if let Some((src, n)) = compose_partial(&u.prog, e.file, &e.src) {
                     kept = Some(kept.unwrap_or(0) + n);
                     return u.prog.parse_version(e.file, &e.path, src);
