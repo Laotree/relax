@@ -6136,6 +6136,19 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             errs.extend(e);
         }
     }
+    // What a crate the host provides lacks: its items are this makepad's own, and its changed
+    // sources wait for the rebuilt makepad, so no patch adds them -- the restart into that
+    // makepad applies the edit (the held items wait for it, the rest patches now). Only while
+    // makepad's own inputs have changed (a rebuild offered, running or done): with none, no
+    // makepad has them and the errors are the edit's own.
+    if !real.is_empty() && host::route() != host::Route::Plain {
+        if let Some(lines) = provided_lacks(&real) {
+            errs.retain(|e| !real.contains(e));
+            errs.extend(lines);
+            real.clear();
+            as_restart = true;
+        }
+    }
     // a restart that the edit's errors would stop: the errors alone refuse it
     if as_restart && !real.is_empty() {
         errs = real.clone();
@@ -8076,6 +8089,29 @@ pub(crate) fn patch_refused_event(what: &str, refused: bool, lines: &[String]) {
     );
     // Reporting does not restart. The watcher retries the whole settled batch
     // before deciding whether a refusal is a failure of makepad itself.
+}
+
+/// The path an unresolved name's error names: a `use` (E0432), a value (E0425) or a type (E0412),
+/// as the resolver and the type checker print them.
+fn unresolved_path(e: &str) -> Option<&str> {
+    let at = ["E0432: unresolved import `", "E0425: cannot find value `", "E0412: cannot find type `"].iter().find_map(|h| e.find(h).map(|i| i + h.len()))?;
+    Some(&e[at..at + e[at..].find('`')?])
+}
+
+/// `errs`, said as the restart rung's lines, when every one is a path into a provided crate that
+/// does not resolve or a name such a path would have bound (a `use` of its re-export, a call
+/// through that): None when any is another error.
+fn provided_lacks(errs: &[String]) -> Option<Vec<String>> {
+    let last = |p: &str| p.rsplit("::").next().unwrap_or(p).to_string();
+    let lacked: Vec<(String, String)> = errs.iter().filter_map(|e| unresolved_path(e)).filter_map(|p| {
+        let (krate, rest) = p.trim_start_matches("::").split_once("::")?;
+        (!rest.is_empty() && crate::provided::registered(krate)).then(|| (last(p), krate.to_string()))
+    }).collect();
+    errs.iter().map(|e| {
+        let name = last(unresolved_path(e)?);
+        let (_, krate) = lacked.iter().find(|(n, _)| *n == name)?;
+        Some(format!("{e} -- `{krate}` is built into makepad, and this one lacks it: needs the rebuilt makepad: restart to apply"))
+    }).collect()
 }
 
 /// Whether a refusal's lines hold a failure of makepad itself, not of the edit.

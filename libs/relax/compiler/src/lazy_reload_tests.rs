@@ -2134,13 +2134,15 @@ fn module_bodies_classify_by_item() {
 
 /// A new item in one JIT-compiled crate and its first use in another, saved together, patch in one
 /// edit: the dependent crate's new code calls the new fn (no restart, nothing refused). The
-/// counterpart of an item a crate the host provides gains: that one waits for a rebuilt makepad.
+/// counterpart, an item a crate the host provides lacks (its items are the running makepad's):
+/// with makepad's inputs unchanged a use of it is the edit's own error, and once they changed it
+/// waits for the rebuilt makepad, the restart offered.
 #[test]
-fn a_new_item_and_its_use_in_another_crate_patch_in_one_edit() {
+fn a_new_item_in_another_crate_patches_unless_the_host_provides_that_crate() {
     const CHILD: &str = "MAKEPAD_RUN_CROSS_ITEM_TEST";
     if std::env::var(CHILD).is_err() {
         let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "lazy_reload_tests::a_new_item_and_its_use_in_another_crate_patch_in_one_edit", "--nocapture", "--test-threads=1", "--format=terse"])
+            .args(["--exact", "lazy_reload_tests::a_new_item_in_another_crate_patches_unless_the_host_provides_that_crate", "--nocapture", "--test-threads=1", "--format=terse"])
             .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0"));
         let out = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
@@ -2195,10 +2197,19 @@ fn a_new_item_and_its_use_in_another_crate_patch_in_one_edit() {
     let app_file = u.prog.def(value).file;
     let o = unsafe { apply(up, vec![
         Edit { file: parts_file, path: parts_path, src: format!("{parts_src}pub fn fresh() -> u32 {{ 29 }}\n").into_bytes() },
-        Edit { file: app_file, path: app_path, src: app_src("fresh").into_bytes() },
+        Edit { file: app_file, path: app_path.clone(), src: app_src("fresh").into_bytes() },
     ]) };
     assert_eq!(o.rung, Rung::Patch, "a new fn and its first use in another crate, saved together: {:?}", o.lines);
     assert_eq!(run(), 29, "the dependent crate's new code calls the new fn");
+    unsafe extern "C" fn no_panic(_: *mut *const u8, _: *mut usize) {}
+    crate::provided::register("parts", Default::default(), Default::default(), Default::default(), Default::default(), no_panic, 0, &[]);
+    let use_later = || vec![Edit { file: app_file, path: app_path.clone(), src: app_src("later").into_bytes() }];
+    let o = unsafe { apply(up, use_later()) };
+    assert_eq!(o.rung, Rung::Refuse, "a fn the provided crate lacks, with makepad's inputs unchanged: {:?}", o.lines);
+    crate::reload::host::offer_provided(crate::provided::ProvidedChange { crate_name: "parts".into(), files: Vec::new() }, None);
+    let o = unsafe { apply(up, use_later()) };
+    assert!(o.lines.iter().any(|l| l.contains("E0425") && l.contains("needs the rebuilt makepad: restart to apply")), "once makepad's inputs changed, the use waits for the rebuilt makepad: {:?} {:?}", o.rung, o.lines);
+    assert_eq!(run(), 29, "the running code stays until the restart");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
