@@ -650,6 +650,13 @@ pub(super) fn tiers_where(keep: impl Fn(&TierEntry) -> bool) -> Vec<TierEntry> {
     drain_tier_inbox();
     lock().entries.iter().filter_map(|e| if let Job::O3(t) = e.job { keep(&t).then_some(t) } else { None }).collect()
 }
+/// Takes the O3 entries `gone` off the queue (tier_revalidate). By the whole entry, not by slot: hot
+/// code counted again is queued again within microseconds, and that new entry stays.
+pub(super) fn drop_tiers(gone: Vec<TierEntry>) {
+    if !gone.is_empty() {
+        lock().drop_tiers(&gone.into_iter().collect());
+    }
+}
 pub(super) fn retire_front(front: &Arc<FrontShared>) {
     front.alive.store(false, Ordering::SeqCst);
     retain(|job| !matches!(job, Job::Ahead(f, _) if Arc::ptr_eq(f, front)));
@@ -663,6 +670,12 @@ pub(super) fn retain(mut keep: impl FnMut(&Job) -> bool) {
     }
 }
 impl Queue {
+    fn drop_tiers(&mut self, gone: &std::collections::HashSet<TierEntry>) {
+        let mut i = 0;
+        while i < self.entries.len() {
+            if matches!(&self.entries[i].job, Job::O3(e) if gone.contains(e)) { self.remove(i); } else { i += 1; }
+        }
+    }
     /// Promotes slot `id`'s queued and running jobs to their waiters' class; returns whether a
     /// queued one can start now.
     fn promote(&mut self, unit: usize, id: u32) -> bool {
@@ -971,6 +984,22 @@ pub(super) fn view(n: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_slot_queued_again_keeps_its_new_entry() {
+        let mut q = Queue::new();
+        let (old, new, other) = ((7, 0, 100, 5), (7, 0, 200, 5), (8, 0, 100, 5));
+        for e in [old, other, new] {
+            q.push(Job::O3(e), e.2);
+        }
+        q.drop_tiers(&[old].into_iter().collect());
+        let left: Vec<TierEntry> = q.entries.iter().filter_map(|e| if let Job::O3(t) = e.job { Some(t) } else { None }).collect();
+        assert_eq!(left.len(), 2);
+        assert!(left.contains(&new) && left.contains(&other), "only the entry counted again goes: {left:?}");
+        for e in [new, other] {
+            q.drop_tiers(&[e].into_iter().collect());
+        }
+    }
 
     #[test]
     fn admission_order_and_waiter_promotion() {

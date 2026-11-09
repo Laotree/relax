@@ -17993,22 +17993,25 @@ unsafe fn queued_gone_cold(rec: *const AtomicU64, at: u64, now: u64, threshold: 
         && tier_cost_now(rec, threshold, tier_clock()).0 < threshold
 }
 
-fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) {
+/// Returns the entries it took out of `q`: whole entries, as the slot may be queued again already.
+fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) -> Vec<(u32, u8, u64, u64)> {
+    let mut gone = Vec::new();
     if q.is_empty() || !ahead_policy().o3_revalidate {
-        return;
+        return gone;
     }
     let now = wall_ns();
     if !q.iter().any(|e| matches!(e.1, Q_CALLS | Q_LOOP) && now.saturating_sub(e.2) >= REVALIDATE_NS) {
-        return;
+        return gone;
     }
     let up = TIER_UNIT.load(Ordering::Acquire);
     if up.is_null() {
-        return;
+        return gone;
     }
     let u = unsafe { &*up };
-    let Some(threshold) = u.tier1.as_ref().map(|t| t.threshold) else { return };
+    let Some(threshold) = u.tier1.as_ref().map(|t| t.threshold) else { return gone };
     let mut n = 0u64;
-    q.retain(|&(id, why, at, _)| {
+    q.retain(|&entry| {
+        let (id, why, at, _) = entry;
         if !matches!(why, Q_CALLS | Q_LOOP) {
             return true;
         }
@@ -18034,6 +18037,7 @@ fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) {
             crate::inspect::tierlog::note_arm(id, crate::inspect::tierlog::ARM_REVALIDATE, code);
         }
         n += 1;
+        gone.push(entry);
         false
     });
     if n > 0 {
@@ -18042,6 +18046,7 @@ fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) {
             eprintln!("O3q @{:.3} {} cold entries counted again, q={}", now as f64 / 1e9, n, q.len());
         }
     }
+    gone
 }
 
 
@@ -28440,11 +28445,7 @@ fn run_tick() {
     drain_slow_base();
     settle_tier_tick();
     if records_due() { drain_records_bounded(); }
-    let mut tiers = queue::tiers();
-    let before: std::collections::HashSet<_> = tiers.iter().map(|e| e.0).collect();
-    tier_revalidate(&mut tiers);
-    let kept: std::collections::HashSet<_> = tiers.iter().map(|e| e.0).collect();
-    queue::retain(|job| !matches!(job, queue::Job::O3(e) if before.contains(&e.0) && !kept.contains(&e.0)));
+    queue::drop_tiers(tier_revalidate(&mut queue::tiers()));
     o2_offer_hottest();
     let now = w0_activity();
     let mut state = TICK_STATE.lock().unwrap_or_else(|e| e.into_inner());
