@@ -810,11 +810,13 @@ pub fn note_big(kind: &str, name: &str, s: PeakScope, what: impl FnOnce() -> Str
 }
 
 /// glibc malloc keeps freed memory at the top of each thread arena until the top exceeds the trim
-/// threshold, which grows by itself (to 32 MB) whenever a large mapped block is freed. With the
-/// compiler's and the apps' threads each using an arena, a domain's start/stop cycles left ~5 MB
-/// per cycle of such free-but-resident tops (and `malloc_trim` does not release an arena's top).
-/// A fixed 1 MB threshold (which also turns the dynamic adjustment off) returns them as they
-/// are freed. Call once at process start, before threads exist. Other platforms: nothing.
+/// threshold, which grows by itself (to 32 MB) whenever a large mapped block is freed. A fixed 1 MB
+/// threshold returns such tops as they are freed: for a long-lived process whose threads come and go
+/// and whose memory is what counts (a devhub hub, devhub heap.rs). Not for a JIT process: it turns
+/// the dynamic adjustment off for the mmap threshold too, which stays at 128 KB, so every block of
+/// that size or more is its own mapping, faulted in 4 KB at a time and unmapped when it is freed
+/// (a slice's Vec growth and buffers: 1.73M faults against 0.65M, 6% of its wall time). Call once at
+/// process start, before threads exist. Other platforms: nothing.
 pub fn tune_malloc() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
