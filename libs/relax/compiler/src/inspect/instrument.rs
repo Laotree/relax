@@ -1231,6 +1231,22 @@ pub(crate) fn program_thread(t: &super::threads::Thread) -> bool {
     !(t.name.starts_with("run-") || t.name.starts_with("gandalf") || (t.handle != 0 && t.handle == crate::owner::owner_tid()))
 }
 
+/// The CPU the runtime's own threads have run (not `program_thread`s: its compiles, checks,
+/// monitor and owner), in nanoseconds: none of it is the program's work, and a test's idle rule
+/// leaves it out of the app's (makepad_hal::clock::runtime_cpu_ns). A thread that ended keeps what
+/// it had run at the last look: the count only grows.
+pub fn runtime_cpu_ns() -> u64 {
+    static SEEN: relax_session::sync::Mutex<(Vec<(u64, u64)>, u64)> = relax_session::sync::Mutex::new((Vec::new(), 0));
+    let now: Vec<(u64, u64)> = super::threads::list().iter().filter(|t| !program_thread(t)).map(|t| (t.os_id, t.cpu_ns)).collect();
+    crate::zone_alloc::kept_with(|| {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let ended: u64 = seen.0.iter().filter(|(id, _)| !now.iter().any(|(n, _)| n == id)).map(|(_, cpu)| cpu).sum();
+        seen.1 += ended;
+        seen.0 = now;
+        seen.1 + seen.0.iter().map(|(_, cpu)| cpu).sum::<u64>()
+    })
+}
+
 /// The host's UI thread of a hosted run (run.rs `host_thread`: the process's main thread, on the
 /// HAL's main loop, the app's main on a thread of its own).
 fn host_ui_thread(t: &super::threads::Thread) -> bool {
