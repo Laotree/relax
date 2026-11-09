@@ -20041,7 +20041,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         }
         Err(b) => {
             owner::BAILS[owner::BAIL_DROPPED].fetch_add(1, Ordering::Relaxed);
-            crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_REFUSED, crate::inspect::tierlog::REFUSE_TAKE, 0, 0);
+            let front_why = PREFRONT_WHY.try_with(|w| w.get()).unwrap_or(AF_OK);
+            crate::inspect::tierlog::note_take_bail(id, b.what, b.slots.first().copied(), rounds, front_why);
             if tier1_trace() {
                 eprintln!("O3 take of #{} bailed: {} (slots {:?})", id, b.what, b.slots);
             }
