@@ -385,6 +385,12 @@ static QUEUE: OnceLock<relax_session::sync::Mutex<Queue>> = OnceLock::new();
 const TIERS: usize = 6;
 static COUNTS: [AtomicUsize; TIERS] = [const { AtomicUsize::new(0) }; TIERS];
 static RUNNING: [AtomicUsize; TIERS] = [const { AtomicUsize::new(0) }; TIERS];
+const TIER_NAMES: [&str; TIERS] = ["ahead", "O2", "O3", "spec", "tick", "check"];
+/// What the jobs of each tier took so far, the CPU of the threads running them (makepad inspect `jit spent`).
+static JOB_CPU: [AtomicU64; TIERS] = [const { AtomicU64::new(0) }; TIERS];
+static JOB_RUNS: [AtomicU64; TIERS] = [const { AtomicU64::new(0) }; TIERS];
+/// The same per slot for its O2 and O3 jobs: O2 ns, O2 jobs, O3 ns, O3 jobs.
+static SLOT_CPU: relax_session::sync::Mutex<Option<HashMap<u32, [u64; 4]>>> = relax_session::sync::Mutex::new(None);
 /// A worker's park state, on its own cache line (each worker writes its flag at every job).
 #[repr(align(64))]
 /// `idle`: the worker runs at the OS's idle policy (idle_tiers): it takes tier-ups only.
@@ -657,6 +663,34 @@ pub(super) fn drop_tiers(gone: Vec<TierEntry>) {
         lock().drop_tiers(&gone.into_iter().collect());
     }
 }
+fn note_job(tier: usize, slot: Option<u32>, ns: u64) {
+    JOB_CPU[tier].fetch_add(ns, Ordering::Relaxed);
+    JOB_RUNS[tier].fetch_add(1, Ordering::Relaxed);
+    if let (true, Some(slot)) = (is_tier_up(tier), slot) {
+        let at = (tier - 1) * 2;
+        crate::zone_alloc::kept_with(|| {
+            let mut g = SLOT_CPU.lock().unwrap_or_else(|e| e.into_inner());
+            let row = g.get_or_insert_with(Default::default).entry(slot).or_default();
+            row[at] += ns;
+            row[at + 1] += 1;
+        });
+    }
+}
+/// What the jobs took by tier, then the `n` slots whose O2 and O3 jobs took the most.
+pub(super) fn spent(n: usize) -> Vec<String> {
+    let mut rows = vec![TIER_NAMES.iter().enumerate()
+        .map(|(i, name)| format!("{name} {:.1} s x{}", JOB_CPU[i].load(Ordering::Relaxed) as f64 / 1e9, JOB_RUNS[i].load(Ordering::Relaxed)))
+        .collect::<Vec<_>>().join(", ")];
+    let g = SLOT_CPU.lock().unwrap_or_else(|e| e.into_inner());
+    let mut slots: Vec<(&u32, &[u64; 4])> = g.iter().flatten().collect();
+    slots.sort_by_key(|(id, r)| (std::cmp::Reverse(r[0] + r[2]), **id));
+    rows.push(format!("{} slots had an O2 or O3 job", slots.len()));
+    rows.extend(slots.into_iter().take(n).map(|(id, r)| {
+        let name = slot_name(*id).unwrap_or_default();
+        format!("S{id} O2 {:.1} ms x{} O3 {:.1} ms x{} {name}", r[0] as f64 / 1e6, r[1], r[2] as f64 / 1e6, r[3])
+    }));
+    rows
+}
 pub(super) fn retire_front(front: &Arc<FrontShared>) {
     front.alive.store(false, Ordering::SeqCst);
     retain(|job| !matches!(job, Job::Ahead(f, _) if Arc::ptr_eq(f, front)));
@@ -893,7 +927,9 @@ fn worker_loop(index: usize) {
                         TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).push(tier.0);
                         Some(TierActive(tier.0))
                     } else { None };
+                    let (slot, cpu) = (entry.slot.map(|s| s.1), cpu_ns());
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(entry.job)));
+                    note_job(tier, slot, cpu_ns().saturating_sub(cpu));
                     drop(active);
                     if let Err(payload) = result {
                         let (message, bail) = panic_payload(&*payload);
@@ -1013,6 +1049,17 @@ mod tests {
         for e in [new, other] {
             q.drop_tiers(&[e].into_iter().collect());
         }
+    }
+
+    #[test]
+    fn a_jobs_cpu_goes_to_its_tier_and_slot() {
+        let slot = u32::MAX - 11;
+        note_job(2, Some(slot), 5_000_000);
+        note_job(2, Some(slot), 5_000_000);
+        note_job(1, Some(slot), 1_000_000);
+        let rows = spent(usize::MAX);
+        assert!(rows[0].contains("O3 "), "by tier first: {}", rows[0]);
+        assert!(rows.iter().any(|r| r.starts_with(&format!("S{slot} O2 1.0 ms x1 O3 10.0 ms x2"))), "{rows:?}");
     }
 
     #[test]
@@ -1168,6 +1215,9 @@ pub(crate) unsafe fn reset_statics() {
     reset(&QUEUE, OnceLock::new());
     reset(&COUNTS, [const { AtomicUsize::new(0) }; TIERS]);
     reset(&RUNNING, [const { AtomicUsize::new(0) }; TIERS]);
+    reset(&JOB_CPU, [const { AtomicU64::new(0) }; TIERS]);
+    reset(&JOB_RUNS, [const { AtomicU64::new(0) }; TIERS]);
+    reset(&SLOT_CPU, relax_session::sync::Mutex::new(None));
     reset(&THREADS, OnceLock::new());
     reset(&NEXT_WORKER, AtomicUsize::new(0));
     reset(&IDLE_WORKERS, AtomicUsize::new(0));

@@ -18441,6 +18441,9 @@ fn tier_push_locked(id: u32, why: u8, rate: u64, now: u64) {
 /// Common queue admission order, including running jobs, class, heat, age and blocking reason.
 pub(crate) fn queue_view(n: usize) -> Vec<String> { queue::view(n) }
 
+/// What the compile jobs took so far (makepad inspect `jit spent`).
+pub(crate) fn queue_spent(n: usize) -> Vec<String> { queue::spent(n) }
+
 /// The UI must be quiet this long before concurrent non-Interactive builds resume.
 const BURST_UI_QUIET_NS: u64 = 1_000_000_000;
 

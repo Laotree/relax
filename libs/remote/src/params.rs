@@ -195,7 +195,7 @@ pub fn jit(cmd: &str, sub: &str) -> Option<&'static str> {
         ("heap", "life") => params!("host": "integer", "n": "integer", "ms": "integer", "file": "string"),
         ("heap", "diff") => params!("host": "integer", "n": "integer", "depth": "integer"),
         ("heap" | "path", _) => params!("host": "integer"),
-        ("jit", "queue") => params!("n": "integer"),
+        ("jit", "queue" | "spent") => params!("n": "integer"),
         ("jit", _) => params!("ms": "integer"),
         ("owner", _) => params!("since": "integer", "n": "integer"),
         ("stacks", _) => params!("thread": "string", "depth": "integer"),
