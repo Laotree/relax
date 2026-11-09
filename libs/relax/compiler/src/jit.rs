@@ -26744,11 +26744,12 @@ mod front_yield_tests {
         makepad_cpu_budget::tokens().holders.iter().filter(|h| h.label == label).count()
     }
 
-    /// As many jobs as CPU tokens, each with its token, all calling one fn whose speculative build
-    /// (Background, in flight) sits out a checkpoint for them: the build needs a token and they wait
-    /// for the build. Budget::acquire held it for good: nothing moved until the process died.
+    /// As many jobs as Visible lets in, each with its token, all calling one fn whose speculative
+    /// build (Background, in flight) sits out a checkpoint for them: the build needs a token and they
+    /// wait for the build. Budget::acquire held it for good: nothing moved until the process died.
     /// `callers` of the jobs call; the others keep their tokens, running.
-    /// `jobs` is the tokens left beside the other compile job and the build.
+    /// `jobs` is what Visible lets in beside the compile jobs at the JIT's floor (it does not count
+    /// the JIT's builds past the floor, so the build's token is not among them).
     /// Returns once the callers are on their way: the jobs, and the callers still to end.
     fn jobs_on_every_token(up: usize, slot: u32, jobs: usize, callers: usize) -> (Vec<std::thread::JoinHandle<u64>>, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use makepad_cpu_budget as budget;
@@ -26758,7 +26759,7 @@ mod front_yield_tests {
         queue::spec(up, slot);
         back_end_at_gate(up, slot);
         let (go, left) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(callers)));
-        let handles = (0..jobs).map(|i| {
+        let mut handles: Vec<_> = (0..jobs).map(|i| {
             let (go, left) = (go.clone(), left.clone());
             std::thread::spawn(move || {
                 // (the wait's own code compiled first: under the JIT a thread waiting for a compile
@@ -26783,15 +26784,22 @@ mod front_yield_tests {
                 code
             })
         }).collect();
-        // the build's token is the one the last job waits for: its first checkpoint yields it
+        on_budget_change(|| pool_jobs("a pool job") >= jobs);
+        // one more Visible job waits for a token: the build's first checkpoint yields its token for
+        // it. That lets it in no sooner (Visible never counted the build's token); it gives up any
+        // token it gets at once, so a token the callers lend goes on to the build.
+        handles.push(std::thread::spawn(|| {
+            let permit = budget::admit(budget::VISIBLE, budget::APP, "a job waiting for a token");
+            budget::release(permit);
+            1
+        }));
         on_budget_change(|| budget::tokens().waiting.iter().any(|w| w.class == budget::VISIBLE && w.client == budget::APP));
         BACK_END_GATE.store(0, Ordering::SeqCst);
-        on_budget_change(|| pool_jobs("a pool job") >= jobs);
         // (a build that no longer stops here would pass without showing anything; asked of the budget,
         // which every JIT in the process shares: under the JIT the wait hook is the loader's)
         let building = BACK_END_THREAD.load(Ordering::SeqCst);
         on_budget_change(|| {
-            assert!(queue::running_class(up, slot).is_some(), "the build sits out its checkpoint for the last job");
+            assert!(queue::running_class(up, slot).is_some(), "the build sits out its checkpoint for the waiting job");
             budget::tokens().waiting.iter().any(|w| w.thread == building)
         });
         go.store(true, Ordering::SeqCst);
