@@ -305,6 +305,21 @@ pub unsafe extern "C" fn program_alloc_zeroed(size: usize, align: usize) -> *mut
         None => System.alloc_zeroed(l),
     }
 }
+/// A block of the calling thread's domain heap for a provided crate's op (the run phase), or
+/// null when the thread is in no domain or the heap refused. The heap accounting's allocator
+/// takes these without its header: a domain block is freed by address, by JIT code and native
+/// code alike.
+#[inline]
+pub unsafe fn run_alloc(l: Layout, zeroed: bool) -> *mut u8 {
+    if !relax_session::phase::in_run() {
+        return std::ptr::null_mut();
+    }
+    match compiler::domain_here() {
+        Some(a) if zeroed => a.alloc_zeroed(l),
+        Some(a) => a.alloc(l),
+        None => std::ptr::null_mut(),
+    }
+}
 /// Also the native global allocator's free (every free of a provided crate passes here).
 #[inline]
 pub unsafe fn dealloc_layout(p: *mut u8, l: Layout) -> bool {
