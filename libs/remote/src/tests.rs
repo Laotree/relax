@@ -342,6 +342,30 @@ fn a_request_sees_its_client_go() {
     assert!(!crate::lines::client_gone(), "no request on this thread");
 }
 
+/// A handler that waits says so ahead of its answer, on that request's channel only.
+#[test]
+fn a_request_says_what_it_waits_on_ahead_of_its_answer() {
+    let ep = Endpoint::new("makepad-remote-says");
+    ep.register("slow", 1, crate::lines::service("slow", std::sync::Arc::new(move |_, out| {
+        crate::lines::say("waits for \"room\"");
+        out.push("{\"answer\":1}".to_string());
+    })));
+    let conn = pair(&ep);
+    let ch = conn.open("slow", "").unwrap();
+    ch.send(b"wait\n".to_vec()).unwrap();
+    let mut text = String::new();
+    while !text.contains("{\"end\":") {
+        match ch.recv_timeout(WAIT).unwrap() {
+            Event::Data(d) => text.push_str(&String::from_utf8_lossy(&d)),
+            Event::Opened(_) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[..2], ["{\"say\":\"waits for \\\"room\\\"\"}", "{\"answer\":1}"]);
+    crate::lines::say("nothing outside a request");
+}
+
 /// A late follower gets what came before it only when it asks from there, and once.
 #[test]
 fn a_feed_from_a_record_gets_what_came_before_it() {
