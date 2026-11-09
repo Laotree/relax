@@ -16505,9 +16505,9 @@ rt_fn! {
 /// budget, the counter the count stub takes its calls' cost from. The slot is queued at its next
 /// call if the decayed cost is over the threshold then (rt_hot): without OSR the frame running the
 /// loop finishes in the code it is in, so a function entered once (a loader's parse loop, an
-/// event loop) is never built for its loops. The first time the loop makes its slot hot, its JIT
-/// callers are charged a threshold's cost each: a loop in a callee is their loop too, and they
-/// queue at their next call.
+/// event loop) is never built for its loops. The first time the loop makes its slot hot, the JIT
+/// callers right under it are charged a threshold's cost each (loop_walk): a loop in a callee is
+/// their loop too, and they queue at their next call.
 fn rt_loop_hot(counter: u64, fp: u64) {
     let _z = crate::zone_alloc::compiler();
     let _keep = os::proc::KeepLastError::new();
@@ -16574,44 +16574,59 @@ fn rt_loop_hot(counter: u64, fp: u64) {
         // address into it); a frame that is not JIT code ends the walk before its fp is read
         let mut fp = fp;
         let mut at = id;
-        for _ in 0..LOOP_CALLERS {
+        let callers = std::iter::from_fn(|| {
             if fp == 0 || fp % 8 != 0 {
-                break;
+                return None;
             }
             let ra = *((fp + 8) as *const u64);
             let found = u.find_fn(ra);
             if tier1_trace() {
                 eprintln!("O3q loop #{}: caller {:?} (state {})", at, found, found.map_or(0, |c| (*tier_rec(&u.slots, c).add(3)).load(Ordering::Relaxed)));
             }
-            let Some(c) = found else { break };
-            // SPEC-V: a frame calling a twin is that twin's caller (indirect and helper-lowered
-            // calls leave no record at lowering): recorded, and if the twin is hot its caller is
-            // brought to the base slot (twin_seen)
-            if c != at && matches!(u.fns[at as usize].key, FnKey::Plain(_)) {
-                twin_seen(u, c, at);
-            }
-            if c != at {
-                let crec = tier_rec(&u.slots, c);
-                let st = (*crec.add(3)).load(Ordering::Relaxed);
-                // a lukewarm slot in its counting window: the loop under it is its work (credited:
-                // pgo_poll ends its window); any other slot that turned hot ends the walk
-                if st == T_QUEUED && !pgo_credit(c) {
-                    break;
-                }
-                if st == T_COUNTING {
-                    tier_charge(crec, threshold);
-                    (*crec.add(5)).fetch_or(LOOP_CHARGED, Ordering::Relaxed);
-                }
-            }
+            let c = found?;
             at = c;
             let next = *(fp as *const u64);
-            if next <= fp {
-                break;
+            fp = if next <= fp { 0 } else { next };
+            Some(c)
+        });
+        // SPEC-V: a frame calling a twin is that twin's caller (indirect and helper-lowered calls
+        // leave no record at lowering): recorded, and if the twin is hot its caller is brought to
+        // the base slot (twin_seen)
+        let twin = |c: u32, callee: u32| {
+            if matches!(u.fns[callee as usize].key, FnKey::Plain(_)) {
+                twin_seen(u, c, callee);
             }
-            fp = next;
-        }
+        };
+        loop_walk(id, threshold, callers.take(LOOP_FRAMES), |c| tier_rec(&u.slots, c), twin);
     }
 }
+}
+
+/// rt_loop_hot's walk over the JIT callers under the loop that turned hot in slot `at`, innermost
+/// first (a frame of the same slot, a recursion, is skipped). Each is shown to `twin` with the
+/// slot it called. The first LOOP_CALLERS are charged a threshold's cost if they are counting, and
+/// a lukewarm one in its counted window is credited (pgo_poll looks at its own work now); further
+/// down neither, the walk goes on past them for `twin` alone. A slot that turned hot otherwise
+/// ends the walk.
+unsafe fn loop_walk(mut at: u32, threshold: u64, callers: impl Iterator<Item = u32>, rec: impl Fn(u32) -> *const AtomicU64, mut twin: impl FnMut(u32, u32)) {
+    let mut near = LOOP_CALLERS;
+    for c in callers {
+        if c == at {
+            continue;
+        }
+        twin(c, at);
+        let crec = rec(c);
+        let st = (*crec.add(3)).load(Ordering::Relaxed);
+        if st == T_QUEUED && !pgo_credit(c, near > 0) {
+            break;
+        }
+        if st == T_COUNTING && near > 0 {
+            tier_charge(crec, threshold);
+            (*crec.add(5)).fetch_or(LOOP_CHARGED, Ordering::Relaxed);
+        }
+        near = near.saturating_sub(1);
+        at = c;
+    }
 }
 
 /// Per-slot record at `SlotTable::tier(slot)`: [cost budget, counted code, count stub, state,
@@ -16671,11 +16686,17 @@ const LOOP_CHUNK_DIV: u64 = 4;
 /// A check that stays under the threshold refills the budget with what is left to it, at least
 /// threshold / REFILL_DIV: lukewarm code checks a few times per threshold's worth of cost
 const REFILL_DIV: u64 = 8;
-/// A hot loop queues the JIT frames under it with it (rt_loop_hot), up to the first one queued
-/// already and at most this many: a loop in a callee is its callers' loop too, and their O3 builds
-/// inline it (llm_host: a generic collect's loop under f32_bytes_to_vec under the decode step,
-/// all entered rarely). Each caller is charged a threshold's cost: its next call queues it.
-const LOOP_CALLERS: usize = 64;
+/// A hot loop queues the JIT callers right under it with it (rt_loop_hot), this many: a loop in a
+/// callee is its callers' loop too, and their O3 builds inline it (llm_host: a generic collect's
+/// loop under f32_bytes_to_vec under the decode step, all entered rarely). Each is charged a
+/// threshold's cost: its next call queues it. Further down the counted builds were waste: in a
+/// cold plate run the callers three and more frames down took ~200 counted builds (2.9 s of CPU),
+/// one in twelve showing work of its own, nearly all of those with a hot loop of their own; the
+/// second caller down still one in four (the first: one in three)
+const LOOP_CALLERS: usize = 2;
+/// ... and the walk goes on past them up to the first one queued already and at most this many
+/// frames, for SPEC-V's twin callers (twin_seen)
+const LOOP_FRAMES: usize = 64;
 /// The threshold's cost reached within this: hot without the counted window's evidence of work
 /// (rt_hot's rate is the cost spent since the last check per second)
 const CALL_FAST_NS: u64 = 10_000_000;
@@ -16949,6 +16970,60 @@ mod tier_cost_tests {
         assert!(drive(60 * 894, 894, 10).is_some(), "the race's Hud::draw_walk (weight 894) tiers up within 10 s");
         let t = drive(1_000_000_000, 20, 10).unwrap();
         assert!(t < 0.01, "a burst tiers up at once ({t} s)");
+    }
+
+    /// Why: every UI handler on a hot loop's stack went to O3 (rt_loop_hot credits each lukewarm
+    /// frame it walks past, and a credited window skipped the work test): in a slicing session 94%
+    /// of the compile CPU went to code no sample saw. A credited window is looked at at once, on
+    /// its own work: with too little it stays parked, with enough it goes to O3.
+    #[test]
+    fn a_lukewarm_slot_a_hot_loop_ran_under_needs_work_of_its_own() {
+        isolated_test!(a_lukewarm_slot_a_hot_loop_ran_under_needs_work_of_its_own);
+        let now = 100 * PGO_WORK_NS;
+        let weights: &'static [u32] = Box::leak(vec![8u32; 4].into_boxed_slice());
+        // its own code over the window since its last look: 4 blocks of 8 instructions, `runs` times
+        let window = |id: u32, runs: u64| {
+            let counters: &'static [AtomicU64] = Box::leak((0..4).map(|_| AtomicU64::new(runs)).collect());
+            Counting { id, counters, weights, at: now - 10 * PGO_WORK_NS, lukewarm: true, mark: (0, now - 2 * PGO_MS * 1_000_000), parked: true, credited: false }
+        };
+        // a handler: a few calls a second; a loop driver: the bar's work over the window, twice over
+        let per_window = (2 * PGO_MIN_WORK * 2 * PGO_MS / 1000).div_ceil(4 * 8);
+        let (handler, driver, untouched) = (u32::MAX - 1, u32::MAX - 2, u32::MAX - 3);
+        COUNTING.lock().unwrap().extend([window(handler, 3), window(driver, per_window), window(untouched, per_window)]);
+        assert!(pgo_credit(handler, true) && pgo_credit(driver, true), "both are lukewarm counting slots");
+        pgo_poll_at(now);
+        let left = |id: u32| COUNTING.lock().unwrap().iter().find(|e| e.id == id).map(|e| (e.parked, e.credited));
+        assert_eq!(left(handler), Some((true, false)), "the handler stays parked in its counted code: a loop under it is not its work");
+        assert_eq!(left(driver), None, "the driver's own work takes it to O3");
+        assert_eq!(left(untouched), Some((true, false)), "a parked window no loop ran under waits for its PGO_WORK_NS look");
+    }
+
+    /// Why: a hot loop charged every JIT frame under it, up to 64 of them, and the counted builds
+    /// of the callers far down were waste (LOOP_CALLERS). The two callers right under the loop are
+    /// charged, or credited if lukewarm; the walk goes on past the rest for SPEC-V's twin callers.
+    #[test]
+    fn a_hot_loop_charges_the_two_callers_right_under_it() {
+        isolated_test!(a_hot_loop_charges_the_two_callers_right_under_it);
+        let threshold = tier_threshold(2000);
+        // the loop's slot 0 (a recursion of it first), counting callers 1, 3 and 5, lukewarm 2 and 4
+        // in their counted windows, 7 queued for O3 (6 under it is never reached)
+        let recs: Vec<Vec<AtomicU64>> = (0..8).map(|_| (0..10).map(|_| AtomicU64::new(threshold)).collect()).collect();
+        for (c, r) in recs.iter().enumerate() {
+            r[3].store(if [2, 4, 7].contains(&c) { T_QUEUED } else { T_COUNTING }, Ordering::Relaxed);
+            r[5].store(0, Ordering::Relaxed);
+        }
+        let window = |id: u32| Counting { id, counters: &[], weights: &[], at: 0, lukewarm: true, mark: (0, 0), parked: true, credited: false };
+        COUNTING.lock().unwrap().extend([window(2), window(4)]);
+        let mut seen = Vec::new();
+        unsafe { loop_walk(0, threshold, [0, 1, 2, 3, 4, 5, 7, 6].into_iter(), |c| recs[c as usize].as_ptr(), |c, at| seen.push((c, at))) };
+        let charged = |c: usize| (recs[c][0].load(Ordering::Relaxed) == 0, recs[c][5].load(Ordering::Relaxed) & LOOP_CHARGED != 0);
+        assert_eq!(charged(1), (true, true), "the caller right under the loop is charged");
+        let credited = |id: u32| COUNTING.lock().unwrap().iter().find(|e| e.id == id).map(|e| e.credited);
+        assert_eq!(credited(2), Some(true), "the second, lukewarm, is credited");
+        assert_eq!([charged(3), charged(5)], [(false, false); 2], "the callers further down are not charged");
+        assert_eq!(credited(4), Some(false), "nor credited");
+        assert_eq!(charged(6), (false, false));
+        assert_eq!(seen, [(1, 0), (2, 1), (3, 2), (4, 3), (5, 4), (7, 5)], "the twin callers: every frame down to the one queued for O3");
     }
 
     /// Idle code decays to nothing (no work while it is idle: the decay is applied at its next check).
@@ -18943,7 +19018,8 @@ struct Counting {
     /// a lukewarm slot whose last window showed too little work: it stays in its counted code
     /// (not pending for O3_PROGRESS, looked at on the usual poll)
     parked: bool,
-    /// a hot loop ran under one of its frames (rt_loop_hot): the work is its callees'
+    /// a hot loop ran under one of its frames (rt_loop_hot): its window is looked at on the next
+    /// poll, parked or not (its own work still decides)
     credited: bool,
 }
 /// slots running counted code
@@ -18996,8 +19072,11 @@ static PGO_LOOP_UNFINALS: AtomicU64 = AtomicU64::new(0);
 
 /// Queues O3 for the counting slots whose window is over (first O3 worker, no lock held).
 fn pgo_poll() {
+    pgo_poll_at(wall_ns());
+}
+
+fn pgo_poll_at(now: u64) {
     profiled_heat();
-    let now = wall_ns();
     let mut ready: Vec<(u32, u64, &'static [AtomicU64], &'static [u32])> = Vec::new();
     let mut parked_now: Vec<u32> = Vec::new();
     {
@@ -19018,17 +19097,14 @@ fn pgo_poll() {
                 let work: u64 = ctr.iter().zip(e.weights).map(|(c, w)| c.load(Ordering::Relaxed).saturating_mul(*w as u64)).fold(0, u64::saturating_add);
                 (work as u128 * 1_000_000_000 / el.max(1) as u128).min(u64::MAX as u128) as u64
             };
-            if e.lukewarm && e.credited {
-                crate::inspect::tierlog::note(e.id, crate::inspect::tierlog::ev::WINDOW_END, crate::inspect::tierlog::WIN_CREDITED, rate, 0);
-                ready.push((e.id, work_rate(), e.counters, e.weights));
-                return false;
-            }
             if e.lukewarm {
-                // (a parked slot is looked at once per PGO_WORK_NS window)
+                // (a parked slot is looked at once per PGO_WORK_NS window, one a hot loop ran under
+                // at once: its own work decides, not the loop's)
                 let win = now.saturating_sub(e.mark.1);
-                if win < if e.parked { PGO_WORK_NS } else { PGO_MS * 1_000_000 } {
+                if win < if e.parked && !e.credited { PGO_WORK_NS } else { PGO_MS * 1_000_000 } {
                     return true;
                 }
+                e.credited = false;
                 let work: u64 = ctr.iter().zip(e.weights).map(|(c, w)| c.load(Ordering::Relaxed).saturating_mul(*w as u64)).fold(0, u64::saturating_add);
                 let per_s = ((work - e.mark.0.min(work)) as u128 * 1_000_000_000 / win as u128) as u64;
                 if per_s >= PGO_MIN_WORK {
@@ -19151,13 +19227,14 @@ fn profiled_heat() {
 }
 
 /// A hot loop ran under a frame of slot `id` (rt_loop_hot, no unit lock): true if `id` is a
-/// lukewarm counting slot, whose window that credit ends. A program thread never waits on the
-/// lock (rule I-CALL): busy, no credit (the walk stops there; the next run-out looks again).
-fn pgo_credit(id: u32) -> bool {
+/// lukewarm counting slot, whose window, with `credit`, is looked at on the next poll. A program
+/// thread never waits on the lock (rule I-CALL): busy, no credit (the walk stops there; the next
+/// run-out looks again).
+fn pgo_credit(id: u32, credit: bool) -> bool {
     let Ok(mut g) = COUNTING.try_lock() else { return false };
     match g.iter_mut().find(|e| e.id == id && e.lukewarm) {
         Some(e) => {
-            e.credited = true;
+            e.credited |= credit;
             true
         }
         None => false,

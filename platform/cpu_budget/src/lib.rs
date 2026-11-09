@@ -6,6 +6,10 @@
 //! The JIT always has a job able to run: with no job of its running one is admitted over a full
 //! budget, on a row that counts no token (`above`) and never yields. A long slice would run on slow
 //! code the whole way otherwise, and settled work keeps its cores: nothing is reserved.
+//! A person's work never waits for the JIT's Background builds: Interactive counts none of their
+//! tokens, Visible none above the JIT's floor. A build has no checkpoint for seconds at a time, in
+//! its optimiser: until its next one the machine runs over its cores, with the build below the
+//! person's work by the OS's priorities.
 use makepad_relax_api::relax_api;
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
@@ -87,6 +91,8 @@ struct State {
     /// The JIT's Background jobs: running, and waiting for a permit.
     jit_background: usize,
     jit_waiting: usize,
+    /// The tokens the JIT's Background jobs hold (the one `above` holds none).
+    jit_tokens: usize,
     waiting: u8,
     parked: [u64; 3],
     admitted: [u64; 3],
@@ -144,7 +150,7 @@ impl Budget {
             jit_floor: JIT_FLOOR.min(limit / 4),
             state: Mutex::new(State {
                 slots: vec![None; cores], waiters: Vec::new(), ticket: 0,
-                running: 0, jit_running: 0, background: 0, visible: 0, jit_background: 0, jit_waiting: 0, waiting: 0, parked: [0; 3], admitted: [0; 3],
+                running: 0, jit_running: 0, background: 0, visible: 0, jit_background: 0, jit_waiting: 0, jit_tokens: 0, waiting: 0, parked: [0; 3], admitted: [0; 3],
                 runtime: [0; 3], spans: [Span::default(); 3], warnings: HashMap::new(),
                 worst: VecDeque::new(),
                 strand_worst: VecDeque::new(),
@@ -169,12 +175,24 @@ impl Budget {
     }
     fn class_limit(&self, s: &State, class: u8, client: u8) -> usize {
         match class {
-            INTERACTIVE => self.cores,
-            VISIBLE => self.limit - self.jit_short(s).min(s.jit_waiting),
+            INTERACTIVE => self.cores + self.builds_passed(s, class),
+            VISIBLE => self.limit + self.builds_passed(s, class) - self.jit_short(s).min(s.jit_waiting),
             BACKGROUND if client == JIT && self.jit_short(s) > 0 => self.limit,
             BACKGROUND => self.background_limit,
             _ => unreachable!(),
         }
+    }
+    /// The tokens of the JIT's Background builds that `class` does not count: they leave for it at
+    /// their next checkpoint. Visible stops at the JIT's floor, Interactive at nothing.
+    fn builds_passed(&self, s: &State, class: u8) -> usize {
+        match class {
+            INTERACTIVE => s.jit_tokens,
+            VISIBLE => s.jit_tokens.saturating_sub(self.jit_floor),
+            _ => 0,
+        }
+    }
+    fn over_cores(&self, s: &State, class: u8) -> bool {
+        s.running - self.builds_passed(s, class) > self.cores
     }
     fn room(&self, s: &State, class: u8, client: u8) -> bool {
         client == JIT && s.jit_running == 0
@@ -188,9 +206,9 @@ impl Budget {
         s.jit_waiting = s.waiters.iter().filter(|w| w.class == BACKGROUND && w.client == JIT).count();
         let (mut bits, mut contended) = (0, 0);
         for class in 0..3 {
-            if s.waiting & ((1 << class) - 1) != 0 || s.running > self.cores
+            if s.waiting & ((1 << class) - 1) != 0 || self.over_cores(s, class)
             { bits |= 1 << class; }
-            if s.waiting & ((2 << class) - 1) != 0 || s.running > self.cores
+            if s.waiting & ((2 << class) - 1) != 0 || self.over_cores(s, class)
             { contended |= 1 << class; }
         }
         if s.running >= self.limit && self.jit_short(s).min(s.jit_waiting) > 0 { bits |= 1 << VISIBLE; }
@@ -305,6 +323,7 @@ impl Budget {
         s.background += usize::from(job.class == BACKGROUND && job.client == APP);
         s.visible += usize::from(job.class == VISIBLE);
         s.jit_background += usize::from(job.class == BACKGROUND && job.client == JIT);
+        s.jit_tokens += usize::from(job.class == BACKGROUND && job.client == JIT && !job.above);
     }
     fn stop_counting(s: &mut State, job: &Job, now: u64) {
         s.running -= usize::from(!job.above);
@@ -312,6 +331,7 @@ impl Budget {
         s.background -= usize::from(job.class == BACKGROUND && job.client == APP);
         s.visible -= usize::from(job.class == VISIBLE);
         s.jit_background -= usize::from(job.class == BACKGROUND && job.client == JIT);
+        s.jit_tokens -= usize::from(job.class == BACKGROUND && job.client == JIT && !job.above);
         s.runtime[job.class as usize] += now.saturating_sub(job.admitted_at);
         Self::span(s, job.label, now.saturating_sub(job.checkpoint_at));
     }
@@ -447,6 +467,7 @@ impl Budget {
         let old = job.class;
         let elapsed = now.saturating_sub(job.admitted_at);
         let client = job.client;
+        let above = job.above;
         let app = client == APP;
         job.class = class;
         job.admitted_at = now;
@@ -457,6 +478,8 @@ impl Budget {
         s.visible += usize::from(class == VISIBLE);
         s.jit_background -= usize::from(old == BACKGROUND && client == JIT);
         s.jit_background += usize::from(class == BACKGROUND && client == JIT);
+        s.jit_tokens -= usize::from(old == BACKGROUND && client == JIT && !above);
+        s.jit_tokens += usize::from(class == BACKGROUND && client == JIT && !above);
         self.classes[permit as usize].store(class, Relaxed);
         self.refresh(&mut s);
     }
