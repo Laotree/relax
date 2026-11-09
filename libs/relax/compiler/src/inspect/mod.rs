@@ -265,7 +265,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 ];
 
 fn dispatch(req: &Req, out: &mut Out) {
-    let _at_the_run = crate::run_threads::request();
+    let Some(_at_the_run) = crate::run_threads::request(makepad_remote::cmd::asker_pid() == std::process::id()) else {
+        // (this process asks itself, from the run that ends: the next run waits for it)
+        out.err("the run that asks this has ended");
+        return;
+    };
     // (a wait of a long command ends when the run does: `gone` says so, and so does the answer)
     out.stop_also(crate::run_threads::ending);
     let _act = activity::begin(req);
