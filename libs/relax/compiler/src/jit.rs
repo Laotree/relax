@@ -3533,13 +3533,14 @@ unsafe fn unwind_walk(regs: *const u64) -> ! {
     }
 }
 
-#[cfg(target_vendor = "apple")]
+// (the stub's symbol, for the two asm blocks below: their targets only)
+#[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64"), target_vendor = "apple"))]
 macro_rules! native_raise_sym {
     () => {
         "_relax_native_raise_stub"
     };
 }
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64"), not(target_vendor = "apple")))]
 macro_rules! native_raise_sym {
     () => {
         "relax_native_raise_stub"
