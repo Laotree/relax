@@ -21,7 +21,12 @@ impl Speak for Dog {
 }
 
 #[inline]
-pub fn leaf() -> u32 { 100 } // EDIT callee
+pub fn leaf() -> u32 { 100 } // EDIT inline
+
+/// leaf's caller in this crate (the app crate's code is lowered before its check's verdict here:
+/// baseline code, which inlines no user-crate fn)
+#[inline(never)]
+pub fn leaf_user() -> u32 { leaf() + 1 }
 
 /// The size of `T` as code instantiated with `T` has it (no constant the caller folded).
 #[inline(never)]
