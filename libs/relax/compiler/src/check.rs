@@ -673,6 +673,39 @@ fn forced_body_unwind(prog: &crate::program::Program, d: crate::program::DefId) 
     }
 }
 
+/// The same for evaluations alone (eval_items): the next ones of the item named `.0` unwind with
+/// no result, `.1` times; with `.2` they panic instead. Its own count: the item's body check,
+/// which runs first, must not take it.
+#[cfg(test)]
+static FORCED_EVALS: std::sync::Mutex<(String, u32, bool)> = std::sync::Mutex::new((String::new(), 0, false));
+
+#[cfg(test)]
+pub(crate) fn force_eval_unwinds(name: &str, times: u32) {
+    *FORCED_EVALS.lock().unwrap() = (name.to_string(), times, false);
+}
+
+#[cfg(test)]
+pub(crate) fn force_eval_panic(name: &str) {
+    *FORCED_EVALS.lock().unwrap() = (name.to_string(), 1, true);
+}
+
+#[cfg(test)]
+pub(crate) fn forced_evals_left() -> u32 {
+    FORCED_EVALS.lock().unwrap().1
+}
+
+#[cfg(test)]
+fn forced_eval(prog: &crate::program::Program, d: crate::program::DefId) {
+    let mut forced = FORCED_EVALS.lock().unwrap();
+    if forced.1 > 0 && prog.def_path(d).ends_with(forced.0.as_str()) {
+        forced.1 -= 1;
+        let panics = forced.2;
+        drop(forced);
+        assert!(!panics, "a forced panic");
+        std::panic::resume_unwind(Box::new(crate::preempt::Preempted));
+    }
+}
+
 /// An item pass's internal error, at the definition and saying what went wrong.
 fn def_ice(prog: &crate::program::Program, d: crate::program::DefId, what: &str, said: &str) -> String {
     let def = prog.def(d);
@@ -1766,12 +1799,19 @@ fn eval_items(up: *mut Unit, own: &[bool], tainted: &std::collections::HashSet<c
         let before = unsafe { (&*up).errors.len() };
         let t1 = std::time::Instant::now();
         let inner = std::sync::atomic::AtomicU64::new(0);
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::owner::call(crate::owner::Class::Program, || unsafe {
-            let t2 = std::time::Instant::now();
-            let u = &mut *up;
-            if is_static { u.static_addr(d); } else { u.const_addr(d, Vec::new()); }
-            inner.store(t2.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        })));
+        // (work cancelled on its way is asked again: const_addr's stack pops as it unwinds, and a
+        // static's initializer that unwound runs again into its storage (PendingInit). A panic
+        // is the check's internal error, never a clean item)
+        let evaluated = settled_def(up, d, if is_static { "the static" } else { "the constant" }, || {
+            #[cfg(test)]
+            forced_eval(unsafe { &(*up).prog }, d);
+            crate::owner::call(crate::owner::Class::Program, || unsafe {
+                let t2 = std::time::Instant::now();
+                let u = &mut *up;
+                if is_static { u.static_addr(d); } else { u.const_addr(d, Vec::new()); }
+                inner.store(t2.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            })
+        });
         let inner = inner.load(std::sync::atomic::Ordering::Relaxed) as u128;
         t_queue += t1.elapsed().as_nanos().saturating_sub(inner);
         if is_static { t_static += inner; n_static += 1; } else { t_const += inner; n_const += 1; }
@@ -1781,6 +1821,7 @@ fn eval_items(up: *mut Unit, own: &[bool], tainted: &std::collections::HashSet<c
         while i < u.errors.len() {
             if u.errors[i].starts_with("compile error in ") && u.errors[i].contains("not found in the loaded libraries") { u.errors.remove(i); } else { i += 1; }
         }
+        if let Err(failed) = evaluated { u.errors.push(failed); }
     }
     // (a verdict no evaluation took is not kept for a later check)
     unsafe { (*up).interp_ahead.clear(); }
