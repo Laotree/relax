@@ -23894,12 +23894,30 @@ thread_local! {
 /// (instrument) fronts run off the owner by job: [count, cpu ns] per PREFRONT_SITE_NAMES
 pub static PREFRONT_SITE: [[AtomicU64; 2]; 8] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 8];
 pub const PREFRONT_SITE_NAMES: [&str; 8] = ["other", "O2", "O1v", "borrow", "O2 base", "counted", "spec", "O3"];
+/// A background job's fronts (the checks and lowerings ahead its build makes off the owner for its
+/// own takes), from before the first to the job's end: the job they count under (instrument,
+/// PREFRONT_SITE_NAMES), and held (FRONTS_HELD): queue::cleanup_ahead sweeps none while one is.
+/// A sweep between a build's front and its take took the lowering just made for it: the take
+/// fronted again, or the build gave up ("front failed other") and left its slot to a lazy compile.
 struct FrontSite(u8);
 impl FrontSite {
-    fn enter(k: u8) -> Self { FrontSite(FRONT_SITE.with(|s| s.replace(k))) }
+    fn enter(k: u8) -> Self {
+        FRONTS_HELD.fetch_add(1, Ordering::SeqCst);
+        FrontSite(FRONT_SITE.with(|s| s.replace(k)))
+    }
 }
 impl Drop for FrontSite {
-    fn drop(&mut self) { let _ = FRONT_SITE.try_with(|s| s.set(self.0)); }
+    fn drop(&mut self) {
+        let _ = FRONT_SITE.try_with(|s| s.set(self.0));
+        FRONTS_HELD.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+/// Background jobs holding their fronts (FrontSite)
+static FRONTS_HELD: AtomicU32 = AtomicU32::new(0);
+/// A background job holds its fronts (FrontSite). Asked under the lock a front is put under: a
+/// job holds them from before it puts the first.
+fn fronts_held() -> bool {
+    FRONTS_HELD.load(Ordering::SeqCst) != 0
 }
 fn prefront_count(t0: u64) {
     let ns = cpu_ns() - t0;
