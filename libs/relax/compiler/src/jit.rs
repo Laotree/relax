@@ -28048,12 +28048,16 @@ unsafe fn realtime_refs(up: *mut Unit, id: u32) -> Vec<u32> {
             c.last_thunks.clear();
             c.last_data.clear();
         };
-        clear(up);
         if !(&*up).fns[id as usize].compiled {
             let _ = compile_slot_locked(up, id, false);
-        } else if (&*up).fns[id as usize].rir.is_none() && (&*up).cache.is_some() && !matches!((&*up).fns[id as usize].key, FnKey::Sandbox(_)) {
-            // installed from the disk cache (or the startup image): its entry names its references
-            // (none linked: it was built this run, its RIR dropped at its install)
+        }
+        // installed from the disk cache (or the startup image), just now or before: its entry names
+        // its references (none linked: it was built this run, its RIR dropped at its install). Read
+        // afresh: the link that installs a slot takes its callees to link them ahead, and those
+        // links leave their own references behind (a gate run's cell loop met 16 to 244 lazy
+        // compiles: warm code, no set recorded, the walk lost what every slot it linked calls)
+        clear(up);
+        if (&*up).fns[id as usize].compiled && (&*up).fns[id as usize].rir.is_none() && (&*up).cache.is_some() && !matches!((&*up).fns[id as usize].key, FnKey::Sandbox(_)) {
             if cache_lookup(up, id).is_none() {
                 clear(up);
             }
