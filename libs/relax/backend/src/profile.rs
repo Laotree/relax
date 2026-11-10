@@ -12,7 +12,11 @@
 use crate::rir::{Block, Callee, Cls, Cond, Func, IOp, Inst, Mem, Sym, Term, I64};
 
 /// Block `b`'s counter is the u64 at `base + 8 * b`. Each block starts with a plain (racy,
-/// non-atomic) load, add and store of its counter: counts are a frequency, never a fact.
+/// non-atomic) load, add and store of its counter: counts are a frequency, never a fact. The
+/// counter is addressed as an offset from the one constant `base`, so the blocks of a loop share
+/// one register for it (hoist_loop_consts makes one value of equal constants). An address
+/// constant per block made one live range per block through the loop: arm64's counted build of
+/// draw_models_inner took 9.4 s of CPU, 0.38 s with the shared base.
 ///
 /// A block of moves only that jumps on or returns gets no counter (its count comes from its
 /// predecessors): a call followed by such blocks is in tail position (tail::returns_results), and a
@@ -31,11 +35,12 @@ pub fn instrument(f: &mut Func, base: u64) -> Vec<bool> {
         let blk: &mut Block = &mut f.blocks[b];
         let at = blk.pos.first().copied().unwrap_or(blk.term_pos);
         let had_pos = blk.pos.len() == blk.insts.len();
+        let off = 8 * b as i32;
         let ins = [
-            Inst::Iconst(a, (base + 8 * b as u64) as i64),
-            Inst::Load(Mem::Int(8, false), v, a, 0),
+            Inst::Iconst(a, base as i64),
+            Inst::Load(Mem::Int(8, false), v, a, off),
             Inst::IBinI(IOp::Add, I64, w, v, 1),
-            Inst::Store(Mem::Int(8, false), a, 0, w),
+            Inst::Store(Mem::Int(8, false), a, off, w),
         ];
         blk.insts.splice(0..0, ins);
         if had_pos {
@@ -476,8 +481,10 @@ mod tests {
     fn instrumented_blocks_start_with_their_counter() {
         let mut f = func(vec![blk(Term::Jump(1), -1.0), blk(Term::Unreachable, -1.0)]);
         assert_eq!(instrument(&mut f, 0x1000), vec![false, true]);
-        assert!(matches!(f.blocks[1].insts[0], Inst::Iconst(_, 0x1008)));
-        assert!(matches!(f.blocks[1].insts[3], Inst::Store(..)));
+        // block 1's counter: the word at base + 8
+        assert!(matches!(f.blocks[1].insts[0], Inst::Iconst(_, 0x1000)));
+        assert!(matches!(f.blocks[1].insts[1], Inst::Load(_, _, _, 8)));
+        assert!(matches!(f.blocks[1].insts[3], Inst::Store(_, _, 8, _)));
         assert!(f.verify().is_ok());
     }
 
