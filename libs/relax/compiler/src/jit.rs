@@ -1589,6 +1589,7 @@ unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, 
         return;
     }
     let tier1 = s.o3;
+    let counted = s.counted();
     if tier1 {
         cached_tier1(up, s.id, &s.inlined);
     } else {
@@ -1631,10 +1632,11 @@ unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, 
     }
     // an instance, a closure or an unverified-mode twin (image slots are never foreign fns: their
     // code is not stored): its call counter, armed with the others of the block (arm_counters), as
-    // arm_counter arms them. (A twin left out had no count stub and tier state 0, so neither its
-    // calls nor its loop counters could tier it up: a warm launch whose image held the previous
-    // run's unverified callers ran their twins' baseline code for the whole session, MICKEYGAP.)
-    if matches!(s.kind, 0 | 1 | 4) {
+    // arm_counter arms them. (A kind left out has no count stub and tier state 0, so neither its
+    // calls nor its loop counters can tier it up: a warm launch whose image held the previous
+    // run's unverified callers ran their twins' baseline code for the whole session, MICKEYGAP;
+    // closures keyed by their ordinal ran their image code so, their loops uncounted)
+    if counted {
         arm.push((s.id, s.at));
         // (its tier starts from its stored verdict once armed: stored_tier_verdict)
         if !tier1 {
@@ -1645,7 +1647,7 @@ unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, 
     }
     crate::cache::trace_lookup(u, s.id, "prelink");
     crate::cache::trace_lookup(u, s.id, if tier1 { "hit1" } else { "hit" });
-    if gandalf && s.kind == 0 {
+    if gandalf && s.kind == Some(crate::cache::KeyKind::Inst) {
         notes.push(s.id);
     }
 }
@@ -16422,17 +16424,24 @@ pub(crate) fn names_moved_copy_ver(u: &Unit, syms: impl Iterator<Item = relax_ba
     guard_reads(u, syms).1.iter().any(|&x| unsafe { (*tier_rec(&u.slots, x).add((TIER_COPY / 8) as usize)).load(Ordering::Acquire) } != 0)
 }
 
-/// The loop counter and rt_loop_hot symbols for the baseline / O1 / O2 code of slot `id` (unit
-/// lock held): every slot whose calls the count stub counts, when O3 is on. None: its code counts
-/// no loops (O3 off, a shim / glue / foreign fn, a naked fn).
-unsafe fn loop_syms(u: &Unit, id: u32) -> Option<(relax_backend::rir::Sym, relax_backend::rir::Sym)> {
-    let counted = match &u.fns[id as usize].key {
+/// Slots of key `key` count their calls (a count stub) and loops for O3: an instance that is not
+/// a foreign fn, a closure, a sandbox twin of a base, an unverified-mode twin (SPEC-V: twins tier
+/// up too, Unit::o3_allowed). Not shims and glue. (The startup image decides by the key's first
+/// byte before it decodes: cache::KeyKind::counted.)
+pub(crate) fn counted_key(u: &Unit, key: &FnKey) -> bool {
+    match key {
         FnKey::Inst(d, _) => u.prog.def(*d).kind != DefKind::ForeignFn,
         FnKey::Closure(..) | FnKey::Plain(_) => true,
         FnKey::Sandbox(base) => *base != u32::MAX,
         FnKey::Shim(_) | FnKey::Glue(..) => false,
-    };
-    if u.tier1.is_none() || !counted || !loops_on() {
+    }
+}
+
+/// The loop counter and rt_loop_hot symbols for the baseline / O1 / O2 code of slot `id` (unit
+/// lock held): every slot whose calls the count stub counts, when O3 is on. None: its code counts
+/// no loops (O3 off, a shim / glue / foreign fn, a naked fn).
+unsafe fn loop_syms(u: &Unit, id: u32) -> Option<(relax_backend::rir::Sym, relax_backend::rir::Sym)> {
+    if u.tier1.is_none() || !counted_key(u, &u.fns[id as usize].key) || !loops_on() {
         return None;
     }
     Some((loop_counter_sym(u, id), loop_hot_sym(u)))
@@ -18294,15 +18303,18 @@ pub(crate) fn sampler_period_floor() -> u64 {
     if SAMPLER_SETTLED.load(Ordering::Relaxed) { SETTLED_MS } else { SAMPLE_MS }
 }
 
-/// makepad inspect `why-tier uncounted`: slots still counting (T_COUNTING) whose count stub is not
-/// their entry (other code was installed over it) -- their calls are not counted.
-pub(crate) fn tier_uncounted(u: &Unit) -> Vec<u32> {
+/// makepad inspect `why-tier uncounted`: the slots whose calls are not counted, so they never
+/// queue O3 -- still counting (T_COUNTING) with their count stub not their entry (other code was
+/// installed over it: false), or of a counted kind (counted_key) with code below O3 and never
+/// armed (no count stub, tier state 0: true).
+pub(crate) fn tier_uncounted(u: &Unit) -> Vec<(u32, bool)> {
     if u.tier1.is_none() {
         return Vec::new();
     }
     let mut v = Vec::new();
     for id in 0..u.fns.len() as u32 {
-        if !u.fns[id as usize].compiled {
+        let f = &u.fns[id as usize];
+        if !f.compiled {
             continue;
         }
         let (state, stub) = unsafe {
@@ -18310,7 +18322,11 @@ pub(crate) fn tier_uncounted(u: &Unit) -> Vec<u32> {
             ((*rec.add(3)).load(Ordering::Relaxed), (*rec.add(2)).load(Ordering::Relaxed))
         };
         if state == T_COUNTING && stub != 0 && slot_word(u, id) != stub {
-            v.push(id);
+            v.push((id, false));
+        } else if state == 0 && stub == 0 && f.code_len > 0 && counted_key(u, &f.key) && u.forward_of(id).is_none()
+            && !matches!(crate::inspect::codever::kind_at(u, f.code).tier, tier::O3 | tier::INSTRUMENTED_O3)
+        {
+            v.push((id, true));
         }
     }
     v
@@ -18735,14 +18751,7 @@ impl Unit {
 
     /// After a O1 compile: count calls through the slot (unit lock held).
     fn arm_counter(&mut self, id: u32, code: u64) {
-        let counted = match &self.fns[id as usize].key {
-            FnKey::Inst(d, _) => self.prog.def(*d).kind != DefKind::ForeignFn,
-            FnKey::Closure(..) => true,
-            FnKey::Sandbox(base) => *base != u32::MAX,
-            // SPEC-V: twins tier up too (Unit::o3_allowed); loop counters queue only counted slots
-            FnKey::Plain(_) => true,
-            FnKey::Shim(_) | FnKey::Glue(..) => false,
-        };
+        let counted = counted_key(self, &self.fns[id as usize].key);
         self.arm_counter_as(id, code, counted);
     }
 
