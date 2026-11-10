@@ -1,12 +1,15 @@
 //! The CPU an endpoint's threads run serving its peers: reading and writing their frames,
 //! answering their commands (an app's UI thread too, for the commands it answers:
 //! [`charge_served`]), following their feeds. In an app it is what observing the app costs
-//! it, not the app's own work: a test's idle rule leaves it out.
+//! it, not the app's own work: a test's idle rule leaves it out. And the CPU a client's
+//! connection threads run carrying its own asks of a peer ([`asked_cpu_ns`]): in a test, what
+//! observing the app costs the test process, not the work of a service it runs.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 static SERVED_NS: AtomicU64 = AtomicU64::new(0);
+static ASKED_NS: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     /// The calling thread's CPU at its last [`tick`] (nothing, at its start).
@@ -24,11 +27,21 @@ pub fn charge_served(ns: u64) {
     SERVED_NS.fetch_add(ns, Relaxed);
 }
 
-/// Counts what the calling serving thread has run since its last tick (since it started, at the
-/// first): a serving thread ticks after each piece of work, so the count follows its CPU.
-pub(crate) fn tick() {
+/// The CPU the process's client connection threads (a connection that serves nothing: it
+/// carries this process's asks of its peer and their answers) have run to their last ticks, in
+/// nanoseconds.
+pub fn asked_cpu_ns() -> u64 {
+    ASKED_NS.load(Relaxed)
+}
+
+/// Counts what the calling connection thread has run since its last tick (since it started, at
+/// the first), as served (`serves`) or asked: a connection thread ticks after each piece of
+/// work, so the count follows its CPU.
+pub(crate) fn tick(serves: bool) {
     let now = thread_cpu_ns();
-    SERVED_NS.fetch_add(now.saturating_sub(LAST.replace(now)), Relaxed);
+    let ran = now.saturating_sub(LAST.replace(now));
+    let count = if serves { &SERVED_NS } else { &ASKED_NS };
+    count.fetch_add(ran, Relaxed);
 }
 
 /// The calling thread's CPU, in nanoseconds.

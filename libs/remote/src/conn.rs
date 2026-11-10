@@ -207,7 +207,7 @@ impl State {
 impl Conn {
     /// Starts the reader and writer threads over `io`, after the handshake. `initiator`: the
     /// side that dialled (it allocates odd channel numbers, the other even). A connection with a
-    /// `handler` serves its peer: its threads' CPU counts as served.
+    /// `handler` serves its peer: its threads' CPU counts as served (else as asked).
     pub fn start(io: Io, peer: Hello, initiator: bool, handler: Option<OpenHandler>, hooks: Hooks) -> Conn {
         let serves = handler.is_some();
         let closed = Arc::new(AtomicBool::new(false));
@@ -367,9 +367,7 @@ impl Conn {
 
     fn read_loop(&self, mut rd: FrameReader, serves: bool) {
         loop {
-            if serves {
-                crate::served::tick();
-            }
+            crate::served::tick(serves);
             let f = match rd.next() {
                 Ok(f) => f,
                 Err(e) => {
@@ -515,9 +513,7 @@ impl Conn {
         let mut flushed = true;
         let mut idle_since = std::time::Instant::now();
         loop {
-            if serves {
-                crate::served::tick();
-            }
+            crate::served::tick(serves);
             let work = {
                 let mut st = self.0.st.lock().unwrap();
                 loop {

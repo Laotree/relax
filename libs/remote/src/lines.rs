@@ -87,7 +87,7 @@ pub fn service(name: &'static str, handler: Arc<Handler>) -> Factory {
                         if ch.send(text.into_bytes()).is_err() {
                             break 'requests;
                         }
-                        crate::served::tick();
+                        crate::served::tick(true);
                     }
                 }
                 (hooks.exit)();
