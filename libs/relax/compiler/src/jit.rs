@@ -2128,6 +2128,19 @@ pub static FAULTS_FATAL: AtomicBool = AtomicBool::new(false);
 /// Set by the first contained fault: what happened where (reported with every later error).
 static POISONED: relax_session::sync::Mutex<Option<String>> = relax_session::sync::Mutex::new(None);
 
+/// MAKEPAD_RUN_ABORT_HOLD (os/fault.rs, tests/abort_heap's held case): every lock an abort's
+/// report of unit `up` could wait for, taken and kept while `then` runs, as a thread stuck in a
+/// corrupt heap would keep them.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+pub(crate) fn hold_report_locks(up: *mut Unit, then: impl FnOnce()) {
+    let u = unsafe { &*up };
+    let _frames = FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+    let _poisoned = POISONED.lock().unwrap_or_else(|e| e.into_inner());
+    let _sites = u.sites.lock().unwrap_or_else(|e| e.into_inner());
+    let _code = u.code.write().unwrap_or_else(|e| e.into_inner());
+    then();
+}
+
 /// The poisoned-state note, when a fault was contained earlier.
 pub fn poisoned_note() -> Option<String> {
     POISONED.lock().ok().and_then(|g| g.clone())
@@ -2937,7 +2950,7 @@ unsafe fn stale_how_in(u: &Unit, pc: u64, sp_top: u64, sp_below: u64, lr: u64) -
 }
 
 fn frames_from_raw(pc: u64, pc_is_ret: bool, raw: &[u64]) -> Vec<u64> {
-    frames_from_raw_in(cur_unit(), pc, pc_is_ret, raw)
+    frames_from_raw_in(cur_unit(), pc, pc_is_ret, raw, None)
 }
 
 /// The return addresses of the calling thread's frame chain from `fp` (signal-safe: no
@@ -2945,24 +2958,66 @@ fn frames_from_raw(pc: u64, pc_is_ret: bool, raw: &[u64]) -> Vec<u64> {
 /// thread: os/fault.rs's abort report.
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 pub(crate) fn raw_frames_here(fp: u64, out: &mut [u64]) -> usize {
+    if STACK_BOUNDS.try_with(|c| c.get().1).unwrap_or(0) == 0 {
+        return walk_fp_checked(fp, out);
+    }
     let here = &fp as *const u64 as u64;
     walk_fp_bounded(fp, here.min(fp), out)
 }
 
-/// `frames_from_raw` of the thread whose unit is `up`, on any thread.
-pub(crate) fn frames_from_raw_in(up: *mut Unit, pc: u64, pc_is_ret: bool, raw: &[u64]) -> Vec<u64> {
+/// `walk_fp_bounded` of a thread that never recorded its stack bounds (asking for them here is not
+/// safe: glibc's pthread_getattr_np allocates, in the heap an abort may have found corrupt): only
+/// aligned, strictly rising frame addresses, each read checked. Signal-safe.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+pub(crate) fn walk_fp_checked(mut fp: u64, out: &mut [u64]) -> usize {
+    let mut n = 0;
+    while n < out.len() && fp != 0 && fp & 7 == 0 {
+        let (Some(next), Some(ret)) = (os::fault::read_word_checked(fp), os::fault::read_word_checked(fp + 8)) else {
+            break;
+        };
+        out[n] = ret;
+        n += 1;
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    n
+}
+
+/// `frames_from_raw` of the thread whose unit is `up`, on any thread. `skipped` (an abort's
+/// report, Unit::report_nowait): the code table's lock is tried, not waited for; held, every
+/// frame is kept and `skipped` says so.
+pub(crate) fn frames_from_raw_in(up: *mut Unit, pc: u64, pc_is_ret: bool, raw: &[u64], skipped: Option<&mut Vec<&'static str>>) -> Vec<u64> {
+    use std::sync::TryLockError;
     let mut frames = vec![pc.wrapping_sub(pc_is_ret as u64)];
     if up.is_null() {
         return frames;
     }
     let u = unsafe { &*up };
+    let tried = match skipped {
+        None => None,
+        Some(sk) => match u.code.try_read() {
+            Ok(t) => Some(t),
+            Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                sk.push("frames: code table lock held, C frames kept");
+                frames.extend(raw.iter().map(|r| r.wrapping_sub(1)));
+                return frames;
+            }
+        },
+    };
+    let is_jit = |pc: u64| match &tried {
+        Some(t) => t.slot_at(pc).is_some(),
+        None => u.find_fn(pc).is_some(),
+    };
     // a stop inside C code (a libc abort/trap): its frames (frame pointers are kept on both
     // targets) are skipped up to the JIT code that called it
-    let mut in_c = u.find_fn(frames[0]).is_none();
+    let mut in_c = !is_jit(frames[0]);
     let mut c_frames = 0;
     for r in raw {
         let ra = r.wrapping_sub(1);
-        if u.find_fn(ra).is_none() {
+        if !is_jit(ra) {
             c_frames += 1;
             if !in_c || c_frames > 16 {
                 break;
@@ -7686,6 +7741,11 @@ impl Unit {
     /// source position of the instruction containing it)
     pub fn pc_to_src(&self, pc: u64) -> Option<(u32, String)> {
         let id = self.find_fn(pc)?;
+        Some(self.src_at(id, pc))
+    }
+
+    /// `pc_to_src` of a pc in slot `id`'s code.
+    fn src_at(&self, id: u32, pc: u64) -> (u32, String) {
         let f = &self.fns[id as usize];
         let (base, map) = if pc >= f.code && pc < f.code + f.code_len as u64 {
             (f.code, &f.pc_map)
@@ -7706,16 +7766,56 @@ impl Unit {
         let off = (pc - base) as u32;
         // no pc-map entry: the fn's file without a line (byte 0 would claim line 1:1)
         let Some(pos) = map.lookup(off) else {
-            return Some((id, self.prog.file_paths.get(f.file as usize).cloned().unwrap_or_else(|| "source position unknown".to_string())));
+            return (id, self.prog.file_paths.get(f.file as usize).cloned().unwrap_or_else(|| "source position unknown".to_string()));
         };
-        Some((id, self.pos_str(relax_backend::rir::pos_file(pos), pos as u32)))
+        (id, self.pos_str(relax_backend::rir::pos_file(pos), pos as u32))
     }
 
     /// Structured JSON crash report for a panic/fault/hang.
     pub fn report(&self, p: &PanicInfo) -> String {
+        self.report_in(p, None)
+    }
+
+    /// `report` that waits for no lock: an abort's (os/fault.rs), whose locks may be held by a
+    /// thread stuck for good in the heap the abort found corrupt. Each lock is tried once; one
+    /// another thread holds leaves its part out, and "skipped" names it, after `skipped`.
+    pub fn report_nowait(&self, p: &PanicInfo, skipped: Vec<&'static str>) -> String {
+        self.report_in(p, Some(skipped))
+    }
+
+    fn report_in(&self, p: &PanicInfo, mut nowait: Option<Vec<&'static str>>) -> String {
+        use std::sync::TryLockError;
         let mut s = String::from("{");
         s.push_str(&format!("\"kind\":{:?},\"message\":{:?},\"build\":{:?}", p.kind, p.message, crate::jit::PROVENANCE));
-        let site = self.sites.lock().unwrap_or_else(|e| e.into_inner()).get(p.site as usize).map(|st| (st.file, st.pos));
+        // (nowait: the locks of every frame, tried once here)
+        let mut frames_g = None;
+        let mut code_g = None;
+        if let Some(sk) = nowait.as_mut() {
+            match FRAMES.try_lock() {
+                Ok(g) => frames_g = Some(g),
+                Err(TryLockError::Poisoned(e)) => frames_g = Some(e.into_inner()),
+                Err(TryLockError::WouldBlock) => sk.push("frames: FRAMES lock held, frame sizes left out"),
+            }
+            match self.code.try_read() {
+                Ok(g) => code_g = Some(g),
+                Err(TryLockError::Poisoned(e)) => code_g = Some(e.into_inner()),
+                Err(TryLockError::WouldBlock) => sk.push("backtrace: code table lock held, frames by address only"),
+            }
+        }
+        let site = if p.site == u64::MAX {
+            None
+        } else if let Some(sk) = nowait.as_mut() {
+            match self.sites.try_lock() {
+                Ok(g) => g.get(p.site as usize).map(|st| (st.file, st.pos)),
+                Err(TryLockError::Poisoned(e)) => e.into_inner().get(p.site as usize).map(|st| (st.file, st.pos)),
+                Err(TryLockError::WouldBlock) => {
+                    sk.push("location: sites lock held, left out");
+                    None
+                }
+            }
+        } else {
+            self.sites.lock().unwrap_or_else(|e| e.into_inner()).get(p.site as usize).map(|st| (st.file, st.pos))
+        };
         if let Some((file, pos)) = site {
             s.push_str(&format!(",\"location\":{:?}", self.pos_str(file, pos)));
         } else if !p.location.is_empty() {
@@ -7726,24 +7826,47 @@ impl Unit {
             if i > 0 {
                 s.push(',');
             }
-            match self.pc_to_src(*f) {
+            let src = match (&nowait, &code_g) {
+                (None, _) => self.pc_to_src(*f),
+                (Some(_), Some(t)) => t.slot_at(*f).map(|id| self.src_at(id, *f)),
+                (Some(_), None) => None,
+            };
+            match src {
                 Some((id, loc)) => {
                     // the frame size of the code the pc is in (O3 when it is the current code of a
                     // slot that tiered up): a stack overflow's report then shows where the stack went
                     let fe = &self.fns[id as usize];
                     let t1 = !fe.history().retired.is_empty() && *f >= fe.code && *f < fe.code + fe.code_len as u64;
-                    let fr = FRAMES.lock().unwrap_or_else(|e| e.into_inner()).get(id as usize).map_or(0, |x| if t1 { x.1 } else { x.0 });
-                    // the code version the pc is in (tier, origin, start): which optimised code ran
-                    let (start, kind) = match self.code.try_read().ok().and_then(|t| t.entry_at(*f).map(|e| (e.0, t.kind_of(e.0)))) {
-                        Some(x) => x,
-                        None => (fe.code, CodeKind::default()),
+                    let size = |x: &(u32, u32)| if t1 { x.1 } else { x.0 };
+                    let fr = match (&nowait, &frames_g) {
+                        (None, _) => FRAMES.lock().unwrap_or_else(|e| e.into_inner()).get(id as usize).map_or(0, size),
+                        (Some(_), Some(g)) => g.get(id as usize).map_or(0, size),
+                        (Some(_), None) => 0,
                     };
+                    // the code version the pc is in (tier, origin, start): which optimised code ran
+                    let entry = |t: &CodeTables| t.entry_at(*f).map(|e| (e.0, t.kind_of(e.0)));
+                    let at = match &code_g {
+                        Some(t) => entry(&**t),
+                        None => self.code.try_read().ok().and_then(|t| entry(&*t)),
+                    };
+                    let (start, kind) = at.unwrap_or((fe.code, CodeKind::default()));
                     s.push_str(&format!("{{\"fn\":{:?},\"at\":{:?},\"off\":{},\"patch_gen\":{},\"tier\":{},\"code\":\"{} {} {:#x}\",\"frame\":{}}}", fe.name, loc, f.wrapping_sub(start), fe.patch_gen, t1 as u8, kind.tier_name(), kind.origin_name(), start, fr))
                 }
                 None => s.push_str(&format!("{{\"pc\":\"{:#x}\"}}", f)),
             }
         }
-        if let Some(n) = poisoned_note() {
+        let poisoned = match nowait.as_mut() {
+            None => poisoned_note(),
+            Some(sk) => match POISONED.try_lock() {
+                Ok(g) => g.clone(),
+                Err(TryLockError::Poisoned(e)) => e.into_inner().clone(),
+                Err(TryLockError::WouldBlock) => {
+                    sk.push("poisoned: POISONED lock held, left out");
+                    None
+                }
+            },
+        };
+        if let Some(n) = poisoned {
             s.push_str(&format!("],\"poisoned\":{:?},\"recent_patches\":[", n));
         } else {
             s.push_str("],\"recent_patches\":[");
@@ -7756,7 +7879,11 @@ impl Unit {
             }
             s.push_str(&format!("{{\"fn\":{:?},\"gen\":{}}}", self.fns[*slot as usize].name, gen));
         }
-        s.push_str("]}");
+        s.push(']');
+        if let Some(sk) = nowait.filter(|sk| !sk.is_empty()) {
+            s.push_str(&format!(",\"skipped\":{:?}", sk));
+        }
+        s.push('}');
         s
     }
 
