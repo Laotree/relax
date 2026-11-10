@@ -6,7 +6,7 @@
 use super::compiler::{self, Arena};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::Arc;
 
 pub struct DomainHeap {
@@ -19,8 +19,6 @@ struct Heap {
 unsafe impl Send for Heap {}
 unsafe impl Sync for Heap {}
 
-static LOW: AtomicUsize = AtomicUsize::new(usize::MAX);
-static HIGH: AtomicUsize = AtomicUsize::new(0);
 static HELD: AtomicBool = AtomicBool::new(false);
 static HEAD: AtomicPtr<Heap> = AtomicPtr::new(std::ptr::null_mut());
 struct Registry;
@@ -50,9 +48,6 @@ impl DomainHeap {
                 next: UnsafeCell::new(std::ptr::null_mut()),
             }),
         });
-        let (base, size) = heap.range();
-        LOW.fetch_min(base, Ordering::Release);
-        HIGH.fetch_max(base + size, Ordering::Release);
         let _registry = Registry::lock();
         unsafe {
             *heap.inner.next.get() = HEAD.load(Ordering::Relaxed);
@@ -61,22 +56,34 @@ impl DomainHeap {
         }
         Some(heap)
     }
+    /// (bytes in use, bytes committed), over all regions.
     pub fn stats(&self) -> (usize, usize) {
-        (self.inner.arena.requested_bytes(), self.inner.arena.committed())
+        self.inner.arena.regions().fold((0, 0), |(u, c), r| (u + r.requested_bytes(), c + r.committed()))
     }
     /// (bytes touched in small chunks, bytes in live slots, bytes in large blocks, chunks in the partial list)
     pub fn detail(&self) -> (usize, usize, usize, usize) {
-        self.inner.arena.detail()
+        self.inner.arena.regions().map(|r| r.detail()).fold((0, 0, 0, 0), |a, d| (a.0 + d.0, a.1 + d.1, a.2 + d.2, a.3 + d.3))
     }
-    /// Chunk states with resident bytes (arena.rs `states`).
+    /// Chunk states with resident bytes (arena.rs `states`), summed over the regions.
     pub fn states(&self) -> [usize; 29] {
-        self.inner.arena.states()
+        let mut c = [0usize; 29];
+        for r in self.inner.arena.regions() {
+            for (a, b) in c.iter_mut().zip(r.states()) {
+                *a += b;
+            }
+        }
+        c
     }
+    /// The first region's address range (where a heap that never filled one has all its blocks).
     pub fn range(&self) -> (usize, usize) {
         self.inner.arena.range()
     }
+    /// Every region's address range.
+    pub fn ranges(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.inner.arena.regions().map(|r| r.range())
+    }
     pub fn metadata_bytes(&self) -> usize {
-        std::mem::size_of::<Arena>() + std::mem::size_of::<Heap>() + std::mem::size_of::<Self>()
+        self.inner.arena.regions().count() * std::mem::size_of::<Arena>() + std::mem::size_of::<Heap>() + std::mem::size_of::<Self>()
     }
 }
 impl Drop for DomainHeap {
@@ -175,24 +182,28 @@ unsafe fn release(arena: &Arena, p: *mut u8) {
     );
 }
 
-unsafe fn owner(p: *mut u8) -> Option<Arc<Heap>> {
+/// The heap holding `p` and the region of it that does (alive while the lease is).
+unsafe fn owner(p: *mut u8) -> Option<(Arc<Heap>, *const Arena)> {
     // Conservative bounds only widen: ordinary native frees need no registry lock. Actual
     // ownership is still checked against live ranges, so recycled addresses are never stale.
-    let address = p as usize;
-    if address < LOW.load(Ordering::Acquire) || address >= HIGH.load(Ordering::Acquire) || HEAD.load(Ordering::Acquire).is_null() {
+    if !in_heaps(p) || HEAD.load(Ordering::Acquire).is_null() {
         return None;
     }
     let _registry = Registry::lock();
     let mut h = HEAD.load(Ordering::Relaxed);
     while let Some(heap) = h.as_ref() {
-        let (base, size) = heap.arena.range();
-        if (p as usize).wrapping_sub(base) < size {
+        if let Some(r) = heap.arena.region_of(p) {
             Arc::increment_strong_count(h);
-            return Some(Arc::from_raw(h));
+            return Some((Arc::from_raw(h), r));
         }
         h = *heap.next.get();
     }
     None
+}
+/// Whether `p` may be a domain heap's (the regions' conservative bounds).
+fn in_heaps(p: *mut u8) -> bool {
+    let address = p as usize;
+    address >= compiler::HEAPS_LOW.load(Ordering::Acquire) && address < compiler::HEAPS_HIGH.load(Ordering::Acquire)
 }
 
 /// The calling program thread is about to block in a condvar or park wait (std's wait registry):
@@ -211,7 +222,7 @@ pub fn after_wait() {
 /// 226 MB resident). The heaps are leased under the registry lock and trimmed outside it.
 pub fn trim_all() {
     for h in lease().iter().flatten() {
-        h.arena.trim();
+        h.arena.regions().for_each(|r| r.trim());
     }
 }
 
@@ -219,7 +230,7 @@ pub fn trim_all() {
 /// waiting threads' current chunks settled, and (Linux) huge pages for dense chunks, taken from
 /// sparse ones; at most `budget` collapses per heap. Returns the collapses done.
 pub fn densify_all(budget: usize) -> usize {
-    lease().iter().flatten().map(|h| h.arena.densify(budget)).sum()
+    lease().iter().flatten().flat_map(|h| h.arena.regions()).map(|r| r.densify(budget)).sum()
 }
 
 /// The live domain heaps, leased (at most 64; the rest wait for the next call).
@@ -251,25 +262,23 @@ fn lease() -> [Option<Arc<Heap>>; 64] {
 pub unsafe fn dealloc(p: *mut u8) -> bool {
     // The common free is of a block of the heap this thread is inside (alive while the thread
     // is registered in its domain): no registry lock.
-    if let Some(a) = compiler::domain_here() {
-        if a.owns(p) {
-            release(a, p);
-            return true;
-        }
+    if let Some(r) = compiler::domain_here().and_then(|a| a.region_of(p)) {
+        release(r, p);
+        return true;
     }
-    if let Some(heap) = owner(p) {
-        release(&heap.arena, p);
+    if let Some((_heap, r)) = owner(p) {
+        release(&*r, p);
         true
     } else {
         false
     }
 }
 pub unsafe fn realloc_owned(p: *mut u8, size: usize) -> Option<*mut u8> {
-    if let Some(a) = compiler::domain_here() {
-        if a.owns(p) { return Some(reallocate(a, p, size)); }
+    if let Some(r) = compiler::domain_here().and_then(|a| a.region_of(p)) {
+        return Some(reallocate(r, p, size));
     }
-    let Some(heap) = owner(p) else { return None };
-    Some(reallocate(&heap.arena, p, size))
+    let (_heap, r) = owner(p)?;
+    Some(reallocate(&*r, p, size))
 }
 unsafe fn reallocate(heap: &Arena, p: *mut u8, size: usize) -> *mut u8 {
     let h = p.cast::<Header>().sub(1).read();
@@ -328,8 +337,7 @@ pub unsafe fn dealloc_layout(p: *mut u8, l: Layout) -> bool {
     }
     // a block outside every domain heap's range (an ordinary native one, or the web target's
     // linear memory): no call into the owner lookup
-    let address = p as usize;
-    if address < LOW.load(Ordering::Acquire) || address >= HIGH.load(Ordering::Acquire) {
+    if !in_heaps(p) {
         return false;
     }
     dealloc_other(p, l)
@@ -338,8 +346,8 @@ pub unsafe fn dealloc_layout(p: *mut u8, l: Layout) -> bool {
 #[cold]
 #[inline(never)]
 unsafe fn dealloc_other(p: *mut u8, l: Layout) -> bool {
-    if let Some(h) = owner(p) {
-        h.arena.dealloc(p, l);
+    if let Some((_heap, r)) = owner(p) {
+        (*r).dealloc(p, l);
         true
     } else { false }
 }
@@ -366,11 +374,11 @@ unsafe fn resize_layout(a: &Arena, p: *mut u8, l: Layout, size: usize) -> *mut u
     q
 }
 pub unsafe fn realloc_layout(p: *mut u8, l: Layout, size: usize) -> Option<*mut u8> {
-    if let Some(a) = compiler::domain_here() {
-        if a.owns(p) { return Some(resize_layout(a, p, l, size)); }
+    if let Some(r) = compiler::domain_here().and_then(|a| a.region_of(p)) {
+        return Some(resize_layout(r, p, l, size));
     }
-    let Some(h) = owner(p) else { return None };
-    Some(resize_layout(&h.arena, p, l, size))
+    let (_heap, r) = owner(p)?;
+    Some(resize_layout(&*r, p, l, size))
 }
 
 pub unsafe extern "C" fn program_resize(p: *mut u8, old: usize, align: usize, size: usize) -> *mut u8 {
@@ -472,7 +480,7 @@ pub unsafe extern "C" fn program_malloc_trim(pad: usize) -> i32 {
         fn malloc_trim(pad: usize) -> i32;
     }
     if let Some(a) = compiler::domain_here() {
-        a.trim();
+        a.regions().for_each(|r| r.trim());
     }
     malloc_trim(pad)
 }
@@ -482,7 +490,7 @@ pub unsafe extern "C" fn program_pressure_relief(zone: *const u8, goal: usize) -
         fn malloc_zone_pressure_relief(zone: *const u8, goal: usize) -> usize;
     }
     if let Some(a) = compiler::domain_here() {
-        a.trim();
+        a.regions().for_each(|r| r.trim());
     }
     malloc_zone_pressure_relief(zone, goal)
 }
@@ -645,6 +653,64 @@ mod tests {
             // the trim gives the warm runs back
             heap.inner.arena.trim();
             assert!(heap.stats().1 < committed, "trim decommits the warm large runs");
+            enter(std::ptr::null());
+        }
+    }
+
+    /// A heap whose region is full reserves another: blocks keep coming, each free finds its
+    /// block's region (the thread's own, another region of its heap, or from a thread in no domain),
+    /// and freed regions serve again before a new one is reserved. A block larger than a region
+    /// gets a region of its own (macOS only: Linux refuses to commit more than memory and swap at
+    /// once). The blocks are never touched, so no memory is used.
+    #[cfg(unix)]
+    #[test]
+    fn a_full_region_reserves_another() {
+        symbol(b"relax_alloc");
+        let heap = DomainHeap::new().unwrap();
+        let (base, size) = heap.range();
+        let block = size / 64;
+        unsafe {
+            enter(&*heap);
+            let fill = || (0..65).map(|_| program_alloc(block, 8) as usize).collect::<Vec<_>>();
+            let blocks = fill();
+            assert!(blocks.iter().all(|&p| p != 0), "every block is served");
+            assert!(blocks[..64].iter().all(|&p| p.wrapping_sub(base) < size), "64 blocks fill the first region");
+            assert!(blocks[64].wrapping_sub(base) >= size, "the next one comes from a new region");
+            assert_eq!(heap.ranges().count(), 2);
+            assert_eq!(heap.stats().1, 65 * block, "both regions count");
+            // half freed by a thread in no domain, the rest here (this thread allocates in the
+            // second region now: the first region's blocks are another region's)
+            let (half, rest) = blocks.split_at(32);
+            let half = half.to_vec();
+            std::thread::spawn(move || {
+                for p in half {
+                    program_dealloc(p as *mut u8, block, 8);
+                }
+            })
+            .join()
+            .unwrap();
+            for &p in rest {
+                program_dealloc(p as *mut u8, block, 8);
+            }
+            assert_eq!(heap.stats(), (0, 0));
+            let again = fill();
+            assert!(again.iter().all(|&p| p != 0));
+            assert_eq!(heap.ranges().count(), 2, "the freed regions serve again");
+            for p in again {
+                program_dealloc(p as *mut u8, block, 8);
+            }
+            #[cfg(target_vendor = "apple")]
+            {
+                let p = program_alloc(size + block, 8);
+                assert!(!p.is_null(), "a block larger than a region is served");
+                assert_eq!(heap.ranges().count(), 3);
+                program_dealloc(p, size + block, 8);
+                let q = program_alloc(size + block, 8);
+                assert_eq!(q, p, "its free region serves the next block that fits");
+                program_dealloc(q, size + block, 8);
+                assert_eq!(heap.ranges().count(), 3);
+            }
+            assert_eq!(heap.stats(), (0, 0));
             enter(std::ptr::null());
         }
     }
