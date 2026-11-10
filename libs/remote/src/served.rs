@@ -1,5 +1,6 @@
 //! The CPU an endpoint's threads run serving its peers: reading and writing their frames,
-//! answering their commands, following their feeds. In an app it is what observing the app costs
+//! answering their commands (an app's UI thread too, for the commands it answers:
+//! [`charge_served`]), following their feeds. In an app it is what observing the app costs
 //! it, not the app's own work: a test's idle rule leaves it out.
 
 use std::cell::Cell;
@@ -15,6 +16,12 @@ thread_local! {
 /// The CPU the process's serving threads have run to their last ticks, in nanoseconds.
 pub fn served_cpu_ns() -> u64 {
     SERVED_NS.load(Relaxed)
+}
+
+/// Counts `ns` as served: what a thread that is not a serving one ran answering a peer's command
+/// (an app's UI thread answering an ask), measured by that thread around its answer.
+pub fn charge_served(ns: u64) {
+    SERVED_NS.fetch_add(ns, Relaxed);
 }
 
 /// Counts what the calling serving thread has run since its last tick (since it started, at the

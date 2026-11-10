@@ -1228,22 +1228,63 @@ pub(crate) fn program_thread(t: &super::threads::Thread) -> bool {
     if (t.handle != 0 && t.handle == main) || t.os_id == std::process::id() as u64 {
         return true;
     }
-    !(t.name.starts_with("run-") || t.name.starts_with("gandalf") || (t.handle != 0 && t.handle == crate::owner::owner_tid()))
+    !(runtime_name(&t.name) || (t.handle != 0 && t.handle == crate::owner::owner_tid()))
+}
+
+/// A name the runtime gives its own threads: its compilers, checks, monitor, writers and the owner
+/// (`run-owner`), and gandalf's.
+fn runtime_name(name: &str) -> bool {
+    name.starts_with("run-") || name.starts_with("gandalf")
+}
+
+/// A thread `runtime_cpu_ns` has seen: its id, whether it is the runtime's (by its name, read on
+/// its first two looks: a thread takes its name just after it starts), and its CPU at the last look.
+#[derive(Clone, Copy)]
+struct Seen {
+    id: u64,
+    runtime: bool,
+    looks: u8,
+    cpu: u64,
 }
 
 /// The CPU the runtime's own threads have run (not `program_thread`s: its compiles, checks,
 /// monitor and owner), in nanoseconds: none of it is the program's work, and a test's idle rule
 /// leaves it out of the app's (makepad_hal::clock::runtime_cpu_ns). A thread that ended keeps what
 /// it had run at the last look: the count only grows.
+///
+/// The app's UI thread reads it for every look a test's wait takes (`uicounts`, twice per poll), so
+/// it is cheap: the threads from one listing (`threads::each_thread`), a name only while a thread is
+/// new, and each runtime thread's own CPU clock (ns): about 70 us of the UI thread with 69 threads on
+/// a loaded gate box, 5 of them the clocks. Read from the full thread list (three files a
+/// thread on Linux, one of them waiting for the thread to leave its CPU) the wait's polls cost the
+/// UI thread 4-8 ms each on a loaded gate box, 8% of a core at 20 Hz: an idle Fab read as busy for
+/// two minutes.
 pub fn runtime_cpu_ns() -> u64 {
-    static SEEN: relax_session::sync::Mutex<(Vec<(u64, u64)>, u64)> = relax_session::sync::Mutex::new((Vec::new(), 0));
-    let now: Vec<(u64, u64)> = super::threads::list().iter().filter(|t| !program_thread(t)).map(|t| (t.os_id, t.cpu_ns)).collect();
+    // (the threads at the last look, by id; this look's, kept for its storage; what the runtime
+    // threads that ended since had run)
+    static SEEN: relax_session::sync::Mutex<(Vec<Seen>, Vec<Seen>, u64)> = relax_session::sync::Mutex::new((Vec::new(), Vec::new(), 0));
     crate::zone_alloc::kept_with(|| {
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        let ended: u64 = seen.0.iter().filter(|(id, _)| !now.iter().any(|(n, _)| n == id)).map(|(_, cpu)| cpu).sum();
-        seen.1 += ended;
-        seen.0 = now;
-        seen.1 + seen.0.iter().map(|(_, cpu)| cpu).sum::<u64>()
+        let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let (last, now, ended) = &mut *g;
+        now.clear();
+        super::threads::each_thread(|id, name, cpu| {
+            let was = last.binary_search_by_key(&id, |s| s.id).ok().map(|i| last[i]);
+            let (runtime, looks) = match was {
+                Some(s) if s.looks >= 2 => (s.runtime, s.looks),
+                _ => (runtime_name(&name()), was.map_or(1, |s| s.looks + 1)),
+            };
+            let cpu = if runtime { cpu().unwrap_or(was.map_or(0, |s| s.cpu)) } else { 0 };
+            now.push(Seen { id, runtime, looks, cpu });
+        });
+        now.sort_unstable_by_key(|s| s.id);
+        // a runtime thread that ended (or that took a program thread's name) keeps what it had run
+        for s in last.iter().filter(|s| s.runtime) {
+            if now.binary_search_by_key(&s.id, |n| n.id).map_or(true, |i| !now[i].runtime) {
+                *ended += s.cpu;
+            }
+        }
+        std::mem::swap(last, now);
+        *ended + last.iter().map(|s| s.cpu).sum::<u64>()
     })
 }
 
