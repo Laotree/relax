@@ -346,13 +346,14 @@ fn cmd_uncounted(req: &super::Req, out: &mut super::Out) {
     let r = crate::owner::call_within(crate::owner::Class::Job, 10_000, move || {
         let u = unsafe { &*up };
         let v = crate::jit::tier_uncounted(u);
-        let mut rows = vec![format!("{} slots are not counted (their count stub replaced while they count): they never queue O3", v.len())];
+        let never = v.iter().filter(|x| x.1).count();
+        let mut rows = vec![format!("{} slots are not counted: {} with their count stub replaced while they count, {} of a counted kind never armed (installed without a count stub): they never queue O3", v.len(), v.len() - never, never)];
         if !v.is_empty() {
-            rows.push("| slot | fn | code |".into());
-            rows.push("|---|---|---|".into());
-            for id in v.iter().take(n) {
-                let f = &u.fns[*id as usize];
-                rows.push(format!("| S{} | `{}` | {} |", id, super::short(&super::display_name(u, *id, 0), 80), super::codever::label(super::codever::kind_at(u, f.code))));
+            rows.push("| slot | fn | code | why |".into());
+            rows.push("|---|---|---|---|".into());
+            for &(id, never) in v.iter().take(n) {
+                let f = &u.fns[id as usize];
+                rows.push(format!("| S{} | `{}` | {} | {} |", id, super::short(&super::display_name(u, id, 0), 80), super::codever::label(super::codever::kind_at(u, f.code)), if never { "never armed" } else { "stub replaced" }));
             }
             if v.len() > n {
                 rows.push(format!("+{} more (n=)", v.len() - n));

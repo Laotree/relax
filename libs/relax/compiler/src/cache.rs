@@ -2217,7 +2217,7 @@ impl Cache {
             // twins are never cached (their code depends on the sandbox layout of this run)
             FnKey::Shim(shim) => {
                 use relax_types::instance::{ShimKind, ReifyReason};
-                e.u8(3);
+                e.u8(KeyKind::Shim as u8);
                 let def = shim.kind.def_id();
                 let (tag, ty) = match shim.kind {
                     ShimKind::VTable(_) => (0, None),
@@ -2248,12 +2248,12 @@ impl Cache {
                 if base as usize >= u.fns.len() {
                     return None;
                 }
-                e.u8(4);
+                e.u8(KeyKind::Twin as u8);
                 let bk = u.fns[base as usize].key.clone();
                 self.enc_fnkey(u, &bk, e, crates, depth + 1)
             }
             FnKey::Inst(d, args) => {
-                e.u8(0);
+                e.u8(KeyKind::Inst as u8);
                 self.enc_def(u, d, e, crates);
                 self.enc_tys(u, &args, e, crates, 0)
             }
@@ -2264,14 +2264,14 @@ impl Cache {
                 // its owner's closure ordinal, as rustc names it (closure_ordinal)
                 let owner = key_defs(u, &u.fns[parent as usize].key).first().copied();
                 if let Some((ord, fp)) = owner.filter(|_| !u.prog.is_edit_version(file)).and_then(|o| self.closure_ordinal(u, o, file, expr)) {
-                    e.u8(5);
+                    e.u8(KeyKind::Closure as u8);
                     crates.push(u.prog.file_crate.get(file as usize).copied().unwrap_or(0));
                     e.u32(ord);
                     e.u64(fp);
                     let pk = u.fns[parent as usize].key.clone();
                     return self.enc_fnkey(u, &pk, e, crates, depth + 1);
                 }
-                e.u8(1);
+                e.u8(KeyKind::ClosureInFile as u8);
                 crates.push(u.prog.file_crate.get(file as usize).copied().unwrap_or(0));
                 self.enc_file(u, file, e)?;
                 e.u32(expr);
@@ -2286,7 +2286,7 @@ impl Cache {
                 None
             }
             FnKey::Glue(g, t) => {
-                e.u8(2);
+                e.u8(KeyKind::Glue as u8);
                 e.u8(g);
                 self.enc_ty(u, t, e, crates, 0)
             }
@@ -4080,6 +4080,52 @@ impl Cache {
             prune_root(root);
         }
         Ok(n)
+    }
+}
+
+/// Declares KeyKind and its byte map together: `of` names every kind the enum has.
+macro_rules! key_kinds {
+    ($($(#[$m:meta])* $name:ident = $v:literal,)*) => {
+        /// The first byte of a slot identity's bytes (enc_fnkey): the kind of key it is. Its readers
+        /// match on this enum without a catch-all, so a new kind does not build until each of
+        /// them says what it does with it (the startup image's count stubs missed a new closure
+        /// kind once, a twin before: KeyKind::counted).
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        #[repr(u8)]
+        pub(crate) enum KeyKind { $($(#[$m])* $name = $v,)* }
+        impl KeyKind {
+            /// The kind a key's first byte names (None: no key's first byte).
+            pub(crate) fn of(b: u8) -> Option<KeyKind> {
+                match b { $($v => Some(KeyKind::$name),)* _ => None }
+            }
+        }
+    };
+}
+
+key_kinds! {
+    /// an instance: its def and type args
+    Inst = 0,
+    /// a closure by its file's identity, its expression and its text (async fn bodies, live
+    /// edits' file versions)
+    ClosureInFile = 1,
+    /// type glue: its kind and type
+    Glue = 2,
+    /// a shim: its kind, def and type args
+    Shim = 3,
+    /// an unverified-mode twin: its base's key
+    Twin = 4,
+    /// a closure by its owner's closure ordinal and its text (closure_ordinal)
+    Closure = 5,
+}
+
+impl KeyKind {
+    /// Slots of this kind count their calls and loops for O3 (jit::counted_key's rule, for the
+    /// slots the startup image installs before their identities decode: jit arm_counters).
+    pub(crate) fn counted(self) -> bool {
+        match self {
+            KeyKind::Inst | KeyKind::ClosureInFile | KeyKind::Closure | KeyKind::Twin => true,
+            KeyKind::Glue | KeyKind::Shim => false,
+        }
     }
 }
 
@@ -7441,9 +7487,11 @@ mod data_tests {
         pub(super) static BEFORE_LINK: std::cell::RefCell<Option<Box<dyn FnOnce(&mut Unit)>>> = Default::default();
     }
 
+    /// Every kind of fn key round-trips (encode, decode, the image's skip), and the startup image
+    /// arms the slot of each key's first byte as arm_counter arms the decoded key.
     #[test]
-    fn round23_shim_keys_roundtrip() {
-        isolated_test!(round23_shim_keys_roundtrip);
+    fn round23_fn_keys_roundtrip() {
+        isolated_test!(round23_fn_keys_roundtrip);
         use relax_types::instance::{ShimKind, ReifyReason};
         let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
         let mut session = crate::Session::default();
@@ -7478,17 +7526,33 @@ mod data_tests {
         let array = u.tcx.tys.intern(TyKind::Array(u.tcx.tys.usize_, u.tcx.tys.const_usize(3)));
         let tuple = u.tcx.tys.intern(TyKind::Tuple(u.tcx.tys.mk_list(&[array, reference])));
         let slice = u.tcx.tys.intern(TyKind::Slice(tuple));
+        let mut keys: Vec<FnKey> = kinds.into_iter().map(|kind| FnKey::Shim(crate::jit::ShimInstance { kind, args: vec![callable, pointer, borrowed, early, alias, object, reference, array, tuple, slice] })).collect();
+        // an instance, its unverified-mode twin, and the closures of an instance (keyed by their
+        // owner's ordinal)
+        let owner = named("owner");
+        let owner_slot = u.fn_id(FnKey::Inst(owner, vec![]));
+        let method_slot = u.fn_id(FnKey::Inst(method, vec![]));
+        keys.extend([FnKey::Inst(method, vec![]), FnKey::Plain(method_slot)]);
+        let owner_file = u.prog.def(owner).file;
+        let owner_closures = cache.item_closures(&u, owner);
+        assert_eq!(owner_closures.len(), 2);
+        keys.extend(owner_closures.iter().map(|&expr| FnKey::Closure(owner_file, expr, owner_slot)));
         let mut encoded = Vec::new();
-        for kind in kinds {
-            let key = FnKey::Shim(crate::jit::ShimInstance { kind, args: vec![callable, pointer, borrowed, early, alias, object, reference, array, tuple, slice] });
+        for key in keys {
             let mut bytes = E::default();
             let mut crates = vec![];
             assert!(cache.enc_fnkey(&u, &key, &mut bytes, &mut crates, 0).is_some());
+            if matches!(key, FnKey::Closure(..)) {
+                assert_eq!(bytes.0[0], KeyKind::Closure as u8, "a closure of an instance is keyed by its ordinal");
+            }
+            // the startup image arms a slot by its key's first byte (before the key decodes): as
+            // arm_counter arms the decoded key (a closure left unarmed ran its image code for good)
+            assert_eq!(KeyKind::of(bytes.0[0]).is_some_and(KeyKind::counted), crate::jit::counted_key(&u, &key), "the startup image arms {key:?} as arm_counter does");
             // the image's walk of a key finds the crates its encoder named (Img::key_ok)
             crates.sort_unstable();
             crates.dedup();
             assert_eq!(cache.key_crates(&u, &bytes.0), Some(crates));
-            assert!(!encoded.contains(&bytes.0), "colliding shim key");
+            assert!(!encoded.contains(&bytes.0), "colliding fn key");
             encoded.push(bytes.0);
         }
         u.tcx = crate::tcx::Tcx::new();
@@ -8475,12 +8539,12 @@ impl Linker {
         if depth > 32 {
             return None;
         }
-        Some(match d.u8()? {
-            0 => {
+        Some(match KeyKind::of(d.u8()?)? {
+            KeyKind::Inst => {
                 let def = self.cache().dec_def(u, d)?;
                 FnKey::Inst(def, self.cache().dec_tys(u, d, 0)?)
             }
-            1 => {
+            KeyKind::ClosureInFile => {
                 let file = self.cache().dec_file(u, d)?;
                 let expr = d.u32()?;
                 if !self.cache().closure_fp_agrees(u, file, expr, d.u64()?) { return None; }
@@ -8494,7 +8558,7 @@ impl Linker {
                 };
                 FnKey::Closure(file, expr, parent)
             }
-            5 => {
+            KeyKind::Closure => {
                 let ord = d.u32()?;
                 let fp = d.u64()?;
                 let parent = match self.image_slot_at(u, d) {
@@ -8508,11 +8572,11 @@ impl Linker {
                 let (file, expr) = self.cache().closure_at(u, owner, ord, fp)?;
                 FnKey::Closure(file, expr, parent)
             }
-            2 => {
+            KeyKind::Glue => {
                 let g = d.u8()?;
                 FnKey::Glue(g, self.cache().dec_ty(u, d, 0)?)
             }
-            3 => {
+            KeyKind::Shim => {
                 use relax_types::instance::{ShimKind, ReifyReason};
                 let tag = d.u8()?;
                 let def = self.cache().dec_def(u, d)?;
@@ -8528,7 +8592,7 @@ impl Linker {
                 FnKey::Shim(crate::jit::ShimInstance { kind, args: self.cache().dec_tys(u, d, 0)? })
             }
             // SPEC-V: an unverified-mode twin, keyed by its base (a base the startup image names: its slot)
-            4 => {
+            KeyKind::Twin => {
                 let base = match self.image_slot_at(u, d) {
                     Some(b) => b,
                     None => {
@@ -8538,7 +8602,6 @@ impl Linker {
                 };
                 FnKey::Plain(base)
             }
-            _ => return None,
         })
     }
 
