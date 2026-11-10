@@ -2136,7 +2136,9 @@ fn module_bodies_classify_by_item() {
 /// edit: the dependent crate's new code calls the new fn (no restart, nothing refused). The
 /// counterpart, an item a crate the host provides lacks (its items are the running makepad's):
 /// with makepad's inputs unchanged a use of it is the edit's own error, and once they changed it
-/// waits for the rebuilt makepad, the restart offered.
+/// waits for the rebuilt makepad, the restart offered -- also where this process cannot build
+/// makepad and nothing on the ring builds (a dock app's sync, 11-10: E0425 on a new `makepad_hal`
+/// op stood as the edit's own error).
 #[test]
 fn a_new_item_in_another_crate_patches_unless_the_host_provides_that_crate() {
     const CHILD: &str = "MAKEPAD_RUN_CROSS_ITEM_TEST";
@@ -2206,7 +2208,9 @@ fn a_new_item_in_another_crate_patches_unless_the_host_provides_that_crate() {
     let use_later = || vec![Edit { file: app_file, path: app_path.clone(), src: app_src("later").into_bytes() }];
     let o = unsafe { apply(up, use_later()) };
     assert_eq!(o.rung, Rung::Refuse, "a fn the provided crate lacks, with makepad's inputs unchanged: {:?}", o.lines);
-    crate::reload::host::offer_provided(crate::provided::ProvidedChange { crate_name: "parts".into(), files: Vec::new() }, None);
+    // makepad's inputs changed, and this process cannot build it (no loader package here)
+    assert!(crate::reload::host::request("a provided crate changed".into(), Vec::new()).is_err(), "the test process has no makepad to rebuild");
+    assert!(crate::reload::host::route() == crate::reload::host::Route::Plain, "nothing builds: the ring has no rebuild to offer");
     let o = unsafe { apply(up, use_later()) };
     assert!(o.lines.iter().any(|l| l.contains("E0425") && l.contains("needs the rebuilt makepad: restart to apply")), "once makepad's inputs changed, the use waits for the rebuilt makepad: {:?} {:?}", o.rung, o.lines);
     assert_eq!(run(), 29, "the running code stays until the restart");

@@ -6139,9 +6139,11 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // What a crate the host provides lacks: its items are this makepad's own, and its changed
     // sources wait for the rebuilt makepad, so no patch adds them -- the restart into that
     // makepad applies the edit (the held items wait for it, the rest patches now). Only while
-    // makepad's own inputs have changed (a rebuild offered, running or done): with none, no
-    // makepad has them and the errors are the edit's own.
-    if !real.is_empty() && host::route() != host::Route::Plain {
+    // makepad's own inputs have changed (host::inputs_changed: seen, whether or not this process
+    // can build makepad, until a rebuild shows them unchanged): with none, no makepad has them and
+    // the errors are the edit's own. (A new op runs in the host, beside its state: no JIT copy of
+    // it can stand in.)
+    if !real.is_empty() && host::inputs_changed() {
         if let Some(lines) = provided_lacks(&real) {
             errs.retain(|e| !real.contains(e));
             errs.extend(lines);
