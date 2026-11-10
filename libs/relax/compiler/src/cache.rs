@@ -531,6 +531,9 @@ pub struct CacheStats {
     pub link_ns: u64,
     pub verify_same: u64,
     pub verify_diff: u64,
+    /// cached entries of another tier than the verifying build's (an O2 or O3 rebuild replaced
+    /// the first build's entry): not compared
+    pub verify_other_tier: u64,
     pub packs: u64,
     pub packs_rejected: u64,
     pub index_entries: u64,
@@ -4051,7 +4054,7 @@ impl Cache {
     pub fn flush(&mut self) -> Result<usize, String> {
         if self.verbose && self.mode == Mode::Verify {
             let s = &self.stats;
-            eprintln!("makepad-run cache: verify: {} identical, {} different", s.verify_same, s.verify_diff);
+            eprintln!("makepad-run cache: verify: {} identical, {} different, {} of another tier", s.verify_same, s.verify_diff, s.verify_other_tier);
         }
         if self.mode == Mode::ReadOnly {
             return Ok(0);
@@ -4983,17 +4986,25 @@ fn provided_value(u: &Unit, name: &str) -> Option<u64> {
 impl Cache {
     /// Verify mode: the entry this run would record for slot `id` (fresh code + relocs) against
     /// the cached entry: same declared nounwind inputs, pool-zeroed code and encoded
-    /// relocations. Prints the first difference, including changed conservative answers.
-    pub fn verify_entry(&mut self, u: &Unit, id: u32, fresh: &[u8], relocs: &[RelocAt]) -> bool {
+    /// relocations. Prints the first difference, including changed conservative answers. None:
+    /// the cached code is another tier than the fresh build's (baseline or O1), so the two say
+    /// nothing about each other.
+    pub fn verify_entry(&mut self, u: &Unit, id: u32, fresh: &[u8], relocs: &[RelocAt]) -> Option<bool> {
         let key = match self.slot_key(u, id) {
             Some(k) => k,
-            None => return true,
+            None => return Some(true),
         };
         let cached = match self.get(key) {
             Some((KIND_CODE, p)) => p.to_vec(),
-            _ => return true,
+            _ => return Some(true),
         };
-        let mut d = D { b: &cached, p: 0 };
+        let fresh_tier = if u.fns[id as usize].rir.as_ref().is_some_and(|r| r.baseline) { TIER_BASE } else { TIER_O1 };
+        if payload_tier(&cached).is_some_and(|t| t != fresh_tier) { return None; }
+        Some(self.verify_same_tier(u, id, &cached, fresh, relocs))
+    }
+
+    fn verify_same_tier(&mut self, u: &Unit, id: u32, cached: &[u8], fresh: &[u8], relocs: &[RelocAt]) -> bool {
+        let mut d = D { b: cached, p: 0 };
         if d.u32() != Some(ENTRY_VERSION) || d.str().is_none() { return false; }
         let Some((start, end)) = skip_build_inputs(&mut d) else { return false };
         let facts = u.fns[id as usize].rir.as_ref().map_or(&[][..], |r| r.nounwind_inputs.as_slice());
