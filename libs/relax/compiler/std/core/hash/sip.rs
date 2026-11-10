@@ -1,6 +1,6 @@
-//! SipHash-2-4 (rustc library/core/src/hash/sip.rs: `SipHasher`, deprecated since 1.13). Same
-//! algorithm and byte stream as real core, so `SipHasher::new_with_keys(k0, k1)` hashes to the
-//! same values; only the 2-4 variant is provided (SipHasher13 is a hidden unstable type).
+//! SipHash (rustc library/core/src/hash/sip.rs): `SipHasher` (2-4, deprecated since 1.13) and the
+//! hidden SipHasher13 (1-3) that real std's DefaultHasher::new hashes with (fast.rs). Same
+//! algorithm and byte stream as real core, so each hashes to real core's values for the same keys.
 
 use super::Hasher;
 
@@ -41,29 +41,18 @@ fn u8to64_le(buf: &[u8], start: usize, len: usize) -> u64 {
     out
 }
 
+/// The state both variants share; `c` / `d`: the compression rounds per message word and at the end.
 #[derive(Debug, Clone)]
-pub struct SipHasher {
-    k0: u64,
-    k1: u64,
+struct Sip {
     length: usize, // how many bytes we've processed
     state: State,  // hash State
     tail: u64,     // unprocessed bytes le
     ntail: usize,  // how many bytes in tail are valid
 }
 
-impl SipHasher {
-    #[deprecated(since = "1.13.0", note = "use `std::hash::DefaultHasher` instead")]
-    #[must_use]
-    pub fn new() -> SipHasher {
-        SipHasher::new_with_keys(0, 0)
-    }
-
-    #[deprecated(since = "1.13.0", note = "use `std::hash::DefaultHasher` instead")]
-    #[must_use]
-    pub fn new_with_keys(key0: u64, key1: u64) -> SipHasher {
-        SipHasher {
-            k0: key0,
-            k1: key1,
+impl Sip {
+    const fn new_with_keys(key0: u64, key1: u64) -> Sip {
+        Sip {
             length: 0,
             state: State {
                 v0: key0 ^ 0x736f6d6570736575,
@@ -75,17 +64,18 @@ impl SipHasher {
             ntail: 0,
         }
     }
-}
 
-impl Default for SipHasher {
-    fn default() -> SipHasher {
-        #[allow(deprecated)]
-        SipHasher::new_with_keys(0, 0)
+    #[inline]
+    fn rounds(s: &mut State, n: usize) {
+        let mut i = 0;
+        while i < n {
+            compress(s);
+            i += 1;
+        }
     }
-}
 
-impl Hasher for SipHasher {
-    fn write(&mut self, msg: &[u8]) {
+    #[inline]
+    fn write(&mut self, msg: &[u8], c: usize) {
         let length = msg.len();
         self.length += length;
 
@@ -100,8 +90,7 @@ impl Hasher for SipHasher {
                 return;
             } else {
                 self.state.v3 ^= self.tail;
-                compress(&mut self.state);
-                compress(&mut self.state);
+                Sip::rounds(&mut self.state, c);
                 self.state.v0 ^= self.tail;
                 self.ntail = 0;
             }
@@ -116,8 +105,7 @@ impl Hasher for SipHasher {
             let mi = u8to64_le(msg, i, 7) | ((msg[i + 7] as u64) << 56);
 
             self.state.v3 ^= mi;
-            compress(&mut self.state);
-            compress(&mut self.state);
+            Sip::rounds(&mut self.state, c);
             self.state.v0 ^= mi;
 
             i += 8;
@@ -127,22 +115,75 @@ impl Hasher for SipHasher {
         self.ntail = left;
     }
 
-    fn finish(&self) -> u64 {
+    #[inline]
+    fn finish(&self, c: usize, d: usize) -> u64 {
         let mut state = self.state;
 
         let b: u64 = ((self.length as u64 & 0xff) << 56) | self.tail;
 
         state.v3 ^= b;
-        compress(&mut state);
-        compress(&mut state);
+        Sip::rounds(&mut state, c);
         state.v0 ^= b;
 
         state.v2 ^= 0xff;
-        compress(&mut state);
-        compress(&mut state);
-        compress(&mut state);
-        compress(&mut state);
+        Sip::rounds(&mut state, d);
 
         state.v0 ^ state.v1 ^ state.v2 ^ state.v3
+    }
+}
+
+/// SipHash-2-4.
+#[derive(Debug, Clone)]
+pub struct SipHasher(Sip);
+
+impl SipHasher {
+    #[deprecated(since = "1.13.0", note = "use `std::hash::DefaultHasher` instead")]
+    #[must_use]
+    pub fn new() -> SipHasher {
+        SipHasher(Sip::new_with_keys(0, 0))
+    }
+
+    #[deprecated(since = "1.13.0", note = "use `std::hash::DefaultHasher` instead")]
+    #[must_use]
+    pub fn new_with_keys(key0: u64, key1: u64) -> SipHasher {
+        SipHasher(Sip::new_with_keys(key0, key1))
+    }
+}
+
+impl Default for SipHasher {
+    fn default() -> SipHasher {
+        SipHasher(Sip::new_with_keys(0, 0))
+    }
+}
+
+impl Hasher for SipHasher {
+    fn write(&mut self, msg: &[u8]) {
+        self.0.write(msg, 2)
+    }
+
+    fn finish(&self) -> u64 {
+        self.0.finish(2, 4)
+    }
+}
+
+/// SipHash-1-3, real core's hidden SipHasher13: the hash of real std's `DefaultHasher::new()`. Its
+/// writes are real core's: integers as their native-endian bytes (`write`), a str as its bytes and
+/// 0xff (the Hasher defaults).
+#[derive(Debug, Clone)]
+pub(crate) struct SipHasher13(Sip);
+
+impl SipHasher13 {
+    pub(crate) const fn new_with_keys(key0: u64, key1: u64) -> SipHasher13 {
+        SipHasher13(Sip::new_with_keys(key0, key1))
+    }
+}
+
+impl Hasher for SipHasher13 {
+    fn write(&mut self, msg: &[u8]) {
+        self.0.write(msg, 1)
+    }
+
+    fn finish(&self) -> u64 {
+        self.0.finish(1, 3)
     }
 }
