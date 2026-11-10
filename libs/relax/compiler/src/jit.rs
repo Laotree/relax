@@ -22896,6 +22896,10 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_fork_exec_done" => Some(crate::forkexec::relax_fork_exec_done as *const () as usize),
         b"relax_allocator_swap" => Some(relax_allocator_swap as *const () as usize),
         b"relax_set_panic_hook" => Some(relax_set_panic_hook as *const () as usize),
+        // what observers cost the program and what the runtime's own threads run: one count for the
+        // host's endpoint and every copy of makepad-remote the program runs, whichever crates bind
+        b"relax_served_ns" => Some(makepad_remote::served_count() as *const std::sync::atomic::AtomicU64 as usize),
+        b"relax_runtime_cpu_ns" => Some(crate::inspect::instrument::relax_runtime_cpu_ns as *const () as usize),
         b"relax_set_payload_end" => Some(relax_set_payload_end as *const () as usize),
         b"relax_before_first_frame" => Some(relax_before_first_frame as *const () as usize),
         b"relax_app_main" => Some(relax_app_main as *const () as usize),

@@ -1249,8 +1249,8 @@ struct Seen {
 
 /// The CPU the runtime's own threads have run (not `program_thread`s: its compiles, checks,
 /// monitor and owner), in nanoseconds: none of it is the program's work, and a test's idle rule
-/// leaves it out of the app's (makepad_hal::clock::runtime_cpu_ns). A thread that ended keeps what
-/// it had run at the last look: the count only grows.
+/// leaves it out of the app's (makepad_remote::runtime_cpu_ns, through `relax_runtime_cpu_ns`). A
+/// thread that ended keeps what it had run at the last look: the count only grows.
 ///
 /// The app's UI thread reads it for every look a test's wait takes (`uicounts`, twice per poll), so
 /// it is cheap: the threads from one listing (`threads::each_thread`), a name only while a thread is
@@ -1286,6 +1286,12 @@ pub fn runtime_cpu_ns() -> u64 {
         std::mem::swap(last, now);
         *ended + last.iter().map(|s| s.cpu).sum::<u64>()
     })
+}
+
+/// [`runtime_cpu_ns`] for the program (a loader symbol, jit.rs `loader_symbol`): makepad-remote
+/// finds it at its first read, whichever copy of the program's crates reads it.
+pub(crate) extern "C" fn relax_runtime_cpu_ns() -> u64 {
+    runtime_cpu_ns()
 }
 
 /// The host's UI thread of a hosted run (run.rs `host_thread`: the process's main thread, on the
