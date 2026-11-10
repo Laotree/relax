@@ -941,6 +941,14 @@ fn skip_ty(d: &mut D, depth: u32, v: &mut dyn FnMut(Atom)) -> Option<()> {
         }
         20 => skip_const(d, depth + 1, v)?,
         27 => skip_def(d, v)?,
+        28 => {
+            skip_ty(d, depth + 1, v)?;
+            d.u32()?;
+            d.u64()?;
+            skip_ty(d, depth + 1, v)?;
+            skip_ty(d, depth + 1, v)?;
+            skip_ty(d, depth + 1, v)?;
+        }
         _ => return None,
     }
     Some(())
@@ -957,6 +965,12 @@ pub(crate) fn skip_fnkey(d: &mut D, depth: u32, v: &mut dyn FnMut(Atom)) -> Opti
         }
         1 => {
             skip_file(d, v)?;
+            d.u32()?;
+            d.u64()?;
+            skip_fnkey(d, depth + 1, v)
+        }
+        // a closure by its owner's ordinal and its text (cache.rs closure_ordinal)
+        5 => {
             d.u32()?;
             d.u64()?;
             skip_fnkey(d, depth + 1, v)
