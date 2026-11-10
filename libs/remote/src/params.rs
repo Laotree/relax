@@ -69,6 +69,8 @@ pub fn ui(verb: &str) -> Option<&'static str> {
         "act" => concat!(ui_common!(), selectors!(), params!("action": "string", "name": "string", "v": "string", "t": "string", "from": "integer", "to": "integer", "dx": "number", "dy": "number", "ms": "number", "hz": "number", "legs": "integer", "x": "number", "y": "number", "b": "integer", "mods": "string", "wait": "boolean", "if_user_seq": "integer")),
         "type" => concat!(ui_common!(), selectors!(), params!("name": "string", "action": "string", "t": "string", "from": "integer", "to": "integer", "wait": "boolean", "if_user_seq": "integer")),
         "wait" => concat!(ui_common!(), selectors!(), params!("name": "string", "action": "string", "gone": "boolean", "changed": "boolean", "count": "integer")),
+        "done" => concat!(ui_common!(), params!("req": "integer")),
+        "present" => concat!(ui_common!(), selectors!(), params!("name": "string", "action": "string")),
         "snap" => concat!(ui_common!(), params!("name": "string")),
         "diff" => concat!(ui_common!(), params!("a": "string", "b": "string")),
         "speak" => concat!(ui_common!(), selectors!(), params!("name": "string", "action": "string", "since": "integer")),
@@ -143,7 +145,7 @@ mod tests {
         let nested = r#""value":{"anyOf":[{"type":"string"},{"type":"number"}],"description":"braces }, comma, and \"quote\""},"count":{"type":"integer"}"#;
         assert!(validate(["value", "count", "full"], nested).is_ok());
         assert!(validate(["type"], nested).unwrap_err().contains("known: value, count, full"));
-        for verb in ["", "find", "act", "type", "wait", "snap", "diff", "speak", "lint", "oscheck"] {
+        for verb in ["", "find", "act", "type", "wait", "done", "present", "snap", "diff", "speak", "lint", "oscheck"] {
             let schema = ui(verb).unwrap();
             assert!(validate(["timeout_ms", "json", "w", "app", "machine"], schema).is_ok());
             assert!(validate(["timeout"], schema).unwrap_err().contains("timeout_ms"));
