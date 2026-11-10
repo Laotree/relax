@@ -2643,12 +2643,9 @@ fn def_is_bound(prog: &crate::program::Program, d: DefId) -> bool {
 /// The two types a vtable's data name gives (syms::VTABLE_NAME: `vtable:<type>#<hash>:<dyn
 /// type>#<hash>`, jit.rs Unit::vtable), as printed, without their hashes.
 fn vtable_name_types(name: &str) -> Option<(String, String)> {
-    let rest = name.strip_prefix(crate::syms::VTABLE_NAME)?;
-    let b = rest.as_bytes();
-    // (the last `#<hash>:`: the concrete type's end; the dyn type ends in its own hash)
-    let cut = (0..b.len()).rev().find(|&i| b[i] == b'#' && i + 9 < b.len() && b[i + 9] == b':' && b[i + 1..i + 9].iter().all(u8::is_ascii_hexdigit))?;
+    let (t, dy) = crate::syms::vtable_name_parts(name)?;
     let bare = |t: &str| t.rsplit_once('#').map_or(t, |x| x.0).to_string();
-    Some((bare(&rest[..cut + 9]), bare(&rest[cut + 10..])))
+    Some((bare(t), bare(dy)))
 }
 
 /// "T` as `dyn Tr" from a vtable's data name, for a message's backquotes.

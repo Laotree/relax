@@ -6230,13 +6230,11 @@ impl Unit {
             bytes.extend_from_slice(&self.ptr_word(*w));
         }
         let a = self.data(&bytes, pb as u64, crate::syms::DataKind::Words(wsyms));
+        // (named: one of a trait-object type real-time code calls through is compiled after the
+        // current request, realtime_vtable)
         self.syms.set_data_name(a, format!("{}{}:{}", crate::syms::VTABLE_NAME, crate::syms::stable_ty(self, src), crate::syms::stable_ty(self, dy)));
         // a racing builder of the same vtable: everyone uses the first (one symbol per vtable)
-        let a = self.vtables.insert_first((src, dy), a);
-        // real-time code calls through this trait-object type: the new vtable's methods are
-        // compiled after the current request (realtime_drain)
-        realtime_vtable(dy, a);
-        Ok(a)
+        Ok(self.vtables.insert_first((src, dy), a))
     }
 
     /// The reload index, built from the slots made so far on first use.
@@ -27376,15 +27374,18 @@ struct RealTime {
     /// slots reached, in order (what the disk cache records)
     set: Vec<u32>,
     seen: crate::fxhash::HashSet<u32>,
-    /// trait-object types real-time code is handed (TyId), and the vtables already followed
+    /// trait-object types real-time code is handed (TyId) and their names (stable_ty: a vtable
+    /// linked from the disk cache or placed from the startup image names its types only so), and
+    /// the vtables already followed
     dyns: crate::fxhash::HashSet<u32>,
+    dyn_names: crate::fxhash::HashSet<String>,
     vtables: crate::fxhash::HashSet<u64>,
     /// the earlier runs' set was taken (into `link`)
     loaded: bool,
     /// slots of the set whose compile failed: a call still compiles them (Realtime::lazy counts them)
     failed: crate::fxhash::HashSet<u32>,
-    /// the reach in progress: the earlier runs' slots still to link (compiled, not walked), the
-    /// slots still to walk, the trait-object types newly called through
+    /// the reach in progress: the earlier runs' slots still to compile ahead (no part of the reach
+    /// until the walk takes them), the slots still to walk, the trait-object types newly called through
     link: Vec<u32>,
     todo: Vec<u32>,
     new_dyns: Vec<u32>,
@@ -27403,7 +27404,7 @@ struct RealTime {
 }
 
 static REALTIME: relax_session::sync::Mutex<Option<RealTime>> = relax_session::sync::Mutex::new(None);
-/// any real-time slot or trait-object type known (vtable() / installs check this before the mutex)
+/// any real-time slot or trait-object type known (realtime_vtable / installs check this before the mutex)
 static RT_DYNS: AtomicBool = AtomicBool::new(false);
 static RT_ANY: AtomicBool = AtomicBool::new(false);
 /// vtables made for a real-time trait-object type, waiting for realtime_drain
@@ -27509,8 +27510,8 @@ static RT_ARMED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::ne
 /// What real-time code can reach that a call would still compile: the reach's work left (slots to
 /// link or walk, trait-object types and vtables to follow, the new callees of new code) and the
 /// set's slots whose compile failed. The reach is one walk for every mark (a slot two roots reach is
-/// walked once, and a warm run links the earlier runs' set without walking it), so this is the
-/// whole real-time set's answer: never 0 while something on any root's path is lazy.
+/// walked once; a warm run compiles the earlier runs' set ahead and walks from the roots all the
+/// same), so this is the whole real-time set's answer: never 0 while something on any root's path is lazy.
 ///
 /// The queues realtime_drain empties are read first: it adds their work to the reach before it
 /// takes them off, so a read never falls between the two (a vtable made just now is counted in
@@ -27562,10 +27563,10 @@ unsafe fn realtime_mark(up: *mut Unit, root: u64, data: u64, meta: u64, ticket: 
             }
         }
     }
-    // a trait object (or a struct ending in one): the methods of its vtable
+    // a trait object (or a struct ending in one): the methods of its vtable (and its drop glue:
+    // the concrete type behind it is a parameter, below)
     if meta != 0 {
         crate::syms::data_thunks(u, meta, &mut roots);
-        values.extend(u.vtables.snapshot().into_iter().filter(|(_, a)| *a == meta).map(|((t, _), _)| t));
     }
     // what the roots' callers pass them (a Fab arms run's `run_until(&mut self, link: &mut dyn
     // CellLink, ..)`: the planner's `Box<dyn Route>`, the link)
@@ -27629,14 +27630,17 @@ pub(crate) unsafe fn realtime_reach_queued(up: *mut Unit, roots: Vec<u32>, why: 
     }
 }
 
-/// One bounded owner step of the reach (see the section comment): links the earlier runs' set,
-/// then compiles and walks slots until the reach is done or RT_STEP_NS passed; the rest is posted
+/// One bounded owner step of the reach (see the section comment): compiles the earlier runs' set
+/// ahead, then compiles and walks slots until the reach is done or RT_STEP_NS passed; the rest is posted
 /// behind the program's requests. Done: the set's top tier, its disk cache record, the tickets.
 unsafe fn realtime_step(up: *mut Unit) {
     let t0 = wall_ns();
-    // the earlier runs' set, once, first: on a warm run most of it links from the disk cache
-    // (their code is compiled, their references are not walked again: what they reached then is
-    // in the set; an edited slot's key no longer resolves and is walked from what calls it)
+    // the earlier runs' set, once, first: on a warm run most of it links from the disk cache. It is
+    // only what to compile ahead: the reach is what the walk from the roots takes. A slot's key names
+    // its identity, not its body, so a set an older program recorded still resolves where the bodies
+    // call other code now; a set walked no further kept its hole for good (the land gate's recorded
+    // 5182 slots of which 3 resolved, its root among them: that run reached 1934 of 8250, and every
+    // run after linked those 1934, meeting 27 to 67 lazy compiles on the cell's loop thread, 11-10)
     if with_rt(|rt| !std::mem::replace(&mut rt.loaded, true)) {
         let root = crate::layout::root_crate();
         let (keys, dyns) = {
@@ -27654,7 +27658,7 @@ unsafe fn realtime_step(up: *mut Unit) {
         if rt_trace() {
             eprintln!("makepad-run rt: the earlier runs' set: {} keys, {} resolved, {} trait-object types", keys.len(), earlier.len(), dyns.len());
         }
-        // (linked slots are not walked: the trait-object types the reach followed are the set's)
+        // (the trait-object types the reach followed then: their vtables are followed now too)
         with_rt(|rt| {
             rt.link.extend(earlier.into_iter().rev());
             rt.new_dyns.extend(dyns.into_iter().map(|d| d.0).filter(|d| !rt.dyns.contains(d)));
@@ -27685,19 +27689,11 @@ unsafe fn realtime_step(up: *mut Unit) {
         });
         match next {
             Next::Link(id) => {
-                if !realtime_take(id) {
-                    continue;
-                }
+                // compiled ahead only (the walk reads its references from that code)
                 if (id as usize) < (&*up).fns.len() && !(&*up).fns[id as usize].compiled {
                     let _ = compile_slot_locked(up, id, false);
                     compiled += 1;
                 }
-                let lazy = (id as usize) < (&*up).fns.len() && !(&*up).fns[id as usize].compiled;
-                let partner = realtime_partner(&*up, id);
-                with_rt(|rt| {
-                    if lazy { rt.failed.insert(id); } else { rt.failed.remove(&id); }
-                    rt.todo.extend(partner);
-                });
             }
             Next::Walk(id) => {
                 // a diverging fn (a panic, an abort) ends the callback's normal path: it stays lazy
@@ -27723,34 +27719,44 @@ unsafe fn realtime_step(up: *mut Unit) {
                 });
             }
             // trait-object types newly handed to real-time code: every vtable of each, now and later
+            // (lowered, linked from the disk cache, placed from the startup image: by its name)
             Next::Dyns(new_dyns) => {
                 let u = &*up;
+                let names: Vec<(u32, String)> = new_dyns.iter().map(|&d| (d, crate::syms::stable_ty(u, TyId(d)))).collect();
                 // known first, then the vtables made so far: one made meanwhile (on another
-                // thread) is in the snapshot or noted by realtime_vtable
+                // thread) is in the scan or noted by realtime_vtable
                 with_rt(|rt| {
-                    if new_dyns.iter().filter(|d| rt.dyns.insert(**d)).count() > 0 {
+                    let mut any = false;
+                    for (d, n) in names {
+                        if rt.dyns.insert(d) {
+                            rt.dyn_names.insert(n);
+                            any = true;
+                        }
+                    }
+                    if any {
                         RT_DYNS.store(true, Ordering::Release);
                     }
                 });
-                let snapshot = u.vtables.snapshot();
                 with_rt(|rt| {
-                    let addrs: Vec<(u32, u64, TyId)> = snapshot.into_iter().filter(|((_, dy), a)| rt.dyns.contains(&dy.0) && !rt.vtables.contains(a)).map(|((t, dy), a)| (dy.0, a, t)).collect();
+                    let addrs = u.syms.vtables_of(|a, dy| rt.dyn_names.contains(dy) && !rt.vtables.contains(&a));
                     if rt_trace() {
-                        let mut by: crate::fxhash::HashMap<u32, usize> = Default::default();
-                        for (d, _, _) in &addrs {
-                            *by.entry(*d).or_default() += 1;
+                        let mut by: std::collections::BTreeMap<&str, usize> = Default::default();
+                        for (_, dy) in &addrs {
+                            *by.entry(dy.as_str()).or_default() += 1;
                         }
-                        for (d, n) in by {
-                            eprintln!("makepad-run rt: trait objects `{}` handed to real-time code: {} vtables followed", crate::typeck::ty_to_string(false, &u.prog, &u.tcx, TyId(d)), n);
+                        for (dy, n) in by {
+                            eprintln!("makepad-run rt: trait objects `{}` handed to real-time code: {} vtables followed", dy, n);
+                        }
+                    }
+                    let mut slots = Vec::new();
+                    for (a, _) in addrs {
+                        if rt.vtables.insert(a) {
+                            crate::syms::data_thunks(u, a, &mut slots);
                         }
                     }
                     // the values behind those vtables hold trait objects of their own
-                    let behind: Vec<TyId> = addrs.iter().map(|x| x.2).collect();
-                    rt.new_dyns.extend(realtime_value_dyns(u, &behind).into_iter().filter(|d| !rt.dyns.contains(d)));
-                    for (_, a, _) in addrs {
-                        rt.vtables.insert(a);
-                        crate::syms::data_thunks(u, a, &mut rt.todo);
-                    }
+                    rt.new_dyns.extend(realtime_value_dyns(u, &realtime_root_params(u, &slots, &[])).into_iter().filter(|d| !rt.dyns.contains(d)));
+                    rt.todo.extend(slots);
                 });
             }
             Next::Done => break true,
@@ -27860,19 +27866,25 @@ unsafe fn realtime_miss_caller(up: *mut Unit, id: u32, frames: &[u64]) {
     eprintln!("makepad-run rt: miss `{}` called by {} (caller in the real-time set: {})", short_name(&u.fns[id as usize].name), who, if inset { "yes" } else { "no" });
 }
 
-/// The parameter types of the real-time roots: fn items' and methods' (slots `roots`), closures'
-/// and fn pointers' (values of `types`). Their callers are not real-time code: what they pass in is
-/// made elsewhere, and so are the trait objects it holds.
+/// The parameter types of the real-time roots: fn items' and methods' (slots `roots`), the value a
+/// drop glue drops, closures' and fn pointers' (values of `types`). Their callers are not real-time
+/// code: what they pass in is made elsewhere, and so are the trait objects it holds. (A vtable's
+/// methods and drop glue: the concrete type behind it, also where the vtable came from the disk
+/// cache or the startup image and only its name tells the type.)
 fn realtime_root_params(u: &Unit, roots: &[u32], types: &[TyId]) -> Vec<TyId> {
     let mut out = Vec::new();
     for &id in roots {
         if (id as usize) >= u.fns.len() {
             continue;
         }
-        if let FnKey::Inst(d, args) = &u.fns[id as usize].key {
-            if let Some(sig) = u.tcx.fn_sig(&u.prog, *d) {
-                out.extend(sig.params.iter().map(|p| u.tcx.tys.subst_erasing_regions(*p, args)));
+        match &u.fns[id as usize].key {
+            FnKey::Inst(d, args) => {
+                if let Some(sig) = u.tcx.fn_sig(&u.prog, *d) {
+                    out.extend(sig.params.iter().map(|p| u.tcx.tys.subst_erasing_regions(*p, args)));
+                }
             }
+            FnKey::Glue(GLUE_DROP, t) => out.push(*t),
+            _ => {}
         }
     }
     for &t in types {
@@ -28094,13 +28106,15 @@ fn realtime_rir_refs(u: &Unit, f: &relax_backend::rir::Func, slots: &mut Vec<u32
     }
 }
 
-/// A vtable was made (Unit::vtable): one of a trait-object type real-time code calls through is
-/// compiled after the current request.
-fn realtime_vtable(dy: TyId, addr: u64) {
+/// A vtable was named (`name`, syms::VTABLE_NAME: lowered by Unit::vtable, linked from the disk
+/// cache, placed from the startup image): one of a trait-object type real-time code calls through
+/// is compiled after the current request. (The data lock not held.)
+pub(crate) fn realtime_vtable(addr: u64, name: &str) {
     if !RT_DYNS.load(Ordering::Acquire) {
         return;
     }
-    let known = REALTIME.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|r| r.dyns.contains(&dy.0) && !r.vtables.contains(&addr));
+    let Some((_, dy)) = crate::syms::vtable_name_parts(name) else { return };
+    let known = REALTIME.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|r| r.dyn_names.contains(dy) && !r.vtables.contains(&addr));
     if known {
         crate::zone_alloc::kept_with(|| RT_PENDING.lock().unwrap_or_else(|e| e.into_inner()).push(addr));
     }
@@ -28374,14 +28388,20 @@ pub(crate) fn realtime_drain() {
         return;
     }
     let u = unsafe { &*up };
-    with_rt(|rt| {
+    let held = with_rt(|rt| {
+        let mut methods = Vec::new();
         for &a in &addrs {
             if rt.vtables.insert(a) {
-                crate::syms::data_thunks(u, a, &mut roots);
+                crate::syms::data_thunks(u, a, &mut methods);
             }
         }
+        // the values behind those vtables hold trait objects of their own
+        let n = rt.new_dyns.len();
+        rt.new_dyns.extend(realtime_value_dyns(u, &realtime_root_params(u, &methods, &[])).into_iter().filter(|d| !rt.dyns.contains(d)));
+        roots.extend(methods);
+        rt.new_dyns.len() > n
     });
-    if !roots.is_empty() {
+    if !roots.is_empty() || held {
         unsafe { realtime_reach(up, roots, if slots > 0 { "new code" } else { "new vtable" }) };
     }
     RT_PENDING_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).drain(..slots);
