@@ -535,9 +535,13 @@ struct State {
     /// A large block handed out from the warm large list: its pages hold old bytes, so
     /// `alloc_zeroed` writes the zeros the pool's decommitted runs would have given.
     dirty: bool,
-    /// The live blocks this chunk had when, detached, it last gave its whole free granules back
-    /// (`trim_detached`; usize::MAX: not since it was last handed back).
+    /// Detached: the live blocks this chunk had when it last gave its whole free granules back
+    /// (`trim_detached`; usize::MAX: not since it was last handed back). Attached to a waiting
+    /// owner: the monitor's `idle_mark` of the chunk at its last pass (`settle_for_waiting_owner`).
     trim_live: usize,
+    /// Bytes of the carved part given back to the OS (`drop_free_granules`): their slots left the
+    /// free list until the chunk is released.
+    dropped: usize,
 }
 
 // A buddy free-chunk list supports both single chunks and contiguous large mappings.
@@ -1132,9 +1136,9 @@ impl Arena {
             return;
         }
         o.trim_seen = epoch;
-        let _s = lock(&h.state);
+        let mut s = lock(&h.state);
         let chunk = self.base.load(Ordering::Relaxed) + index * CHUNK;
-        if let Some(head) = self.drop_free_granules(index, chunk, o.stride, bump, o.free) {
+        if let Some(head) = self.drop_free_granules(index, &mut s, chunk, o.stride, bump, o.free) {
             o.free = head;
         }
     }
@@ -1150,7 +1154,8 @@ impl Arena {
         }
         s.trim_live = live;
         let chunk = self.base.load(Ordering::Relaxed) + index * CHUNK;
-        if let Some(head) = self.drop_free_granules(index, chunk, s.stride, s.bump, s.free) {
+        let (stride, bump, free) = (s.stride, s.bump, s.free);
+        if let Some(head) = self.drop_free_granules(index, s, chunk, stride, bump, free) {
             s.free = head;
         }
     }
@@ -1158,26 +1163,41 @@ impl Arena {
     /// owner is blocked in a wait, as the owner's own pass would: the blocks other threads freed
     /// into it are its free list's again, and, sparse, it gives its whole free pages back. A pool
     /// worker that did a job and now waits for the next kept what the others freed of its blocks
-    /// (Scope: 25-55 MB on the remote lists of waiting workers). The owner's `quiet` word makes it
-    /// safe: taken from QUIET_WAITING, the owner, waking, waits for it to be handed back.
-    unsafe fn settle_for_waiting_owner(&self, index: usize, h: &Chunk, epoch: usize) {
+    /// (Scope: 25-55 MB on the remote lists of waiting workers). A chunk that sat through a whole
+    /// epoch unchanged gives its whole free pages back at any fill, once: the waiting pool workers
+    /// of a Fab session held 155 MB of whole free pages in current chunks at least a quarter
+    /// live, which the sparse rule never trims. A busy owner changes its chunks between passes and
+    /// is never walked for it. A trim the program asks for (`trim`, `force`) walks it at once, at
+    /// any fill, unless it was walked at this very state. The owner's `quiet` word makes it safe:
+    /// taken from QUIET_WAITING, the owner, waking, waits for it to be handed back.
+    unsafe fn settle_for_waiting_owner(&self, index: usize, h: &Chunk, s: &mut State, epoch: usize, force: bool) {
         let q = h.owner_quiet.load(Ordering::Relaxed);
-        if !COMPILER || q == 0 || h.remote.load(Ordering::Relaxed) == 0 {
+        if !COMPILER || q == 0 {
             return;
         }
         let q = &*(q as *const AtomicU8);
         if q.compare_exchange(QUIET_WAITING, QUIET_SETTLING, Ordering::Acquire, Ordering::Relaxed).is_err() {
             return;
         }
-        self.drain(h, h.remote.swap(0, Ordering::Acquire));
+        if h.remote.load(Ordering::Relaxed) != 0 {
+            self.drain(h, h.remote.swap(0, Ordering::Acquire));
+        }
         let o = &mut *h.owned.get();
         let (live, bump) = (o.live.load(Ordering::Relaxed), o.bump.load(Ordering::Relaxed));
-        if bump >= OWNED_TRIM_MIN && live * o.stride * 4 < bump && o.trim_seen != epoch {
+        let mark = idle_mark(o.free, live, bump);
+        let sparse = live * o.stride * 4 < bump && o.trim_seen != epoch;
+        let idle = s.trim_live == mark;
+        let walked = s.trim_live == mark | 1;
+        if bump >= OWNED_TRIM_MIN && (sparse || idle || force && !walked) {
             o.trim_seen = epoch;
             let chunk = self.base.load(Ordering::Relaxed) + index * CHUNK;
-            if let Some(head) = self.drop_free_granules(index, chunk, o.stride, bump, o.free) {
+            if let Some(head) = self.drop_free_granules(index, s, chunk, o.stride, bump, o.free) {
                 o.free = head;
             }
+            // walked at this state: the next pass walks it only after it changed and sat again
+            s.trim_live = idle_mark(o.free, live, bump) | 1;
+        } else if s.trim_live & !1 != mark {
+            s.trim_live = mark;
         }
         q.store(QUIET_WAITING, Ordering::Release);
     }
@@ -1207,6 +1227,42 @@ impl Arena {
             } else if live != 0 {
                 self.trim_owned(c.index, live, epoch);
             }
+        }
+    }
+    /// A trim the program asked for (`trim`), on its own thread `t` inside this program heap: its
+    /// current chunks give their whole free pages back at any fill, as a waiting owner's do,
+    /// after taking what other threads freed into them; an emptied one goes back. Fab asks from
+    /// a pool worker at its quiet points, and its own chunks were the ones the trim skipped.
+    unsafe fn owner_trim(&self, t: &DomainTls) {
+        let epoch = self.trim_epoch.load(Ordering::Relaxed);
+        for class in 0..CLASSES {
+            let c = t.current.as_ptr().cast::<Current>().add(class).read();
+            if c.index == NONE {
+                continue;
+            }
+            let h = self.headers.get_unchecked(c.index);
+            if h.remote.load(Ordering::Relaxed) != 0 {
+                self.drain(h, h.remote.swap(0, Ordering::Acquire));
+            }
+            let o = &mut *h.owned.get();
+            let (live, bump) = (o.live.load(Ordering::Relaxed), o.bump.load(Ordering::Relaxed));
+            if live == 0 && bump > OWNED_KEEP_MAX {
+                self.release_emptied(c.index, class);
+                continue;
+            }
+            if bump < OWNED_TRIM_MIN {
+                continue;
+            }
+            let mut s = lock(&h.state);
+            if s.trim_live == idle_mark(o.free, live, bump) | 1 {
+                continue;
+            }
+            o.trim_seen = epoch;
+            let chunk = self.base.load(Ordering::Relaxed) + c.index * CHUNK;
+            if let Some(head) = self.drop_free_granules(c.index, &mut s, chunk, o.stride, bump, o.free) {
+                o.free = head;
+            }
+            s.trim_live = idle_mark(o.free, live, bump) | 1;
         }
     }
     /// The thread's current chunk of `class` has no live block left and a large carved part: it
@@ -1389,12 +1445,12 @@ impl Arena {
         let epoch = self.trim_epoch.fetch_add(1, Ordering::Relaxed) + 1;
         let mut done = 0;
         for (index, h) in self.headers.iter().enumerate() {
-            let s = lock(&h.state);
+            let mut s = lock(&h.state);
             if s.committed == 0 || s.released {
                 continue;
             }
             if s.attached && s.stride != 0 {
-                unsafe { self.settle_for_waiting_owner(index, h, epoch) };
+                unsafe { self.settle_for_waiting_owner(index, h, &mut s, epoch, false) };
             }
             if !os::THP {
                 continue;
@@ -1413,7 +1469,9 @@ impl Arena {
             // a thread's current chunk is hot whatever is live in it at this moment (a frame's
             // temporaries come and go there): carved half way, it is dense enough -- unless its
             // live blocks fill under a quarter of what it carved: that one gives its free pages
-            // back (`owned_tick`), and a huge page would keep them
+            // back (`owned_tick`), and a huge page would keep them. A chunk that gave pages back
+            // never gets one: the collapse would fill those pages again, resident, while their
+            // slots stay off the free list until the chunk is released.
             let attached = s.attached && COMPILER;
             let (dense, sparse) = if attached {
                 // the owner thread updates these without the lock: a racy, approximate read
@@ -1424,7 +1482,7 @@ impl Arena {
             } else {
                 (h.live.load(Ordering::Relaxed) * s.stride >= CHUNK / 2, h.live.load(Ordering::Relaxed) * s.stride < CHUNK / 8)
             };
-            if !huge && s.committed == CHUNK && dense && done < budget {
+            if !huge && s.committed == CHUNK && dense && s.dropped == 0 && done < budget {
                 h.huge.store(true, Ordering::Relaxed);
                 unsafe { os::huge_pages(address, CHUNK, true) };
                 done += 1;
@@ -2062,6 +2120,7 @@ impl Arena {
                 bytes: 0,
                 dirty: warm_large.is_some(),
                 trim_live: usize::MAX,
+                dropped: 0,
             };
             h.live.store(1, Ordering::Relaxed);
             h.old.store(false, Ordering::Relaxed);
@@ -2352,12 +2411,23 @@ impl Arena {
         w.bytes -= e.1;
         Some((e.0, e.1))
     }
-    /// Decommits the warm chunks and returns them to the pool (settle's heap trim, tests).
+    /// Decommits the warm chunks and returns them to the pool (settle's heap trim, the program's
+    /// `malloc_trim`, tests). A program heap's current chunks give their whole free pages back at
+    /// any fill: the calling thread's own and those of the threads blocked in a wait (the others
+    /// are in use). Only the lists were trimmed before: Fab's trims at its quiet points gave back
+    /// 13-49 MB each while its waiting pool workers' chunks held 894 MB resident for 310 MB live.
     pub fn trim(&self) {
         // the calling thread's own current chunks go back first (the lists are what the trim walks)
         if COMPILER && !self.dynamic {
             self.detach_thread();
             let _ = HAND_SEEN.try_with(|e| e.set(HAND_BACK.fetch_add(1, Ordering::Relaxed) + 1));
+        }
+        if COMPILER && self.dynamic {
+            let _ = DOMAIN.try_with(|t| {
+                if std::ptr::eq(t.arena.get(), self) {
+                    unsafe { self.owner_trim(t) };
+                }
+            });
         }
         self.warm_drain();
         // burst arena too: blocks that outlived their compile pin the chunks they were carved
@@ -2412,20 +2482,29 @@ impl Arena {
     /// Gives the OS every granule of a small chunk whose slots are all free. Such a
     /// granule's slots leave the free list for good (the chunk stays attached to its live blocks and
     /// is released whole when they are gone); the rest of the free list is relinked. What malloc_trim
-    /// does for the system heap.
+    /// does for the system heap. A program heap's chunk attached to a thread blocked in a wait is
+    /// settled for it (`settle_for_waiting_owner`, at any fill).
     fn release_free_pages(&self) {
         let base = self.base.load(Ordering::Relaxed);
         if base == 0 {
             return;
         }
+        let epoch = self.trim_epoch.load(Ordering::Relaxed);
         for index in 0..N {
             let h = &self.headers[index];
             let mut s = lock(&h.state);
-            if (COMPILER && s.attached) || s.stride == 0 || s.committed == 0 || h.live.load(Ordering::Relaxed) == 0 || s.free == 0 {
+            if COMPILER && s.attached {
+                if self.dynamic && s.stride != 0 && s.committed != 0 && !s.released {
+                    unsafe { self.settle_for_waiting_owner(index, h, &mut s, epoch, true) };
+                }
+                continue;
+            }
+            if s.stride == 0 || s.committed == 0 || h.live.load(Ordering::Relaxed) == 0 || s.free == 0 {
                 continue;
             }
             let chunk = base + index * CHUNK;
-            if let Some(head) = unsafe { self.drop_free_granules(index, chunk, s.stride, s.bump, s.free) } {
+            let (stride, bump, free) = (s.stride, s.bump, s.free);
+            if let Some(head) = unsafe { self.drop_free_granules(index, &mut s, chunk, stride, bump, free) } {
                 s.free = head;
             }
         }
@@ -2433,8 +2512,9 @@ impl Arena {
     /// Releases the granules of chunk `index` (at `chunk`, `carved` bytes carved in slots of
     /// `stride`) whose slots are all on the free list from `head`, and returns the relinked list of
     /// the other free slots; None when no granule was whole. The caller owns the list (the chunk's
-    /// lock for a detached chunk, the owner thread for its current one) and holds the chunk's lock.
-    unsafe fn drop_free_granules(&self, index: usize, chunk: usize, stride: usize, carved: usize, head: usize) -> Option<usize> {
+    /// lock for a detached chunk, the owner thread for its current one) and holds the chunk's lock,
+    /// whose `dropped` count the released bytes join.
+    unsafe fn drop_free_granules(&self, index: usize, s: &mut State, chunk: usize, stride: usize, carved: usize, head: usize) -> Option<usize> {
         let nslots = carved / stride;
         let mut free = [0u64; (CHUNK / 16) / 64];
         let mut p = head;
@@ -2474,6 +2554,7 @@ impl Arena {
         if released == 0 {
             return None;
         }
+        s.dropped += released;
         self.unhuge(index, chunk, CHUNK);
         // pass 2: relink the free slots that do not touch a dropped granule
         let dropped = |k: usize| {
@@ -2497,6 +2578,11 @@ impl Arena {
         let c = class_for(n);
         (c, STRIDE[c])
     }
+}
+/// A current chunk's state as the monitor sees it between passes (its free list's head, live
+/// blocks, bump), bit 0 clear: the same mark at two passes means its owner did not touch it.
+fn idle_mark(free: usize, live: usize, bump: usize) -> usize {
+    (free ^ live.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ bump.rotate_left(32)) & !1
 }
 impl Drop for Arena {
     fn drop(&mut self) {

@@ -649,29 +649,72 @@ mod tests {
         }
     }
 
-    /// The program's `malloc_trim` trims the heap of the domain it runs in.
+    /// The program's `malloc_trim` trims the heap of the domain it runs in: the warm runs, and
+    /// the whole free pages of the current chunks, at any fill, of the calling thread and of a
+    /// thread blocked in a wait (the trim skipped both: Fab's trims gave back 13-49 MB each).
     #[cfg(target_os = "linux")]
     #[test]
     fn program_malloc_trim_trims_the_domain_heap() {
         symbol(b"relax_alloc");
         let heap = DomainHeap::new().unwrap();
+        let addr = &*heap as *const DomainHeap as usize;
+        // half of a class's blocks freed, the low half: the current chunk is half live (not
+        // sparse) and its low pages are whole free pages
+        let half_free = || unsafe {
+            let blocks: Vec<usize> = (0..6000).map(|_| program_alloc(200, 8) as usize).collect();
+            for &p in &blocks[..3000] {
+                program_dealloc(p as *mut u8, 200, 8);
+            }
+            for &p in &blocks[3000..] {
+                std::ptr::write_bytes(p as *mut u8, 7, 200);
+            }
+            blocks[3000..].to_vec()
+        };
+        let still = |blocks: &[usize]| unsafe {
+            for &p in blocks {
+                assert!(std::slice::from_raw_parts(p as *const u8, 200).iter().all(|b| *b == 7), "a live block kept its bytes");
+                program_dealloc(p as *mut u8, 200, 8);
+            }
+        };
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let (ready, waiting) = std::sync::mpsc::channel::<()>();
+        let owner = std::thread::spawn(move || unsafe {
+            enter(addr as *const DomainHeap);
+            let live = half_free();
+            before_wait();
+            ready.send(()).unwrap();
+            wait.recv().unwrap();
+            after_wait();
+            still(&live);
+            enter(std::ptr::null());
+        });
+        waiting.recv().unwrap();
         unsafe {
             enter(&*heap);
             let p = program_alloc(600_000, 8);
             std::ptr::write_bytes(p, 0xAB, 600_000);
+            let mine = half_free();
             let committed = heap.stats().1;
             program_dealloc(p, 600_000, 8);
             assert_eq!(heap.stats().1, committed, "the run stays committed (warm)");
+            let kept = heap.states()[24];
+            assert!(kept >= 2 * (512 << 10), "both current chunks hold whole free pages: {kept}");
             let trim = symbol(b"malloc_trim").expect("malloc_trim is the program's");
             let trim: unsafe extern "C" fn(usize) -> i32 = std::mem::transmute(trim);
             trim(0);
             assert!(heap.stats().1 < committed, "the program's malloc_trim decommits the warm run");
+            let left = heap.states()[24];
+            assert!(left < 64 << 10, "the caller's and the waiting thread's current chunks gave their free pages back: {left} of {kept}");
+            still(&mine);
             enter(std::ptr::null());
         }
+        go.send(()).unwrap();
+        owner.join().unwrap();
     }
 
     /// Only dense chunks of a program heap get huge pages (`densify`): a chunk half full of live
-    /// blocks is marked once, a sparse one never, and one that turned sparse loses its mark.
+    /// blocks is marked once, a sparse one never, one that turned sparse loses its mark, and one
+    /// that gave pages back is never marked again.
     #[test]
     fn densify_marks_dense_chunks_only() {
         symbol(b"relax_alloc");
@@ -692,7 +735,14 @@ mod tests {
                 assert_eq!(first, 0);
             }
             assert_eq!(again, 0, "a marked chunk is not collapsed twice");
-            for p in dense {
+            // the dense chunk, still dense, gives the pages of its first 300 blocks back: it loses
+            // its mark and gets none again (a collapse would make those pages resident again)
+            for &p in &dense[..300] {
+                program_dealloc(p, 1000, 8);
+            }
+            heap.inner.arena.trim();
+            assert_eq!(heap.inner.arena.densify(64), 0, "a chunk that gave pages back gets no huge page");
+            for p in dense.into_iter().skip(300) {
                 program_dealloc(p, 1000, 8);
             }
             program_dealloc(sparse, 48, 8);
