@@ -4566,7 +4566,7 @@ fn summary_inner(why: &str) {
                 }
                 if c.mode == crate::cache::Mode::Verify {
                     let st = &c.stats;
-                    verbose!("makepad-run cache: verify: {} same, {} DIFFERENT", st.verify_same, st.verify_diff);
+                    verbose!("makepad-run cache: verify: {} same, {} DIFFERENT, {} of another tier", st.verify_same, st.verify_diff, st.verify_other_tier);
                 }
             }
         }

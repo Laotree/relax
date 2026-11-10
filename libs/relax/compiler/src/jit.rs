@@ -9137,10 +9137,14 @@ unsafe fn ready_code_locked(up: *mut Unit, id: u32) -> Option<u64> {
             if let Ok((fresh, fmap, relocs)) = compile_fn(up, id) {
                 let u = &mut *up;
                 let mut c = u.cache.take();
-                let same = c.as_mut().map_or(true, |c| c.verify_entry(u, id, &fresh, &relocs));
+                let same = c.as_mut().map_or(Some(true), |c| c.verify_entry(u, id, &fresh, &relocs));
                 u.cache = c;
                 if let Some(c) = u.cache.as_mut() {
-                    if same { c.stats.verify_same += 1 } else { c.stats.verify_diff += 1 }
+                    match same {
+                        Some(true) => c.stats.verify_same += 1,
+                        Some(false) => c.stats.verify_diff += 1,
+                        None => c.stats.verify_other_tier += 1,
+                    }
                 }
                 return Some(install_compiled(up, id, &fresh, fmap, &relocs, true));
             }
