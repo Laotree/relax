@@ -20448,14 +20448,18 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 }
             }
         }
-        // the calls O3 left (MAKEPAD_RUN_O3_TRACE): (callee slot, in a cold block)
+        // the calls O3 left (MAKEPAD_RUN_O3_TRACE): (callee slot, in a cold block). A guarded inline
+        // copy's slow call is not one of them: the callee was inlined, and that call runs only once
+        // a live patch replaced it.
         let mut left: Vec<(u32, bool, u8)> = Vec::new();
         if tier1_trace() {
-            for b in &func.blocks {
+            for (bi, b) in func.blocks.iter().enumerate() {
                 let cold = matches!(b.term, relax_backend::rir::Term::Unreachable | relax_backend::rir::Term::Resume);
-                for i in &b.insts {
+                for (ii, i) in b.insts.iter().enumerate() {
                     if let relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) = i {
-                        left.push((*c, cold, get(*c).map_or(255, |x| x.1)));
+                        if !func.guard_call(bi, ii) {
+                            left.push((*c, cold, get(*c).map_or(255, |x| x.1)));
+                        }
                     }
                 }
             }
