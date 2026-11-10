@@ -23,10 +23,14 @@ impl Speak for Dog {
 #[inline]
 pub fn leaf() -> u32 { 100 } // EDIT inline
 
+/// The size of `T` as code instantiated with `T` has it (no constant the caller folded).
+#[inline(never)]
+pub fn size_in<T>(v: &[T]) -> usize { std::mem::size_of::<T>() * v.len() }
+
 pub fn local_size() -> usize {
     struct Local { a: u8 } // EDIT local
-    let l = Local { a: 1 };
-    std::mem::size_of::<Local>() + l.a as usize
+    let l = vec![Local { a: 1 }];
+    size_in(&l) + l[0].a as usize
 }
 
 pub fn untouched_user() -> u32 { stable_before() + 1 }
