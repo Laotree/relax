@@ -3932,8 +3932,12 @@ impl Cache {
             return true;
         }
         let Some(key) = self.manifest_key(root) else { self.manifest_done = true; self.manifest_len = order.len(); return true };
-        // what earlier spills of this run wrote: the image takes those entries too
-        self.index_written();
+        // what earlier spills of this run wrote: the image takes those entries too (mid-run, as the
+        // cache writer opened their stores before this request: open_written)
+        if !self.index_written(crate::preempt::is_stopped()) {
+            if self.verbose { eprintln!("makepad-run cache: startup manifest waits for the stores a spill wrote since this write began"); }
+            return false;
+        }
         crate::run::yield_section("manifest keys");
         let mut list: Vec<(Vec<u8>, u128)> = Vec::with_capacity(order.len());
         let mut before_present = 0;
@@ -4232,41 +4236,91 @@ impl Spill {
 /// first warm run rewrote the whole image (~435 ms on the owner) and started unprelinked.
 static WRITTEN: relax_session::sync::Mutex<Vec<(PathBuf, PathBuf, Vec<u128>)>> = relax_session::sync::Mutex::new(Vec::new());
 
-impl Cache {
-    /// Indexes the code and data entries this run's spills wrote to this cache's stores
-    /// (WRITTEN): the store file is opened again (mapped) and its new entries replace what the
-    /// index had for their keys, as the file's own index does.
-    fn index_written(&mut self) {
-        let mine: Vec<(PathBuf, Vec<u128>)> = {
+/// The stores of WRITTEN's entries, opened and searched off the owner thread (`open_written`):
+/// (cache dir, store path, the store, the keys WRITTEN named in it, (key, entry) of the ones it holds).
+static OPENED: relax_session::sync::Mutex<Vec<(PathBuf, PathBuf, std::sync::Arc<Store>, Vec<u128>, Vec<(u128, u32)>)>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// Opens the stores this run's spills wrote to the cache at `dir` (WRITTEN) and finds the
+/// entries they wrote, for `Cache::index_written`. On the cache writer, not the owner thread: an
+/// open takes the store file's shared lock and reads its index (a mid-run write on a loaded box
+/// held the owner 1.5 s here, while program threads' lazy compiles queued behind it). A store
+/// opened before is opened again once, for its earlier keys and its new ones.
+pub fn open_written(dir: &std::path::Path) {
+    crate::zone_alloc::kept_with(|| {
+        // (process state, in the kept heap: what stays is another cache's, kept as it was)
+        let mut paths: Vec<(PathBuf, Vec<u128>)> = Vec::new();
+        {
             let mut w = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-            // (what stays is another cache's, kept as it was: the list lives in the kept heap)
-            let mut mine = Vec::new();
             let mut i = 0;
             while i < w.len() {
-                if w[i].0 == self.dir {
-                    let (_, path, keys) = &w[i];
-                    mine.push((path.clone(), keys.clone()));
-                    crate::zone_alloc::kept_with(|| drop(w.swap_remove(i)));
+                if w[i].0 == dir {
+                    let (_, path, keys) = w.swap_remove(i);
+                    match paths.iter_mut().find(|p| p.0 == path) {
+                        Some(p) => p.1.extend(keys),
+                        None => paths.push((path, keys)),
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        if paths.is_empty() { return; }
+        {
+            let mut o = OPENED.lock().unwrap_or_else(|e| e.into_inner());
+            let mut i = 0;
+            while i < o.len() {
+                match paths.iter_mut().find(|p| o[i].0 == dir && p.0 == o[i].1) {
+                    Some(p) => { let (_, _, _, keys, _) = o.swap_remove(i); p.1.extend(keys); }
+                    None => i += 1,
+                }
+            }
+        }
+        for (path, keys) in paths {
+            let Some(st) = Store::open(&path) else { continue };
+            let want: HashSet<u128> = keys.iter().copied().collect();
+            let found: Vec<(u128, u32)> = st.index.iter().enumerate().filter_map(|(e, ix)| { let key = ix.key; want.contains(&key).then_some((key, e as u32)) }).collect();
+            OPENED.lock().unwrap_or_else(|e| e.into_inner()).push((dir.to_path_buf(), path, std::sync::Arc::new(st), keys, found));
+        }
+    });
+}
+
+impl Cache {
+    /// Indexes the code and data entries this run's spills wrote to this cache's stores, as
+    /// `open_written` found them: their entries replace what the index had for their keys, as the
+    /// file's own index does. `open`: the stores not opened yet are opened here first (the exit:
+    /// nothing waits for the owner thread then). false: a spill wrote to this cache since the last
+    /// `open_written` (a mid-run startup image waits for the next write, which opens it).
+    fn index_written(&mut self, open: bool) -> bool {
+        if open { open_written(&self.dir); }
+        let mine: Vec<(std::sync::Arc<Store>, Vec<(u128, u32)>)> = crate::zone_alloc::kept_with(|| {
+            let mut o = OPENED.lock().unwrap_or_else(|e| e.into_inner());
+            let mut mine = Vec::new();
+            let mut i = 0;
+            while i < o.len() {
+                if o[i].0 == self.dir {
+                    let (_, _, st, _, found) = o.swap_remove(i);
+                    mine.push((st, found));
                 } else {
                     i += 1;
                 }
             }
             mine
-        };
-        for (path, keys) in mine {
-            let Some(st) = Store::open(&path) else { continue };
-            let keys: HashSet<u128> = keys.into_iter().collect();
+        });
+        for (st, found) in &mine {
+            if found.is_empty() { continue; }
             let si = self.stores.len() as u32;
-            let mut n = 0;
-            for (e, ix) in st.index.iter().enumerate() {
-                let key = ix.key;
-                if keys.contains(&key) {
-                    self.index.insert(key, (si, e as u32));
-                    n += 1;
-                }
+            for &(key, e) in found {
+                self.index.insert(key, (si, e));
             }
-            if n != 0 { self.stores.push(std::sync::Arc::new(st)); }
+            self.stores.push(st.clone());
         }
+        crate::zone_alloc::kept_with(|| drop(mine));
+        !WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|w| w.0 == self.dir)
+    }
+
+    /// The directory of this cache's stores
+    pub fn dir(&self) -> &std::path::Path {
+        &self.dir
     }
 }
 
@@ -8146,6 +8200,34 @@ mod data_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A mid-run write indexes the code its spills wrote for the startup manifest, but the owner
+    /// thread never opens their stores: the cache writer opens them first (`open_written`), and an
+    /// unopened write makes the manifest wait. A store written again after it was opened is
+    /// opened again for its earlier keys and its new ones.
+    #[test]
+    fn written_code_is_indexed_only_from_stores_opened_off_the_owner() {
+        isolated_test!(written_code_is_indexed_only_from_stores_opened_off_the_owner);
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let (root, prog, _) = front_fixture(sess, "written");
+        let u = Unit::new(prog, crate::tcx::Tcx::new(), 0);
+        let mut c = open_test_cache(&u, &root);
+        let (first, second) = (0x51u128 << 64 | 1, 0x52u128 << 64 | 2);
+        let spill = |c: &mut Cache, key: u128| {
+            c.pending.push((0, NewEntry { key, kind: KIND_CODE, payload: vec![7; 16] }));
+            c.spill_take().unwrap().write().unwrap();
+        };
+        spill(&mut c, first);
+        assert!(!c.index_written(false), "an unopened write must make the manifest wait");
+        assert!(!c.has_index(&first), "the owner must not open a written store itself");
+        open_written(&c.dir);
+        spill(&mut c, second);
+        open_written(&c.dir);
+        assert!(c.index_written(false), "every write was opened");
+        assert!(c.has_index(&first) && c.has_index(&second), "a store opened again keeps its earlier keys");
+        drop(c);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn front_record_rejects_unexplained_files_and_metadata_changes() {
         isolated_test!(front_record_rejects_unexplained_files_and_metadata_changes);
@@ -9801,6 +9883,7 @@ pub(crate) unsafe fn reset_statics() {
     warm_count::reset_statics();
     reset(&FRONT_USED, relax_session::sync::Mutex::new(Vec::new()));
     reset(&WRITTEN, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&OPENED, relax_session::sync::Mutex::new(Vec::new()));
     reset(&TRACE, relax_session::sync::Mutex::new(None));
     reset(&FRONT_GRAPH_WRITES, relax_session::sync::Mutex::new(Vec::new()));
     reset(&DEFERRED_FRONT, relax_session::sync::Mutex::new(Vec::new()));

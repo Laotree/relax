@@ -4223,6 +4223,15 @@ fn collected_skip(why: &'static str) {
     if *l != why { *l = why; verbose!("makepad-run collected: not recorded: {why}"); }
 }
 
+/// The run cache's directory, as the last mid-run write's request saw it: the next write opens
+/// the stores its spills wrote there before its own request (cache.rs open_written)
+static MID_CACHE_DIR: relax_session::sync::Mutex<Option<std::path::PathBuf>> = relax_session::sync::Mutex::new(None);
+
+fn set_mid_cache_dir(dir: &std::path::Path) {
+    let mut d = MID_CACHE_DIR.lock().unwrap_or_else(|e| e.into_inner());
+    if d.as_deref() != Some(dir) { crate::zone_alloc::kept_with(|| *d = Some(dir.to_path_buf())); }
+}
+
 // the front images' line once the program presented (a process ended by its framework
 // never prints the exit summary): files mapped, images not matching, arrays copied back
 static FRONT_REPORTED: AtomicBool = AtomicBool::new(false);
@@ -4248,6 +4257,13 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     // the deferred cache records in bounded publishes (a program thread waits for one batch);
     // the request below holds only what installs add meanwhile
     jit::drain_records_bounded();
+    // the stores earlier spills wrote, opened here when the startup manifest may be recorded below
+    // (cache.rs open_written): its image takes their entries, and the request only indexes them
+    if jit::FIRST_PRESENT.load(Ordering::Acquire) && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed)
+        && (!MID_MANIFEST_DONE.load(Ordering::Relaxed) || jit::QUIT_SEEN.load(Ordering::Relaxed)) {
+        let dir = MID_CACHE_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(dir) = dir { crate::cache::open_written(&dir); }
+    }
     let mut parts = [0f64; 4];
     let mut n_imgs = 0;
     // the files whose front images this write holds: the collected program below is recorded
@@ -4262,6 +4278,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     yield_section("mid write");
     let spill = {
         let u = unsafe { &mut *up };
+        if let Some(c) = u.cache.as_ref() { set_mid_cache_dir(c.dir()); }
         u.flush_cache_records();
         parts[3] = held.elapsed().as_secs_f64() * 1e3;
         probe.tick("records");
@@ -5037,6 +5054,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&MID_COLLECTED_TRIED, AtomicBool::new(false));
     reset(&MID_MANIFEST_DONE, AtomicBool::new(false));
     reset(&MID_MANIFEST_LEN, std::sync::atomic::AtomicUsize::new(0));
+    reset(&MID_CACHE_DIR, relax_session::sync::Mutex::new(None));
     reset(&MAIN_START_WALL, AtomicU64::new(0));
     reset(&QUIT_WRITE_DONE, AtomicBool::new(false));
     reset(&ONCE, AtomicBool::new(false));
