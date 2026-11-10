@@ -19,9 +19,11 @@ SCENARIOS = {
     # a fn body: the fn recompiles; nothing else in its file or above it does
     "body": ("fn speak(&self) -> u32 { 10 } // EDIT body", "fn speak(&self) -> u32 { 11 } // EDIT body",
              {3: 11}, ["speak"], ["unrelated", "use_leaf", "use_shape", "use_const", "use_loud", "stable_before", "untouched_user", "stable_after"]),
-    # an inlined callee's body: the code that inlined it (main's) is not linked again
-    "inline": ("pub fn leaf() -> u32 { 100 } // EDIT inline", "pub fn leaf() -> u32 { 200 } // EDIT inline",
-               {0: 201}, [], []),
+    # a callee's body: the callee recompiles and its caller gets the new value. (The callers here run
+    # at the base tier, which inlines no user-crate code: entries that inlined an edited callee are
+    # cache_warm_inlined_edit's.)
+    "callee": ("pub fn leaf() -> u32 { 100 } // EDIT callee", "pub fn leaf() -> u32 { 200 } // EDIT callee",
+               {0: 201}, ["leaf"], []),
     # a struct layout: its users recompile
     "layout": ("pub struct Shape { pub a: u32, pub b: u32 } // EDIT layout", "pub struct Shape { pub a: u32, pub b: u32, pub c: u64 } // EDIT layout",
                {1: 16}, ["use_shape"], []),
@@ -39,8 +41,8 @@ SCENARIOS = {
               {9: 9}, ["local_size"], ["unrelated", "use_shape", "use_const", "stable_before", "untouched_user", "stable_after"]),
     # a struct layout in the app (the top crate): the app's code recompiles, the dependency
     # crate below it does not
-    "applayout": ("struct Pad { a: u32 } // EDIT applayout", "struct Pad { a: u32, b: u64 } // EDIT applayout",
-                  {10: 24}, ["use_pad"], ["stable_before", "untouched_user", "stable_after", "local_size", "speak"]),
+    "applayout": ("struct Pad { a: u32 } // EDIT applayout", "struct Pad { a: u128 } // EDIT applayout",
+                  {10: 32}, ["use_pad"], ["stable_before", "untouched_user", "stable_after", "local_size", "speak"]),
     # content inside a macro invocation that expands to an item fn / a static / a fn body: the code it
     # feeds follows the invocation's tokens, the rest of the file stays linked
     "macro_item": ("mk_fn!(from_mac = 7); // EDIT macro_item", "mk_fn!(from_mac = 8); // EDIT macro_item",
@@ -100,12 +102,10 @@ def scenario(relax, name):
         cache = os.path.join(tmp, "c")
         os.mkdir(cache, 0o700)
         want = list(BASE)
-        # tier 0 inlines (into main) only past the startup phase
-        tier0 = {"MAKEPAD_RUN_STARTUP_PHASE": "0"} if name == "inline" else None
-        rc, res, out, cold = run(relax, tmp, cache, "1-cold", tier0)
+        rc, res, out, cold = run(relax, tmp, cache, "1-cold")
         if rc != 0 or res != want:
             bad.append(f"cold run: exit {rc}, result {res}, want {want}")
-        rc, res, _, warm = run(relax, tmp, cache, "2-warm", tier0)
+        rc, res, _, warm = run(relax, tmp, cache, "2-warm")
         if rc != 0 or res != want:
             bad.append(f"warm run: exit {rc}, result {res}")
         for f in recompiled + kept:
@@ -117,7 +117,7 @@ def scenario(relax, name):
         open(lib, "w").write(text.replace(old, new))
         for i, v in changes.items():
             want[i] = v
-        rc, res, _, edit = run(relax, tmp, cache, "3-edit", tier0)
+        rc, res, _, edit = run(relax, tmp, cache, "3-edit")
         if rc != 0 or res != want:
             bad.append(f"edit run: exit {rc}, result {res}, want {want}")
         for f in recompiled:
@@ -126,15 +126,6 @@ def scenario(relax, name):
         for f in kept:
             if status(edit, f) != "hit":
                 bad.append(f"edit run did not link unchanged {f} ({status(edit, f)})")
-        if name == "inline":
-            # main's code inlined use_leaf and leaf: the warm run linked it; after the edit of leaf
-            # its certificate refuses it (and the result is the edited one)
-            if not any("hit" in w for k, w in warm.items() if k.endswith("::main")):
-                bad.append("the warm run did not link main (the test needs it)")
-            if not any("cert:stale" in w for k, w in edit.items() if k.endswith(("::main", "use_leaf"))):
-                bad.append("edit run: no entry that inlined leaf was refused")
-            if any("hit" in w for k, w in edit.items() if k.endswith(("::main", "use_leaf"))):
-                bad.append("edit run linked code that inlined the old leaf")
         rc, res, _, again = run(relax, tmp, cache, "4-warm")
         if rc != 0 or res != want:
             bad.append(f"warm run after the edit: exit {rc}, result {res}")

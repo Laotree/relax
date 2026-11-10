@@ -21,7 +21,7 @@ impl Speak for Dog {
 }
 
 #[inline]
-pub fn leaf() -> u32 { 100 } // EDIT inline
+pub fn leaf() -> u32 { 100 } // EDIT callee
 
 /// The size of `T` as code instantiated with `T` has it (no constant the caller folded).
 #[inline(never)]
