@@ -230,7 +230,8 @@ const LEDGER_KEY: u128 = 0;
 // with the trait-object types its code calls through; 31: it no longer does (jit.rs realtime reach
 // follows the trait objects its roots are passed, not every one its code calls through). 32: a
 // closure is named by its owner's closure ordinal and its text (closure_ordinal), not by its
-// file version and position, in slot keys and types alike.
+// file version and position, in slot keys and types alike; a block-scoped item by its fn and
+// its ordinal there (stable::block_place), not its offset.
 const ENTRY_VERSION: u32 = 32;
 /// the level of a code entry's code (its tier byte)
 const TIER_O1: u8 = 0;
@@ -4740,8 +4741,9 @@ fn prim_of(c: u8) -> Option<crate::program::Prim> {
 }
 
 /// A definition's key: its parent's key (the crate's identity at the root), name, kind,
-/// defining file and, for an item its path does not name (block-scoped, `const _`), its offset
-/// there -- the identity stable::def_ident gives TypeId (memoized in `memo`; parents are in
+/// defining file and, for an item its path does not name (block-scoped, `const _`), its place
+/// there (stable::block_place: its fn's key and its ordinal) -- the identity stable::def_ident
+/// gives TypeId (memoized in `memo`; parents are in
 /// the same crate).
 fn def_key_in(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, crate_ident: &[u128], memo: &mut HashMap<DefId, u128>, files: &mut HashMap<u32, u128>, d: DefId) -> u128 {
     if let Some(&k) = memo.get(&d) {
@@ -4755,10 +4757,15 @@ fn def_key_in(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, crate_ident
     h.str(prog.syms.str(def.name));
     h.u32(def_kind_code(&def.kind));
     h.u128(fk);
-    // the item's offset only when its path does not name it -- the identity TypeId uses
+    // the item's place only when its path does not name it -- the identity TypeId uses
     // (stable::def_ident): a key and the TypeId folded into its code never disagree
-    if crate::stable::ident_has_offset(prog, d) {
-        h.u32(prog.files.get(def.file as usize).and_then(|f| f.ast.items.get(def.item.0 as usize)).map_or(u32::MAX, |it| it.lo));
+    if crate::stable::ident_has_place(prog, d) {
+        let (owner, ord) = crate::stable::block_place(prog, d);
+        if let Some(o) = owner {
+            h.str("block of");
+            h.u128(def_key_in(prog, tcx, crate_ident, memo, files, o));
+        }
+        h.u32(ord);
     }
     // not def.sub: module / impl indices are global to the program (they differ per app).
     // Impls (derived ones share their type's item) by what they implement for what.
