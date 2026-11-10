@@ -32,9 +32,11 @@ SCENARIOS = {
     # the rest of its file stay linked
     "static": ("pub static LEVEL: u32 = 5; // EDIT static", "pub static LEVEL: u32 = 50; // EDIT static",
                {8: 51}, [], ["use_static", "unrelated", "use_shape", "use_const", "stable_before", "untouched_user", "stable_after"]),
-    # a struct defined in a fn body: the code of its type (size_of::<Local>) follows the body
-    "local": ("    struct Local { a: u8 } // EDIT local", "    struct Local { a: u8, b: u64 } // EDIT local",
-              {9: 17}, ["local_size"], ["unrelated", "use_shape", "use_const", "stable_before", "untouched_user", "stable_after"]),
+    # a struct defined in a fn body, its field retyped: its identity (its fn and its place among
+    # that body's items) stays, and the code instantiated with it (size_in::<Local>, Vec<Local>'s)
+    # must still take the new layout -- its key has the holder body's text -- never the old one
+    "local": ("    struct Local { a: u8 } // EDIT local", "    struct Local { a: u64 } // EDIT local",
+              {9: 9}, ["local_size"], ["unrelated", "use_shape", "use_const", "stable_before", "untouched_user", "stable_after"]),
     # a struct layout in the app (the top crate): the app's code recompiles, the dependency
     # crate below it does not
     "applayout": ("struct Pad { a: u32 } // EDIT applayout", "struct Pad { a: u32, b: u64 } // EDIT applayout",

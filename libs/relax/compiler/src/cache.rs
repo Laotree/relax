@@ -228,8 +228,11 @@ const LEDGER_KEY: u128 = 0;
 // offsets of one block link to one block. 29: image symbol and closure-parent key spans (image.rs
 // skip_*) follow the encoding again; images written before cut keys short. 30: a code entry ended
 // with the trait-object types its code calls through; 31: it no longer does (jit.rs realtime reach
-// follows the trait objects its roots are passed, not every one its code calls through).
-const ENTRY_VERSION: u32 = 31;
+// follows the trait objects its roots are passed, not every one its code calls through). 32: a
+// closure is named by its owner's closure ordinal and its text (closure_ordinal), not by its
+// file version and position, in slot keys and types alike; a block-scoped item by its fn and
+// its ordinal there (stable::block_place), not its offset.
+const ENTRY_VERSION: u32 = 32;
 /// the level of a code entry's code (its tier byte)
 const TIER_O1: u8 = 0;
 const TIER_O3: u8 = 1;
@@ -862,6 +865,9 @@ pub struct Cache {
     /// expression has, for expressions this run has not parsed yet: checked when one is
     /// decoded again and when the closure is built (jit: closure_identity_ok)
     closure_fps: HashMap<(u32, u32), u64>,
+    /// (item, its file) -> the item's closures in order (program::closure_exprs): what an
+    /// owner-local closure identity's ordinal counts (closure_ordinal, closure_at)
+    closure_ords: HashMap<(DefId, u32), std::sync::Arc<[u32]>>,
     pub stats: CacheStats,
     pub why_unencodable: HashMap<&'static str, u64>,
     last_why: &'static str,
@@ -1144,6 +1150,7 @@ impl Cache {
             pending_verdicts: HashMap::new(),
             slot_by_bytes: Default::default(),
             closure_fps: HashMap::new(),
+            closure_ords: HashMap::new(),
             stats: CacheStats::default(),
             why_unencodable: HashMap::new(),
             last_why: "",
@@ -1715,6 +1722,36 @@ impl Cache {
         self.closure_fps.get(&(file, expr)).copied()
     }
 
+    /// Item `item`'s closures in order, memoized per item and file version.
+    fn item_closures(&mut self, u: &Unit, item: DefId) -> std::sync::Arc<[u32]> {
+        let file = u.prog.def(item).file;
+        self.closure_ords.entry((item, file)).or_insert_with(|| crate::program::closure_exprs(&u.prog, item).into()).clone()
+    }
+
+    /// Closure `expr` of `file` as its owner knows it, the way rustc's DefPath names a closure:
+    /// its ordinal among the closures of the item that encloses it (`owner`, or the item a closure
+    /// def `owner` is in) and its text, with no file version and no position -- a line added above
+    /// it, or anywhere else in its file, leaves it the same closure (its code's entries still say
+    /// where it is: code keys hash the enclosing bodies' text and position). None: an async fn's
+    /// body, or an expression the item's closures do not hold (it keeps the file-keyed identity).
+    fn closure_ordinal(&mut self, u: &Unit, owner: DefId, file: u32, expr: u32) -> Option<(u32, u64)> {
+        if expr & crate::tcx::ASYNC_FN_BODY != 0 || (owner.0 as usize) >= u.prog.defs.len() { return None; }
+        let item = closure_item(u, owner);
+        if u.prog.def(item).file != file { return None; }
+        let ord = self.item_closures(u, item).iter().position(|&x| x == expr)? as u32;
+        Some((ord, closure_text_only_fp(u, file, expr)?))
+    }
+
+    /// The closure an owner-local identity (closure_ordinal) names in this program: (file,
+    /// expr), when the item's closure at that ordinal has that text.
+    fn closure_at(&mut self, u: &Unit, owner: DefId, ord: u32, fp: u64) -> Option<(u32, u32)> {
+        if (owner.0 as usize) >= u.prog.defs.len() { return None; }
+        let item = closure_item(u, owner);
+        let file = u.prog.def(item).file;
+        let expr = *self.item_closures(u, item).get(ord as usize)?;
+        (closure_text_only_fp(u, file, expr)? == fp).then_some((file, expr))
+    }
+
     fn dec_file(&mut self, u: &Unit, d: &mut D) -> Option<u32> {
         let ident = d.u128()?;
         self.file_by_ident(u, ident)
@@ -1872,6 +1909,18 @@ impl Cache {
                 return self.enc_tys(u, u.tcx.tys.list(args), e, crates, depth);
             }
             TyKind::Closure(file, expr, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: state }) => {
+                // its owner's closure ordinal (closure_ordinal): the owner's type first, which
+                // names the item the ordinal counts in
+                let def = match u.tcx.tys.kind(owner) { TyKind::FnDef(d, ..) => Some(*d), _ => None };
+                if let Some((ord, fp)) = def.filter(|_| !u.prog.is_edit_version(file)).and_then(|d| self.closure_ordinal(u, d, file, expr)) {
+                    e.u8(28);
+                    crates.push(u.prog.file_crate.get(file as usize).copied().unwrap_or(0));
+                    self.enc_ty(u, owner, e, crates, depth + 1)?;
+                    e.u32(ord);
+                    e.u64(fp);
+                    self.enc_ty(u, closure_kind_ty, e, crates, depth + 1)?; self.enc_ty(u, sig, e, crates, depth + 1)?;
+                    return self.enc_ty(u, state, e, crates, depth + 1);
+                }
                 e.u8(17);
                 crates.push(u.prog.file_crate.get(file as usize).copied().unwrap_or(0));
                 self.enc_file(u, file, e)?;
@@ -2100,6 +2149,17 @@ impl Cache {
                 let owner = self.dec_ty(u, d, depth + 1)?;
                 TyKind::Closure(file, expr, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: kind, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: state })
             }
+            28 => {
+                let owner = self.dec_ty(u, d, depth + 1)?;
+                let ord = d.u32()?;
+                let fp = d.u64()?;
+                let TyKind::FnDef(def, ..) = *u.tcx.tys.kind(owner) else { return None };
+                let (file, expr) = self.closure_at(u, def, ord, fp)?;
+                let kind = self.dec_ty(u, d, depth + 1)?;
+                let sig = self.dec_ty(u, d, depth + 1)?;
+                let state = self.dec_ty(u, d, depth + 1)?;
+                TyKind::Closure(file, expr, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: kind, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: state })
+            }
             18 => {
                 let rigid = match d.u8()? { 0 => crate::consts::IsRigid::Yes, 1 => crate::consts::IsRigid::No, _ => return None };
                 let tag = d.u8()?;
@@ -2200,6 +2260,16 @@ impl Cache {
             FnKey::Closure(file, expr, parent) => {
                 if parent as usize >= u.fns.len() {
                     return None;
+                }
+                // its owner's closure ordinal, as rustc names it (closure_ordinal)
+                let owner = key_defs(u, &u.fns[parent as usize].key).first().copied();
+                if let Some((ord, fp)) = owner.filter(|_| !u.prog.is_edit_version(file)).and_then(|o| self.closure_ordinal(u, o, file, expr)) {
+                    e.u8(5);
+                    crates.push(u.prog.file_crate.get(file as usize).copied().unwrap_or(0));
+                    e.u32(ord);
+                    e.u64(fp);
+                    let pk = u.fns[parent as usize].key.clone();
+                    return self.enc_fnkey(u, &pk, e, crates, depth + 1);
                 }
                 e.u8(1);
                 crates.push(u.prog.file_crate.get(file as usize).copied().unwrap_or(0));
@@ -4671,8 +4741,9 @@ fn prim_of(c: u8) -> Option<crate::program::Prim> {
 }
 
 /// A definition's key: its parent's key (the crate's identity at the root), name, kind,
-/// defining file and, for an item its path does not name (block-scoped, `const _`), its offset
-/// there -- the identity stable::def_ident gives TypeId (memoized in `memo`; parents are in
+/// defining file and, for an item its path does not name (block-scoped, `const _`), its place
+/// there (stable::block_place: its fn's key and its ordinal) -- the identity stable::def_ident
+/// gives TypeId (memoized in `memo`; parents are in
 /// the same crate).
 fn def_key_in(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, crate_ident: &[u128], memo: &mut HashMap<DefId, u128>, files: &mut HashMap<u32, u128>, d: DefId) -> u128 {
     if let Some(&k) = memo.get(&d) {
@@ -4686,10 +4757,15 @@ fn def_key_in(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, crate_ident
     h.str(prog.syms.str(def.name));
     h.u32(def_kind_code(&def.kind));
     h.u128(fk);
-    // the item's offset only when its path does not name it -- the identity TypeId uses
+    // the item's place only when its path does not name it -- the identity TypeId uses
     // (stable::def_ident): a key and the TypeId folded into its code never disagree
-    if crate::stable::ident_has_offset(prog, d) {
-        h.u32(prog.files.get(def.file as usize).and_then(|f| f.ast.items.get(def.item.0 as usize)).map_or(u32::MAX, |it| it.lo));
+    if crate::stable::ident_has_place(prog, d) {
+        let (owner, ord) = crate::stable::block_place(prog, d);
+        if let Some(o) = owner {
+            h.str("block of");
+            h.u128(def_key_in(prog, tcx, crate_ident, memo, files, o));
+        }
+        h.u32(ord);
     }
     // not def.sub: module / impl indices are global to the program (they differ per app).
     // Impls (derived ones share their type's item) by what they implement for what.
@@ -4975,6 +5051,31 @@ fn closure_text_fp(u: &Unit, file: u32, expr: u32) -> Option<u64> {
     h.write(pf.bytes(lo, hi));
     h.u32(at.lo);
     h.u32(at.hi);
+    Some(h.finish128() as u64)
+}
+
+/// The item a closure def is in (closure defs' parents, up to the first that is no closure).
+fn closure_item(u: &Unit, mut d: DefId) -> DefId {
+    for _ in 0..64 {
+        let def = u.prog.def(d);
+        if def.kind != DefKind::Closure || def.parent == NO_DEF { break; }
+        d = def.parent;
+    }
+    d
+}
+
+/// A closure expression's text alone (closure_ordinal's identity): closure_text_fp without
+/// where the text is.
+fn closure_text_only_fp(u: &Unit, file: u32, expr: u32) -> Option<u64> {
+    let pf = u.prog.files.get(file as usize)?;
+    let x = crate::ast::ExprId(expr);
+    if !pf.ast.has_expr(x) {
+        return None;
+    }
+    let x = pf.ast.expr(x);
+    let mut h = Sip128::new();
+    h.str("closure-text");
+    h.write(pf.bytes(x.lo, x.hi));
     Some(h.finish128() as u64)
 }
 
@@ -8391,6 +8492,20 @@ impl Linker {
                         u.fn_id(pk)
                     }
                 };
+                FnKey::Closure(file, expr, parent)
+            }
+            5 => {
+                let ord = d.u32()?;
+                let fp = d.u64()?;
+                let parent = match self.image_slot_at(u, d) {
+                    Some(p) => p,
+                    None => {
+                        let pk = self.dec_fnkey(u, d, depth + 1)?;
+                        u.fn_id(pk)
+                    }
+                };
+                let owner = *key_defs(u, &u.fns[parent as usize].key).first()?;
+                let (file, expr) = self.cache().closure_at(u, owner, ord, fp)?;
                 FnKey::Closure(file, expr, parent)
             }
             2 => {
