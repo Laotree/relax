@@ -1197,9 +1197,19 @@ pub(super) fn cleanup_ahead() {
     let Some(front) = front else { return };
     let q = lock();
     if q.entries.iter().any(|e| e.job.tier() == 0) || q.running.iter().any(|r| r.tier == 0) { return; }
-    let keys = std::mem::take(&mut *front.ahead_post.lock().unwrap_or_else(|e| e.into_inner()));
-    let unused: Vec<_> = keys.iter().filter_map(|key| front.ahead.remove(key)).collect();
-    let lowered = std::mem::take(&mut *front.lowered.lock().unwrap_or_else(|e| e.into_inner()));
+    // (not what a background build checked and lowered for its own take: its bodies are published
+    // under the claim lock, its lowerings under the map's)
+    let (keys, unused) = {
+        let _claim = front.inprog.lock().unwrap_or_else(|e| e.into_inner());
+        if fronts_held() { return; }
+        let keys = std::mem::take(&mut *front.ahead_post.lock().unwrap_or_else(|e| e.into_inner()));
+        let unused: Vec<_> = keys.iter().filter_map(|key| front.ahead.remove(key)).collect();
+        (keys, unused)
+    };
+    let lowered = {
+        let mut lowered = front.lowered.lock().unwrap_or_else(|e| e.into_inner());
+        if fronts_held() { Default::default() } else { std::mem::take(&mut *lowered) }
+    };
     drop(q);
     lowered_end();
     if !keys.is_empty() {
