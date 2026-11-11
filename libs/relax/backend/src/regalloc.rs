@@ -1275,10 +1275,15 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
         }
         if chosen.is_none() {
             if let Some(m) = unit_members(v) {
-                // dissolve: the root and its members take their turns now, heaviest first
+                // dissolve: the root and its members take their turns now, heaviest first, each its own
+                // unit again (a member's partners are then found where they are placed: a loop piece and
+                // its step's temporary share a register after their spilled original left the unit)
                 let mut parts: Vec<u32> = m.clone();
                 parts.push(v);
                 dissolved[v as usize].set(true);
+                for &u in &parts {
+                    parent[u as usize] = u;
+                }
                 parts.sort_by(|a, b| prio(refs[*b as usize], lens[*b as usize]).partial_cmp(&prio(refs[*a as usize], lens[*a as usize])).unwrap_or(std::cmp::Ordering::Equal));
                 let parts: Vec<u32> = parts.into_iter().filter(|u| !ranges.of(*u).is_empty()).collect();
                 order.splice(oi..oi, parts);
@@ -3730,6 +3735,17 @@ fn affinities(f: &Func, reach: &[bool], block_start: &[u32], ranges: &Ranges, wt
                 // dies here, addend first
                 Inst::FMulAdd(_, _, _, d, a, b2, c) => {
                     if let Some(s2) = [*c, *a, *b2].into_iter().find(|s2| *s2 != *d && dies_at(ranges, s2.0, p)) {
+                        edges.push((d.0, s2.0, w));
+                        edges.push((s2.0, d.0, w));
+                    }
+                    continue;
+                }
+                // a select writes its result over either input (x64: cmov over the second, or over the
+                // first on the inverse condition; a float select's first move; arm64 csel has its own
+                // destination): the result prefers the input that dies here, and no copy comes first.
+                // The first input first: x64's SSE min / max (`minsd d, b`) writes in place only over it
+                Inst::Sel(d, _, a, b2) | Inst::SelCmp(d, _, a, b2) => {
+                    if let Some(s2) = [*a, *b2].into_iter().find(|s2| *s2 != *d && f.vregs[s2.0 as usize] == f.vregs[d.0 as usize] && dies_at(ranges, s2.0, p)) {
                         edges.push((d.0, s2.0, w));
                         edges.push((s2.0, d.0, w));
                     }
