@@ -531,6 +531,12 @@ pub struct CacheStats {
     pub link_ns: u64,
     pub verify_same: u64,
     pub verify_diff: u64,
+    /// of verify_diff: the cached entry's recorded inputs (inlined slots, nounwind answers,
+    /// dependency keys) differ from the fresh build's; the same inputs gave other code; the same
+    /// inputs and code, a relocation differs
+    pub verify_diff_inputs: u64,
+    pub verify_diff_code: u64,
+    pub verify_diff_reloc: u64,
     /// cached entries of another tier than the verifying build's (an O2 or O3 rebuild replaced
     /// the first build's entry): not compared
     pub verify_other_tier: u64,
@@ -3550,38 +3556,11 @@ impl Cache {
         Some(h.finish128())
     }
 
-    /// The payload of a code entry (O1, or O3 with its inlined slots);
-    /// None: it cannot be stored (`last_why` says why).
-    #[allow(clippy::too_many_arguments)]
-    fn encode_entry(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], o3: Option<(&[u32], &[(u32, bool)])>, kind: RecKind, pending: Option<&PendingRecord>) -> Option<Vec<u8>> {
+    /// An entry's build inputs as encode_entry writes them: the code's level (TIER_O1 / TIER_O3 /
+    /// TIER_O2 / TIER_BASE), the inlined slots, the nounwind answers and the dependency
+    /// certificate. Verify compares a cached entry's with the fresh build's.
+    fn encode_inputs(&mut self, u: &Unit, id: u32, o3: Option<(&[u32], &[(u32, bool)])>, kind: RecKind, pending: Option<&PendingRecord>, e: &mut E) -> Option<()> {
         let o2 = kind == RecKind::O2;
-        // unlinked code only: a pool word must still be zero (linked code holds this run's values)
-        for rl in relocs {
-            let o = rl.at as usize;
-            if rl.kind == RelocKind::Pool64 && code.get(o..o + 8).map_or(true, |w| w.iter().any(|b| *b != 0)) {
-                self.stats.unencodable += 1;
-                self.why("linked code");
-                return None;
-            }
-        }
-        self.last_why = "unrecorded reason";
-        if let Some(w) = dump_filter().filter(|_| self.verbose) {
-            let name = crate::syms::stable_fn_name(u, id);
-            if name.contains(w) {
-                for rl in relocs {
-                    let t = match &rl.target {
-                        Reloc::Sym(s) => format!("{} +{}", crate::syms::describe(u, *s), s.off),
-                        Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => format!("slot {}", crate::syms::stable_fn_name(u, *x)),
-                        r => format!("{:?}", r),
-                    };
-                    eprintln!("makepad-run cache: RELOCS rec {} {} {}", name, rl.at, t);
-                }
-            }
-        }
-        let mut e = E::default();
-        e.u32(ENTRY_VERSION);
-        e.str(&u.fns[id as usize].name);
-        // the code's level (TIER_O1 / TIER_O3 / TIER_O2 / TIER_BASE), then its inline inputs
         let base = o3.is_none() && kind == RecKind::First && match pending {
             Some(p) => p.baseline,
             None => u.fns[id as usize].rir.as_ref().is_some_and(|r| r.baseline),
@@ -3634,6 +3613,40 @@ impl Cache {
             return None;
         };
         e.0.extend_from_slice(&cert);
+        Some(())
+    }
+
+    /// The payload of a code entry (O1, or O3 with its inlined slots);
+    /// None: it cannot be stored (`last_why` says why).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_entry(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], o3: Option<(&[u32], &[(u32, bool)])>, kind: RecKind, pending: Option<&PendingRecord>) -> Option<Vec<u8>> {
+        // unlinked code only: a pool word must still be zero (linked code holds this run's values)
+        for rl in relocs {
+            let o = rl.at as usize;
+            if rl.kind == RelocKind::Pool64 && code.get(o..o + 8).map_or(true, |w| w.iter().any(|b| *b != 0)) {
+                self.stats.unencodable += 1;
+                self.why("linked code");
+                return None;
+            }
+        }
+        self.last_why = "unrecorded reason";
+        if let Some(w) = dump_filter().filter(|_| self.verbose) {
+            let name = crate::syms::stable_fn_name(u, id);
+            if name.contains(w) {
+                for rl in relocs {
+                    let t = match &rl.target {
+                        Reloc::Sym(s) => format!("{} +{}", crate::syms::describe(u, *s), s.off),
+                        Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => format!("slot {}", crate::syms::stable_fn_name(u, *x)),
+                        r => format!("{:?}", r),
+                    };
+                    eprintln!("makepad-run cache: RELOCS rec {} {} {}", name, rl.at, t);
+                }
+            }
+        }
+        let mut e = E::default();
+        e.u32(ENTRY_VERSION);
+        e.str(&u.fns[id as usize].name);
+        self.encode_inputs(u, id, o3, kind, pending, &mut e)?;
         e.bytes(code);
         e.u32(relocs.len() as u32);
         let mut rw = Vec::new();
@@ -4054,7 +4067,7 @@ impl Cache {
     pub fn flush(&mut self) -> Result<usize, String> {
         if self.verbose && self.mode == Mode::Verify {
             let s = &self.stats;
-            eprintln!("makepad-run cache: verify: {} identical, {} different, {} of another tier", s.verify_same, s.verify_diff, s.verify_other_tier);
+            eprintln!("makepad-run cache: verify: {} identical, {} different ({} with other recorded inputs, {} code from the same inputs, {} only a relocation), {} of another tier", s.verify_same, s.verify_diff, s.verify_diff_inputs, s.verify_diff_code, s.verify_diff_reloc, s.verify_other_tier);
         }
         if self.mode == Mode::ReadOnly {
             return Ok(0);
@@ -5006,13 +5019,20 @@ impl Cache {
     fn verify_same_tier(&mut self, u: &Unit, id: u32, cached: &[u8], fresh: &[u8], relocs: &[RelocAt]) -> bool {
         let mut d = D { b: cached, p: 0 };
         if d.u32() != Some(ENTRY_VERSION) || d.str().is_none() { return false; }
+        let inputs_at = d.p;
         let Some((start, end)) = skip_build_inputs(&mut d) else { return false };
         let facts = u.fns[id as usize].rir.as_ref().map_or(&[][..], |r| r.nounwind_inputs.as_slice());
         let Some(encoded) = self.nounwind_bytes(u, facts) else { return false };
         if cached[start..end] != encoded {
             eprintln!("makepad-run cache: VERIFY nounwind inputs differ: {}", crate::syms::stable_fn_name(u, id));
+            self.stats.verify_diff_inputs += 1;
             return false;
         }
+        // the recorded inputs as the fresh build has them (level, inlined slots, nounwind answers,
+        // dependency keys): a difference from other inputs is counted apart from one from the same
+        let mut fresh_inputs = E::default();
+        let same_inputs = self.encode_inputs(u, id, None, RecKind::First, None, &mut fresh_inputs).is_some() && fresh_inputs.0[..] == cached[inputs_at..d.p];
+        let inputs_word = if same_inputs { "same inputs" } else { "recorded inputs differ" };
         let Some(ccode) = d.bytes() else { return false };
         let ccode = ccode.to_vec();
         let fz = fresh.to_vec();
@@ -5024,7 +5044,8 @@ impl Cache {
                     diffs.push(format!("{}: {:08x}/{:08x}", k, u32::from_le_bytes(ccode[k..k + 4].try_into().unwrap()), u32::from_le_bytes(fz[k..k + 4].try_into().unwrap())));
                 }
             }
-            eprintln!("makepad-run cache: VERIFY code differs: {} ({} vs {} bytes) cached/fresh {:?}", name, ccode.len(), fz.len(), diffs);
+            eprintln!("makepad-run cache: VERIFY code differs: {} ({} vs {} bytes, {}) cached/fresh {:?}", name, ccode.len(), fz.len(), inputs_word, diffs);
+            if same_inputs { self.stats.verify_diff_code += 1 } else { self.stats.verify_diff_inputs += 1 }
             // the fresh relocations whose encoding the cached entry does not hold (what the two
             // builds' constant pools disagree on)
             if dump_filter().map_or(false, |w| name.contains(w)) {
@@ -5087,7 +5108,8 @@ impl Cache {
             };
             let cbytes = d.b.get(d.p..d.p + e.0.len()).map(|x| x.to_vec());
             if co != *o || ck != Some(rl.kind) || !ok || cbytes.as_deref() != Some(&e.0[..]) {
-                eprintln!("makepad-run cache: VERIFY RELOC differs: {} at {} ({:?} -> {})", name, o, r, match r { Reloc::Sym(s) => crate::syms::describe(u, *s), Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => crate::syms::stable_fn_name(u, *x), _ => String::new() });
+                eprintln!("makepad-run cache: VERIFY RELOC differs: {} at {} ({:?} -> {}, {})", name, o, r, match r { Reloc::Sym(s) => crate::syms::describe(u, *s), Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => crate::syms::stable_fn_name(u, *x), _ => String::new() }, inputs_word);
+                if same_inputs { self.stats.verify_diff_reloc += 1 } else { self.stats.verify_diff_inputs += 1 }
                 return false;
             }
             d.p += e.0.len();

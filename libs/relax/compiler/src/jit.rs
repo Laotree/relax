@@ -145,6 +145,9 @@ pub struct FnEntry {
     /// SPEC-V: a body with no code of its own whose slot word holds its twin's code until its own
     /// build (background) is installed (`Unit::borrow_twin`). Owner thread.
     pub borrowed: bool,
+    /// (instrument) the build that stored its RIR (RIR_OWN / RIR_BESIDE / RIR_TIER_UP): the inline
+    /// state counter (INLINE_STATE) tells its callers' candidates apart by it
+    pub rir_from: u8,
 }
 
 /// SPEC-V: a body's standing with the borrow checker.
@@ -6540,7 +6543,7 @@ impl Unit {
         // Copy explicitly: converting an existing String can keep its old allocation.
         // Clone also copies both Inst's and Shim's owned type arguments.
         let (key, name) = crate::zone_alloc::slots_with(|| (key.clone(), Box::<str>::from(name)));
-        FnEntry { key, name, code: stub_addr, code_len: stub_len, pc_map: PcMap::default(), file, history: None, compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, build_ns: 0, cg_ns: 0, version: 0, inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), unverified: AtomicBool::new(false), d3_lowered: AtomicBool::new(false), ran_before: AtomicBool::new(false), twin_ran: AtomicBool::new(false), patched: AtomicBool::new(false), borrowed: false, calls: Box::default() }
+        FnEntry { key, name, code: stub_addr, code_len: stub_len, pc_map: PcMap::default(), file, history: None, compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, build_ns: 0, cg_ns: 0, version: 0, inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), unverified: AtomicBool::new(false), d3_lowered: AtomicBool::new(false), ran_before: AtomicBool::new(false), twin_ran: AtomicBool::new(false), patched: AtomicBool::new(false), borrowed: false, rir_from: RIR_OWN, calls: Box::default() }
     }
 
     /// Slot `id` has its key: the front's slot keys and its ahead check (before the slot is
@@ -10228,6 +10231,9 @@ pub fn src_size(u: &Unit, id: u32) -> u32 {
     (b - a) as u32
 }
 
+/// callee_attrs' answer for a callee without a clean verdict yet
+const NOT_INLINABLE_UNVERIFIED: &str = "not inlinable: unverified";
+
 /// Inline attributes of callee slot `c` for the inliner, or why it may not be inlined (a
 /// why-tier note):
 /// #[inline]/#[inline(always)], rule 4 (core instances made for a closure / fn item), and
@@ -10245,7 +10251,7 @@ fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &cra
     }
     // SPEC-V: unverified code is inlined only into unverified code
     if !into_unverified && fns[c as usize].unverified.load(Ordering::Relaxed) {
-        return Err("not inlinable: unverified");
+        return Err(NOT_INLINABLE_UNVERIFIED);
     }
     // makepad inspect: an instrumented or pinned fn runs as its own code (a copy would run
     // unprobed, or at another tier than its pin)
@@ -11667,7 +11673,7 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done) {
             if let Ok((f, inl)) = r {
                 let x = &(&*up).fns[c as usize];
                 if x.rir.as_ref().map_or(true, |r| upgrade_replaces(r, &f)) && !x.building && x.build_err.is_none() {
-                    store_rir(up, c, f, inl, 0);
+                    store_rir(up, c, f, inl, 0, RIR_TIER_UP);
                 }
             }
         }
@@ -11679,7 +11685,7 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done) {
             u.link_check(&c.code[..n], &c.relocs)
         } => {
             // O3 starts from this RIR
-            store_rir(up, id, func, inlined, 0);
+            store_rir(up, id, func, inlined, 0, RIR_TIER_UP);
             c
         }
         _ => {
@@ -12585,7 +12591,7 @@ unsafe fn build_rir_body(up: *mut Unit, id: u32, lowered: Option<relax_backend::
         let e = crate::zone_alloc::kept_with(|| m.get_or_insert_with(Default::default).entry((owner::serving_line(), BUILD_WHY.with(|w| w.get()) as usize * 100 + i)).or_insert((0, 0)) as *mut (u64, u64));
         unsafe { (*e).0 += 1; (*e).1 += dt; }
     }
-    store_rir(up, id, func, inlined, dt + prep.1);
+    store_rir(up, id, func, inlined, dt + prep.1, RIR_OWN);
     if let Some(p) = size_first {
         let _size_first = SizeFirstBuild::set(true);
         if let Ok((f, _)) = optimize_rir(options, id, p) {
@@ -12816,6 +12822,8 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             }
         }
     }
+    // (instrument) INLINE_STATE's caller tier
+    let tier = if baseline { 0 } else if full { 2 } else { 1 };
     if cfg.inline {
         // inside a background build's take: the candidates that need a front only the owner could
         // run (rule I-PURE), all of them; the take bails with the list after the loop
@@ -12860,7 +12868,11 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             // refused callees (#[inline(never)], sandboxed, user code without inline_all,
             // MAKEPAD_RUN_NOINL) are not built for inlining: decided before the build, not after
             let attrs = callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false);
-            let want = (baseline && matches!(u.fns[*c as usize].key, FnKey::Glue(..)) || inline_source_wanted(u, *c, full))
+            let source_wanted = baseline && matches!(u.fns[*c as usize].key, FnKey::Glue(..)) || inline_source_wanted(u, *c, full);
+            if source_wanted && attrs == Err(NOT_INLINABLE_UNVERIFIED) {
+                inline_state(tier, INLINE_LEFT_OUT);
+            }
+            let want = source_wanted
                 && attrs.is_ok()
                 && !noinl_callee.is_some_and(|p| name_matches(&u.fns[*c as usize].name, p));
             if let Err(why) = attrs.as_ref() {
@@ -12928,6 +12940,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                         if attrs.is_none() && sig_dir().is_some() && inline_cycle(u, id, *c) {
                             skipped.push((*c, "cycle"));
                         }
+                        if attrs.is_some() { inline_state(tier, INLINE_BUILT_HERE); }
                         deferred.push((*c, attrs, p));
                     }
                 } else {
@@ -12944,6 +12957,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                     if let Some(Some(p)) = collect_fronts(&mut needs, || split_upgrade(up, *c)) {
                         let u = &*up;
                         let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false).ok() };
+                        if attrs.is_some() { inline_state(tier, INLINE_BUILT_HERE); }
                         deferred.push((*c, attrs, p));
                     }
                 } else {
@@ -12975,6 +12989,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                 continue;
             }
             if let Some(r) = &u.fns[c as usize].rir {
+                inline_state(tier, rir_state(&u.fns[c as usize], r));
                 snap.push((c, r.clone(), attrs));
             }
         }
@@ -13557,8 +13572,50 @@ fn deferred_slots(prep: &Prep, out: &mut Vec<u32>) {
     }
 }
 
-/// Records an optimised RIR (under the lock): inlining links, stats, the slot's RIR.
-unsafe fn store_rir(up: *mut Unit, id: u32, func: relax_backend::rir::Func, inlined: Vec<(u32, usize)>, opt_ns: u64) {
+/// (instrument) FnEntry::rir_from: the slot's own build; a build beside another slot's O1 build (a
+/// pipelined caller's deferred candidate, a compile batch's candidate); a tier-up's (an O2 or O3
+/// preparation's candidates, the slot's own O2 or verified O1 build)
+pub(crate) const RIR_OWN: u8 = 0;
+pub(crate) const RIR_BESIDE: u8 = 1;
+pub(crate) const RIR_TIER_UP: u8 = 2;
+
+/// (instrument) the inline candidates prepare_rir_from took, by caller tier (baseline, O1, full) and
+/// by the state of the callee RIR it took (INLINE_STATE_NAMES), and the candidates it left out
+/// because their borrow-check verdict was pending: what a caller's O1 RIR depended on besides the
+/// source. Verbose summary.
+pub static INLINE_STATE: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
+const INLINE_STATE_NAMES: [&str; 8] = ["raw lowering", "unverified lowering", "O2", "own build", "built beside an O1 build", "built by a tier-up", "built for this caller", "left out (verdict pending)"];
+const INLINE_BUILT_HERE: usize = 6;
+const INLINE_LEFT_OUT: usize = 7;
+
+fn inline_state(caller: usize, state: usize) {
+    INLINE_STATE[caller * INLINE_STATE_NAMES.len() + state].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The INLINE_STATE_NAMES index of slot `f`'s RIR `r`
+fn rir_state(f: &FnEntry, r: &relax_backend::rir::Func) -> usize {
+    if r.baseline {
+        0
+    } else if r.plain_calls || !r.withheld_noalias.is_empty() {
+        1
+    } else if r.full {
+        2
+    } else {
+        3 + f.rir_from as usize
+    }
+}
+
+pub(crate) fn inline_state_summary() -> String {
+    let n = INLINE_STATE_NAMES.len();
+    INLINE_STATE_NAMES.iter().enumerate().filter_map(|(i, name)| {
+        let v: Vec<u64> = (0..3).map(|t| INLINE_STATE[t * n + i].load(Ordering::Relaxed)).collect();
+        v.iter().any(|x| *x > 0).then(|| format!("{} {}/{}/{}", name, v[0], v[1], v[2]))
+    }).collect::<Vec<_>>().join(", ")
+}
+
+/// Records an optimised RIR (under the lock): inlining links, stats, the slot's RIR, and which
+/// build stored it (`from`: RIR_OWN / RIR_BESIDE / RIR_TIER_UP).
+unsafe fn store_rir(up: *mut Unit, id: u32, func: relax_backend::rir::Func, inlined: Vec<(u32, usize)>, opt_ns: u64, from: u8) {
     let u = &mut *up;
     note_body_deps(u, id, inlined.iter().map(|x| x.0).chain(func.nounwind_inputs.iter().filter(|x| x.1).map(|x| x.0)));
     for (c, rule) in inlined {
@@ -13576,6 +13633,7 @@ unsafe fn store_rir(up: *mut Unit, id: u32, func: relax_backend::rir::Func, inli
     u.stats.opt_ns += opt_ns;
     u.stats.rir_insts += relax_codegen::opt::inst_count(&func) as u64;
     u.set_rir(id, func);
+    u.fns[id as usize].rir_from = from;
     if TAINTED.with(|t| t.get()) {
         TAINT_BUILT.with(|b| b.borrow_mut().push((up as usize, id)));
     }
@@ -22468,7 +22526,7 @@ unsafe fn o3_candidates_finish(up: *mut Unit, epoch: u64, done: Vec<Deferred>) {
         };
         if store {
             cand_skip(17);
-            store_rir(up, c, f, inl, 0);
+            store_rir(up, c, f, inl, 0, RIR_TIER_UP);
         } else {
             cand_skip(16);
         }
@@ -23499,7 +23557,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
                 Ok((f, inl)) => {
                     let x = &(&*up).fns[c as usize];
                     if x.rir.as_ref().map_or(true, |r| upgrade_replaces(r, &f) && !x.building) {
-                        store_rir(up, c, f, inl, 0);
+                        store_rir(up, c, f, inl, 0, RIR_BESIDE);
                     }
                 }
                 Err(e) => {
@@ -23513,7 +23571,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
                 if let Some((f, inl, ns)) = opt {
                     if (&*up).fns[id as usize].rir.is_none() {
                         let f = std::sync::Arc::try_unwrap(f).unwrap_or_else(|a| (*a).clone());
-                        store_rir(up, id, f, inl, ns);
+                        store_rir(up, id, f, inl, ns, RIR_OWN);
                     }
                 }
                 out.push((id, Ok((code, map, relocs))));
@@ -23897,7 +23955,7 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
                 Ok((f, inl)) => {
                     let x = &(&*up).fns[c as usize];
                     if x.rir.as_ref().map_or(true, |r| upgrade_replaces(r, &f) && !x.building) {
-                        store_rir(up, c, f, inl, 0);
+                        store_rir(up, c, f, inl, 0, RIR_BESIDE);
                     }
                 }
                 Err(e) => {
@@ -23918,7 +23976,7 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
             if let Some((f, inl, ns)) = opt {
                 if u.fns[id as usize].rir.is_none() {
                     let f = std::sync::Arc::try_unwrap(f).unwrap_or_else(|a| (*a).clone());
-                    store_rir(up, id, f, inl, ns);
+                    store_rir(up, id, f, inl, ns, RIR_OWN);
                 }
             }
             let u = &mut *up;
@@ -28998,6 +29056,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&TIER1_SNAP_FRONTS, [AtomicU64::new(0), AtomicU64::new(0)]);
     reset(&TIER1_SNAP_OFF, [AtomicU64::new(0), AtomicU64::new(0)]);
     reset(&CAND_SKIP, [const { AtomicU64::new(0) }; 27]);
+    reset(&INLINE_STATE, [const { AtomicU64::new(0) }; 24]);
     reset(&O3_INSTALL_REC, [AtomicU64::new(0), AtomicU64::new(0)]);
     reset(&O3_OWNER, [const { AtomicU64::new(0) }; 24]);
     reset(&SPEC_BUILT, relax_session::sync::Mutex::new(Vec::new()));
