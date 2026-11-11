@@ -1731,11 +1731,11 @@ fn realtime_tier_up_compiles_new_callees_before_its_install() {
 }
 
 /// The reach reads the references of the code a real-time slot runs, not those of another version
-/// of it. An earlier run stored `run`'s O2 code (the generic `twice` inlined); this run installs
-/// baseline code for it, which calls `twice` (code built before its key's entry was there, or
-/// placed from a startup image older than the entry). The walk must follow the installed code's
-/// calls: the fab arm lab's loop met lazy compiles of closures that only the code it ran called
-/// (11-11).
+/// of it. An earlier run stored `run`'s O2 code (the generic `twice` inlined, `more` called); this
+/// run installs baseline code for it, which calls `twice` (code built before its key's entry was
+/// there, or placed from a startup image older than the entry). The walk must follow the installed
+/// code's calls: the fab arm lab's loop met lazy compiles of closures that only the code it ran
+/// called (11-11).
 #[test]
 fn realtime_reach_reads_the_installed_code() {
     const CHILD: &str = "MAKEPAD_RUN_RT_INSTALLED_TEST";
@@ -1748,7 +1748,8 @@ fn realtime_reach_reads_the_installed_code() {
         std::fs::write(dir.join("app/src/lib.rs"), "#[repr(C)]\n\
             pub struct Cell { pub x: u32, pub out: u32 }\n\
             fn twice<F: Fn(u32) -> u32>(f: F, x: u32) -> u32 { f(f(x)) }\n\
-            pub fn run(c: &mut Cell) { let k = c.x; c.out = twice(|v| v * 3 + k, c.x); }\n").unwrap();
+            #[inline(never)] pub fn more(x: u32) -> u32 { x + 1 }\n\
+            pub fn run(c: &mut Cell) { let k = c.x; c.out = more(twice(|v| v * 3 + k, c.x)); }\n").unwrap();
         for phase in ["earlier", "now"] {
             let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "lazy_reload_tests::realtime_reach_reads_the_installed_code", "--nocapture", "--test-threads=1", "--format=terse"])
@@ -1829,7 +1830,7 @@ fn realtime_reach_reads_the_installed_code() {
         let linked = unsafe { crate::jit::cache_lookup(up, run) }.is_some();
         (linked, names(&u, &u.cache.as_ref().unwrap().last_callees))
     });
-    assert!(stored.0 && !stored.1.iter().any(|n| n.contains("twice")), "the disk cache holds `run`'s O2 entry, which does not call `twice` (else this fixture proves nothing): linked {}, it calls {:?}", stored.0, stored.1);
+    assert!(stored.0 && stored.1.iter().any(|n| n.contains("more")) && !stored.1.iter().any(|n| n.contains("twice")), "the disk cache holds `run`'s O2 entry, which calls `more` and not `twice` (else this fixture proves nothing): linked {}, it calls {:?}", stored.0, stored.1);
     let ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![run]) });
     for _ in 0..5000 {
         if crate::jit::__relax_realtime_compiled(ticket) {
@@ -1848,7 +1849,7 @@ fn realtime_reach_reads_the_installed_code() {
         unsafe { crate::jit::call_jit(upn as *mut crate::jit::Unit, run_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
         (unsafe { *((cp + 4) as *const u32) }, crate::jit::__relax_realtime_misses() - before)
     }).join().unwrap();
-    assert_eq!((out, misses), (26, 0), "the real-time thread met lazy compiles (MAKEPAD_RUN_RT_TRACE=1 names them)");
+    assert_eq!((out, misses), (27, 0), "the real-time thread met lazy compiles (MAKEPAD_RUN_RT_TRACE=1 names them)");
     std::mem::forget(u);
 }
 
