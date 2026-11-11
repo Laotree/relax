@@ -12961,7 +12961,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             // function of the source alone: the disk cache's keys and O3's inputs assume it)
             // (also an upgrade deferred by another split compile: its normal RIR, not the baseline RIR
             // it has until that finish)
-            if want && u.fns[*c as usize].rir.as_ref().map_or(true, |r| !baseline && (upgradable(r) || !full && needs_normal(&u.fns[*c as usize]))) && u.fns[*c as usize].inflight && u.fns[*c as usize].build_err.is_none() {
+            if want && u.fns[*c as usize].rir.as_ref().map_or(true, |r| upgradable(r) || !full && needs_normal(&u.fns[*c as usize])) && u.fns[*c as usize].inflight && u.fns[*c as usize].build_err.is_none() {
                 wait_inflight(up, *c);
             }
             let u = &mut *up;
@@ -12982,14 +12982,13 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             if want && u.fns[*c as usize].rir.is_none() && !open && u.fns[*c as usize].build_err.is_none() {
                 let tn = cpu_ns();
                 if baseline && !defer {
-                    // Keep the caller's frozen tier even if another thread presents while
-                    // lowering. Already available higher-tier RIR is reused above.
-                    let _ = collect_fronts(&mut needs, || build_rir_mode(up, *c, RirMode::Baseline));
+                    // a baseline caller inlines the callee's normal body too (never a start
+                    // tier's raw body: what it inlines must not depend on when it was built)
+                    let _ = collect_fronts(&mut needs, || build_rir_mode(up, *c, RirMode::Normal));
                 } else if defer {
-                    // only the callee's front end now (a baseline caller's: as baseline, its frozen
-                    // tier; any other caller's: as normal RIR, never a start tier's raw body); its
-                    // optimisation runs with the caller's back end, off the lock
-                    let Some(r) = collect_fronts(&mut needs, || split_front_as(up, *c, if baseline { RirMode::Baseline } else { RirMode::Normal })) else { continue };
+                    // only the callee's front end now, as normal RIR (never a start tier's raw
+                    // body); its optimisation runs with the caller's back end, off the lock
+                    let Some(r) = collect_fronts(&mut needs, || split_front_as(up, *c, RirMode::Normal)) else { continue };
                     if matches!(&r, Err(e) if e == YIELDED) {
                         return Err(YIELDED.to_string());
                     }
@@ -13018,8 +13017,8 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             }
             // (a caller below O2 whose callee's RIR is an O2 build's full body: the callee's normal
             // body, built from a fresh lowering and kept beside the full one)
-            let fresh = !baseline && !full && needs_normal(&(&*up).fns[*c as usize]);
-            if want && !baseline && ((&*up).fns[*c as usize].rir.as_ref().is_some_and(|r| upgradable(r)) || fresh) {
+            let fresh = !full && needs_normal(&(&*up).fns[*c as usize]);
+            if want && ((&*up).fns[*c as usize].rir.as_ref().is_some_and(|r| upgradable(r)) || fresh) {
                 let tn = cpu_ns();
                 if defer {
                     // the upgrade's preparation now, its optimisation with the caller's back end
@@ -13058,9 +13057,10 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                 }
                 continue;
             }
-            // a caller below O2 inlines the callee's normal body; an O2 build (full) the RIR as it is
+            // a caller below O2 (baseline included) inlines the callee's normal body; an O2 build
+            // (full) the RIR as it is
             let f = &u.fns[c as usize];
-            let body = if full || baseline { f.rir.as_ref() } else { inline_body(f) };
+            let body = if full { f.rir.as_ref() } else { inline_body(f) };
             if body.is_none() && f.rir.is_some() {
                 // its normal body is being built elsewhere: left out, and this request's builds
                 // are not kept (they depend on that timing)
