@@ -590,252 +590,177 @@ code.nw{white-space:nowrap}
 <a class="skip" href="#main">跳到正文</a>
 <div id="prog" aria-hidden="true"></div>
 <div id="plain">
-<p>本页的文字由 JavaScript 填充。以下是同一内容的纯 HTML 英文全文，供不运行 JavaScript 的读者使用；也可阅读 <a href="https://github.com/makepad/relax#readme">README</a> 或 <a href="../retro/">纯 HTML 版</a>。</p>
-<div lang="en">
-<h1>Relax</h1>
-<p><b>Rust without the wait.</b></p>
-<p><b>rustc builds your program, then you run it. Relax runs your program while it builds it.</b></p>
-<p>Relax is a live compiler and JIT runtime for Rust, written in Rust. It runs a Cargo package straight from source, with no rustc, LLVM or linker in the loop. It checks your code, compiles each function the moment it is first called, optimises the hot ones while the program runs, and patches new code into the running process when you save a file.</p>
-<p><b>TL;DR</b> Rust's speed and safety, without the compile-time wait.</p>
+<p>本页的文字由 JavaScript 填充。以下是同一内容的纯 HTML 版，供不运行 JavaScript 的读者使用；英文原文见 <a href="https://github.com/makepad/relax#readme">README</a> 和 <a href="../retro/">纯 HTML 版</a>。</p>
+<h1>Rust，告别等待。</h1>
+<p><b>rustc：先构建，再运行。Relax：边构建，边运行。</b></p>
 <ul>
-<li><b>What:</b> a live compiler and JIT runtime for Rust that runs a Cargo package straight from source. No rustc, no LLVM, no linker.
-<li><b>Start:</b> on an M4 MacBook a large 3D game shows its first frame <b>11 s</b> after a clean checkout, where rustc builds for ~3 min first. The second run takes <b>1.15 s</b>.
-<li><b>Change:</b> save a file and the changed functions are patched into the running program, state kept. <b>92 tests re-run in 2.2 s.</b>
-<li><b>Speed:</b> optimised code is still slower than rustc <code>--release</code>. A broader run this week came out slower than our earlier numbers and we're re-measuring; see <a href="#plain-where-llvm-still-wins">where LLVM still wins</a>.
-<li><b>Size:</b> one Rust library: <b>438k lines, 0 crates.io dependencies.</b>
+<li><b>11 s</b> 大型 3D 游戏：在 M4 MacBook 上从全新检出到首帧，直接跑源码
+<li><b>1.15 s</b> 同一个游戏再次运行到首帧：什么都不用重新编译
+<li><b>2.2 s</b> 从保存文件到 92 个测试重跑完毕
+<li><b>0</b> 个 crates.io 依赖，共 438k 行 Rust 代码
 </ul>
-<h2><a name="plain-relax-vs-rustc">Relax vs rustc</a></h2>
-<table border="1" cellpadding="4" cellspacing="0">
-<tr><th></th><th>rustc + Cargo</th><th><b>Relax</b></th></tr>
-<tr valign="top"><td><b>Large 3D game, clean checkout → first frame</b></td><td>~3 min build, then start</td><td><b>11 s</b> on an M4 MacBook, straight from source</td></tr>
-<tr valign="top"><td><b>Same game, second run → first frame</b></td><td>start the built binary</td><td><b>1.15 s</b> on an M4 MacBook, nothing recompiled</td></tr>
-<tr valign="top"><td><b>Change one function in a running program</b></td><td>rebuild, relink, restart: program state lost</td><td><b>patched into the running process</b>: state kept</td></tr>
-<tr valign="top"><td><b>Save a file → 92 tests re-run</b></td><td>rebuild the test binary first</td><td><b>2.2 s</b> after the save</td></tr>
-<tr valign="top"><td><b>Small app, cold → first frame</b></td><td>build it first</td><td><b>3.7 s</b> cold, <b>0.41 s</b> warm (M4 MacBook)</td></tr>
-<tr valign="top"><td><b>Speed of optimised code</b></td><td>1.00× (LLVM, <code>--release</code> for the native CPU)</td><td><b>slower</b>: 1.14–1.26× on the workloads we profile most, 2.3× on dense numeric loops (not vectorised yet); being re-measured (<a href="#plain-where-llvm-still-wins">details</a>)</td></tr>
-<tr valign="top"><td><b>Type- and borrow-checked before it runs</b></td><td>yes</td><td><b>yes</b></td></tr>
-<tr valign="top"><td><b>Needs</b></td><td>rustc, LLVM, a linker</td><td><b>Relax</b>, one Rust library (438k lines, 0 crates.io dependencies)</td></tr>
-</table>
-<h3><a name="plain-what-it-took-a-new-rust-toolchain-from-source-bytes-to-machine-code">What it took: a new Rust toolchain, from source bytes to machine code</a></h3>
-<p>Relax isn't a wrapper around rustc or a plugin for LLVM. It replaces both, plus the parts of Cargo and the linker that sit between your source and a running program, in one Rust library with no dependencies.</p>
-<table border="1" cellpadding="4" cellspacing="0">
-<tr><th>The job</th><th>In the usual toolchain</th><th><b>In Relax</b></th></tr>
-<tr valign="top"><td>Lex, parse and expand macros, <code>macro_rules!</code> and procedural</td><td>rustc</td><td><b>relax-lex, relax-front</b></td></tr>
-<tr valign="top"><td>Resolve names, solve traits, infer types, check borrows, evaluate constants</td><td>rustc</td><td><b>relax-types</b></td></tr>
-<tr valign="top"><td>Optimise: inlining, folding, loops, ranges</td><td>rustc's MIR passes + LLVM</td><td><b>relax-codegen</b> (O1 and O3)</td></tr>
-<tr valign="top"><td>Allocate registers, emit x86-64 and AArch64 machine code</td><td>LLVM</td><td><b>relax-backend</b></td></tr>
-<tr valign="top"><td>Link and load</td><td>the system linker and loader</td><td><b>relax-compiler</b>, straight into executable memory</td></tr>
-<tr valign="top"><td>Read manifests and resolve the crate graph</td><td>Cargo</td><td><b>relax-base</b></td></tr>
-<tr valign="top"><td>Build <code>core</code>, <code>alloc</code> and <code>std</code></td><td>shipped prebuilt</td><td><b>compiled from source by Relax</b></td></tr>
-<tr valign="top"><td>Size</td><td>millions of lines of Rust and C++</td><td><b>438k lines of Rust, 0 crates.io dependencies</b></td></tr>
-</table>
-<hr>
-<h2><a name="plain-why-this-changes-rust">Why this changes Rust</a></h2>
-<p>Rust gives you speed and safety, and charges for them in compile times. Relax keeps the speed and the safety and drops the charge.</p>
-<table border="1" cellpadding="4" cellspacing="0">
-<tr><th></th><th>With rustc</th><th><b>With Relax</b></th></tr>
-<tr valign="top"><td><b>Getting started</b></td><td>Build everything first. On a large app, minutes pass before <code>main</code> runs.</td><td><b>Start from source now.</b> On an M4 MacBook a small app shows its first frame 3.7 s after a cold start, and a large 3D game in 11 s. Run them again and it's 0.41 s and 1.15 s.</td></tr>
-<tr valign="top"><td><b>Making a change</b></td><td>Rebuild the crate and everything that depends on it, relink, restart, and get back to where you were.</td><td><b>Saving is the build.</b> Only the functions you changed are rechecked and recompiled, and they're swapped into the running program, which keeps its state, windows and connections.</td></tr>
-<tr valign="top"><td><b>Run-time speed</b></td><td>Fast, after a long optimised build.</td><td><b>Fast, while it runs.</b> Code starts on an interpreter and climbs to O1 and O3 in the background. Optimised Relax code is still slower than rustc <code>--release</code> (see <a href="#plain-where-llvm-still-wins">where LLVM still wins</a>).</td></tr>
-<tr valign="top"><td><b>Safety</b></td><td>Everything type- and borrow-checked.</td><td><b>The same.</b> Relax never runs code it hasn't checked.</td></tr>
-<tr valign="top"><td><b>Your crates</b></td><td>Path, git, crates.io, vendored, proc macros.</td><td><b>The same crates, as written,</b> procedural macros included.</td></tr>
-<tr valign="top"><td><b>Caches</b></td><td>Incremental artefacts on disk that can go stale and need <code>cargo clean</code>.</td><td><b>Every result is keyed by the hashes of its inputs.</b> A hit is exactly what a fresh compile would produce. A warm start recompiles nothing.</td></tr>
-<tr valign="top"><td><b>When it's slow</b></td><td>You wait and guess.</td><td><b>The runtime tells you.</b> Every compile phase, stall and tier change goes to a flight recorder.</td></tr>
-</table>
-<hr>
-<h2><a name="plain-built-for-ai-agents-the-loop-that-stays-hot">Built for AI agents: the loop that stays hot</a></h2>
-<p>An AI agent can't feel a slow build, but it pays for every one in tokens, wall-clock and lost context.</p>
-<table border="1" cellpadding="4" cellspacing="0">
-<tr><th>An agent's iteration</th><th>With rustc + Cargo</th><th><b>With Relax + devhub</b></th></tr>
-<tr valign="top"><td><b>Edit reaches the program</b></td><td>rebuild and relink: minutes on a large app</td><td><b>synced and patched in milliseconds</b> (~50–200 ms to the box)</td></tr>
-<tr valign="top"><td><b>Test verdict</b></td><td>rebuild the test binary, then run</td><td><b>92 tests back 2.2 s after the save</b></td></tr>
-<tr valign="top"><td><b>See the UI</b></td><td>rebuild, relaunch, navigate back</td><td><b>a frame of the live app, grabbed as a PNG</b></td></tr>
-<tr valign="top"><td><b>Layout change that can't be patched</b></td><td>full rebuild and restart</td><td><b>restart in place, automatically</b>: one log line, no error</td></tr>
-<tr valign="top"><td><b>New worker or lane</b></td><td>cold build</td><td><b>starts warm</b>: every machine keeps a warm cache at the tip</td></tr>
-<tr valign="top"><td><b>"Why was that slow?"</b></td><td>read logs and guess</td><td><b>ask the flight recorder</b>: which thread waited, on what, compiling which function</td></tr>
-</table>
-<p><a href="https://github.com/makepad/makepad">Makepad</a> builds its apps with many AI agents working in parallel, each in its own lane, and Relax keeps them fast. Its dev hub, <b>devhub</b>, runs the build and test machines around Relax, so nothing an agent touches is ever cold:</p>
-<pre>flowchart LR
-    A["AI agent&lt;br/&gt;edits a file"] --&gt;|"sync, ~50-200 ms"| B["devhub&lt;br/&gt;routes to a warm box"]
-    B --&gt; C["Live Relax session&lt;br/&gt;patches only what changed"]
-    C --&gt; D["Tests re-run&lt;br/&gt;verdict in seconds"]
-    C --&gt; E["App frame&lt;br/&gt;grabbed as a PNG"]
-    D --&gt; A
-    E --&gt; A
-    C --&gt;|"flight recorder"| F["why it was slow,&lt;br/&gt;what it compiled"]
-    F --&gt; A</pre>
+<h2><a name="plain-tldr">太长不看</a></h2>
+<p>Rust 的速度与安全，不必再等编译。</p>
 <ul>
-<li><b>A live session per lane.</b> Each agent's app or test run stays alive under Relax on a pool machine, and every save patches it. Nothing is rebuilt or relaunched.
-<li><b>Warm caches everywhere.</b> Each machine refreshes its Relax cache as changes land, so a fresh worker starts warm.
-<li><b>No native builds in the loop.</b> devhub sends iteration and pre-landing checks to Relax, and counts every native build that slips through, per lane.
-<li><b>Measured routing.</b> Jobs are sized by their measured times, and quick checks go to machines with warm sessions, so they never queue behind a long build.
+<li><b>是什么</b>：一个 Rust 实时编译器与 JIT 运行时，直接从源码运行 Cargo 包。不要 rustc，不要 LLVM，不要链接器。
+<li><b>启动</b>：在 M4 MacBook 上，一个大型 3D 游戏从全新检出到出首帧只要 <b>11 s</b>，而 rustc 光是构建就得先花 ~3 min。第二次运行只要 <b>1.15 s</b>。
+<li><b>改动</b>：保存文件，改过的函数就被热补丁进运行中的程序，状态不丢。<b>92 个测试 2.2 s 重跑完。</b>
+<li><b>速度</b>：优化后的代码仍然比 rustc <code>--release</code> 慢。本周一次范围更广的测试，结果比我们之前公布的数字更慢，我们正在重新测量；详见 <a href="#plain-gaps">LLVM 仍然领先的地方</a>。
+<li><b>体积</b>：就一个 Rust 库：<b>438k 行代码，0 个 crates.io 依赖。</b>
 </ul>
-<p><b>In practice:</b> nine agent lanes run side by side, devhub handles more than 300 build and test jobs an hour, and dozens of changes land every day, each checked under Relax before it merges.</p>
-<hr>
-<h2><a name="plain-relax-vs-rustc-feature-by-feature">Relax vs rustc, feature by feature</a></h2>
+<h2><a name="plain-race">Relax 对决 rustc</a></h2>
 <table border="1" cellpadding="4" cellspacing="0">
-<tr><th></th><th>rustc + Cargo</th><th><b>Relax</b></th></tr>
-<tr valign="top"><td><b>Start</b></td><td>Build the whole crate graph, link, then run <code>main</code>.</td><td><b>Resolve the crate graph and start <code>main</code> from source.</b> No native build of your code.</td></tr>
-<tr valign="top"><td><b>Checking</b></td><td>Type- and borrow-check every crate up front.</td><td><b>The same, before the first call.</b></td></tr>
-<tr valign="top"><td><b>Compiling</b></td><td>Whole crates, ahead of time.</td><td><b>One function at a time, the moment it's first called.</b> Hot functions move up in the background: interpreter → O1 → O3. <code>#[relax(O2)]</code> / <code>#[relax(O3)]</code> ask for a level ahead of time; under rustc the attribute does nothing.</td></tr>
-<tr valign="top"><td><b>Editing</b></td><td>Rebuild and restart.</td><td><b>Recheck, recompile and swap in only what changed, while the program runs.</b> Code already handed out stays valid. A change that can't be swapped restarts the program in place.</td></tr>
-<tr valign="top"><td><b>Caching</b></td><td>Incremental artefacts per crate.</td><td><b>Every result keyed by the hashes of its inputs.</b> An unchanged package recompiles nothing.</td></tr>
-<tr valign="top"><td><b>Procedural macros</b></td><td>Built as native dylibs, then loaded.</td><td><b>Run natively when they match a linked build, otherwise on the JIT.</b></td></tr>
-<tr valign="top"><td><b>The standard library</b></td><td>Ships precompiled.</td><td><b><code>core</code>, <code>alloc</code> and <code>std</code> (134k lines) compiled from source by Relax itself.</b></td></tr>
-<tr valign="top"><td><b>Native code</b></td><td>Everything is native.</td><td><b>Crates that must stay native (OS layers, GPU, audio) export an interface with <code>#[relax_api]</code>.</b> JIT code calls them through the C ABI planner, with per-thread heap routing across the boundary.</td></tr>
-<tr valign="top"><td><b>Visibility</b></td><td>Compiler timings after the fact.</td><td><b>A live flight recorder,</b> with hitch events and compile profilers.</td></tr>
-<tr valign="top"><td><b>Back ends</b></td><td>LLVM, then a system linker.</td><td><b>Its own x86-64 and AArch64 code generators,</b> with no linker and no LLVM.</td></tr>
+<tr><th></th><th>rustc</th><th>Relax</th></tr>
+<tr valign="top"><td>大型 3D 游戏：全新检出 → 首帧</td><td>构建 ~3 min，然后启动</td><td><b>11 s</b> M4 MacBook，直接跑源码</td></tr>
+<tr valign="top"><td>同一个游戏，再次运行 → 首帧</td><td>启动已经构建好的二进制</td><td><b>1.15 s</b> M4 MacBook，什么都不用重新编译</td></tr>
+<tr valign="top"><td>小应用，冷启动 → 首帧</td><td>得先构建</td><td><b>3.7 s</b> 冷启动；热启动只要 0.41 s（M4 MacBook）</td></tr>
+<tr valign="top"><td>保存文件 → 92 个测试重跑</td><td>得先重新构建测试二进制</td><td><b>2.2 s</b> 从保存那一刻算起</td></tr>
+<tr valign="top"><td>改动运行中程序里的一个函数</td><td>重新构建、重新链接、重启：程序状态全丢</td><td>热补丁进正在运行的进程</td></tr>
+<tr valign="top"><td>优化后代码的速度</td><td>基准 1.00×（LLVM，针对本机 CPU 的 <code>--release</code>）</td><td><b>更慢</b>：在我们最常剖析的负载上耗时为其 1.14–1.26 倍，密集数值循环上为 2.3 倍（尚未做向量化）；正在重新测量（<a href="#plain-gaps">详情</a>）</td></tr>
+<tr valign="top"><td>运行前完成类型检查和借用检查</td><td>是</td><td><b>是</b></td></tr>
+<tr valign="top"><td>需要什么</td><td>rustc、LLVM、链接器</td><td><b>Relax</b>，一个 Rust 库（438k 行，0 个 crates.io 依赖）</td></tr>
 </table>
-<hr>
-<h2><a name="plain-where-llvm-still-wins">Where LLVM still wins</a></h2>
-<p>LLVM has decades of optimisation work behind it, and in steady state its code is still faster than Relax's. Our own measurements: warm JIT against a native build of the same source and inputs, as wall-clock ratios (lower is better, 1.00× = LLVM).</p>
+<h2><a name="plain-toolchain">一套全新的 Rust 工具链，从源码字节到机器码。</a></h2>
+<p>Relax 不是 rustc 的套壳，也不是 LLVM 的插件。<b>它把两者都换掉了</b>，连同 Cargo 和链接器里夹在源码与运行中程序之间的那部分，全部装进一个零依赖的 Rust 库。</p>
 <table border="1" cellpadding="4" cellspacing="0">
-<tr><th>Workload</th><th>CPU</th><th>vs <code>--release</code>, native CPU</th><th>Measured</th></tr>
-<tr valign="top"><td>3D-print slicer, first slice of a part, 4 threads</td><td>x86-64 (Zen 4)</td><td><b>1.14×</b> (cycles 1.15×, instructions 1.26×)</td><td>2026-11-11</td></tr>
-<tr valign="top"><td>Same, 8 threads</td><td>x86-64 (Zen 4)</td><td><b>1.17×</b></td><td>2026-11-11</td></tr>
-<tr valign="top"><td>Same, 4 threads</td><td>AArch64 (Apple M4)</td><td><b>1.24×</b> (before this week's x86 gains were ported)</td><td>2026-11-09</td></tr>
-<tr valign="top"><td>CAD B-rep modelling round</td><td>x86-64 (Zen 4)</td><td><b>1.26×</b></td><td>2026-11-10</td></tr>
-<tr valign="top"><td>Script VM interpreter loop</td><td>x86-64 (Zen 4)</td><td><b>1.19×</b></td><td>2026-11-11</td></tr>
-<tr valign="top"><td>Dense numeric kernel (Cholesky factorisation)</td><td>x86-64 (Zen 4)</td><td><b>2.29×</b>: LLVM vectorises it with AVX-512, Relax doesn't vectorise loops yet</td><td>2026-11-10</td></tr>
-<tr valign="top"><td>Any workload against plain <code>--release</code> (portable CPU baseline)</td><td></td><td><b>not measured yet</b></td><td></td></tr>
+<tr valign="top"><td>词法分析、语法分析、宏展开（<code>macro_rules!</code> 与过程宏）</td><td>rustc</td><td>relax-lex、relax-front</td></tr>
+<tr valign="top"><td>名称解析、trait 求解、类型推断、借用检查、常量求值</td><td>rustc</td><td>relax-types</td></tr>
+<tr valign="top"><td>优化：内联、折叠、循环、范围分析</td><td>rustc 的 MIR pass + LLVM</td><td>relax-codegen（O1 与 O3）</td></tr>
+<tr valign="top"><td>寄存器分配，生成 x86-64 与 AArch64 机器码</td><td>LLVM</td><td>relax-backend</td></tr>
+<tr valign="top"><td>链接与加载</td><td>系统链接器与加载器</td><td>relax-compiler，直接写入可执行内存</td></tr>
+<tr valign="top"><td>读取 manifest，解析 crate 依赖图</td><td>Cargo</td><td>relax-base</td></tr>
+<tr valign="top"><td>构建 <code>core</code>、<code>alloc</code> 和 <code>std</code></td><td>预编译好随工具链分发</td><td>由 Relax 从源码编译</td></tr>
 </table>
-<p>These are the workloads we profile most. A broader run of 18 workloads this week came out slower than these, and slower than in October; we're finding out why and will update this section with the result.</p>
-<p><b>Which <code>--release</code>?</b> Most Rust ships with plain <code>--release</code>, built for a portable baseline CPU (on x86-64, no AVX). Our numbers are against the harder setting, <code>--release</code> with <code>-C target-cpu=native</code>, where LLVM may use every instruction the machine has. Relax always compiles for the CPU it runs on, so against plain <code>--release</code> these gaps shrink, and on vector-heavy code they can flip. That comparison hasn't been measured yet.</p>
-<p><b>Where the gap comes from</b>, from instruction-level comparisons of the same functions. The gap is extra instructions rather than stalls: 1.26× the instructions cost only 1.15× the cycles.</p>
+<ul>
+<li><b>438k</b> 行 Rust 代码：常规工具链：数百万行 Rust 与 C++。
+<li><b>0</b> 个 crates.io 依赖：一个零依赖的 Rust 库。
+<li><b>134k</b> 行 <code>core</code>、<code>alloc</code> 与 <code>std</code>，由 Relax 自己从源码编译：用 rustc 时，标准库是预编译好再分发的。
+</ul>
+<h2><a name="plain-why">要速度，要安全，不要等。</a></h2>
+<p>Rust 给了你速度和安全，代价是拿编译时间来付账。<b>Relax 保留速度与安全，免掉这笔账。</b></p>
 <table border="1" cellpadding="4" cellspacing="0">
-<tr><th>Cause</th><th>Extra instructions (slicer run)</th></tr>
-<tr valign="top"><td>Compares kept as bool registers and recomputed</td><td>~25 G</td></tr>
-<tr valign="top"><td>Register copies (two-address form, coalescing misses)</td><td>~23 G</td></tr>
-<tr valign="top"><td>Stack traffic: loop state kept in stack slots; 12 allocatable registers against rustc's 15</td><td>~22 G</td></tr>
-<tr valign="top"><td>Extra loop-control and check branches, invariant tests left inside loops</td><td>~13 G</td></tr>
-<tr valign="top"><td>Loads not folded into compares, i128 arithmetic, rematerialised constants, smaller items</td><td>~33 G</td></tr>
-<tr valign="top"><td>Runtime outside the generated code (memcpy, allocator wrappers, TLS access, stubs)</td><td>~40 G</td></tr>
-<tr valign="top"><td>No loop vectorisation, shallow unrolling</td><td>most of the numeric-kernel gap</td></tr>
+<tr><th></th><th>用 rustc</th><th>用 Relax</th></tr>
+<tr valign="top"><td>启动</td><td>先把所有东西构建完。大型应用要等上几分钟，<code>main</code> 才开始跑。</td><td><b>现在就从源码启动。</b>在 M4 MacBook 上，小应用冷启动 3.7 s 出首帧，大型 3D 游戏 11 s。再次运行分别只要 0.41 s 和 1.15 s。</td></tr>
+<tr valign="top"><td>改代码</td><td>重新构建这个 crate 和所有依赖它的东西，重新链接，重启，再回到刚才的位置。</td><td><b>保存即构建。</b>只有你改过的函数会被重新检查、重新编译，然后热替换进运行中的程序，状态、窗口和连接都还在。</td></tr>
+<tr valign="top"><td>运行速度</td><td>快，但得先熬过漫长的优化构建。</td><td><b>运行中就变快。</b>代码从解释器起步，在后台逐级升到 O1、O3。Relax 优化后的代码仍然比 rustc <code>--release</code> 慢（见 <a href="#plain-gaps">LLVM 仍然领先的地方</a>）。</td></tr>
+<tr valign="top"><td>安全</td><td>所有代码都经过类型检查和借用检查。</td><td><b>一样。</b>Relax 绝不运行没检查过的代码。</td></tr>
+<tr valign="top"><td>你的 crate</td><td>path、git、crates.io、vendored、过程宏。</td><td><b>同样的 crate，原样使用，</b>过程宏也包括在内。</td></tr>
+<tr valign="top"><td>缓存</td><td>磁盘上的增量编译产物，可能过期，需要 <code>cargo clean</code>。</td><td><b>每个结果都以其输入的哈希为键。</b>命中的结果与全新编译的产物完全一致。热启动什么都不重新编译。</td></tr>
+<tr valign="top"><td>慢的时候</td><td>干等，靠猜。</td><td><b>运行时直接告诉你。</b>每个编译阶段、每次卡顿、每次层级切换，都会记进飞行记录器。</td></tr>
 </table>
-<p>What isn't a cause: inlining. Relax inlines more than rustc does.</p>
-<p>Every row in this table is a work item, and the slicer gap went from 1.26× to 1.14× in the last three days.</p>
-<hr>
-<h2><a name="plain-architecture">Architecture</a></h2>
-<p>rustc hands your program to LLVM and a linker, and Cargo glues the steps together. Relax owns the whole pipeline, from source bytes to executable memory, in one process.</p>
-<p>Relax is a stack of layers. Each layer is its own crate, builds only on the ones below it and re-exports them, so every module is <code>crate::&lt;module&gt;</code> at every layer. The layers compile in parallel, and a change in an upper layer never rebuilds the ones below.</p>
-<pre>flowchart TB
-    SRC["Cargo package&lt;br/&gt;.rs sources + Cargo.toml"]
-
-    subgraph FRONT["Front: what the program says"]
-        LEX["relax-lex&lt;br/&gt;lexer + proc-macro token model"]
-        BASE["relax-base&lt;br/&gt;hashing, arenas, syntax tree,&lt;br/&gt;manifests, git + source mounts"]
-        SES["relax-session&lt;br/&gt;compilation inputs, stable hashes"]
-        FE["relax-front&lt;br/&gt;parse, crate graph, name resolution,&lt;br/&gt;macro expansion, derives"]
-    end
-
-    subgraph MID["Types: what the program means"]
-        TY["relax-types&lt;br/&gt;interned types, impls, typeck,&lt;br/&gt;layouts, const eval, borrow check"]
-    end
-
-    subgraph LOW["Code: how it runs"]
-        CG["relax-codegen&lt;br/&gt;RIR optimisers O1 / O3,&lt;br/&gt;loops + ranges, threaded interpreter"]
-        BE["relax-backend&lt;br/&gt;RIR + vectors, register allocation,&lt;br/&gt;x86-64 / AArch64 code, C ABI, exec memory"]
-    end
-
-    subgraph RT["relax-compiler: the runtime"]
-        JIT["JIT runtime&lt;br/&gt;lazy compile, tiers, live swap,&lt;br/&gt;warm caches, flight recorder"]
-        STD["core / alloc / std&lt;br/&gt;from source"]
-        PM["proc-macro host"]
-    end
-
-    API["relax_api&lt;br/&gt;native crates"]
-
-    SRC --&gt; LEX --&gt; BASE --&gt; SES --&gt; FE --&gt; TY --&gt; CG --&gt; BE --&gt; JIT
-    PM --&gt; FE
-    STD --&gt; TY
-    API &lt;--&gt; JIT</pre>
-<h3><a name="plain-the-layers-and-what-they-replace">The layers, and what they replace</a></h3>
+<h2><a name="plain-agents">迭代循环，始终是热的。</a></h2>
+<p>AI 智能体感觉不到构建有多慢，但每一次慢构建它都在付账：<b>token、时间，还有丢掉的上下文。</b></p>
 <table border="1" cellpadding="4" cellspacing="0">
-<tr><th>Crate</th><th>Path</th><th>Role</th><th>In the rustc world</th></tr>
-<tr valign="top"><td><code>relax-lex</code></td><td><code>libs/relax/lex</code></td><td>The one lexer and token model for Rust (every edition), and the token model procedural macros see.</td><td>the lexer and <code>proc_macro</code></td></tr>
-<tr valign="top"><td><code>relax-base</code></td><td><code>libs/relax/base</code></td><td>What every phase shares: hashing, memory accounting and zone allocation, concurrent containers and arenas, the syntax tree, <code>cfg</code>, manifests (TOML, resolution), the git read path and source mounts.</td><td>parts of Cargo and rustc's shared infrastructure</td></tr>
-<tr valign="top"><td><code>relax-session</code></td><td><code>libs/relax/session</code></td><td>The inputs of a compilation and their stable hashing: the keys every cache is built on.</td><td>the session and incremental keys</td></tr>
-<tr valign="top"><td><code>relax-front</code></td><td><code>libs/relax/front</code></td><td>Parsing, the crate graph and name resolution, macro expansion (<code>macro_rules!</code>, built-ins, <code>format_args!</code>, derives, proc-macro registration).</td><td>parser, resolver, macro expansion</td></tr>
-<tr valign="top"><td><code>relax-types</code></td><td><code>libs/relax/types</code></td><td>Interned types, signatures and impls, type checking, layouts, constant evaluation, the borrow checker, per-definition body queries and stable type hashes.</td><td>type checker, borrow checker, const eval</td></tr>
-<tr valign="top"><td><code>relax-codegen</code></td><td><code>libs/relax/codegen</code></td><td>The middle end on RIR (Relax IR): the O1 and O3 optimisers (inlining, folding, loop and range passes), the threaded interpreter tier and the compile profilers.</td><td>MIR optimisations and LLVM's optimiser</td></tr>
-<tr valign="top"><td><code>relax-backend</code></td><td><code>libs/relax/backend</code></td><td>Register allocation, machine code for the host (x86-64 or AArch64), jump tables, the C ABI planner and executable memory.</td><td>LLVM's code generator and the linker</td></tr>
-<tr valign="top"><td><code>relax-compiler</code></td><td><code>libs/relax/compiler</code></td><td>The compiler, JIT runtime and std as one library: lazy compilation, tiering, live edits, caches, the proc-macro host and the test runner.</td><td>Cargo, the rustc driver, the test harness and the OS loader</td></tr>
-<tr valign="top"><td><code>relax-native-macros</code></td><td><code>libs/relax/native_macros</code></td><td>Natively linked procedural macros, checked against their source so they expand exactly as they would under Cargo.</td><td>proc-macro dylibs</td></tr>
-<tr valign="top"><td>attribute</td><td><code>libs/relax/attr</code></td><td><code>#[relax(O2)]</code> / <code>#[relax(O3)]</code>: the optimisation-level attribute; a no-op under rustc.</td><td><code>opt-level</code> per profile</td></tr>
-<tr valign="top"><td><code>relax_api</code></td><td><code>libs/relax_api</code></td><td><code>#[relax_api]</code>: the interface a natively compiled crate offers to JIT code, and per-thread heap routing.</td><td>(no equivalent: everything is native)</td></tr>
+<tr><th></th><th>用 rustc + Cargo</th><th>用 Relax + devhub</th></tr>
+<tr valign="top"><td>改动生效</td><td>重新构建、重新链接：大型应用要几分钟</td><td><b>毫秒级同步并打上补丁</b>（送到机器约 50–200 ms）</td></tr>
+<tr valign="top"><td>测试结果</td><td>先重新构建测试二进制，再运行</td><td><b>保存后 2.2 s，92 个测试的结果就回来了</b></td></tr>
+<tr valign="top"><td>查看界面</td><td>重新构建、重新启动、再点回原来的页面</td><td><b>直接抓取运行中应用的一帧，存成 PNG</b></td></tr>
+<tr valign="top"><td>无法热补丁的类型布局改动</td><td>完整重新构建并重启</td><td><b>自动原地重启</b>：只多一行日志，不报错</td></tr>
+<tr valign="top"><td>新 worker 或新泳道</td><td>冷构建</td><td><b>一上来就是热的</b>：每台机器都为最新提交保持热缓存</td></tr>
+<tr valign="top"><td>“刚才为什么慢？”</td><td>翻日志，靠猜</td><td><b>问飞行记录器</b>：哪个线程在等、在等什么、正在编译哪个函数</td></tr>
 </table>
-<h3><a name="plain-a-functions-life">A function's life</a></h3>
-<pre>sequenceDiagram
-    participant App as Running program
-    participant RT as JIT runtime
-    participant TY as Types layer
-    participant CG as Codegen + backend
-
-    Note over RT,TY: before the first call, every crate of the program is type-checked
-    App-&gt;&gt;RT: first call of fn f
-    RT-&gt;&gt;CG: compile f (interpreter or O1)
-    CG--&gt;&gt;RT: machine code, published
-    RT--&gt;&gt;App: call proceeds
-    loop while f is hot
-        RT-&gt;&gt;CG: recompile f at O3 in the background
-        CG--&gt;&gt;RT: faster code, swapped in
-    end
-    Note over App,RT: you save a change to f
-    RT-&gt;&gt;TY: recheck what changed
-    TY--&gt;&gt;RT: ok
-    RT-&gt;&gt;CG: recompile f
-    CG--&gt;&gt;RT: new code, the old code stays valid
-    RT--&gt;&gt;App: next call runs the new f</pre>
-<p>With rustc, the same change is a rebuild of the crate, a relink and a restart.</p>
-<h3><a name="plain-design-rules">Design rules</a></h3>
+<p>Makepad 用许多并行工作的 AI 智能体来构建自己的应用，每个智能体各占一条泳道，而 Relax 让它们都保持高速。它的开发中枢 <b>devhub</b> 围绕 Relax 调度构建与测试机器，所以智能体碰到的一切都不会是冷的。</p>
+<ul>
+<li><b>每条泳道一个实时会话</b>：每个智能体的应用或测试，都在机器池中的某台机器上由 Relax 持续运行，每次保存都给它打补丁。不重新构建，也不重新启动。
+<li><b>处处是热缓存</b>：每有改动合入，每台机器都会刷新自己的 Relax 缓存，所以新起的 worker 一启动就是热的。
+<li><b>循环里没有原生构建</b>：devhub 把迭代和合入前检查都交给 Relax，并按泳道统计每一次漏网的原生构建。
+<li><b>按实测调度</b>：任务按实测耗时估算大小，快速检查交给有热会话的机器，绝不会排在长时间构建后面。
+</ul>
+<h2><a name="plain-features">Relax 对比 rustc，逐项来看。</a></h2>
 <table border="1" cellpadding="4" cellspacing="0">
-<tr><th>Rule</th><th>What it means against rustc</th></tr>
-<tr valign="top"><td><b>Checked, then run</b></td><td>Same guarantee as rustc: nothing runs unchecked. Relax just doesn't make you wait for the rest of the program first.</td></tr>
-<tr valign="top"><td><b>Never stale</b></td><td>Every cached result is keyed by the hashes of its inputs. A hit is exactly what a fresh compile would produce, so there's no <code>cargo clean</code>.</td></tr>
-<tr valign="top"><td><b>Code only grows</b></td><td>Published machine code is never freed or rewritten while it can still be on a stack. A swap publishes new code and redirects future calls, and is safe where a native hot-reload hack isn't.</td></tr>
-<tr valign="top"><td><b>Lazy by default</b></td><td>rustc compiles everything you might call. Relax compiles what you do call, and optimises it in the background.</td></tr>
-<tr valign="top"><td><b>Rust as written</b></td><td>Ordinary crates, from crates.io and git. <code>libs/relax/KNOWN_GAPS.md</code> lists what doesn't work yet.</td></tr>
-<tr valign="top"><td><b>Inspectable</b></td><td>Every phase reports what it's doing; a stall can always be explained from its record.</td></tr>
+<tr><th></th><th>rustc</th><th>Relax</th></tr>
+<tr valign="top"><td>启动</td><td>构建整张 crate 依赖图，链接，然后运行 <code>main</code>。</td><td><b>解析 crate 依赖图，直接从源码启动 <code>main</code>。</b>你的代码不需要原生构建。</td></tr>
+<tr valign="top"><td>检查</td><td>预先对每个 crate 做类型检查和借用检查。</td><td><b>一样，在第一次调用之前完成。</b></td></tr>
+<tr valign="top"><td>编译</td><td>整个 crate，提前编译。</td><td><b>一次一个函数，在它第一次被调用的那一刻。</b>热点函数在后台逐级升档：解释器 → O1 → O3。<code>#[relax(O2)]</code> / <code>#[relax(O3)]</code> 可以提前指定级别；在 rustc 下这个属性什么也不做。</td></tr>
+<tr valign="top"><td>编辑</td><td>重新构建，然后重启。</td><td><b>程序运行期间，只重新检查、重新编译、热替换改动的部分。</b>已经交出去的代码依然有效。无法热替换的改动会让程序原地重启。</td></tr>
+<tr valign="top"><td>缓存</td><td>按 crate 存放的增量编译产物。</td><td><b>每个结果都以其输入的哈希为键。</b>没有改动的包什么都不重新编译。</td></tr>
+<tr valign="top"><td>过程宏</td><td>构建成原生 dylib，再加载。</td><td><b>与已链接的构建一致时原生运行，否则在 JIT 上运行。</b></td></tr>
+<tr valign="top"><td>标准库</td><td>预编译好随工具链分发。</td><td><b><code>core</code>、<code>alloc</code> 和 <code>std</code>（134k 行）由 Relax 自己从源码编译。</b></td></tr>
+<tr valign="top"><td>原生代码</td><td>全部都是原生的。</td><td><b>必须保持原生的 crate（系统层、GPU、音频）用 <code>#[relax_api]</code> 导出接口。</b>JIT 代码通过 C ABI 规划器调用它们，跨越边界时按线程路由堆内存。</td></tr>
+<tr valign="top"><td>可观测性</td><td>事后看编译器计时。</td><td><b>实时飞行记录器，</b>附带卡顿事件和编译分析器。</td></tr>
+<tr valign="top"><td>后端</td><td>LLVM，再接系统链接器。</td><td><b>自研的 x86-64 与 AArch64 代码生成器，</b>不用链接器，也不用 LLVM。</td></tr>
 </table>
-<hr>
-<h2><a name="plain-building">Building</a></h2>
+<h2><a name="plain-gaps">LLVM 仍然领先的地方。</a></h2>
+<p>LLVM 背后是几十年的优化积累，在稳定状态下，它生成的代码仍然比 Relax 的快。以下是我们自己的测量：<b>热 JIT 对比同一份源码、同样输入的原生构建，取实际耗时之比。</b>越低越好，1.00× = LLVM。</p>
 <table border="1" cellpadding="4" cellspacing="0">
-<tr><th></th><th>rustc</th><th><b>Relax</b></th></tr>
-<tr valign="top"><td><b>To build it</b></td><td>LLVM plus a bootstrap</td><td><b>A stable Rust toolchain. Nothing from crates.io.</b></td></tr>
+<tr valign="top"><td>3D 打印切片器：零件首次切片，4 线程</td><td>x86-64 (Zen 4)</td><td><b>1.14×</b>（周期数 1.15 倍，指令数 1.26 倍）</td><td>测于 2026-11-11</td></tr>
+<tr valign="top"><td>同上，8 线程</td><td>x86-64 (Zen 4)</td><td><b>1.17×</b></td><td>测于 2026-11-11</td></tr>
+<tr valign="top"><td>同上，4 线程</td><td>AArch64 (Apple M4)</td><td><b>1.24×</b>（测于本周的 x86 优化移植过来之前）</td><td>测于 2026-11-09</td></tr>
+<tr valign="top"><td>CAD B-rep 建模一轮</td><td>x86-64 (Zen 4)</td><td><b>1.26×</b></td><td>测于 2026-11-10</td></tr>
+<tr valign="top"><td>脚本虚拟机的解释器循环</td><td>x86-64 (Zen 4)</td><td><b>1.19×</b></td><td>测于 2026-11-11</td></tr>
+<tr valign="top"><td>密集数值内核（Cholesky 分解）</td><td>x86-64 (Zen 4)</td><td><b>2.29×</b>（LLVM 用 AVX-512 把它向量化了，Relax 目前还不做循环向量化）</td><td>测于 2026-11-10</td></tr>
+<tr valign="top"><td>任意负载对比普通 <code>--release</code>（可移植 CPU 基线）</td><td></td><td>尚未测量</td><td></td></tr>
+</table>
+<p>以上是我们最常剖析的负载。本周一次覆盖 18 个负载的更广泛测试，结果比这些数字更慢，也比十月份更慢；我们正在查明原因，查清后会在这里更新结果。</p>
+<p><b>哪个 <code>--release</code>？</b> 大多数 Rust 程序发布时用的是普通 <code>--release</code>，面向可移植的基线 CPU，在 x86-64 上就是不用 AVX。我们的数字对比的是更难的设定：带 <code>-C target-cpu=native</code> 的 <code>--release</code>，LLVM 可以用上这台机器的每一条指令。Relax 总是针对它所运行的 CPU 编译，所以对比普通 <code>--release</code> 时这些差距会缩小，在向量运算密集的代码上甚至可能反转。<b>这项对比还没有测过。</b></p>
+<p><b>差距从哪来</b>：基于同一批函数的指令级对比。差距来自多出来的指令，而不是停顿：指令数是 1.26 倍，周期数只有 1.15 倍。</p>
+<p><b>多出的指令按原因分类（切片器运行）</b></p>
+<ul>
+<li>比较结果存成 bool 寄存器，之后又重新计算：~25 G
+<li>寄存器间拷贝（二地址形式、拷贝合并遗漏）：~23 G
+<li>栈访问：循环状态放在栈槽里；可分配寄存器只有 12 个，rustc 有 15 个：~22 G
+<li>多余的循环控制与检查分支，循环不变的判断留在了循环内：~13 G
+<li>load 没有折叠进比较、i128 运算、重新物化的常量，以及其他小项：~33 G
+<li>生成代码之外的运行时开销（memcpy、分配器包装、TLS 访问、桩代码）：~40 G
+<li>没有循环向量化，循环展开较浅：数值内核差距的大头
+</ul>
+<p>不是原因的：内联。Relax 内联得比 rustc 还多。</p>
+<p>表里每一行都是一项待办，切片器的差距在过去三天里从 1.26 倍缩小到了 1.14 倍。</p>
+<h2><a name="plain-architecture">一个进程，从源码字节到可执行内存。</a></h2>
+<p>rustc 把你的程序交给 LLVM 和链接器，再由 Cargo 把各个步骤粘在一起。<b>Relax 在一个进程里包揽整条流水线，从源码字节一直到可执行内存。</b></p>
+<p>Relax 是一层层叠起来的。每一层都是独立的 crate，只依赖它下面的层并重新导出它们，所以在任何一层，每个模块都是 <code>crate::&lt;module&gt;</code>。各层并行编译，上层的改动永远不会让下层重新构建。</p>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr valign="top"><td>relax-lex</td><td><code>libs/relax/lex</code></td><td>统一的 Rust 词法分析器和 token 模型（覆盖所有 edition），也是过程宏看到的那个 token 模型。</td><td><b>在 rustc 体系里</b>：词法分析器与 <code>proc_macro</code></td></tr>
+<tr valign="top"><td>relax-base</td><td><code>libs/relax/base</code></td><td>各阶段共用的基础：哈希、内存记账与分区分配、并发容器与 arena、语法树、<code>cfg</code>、manifest（TOML、依赖解析）、git 读取路径与源码挂载。</td><td><b>在 rustc 体系里</b>：Cargo 的一部分，以及 rustc 的共享基础设施</td></tr>
+<tr valign="top"><td>relax-session</td><td><code>libs/relax/session</code></td><td>一次编译的输入及其稳定哈希：所有缓存都建立在这些键之上。</td><td><b>在 rustc 体系里</b>：session 与增量编译的键</td></tr>
+<tr valign="top"><td>relax-front</td><td><code>libs/relax/front</code></td><td>语法解析、crate 依赖图与名称解析、宏展开：<code>macro_rules!</code>、内置宏、<code>format_args!</code>、derive 与过程宏注册。</td><td><b>在 rustc 体系里</b>：解析器、名称解析、宏展开</td></tr>
+<tr valign="top"><td>relax-types</td><td><code>libs/relax/types</code></td><td>驻留类型、签名与 impl、类型检查、布局、常量求值、借用检查器、按定义查询函数体，以及稳定的类型哈希。</td><td><b>在 rustc 体系里</b>：类型检查器、借用检查器、常量求值</td></tr>
+<tr valign="top"><td>relax-codegen</td><td><code>libs/relax/codegen</code></td><td>基于 RIR（Relax IR）的中端：O1 与 O3 优化器（内联、折叠、循环与范围 pass）、threaded-code 解释器这一层级，以及编译分析器。</td><td><b>在 rustc 体系里</b>：MIR 优化与 LLVM 优化器</td></tr>
+<tr valign="top"><td>relax-backend</td><td><code>libs/relax/backend</code></td><td>寄存器分配、面向宿主机的机器码（x86-64 或 AArch64）、跳转表、C ABI 规划器与可执行内存。</td><td><b>在 rustc 体系里</b>：LLVM 的代码生成器与链接器</td></tr>
+<tr valign="top"><td>relax-compiler</td><td><code>libs/relax/compiler</code></td><td>编译器、JIT 运行时和 std 合为一个库：惰性编译、分层、实时编辑、缓存、过程宏宿主和测试运行器。</td><td><b>在 rustc 体系里</b>：Cargo、rustc driver、测试框架与操作系统加载器</td></tr>
+<tr valign="top"><td>relax-native-macros</td><td><code>libs/relax/native_macros</code></td><td>原生链接的过程宏，会对照其源码校验，确保展开结果与在 Cargo 下完全一致。</td><td><b>在 rustc 体系里</b>：过程宏 dylib</td></tr>
+<tr valign="top"><td>属性</td><td><code>libs/relax/attr</code></td><td><code>#[relax(O2)]</code> / <code>#[relax(O3)]</code>：优化级别属性；在 rustc 下不起作用。</td><td><b>在 rustc 体系里</b>：按 profile 设置的 <code>opt-level</code></td></tr>
+<tr valign="top"><td>relax_api</td><td><code>libs/relax_api</code></td><td><code>#[relax_api]</code>：原生编译的 crate 向 JIT 代码提供的接口，以及按线程的堆路由。</td><td><b>在 rustc 体系里</b>：（没有对应物：一切都是原生的）</td></tr>
+</table>
+<h2><a name="plain-life">一个函数的一生。</a></h2>
+<ul>
+<li><b>解释器</b>：代码从这里起步。
+<li><b>O1</b>：机器码，已发布。
+<li><b>O3</b>：变热后在后台重新编译；更快的代码，热替换上线。
+</ul>
+<p>换成 rustc，同样的改动意味着：重新构建 crate、重新链接、重启。</p>
+<h2><a name="plain-rules">设计原则，以及相对 rustc 的意义。</a></h2>
+<ul>
+<li><b>先检查，再运行</b>：与 rustc 同样的保证：没检查过的代码绝不运行。只是 Relax 不会让你先等程序的其余部分。
+<li><b>永不过期</b>：每个缓存结果都以其输入的哈希为键。命中的结果与全新编译的产物完全一致，所以根本不需要 <code>cargo clean</code>。
+<li><b>代码只增不减</b>：已发布的机器码，只要还可能出现在某个栈上，就绝不会被释放或改写。热替换会发布新代码，并把之后的调用重定向过去；原生热重载的野路子不安全的地方，它是安全的。
+<li><b>默认按需</b>：rustc 会编译所有你可能调用的代码。Relax 只编译你真正调用的，并在后台优化它。
+<li><b>原样的 Rust</b>：普通的 crate，来自 crates.io 和 git。<code>libs/relax/KNOWN_GAPS.md</code> 列出了目前还不支持的部分。
+<li><b>可观测</b>：每个阶段都会报告自己在做什么；任何一次卡顿，都能从它的记录里找到原因。
+</ul>
+<h2><a name="plain-build">构建 Relax。</a></h2>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th></th><th>rustc</th><th>Relax</th></tr>
+<tr valign="top"><td>构建它需要</td><td>LLVM，外加一次自举</td><td><b>一套 stable Rust 工具链。crates.io 上的东西一个都不用。</b></td></tr>
 </table>
 <pre>cargo build --release -p relax-compiler</pre>
-<p>The compiler is the <code>relax_compiler</code> library; <code>relax</code> (<code>tools/run/runner</code>) is its command-line runner.</p>
-<h2><a name="plain-try-it">Try it</a></h2>
-<p>From a fresh clone, build <code>relax</code> and run a new package through the JIT:</p>
-<pre>git clone https://github.com/makepad/relax
-cargo build --release --manifest-path relax/Cargo.toml -p relax-runner --bin relax
-
-cargo new hello
-cd hello
-../relax/target/release/relax run --quiet hello    # run main under the JIT
-../relax/target/release/relax test hello           # run its #[test] fns
-../relax/target/release/relax check hello          # type- and borrow-check only</pre>
-<p>Run <code>relax</code> in the package's folder and give it the package's name, not a path. It reads Relax's std from the checkout it was built in, so keep the <code>relax</code> folder where it is.</p>
-<p>Each run also prints a <code>makepad-remote: pid ...</code> line: the running program's inspect socket (<code>relax inspect</code>).</p>
-<p>Measured from a fresh clone: on a 16-core x86-64 Linux box, building <code>relax</code> took 53 s, the first <code>relax run</code> of <code>hello</code> 0.24 s and the next ones 0.01 to 0.07 s. On a 10-core arm64 Mac, with cargo held to 4 jobs, the build took 78 s, the first run 0.97 s and the next ones 0.03 to 0.04 s. Relax keeps what it compiles in the package's <code>target/makepad-run</code>, beside cargo's build output (120 to 190 MB for <code>hello</code>; <code>relax clean</code> removes it), so each new package starts cold.</p>
-<p><b>Network.</b> A package with no dependencies, like <code>hello</code>, needs none: it also runs with <code>MAKEPAD_RUN_OFFLINE=1</code>. For a crates.io dependency Relax takes the package from <code>~/.cargo</code>'s registry when it is there, and otherwise downloads it itself: the sparse index from index.crates.io and the <code>.crate</code> file from static.crates.io, checked against the index's SHA-256 and kept in that package's <code>target/makepad-run</code>. With cargo's offline setting (<code>CARGO_NET_OFFLINE</code>) or <code>MAKEPAD_RUN_OFFLINE=1</code> it never downloads: a package whose dependencies it already fetched still runs, and one whose dependencies it has not fetched stops with an error naming the missing crate. <code>relax fetch &lt;git-url&gt;</code> (<code>tools/run/runner/src/fetch.rs</code>, also used by <code>relax run &lt;git-url&gt; &lt;package&gt;</code>) downloads a git repository over HTTPS into one store file under <code>~/.makepad-run</code> (<code>MAKEPAD_RUN_HOME</code>); this repository is a 4 MB store.</p>
-<p>Not everything runs yet: <a href="https://github.com/makepad/relax/blob/main/libs/relax/KNOWN_GAPS.md">libs/relax/KNOWN_GAPS.md</a> lists the open gaps, each with a repro.</p>
-<h2><a name="plain-repository-layout">Repository layout</a></h2>
-<pre>Cargo.toml                              the workspace
+<p>编译器是 <code>relax_compiler</code> 这个库；<code>relax</code>（<code>tools/run/runner</code>）是它的命令行运行器。</p>
+<pre>Cargo.toml                           工作区
 libs/relax/
-  lex/ base/ session/ front/ types/     front end and type system
-  codegen/ backend/                     middle end and machine code
-  compiler/                             runtime, std (compiler/std), 96 end-to-end test packages
-  attr/ native_macros/                  #[relax(..)] and native proc macros
-  KNOWN_GAPS.md                         what isn't supported yet
-libs/relax_api/                         #[relax_api] and per-thread heap routing
-tools/run/runner/                       relax, the command-line runner
-libs/ platform/ tools/ widgets/         the small support crates Relax links: token model,
-                                        serialisation, remote inspection, profiling, and the
-                                        native proc macros it checks against their source</pre>
-<h2><a name="plain-license">License</a></h2>
-<p>MIT, see <a href="https://github.com/makepad/relax/blob/main/LICENSE">LICENSE</a>. The std sources Relax compiles carry their own notices; see <code>libs/relax/compiler/std/CREDITS.md</code> and the license files beside them.</p>
-</div>
+  lex/ base/ session/ front/ types/  前端与类型系统
+  codegen/ backend/                  中端与机器码
+  compiler/                          运行时、std（compiler/std）、
+                                     96 个端到端测试包
+  attr/ native_macros/               #[relax(..)] 与原生过程宏
+  KNOWN_GAPS.md                      尚未支持的内容
+libs/relax_api/                      #[relax_api] 与按线程的堆路由
+tools/run/runner/                    relax，命令行运行器
+libs/ platform/ tools/ widgets/      Relax 链接的几个小型支撑 crate：
+                                     token 模型、序列化、远程检视、
+                                     性能分析，以及它对照源码
+                                     校验的原生过程宏</pre>
+<p>MIT 许可证，见 <a href="https://github.com/makepad/relax/blob/main/LICENSE">LICENSE</a>。Relax 编译的 std 源码带有各自的版权声明，见 <code>libs/relax/compiler/std/CREDITS.md</code> 及其旁边的许可证文件。</p>
+<h2>Rust，告别等待。</h2>
 </div>
 
 <header class="nav">
