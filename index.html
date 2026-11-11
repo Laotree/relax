@@ -105,9 +105,9 @@ h1 .glow::after{content:"";position:absolute;left:0;right:.12em;bottom:0;height:
 
 .mq{overflow:hidden;border-block:1px solid var(--line);padding:16px 0;background:var(--bg2)}
 .mq div{display:flex;width:max-content;animation:mq 46s linear infinite;will-change:transform}
-.mq span{font-size:clamp(1.5rem,5vw,3rem);font-weight:800;letter-spacing:-.04em;white-space:nowrap;color:transparent;-webkit-text-stroke:1px rgba(255,255,255,.3);padding-right:.5em}
-.mq span:nth-child(3n+1){color:var(--relax);-webkit-text-stroke:0}
-.mq span::after{content:"/";padding-left:.5em;color:transparent;-webkit-text-stroke:1px rgba(255,255,255,.16)}
+.mq span{font-size:clamp(1.5rem,5vw,3rem);font-weight:800;letter-spacing:-.04em;white-space:nowrap;color:rgba(255,255,255,.2);padding-right:.5em}
+.mq span:nth-child(3n+1){color:var(--relax)}
+.mq span::after{content:"/";padding-left:.5em;color:rgba(255,255,255,.12)}
 @keyframes mq{to{transform:translateX(-50%)}}
 
 /* sections */
