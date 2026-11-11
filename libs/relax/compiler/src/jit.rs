@@ -12981,7 +12981,8 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     }
     let u = &*up;
     // MAKEPAD_RUN_CODE_SIG_DIR: the inline candidates this preparation had (ready RIR / deferred), per
-    // build, for order-independence diffs (tools/hrcheck/fe/rirdiff.py)
+    // build, as <dir>/<name hash>.prep beside the signed RIR files: `diff -r` of two runs' dirs shows
+    // where a build's candidates or their readiness depended on the run's order
     if let Some(dir) = sig_dir() {
         let me = sig_name(u, id);
         let nh = me.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, c| (h ^ c as u64).wrapping_mul(0x100_0000_01b3));
