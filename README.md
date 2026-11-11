@@ -294,8 +294,8 @@ cd hello
 Run `relax` in the package's folder and give it the package's name, not a path. It reads Relax's
 std from the checkout it was built in, so keep the `relax` folder where it is.
 
-Each run also prints a `makepad-remote: pid ...` line: the running program's inspect socket
-(`relax inspect`).
+Each run also prints a `relax-remote: pid ...` line: the running program's inspect socket
+(`relax inspect <pid> help`).
 
 Measured from a fresh clone: on a 16-core x86-64 Linux box, building `relax` took 53 s, the first
 `relax run` of `hello` 0.24 s and the next ones 0.01 to 0.07 s. On a 10-core arm64 Mac, with cargo
