@@ -3479,7 +3479,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             // held the owner 620 ms in front of a tab's first visit): it goes in the next pause.
             // The warm record's pass does not wait for 2 s without a UI wait (jit::ui_burst), only
             // for the burst's end (ui_light): its owner requests stop at their checks for a
-            // waiting program request, and a frame now and then reaching a new fn held it for
+            // waiting request, and a frame now and then reaching a new fn held it for
             // seconds (Fab: 10 s after the present)
             if start != 0 && (record || main_ms >= 3000 && due) && (if record { ui_light } else { !jit::ui_burst() }) && !mid_busy.swap(true, Ordering::SeqCst) {
                 mid_flushed = n;
@@ -4269,7 +4269,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     // the files whose front images this write holds: the collected program below is recorded
     // only if no file was loaded since (its restore maps every file from these images)
     let mut imaged_files = usize::MAX;
-    // the crate records stopped for a program request (record_front_crates_until)
+    // the crate records stopped for a waiting request (record_front_crates_until)
     let mut crates_left = false;
     let probe = YieldProbe::new();
     let Some(Some((held, spill))) = unit_call(wait, || {
@@ -4294,12 +4294,12 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
             let (order, present) = jit::manifest_order(u.start_order.clone(), jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed));
             let mut cache = u.cache.take();
             if let Some(c) = cache.as_mut() {
-                // a waiting program request (a frame's lazy compile, a live patch) goes first: the
-                // manifest is made again by a later write
-                let stop = || { probe.tick("manifest"); crate::owner::program_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed) };
+                // a waiting request (a frame's lazy compile, a live patch, a back end's Job) goes
+                // first: the manifest is made again by a later write
+                let stop = || { probe.tick("manifest"); crate::owner::request_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed) };
                 if !c.record_manifest(u, crate::layout::root_crate(), &order, present, &stop) {
                     MID_MANIFEST_DONE.store(false, Ordering::Relaxed);
-                    verbose!("makepad-run cache: startup manifest yielded to a program request; retried later");
+                    verbose!("makepad-run cache: startup manifest yielded to a waiting request; retried later");
                 }
             }
             u.cache = cache;
@@ -4320,7 +4320,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
             parts[1] = held.elapsed().as_secs_f64() * 1e3;
             yield_section("crate records");
             probe.tick("front images");
-            let stop = || { probe.tick("crate records"); crate::owner::program_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed) };
+            let stop = || { probe.tick("crate records"); crate::owner::request_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed) };
             let complete = c.record_front_crates_until(&u.prog, &stop);
             parts[2] = held.elapsed().as_secs_f64() * 1e3;
             yield_section("spill take");
@@ -4372,11 +4372,11 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
             let mut retired_boot = None;
             let mut late_spill = None;
             let t = Instant::now();
-            // asked at each step and through the encode: a waiting program request (a frame's lazy
-            // compile, a live patch) goes first, and a later pass tries again
-            let stop = || { cprobe.tick("collected"); crate::owner::program_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed) };
-            // the front-end lock: for at most 50 ms, and not while a program request waits for
-            // the owner thread this holds
+            // asked at each step and through the encode: a waiting request (a frame's lazy
+            // compile, a live patch, a back end's Job) goes first, and a later pass tries again
+            let stop = || { cprobe.tick("collected"); crate::owner::request_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed) };
+            // the front-end lock: for at most 50 ms, and not while a request waits for the owner
+            // thread this holds
             let front = if jit::QUIT_SEEN.load(Ordering::Relaxed) { jit::front_write_within(1000) } else {
                 let t = Instant::now();
                 loop {
@@ -4400,13 +4400,13 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
                     }
                 }
                 if u.prog.files.len() != imaged_files {
-                    collected_skip(if crates_left { "the crate records stopped for a program request" } else { "files were loaded since the front images were taken" });
+                    collected_skip(if crates_left { "the crate records stopped for a waiting request" } else { "files were loaded since the front images were taken" });
                 }
                 if let Some(c) = u.cache.as_mut().filter(|_| u.prog.files.len() == imaged_files) {
                     match c.encode_collected(&u.prog, &u.tcx, &stop) {
                         crate::cache::CollectedRecord::Ready(dest, payload) => { MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); ready = Some((u.prog.session.options.verbose.then_some(c.collected_crates(&u.prog)), dest, payload)); }
                         crate::cache::CollectedRecord::Current => { MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); COLLECTED_CURRENT.store(true, Ordering::Relaxed); retired_boot = Some(c.finish_collected()); }
-                        crate::cache::CollectedRecord::Yielded => verbose!("makepad-run collected: record yielded to a program request after {:.1} ms; retried later", t.elapsed().as_secs_f64() * 1e3),
+                        crate::cache::CollectedRecord::Yielded => verbose!("makepad-run collected: record yielded to a waiting request after {:.1} ms; retried later", t.elapsed().as_secs_f64() * 1e3),
                         crate::cache::CollectedRecord::Failed => MID_COLLECTED_TRIED.store(true, Ordering::Relaxed),
                     }
                 }
