@@ -3989,7 +3989,7 @@ impl Cache {
     /// in order, the first `present` of them before the first present; per slot its stable key
     /// encoding and the code entry it maps to, 0 when its code has none) unless the loaded one
     /// already covers it (on the owner thread).
-    /// `stop` (a mid-run write: a program request waits for the owner thread) is asked every 64
+    /// `stop` (a mid-run write: a request waits for the owner thread) is asked every 64
     /// slots; yes drops this record (false comes back) and a later write makes it again.
     pub fn record_manifest(&mut self, u: &Unit, root: u32, order: &[u32], present: usize, stop: &dyn Fn() -> bool) -> bool {
         // past a const edit the slots' code is of two texts: the image would hold new values under
