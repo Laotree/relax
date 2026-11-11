@@ -272,7 +272,48 @@ With rustc, the same change is a rebuild of the crate, a relink and a restart.
 cargo build --release -p relax-compiler
 ```
 
-Relax is a library: a host tool embeds `relax_compiler` and drives it.
+The compiler is the `relax_compiler` library; `relax` (`tools/run/runner`) is its command-line runner.
+
+## Try it
+
+From a fresh clone, build `relax` and run a new package through the JIT:
+
+```sh
+git clone https://github.com/makepad/relax
+cargo build --release --manifest-path relax/Cargo.toml -p relax-runner --bin relax
+
+cargo new hello
+cd hello
+../relax/target/release/relax run --quiet hello    # run main under the JIT
+../relax/target/release/relax test hello           # run its #[test] fns
+../relax/target/release/relax check hello          # type- and borrow-check only
+```
+
+Run `relax` in the package's folder and give it the package's name, not a path. It reads Relax's
+std from the checkout it was built in, so keep the `relax` folder where it is.
+
+Each run also prints a `makepad-remote: pid ...` line: the running program's inspect socket
+(`relax inspect`).
+
+Measured from a fresh clone: on a 16-core x86-64 Linux box, building `relax` took 53 s, the first
+`relax run` of `hello` 0.24 s and the next ones 0.01 to 0.07 s. On a 10-core arm64 Mac, with cargo
+held to 4 jobs, the build took 78 s, the first run 0.97 s and the next ones 0.03 to 0.04 s. Relax
+keeps what it compiles in the package's `target/makepad-run`, beside cargo's build output (120 to
+190 MB for `hello`; `relax clean` removes it), so each new package starts cold.
+
+**Network.** A package with no dependencies, like `hello`, needs none: it also runs with
+`MAKEPAD_RUN_OFFLINE=1`. For a crates.io dependency Relax takes the package from `~/.cargo`'s registry
+when it is there, and otherwise downloads it itself: the sparse index from index.crates.io and the
+`.crate` file from static.crates.io, checked against the index's SHA-256 and kept in that package's
+`target/makepad-run`. With cargo's offline setting (`CARGO_NET_OFFLINE`) or `MAKEPAD_RUN_OFFLINE=1`
+it never downloads: a package whose dependencies it already fetched still runs, and one whose
+dependencies it has not fetched stops with an error naming the missing crate. `relax fetch <git-url>`
+(`tools/run/runner/src/fetch.rs`, also used by `relax run <git-url> <package>`) downloads a git
+repository over HTTPS into one store file under `~/.makepad-run` (`MAKEPAD_RUN_HOME`); this
+repository is a 4 MB store.
+
+Not everything runs yet: [libs/relax/KNOWN_GAPS.md](libs/relax/KNOWN_GAPS.md) lists the open gaps,
+each with a repro.
 
 ## Repository layout
 
@@ -285,6 +326,7 @@ libs/relax/
   attr/ native_macros/                  #[relax(..)] and native proc macros
   KNOWN_GAPS.md                         what isn't supported yet
 libs/relax_api/                         #[relax_api] and per-thread heap routing
+tools/run/runner/                       relax, the command-line runner
 libs/ platform/ tools/ widgets/         the small support crates Relax links: token model,
                                         serialisation, remote inspection, profiling, and the
                                         native proc macros it checks against their source
