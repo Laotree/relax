@@ -14,6 +14,7 @@ members = [
     "libs/relax_api/macro",
     "libs/relax_api/macro_impl",
     "libs/relax_api/phase",
+    "tools/run/runner",
 ]
 exclude = [
     "libs/relax/compiler/bench_rt",
