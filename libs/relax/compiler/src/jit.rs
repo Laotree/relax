@@ -1618,6 +1618,9 @@ unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, 
     if s.base {
         note_base(up, s.id);
     }
+    if let Some((level, pending)) = s.provisional {
+        provisional_installed(up, s.id, level, pending);
+    }
     let u = &mut *up;
     // the startup set of the next manifest (install_compiled's rule: before the first present)
     if u.fns[s.id as usize].patch_gen == 0 && (!FIRST_PRESENT.load(Ordering::Acquire) || wall_ns() < ORDER_UNTIL_NS.load(Ordering::Relaxed)) {
@@ -9296,10 +9299,11 @@ unsafe fn ready_code_locked(up: *mut Unit, id: u32) -> Option<u64> {
                 let same = c.as_mut().map_or(Some(true), |c| c.verify_entry(u, id, &fresh, &relocs));
                 u.cache = c;
                 if let Some(c) = u.cache.as_mut() {
+                    // (None: not compared, counted by verify_entry)
                     match same {
                         Some(true) => c.stats.verify_same += 1,
                         Some(false) => c.stats.verify_diff += 1,
-                        None => c.stats.verify_other_tier += 1,
+                        None => {}
                     }
                 }
                 return Some(install_compiled(up, id, &fresh, fmap, &relocs, true));
@@ -9328,6 +9332,9 @@ unsafe fn ready_code_locked(up: *mut Unit, id: u32) -> Option<u64> {
                 o1v_enqueue(up, id, false);
             }
         }
+        // provisional code (an earlier session's build that left slots out): its complete build
+        // becomes the entry
+        provisional_linked(up, id);
         if TWINS_RAN.load(Ordering::Relaxed) > 0 {
             (&mut *up).borrow_callees(callees.iter().copied());
         }
@@ -11221,7 +11228,7 @@ unsafe fn settle_sweep(up: *mut Unit) -> (u64, u64, u64) {
                 if let Some(mut c) = (&mut *up).cache.take() {
                     let r = c.slot_entry_rank(&*up, id);
                     (&mut *up).cache = Some(c);
-                    let k = match r { None => 0, Some(None) => 1, Some(Some(t)) => 2 + t.min(3) as usize };
+                    let k = match r { None => 0, Some(None) => 1, Some(Some(t)) => 2 + (t / 2).min(3) as usize };
                     SETTLE_ENTRY_RANKS[k].fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -11465,16 +11472,20 @@ unsafe fn o1v_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
         r
     };
     // no storable key, or the entry is verified code at O1 or above already (a standalone entry's
-    // slot: any entry)
+    // slot: any entry) -- unless the slot's body is provisional (complete_provisional: its
+    // completion is what its callers' completions wait for, whatever its entry)
     let standalone = O1V_STANDALONE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&(up as usize, id)));
-    if rank.is_none_or(|r| r.is_some_and(|t| t >= 1 || standalone)) {
+    let provisional = inline_body(&(&*up).fns[id as usize]).is_some_and(|r| !r.pending.is_empty());
+    if !provisional && rank.is_none_or(|r| r.is_some_and(|t| t >= crate::cache::RANK_O1 || standalone)) {
         return dropped();
     }
     let u = &*up;
     let f = &u.fns[id as usize];
-    // the lowering is reused unless it is lowered again for its verdict (calls to twins, missing
-    // disjoint-index checks: split_upgrade's rule); a baseline RIR's is the one it kept
-    let lowered = f.rir.as_ref().filter(|r| !r.plain_calls && !(!f.d3_lowered.load(Ordering::Relaxed) && u.disjoint_checks(id).is_some())).and_then(|r| if r.baseline { f.lowering.as_deref().cloned() } else { Some((**r).clone()) });
+    // a baseline body's kept lowering is reused unless it is lowered again for its verdict (calls
+    // to twins, missing disjoint-index checks: split_upgrade's rule); any other body is lowered
+    // again: the build is the slot's first build from the source, with every verdict in (an
+    // optimised body optimised once more is other code from the same inputs)
+    let lowered = f.rir.as_ref().filter(|r| r.baseline && !r.plain_calls && !(!f.d3_lowered.load(Ordering::Relaxed) && u.disjoint_checks(id).is_some())).and_then(|_| f.lowering.as_deref().cloned());
     if begin_build(up, id).is_err() {
         return dropped();
     }
@@ -11496,7 +11507,9 @@ unsafe fn o1v_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     let u = &*up;
     let session = (*std::ptr::addr_of!(u.prog.session)).clone();
     let e = &u.env;
-    let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: true, syms: e.syms, sym_class: e.sym_class, near: e.near };
+    // (its code is O1 code, the slot's entry at O1: the register allocation of an O1 build, not
+    // the O2 worker's)
+    let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: !TIER1_ENABLED.load(Ordering::Relaxed), syms: e.syms, sym_class: e.sym_class, near: e.near };
     let (fold, layout) = (u.opt.fold, u.opt.layout);
     let lc = loop_syms(u, id);
     Some(O2Work { id, capture_unit: u.wasm_export_id, prep, epoch, snapshot: false, o1: true, session, env, fold, layout, lc, t0 })
@@ -12790,7 +12803,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     // built (its caller's preparation bails with every front noted), an outermost one bails now
     if matches!(&r, Err(e) if e == NEEDS_FRONT) {
         if COLLECTING.with(|c| c.get()) == 0 {
-            bail_for_fronts(Vec::new());
+            let _ = bail_for_fronts(Vec::new());
         }
         return Err(NEEDS_FRONT.to_string());
     }
@@ -12862,6 +12875,9 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     let mut snap = Vec::new();
     let mut deferred = Vec::new();
     let mut skipped: Vec<(u32, &str)> = Vec::new();
+    // the candidates left out for a pending verdict, and (inside a take) the slots whose fronts
+    // the take could not make: the body's pending slots (Func::pending)
+    let mut left: Vec<u32> = Vec::new();
     // the callees chosen from the source above: only they are inline candidates -- not every
     // callee that happens to have RIR already (built for another caller, or called first), which
     // made O1 code depend on what was compiled before
@@ -12959,6 +12975,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             let source_wanted = baseline && matches!(u.fns[*c as usize].key, FnKey::Glue(..)) || inline_source_wanted(u, *c, full);
             if source_wanted && attrs == Err(NOT_INLINABLE_UNVERIFIED) {
                 inline_state(tier, INLINE_LEFT_OUT);
+                left.push(*c);
             }
             let want = source_wanted
                 && attrs.is_ok()
@@ -13058,7 +13075,11 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                 nested_ns += cpu_ns() - tn;
             }
         }
-        bail_for_fronts(needs);
+        let fronts = bail_for_fronts(needs);
+        if !fronts.is_empty() {
+            PROVISIONAL_COUNT[3].fetch_add(1, Ordering::Relaxed);
+            left.extend(fronts);
+        }
         let u = &mut *up;
         for &c in &callees {
             // (an upgrade deferred above inlines its normal RIR, not the baseline RIR it has now)
@@ -13132,8 +13153,11 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     let prep_ns = (cpu_ns() - t0).saturating_sub(nested_ns);
     // inside a take: fronts its fact builds (or a candidate loop it skipped) noted
     if owner::bailing() {
-        bail_for_fronts(Vec::new());
+        left.extend(bail_for_fronts(Vec::new()));
     }
+    left.sort_unstable();
+    left.dedup();
+    func.pending = left;
     // (a later bail of the same take gives it back too: TakenBack)
     if let Some(f) = give_back.2.take() {
         TakenBack::note(up, id, f);
@@ -13555,6 +13579,21 @@ fn optimize_rir(options: &crate::options::Options, id: u32, prep: Prep) -> Resul
     r
 }
 
+/// A body's pending slots after its inlining (Func::pending): the candidates its preparation left
+/// out for a pending verdict, and the inlined candidates whose own body was provisional (their
+/// completion comes first: complete_provisional).
+fn note_inlined_pending(func: &mut relax_backend::rir::Func, callees: &[(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], inlined: &[(u32, usize)]) {
+    let before = func.pending.len();
+    for &(c, _) in inlined {
+        if !func.pending.contains(&c) && callees.iter().any(|x| x.0 == c && !x.1.pending.is_empty()) {
+            func.pending.push(c);
+        }
+    }
+    if func.pending.len() != before {
+        func.pending.sort_unstable();
+    }
+}
+
 fn optimize_rir_inner(options: &crate::options::Options, id: u32, prep: Prep) -> Result<(relax_backend::rir::Func, Vec<(u32, usize)>), String> {
     let _census_opt = relax_codegen::exec_census::phase(4);
     let Prep { func, cfg, callees, ro, relayout, name, deferred, facts } = prep;
@@ -13572,6 +13611,7 @@ fn optimize_rir_inner(options: &crate::options::Options, id: u32, prep: Prep) ->
             // Candidates can be baseline bodies too: conservatively keep their unwind edges.
             inlined = relax_codegen::opt::inline_calls(options, &mut func, id, &get, &|_| false, &relax_codegen::opt::InlineLimits::baseline());
             relax_backend::stats::pass_time(5, ti);
+            note_inlined_pending(&mut func, &callees, &inlined);
         }
         baseline_rir(options, &mut func, ro);
         // Only tail_nounwind_facts were asked: other missing answers conservatively mean false.
@@ -13621,7 +13661,8 @@ fn optimize_rir_inner(options: &crate::options::Options, id: u32, prep: Prep) ->
         Ok(inlined)
     });
     let mut result = result;
-    if let Ok((optimized, _)) = &mut result {
+    if let Ok((optimized, inlined)) = &mut result {
+        note_inlined_pending(optimized, &callees, inlined);
         for &(c, v) in &facts {
             match optimized.nounwind_inputs.iter_mut().find(|x| x.0 == c) {
                 Some(x) => x.1 |= v,
@@ -13737,6 +13778,24 @@ unsafe fn store_rir(up: *mut Unit, id: u32, func: relax_backend::rir::Func, inli
     u.stats.rir_insts += relax_codegen::opt::inst_count(&func) as u64;
     let beside = beside_full(u.fns[id as usize].rir.as_deref(), &func);
     let tainted = TAINTED.with(|t| t.get());
+    // a provisional body waits for its completion build; one that replaces a provisional body
+    // may complete those that took it in
+    let provisional = !func.pending.is_empty() && !tainted;
+    let completed = func.pending.is_empty() && inline_body(&u.fns[id as usize]).is_some_and(|r| !r.pending.is_empty());
+    if provisional {
+        PROVISIONAL_COUNT[0].fetch_add(1, Ordering::Relaxed);
+        crate::zone_alloc::kept_with(|| {
+            let mut g = PROVISIONAL.lock().unwrap_or_else(|e| e.into_inner());
+            match g.iter_mut().find(|x| x.0 == up as usize && x.1 == id) {
+                Some(x) => x.2 = func.pending.clone(),
+                None => g.push((up as usize, id, func.pending.clone())),
+            }
+        });
+    }
+    if completed {
+        PROVISIONAL_COUNT[2].fetch_add(1, Ordering::Relaxed);
+    }
+    let _complete = CompleteAfter(up, id, provisional, completed);
     if beside {
         // a normal body for callers below O2, kept beside the full one -- not when this request's
         // builds depend on timing
@@ -17776,6 +17835,115 @@ pub(crate) fn specv_held() -> bool {
 /// verified O1 rebuilds that met held verdicts (o1v_begin): queued again at the release
 static O1V_HELD: relax_session::sync::Mutex<Vec<(usize, u32)>> = relax_session::sync::Mutex::new(Vec::new());
 
+/// Provisional bodies (Func::pending) waiting for their completion build: (unit, slot, its pending
+/// slots) -- kept here, as the slot's RIR may be dropped meanwhile (its code and entry stay
+/// provisional)
+static PROVISIONAL: relax_session::sync::Mutex<Vec<(usize, u32, Vec<u32>)>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// (verbose run summary) provisional bodies stored, their completion builds queued, the
+/// provisional bodies replaced by a complete one, and preparations that left out slots whose
+/// fronts a take could not make
+pub static PROVISIONAL_COUNT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+pub(crate) fn provisional_summary() -> String {
+    let n = |i: usize| PROVISIONAL_COUNT[i].load(Ordering::Relaxed);
+    format!("{} stored, {} completions queued, {} replaced by complete bodies, {} waiting at exit; {} preparations left out fronts a take could not make", n(0), n(1), n(2), PROVISIONAL.lock().unwrap_or_else(|e| e.into_inner()).len(), n(3))
+}
+
+/// Slot `m`, a pending slot of a provisional body, is final now: its verdict is in and the body
+/// callers take in (if it has one yet) is complete. A baseline body counts as final: the
+/// completion build builds the normal one.
+fn pending_final(u: &Unit, m: u32) -> bool {
+    let f = &u.fns[m as usize];
+    !f.unverified.load(Ordering::Relaxed) && inline_body(f).is_none_or(|r| r.baseline || r.pending.is_empty())
+}
+
+/// Slot `s`'s provisional body (pending slots `pending`) can be completed now: the slot is
+/// verified (an unverified one is rebuilt at its verdict: the specv sweep) and its pending slots
+/// are all final.
+fn completion_ready(u: &Unit, s: u32, pending: &[u32]) -> bool {
+    !u.fns[s as usize].unverified.load(Ordering::Relaxed) && pending.iter().all(|&m| pending_final(u, m))
+}
+
+/// The completion of provisional bodies (PROVISIONAL) whose pending slots are all final now:
+/// each gets one verified O1 rebuild in the background (o1v_enqueue: once per slot, after the
+/// first present), whose body and cache entry replace the provisional ones; bottom-up, as a
+/// completion makes its callers' pending slot final. A body still pending afterwards completes
+/// in a later session (its entry stays provisional, and a launch that links it rebuilds it).
+/// Under the unit lock.
+unsafe fn complete_provisional(up: *mut Unit) {
+    let u = &*up;
+    let mut ready = Vec::new();
+    {
+        let mut g = PROVISIONAL.lock().unwrap_or_else(|e| e.into_inner());
+        g.retain(|(k, s, pending)| {
+            if *k != up as usize {
+                return true;
+            }
+            // completed meanwhile (a complete body replaced it)
+            if inline_body(&u.fns[*s as usize]).is_some_and(|r| r.pending.is_empty()) {
+                return false;
+            }
+            if completion_ready(u, *s, pending) {
+                ready.push(*s);
+                return false;
+            }
+            true
+        });
+    }
+    for s in ready {
+        PROVISIONAL_COUNT[1].fetch_add(1, Ordering::Relaxed);
+        o1v_enqueue(up, s, false);
+    }
+}
+
+/// Slot `id` just linked an entry (cache.rs link_entry): provisional code above baseline (an
+/// earlier session's build that left slots out) gets its rebuild, whose entry replaces it -- O1
+/// code a verified O1 rebuild once its recorded pending slots are final in this run (at once, or
+/// waiting with the provisional bodies: complete_provisional), O2 code an O2 build. Owner thread.
+unsafe fn provisional_linked(up: *mut Unit, id: u32) {
+    let Some((level, pending)) = (&mut *up).cache.as_mut().map(|c| (std::mem::take(&mut c.last_provisional), std::mem::take(&mut c.last_pending))) else { return };
+    provisional_installed(up, id, level, pending);
+}
+
+/// Provisional code of level `level` (O1 1, O2 2; baseline code is built again at O2 anyway)
+/// installed from the cache or the startup image, with the slots its completion waits for.
+unsafe fn provisional_installed(up: *mut Unit, id: u32, level: u8, pending: Vec<u32>) {
+    match level {
+        1 if completion_ready(&*up, id, &pending) => {
+            PROVISIONAL_COUNT[1].fetch_add(1, Ordering::Relaxed);
+            o1v_enqueue(up, id, false);
+        }
+        1 => crate::zone_alloc::kept_with(|| {
+            let mut g = PROVISIONAL.lock().unwrap_or_else(|e| e.into_inner());
+            if !g.iter().any(|x| x.0 == up as usize && x.1 == id) {
+                g.push((up as usize, id, pending));
+            }
+        }),
+        2 => o2_hot(up, id),
+        _ => {}
+    }
+}
+
+/// After store_rir's own work, on each of its paths: a provisional body stored (`.2`) whose
+/// pending slots are all final already gets its completion build (a verdict that came in while
+/// it was built); a provisional body replaced by a complete one (`.3`) may complete those that
+/// took it in (complete_provisional).
+struct CompleteAfter(*mut Unit, u32, bool, bool);
+impl Drop for CompleteAfter {
+    fn drop(&mut self) {
+        let (up, id, provisional, completed) = (self.0, self.1, self.2, self.3);
+        unsafe {
+            if completed {
+                complete_provisional(up);
+            } else if provisional && inline_body(&(&*up).fns[id as usize]).is_some_and(|r| !r.pending.is_empty() && completion_ready(&*up, id, &r.pending)) {
+                PROVISIONAL_COUNT[1].fetch_add(1, Ordering::Relaxed);
+                o1v_enqueue(up, id, false);
+            }
+        }
+    }
+}
+
 /// SPEC-V repro hook: the held verdicts are released (once per hold).
 pub(crate) fn specv_release() {
     let s = SPECV_HOLD.load(Ordering::Relaxed);
@@ -17960,6 +18128,10 @@ pub fn sweep_verdicts() {
             if u.fns[c as usize].compiled && !tc.below.contains(&c) {
                 o1v_enqueue(up, c, false);
             }
+        }
+        // provisional bodies whose pending slots were these
+        if !verified.is_empty() {
+            complete_provisional(up);
         }
         for &id in &relower { tier_push(id, Q_RETIER, 0); }
         for &r in &rejected_in {
@@ -23887,6 +24059,8 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
             if u.cache.as_mut().is_some_and(|c| std::mem::take(&mut c.last_o2)) {
                 o2_cached(up, id);
             }
+            provisional_linked(up, id);
+            let u = &mut *up;
             if !u.fns[id as usize].compiled && u.fns[id as usize].spec.is_none() {
                 // cached O3 code: no call counter once installed, inlined slots know it
                 if let Some(inl) = &t1 {
@@ -24643,24 +24817,27 @@ fn collect_fronts<R>(needs: &mut Vec<u32>, f: impl FnOnce() -> R) -> Option<R> {
 /// The end of a preparation's candidate builds inside a take: every front they needed (`needs`,
 /// and those noted without unwinding: owner::note_needs) bails the take at once (the thread fronts
 /// them in one batch, `take_prefronted`, and takes again).
-fn bail_for_fronts(mut needs: Vec<u32>) {
+/// Returns the slots left out instead (FRONTS_DONE): the body's pending slots (Func::pending).
+#[must_use]
+fn bail_for_fronts(mut needs: Vec<u32>) -> Vec<u32> {
     if !owner::bailing() {
-        return;
-    }
-    // the take's thread made what it could: candidates that still need a front stay out of the
-    // snapshot (not inlined: called), the root's build goes on (rule I-PURE)
-    if FRONTS_DONE.with(|f| f.get()) {
-        let _ = owner::take_needs();
-        return;
+        return Vec::new();
     }
     for s in owner::take_needs() {
         if !needs.contains(&s) {
             needs.push(s);
         }
     }
+    // the take's thread made what it could: candidates that still need a front stay out of the
+    // snapshot (not inlined: called), the root's build goes on (rule I-PURE) -- provisional, its
+    // completion built once the fronts can be made (complete_provisional)
+    if FRONTS_DONE.with(|f| f.get()) {
+        return needs;
+    }
     if !needs.is_empty() {
         std::panic::resume_unwind(Box::new(crate::preempt::PublishBail { what: "front", slots: needs }));
     }
+    Vec::new()
 }
 
 /// An inside-a-take build that needs a front (owner::note_needs has its slot): not built, no error
@@ -29146,6 +29323,8 @@ pub(crate) unsafe fn reset_statics() {
     reset(&SWEEP_STATE, relax_session::sync::Mutex::new(SweepState { unit: 0, patches: 0, epoch: 0, flagged: Vec::new(), cleared: Vec::new() }));
     reset(&SPECV_HOLD, std::sync::atomic::AtomicU8::new(u8::MAX));
     reset(&O1V_HELD, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&PROVISIONAL, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&PROVISIONAL_COUNT, [const { AtomicU64::new(0) }; 4]);
     reset(&SPECV_BORROWS, AtomicU64::new(0));
     reset(&SPECV_BORROWS_OWN, AtomicU64::new(0));
     reset(&TWINS_RAN, AtomicU64::new(0));

@@ -4566,7 +4566,7 @@ fn summary_inner(why: &str) {
                 }
                 if c.mode == crate::cache::Mode::Verify {
                     let st = &c.stats;
-                    verbose!("makepad-run cache: verify: {} same, {} DIFFERENT ({} with other recorded inputs, {} code from the same inputs, {} only a relocation), {} of another tier ({} built unverified on one side)", st.verify_same, st.verify_diff, st.verify_diff_inputs, st.verify_diff_code, st.verify_diff_reloc, st.verify_other_tier, st.verify_provisional);
+                    verbose!("makepad-run cache: verify: {} same, {} DIFFERENT ({} with other recorded inputs, {} code from the same inputs, {} only a relocation), {} of another tier, {} provisional (not compared; {} provisional in the cache)", st.verify_same, st.verify_diff, st.verify_diff_inputs, st.verify_diff_code, st.verify_diff_reloc, st.verify_other_tier, st.verify_provisional, st.verify_provisional_cached);
                 }
             }
         }
@@ -4661,6 +4661,7 @@ fn summary_inner(why: &str) {
             verbose!("makepad-run: publish O1 on the owner by kind: {}", jit::publish_opt_summary());
             verbose!("makepad-run: O3 candidate takes: {}", jit::cand_skip_summary());
             verbose!("makepad-run: O1 inline candidates by callee RIR (callers baseline/O1/full): {}", jit::inline_state_summary());
+            verbose!("makepad-run: provisional bodies (pending slots): {}", jit::provisional_summary());
             verbose!("makepad-run: fronts off the owner by job: {}", jit::prefront_site_summary());
             verbose!("makepad-run: O3 install records on the owner: {}x {:.0} ms", jit::O3_INSTALL_REC[0].load(std::sync::atomic::Ordering::Relaxed), jit::O3_INSTALL_REC[1].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6);
             verbose!("makepad-run: O3 owner cpu by part: {}", jit::o3_owner_summary());

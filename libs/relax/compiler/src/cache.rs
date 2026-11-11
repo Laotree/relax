@@ -232,7 +232,7 @@ const LEDGER_KEY: u128 = 0;
 // closure is named by its owner's closure ordinal and its text (closure_ordinal), not by its
 // file version and position, in slot keys and types alike; a block-scoped item by its fn and
 // its ordinal there (stable::block_place), not its offset.
-const ENTRY_VERSION: u32 = 33;
+const ENTRY_VERSION: u32 = 34;
 /// the level of a code entry's code (its tier byte)
 const TIER_O1: u8 = 0;
 const TIER_O3: u8 = 1;
@@ -241,10 +241,12 @@ const TIER_O2: u8 = 2;
 /// a run that links it builds it again at O2 after its first present (jit.rs note_base), and
 /// that code replaces the entry
 const TIER_BASE: u8 = 3;
-/// baseline code built without a clean verdict (SPEC-V: calls to unverified-mode twins, its
-/// noalias facts withheld): provisional, linked and rebuilt like TIER_BASE, and compared only
-/// with code built the same way (verify)
-const TIER_BASE_UV: u8 = 4;
+/// The flag on a tier byte for provisional code: built before one of its inputs was final -- a
+/// body without a clean verdict (SPEC-V: calls to unverified-mode twins, its noalias facts
+/// withheld), or one whose pending slots (rir::Func::pending) are recorded with it. It ranks
+/// below the complete code of its level, which replaces it (a warm launch that links it has it
+/// built again: jit.rs o1v_enqueue), and verify compares it only with code built the same way.
+const TIER_PROVISIONAL: u8 = 0x80;
 
 /// What an earlier run decided for a slot's code below O3 (KIND_TIER; jit.rs stored_tier_verdict).
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -544,9 +546,11 @@ pub struct CacheStats {
     /// cached entries of another tier than the verifying build's (an O2 or O3 rebuild replaced
     /// the first build's entry): not compared
     pub verify_other_tier: u64,
-    /// of those, baseline code one side built without a clean verdict and the other with one
-    /// (TIER_BASE_UV): provisional, not compared
+    /// entries one side built as provisional code (TIER_PROVISIONAL) and the other otherwise, or
+    /// with other pending inputs: not compared
     pub verify_provisional: u64,
+    /// of those, the pairs whose cached entry is provisional
+    pub verify_provisional_cached: u64,
     pub packs: u64,
     pub packs_rejected: u64,
     pub index_entries: u64,
@@ -621,10 +625,12 @@ pub(crate) struct PendingRecord {
     pc_map: Vec<(u32, u64)>,
     nounwind: Vec<(u32, bool)>,
     baseline: bool,
-    /// built without a clean verdict (TIER_BASE_UV)
+    /// built without a clean verdict (TIER_PROVISIONAL)
     unverified: bool,
     deps: Vec<u32>,
     inlined: Vec<u32>,
+    /// the body's pending slots (rir::Func::pending; TIER_PROVISIONAL)
+    pending: Vec<u32>,
     /// jit::patch_epoch() at the install: a record is encoded only against the sources it was built from
     epoch: u64,
     /// O3 code: its inlined slots and nounwind inputs (`record_o3`)
@@ -815,6 +821,11 @@ pub struct Cache {
     /// the hit just linked is O2 code (a `#[relax(O2)]` slot's, or a slot an earlier run found
     /// hot): no O2 build for it this run
     pub last_o2: bool,
+    /// the entry just decoded is provisional code above baseline (TIER_PROVISIONAL), by level (1
+    /// O1, 2 O2; 0 none), and its pending slots as this run has them: the install queues its
+    /// rebuild (jit.rs provisional_linked)
+    pub last_provisional: u8,
+    pub last_pending: Vec<u32>,
     /// the entry just decoded is baseline code (TIER_BASE): lookup moves it to `base_linked`
     pub last_base: bool,
     /// slots linked from TIER_BASE entries and not installed yet (jit.rs install_compiled)
@@ -1162,6 +1173,8 @@ impl Cache {
             last_data: Vec::new(),
             last_tier1: None,
             last_o2: false,
+            last_provisional: 0,
+            last_pending: Vec::new(),
             last_base: false,
             base_linked: HashSet::new(),
             fnkey_bytes: HashMap::new(),
@@ -1480,7 +1493,7 @@ impl Cache {
     pub(crate) fn note_retier_over(&mut self, u: &Unit, id: u32, base: usize) {
         if !self.has_code_entries() { return; }
         let key = self.slot_key(u, id);
-        let rank = key.and_then(|k| self.entry_tier(k)).map_or(0, |t| tier_rank(t) as usize + 1);
+        let rank = key.and_then(|k| self.entry_tier(k)).map_or(0, |t| tier_level(t) as usize + 1);
         warm_count::add(base + rank, 1);
         if trace_on() { trace_keyed(u, id, &format!("fresh-{}-over:{}", if base == warm_count::RETIER_O3_OVER { "O3" } else { "O2" }, ["none", "base", "O1", "O2", "O3"][rank]), key); }
     }
@@ -3279,6 +3292,7 @@ impl Cache {
             unverified: u.fns[id as usize].unverified.load(std::sync::atomic::Ordering::Relaxed),
             deps: record_deps(u, id, &[]),
             inlined: record_inlined(u, id, &[]),
+            pending: rir.map_or_else(Vec::new, |r| r.pending.clone()),
             epoch: crate::jit::patch_epoch(),
             o3: None,
         })
@@ -3301,6 +3315,7 @@ impl Cache {
             unverified: false,
             deps: record_deps(u, id, &extra),
             inlined: record_inlined(u, id, inlined),
+            pending: Vec::new(),
             epoch: crate::jit::patch_epoch(),
             o3: Some((inlined.to_vec(), nounwind.to_vec())),
         })
@@ -3378,8 +3393,9 @@ impl Cache {
         self.linked_key.get(&id).map(|&k| self.tier_verdict_key(k))
     }
 
-    /// The tier rank (baseline 0, O1 1, O2 2, O3 3) of slot `id`'s newest entry, recorded this run
-    /// or stored: None when the slot has no storable key, Some(None) when it has no entry.
+    /// The rank (tier_rank: RANK_O1 and above is complete code at O1 or above) of slot `id`'s
+    /// newest entry, recorded this run or stored: None when the slot has no storable key,
+    /// Some(None) when it has no entry.
     pub(crate) fn slot_entry_rank(&mut self, u: &Unit, id: u32) -> Option<Option<u8>> {
         let key = self.slot_key(u, id)?;
         if self.cert_rejected.contains(&key) && !self.pending_keys.contains(&key) { return Some(None); }
@@ -3459,6 +3475,11 @@ impl Cache {
             if o3.is_some() { warm_count::add(warm_count::O3_SAME, 1); }
             return;
         }
+        // provisional code never replaces an entry that ranks above it
+        if replace && existing && payload_tier(&payload).is_some_and(|new| new & TIER_PROVISIONAL != 0 && self.rec_tier.get(&key).copied().or_else(|| self.entry_tier(key)).is_some_and(|old| tier_rank(old) > tier_rank(new))) {
+            trace_lookup(u, id, "norecord:provisional-below");
+            return;
+        }
         self.pending_keys.insert(key);
         // a replacement of an entry with no recorded tier, and one that moves its slot's tier up
         // (O1 -> O2/O3), count like a stale image slot (record_manifest: rewritten past 2%; the
@@ -3475,7 +3496,7 @@ impl Cache {
         }
         if let Some(t) = payload_tier(&payload) {
             self.rec_tier.insert(key, t);
-            if trace_on() { trace_keyed(u, id, &format!("rec:{}", ["O1", "O3", "O2", "base"].get(t as usize).copied().unwrap_or("?")), Some(key)); }
+            if trace_on() { trace_keyed(u, id, &format!("rec:{}{}", ["base", "O1", "O2", "O3"][tier_level(t) as usize], if t & TIER_PROVISIONAL != 0 { "-provisional" } else { "" }), Some(key)); }
         }
         let kc = self.cur_crate;
         self.push_pending(kc, NewEntry { key, kind: KIND_CODE, payload });
@@ -3568,8 +3589,10 @@ impl Cache {
     }
 
     /// An entry's build inputs as encode_entry writes them: the code's level (TIER_O1 / TIER_O3 /
-    /// TIER_O2 / TIER_BASE / TIER_BASE_UV), the inlined slots, the nounwind answers and the dependency
-    /// certificate. Verify compares a cached entry's with the fresh build's.
+    /// TIER_O2 / TIER_BASE, TIER_PROVISIONAL on provisional code), the inlined slots and the pending
+    /// ones (each list by key, in key order: the same slots encode the same in every session), the
+    /// nounwind answers and the dependency certificate. Verify compares a cached entry's with the
+    /// fresh build's.
     fn encode_inputs(&mut self, u: &Unit, id: u32, o3: Option<(&[u32], &[(u32, bool)])>, kind: RecKind, pending: Option<&PendingRecord>, e: &mut E) -> Option<()> {
         let o2 = kind == RecKind::O2;
         let base = o3.is_none() && kind == RecKind::First && match pending {
@@ -3580,7 +3603,14 @@ impl Cache {
             Some(p) => p.unverified,
             None => u.fns[id as usize].unverified.load(std::sync::atomic::Ordering::Relaxed),
         };
-        e.u8(if o3.is_some() { TIER_O3 } else if o2 { TIER_O2 } else if unverified { TIER_BASE_UV } else if base { TIER_BASE } else { TIER_O1 });
+        // (O3 code is outside the rule: never provisional, never compared)
+        let left: &[u32] = match pending {
+            _ if o3.is_some() => &[],
+            Some(p) => &p.pending,
+            None => u.fns[id as usize].rir.as_ref().map_or(&[][..], |r| r.pending.as_slice()),
+        };
+        let level = if o3.is_some() { TIER_O3 } else if o2 { TIER_O2 } else if base { TIER_BASE } else { TIER_O1 };
+        e.u8(if unverified || !left.is_empty() { level | TIER_PROVISIONAL } else { level });
         let inlined;
         let inl = match pending {
             Some(p) => &p.inlined,
@@ -3589,15 +3619,20 @@ impl Cache {
                 &inlined
             }
         };
-        e.u32(inl.len() as u32);
-        for &x in inl {
-            match self.slot_bytes(u, x) {
-                Some(b) => e.bytes(&b),
-                None => {
+        for (list, what) in [(inl.as_slice(), "inlined slot key"), (left, "pending slot key")] {
+            let mut keys = Vec::with_capacity(list.len());
+            for &x in list {
+                let Some(b) = self.slot_bytes(u, x) else {
                     self.stats.unencodable += 1;
-                    self.why("inlined slot key");
+                    self.why(what);
                     return None;
-                }
+                };
+                keys.push(b);
+            }
+            keys.sort_unstable();
+            e.u32(keys.len() as u32);
+            for b in &keys {
+                e.bytes(b);
             }
         }
         // its nounwind inputs: stable keys replace session slots; false answers are included
@@ -4082,7 +4117,7 @@ impl Cache {
     pub fn flush(&mut self) -> Result<usize, String> {
         if self.verbose && self.mode == Mode::Verify {
             let s = &self.stats;
-            eprintln!("makepad-run cache: verify: {} identical, {} different ({} with other recorded inputs, {} code from the same inputs, {} only a relocation), {} of another tier ({} built unverified on one side)", s.verify_same, s.verify_diff, s.verify_diff_inputs, s.verify_diff_code, s.verify_diff_reloc, s.verify_other_tier, s.verify_provisional);
+            eprintln!("makepad-run cache: verify: {} identical, {} different ({} with other recorded inputs, {} code from the same inputs, {} only a relocation), {} of another tier, {} provisional (not compared; {} provisional in the cache)", s.verify_same, s.verify_diff, s.verify_diff_inputs, s.verify_diff_code, s.verify_diff_reloc, s.verify_other_tier, s.verify_provisional, s.verify_provisional_cached);
         }
         if self.mode == Mode::ReadOnly {
             return Ok(0);
@@ -4360,10 +4395,20 @@ impl Cache {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RecKind { First, O2, O1Up }
 
-/// A stored tier's order (the tier bytes are not in tier order): baseline < O1 < O2 < O3.
-fn tier_rank(t: u8) -> u8 {
-    match t { TIER_BASE | TIER_BASE_UV => 0, TIER_O1 => 1, TIER_O2 => 2, TIER_O3 => 3, _ => 0 }
+/// A stored tier's order (the tier bytes are not in tier order): baseline < O1 < O2 < O3, and
+/// within a level provisional code below complete code (2 * level, + 1 when complete).
+const fn tier_rank(t: u8) -> u8 {
+    let level = match t & !TIER_PROVISIONAL { TIER_O1 => 1, TIER_O2 => 2, TIER_O3 => 3, _ => 0 };
+    2 * level + if t & TIER_PROVISIONAL == 0 { 1 } else { 0 }
 }
+
+/// A stored tier's level: baseline 0, O1 1, O2 2, O3 3.
+const fn tier_level(t: u8) -> u8 {
+    tier_rank(t) / 2
+}
+
+/// The rank of complete O1 code (slot_entry_rank).
+pub(crate) const RANK_O1: u8 = tier_rank(TIER_O1);
 
 /// A code entry payload's tier byte.
 fn payload_tier(p: &[u8]) -> Option<u8> {
@@ -5014,9 +5059,10 @@ fn provided_value(u: &Unit, name: &str) -> Option<u64> {
 impl Cache {
     /// Verify mode: the entry this run would record for slot `id` (fresh code + relocs) against
     /// the cached entry: same declared nounwind inputs, pool-zeroed code and encoded
-    /// relocations. Prints the first difference, including changed conservative answers. None:
-    /// the cached code is another tier than the fresh build's (baseline or O1), so the two say
-    /// nothing about each other.
+    /// relocations. Prints the first difference, including changed conservative answers. None
+    /// (counted here): the cached code is another tier than the fresh build's (baseline or O1), or
+    /// provisional code on either side that was built from other inputs, so the two say nothing
+    /// about each other.
     pub fn verify_entry(&mut self, u: &Unit, id: u32, fresh: &[u8], relocs: &[RelocAt]) -> Option<bool> {
         let key = match self.slot_key(u, id) {
             Some(k) => k,
@@ -5026,26 +5072,26 @@ impl Cache {
             Some((KIND_CODE, p)) => p.to_vec(),
             _ => return Some(true),
         };
-        let fresh_tier = if !u.fns[id as usize].rir.as_ref().is_some_and(|r| r.baseline) {
-            TIER_O1
-        } else if u.fns[id as usize].unverified.load(std::sync::atomic::Ordering::Relaxed) {
-            TIER_BASE_UV
-        } else {
-            TIER_BASE
-        };
+        let rir = u.fns[id as usize].rir.as_ref();
+        let base = rir.is_some_and(|r| r.baseline);
+        let provisional = base && u.fns[id as usize].unverified.load(std::sync::atomic::Ordering::Relaxed) || rir.is_some_and(|r| !r.pending.is_empty());
+        let fresh_tier = (if base { TIER_BASE } else { TIER_O1 }) | (if provisional { TIER_PROVISIONAL } else { 0 });
         if let Some(t) = payload_tier(&cached).filter(|t| *t != fresh_tier) {
-            if tier_rank(t) == 0 && tier_rank(fresh_tier) == 0 {
+            if (t | fresh_tier) & TIER_PROVISIONAL != 0 {
                 self.stats.verify_provisional += 1;
+                self.stats.verify_provisional_cached += u64::from(t & TIER_PROVISIONAL != 0);
+            } else {
+                self.stats.verify_other_tier += 1;
             }
             return None;
         }
-        Some(self.verify_same_tier(u, id, &cached, fresh, relocs))
+        self.verify_same_tier(u, id, &cached, fresh, relocs, provisional)
     }
 
     /// Verify mode: where two encodings of a record's build inputs part (encode_inputs): the
-    /// level, the inlined slots (the fresh build's that the cached record lacks, by name, and how
-    /// many the other way), else the dependency certificate (the nounwind answers are compared
-    /// before)
+    /// level, the pending slots, the inlined slots (the fresh build's that the cached record
+    /// lacks, by name, and how many the other way), else the dependency certificate (the nounwind
+    /// answers are compared before)
     fn inputs_diff(&mut self, u: &Unit, id: u32, cached: &[u8], fresh: &[u8]) -> String {
         fn slots(d: &mut D<'_>) -> Option<Vec<Vec<u8>>> {
             let n = d.u32()?;
@@ -5056,7 +5102,10 @@ impl Cache {
         if ct != ft {
             return format!("level {:?}/{:?}", ct, ft);
         }
-        let (Some(cl), Some(fl)) = (slots(&mut c), slots(&mut f)) else { return "unreadable inputs".into() };
+        let (Some(cl), Some(fl), Some(cp), Some(fp)) = (slots(&mut c), slots(&mut f), slots(&mut c), slots(&mut f)) else { return "unreadable inputs".into() };
+        if cp != fp {
+            return format!("pending {}/{}", cp.len(), fp.len());
+        }
         if cl == fl {
             return "dependency certificate".into();
         }
@@ -5064,25 +5113,34 @@ impl Cache {
         format!("inlined {}/{}, fresh only {:?}, cached only {}", cl.len(), fl.len(), fresh_only, cl.iter().filter(|b| !fl.contains(b)).count())
     }
 
-    fn verify_same_tier(&mut self, u: &Unit, id: u32, cached: &[u8], fresh: &[u8], relocs: &[RelocAt]) -> bool {
+    fn verify_same_tier(&mut self, u: &Unit, id: u32, cached: &[u8], fresh: &[u8], relocs: &[RelocAt], provisional: bool) -> Option<bool> {
         let mut d = D { b: cached, p: 0 };
-        if d.u32() != Some(ENTRY_VERSION) || d.str().is_none() { return false; }
+        if d.u32() != Some(ENTRY_VERSION) || d.str().is_none() { return Some(false); }
         let inputs_at = d.p;
-        let Some((start, end)) = skip_build_inputs(&mut d) else { return false };
+        let Some((start, end)) = skip_build_inputs(&mut d) else { return Some(false) };
         let facts = u.fns[id as usize].rir.as_ref().map_or(&[][..], |r| r.nounwind_inputs.as_slice());
-        let Some(encoded) = self.nounwind_bytes(u, facts) else { return false };
-        if cached[start..end] != encoded {
-            eprintln!("makepad-run cache: VERIFY nounwind inputs differ: {}", crate::syms::stable_fn_name(u, id));
-            self.stats.verify_diff_inputs += 1;
-            return false;
-        }
-        // the recorded inputs as the fresh build has them (level, inlined slots, nounwind answers,
-        // dependency keys): a difference from other inputs is counted apart from one from the same
+        let Some(encoded) = self.nounwind_bytes(u, facts) else { return Some(false) };
+        // provisional code (both sides: the tiers are equal) built with other pending slots or
+        // nounwind answers: not compared
+        let same_nounwind = cached[start..end] == encoded;
         let mut fresh_inputs = E::default();
         let inputs_end = d.p;
-        let same_inputs = self.encode_inputs(u, id, None, RecKind::First, None, &mut fresh_inputs).is_some() && fresh_inputs.0[..] == cached[inputs_at..inputs_end];
+        let same_inputs = same_nounwind && self.encode_inputs(u, id, None, RecKind::First, None, &mut fresh_inputs).is_some() && fresh_inputs.0[..] == cached[inputs_at..inputs_end];
+        if provisional && !same_inputs {
+            self.stats.verify_provisional += 1;
+            self.stats.verify_provisional_cached += 1;
+            return None;
+        }
+        if !same_nounwind {
+            eprintln!("makepad-run cache: VERIFY nounwind inputs differ: {}", crate::syms::stable_fn_name(u, id));
+            self.stats.verify_diff_inputs += 1;
+            return Some(false);
+        }
+        // (the recorded inputs as the fresh build has them -- level, inlined and pending slots,
+        // nounwind answers, dependency keys --: a difference from other inputs is counted apart
+        // from one from the same)
         let inputs_word = if same_inputs { "same inputs" } else { "recorded inputs differ" };
-        let Some(ccode) = d.bytes() else { return false };
+        let Some(ccode) = d.bytes() else { return Some(false) };
         let ccode = ccode.to_vec();
         let fz = fresh.to_vec();
         let name = crate::syms::stable_fn_name(u, id);
@@ -5128,7 +5186,7 @@ impl Cache {
                     eprintln!("makepad-run cache: RELOCS fresh {} {} {}", name, rl.at, t);
                 }
             }
-            return false;
+            return Some(false);
         }
         let n = d.u32().unwrap_or(0) as usize;
         let start = d.p;
@@ -5163,11 +5221,11 @@ impl Cache {
                 let hex = |b: &[u8]| format!("[{}/{}] {}", first, b.len(), b.iter().skip(first.saturating_sub(4)).take(16).map(|x| format!("{:02x}", x)).collect::<String>());
                 eprintln!("makepad-run cache: VERIFY RELOC differs: {} at {} ({:?} -> {}, {}; cached at {} kind {}, target {} / fresh {})", name, o, r, match r { Reloc::Sym(s) => crate::syms::describe(u, *s), Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => crate::syms::stable_fn_name(u, *x), _ => String::new() }, inputs_word, co, if ck == Some(rl.kind) { "same" } else { "differs" }, cbytes.as_deref().map_or(String::from("-"), |b| hex(b)), if ok { hex(&e.0) } else { String::from("unencodable") });
                 if same_inputs { self.stats.verify_diff_reloc += 1 } else { self.stats.verify_diff_inputs += 1 }
-                return false;
+                return Some(false);
             }
             d.p += e.0.len();
         }
-        true
+        Some(true)
     }
 }
 
@@ -5293,11 +5351,13 @@ fn file_ident(path: &str, source: u128, owner: u128, numbering: u128) -> u128 {
 }
 
 fn skip_build_inputs(d: &mut D) -> Option<(usize, usize)> {
-    // the O3 byte and the inlined slots
+    // the tier byte, the inlined slots and the pending ones
     d.u8()?;
-    let n = d.u32()?;
-    for _ in 0..n {
-        d.bytes()?;
+    for _ in 0..2 {
+        let n = d.u32()?;
+        for _ in 0..n {
+            d.bytes()?;
+        }
     }
     skip_nounwind_and_cert(d)
 }
@@ -8668,6 +8728,8 @@ mod nounwind_tests {
         isolated_test!(entries_keep_false_and_true_answers_before_code);
         let mut e = E::default();
         e.u8(0);
+        // no inlined slots, no pending ones
+        e.u32(0);
         e.u32(0);
         let start = e.0.len();
         e.u32(2);
@@ -9142,7 +9204,16 @@ impl Linker {
             let b = d.bytes()?;
             inl.push(self.slot_of_bytes(u, b)?);
         }
-        // the nounwind inputs and the dependency certificate (checked by cert_valid before)
+        // the pending slots (provisional code: its rebuild is queued at the install; a slot this
+        // run cannot name is left out of them), the nounwind inputs and the dependency certificate
+        // (checked by cert_valid before)
+        let mut pending = Vec::new();
+        for _ in 0..d.u32()? {
+            let b = d.bytes()?;
+            if tier & TIER_PROVISIONAL != 0 {
+                pending.extend(self.slot_of_bytes(u, b));
+            }
+        }
         skip_nounwind_and_cert(&mut d)?;
         let code = d.bytes()?.to_vec();
         let n = d.u32()? as usize;
@@ -9235,7 +9306,9 @@ impl Linker {
         }
         self.cache().last_tier1 = if is_o3 { Some(inl) } else { None };
         self.cache().last_o2 = tier == TIER_O2;
-        self.cache().last_base = tier == TIER_BASE || tier == TIER_BASE_UV;
+        self.cache().last_base = tier & !TIER_PROVISIONAL == TIER_BASE;
+        self.cache().last_provisional = if tier & TIER_PROVISIONAL != 0 { tier_level(tier).min(2) } else { 0 };
+        self.cache().last_pending = pending;
         Some((code, pc, relocs))
     }
 }
