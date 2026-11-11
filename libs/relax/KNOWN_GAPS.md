@@ -43,16 +43,7 @@ Seen once (PR #1326) on a serde + `instability` graph: a check spun for five min
 in 1.4 s on every repeat. If you see it, attach to the live process (`relax inspect <pid>
 why-hung`) before it ends; a stack beats a repeat.
 
-## 4. Random tier fuzzer: seed 0x166db5d4c1538fe3 disagrees (register allocation)
-
-`cargo test --release -p relax-codegen --test fuzz_tiers random_programs_agree_across_tiers`
-draws fresh seeds on each run, so it can fail on your machine without any change from you. One
-seed found on 2026-10-24 (x86-64): the register-allocation check reports `v27` reading `r7`, which
-holds `[65]`. Reproduce and shrink it with `FUZZ_REDUCE=166db5d4c1538fe3` on the same test. That
-prints the smallest program that still disagrees and the first tier where it does. Then add the
-seed to `FOUND_SEEDS` in libs/relax/codegen/tests/fuzz_tiers.rs.
-
-## 5. Late lints still print when the check has an error
+## 4. Late lints still print when the check has an error
 
 ```rust
 #![allow(dead_code)]
@@ -73,7 +64,7 @@ dead_code, unnameable_types and unfulfilled_lint_expectations already follow tha
 emitted while the bodies are checked, so they need to be held back (or dropped) once an error is
 known. Start with a "late" mark on the lints rustc runs in LateLintPass.
 
-## 6. `let mut x` assigned but never used: Relax reports at `x`, rustc at `mut x`
+## 5. `let mut x` assigned but never used: Relax reports at `x`, rustc at `mut x`
 
 ```rust
 struct WriteOnly { w: u32 }
