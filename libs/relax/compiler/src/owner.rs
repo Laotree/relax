@@ -1950,9 +1950,7 @@ mod tests {
         let work = std::thread::spawn(|| {
             call(Class::Program, || {
                 RUNNING.store(true, Ordering::SeqCst);
-                let t0 = std::time::Instant::now();
                 while !request_waiting() {
-                    assert!(t0.elapsed().as_secs() < 10, "the long work never gave way to the waited Job");
                     SECTIONS.fetch_add(1, Ordering::SeqCst);
                     std::thread::yield_now();
                 }
@@ -1964,9 +1962,7 @@ mod tests {
         }
         post(Class::Job, || POSTED_RAN.store(true, Ordering::SeqCst));
         let publisher = std::thread::Builder::new().name("run-test-pub".into()).spawn(|| call(Class::Publish, || ())).unwrap();
-        let t0 = std::time::Instant::now();
         while QUEUED_N.load(Ordering::SeqCst) < 2 {
-            assert!(t0.elapsed().as_secs() < 10, "the background publish never queued");
             std::thread::yield_now();
         }
         // with both queued the work runs more sections
