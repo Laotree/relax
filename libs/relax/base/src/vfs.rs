@@ -25,6 +25,15 @@
 //! edits it in place. `.makepad-run-seeded` records each written file's blob: a seeded file whose
 //! bytes still are that blob is not an edit; `reconcile_edits` brings it to the release being run.
 //! One whose bytes changed becomes an edit (recorded in `.makepad-run-edits` from that blob).
+//!
+//! SHARE (MAKEPAD_RUN_SHARE=<name>): a workspace on disk run as the virtual folder
+//! `<run home>/vfs/<name>` (`share_from_env`): an empty store mounted there, with the workspace
+//! itself as its edits folder, so every file is read from the checkout. Every path a cache key
+//! or a stored record holds is then the virtual one, and the run dir is the run home's
+//! (dirs.rs): checkouts of one repository at different places (git worktrees, clones) that give
+//! the same name share their stores, and a crate is compiled again only where its text differs.
+//! The checkout is a plain folder here, not an overlay on a release: a write into it goes to the
+//! disk as it is, with no ledger, base copy or whiteout.
 use crate::gitstore::{self as store, Entry, Oid, Store};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -942,11 +951,41 @@ pub fn parse_range(s: &str) -> Option<(u64, u64)> {
     Some((o.parse().ok()?, l.parse().ok()?))
 }
 
+/// The edits folder is a shared workspace's checkout (SHARE): a plain folder.
+static SHARED: AtomicBool = AtomicBool::new(false);
+
+/// MAKEPAD_RUN_SHARE=<name>: the workspace of the current folder (cargo's root for it) becomes
+/// the edits folder of an empty store mounted at `<run home>/vfs/<name>`, and the run's workspace
+/// is the current folder's place under that mount. It is said in the variables a virtual run
+/// already has (MAKEPAD_RUN_VFS, MAKEPAD_RUN_EDITS, MAKEPAD_RUN_WORKSPACE), which the processes this
+/// run starts inherit: one that finds the mount named keeps it.
+fn share_from_env() -> Result<(), String> {
+    let Some(name) = std::env::var("MAKEPAD_RUN_SHARE").ok().filter(|n| !n.is_empty()) else { return Ok(()) };
+    if name.starts_with('.') || !name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')) {
+        return Err(format!("MAKEPAD_RUN_SHARE: `{name}` is not a name (letters, digits, `-`, `_`, `.`)"));
+    }
+    SHARED.store(true, Ordering::Release);
+    if std::env::var_os("MAKEPAD_RUN_VFS").is_some_and(|v| !v.is_empty()) {
+        return Ok(());
+    }
+    let cwd = std::env::current_dir().map_err(|e| format!("MAKEPAD_RUN_SHARE: {e}"))?.to_string_lossy().into_owned();
+    let disk = crate::resolve::find_root(&cwd).map_err(|e| format!("MAKEPAD_RUN_SHARE: {e}"))?;
+    let rel = relative_path(&cwd, &disk).unwrap_or_default();
+    let home = store::relax_home();
+    let root = normalize_path(&home.join("vfs").join(&name).to_string_lossy());
+    let (file, commit) = store::empty_store(&home.join("cache"))?;
+    std::env::set_var("MAKEPAD_RUN_VFS", format!("{root}\t{}\t{}", file.display(), store::hex(&commit)));
+    std::env::set_var("MAKEPAD_RUN_EDITS", &disk);
+    std::env::set_var("MAKEPAD_RUN_WORKSPACE", if rel.is_empty() { root } else { format!("{root}/{rel}") });
+    Ok(())
+}
+
 /// MAKEPAD_RUN_VFS from the environment, mounted once (the loader calls this at start).
 pub fn mount_from_env() -> Result<(), String> {
     // process state: built in the kept heap
     let _k = crate::zone_alloc::kept();
     record_from_env()?;
+    share_from_env()?;
     if let Some(d) = std::env::var_os("MAKEPAD_RUN_EDITS").filter(|d| !d.is_empty()) {
         set_edits(Some(d.into()));
     }
@@ -1158,6 +1197,12 @@ pub fn prepare_edit(path: &str, keep: bool) -> io::Result<std::path::PathBuf> {
     let (disk, rel) = edit_path(path).ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "read-only (no MAKEPAD_RUN_EDITS)"))?;
     if rel.is_empty() || rel.starts_with(".makepad-run-") {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "not an editable path"));
+    }
+    if SHARED.load(Ordering::Acquire) {
+        if let Some(parent) = disk.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        return Ok(disk);
     }
     let _g = EDIT_LOCK.lock().unwrap();
     let dir = EDITS.read().unwrap().clone().unwrap();
@@ -1499,6 +1544,43 @@ mod tests {
         set_edits(None);
         MOUNTS.write().unwrap().retain(|m| m.root != normalize_path(root));
         let _ = std::fs::remove_dir_all(&edits);
+    }
+
+    /// A shared workspace (SHARE): every file of the mount is the checkout's, under the virtual
+    /// path, and a write goes to the checkout as it is (no ledger).
+    #[test]
+    fn a_shared_workspace_reads_and_writes_its_checkout() {
+        let _one = EDITS_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("relax-vfs-share-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (file, commit) = store::empty_store(&dir).unwrap();
+        assert_eq!(store::empty_store(&dir).unwrap(), (file.clone(), commit), "the store is made once");
+        let checkout = dir.join("checkout");
+        std::fs::create_dir_all(checkout.join("src")).unwrap();
+        std::fs::write(checkout.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(checkout.join("src/lib.rs"), "pub fn f() {}").unwrap();
+        let root = "/share-test/vfs/ws";
+        mount(root, Arc::new(Store::open(&file).unwrap().unwrap()), &commit).unwrap();
+        set_edits(Some(checkout.clone()));
+        SHARED.store(true, Ordering::Release);
+        let lib = format!("{root}/src/lib.rs");
+        assert!(is_virtual(&lib) && is_file(&lib) && is_dir(format!("{root}/src")));
+        assert_eq!(read(&lib).unwrap(), b"pub fn f() {}");
+        assert_eq!(read_dir(root).unwrap(), vec![("Cargo.toml".to_string(), false), ("src".to_string(), true)]);
+        assert!(file_stat(&lib).is_none(), "its content names it, not the checkout's stat");
+        std::fs::write(checkout.join("src/lib.rs"), "pub fn g() {}").unwrap();
+        assert_eq!(read(&lib).unwrap(), b"pub fn g() {}", "an edit of the checkout is read");
+        let new = format!("{root}/src/made/mod.rs");
+        let disk = prepare_edit(&new, false).unwrap();
+        assert_eq!(disk, checkout.join("src/made/mod.rs"));
+        std::fs::write(&disk, "pub fn h() {}").unwrap();
+        assert_eq!(read(&new).unwrap(), b"pub fn h() {}");
+        assert!(!checkout.join(".makepad-run-edits").exists() && !checkout.join(".makepad-run-base").exists(), "no ledger in a checkout");
+        assert_eq!(reconcile_edits(), Vec::<String>::new());
+        SHARED.store(false, Ordering::Release);
+        set_edits(None);
+        MOUNTS.write().unwrap().retain(|m| m.root != normalize_path(root));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A watcher's look at the edits folder gives each virtual file the stamp a stat of its edit

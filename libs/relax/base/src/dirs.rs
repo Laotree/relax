@@ -18,7 +18,8 @@
 //! A git store run (the loader's `run <git url>`) has no workspace on disk: its workspace is
 //! virtual (vfs.rs, `<run home>/vfs/<label>`). Its run dir is
 //! `<run home>/target/<8 hex of the virtual workspace root>`, next to the loader's git stores
-//! in the same per-user folder the loader installs to.
+//! in the same per-user folder the loader installs to. A shared workspace (MAKEPAD_RUN_SHARE,
+//! vfs.rs) is virtual too: the checkouts that give one name have one run dir there.
 //!
 //! MAKEPAD_RUN_CACHE_DIR replaces the whole run dir: for tests and measurement only. A run
 //! that starts another run for the same program (a build script) hands its run dir over

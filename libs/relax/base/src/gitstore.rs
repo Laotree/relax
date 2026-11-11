@@ -715,6 +715,25 @@ pub fn store_path(cache: &Path, url: &str) -> PathBuf {
     cache.join(format!("git-{}-{}.store", if name.is_empty() { "repo" } else { &name }, &hex(&h)[..8]))
 }
 
+/// A store whose one commit has an empty tree, in `cache` (made on first use), and that commit:
+/// what a shared workspace mounts (vfs.rs SHARE), so every file of the mount is its edits folder's.
+pub fn empty_store(cache: &Path) -> Result<(PathBuf, Oid), String> {
+    let object = |kind: &str, data: &[u8]| {
+        let mut bytes = format!("{kind} {}\0", data.len()).into_bytes();
+        bytes.extend_from_slice(data);
+        sha1(&bytes)
+    };
+    let tree = object("tree", b"");
+    let text = format!("tree {}\nauthor makepad <run> 0 +0000\ncommitter makepad <run> 0 +0000\n\nempty\n", hex(&tree)).into_bytes();
+    let commit = object("commit", &text);
+    let path = cache.join("share-empty.store");
+    if !Store::open(&path).ok().flatten().is_some_and(|s| s.index.table(&commit).is_some()) {
+        let objects = [(tree, TREE, Vec::new()), (commit, COMMIT, text)];
+        append(&path, Append { objects: &objects, reference: Ref { key: "empty".into(), commit, time: 1 } }, &|r| r.to_vec())?;
+    }
+    Ok((path, commit))
+}
+
 /// BTreeMap of a path table's folders (for read_dir/is_dir): each folder -> its direct children.
 pub fn folders(entries: &[Entry]) -> BTreeMap<String, Vec<(String, bool)>> {
     let mut out: BTreeMap<String, Vec<(String, bool)>> = BTreeMap::new();
