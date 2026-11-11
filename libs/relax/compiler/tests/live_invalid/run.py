@@ -78,7 +78,8 @@ def step(name, ok, detail=""):
     if not ok:
         fails += 1
         if detail:
-            print("  " + detail[:3000].replace("\n", "\n  "))
+            # (the whole answer: the gate keeps this output, and a rare failure needs all of it)
+            print("  " + detail[:20000].replace("\n", "\n  "))
 
 try:
     step("starts", wait(lambda: any(l.startswith("out tick 0 10") for l in out), 180))
