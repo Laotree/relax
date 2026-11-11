@@ -713,50 +713,93 @@ fn code_as_now() -> Option<CodeKind> {
 }
 
 /// What one code body references, read off the relocations that linked those exact bytes: the
-/// slots it calls or names (a call, a callable address, a table word), then the data objects it
-/// names (their `syms` index: vtables, fn tables, statics). Sorted, each once.
+/// slots it calls or names (a call, a callable address, a table word), of those the ones whose
+/// callable address it takes (a fn pointer it makes), the data objects it names (their `syms`
+/// index: vtables, fn tables), and the statics and thread-locals it names (their DefId). Sorted,
+/// each once.
 pub(crate) struct CodeRefs {
     ids: Box<[u32]>,
-    slots: u32,
+    /// where `taken`, `data` and `statics` start in `ids`
+    ends: [u32; 3],
+}
+
+/// The parts of a CodeRefs as they are collected (CodeRefs::new sorts them).
+#[derive(Default)]
+pub(crate) struct RefList {
+    pub slots: Vec<u32>,
+    pub taken: Vec<u32>,
+    pub data: Vec<u32>,
+    pub statics: Vec<u32>,
+}
+
+impl RefList {
+    /// A relocation naming slot `c` (`taken`: as a callable address).
+    pub(crate) fn slot(&mut self, c: u32, taken: bool) {
+        self.slots.push(c);
+        if taken {
+            self.taken.push(c);
+        }
+    }
+
+    /// A relocation naming a symbol of kind `k`.
+    pub(crate) fn sym(&mut self, k: Option<crate::syms::SymKind>) {
+        use crate::syms::SymKind;
+        match k {
+            Some(SymKind::Thunk(c)) => self.slot(c, true),
+            Some(SymKind::Data(i)) => self.data.push(i),
+            Some(SymKind::Static(d) | SymKind::StaticAddr(d) | SymKind::ThreadLocal(d)) => self.statics.push(d.0),
+            _ => {}
+        }
+    }
 }
 
 impl CodeRefs {
     pub(crate) fn of_relocs(u: &Unit, relocs: &[relax_backend::rir::RelocAt]) -> CodeRefs {
         use relax_backend::rir::Reloc;
-        let mut slots = Vec::new();
-        let mut data = Vec::new();
+        let mut l = RefList::default();
         for r in relocs {
             match r.target {
-                Reloc::Call(c) | Reloc::Thunk(c) | Reloc::Slot(c) => slots.push(c),
-                Reloc::Sym(s) => match u.syms.kind(s.id) {
-                    Some(crate::syms::SymKind::Thunk(c)) => slots.push(c),
-                    Some(crate::syms::SymKind::Data(i)) => data.push(i),
-                    _ => {}
-                },
+                Reloc::Call(c) | Reloc::Slot(c) => l.slot(c, false),
+                Reloc::Thunk(c) => l.slot(c, true),
+                Reloc::Sym(s) => l.sym(u.syms.kind(s.id)),
                 _ => {}
             }
         }
-        CodeRefs::new(slots, data)
+        CodeRefs::new(l)
     }
 
-    pub(crate) fn new(mut slots: Vec<u32>, mut data: Vec<u32>) -> CodeRefs {
-        slots.sort_unstable();
-        slots.dedup();
-        data.sort_unstable();
-        data.dedup();
-        let n = slots.len() as u32;
-        slots.extend(data);
-        CodeRefs { ids: slots.into_boxed_slice(), slots: n }
+    pub(crate) fn new(l: RefList) -> CodeRefs {
+        let mut ids = Vec::with_capacity(l.slots.len() + l.taken.len() + l.data.len() + l.statics.len());
+        let mut ends = [0u32; 3];
+        for (k, mut part) in [l.slots, l.taken, l.data, l.statics].into_iter().enumerate() {
+            if k > 0 {
+                ends[k - 1] = ids.len() as u32;
+            }
+            part.sort_unstable();
+            part.dedup();
+            ids.extend(part);
+        }
+        CodeRefs { ids: ids.into_boxed_slice(), ends }
     }
 
     /// The slots the code calls or names.
     pub(crate) fn slots(&self) -> &[u32] {
-        &self.ids[..self.slots as usize]
+        &self.ids[..self.ends[0] as usize]
+    }
+
+    /// The slots whose callable address the code takes (fn pointers it makes: also in `slots`).
+    pub(crate) fn taken(&self) -> &[u32] {
+        &self.ids[self.ends[0] as usize..self.ends[1] as usize]
     }
 
     /// The data objects the code names (`syms` data indices).
     pub(crate) fn data(&self) -> &[u32] {
-        &self.ids[self.slots as usize..]
+        &self.ids[self.ends[1] as usize..self.ends[2] as usize]
+    }
+
+    /// The statics and thread-locals the code names (DefId).
+    pub(crate) fn statics(&self) -> &[u32] {
+        &self.ids[self.ends[2] as usize..]
     }
 }
 
@@ -829,6 +872,14 @@ impl CodeTables {
     fn note_inlined(&mut self, start: u64, inlined: &[u32]) {
         let _k = crate::zone_alloc::kept();
         self.inlined.insert(start, inlined.into());
+    }
+
+    /// The slots whose callable address any code body installed so far takes (CodeRefs::taken).
+    pub(crate) fn taken_slots(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.refs.values().flat_map(|r| r.taken().iter().copied()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
     }
 
     /// What the code body at `start` references (None: no body installed there).
@@ -9829,7 +9880,7 @@ pub(crate) unsafe fn install_forward(up: *mut Unit, id: u32, target: u32, cell: 
     f.rir = None;
     f.unverified.store(false, Ordering::Relaxed);
     // (its jump holds the target's address: what it references, real-time code walks as a call)
-    let a = u.install_code_refs(id, &code, &[], CodeRefs::new(vec![target], Vec::new()), Vec::new(), gen)?;
+    let a = u.install_code_refs(id, &code, &[], CodeRefs::new(RefList { slots: vec![target], ..Default::default() }), Vec::new(), gen)?;
     crate::zone_alloc::kept_with(|| u.forwards.insert(a, (target, cell)));
     Ok(a)
 }
@@ -28211,6 +28262,16 @@ struct RealTime {
     link: Vec<u32>,
     todo: Vec<u32>,
     new_dyns: Vec<u32>,
+    /// the statics and thread-locals real-time code names whose types were taken in, and the ones
+    /// still to take (DefId): the trait objects and fn pointers their values hold are called
+    /// through as the roots' are
+    statics: crate::fxhash::HashSet<u32>,
+    new_statics: Vec<u32>,
+    /// the fn-pointer signatures real-time values hold (realtime_sig_key), and the fn-pointer types
+    /// still to take: every slot code takes the address of under one of them is real-time code
+    /// too, now and as more code takes one (realtime_installed)
+    sigs: crate::fxhash::HashSet<Box<[u32]>>,
+    new_sigs: Vec<u32>,
     /// slots outside the set with a tier-up build between its walk check and its install
     /// (realtime_before_install: how many), and the ones of them the walk met meanwhile: it takes
     /// each when its build is installed or dropped (RtBuild), and reads that code's references
@@ -28234,6 +28295,8 @@ static REALTIME: relax_session::sync::Mutex<Option<RealTime>> = relax_session::s
 /// any real-time slot or trait-object type known (realtime_vtable / installs check this before the mutex)
 static RT_DYNS: AtomicBool = AtomicBool::new(false);
 static RT_ANY: AtomicBool = AtomicBool::new(false);
+/// any fn-pointer signature real-time values hold (installs check the addresses their code takes)
+static RT_SIGS: AtomicBool = AtomicBool::new(false);
 /// vtables made for a real-time trait-object type, waiting for realtime_drain
 static RT_PENDING: relax_session::sync::Mutex<Vec<u64>> = relax_session::sync::Mutex::new(Vec::new());
 /// slots compiled ahead for real-time code, and the owner's wall ns spent on it
@@ -28368,7 +28431,7 @@ static RT_ARMED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::ne
 /// one or the other).
 fn realtime_pending() -> u64 {
     let queued = RT_PENDING.lock().unwrap_or_else(|e| e.into_inner()).len() as u64;
-    queued + with_rt(|rt| (rt.todo.len() + rt.link.len() + rt.new_dyns.len() + rt.held.len() + rt.failed.len()) as u64 + rt.scheduled as u64)
+    queued + with_rt(|rt| (rt.todo.len() + rt.link.len() + rt.new_dyns.len() + rt.new_statics.len() + rt.new_sigs.len() + rt.held.len() + rt.failed.len()) as u64 + rt.scheduled as u64)
 }
 
 /// A live patch would replace code of `slots` (compiled ones and lazy ones it rebuilds): while a
@@ -28425,12 +28488,14 @@ unsafe fn realtime_mark(up: *mut Unit, root: u64, data: u64, meta: u64, ticket: 
     // the trait objects those values hold (fields, boxes, vectors, closures' captures): every
     // vtable of those types, now and as the program makes more, is real-time code too. Trait
     // objects the code only makes itself are followed through the vtables its code names.
-    dyns.extend(realtime_value_dyns(u, &values));
+    let calls = realtime_value_calls(u, &values);
+    dyns.extend(calls.dyns);
     // (the step it schedules runs after this owner request)
     realtime_reach_queued(up, roots, "mark");
     with_rt(|rt| {
         // (their vtables are followed when the walk has done the roots' slots)
         rt.new_dyns.extend(dyns);
+        rt.new_sigs.extend(calls.sigs);
         rt.added = rt.added.max(ticket);
         if wake != 0 {
             rt.wakes.push((ticket, scope, wake));
@@ -28443,10 +28508,11 @@ unsafe fn realtime_mark(up: *mut Unit, root: u64, data: u64, meta: u64, ticket: 
 #[cfg(test)]
 pub(crate) unsafe fn realtime_mark_slots(up: *mut Unit, roots: Vec<u32>) -> u64 {
     let ticket = RT_TICKET.fetch_add(1, Ordering::AcqRel) + 1;
-    let dyns = realtime_value_dyns(&*up, &realtime_root_params(&*up, &roots, &[]));
+    let calls = realtime_value_calls(&*up, &realtime_root_params(&*up, &roots, &[]));
     realtime_reach_queued(up, roots, "mark");
     with_rt(|rt| {
-        rt.new_dyns.extend(dyns);
+        rt.new_dyns.extend(calls.dyns);
+        rt.new_sigs.extend(calls.sigs);
         rt.added = rt.added.max(ticket);
     });
     ticket
@@ -28462,7 +28528,7 @@ pub(crate) fn realtime_reached(id: u32) -> bool {
 pub(crate) unsafe fn realtime_reach_queued(up: *mut Unit, roots: Vec<u32>, why: &'static str) {
     RT_ANY.store(true, Ordering::Release);
     let post = with_rt(|rt| {
-        if rt.todo.is_empty() && rt.link.is_empty() && rt.new_dyns.is_empty() && rt.held.is_empty() && !rt.scheduled {
+        if rt.todo.is_empty() && rt.link.is_empty() && rt.new_dyns.is_empty() && rt.new_statics.is_empty() && rt.new_sigs.is_empty() && rt.held.is_empty() && !rt.scheduled {
             rt.n0 = rt.set.len();
             rt.d0 = rt.dyns.len();
             rt.compiled = 0;
@@ -28528,6 +28594,8 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
         enum Next {
             Link(u32),
             Walk(u32),
+            Statics(Vec<u32>),
+            Sigs(Vec<u32>),
             Dyns(Vec<u32>),
             Done,
         }
@@ -28537,6 +28605,12 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
             }
             if let Some(id) = rt.todo.pop() {
                 return Next::Walk(id);
+            }
+            if !rt.new_statics.is_empty() {
+                return Next::Statics(std::mem::take(&mut rt.new_statics));
+            }
+            if !rt.new_sigs.is_empty() {
+                return Next::Sigs(std::mem::take(&mut rt.new_sigs));
             }
             if !rt.new_dyns.is_empty() {
                 return Next::Dyns(std::mem::take(&mut rt.new_dyns));
@@ -28563,7 +28637,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
                     continue;
                 }
                 let was = (&*up).fns[id as usize].compiled;
-                let mut slots = realtime_refs(up, id);
+                let (mut slots, statics) = realtime_refs(up, id);
                 slots.extend(realtime_partner(&*up, id));
                 let now = (&*up).fns[id as usize].compiled;
                 if !was && now {
@@ -28572,7 +28646,40 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
                 with_rt(|rt| {
                     if now { rt.failed.remove(&id); } else { rt.failed.insert(id); }
                     rt.todo.extend(slots);
+                    rt.new_statics.extend(statics.into_iter().filter(|d| !rt.statics.contains(d)));
                 });
+            }
+            // statics and thread-locals real-time code names: what their values hold is called
+            // through as the roots' values are (a trait object other code put in a static: every
+            // vtable of its type; a fn pointer: every slot taken under its signature)
+            Next::Statics(ds) => {
+                let u = &*up;
+                let ds: Vec<u32> = with_rt(|rt| ds.into_iter().filter(|&d| rt.statics.insert(d)).collect());
+                let tys: Vec<TyId> = ds.iter().filter_map(|&d| u.tcx.const_ty(&u.prog, DefId(d))).collect();
+                let calls = realtime_value_calls(u, &tys);
+                if rt_trace() && !(calls.dyns.is_empty() && calls.sigs.is_empty()) {
+                    eprintln!("makepad-run rt: {} statics real-time code names hold {} trait-object types and {} fn-pointer types", ds.len(), calls.dyns.len(), calls.sigs.len());
+                }
+                with_rt(|rt| {
+                    rt.new_dyns.extend(calls.dyns.into_iter().filter(|d| !rt.dyns.contains(d)));
+                    rt.new_sigs.extend(calls.sigs);
+                });
+            }
+            // fn-pointer signatures newly held by real-time values: every slot whose address code
+            // took under one of them so far (the code records); later ones at their install
+            Next::Sigs(ts) => {
+                let u = &*up;
+                let keys: Vec<Box<[u32]>> = ts.into_iter().filter_map(|t| realtime_fn_ptr_key(u, TyId(t))).collect();
+                let new: Vec<Box<[u32]>> = with_rt(|rt| keys.into_iter().filter(|k| rt.sigs.insert(k.clone())).collect());
+                if !new.is_empty() {
+                    RT_SIGS.store(true, Ordering::Release);
+                    let taken = u.code.read().unwrap_or_else(|e| e.into_inner()).taken_slots();
+                    let hit: Vec<u32> = taken.into_iter().filter(|&c| realtime_slot_key(u, c).is_some_and(|k| new.contains(&k))).collect();
+                    if rt_trace() {
+                        eprintln!("makepad-run rt: {} fn-pointer signatures held by real-time values: {} slots taken under them", new.len(), hit.len());
+                    }
+                    with_rt(|rt| rt.todo.extend(hit));
+                }
             }
             // trait-object types newly handed to real-time code: every vtable of each, now and later
             // (lowered, linked from the disk cache, placed from the startup image: by its name)
@@ -28610,8 +28717,10 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
                             crate::syms::data_thunks(u, a, &mut slots);
                         }
                     }
-                    // the values behind those vtables hold trait objects of their own
-                    rt.new_dyns.extend(realtime_value_dyns(u, &realtime_root_params(u, &slots, &[])).into_iter().filter(|d| !rt.dyns.contains(d)));
+                    // the values behind those vtables hold trait objects (and fn pointers) of their own
+                    let calls = realtime_value_calls(u, &realtime_root_params(u, &slots, &[]));
+                    rt.new_dyns.extend(calls.dyns.into_iter().filter(|d| !rt.dyns.contains(d)));
+                    rt.new_sigs.extend(calls.sigs);
                     rt.todo.extend(slots);
                 });
             }
@@ -28797,7 +28906,18 @@ unsafe fn realtime_miss_caller(up: *mut Unit, id: u32, frames: &[u64]) {
         }
         None => ("no JIT frame (called by host code)".to_string(), false),
     };
-    eprintln!("makepad-run rt: miss `{}` called by {} (caller in the real-time set: {})", short_name(&u.fns[id as usize].name), who, if inset { "yes" } else { "no" });
+    // a method of a vtable: the trait-object types it can be called through (a call through data
+    // the reach did not close over: realtime_refs)
+    let mut through: Vec<String> = Vec::new();
+    for (a, dy) in u.syms.vtables_of(|_, _| true) {
+        let mut slots = Vec::new();
+        crate::syms::data_thunks(u, a, &mut slots);
+        if slots.contains(&id) && !through.contains(&dy) {
+            through.push(dy);
+        }
+    }
+    let through = if through.is_empty() { String::new() } else { format!(", in the vtables of `{}`", through.join("`, `")) };
+    eprintln!("makepad-run rt: miss `{}` called by {} (caller in the real-time set: {}){}", short_name(&u.fns[id as usize].name), who, if inset { "yes" } else { "no" }, through);
 }
 
 /// The parameter types of the real-time roots: fn items' and methods' (slots `roots`), the value a
@@ -28834,21 +28954,29 @@ fn realtime_root_params(u: &Unit, roots: &[u32], types: &[TyId]) -> Vec<TyId> {
     out
 }
 
-/// The trait-object types values of `types` can hold: through struct, enum, tuple, array and slice
-/// fields, closures' captures, and what pointers point at (Box, Vec, Arc behind their raw
-/// pointers and markers).
-fn realtime_value_dyns(u: &Unit, types: &[TyId]) -> Vec<u32> {
+/// What values of some types can call through: their trait-object types and fn-pointer types (TyId).
+#[derive(Default)]
+struct ValueCalls {
+    dyns: Vec<u32>,
+    sigs: Vec<u32>,
+}
+
+/// The trait-object and fn-pointer types values of `types` can hold: through struct, enum, tuple,
+/// array and slice fields, closures' captures, and what pointers point at (Box, Vec, Arc behind
+/// their raw pointers and markers).
+fn realtime_value_calls(u: &Unit, types: &[TyId]) -> ValueCalls {
     let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
     let mut todo: Vec<TyId> = types.to_vec();
     let mut seen = crate::fxhash::HashSet::default();
-    let mut out = Vec::new();
+    let mut out = ValueCalls::default();
     while let Some(t) = todo.pop() {
         let t = u.tcx.tys.erase_regions(t);
         if !seen.insert(t) {
             continue;
         }
         match u.tcx.tys.kind(t) {
-            TyKind::Dyn(..) => out.push(t.0),
+            TyKind::Dyn(..) => out.dyns.push(t.0),
+            TyKind::FnPtr(..) => out.sigs.push(t.0),
             TyKind::Adt(d, args, _) => {
                 let adt = &u.tcx.adts[d];
                 for (vi, v) in adt.variants.iter().enumerate() {
@@ -28867,6 +28995,53 @@ fn realtime_value_dyns(u: &Unit, types: &[TyId]) -> Vec<u32> {
         }
     }
     out
+}
+
+/// A fn signature as a key: its parameter types then its return type, every region erased (bound
+/// ones too: `for<'a> fn(&'a T)` and `fn(&T)` are one key). ABI and safety are not part of it.
+fn realtime_sig_key(u: &Unit, params: &[TyId], ret: TyId) -> Box<[u32]> {
+    let erased = |t: TyId| u.tcx.tys.map_regions(t, &|_, _| crate::types::RegionId::ERASED, 0).0;
+    params.iter().map(|&p| erased(p)).chain(std::iter::once(erased(ret))).collect()
+}
+
+/// The signature key of fn-pointer type `t`.
+fn realtime_fn_ptr_key(u: &Unit, t: TyId) -> Option<Box<[u32]>> {
+    match u.tcx.tys.kind(t) {
+        TyKind::FnPtr(ps, r, _, _) => Some(realtime_sig_key(u, u.tcx.tys.list(*ps), *r)),
+        _ => None,
+    }
+}
+
+/// The signature key a fn pointer to slot `c` has: a fn item's (or its reify shim's) signature, a
+/// capture-free closure's as a fn pointer. None for other slots (glue, vtable shims).
+fn realtime_slot_key(u: &Unit, c: u32) -> Option<Box<[u32]>> {
+    let item = |d: DefId, args: &[TyId]| {
+        let sig = u.tcx.fn_sig(&u.prog, d)?;
+        let params: Vec<TyId> = sig.params.iter().map(|&p| u.tcx.tys.subst_erasing_regions(p, args)).collect();
+        Some(realtime_sig_key(u, &params, u.tcx.tys.subst_erasing_regions(sig.ret, args)))
+    };
+    if (c as usize) >= u.fns.len() {
+        return None;
+    }
+    match &u.fns[c as usize].key {
+        FnKey::Inst(d, args) => item(*d, args.as_slice()),
+        FnKey::Shim(sh) => match sh.kind {
+            ShimKind::Reify(d, _) => item(d, sh.args.as_slice()),
+            ShimKind::ClosureOnce { .. } => sh.args.iter().find_map(|&t| match u.tcx.tys.kind(t) {
+                TyKind::Closure(_, _, a) => realtime_fn_ptr_key(u, a.closure_sig_as_fn_ptr_ty),
+                _ => None,
+            }),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The slots of `taken` (addresses new code takes) whose signature real-time values hold, not
+/// walked yet.
+fn realtime_sig_hits(u: &Unit, taken: &[u32]) -> Vec<u32> {
+    let keyed: Vec<(u32, Box<[u32]>)> = taken.iter().filter_map(|&c| Some((c, realtime_slot_key(u, c)?))).collect();
+    with_rt(|rt| keyed.into_iter().filter(|(c, k)| rt.sigs.contains(k) && !rt.seen.contains(c)).map(|(c, _)| c).collect())
 }
 
 /// SPEC-V: a body's other slot -- its unverified-mode twin, or a twin's verified body. Code calls
@@ -28941,6 +29116,20 @@ fn realtime_new_refs(u: &Unit, id: u32, refs: &CodeRefs, held_covered: bool) -> 
     refs.into_iter().filter(|c| !rt.seen.contains(c) && !(held_covered && rt.held.contains(c)) && (*c as usize) < u.fns.len() && !realtime_cut(u, *c)).collect()
 }
 
+/// The statics and thread-locals new code of real-time slot `id` names (`refs`) whose types the
+/// reach has not taken in (`queued_covered`: nor queued to); none when `id` is not real-time code.
+fn realtime_new_statics(id: u32, refs: &CodeRefs, queued_covered: bool) -> Vec<u32> {
+    if refs.statics().is_empty() {
+        return Vec::new();
+    }
+    with_rt(|rt| {
+        if !rt.seen.contains(&id) {
+            return Vec::new();
+        }
+        refs.statics().iter().copied().filter(|d| !rt.statics.contains(d) && !(queued_covered && rt.new_statics.contains(d))).collect()
+    })
+}
+
 /// New code for slot `id` is installed at `site` (Unit::install_code, install_prelinked: every
 /// install), referencing `refs`. What real-time code references is walked after the current
 /// request. A build that replaces real-time code has had that done before its install
@@ -28954,18 +29143,33 @@ unsafe fn realtime_installed(up: *mut Unit, id: u32, refs: &CodeRefs, site: &'st
         return;
     }
     let u = &*up;
+    // fn pointers this code makes under a signature real-time values hold: real-time code too
+    // (as a vtable made later is: realtime_vtable)
+    if RT_SIGS.load(Ordering::Acquire) && !refs.taken().is_empty() {
+        let hit = realtime_sig_hits(u, refs.taken());
+        if !hit.is_empty() {
+            if rt_trace() {
+                eprintln!("makepad-run rt: code of `{}` takes the address of {} slots under a real-time fn-pointer signature", short_name(&u.fns[id as usize].name), hit.len());
+            }
+            realtime_reach_queued(up, hit, "fn pointer");
+        }
+    }
     // (a slot held for its own build in flight is walked when that is installed: the reach is not
-    // done until then)
+    // done until then; a static queued is taken before it is)
     let new = realtime_new_refs(u, id, refs, true);
-    if new.is_empty() {
+    let statics = realtime_new_statics(id, refs, true);
+    if new.is_empty() && statics.is_empty() {
         return;
+    }
+    if !statics.is_empty() {
+        with_rt(|rt| rt.new_statics.extend(statics.iter().copied()));
     }
     if u.fns[id as usize].compiled {
         RT_HOLES.fetch_add(1, Ordering::Relaxed);
         let kind = code_as_now().map_or_else(|| "?".to_string(), |k| format!("{} {}", k.tier_name(), k.origin_name()));
         let names: Vec<String> = new.iter().take(4).map(|&c| format!("`{}`", short_name(&u.fns[c as usize].name))).collect();
         let thread = if owner::is_owner() { owner::serving_detail() } else { format!("thread `{}`", std::thread::current().name().unwrap_or("?")) };
-        eprintln!("makepad-run rt: hole: new {} code of real-time `{}` installed at {}:{} ({}) before its walk: {} slots it references were not compiled ahead ({}){}", kind, short_name(&u.fns[id as usize].name), site.file(), site.line(), thread, new.len(), names.join(", "), if RT_ARMED.load(Ordering::Acquire) > 0 { "; a real-time thread can meet them" } else { "" });
+        eprintln!("makepad-run rt: hole: new {} code of real-time `{}` installed at {}:{} ({}) before its walk: {} slots ({}) and {} statics it references were not walked ahead{}", kind, short_name(&u.fns[id as usize].name), site.file(), site.line(), thread, new.len(), names.join(", "), statics.len(), if RT_ARMED.load(Ordering::Acquire) > 0 { "; a real-time thread can meet them" } else { "" });
     } else if rt_trace() {
         eprintln!("makepad-run rt: real-time `{}` got its first code: {} slots it references walked", short_name(&u.fns[id as usize].name), new.len());
     }
@@ -29002,10 +29206,13 @@ unsafe fn realtime_before_install(up: *mut Unit, id: u32, relocs: &[relax_backen
     let ticket = owner::publish(|| {
         let u = &*up;
         // (a slot held for its own build in flight is not walked yet: this install waits for it)
-        let new = realtime_new_refs(u, id, &CodeRefs::of_relocs(u, relocs), false);
-        if new.is_empty() {
+        let refs = CodeRefs::of_relocs(u, relocs);
+        let new = realtime_new_refs(u, id, &refs, false);
+        let statics = realtime_new_statics(id, &refs, false);
+        if new.is_empty() && statics.is_empty() {
             return 0;
         }
+        with_rt(|rt| rt.new_statics.extend(statics));
         if rt_trace() {
             eprintln!("makepad-run rt: new code of `{}` calls {} slots the reach has not walked: walked before its install", short_name(&u.fns[id as usize].name), new.len());
         }
@@ -29106,12 +29313,21 @@ unsafe fn realtime_top_tier(up: *mut Unit, ids: &[u32]) {
     }
 }
 
-/// Compiles slot `id` (if it has no code) and returns the slots its code can reach: what the
-/// reference record of its installed code names (Unit::install_code, install_prelinked), however
-/// that code was made -- built, linked from the disk cache at any tier, placed from the startup
-/// image. Never another version's: the entry its key has now, or a fresh build, can call other
-/// slots than the code that runs (baseline code calls the closures its O2 entry inlined).
-unsafe fn realtime_refs(up: *mut Unit, id: u32) -> Vec<u32> {
+/// Compiles slot `id` (if it has no code) and returns the slots its code can reach and the statics
+/// and thread-locals it names: what the reference record of its installed code names
+/// (Unit::install_code, install_prelinked, the O3 install), however that code was made -- built,
+/// linked from the disk cache at any tier, placed from the startup image. Never another
+/// version's: the entry its key has now, or a fresh build, can call other slots than the code
+/// that runs (baseline code calls the closures its O2 entry inlined).
+///
+/// Calls through data are closed over by type, not read off the code: the trait-object and
+/// fn-pointer types the roots' values, their parameters and the statics real-time code names can
+/// hold (realtime_value_calls). Not covered: a trait object or fn pointer whose type none of those
+/// names -- one only a host fn returns, or a transmute makes. The record does not say what its
+/// code calls through (that needs the virtual-call types recorded per code body, in the disk
+/// cache and the startup image too); a call through one is a miss, and its line names the
+/// trait-object types whose vtables hold the slot (realtime_miss_caller).
+unsafe fn realtime_refs(up: *mut Unit, id: u32) -> (Vec<u32>, Vec<u32>) {
     let was = RT_KEEP.with(|k| k.replace(true));
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if !(&*up).fns[id as usize].compiled {
@@ -29120,12 +29336,12 @@ unsafe fn realtime_refs(up: *mut Unit, id: u32) -> Vec<u32> {
         let u = &*up;
         let f = &u.fns[id as usize];
         if !f.compiled {
-            return Vec::new();
+            return Default::default();
         }
         // (every install records its code's references: code without a record is a hole the
         // audit names when the reach is done)
         let code = u.code.read().unwrap_or_else(|e| e.into_inner());
-        code.refs_at(f.code).map(|refs| realtime_ref_slots(u, refs)).unwrap_or_default()
+        code.refs_at(f.code).map(|refs| (realtime_ref_slots(u, refs), refs.statics().to_vec())).unwrap_or_default()
     }));
     RT_KEEP.with(|k| k.set(was));
     r.unwrap_or_default()
@@ -29411,20 +29627,22 @@ pub(crate) fn realtime_drain() {
         return;
     }
     let u = unsafe { &*up };
-    let (roots, held) = with_rt(|rt| {
+    let (roots, more) = with_rt(|rt| {
         let mut methods = Vec::new();
         for &a in &addrs {
             if rt.vtables.insert(a) {
                 crate::syms::data_thunks(u, a, &mut methods);
             }
         }
-        // the values behind those vtables hold trait objects of their own
-        let n = rt.new_dyns.len();
-        rt.new_dyns.extend(realtime_value_dyns(u, &realtime_root_params(u, &methods, &[])).into_iter().filter(|d| !rt.dyns.contains(d)));
-        let held = rt.new_dyns.len() > n;
-        (methods, held)
+        // the values behind those vtables hold trait objects (and fn pointers) of their own
+        let n = rt.new_dyns.len() + rt.new_sigs.len();
+        let calls = realtime_value_calls(u, &realtime_root_params(u, &methods, &[]));
+        rt.new_dyns.extend(calls.dyns.into_iter().filter(|d| !rt.dyns.contains(d)));
+        rt.new_sigs.extend(calls.sigs);
+        let more = rt.new_dyns.len() + rt.new_sigs.len() > n;
+        (methods, more)
     });
-    if !roots.is_empty() || held {
+    if !roots.is_empty() || more {
         unsafe { realtime_reach(up, roots, "new vtable") };
     }
     RT_PENDING.lock().unwrap_or_else(|e| e.into_inner()).drain(..addrs.len());
@@ -29797,6 +30015,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&REALTIME, relax_session::sync::Mutex::new(None));
     reset(&RT_DYNS, AtomicBool::new(false));
     reset(&RT_ANY, AtomicBool::new(false));
+    reset(&RT_SIGS, AtomicBool::new(false));
     reset(&RT_PENDING, relax_session::sync::Mutex::new(Vec::new()));
     reset(&RT_AHEAD, [AtomicU64::new(0), AtomicU64::new(0)]);
     reset(&RT_TICKET, AtomicU64::new(0));
