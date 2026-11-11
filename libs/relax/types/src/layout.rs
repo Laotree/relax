@@ -254,6 +254,9 @@ pub struct Layouts {
     /// a field type that does not normalize stays as written (transmute's size skeletons erase
     /// parameters to `()`, so `PhantomData<<() as Tr>::Assoc>` need not project)
     lenient_fields: bool,
+    /// laid out apart from the running layouts (`probe`): a closure whose environment is not
+    /// known here is missing, not derived
+    probe: bool,
 }
 
 unsafe impl Send for Layouts {}
@@ -345,6 +348,42 @@ fn fit_unsigned(x: u128) -> u32 {
     }
 }
 
+/// rustc_middle discr_range_of_repr for an enum without repr(int): the smallest integer of at
+/// least `at_least` bytes (4 for repr(C)) holding every discriminant in `min..=max`, unsigned
+/// when one fits. (bytes, signed)
+pub fn discr_int(min: i128, max: i128, at_least: u32) -> (u32, bool) {
+    let uf = fit_unsigned((min as u128).max(max as u128));
+    let sf = fit_signed(min).max(fit_signed(max));
+    if uf <= sf {
+        (uf.max(at_least), false)
+    } else {
+        (sf.max(at_least), true)
+    }
+}
+
+/// An enum tag's valid range: the smallest wrapping range at `bytes` that holds every tag of
+/// `tags` (taken at that width), the largest gap between them (the last of the largest, the tags
+/// in unsigned order) left out. Discriminants {0, 254} are 254..=0, and their Option's None is 1
+/// (rustc's). (start, end); no tags: 0..=0.
+pub fn tag_range(tags: &[u128], bytes: u32) -> (u128, u128) {
+    let wmask = if bytes >= 16 { u128::MAX } else { (1u128 << (bytes * 8)) - 1 };
+    let mut ts: Vec<u128> = tags.iter().map(|&v| v & wmask).collect();
+    ts.sort();
+    ts.dedup();
+    if ts.is_empty() {
+        ts.push(0);
+    }
+    let mut gap_after = 0;
+    let mut widest = 0u128;
+    for k in 0..ts.len() {
+        let gap = ts[(k + 1) % ts.len()].wrapping_sub(ts[k]).wrapping_sub(1) & wmask;
+        if k == 0 || gap >= widest {
+            (gap_after, widest) = (k, gap);
+        }
+    }
+    (ts[(gap_after + 1) % ts.len()], ts[gap_after])
+}
+
 fn fit_signed(x: i128) -> u32 {
     if x >= i8::MIN as i128 && x <= i8::MAX as i128 {
         1
@@ -369,7 +408,7 @@ fn tz(x: u64) -> u64 {
 
 impl Layouts {
     pub fn new() -> Layouts {
-        Layouts { closure_storage: Default::default(), version_storage: Default::default(), table: std::sync::atomic::AtomicPtr::new(Box::into_raw(LTable::new())), retired: Default::default(), ents: crate::conc::AppendVec::with_capacity(1 << 24), pool: Default::default(), opaque: Default::default(), lenient_fields: false }
+        Layouts { closure_storage: Default::default(), version_storage: Default::default(), table: std::sync::atomic::AtomicPtr::new(Box::into_raw(LTable::new())), retired: Default::default(), ents: crate::conc::AppendVec::with_capacity(1 << 24), pool: Default::default(), opaque: Default::default(), lenient_fields: false, probe: false }
     }
 
     /// Layouts of types whose parameters were erased (see `lenient_fields`).
@@ -509,6 +548,48 @@ impl Layouts {
 
     fn table(&self) -> &LTable {
         unsafe { &*self.table.load(std::sync::atomic::Ordering::Acquire) }
+    }
+
+    /// Every type laid out since these Layouts were made, with its newest layout: the current
+    /// table's, else that of the last table `clear` retired that has it. What the values this
+    /// process made of a type were made with (a type laid out again after an edit only takes
+    /// layouts its running values can be read with).
+    pub fn laid_out(&self) -> Vec<(TyId, &'static Layout)> {
+        use std::sync::atomic::Ordering;
+        let retired = self.retired.lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen: Vec<u64> = Vec::new();
+        let mut out = Vec::new();
+        for table in std::iter::once(self.table()).chain(retired.iter().rev().map(|t| &**t)) {
+            for (ci, c) in table.chunks.iter().enumerate() {
+                let p = c.load(Ordering::Acquire);
+                if p.is_null() { continue; }
+                for k in 0..LCHUNK {
+                    let w = unsafe { &*p.add(k) }.load(Ordering::Acquire);
+                    if w & SLOT_IDX == 0 { continue; }
+                    let i = (ci << LCHUNK_BITS) | k;
+                    if seen.len() <= i / 64 { seen.resize(i / 64 + 1, 0); }
+                    if seen[i / 64] & (1 << (i % 64)) != 0 { continue; }
+                    seen[i / 64] |= 1 << (i % 64);
+                    out.push((TyId(i as u32), &self.entry(w).layout));
+                }
+            }
+        }
+        out
+    }
+
+    /// Layouts to lay types out again in, apart from these (an edit's candidate definitions: the
+    /// caller puts them in the Tcx, and these Layouts are left as they are): the provided crates'
+    /// opaque sizes and the closures' environments as these have them, no layouts. A closure
+    /// whose environment neither has is missing there (`LayoutCx::missing`). Its layouts live as
+    /// long as it does.
+    pub fn probe(&self) -> Layouts {
+        let mut p = Layouts::new();
+        p.opaque = self.opaque.clone();
+        p.lenient_fields = self.lenient_fields;
+        p.probe = true;
+        for (t, s) in self.closure_storage.snapshot() { p.closure_storage.insert(t, s); }
+        for (t, s) in self.version_storage.snapshot() { p.version_storage.insert(t, s); }
+        p
     }
 
     /// Forgets every cached layout (a type definition was re-collected). The old table stays
@@ -783,6 +864,10 @@ impl Layouts {
                 l
             }
             TyKind::Closure(file, ce, ..) => {
+                if self.probe && self.closure_storage.get(&t).is_none() && self.version_storage.get(&t).is_none() {
+                    lcx.missing.borrow_mut().push(t);
+                    return plain(0, 1, None);
+                }
                 let storage = self.closure_storage(lcx.prog, tcx, t);
                 let mut l = self.closure_storage_layout(lcx, tcx, t);
                 // a coroutine: its upvars and state word, then the saved locals of its suspension
@@ -1202,42 +1287,15 @@ impl Layouts {
         let mut ds: Vec<i128> = (0..nv).filter(|&i| adt.repr_c || !vfl[i].iter().any(|f| f.uninhabited)).map(|i| adt.tag_for_variant(tcx, lcx.prog, i as u32).expect("existing layout variant").signed_value()).collect();
         ds.sort();
         let (min, max) = (ds.first().copied().unwrap_or(0), ds.last().copied().unwrap_or(0));
-        // rustc_middle discr_range_of_repr
-        let (min_bytes, signed) = match adt.repr_int {
-            Some(p) => {
-                let (b, s) = tcx.tys.int_info(p);
-                (b, s)
-            }
-            None => {
-                let at_least = if adt.repr_c { 4 } else { 1 };
-                let uf = fit_unsigned((min as u128).max(max as u128));
-                let sf = fit_signed(min).max(fit_signed(max));
-                if uf <= sf {
-                    (uf.max(at_least), false)
-                } else {
-                    (sf.max(at_least), true)
-                }
-            }
+        // rustc_middle discr_range_of_repr; tags an in-place edit pinned keep the integer the
+        // running values hold them in
+        let (min_bytes, signed) = match (&adt.tag_pin, adt.repr_int) {
+            (Some(pin), _) => (pin.bytes, pin.signed),
+            (None, Some(p)) => tcx.tys.int_info(p),
+            (None, None) => discr_int(min, max, if adt.repr_c { 4 } else { 1 }),
         };
-        // the tag's valid range: the smallest wrapping range at the tag's width that holds every
-        // tag, the largest gap between them (the last of the largest, the tags in unsigned order)
-        // left out. Discriminants {0, 254} are 254..=0, and their Option's None is 1 (rustc's)
-        let wmask = if min_bytes >= 16 { u128::MAX } else { (1u128 << (min_bytes * 8)) - 1 };
-        let mut ts: Vec<u128> = ds.iter().map(|&v| v as u128 & wmask).collect();
-        ts.sort();
-        ts.dedup();
-        if ts.is_empty() {
-            ts.push(0);
-        }
-        let mut gap_after = 0;
-        let mut widest = 0u128;
-        for k in 0..ts.len() {
-            let gap = ts[(k + 1) % ts.len()].wrapping_sub(ts[k]).wrapping_sub(1) & wmask;
-            if k == 0 || gap >= widest {
-                (gap_after, widest) = (k, gap);
-            }
-        }
-        let (range_start, range_end) = (ts[(gap_after + 1) % ts.len()], ts[gap_after]);
+        let ts: Vec<u128> = ds.iter().map(|&v| v as u128).collect();
+        let (range_start, range_end) = tag_range(&ts, min_bytes);
         let mut prefix_align = min_bytes;
         if adt.repr_c {
             for fl in vfl {

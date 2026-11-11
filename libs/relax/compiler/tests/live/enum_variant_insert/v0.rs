@@ -1,8 +1,11 @@
-// Variants inserted before running ones while a live value holds one: an enum is laid out as rustc
-// lays it, so an added variant restarts the app, and the held value is read as before.
-//  v1: `X(u16)` inserted before the held `C`, describe() and the derived ordering reading it.
-//  v2: a unit variant inserted first, `==` and `mem::discriminant` reading the held value.
-//  v3: a variant inserted after `mem::discriminant` ran.
+// M10: variants inserted before running ones while a live value holds one. The held value keeps
+// its variant (a running variant keeps its tag by name) and the new variants order and number by
+// the new text.
+//  v1: `X(u16)` inserted before the held `C` (it fits the running layout); describe() and the
+//      derived ordering read it.
+//  v2: a unit variant inserted first; `==` and `mem::discriminant` read the held value.
+//  v3: a variant inserted after `mem::discriminant` ran: the numbers it read move, so the edit
+//      takes the restart rung.
 use std::cell::RefCell;
 
 #[derive(Debug, Clone, PartialEq, PartialOrd)]

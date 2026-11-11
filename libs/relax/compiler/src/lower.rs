@@ -13147,7 +13147,7 @@ pub fn variant_disc(u: &Unit, adt: &crate::tcx::AdtT, vi: u32) -> Option<i64> {
 }
 
 /// What a variant test compares the enum's tag, read with `remap` off, with: a Direct tag's own
-/// value for variant `vi` (its discriminant, or the tag a live edit kept for it: AdtT::live_tags),
+/// value for variant `vi` (its discriminant, or the tag a live edit kept for it: AdtT::tag_pin),
 /// else the discriminant.
 pub fn variant_key(u: &Unit, l: &Layout, adt: &crate::tcx::AdtT, vi: u32) -> Option<crate::tcx::Discr> {
     match l.enc {
@@ -13161,7 +13161,7 @@ pub fn variant_key(u: &Unit, l: &Layout, adt: &crate::tcx::AdtT, vi: u32) -> Opt
 /// relative = tag - niche_start, in the niche variants' range when relative <= hi - lo).
 /// Uninhabited layouts have no discriminant. `remap` off: a Direct tag's own value (what
 /// variant tests compare with `variant_key`); on: the discriminant, which differs from it once
-/// a live edit inserted a variant (AdtT::live_tags).
+/// a live edit inserted a variant (AdtT::tag_pin).
 pub fn emit_decode_tag(u: &Unit, f: &mut Func, b: u32, pos: u64, raw: Vec<VReg>, l: &Layout, adt: &crate::tcx::AdtT, remap: bool) -> Option<Vec<VReg>> {
     use crate::layout::TagEnc;
     if l.uninhabited { return None; }
@@ -13177,7 +13177,7 @@ pub fn emit_decode_tag(u: &Unit, f: &mut Func, b: u32, pos: u64, raw: Vec<VReg>,
                 }
                 _ => raw,
             };
-            if !remap || adt.live_tags.is_empty() || tag.len() != 1 {
+            if !remap || adt.tag_pin.is_none() || tag.len() != 1 {
                 return Some(tag);
             }
             // a live edit kept the running values' tags (M10): each tag is mapped to its variant's
@@ -13357,14 +13357,15 @@ pub fn decode_tag_const(u: &Unit, raw: i128, l: &Layout, adt: &crate::tcx::AdtT)
     use crate::layout::TagEnc;
     if l.uninhabited { return None; }
     Some(match l.enc {
-        TagEnc::Direct if !adt.live_tags.is_empty() => {
-            // the tags a live edit kept (M10): the variant whose tag it is
+        TagEnc::Direct if adt.tag_pin.is_some() => {
+            // the tags a live edit kept: the variant whose tag it is
+            let pin = adt.tag_pin.as_ref()?;
             let bytes = match l.tag {
                 Some((_, Mem::Int(n, _))) => n as u32,
                 _ => 8,
             };
             let m: u128 = if bytes >= 16 { u128::MAX } else { (1u128 << (bytes * 8)) - 1 };
-            let v = (0..adt.variants.len() as u32).find(|&v| adt.live_tags[v as usize] & m == raw as u128 & m)?;
+            let v = (0..adt.variants.len() as u32).find(|&v| pin.tags[v as usize] & m == raw as u128 & m)?;
             adt.discriminant_for_variant(&u.tcx, &u.prog, v)?.signed_value()
         }
         TagEnc::Direct => {

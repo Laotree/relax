@@ -4,5 +4,5 @@ v1 refuse note=E0004: non-exhaustive patterns
 v2 refuse note=E0005
 # v3: a variant appended that a match on `Self` misses: E0004, refused
 v3 refuse note=E0004: non-exhaustive patterns
-# v4: its arm added: the added variant alone restarts
-v4 restart note=was added
+# v4: its arm added: applied
+v4 patch|reinst
