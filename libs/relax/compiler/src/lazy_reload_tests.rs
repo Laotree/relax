@@ -1862,6 +1862,95 @@ fn realtime_reach_reads_the_installed_code() {
     std::mem::forget(u);
 }
 
+/// Calls the root's code makes through data other code filled: a trait object in a static (Fab's
+/// slicer `FAN_OUT`, set by the app, read on the cell's loop), filled after the mark, and a fn
+/// pointer in the root's value, filled before it. Neither target is named by code the reach
+/// walks; the static's type (the code names the static) and the fn pointer's signature (every
+/// slot whose address code took with it) close them over, and the real-time thread meets no lazy
+/// compile.
+#[test]
+fn realtime_reach_follows_calls_through_statics_and_fn_pointers() {
+    const CHILD: &str = "MAKEPAD_RUN_RT_DATA_CALLS_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::realtime_reach_follows_calls_through_statics_and_fn_pointers", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0"));
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-rt-data-calls-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    std::fs::write(dir.join("app/src/lib.rs"), "use std::sync::Mutex;\n\
+        pub trait Route { fn next(&mut self) -> u32; }\n\
+        pub struct Ded(pub u32);\n\
+        impl Route for Ded { fn next(&mut self) -> u32 { self.0 += 3; self.0 } }\n\
+        pub static ROUTE: Mutex<Option<Box<dyn Route + Send>>> = Mutex::new(None);\n\
+        #[inline(never)] pub fn more(x: u32) -> u32 { x * 5 + 1 }\n\
+        #[repr(C)]\n\
+        pub struct Cell { pub x: u32, pub out: u32, pub f: Option<fn(u32) -> u32> }\n\
+        pub fn run(c: &mut Cell) {\n\
+            let n = match ROUTE.lock() { Ok(mut r) => r.as_mut().map_or(0, |r| r.next()), Err(_) => 0 };\n\
+            let m = match c.f { Some(f) => f(c.x), None => 0 };\n\
+            c.out = n * 100 + m;\n\
+        }\n\
+        pub fn start(c: &mut Cell) { c.f = Some(more); }\n\
+        pub fn later() { if let Ok(mut r) = ROUTE.lock() { *r = Some(Box::new(Ded(1))); } }\n").unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "rt_data_calls_app", false).unwrap();
+    let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let (run_d, start_d, later_d, more_d) = (def("run"), def("start"), def("later"), def("more"));
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let upn = up as usize;
+    let (root, more, [run_e, start_e, later_e]) = crate::owner::call(crate::owner::Class::Program, || {
+        let ids = [run_d, start_d, later_d, more_d].map(|d| u.fn_id(crate::jit::FnKey::Inst(d, vec![])));
+        (ids[0], ids[3], [ids[0], ids[1], ids[2]].map(|id| u.entry(id)))
+    });
+    // the Cell (#[repr(C)]: `x`, `out`, then the fn pointer)
+    let mut cell = [0u64; 2];
+    cell[0] = 2;
+    let cp = cell.as_mut_ptr() as u64;
+    // the fn pointer is stored before the mark, the trait object after it (other code, both)
+    unsafe { crate::jit::call_jit(up, start_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+    let ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![root]) });
+    unsafe { crate::jit::call_jit(up, later_e, 0) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+    for _ in 0..5000 {
+        if crate::jit::__relax_realtime_compiled(ticket) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(crate::jit::__relax_realtime_compiled(ticket), "the real-time reach was not compiled in 10 s");
+    let next = crate::owner::call(crate::owner::Class::Program, || u.fns.iter().position(|f| f.name.contains("Ded as") && f.name.ends_with("::next")));
+    // (each hole on its own: both are said when both are open)
+    let holes: Vec<&str> = [
+        (!next.is_some_and(|n| crate::jit::realtime_reached(n as u32))).then_some("the trait object in the static: `<Ded as Route>::next` not reached"),
+        (!crate::jit::realtime_reached(more)).then_some("the fn pointer in the root's value: `more` not reached"),
+    ].into_iter().flatten().collect();
+    assert!(holes.is_empty(), "{}", holes.join("; "));
+    let (out, misses) = std::thread::spawn(move || {
+        crate::jit::__relax_realtime_thread();
+        let before = crate::jit::__relax_realtime_misses();
+        unsafe { crate::jit::call_jit(upn as *mut crate::jit::Unit, run_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        (unsafe { *((cp + 4) as *const u32) }, crate::jit::__relax_realtime_misses() - before)
+    }).join().unwrap();
+    assert_eq!((out, misses), (4 * 100 + 11, 0), "the real-time thread met lazy compiles (MAKEPAD_RUN_RT_TRACE=1 names them)");
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Fab's live edit on a node (ICEs "key in collected table", "variance declaration"): a new module
 /// file whose structs (a `#[cfg(relax)]` field of a std type among them) an existing struct holds
 /// in `Option` fields, filled through `get_or_insert_with`. The edit patches, the new code runs.
