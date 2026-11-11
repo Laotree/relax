@@ -11671,14 +11671,15 @@ fn run_o2(unit: usize, id: u32, kind: queue::O2Kind) {
 unsafe fn o2_build_install(up: *mut Unit, w: O2Work) {
     count_linked_provisional_build(up, w.id, w.o1);
     let done = w.run();
-    let mut rt = RtBuild(None);
+    let mut rt = RtBuild::NONE;
     if let Ok(Ok((_, _, c))) = &done.built {
         prebuild_callees(up, &c.relocs, &[]);
         rt = realtime_before_install(up, done.id, &c.relocs);
     }
+    let cut = rt.cut;
     owner::publish(|| {
         let _rt = rt;
-        o2_finish(up, done)
+        o2_finish(up, done, cut)
     });
 }
 
@@ -11822,7 +11823,8 @@ impl O2Work {
 }
 
 /// An O2 build's install (unit call): the inline candidates' RIR, the cache record, the code.
-unsafe fn o2_finish(up: *mut Unit, d: O2Done) {
+/// (`cut`: realtime_before_install did not finish the walk of the new code's references: dropped)
+unsafe fn o2_finish(up: *mut Unit, d: O2Done, cut: bool) {
     let O2Done { id, epoch, snapshot, o1, t0, built, done } = d;
     use crate::cache::warm_count as wc;
     let dropped = move |why: usize| if o1 { wc::add(wc::O1V_DROPPED, 1) } else { o2_drop(why, up, id) };
@@ -11841,7 +11843,7 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done) {
     }
     let u = &mut *up;
     let c = match built {
-        Ok(Ok((func, inlined, c))) if !stale && {
+        Ok(Ok((func, inlined, c))) if !stale && !cut && {
             let n = if relax_codegen::interp::blob::is_blob(&c.code) { c.code.len() } else { relax_backend::rir::split_unwind_info(&c.code).0 };
             u.link_check(&c.code[..n], &c.relocs)
         } => {
@@ -18568,7 +18570,7 @@ unsafe fn prebuild_callees(up: *mut Unit, relocs: &[relax_backend::rir::RelocAt]
             if let Ok(Ok((_, _, cc))) = &done.built {
                 todo.extend(calls(&cc.relocs));
             }
-            owner::publish(|| o2_finish(up, done));
+            owner::publish(|| o2_finish(up, done, false));
             if owner::publish(|| (&*up).fns[c as usize].compiled) {
                 SPECV_PREBUILT.fetch_add(1, Ordering::Relaxed);
             }
@@ -20131,10 +20133,10 @@ pub(crate) unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bo
     };
     let rt = realtime_before_install(up, id, &c.relocs);
     let installed = owner::publish(|| {
-        let _rt = rt;
+        let rt = rt;
         let u = &mut *up;
         let f = &u.fns[id as usize];
-        if PATCH_EPOCH.load(Ordering::SeqCst) != epoch || f.version != version || f.o3.load(Ordering::Relaxed)
+        if rt.cut || PATCH_EPOCH.load(Ordering::SeqCst) != epoch || f.version != version || f.o3.load(Ordering::Relaxed)
             || !f.rir.as_ref().is_some_and(|r| std::sync::Arc::ptr_eq(r, &rir)) || crate::inspect::instrument::active(id) {
             return false;
         }
@@ -21216,14 +21218,14 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // theirs before the swap (prebuild_callees)
     // (not for an O3-always first build: that is a program thread's lazy compile)
     // (a real-time slot's new callees too: realtime_before_install)
-    let mut rt = RtBuild(None);
+    let mut rt = RtBuild::NONE;
     if let (Ok(Ok((_, _, relocs, extra))), false) = (&built, o3_first()) {
         prebuild_callees(up, relocs, &extra.3);
         rt = realtime_before_install(up, id, relocs);
     }
     // (an O3-always first build is a program thread's lazy compile: its finish is foreground)
     let ok = owner::publish(|| {
-        let _rt = rt;
+        let rt = rt;
         let ti0 = cpu_ns();
         struct InstallTotal(u64);
         impl Drop for InstallTotal {
@@ -21236,7 +21238,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         u.stats.tier1_locked_ns += owner_ns.get();
         u.stats.tier1_free_ns += t2 - t1;
         let ok = match built {
-            Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, absent, frame_size, self_call, nounwind_used)))) if PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && (!crate::inspect::instrument::active(id) || inspect_o3_on()) && !inlined_rejected(u, &unverified_in, &inlined)
+            Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, absent, frame_size, self_call, nounwind_used)))) if !rt.cut && PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && (!crate::inspect::instrument::active(id) || inspect_o3_on()) && !inlined_rejected(u, &unverified_in, &inlined)
                 // (code of an invalidated group -- an unloaded module's -- is never built again)
                 && crate::invalid::group_of(u, id, 0, &inlined).map_or(true, |g| !crate::invalid::is_dead(u, g)) && {
                 let n = if relax_codegen::interp::blob::is_blob(&code) { code.len() } else { relax_backend::rir::split_unwind_info(&code).0 };
@@ -21460,6 +21462,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     }.expect("O3 code links (checked)")
                 };
                 u.mark_interpreted(id, at);
+                // what its code references (CodeTables::refs: the real-time walk reads it); real-time
+                // code: its new references were walked before this install (realtime_before_install)
+                let refs = CodeRefs::of_relocs(u, &relocs);
+                realtime_installed(up, id, &refs, std::panic::Location::caller());
+                u.code.write().unwrap_or_else(|e| e.into_inner()).note_refs(at, refs);
                 if !blob {
                     code_growth(if sandboxed { GROW_MODULE } else if u.retiers.contains_key(&id) { GROW_REOPT } else { GROW_TIERUP }, code.len());
                 }
@@ -28922,7 +28929,7 @@ fn realtime_ref_slots(u: &Unit, refs: &CodeRefs) -> Vec<u32> {
 /// walked; none when `id` is not real-time code. A diverging slot stays out (the walk stops
 /// there). An O2/O3 build or a verdict's rebuild can call slots the code it replaces did not
 /// (SPEC-V twins and their verified bodies are separate slots).
-fn realtime_new_refs(u: &Unit, id: u32, refs: &CodeRefs) -> Vec<u32> {
+fn realtime_new_refs(u: &Unit, id: u32, refs: &CodeRefs, held_covered: bool) -> Vec<u32> {
     if !REALTIME.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|rt| rt.seen.contains(&id)) {
         return Vec::new();
     }
@@ -28931,7 +28938,7 @@ fn realtime_new_refs(u: &Unit, id: u32, refs: &CodeRefs) -> Vec<u32> {
     refs.dedup();
     let g = REALTIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(rt) = g.as_ref() else { return Vec::new() };
-    refs.into_iter().filter(|c| !rt.seen.contains(c) && !rt.held.contains(c) && (*c as usize) < u.fns.len() && !realtime_cut(u, *c)).collect()
+    refs.into_iter().filter(|c| !rt.seen.contains(c) && !(held_covered && rt.held.contains(c)) && (*c as usize) < u.fns.len() && !realtime_cut(u, *c)).collect()
 }
 
 /// New code for slot `id` is installed at `site` (Unit::install_code, install_prelinked: every
@@ -28947,7 +28954,9 @@ unsafe fn realtime_installed(up: *mut Unit, id: u32, refs: &CodeRefs, site: &'st
         return;
     }
     let u = &*up;
-    let new = realtime_new_refs(u, id, refs);
+    // (a slot held for its own build in flight is walked when that is installed: the reach is not
+    // done until then)
+    let new = realtime_new_refs(u, id, refs, true);
     if new.is_empty() {
         return;
     }
@@ -28978,7 +28987,7 @@ unsafe fn realtime_installed(up: *mut Unit, id: u32, refs: &CodeRefs, site: &'st
 /// (the first mark can come while one is in flight): a lock and a map entry each.
 unsafe fn realtime_before_install(up: *mut Unit, id: u32, relocs: &[relax_backend::rir::RelocAt]) -> RtBuild {
     if RT_KEEP.with(|k| k.get()) {
-        return RtBuild(None);
+        return RtBuild::NONE;
     }
     let in_set = with_rt(|rt| {
         let i = rt.seen.contains(&id);
@@ -28988,11 +28997,12 @@ unsafe fn realtime_before_install(up: *mut Unit, id: u32, relocs: &[relax_backen
         i
     });
     if !in_set {
-        return RtBuild(Some((up as usize, id)));
+        return RtBuild { slot: Some((up as usize, id)), cut: false };
     }
     let ticket = owner::publish(|| {
         let u = &*up;
-        let new = realtime_new_refs(u, id, &CodeRefs::of_relocs(u, relocs));
+        // (a slot held for its own build in flight is not walked yet: this install waits for it)
+        let new = realtime_new_refs(u, id, &CodeRefs::of_relocs(u, relocs), false);
         if new.is_empty() {
             return 0;
         }
@@ -29005,11 +29015,11 @@ unsafe fn realtime_before_install(up: *mut Unit, id: u32, relocs: &[relax_backen
         t
     });
     if ticket == 0 {
-        return RtBuild(None);
+        return RtBuild::NONE;
     }
     if owner::is_owner() {
         realtime_step_for(up, u64::MAX);
-        return RtBuild(None);
+        return RtBuild::NONE;
     }
     let _budget = crate::pool::suspend();
     let _idle = JobIdle::enter();
@@ -29018,19 +29028,33 @@ unsafe fn realtime_before_install(up: *mut Unit, id: u32, relocs: &[relax_backen
     while RT_DONE.load(Ordering::Acquire) < ticket && !TIER_STOP.load(Ordering::SeqCst) && !SPEC_STOP.load(Ordering::SeqCst) {
         g = RT_DONE_WAKE.1.wait_timeout(g, TIER1_POLL).unwrap_or_else(|e| e.into_inner()).0;
     }
-    RtBuild(None)
+    let cut = RT_DONE.load(Ordering::Acquire) < ticket;
+    if cut && rt_trace() {
+        eprintln!("makepad-run rt: the tiers stopped before the new references of `{}` were walked: its build is dropped", short_name(&(&*up).fns[id as usize].name));
+    }
+    RtBuild { slot: None, cut }
 }
 
 /// A tier-up build of a slot outside the real-time set, from its walk check
 /// (realtime_before_install) to the end of its install's publish, where it is dropped: the walk
 /// holds the slot meanwhile (RealTime::building / held) and takes it now, reading the references
 /// of the code that was installed (or kept, when the build was dropped).
+///
+/// `cut`: the walk of the new code's references did not finish (the tiers stopped meanwhile: the
+/// process ends, the unit goes): the site drops its build, the old code stays.
 #[must_use]
-struct RtBuild(Option<(usize, u32)>);
+struct RtBuild {
+    slot: Option<(usize, u32)>,
+    cut: bool,
+}
+
+impl RtBuild {
+    const NONE: RtBuild = RtBuild { slot: None, cut: false };
+}
 
 impl Drop for RtBuild {
     fn drop(&mut self) {
-        let Some((upn, id)) = self.0.take() else { return };
+        let Some((upn, id)) = self.slot.take() else { return };
         let post = with_rt(|rt| {
             match rt.building.get_mut(&id) {
                 Some(n) if *n > 1 => {
