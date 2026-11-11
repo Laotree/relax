@@ -122,7 +122,7 @@ pub(crate) struct SPrep {
 impl SPrep {
     pub(crate) fn of(p: &Prep) -> SPrep {
         SPrep {
-            func: p.func.clone(),
+            func: Func { lowering: None, ..p.func.clone() },
             callees: p.callees.clone(),
             facts: p.facts.clone(),
             cfg: p.cfg,
@@ -333,7 +333,7 @@ pub(crate) fn store(k: Key, prep: SPrep, opt: &Option<(Arc<Func>, Vec<(u32, usiz
         None => ok.set(false),
     };
     let func = |f: &Func| {
-        let mut f = f.clone();
+        let mut f = Func { lowering: None, ..f.clone() };
         f.fn_slots_mut(&mut |s| to(s));
         f.name = String::new();
         f

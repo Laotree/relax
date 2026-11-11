@@ -152,6 +152,9 @@ pub struct FnEntry {
     /// inline (inline_body). Kept when the full body replaces it, or built after it (once); read
     /// only while `rir` is full, so a reset of `rir` needs no reset of it.
     pub normal_rir: Option<std::sync::Arc<relax_backend::rir::Func>>,
+    /// A baseline RIR's own lowering (its `Func::lowering`, moved here when it is stored): what its
+    /// upgrade to normal RIR starts from. Replaced with the RIR, read only while that is baseline.
+    pub lowering: Option<std::sync::Arc<relax_backend::rir::Func>>,
 }
 
 /// SPEC-V: a body's standing with the borrow checker.
@@ -6547,7 +6550,7 @@ impl Unit {
         // Copy explicitly: converting an existing String can keep its old allocation.
         // Clone also copies both Inst's and Shim's owned type arguments.
         let (key, name) = crate::zone_alloc::slots_with(|| (key.clone(), Box::<str>::from(name)));
-        FnEntry { key, name, code: stub_addr, code_len: stub_len, pc_map: PcMap::default(), file, history: None, compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, build_ns: 0, cg_ns: 0, version: 0, inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), unverified: AtomicBool::new(false), d3_lowered: AtomicBool::new(false), ran_before: AtomicBool::new(false), twin_ran: AtomicBool::new(false), patched: AtomicBool::new(false), borrowed: false, rir_from: RIR_OWN, normal_rir: None, calls: Box::default() }
+        FnEntry { key, name, code: stub_addr, code_len: stub_len, pc_map: PcMap::default(), file, history: None, compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, build_ns: 0, cg_ns: 0, version: 0, inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), unverified: AtomicBool::new(false), d3_lowered: AtomicBool::new(false), ran_before: AtomicBool::new(false), twin_ran: AtomicBool::new(false), patched: AtomicBool::new(false), borrowed: false, rir_from: RIR_OWN, normal_rir: None, lowering: None, calls: Box::default() }
     }
 
     /// Slot `id` has its key: the front's slot keys and its ahead check (before the slot is
@@ -6802,6 +6805,7 @@ impl Unit {
     /// All O1 RIR installations, including sandbox twins, pass through here.
     fn set_rir(&mut self, id: u32, mut func: relax_backend::rir::Func) {
         func.patch_flag = patch_flag(self, id);
+        let lowering = func.lowering.take();
         // a normal body built while the RIR is an O2 build's full body (for callers below O2): kept
         // beside it, once; the full body stays the RIR
         if beside_full(self.fns[id as usize].rir.as_deref(), &func) {
@@ -6896,6 +6900,7 @@ impl Unit {
         }
         self.fns[id as usize].rir = Some(std::sync::Arc::new(func));
         self.fns[id as usize].normal_rir = keep;
+        self.fns[id as usize].lowering = lowering;
         if let FnKey::Closure(_, _, parent) = self.fns[id as usize].key {
             drop_completed_body(self, parent);
         }
@@ -11468,8 +11473,8 @@ unsafe fn o1v_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     let u = &*up;
     let f = &u.fns[id as usize];
     // the lowering is reused unless it is lowered again for its verdict (calls to twins, missing
-    // disjoint-index checks: split_upgrade's rule)
-    let lowered = f.rir.as_ref().filter(|r| !r.plain_calls && !(!f.d3_lowered.load(Ordering::Relaxed) && u.disjoint_checks(id).is_some())).map(|r| (**r).clone());
+    // disjoint-index checks: split_upgrade's rule); a baseline RIR's is the one it kept
+    let lowered = f.rir.as_ref().filter(|r| !r.plain_calls && !(!f.d3_lowered.load(Ordering::Relaxed) && u.disjoint_checks(id).is_some())).and_then(|r| if r.baseline { f.lowering.as_deref().cloned() } else { Some((**r).clone()) });
     if begin_build(up, id).is_err() {
         return dropped();
     }
@@ -12234,7 +12239,10 @@ fn drop_completed_body(u: &mut Unit, id: u32) {
     let before = crate::memstat::live_total();
     // Inline candidates still have startup readers, including callers not lowered yet.
     // Their source-driven eligibility is exactly the inliner's, not a new size heuristic.
-    if drop_rir { u.fns[id as usize].normal_rir = None; }
+    if drop_rir {
+        u.fns[id as usize].normal_rir = None;
+        u.fns[id as usize].lowering = None;
+    }
     let rir = if drop_rir { u.fns[id as usize].rir.take() } else { None };
     if let Some(r) = rir {
         let bytes = if std::sync::Arc::strong_count(&r) == 1 { crate::memreport::rir_bytes(&r) } else { 0 };
@@ -12411,6 +12419,7 @@ impl SettleSweep {
                         if f.compiled && !f.inflight && !f.building && !self.pinned.contains(&(id as u32)) {
                             // Arc snapshots remain valid even after the slot drops its ownership.
                             f.normal_rir = None;
+                            f.lowering = None;
                             if let Some(r) = f.rir.take() {
                                 self.drops.fns += 1;
                                 self.drops.retired_rir.push(r);
@@ -12583,6 +12592,7 @@ unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(
         return Ok(());
     }
     let mut lowered = None;
+    let mut relower = false;
     // a normal build for callers below O2 while the RIR is an O2 build's full body
     let fresh = normal && !o2_build() && needs_normal(&(&*up).fns[id as usize]);
     {
@@ -12595,13 +12605,20 @@ unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(
             // the verdict is clean (checked above). An unverified lowering is lowered again (below)
             // instead of upgraded when it sends calls to unverified-mode twins (SPEC-V: verified code
             // calls the slots themselves) or lacks the run-time disjoint-index checks the verdict
-            // asks for (D3); otherwise it is reused (prepare_rir_from gives it its noalias facts back)
+            // asks for (D3); otherwise the upgrade starts from the lowering the baseline RIR kept
+            // (prepare_rir_from gives it its noalias facts back), never from the baseline body. An
+            // O2 build of normal RIR starts from that RIR.
             if fresh {
                 // the normal body beside a full one: from a fresh lowering (set_rir keeps it beside)
             } else if r.plain_calls || !u.fns[id as usize].d3_lowered.load(Ordering::Relaxed) && u.disjoint_checks(id).is_some() {
                 u.fns[id as usize].rir = None;
-            } else {
+            } else if !upgradable(r) {
                 lowered = Some((**r).clone());
+            } else if let Some(l) = &u.fns[id as usize].lowering {
+                lowered = Some((**l).clone());
+            } else {
+                // none kept (a body the back-end memo gave): lowered again
+                relower = true;
             }
         }
         if let Some(e) = &u.fns[id as usize].build_err {
@@ -12614,7 +12631,7 @@ unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(
         (&mut *up).set_rir(id, f);
         return Ok(());
     }
-    if lowered.is_none() && !fresh && (&*up).fns[id as usize].rir.is_some() {
+    if lowered.is_none() && !fresh && !relower && (&*up).fns[id as usize].rir.is_some() {
         return Ok(());
     }
     if let Some(e) = &(&*up).fns[id as usize].build_err {
@@ -12803,6 +12820,11 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     }
     let u = &mut *up;
     let baseline = baseline && !u.pairs_sincos(&func);
+    // a baseline body keeps its lowering: its upgrade to normal RIR starts from that, not from the
+    // baseline body (the start tier's inlining and passes are in it)
+    if baseline {
+        func.lowering = Some(std::sync::Arc::new(func.clone()));
+    }
     func.baseline = baseline;
     if unverified {
         func.withheld_noalias = std::mem::take(&mut func.noalias);
@@ -22232,9 +22254,9 @@ unsafe fn o3_candidates_begin(up: *mut Unit, ids: &[(u32, RirMode)]) -> (Vec<(u3
             continue;
         }
         // an upgrade of baseline (or SPEC-V unverified) RIR to normal RIR, as build_rir_unguarded
-        // makes it: the lowering it reuses is the slot's own RIR; one it would lower again (calls to
-        // twins, missing disjoint-index checks) or a slot without a clean verdict is left to the
-        // snapshot's own build
+        // makes it: from the lowering the baseline RIR kept (none kept: lowered again); one it would
+        // lower again (calls to twins, missing disjoint-index checks) or a slot without a clean
+        // verdict is left to the snapshot's own build
         let lowered = if mode == RirMode::Normal {
             if !u.refresh_verified(c) {
                 cand_skip(4);
@@ -22251,7 +22273,7 @@ unsafe fn o3_candidates_begin(up: *mut Unit, ids: &[(u32, RirMode)]) -> (Vec<(u3
                 gave.push(c);
                 continue;
             }
-            Some((**r).clone())
+            f.lowering.as_deref().cloned()
         } else {
             if f.rir.is_some() {
                 cand_skip(8);
@@ -22707,6 +22729,7 @@ fn expire_spec_now(now: u64, ttl: u64) -> ExpiredSpec {
             n += 1;
             if f.history().inlined_into.is_empty() {
                 f.normal_rir = None;
+                f.lowering = None;
                 if let Some(r) = f.rir.take() {
                     bytes += relax_codegen::opt::inst_count(&r) as u64 * 80;
                     out.rir.push(r);
@@ -23695,10 +23718,11 @@ unsafe fn split_upgrade(up: *mut Unit, id: u32) -> Option<Prep> {
         let _ = build_rir_mode(up, id, RirMode::Normal);
         return None;
     }
-    let lowered = (**r).clone();
+    // from the lowering the baseline RIR kept (none kept: lowered again)
+    let lowered = f.lowering.as_deref().cloned();
     begin_build(up, id).ok()?;
     let depth0 = BUILD_STACK.try_with(|s| s.borrow().len()).unwrap_or(0);
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare_rir_from(up, id, true, Some(lowered), RirMode::Normal)));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare_rir_from(up, id, true, lowered, RirMode::Normal)));
     if r.is_err() {
         let open: Vec<u32> = BUILD_STACK.try_with(|s| s.borrow()[depth0.min(s.borrow().len())..].to_vec()).unwrap_or_default();
         for x in open.into_iter().rev() {
@@ -23976,7 +24000,15 @@ impl BackWork {
             if let Front::Opt(p, _) = &front {
                 if worthy && bmemo::on(options) {
                     let k = bmemo::key(id, p, (fold, rotate, env.opt_regs, epoch));
-                    if let Some((opt, code, map, relocs, cg_ns, done, frame)) = bmemo::lookup(&k, p) {
+                    if let Some((opt, code, map, relocs, cg_ns, mut done, frame)) = bmemo::lookup(&k, p) {
+                        // (the memo's copies carry no lowering: a baseline body gets this
+                        // preparation's own, the input of its upgrade)
+                        let opt = opt.map(|(f, inl, ns)| (std::sync::Arc::new(relax_backend::rir::Func { lowering: p.func.lowering.clone(), ..std::sync::Arc::unwrap_or_clone(f) }), inl, ns));
+                        for (c, r) in &mut done {
+                            if let (Ok((f, _)), Some(q)) = (r, p.deferred.iter().find(|d| d.0 == *c)) {
+                                f.lowering = q.2.func.lowering.clone();
+                            }
+                        }
                         *done_out.lock().unwrap() = done;
                         note_frame(id, frame.0, frame.1, false);
                         if !spec {
