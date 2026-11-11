@@ -821,11 +821,10 @@ pub struct Cache {
     /// the hit just linked is O2 code (a `#[relax(O2)]` slot's, or a slot an earlier run found
     /// hot): no O2 build for it this run
     pub last_o2: bool,
-    /// the entry just decoded is provisional code above baseline (TIER_PROVISIONAL), by level (1
-    /// O1, 2 O2; 0 none), and its pending slots as this run has them: the install queues its
-    /// rebuild (jit.rs provisional_linked)
-    pub last_provisional: u8,
-    pub last_pending: Vec<u32>,
+    /// the entry just decoded is provisional code (TIER_PROVISIONAL): its level (baseline 0, O1 1,
+    /// O2 2), for the run summary's count of builds started for such slots (jit.rs
+    /// linked_provisional): it starts none
+    pub last_provisional: Option<u8>,
     /// the entry just decoded is baseline code (TIER_BASE): lookup moves it to `base_linked`
     pub last_base: bool,
     /// slots linked from TIER_BASE entries and not installed yet (jit.rs install_compiled)
@@ -1173,8 +1172,7 @@ impl Cache {
             last_data: Vec::new(),
             last_tier1: None,
             last_o2: false,
-            last_provisional: 0,
-            last_pending: Vec::new(),
+            last_provisional: None,
             last_base: false,
             base_linked: HashSet::new(),
             fnkey_bytes: HashMap::new(),
@@ -4120,7 +4118,38 @@ impl Cache {
         flush_front_graphs()
     }
 
+    /// (verbose, at the close) The code entries the cache holds after this run: each key's
+    /// entry, this run's records over the stored ones, by level, complete or provisional. None:
+    /// no code entries.
+    fn census(&self) -> Option<String> {
+        let mut tiers: KeyMap<u8> = KeyMap::default();
+        for (si, st) in self.stores.iter().enumerate() {
+            for (e, ix) in st.index.iter().enumerate() {
+                if ix.kind != KIND_CODE || self.index_at(ix.key) != Some((si as u32, e as u32)) {
+                    continue;
+                }
+                if let Some(t) = st.get_at(e, ix.key).and_then(|(_, p)| payload_tier(p)) {
+                    tiers.insert(ix.key, t);
+                }
+            }
+        }
+        tiers.extend(self.rec_tier.iter().map(|(&k, &t)| (k, t)));
+        if tiers.is_empty() {
+            return None;
+        }
+        let mut n = [[0u64; 2]; 4];
+        for &t in tiers.values() {
+            n[tier_level(t) as usize][usize::from(t & TIER_PROVISIONAL != 0)] += 1;
+        }
+        let provisional: u64 = n.iter().map(|x| x[1]).sum();
+        let levels = ["base", "O1", "O2", "O3"].iter().zip(n).map(|(l, x)| format!("{l} {} + {} provisional", x[0], x[1])).collect::<Vec<_>>().join(", ");
+        Some(format!("{} code entries ({levels}), {} provisional ({:.2}%)", tiers.len(), provisional, 100.0 * provisional as f64 / tiers.len() as f64))
+    }
+
     pub fn flush(&mut self) -> Result<usize, String> {
+        if let Some(c) = self.census().filter(|_| self.verbose) {
+            eprintln!("makepad-run cache: census: {c}");
+        }
         if self.verbose && self.mode == Mode::Verify {
             let s = &self.stats;
             eprintln!("makepad-run cache: verify: {} identical, {} different ({} with other recorded inputs, {} code from the same inputs, {} only a relocation), {} of another tier, {} provisional (not compared; {} provisional in the cache)", s.verify_same, s.verify_diff, s.verify_diff_inputs, s.verify_diff_code, s.verify_diff_reloc, s.verify_other_tier, s.verify_provisional, s.verify_provisional_cached);
@@ -9251,15 +9280,10 @@ impl Linker {
             let b = d.bytes()?;
             inl.push(self.slot_of_bytes(u, b)?);
         }
-        // the pending slots (provisional code: its rebuild is queued at the install; a slot this
-        // run cannot name is left out of them), the nounwind inputs and the dependency certificate
-        // (checked by cert_valid before)
-        let mut pending = Vec::new();
+        // the pending slots (provisional code: recorded, not used at the link), the nounwind
+        // inputs and the dependency certificate (checked by cert_valid before)
         for _ in 0..d.u32()? {
-            let b = d.bytes()?;
-            if tier & TIER_PROVISIONAL != 0 {
-                pending.extend(self.slot_of_bytes(u, b));
-            }
+            d.bytes()?;
         }
         skip_nounwind_and_cert(&mut d)?;
         let code = d.bytes()?.to_vec();
@@ -9352,10 +9376,10 @@ impl Linker {
             }
         }
         self.cache().last_tier1 = if is_o3 { Some(inl) } else { None };
-        self.cache().last_o2 = tier == TIER_O2;
+        // (O2 code, provisional or not: no O2 build for it this run)
+        self.cache().last_o2 = tier & !TIER_PROVISIONAL == TIER_O2;
         self.cache().last_base = tier & !TIER_PROVISIONAL == TIER_BASE;
-        self.cache().last_provisional = if tier & TIER_PROVISIONAL != 0 { tier_level(tier).min(2) } else { 0 };
-        self.cache().last_pending = pending;
+        self.cache().last_provisional = (tier & TIER_PROVISIONAL != 0).then(|| tier_level(tier));
         Some((code, pc, relocs))
     }
 }
