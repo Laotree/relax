@@ -5,8 +5,6 @@
 mod closure;
 pub use closure::ClosureStorage;
 
-use crate::next_solver::TraitRef;
-use crate::consts::GenericArg;
 use crate::program::Prim;
 use relax_backend::rir::{Cls, Mem};
 use crate::tcx::Tcx;
@@ -38,10 +36,6 @@ pub struct Layout {
     pub niche: Option<Niche>,
     /// no value of the type exists (`!`, empty enums, a field of such a type)
     pub uninhabited: bool,
-    /// Live sessions (M10): the offset of the hidden extension word of a live-editable struct
-    /// (a pointer to the fields edits added, null until one is used; hotreload.md section 13).
-    /// Fields in its extension block have offset u32::MAX in `fields`.
-    pub ext: Option<u32>,
 }
 
 /// A scalar of `bytes` at `off` whose valid values are `start..=end` (wrapping; rustc_abi
@@ -272,7 +266,7 @@ impl Drop for Layouts {
 }
 
 fn plain(size: u32, align: u32, leaves: Option<Vec<Leaf>>) -> Layout {
-    Layout { size, align, fields: Vec::new(), tag: None, enc: TagEnc::Direct, variant_fields: Vec::new(), leaves, niche: None, uninhabited: false, ext: None }
+    Layout { size, align, fields: Vec::new(), tag: None, enc: TagEnc::Direct, variant_fields: Vec::new(), leaves, niche: None, uninhabited: false }
 }
 
 fn scalar(size: u32, mem: Mem, cls: Cls) -> Layout {
@@ -682,38 +676,6 @@ impl Layouts {
         }
     }
 
-    /// Live sessions (M10, hotreload.md section 13): a struct in the application's scope that
-    /// edits may give fields in place -- named fields, no repr other than Rust's, not Copy (a
-    /// bitwise copy would share the extension block). Never a provided crate's (`rustc_laid`):
-    /// its values are rustc's bytes, and an application whose tree holds the framework's sources
-    /// has the crate in its scope.
-    pub fn live_editable(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, d: crate::program::DefId, adt: &crate::tcx::AdtT, t: TyId) -> bool {
-        self.live_editable_form(lcx, d, adt) && Self::is_copy(lcx, tcx, t) == Some(false)
-    }
-
-    /// What live_editable asks of a struct but its Copy impl: of the application's scope (not a
-    /// provided crate's), named fields, Rust's repr, in a live session.
-    pub fn live_editable_form(&self, lcx: &LayoutCx<'_>, d: crate::program::DefId, adt: &crate::tcx::AdtT) -> bool {
-        live_laid(lcx.prog, lcx.prog.def(d).krate) && Self::struct_form(adt)
-    }
-
-    /// The struct form live_editable_form asks for, its crate aside: named fields, Rust's repr.
-    pub fn struct_form(adt: &crate::tcx::AdtT) -> bool {
-        if adt.is_enum || adt.is_union {
-            return false;
-        }
-        if adt.repr_c || adt.repr_packed != 0 || adt.repr_align != 0 || adt.repr_int.is_some() || adt.no_niche || adt.valid_start.is_some() || adt.valid_end.is_some() {
-            return false;
-        }
-        adt.variants.first().is_some_and(|v| v.shape == 2)
-    }
-
-    /// Whether `t` may be Copy (None: there is no Copy trait to ask).
-    pub fn is_copy(lcx: &LayoutCx<'_>, tcx: &Tcx, t: TyId) -> Option<bool> {
-        let c = tcx.copy_trait?;
-        Some(tcx.type_implements_trait(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), TraitRef { def_id: c, args: vec![GenericArg::Type(t)] }).may_apply())
-    }
-
     /// Is `t` 4 GiB or larger (its layout saturated)?
     pub fn is_too_big(&self, t: TyId) -> bool {
         let w = self.table().slot(t).load(std::sync::atomic::Ordering::Acquire);
@@ -945,19 +907,6 @@ impl Layouts {
                     for fi in 0..adt.variants[0].fields.len() {
                         fts.push(self.field_ty(lcx, tcx, d, 0, fi as u32, tcx.tys.list(args)));
                     }
-                    // a live-editable struct (M10): its first version's fields, then the hidden
-                    // extension word; the fields edits added live in the extension block
-                    if !adt.is_union && self.live_editable(lcx, tcx, d, &adt, t) {
-                        let n_base = (adt.ext_from as usize).min(fts.len());
-                        let mut l = self.struct_layout(lcx, tcx, &fts[..n_base], repr, Kind::AlwaysSized);
-                        let ext = self.rup(lcx, l.size, pb);
-                        l.align = l.align.max(pb);
-                        l.size = self.rup(lcx, ext + pb, l.align);
-                        l.ext = Some(ext);
-                        l.leaves = None;
-                        l.fields.resize(fts.len(), u32::MAX);
-                        return l;
-                    }
                     if adt.is_union {
                         let mut size = 0;
                         let mut align = 1;
@@ -1043,7 +992,7 @@ impl Layouts {
         let (fl, ls) = self.field_ls(lcx, tcx, fts);
         let u = self.univariant(lcx, &fl, repr, kind);
         let leaves = self.leaves_of(&ls, &u.offsets);
-        Layout { size: u.size, align: u.align, fields: u.offsets, tag: None, enc: TagEnc::Direct, variant_fields: Vec::new(), leaves, niche: u.niche, uninhabited: u.uninhabited, ext: None }
+        Layout { size: u.size, align: u.align, fields: u.offsets, tag: None, enc: TagEnc::Direct, variant_fields: Vec::new(), leaves, niche: u.niche, uninhabited: u.uninhabited }
     }
 
     fn leaves_of(&self, ls: &[&'static Layout], offsets: &[u32]) -> Option<Vec<Leaf>> {
@@ -1205,7 +1154,7 @@ impl Layouts {
             let leaves = self.leaves_of(&vls[v], &u.offsets);
             let mut vfs: Vec<Vec<u32>> = vfl.iter().map(|f| vec![0; f.len()]).collect();
             vfs[v] = u.offsets.clone();
-            return Layout { size: u.size, align: u.align, fields: Vec::new(), tag: None, enc: TagEnc::Single(v as u32), variant_fields: vfs, leaves, niche: u.niche, uninhabited: u.uninhabited, ext: None };
+            return Layout { size: u.size, align: u.align, fields: Vec::new(), tag: None, enc: TagEnc::Single(v as u32), variant_fields: vfs, leaves, niche: u.niche, uninhabited: u.uninhabited };
         }
         let niche_l = if inhibit { None } else { self.niche_filling(lcx, &vfl, &vls, repr) };
         let tagged = self.tagged(lcx, tcx, adt, &vfl, &vls, repr);
@@ -1277,7 +1226,6 @@ impl Layouts {
             leaves,
             niche: reserved.some(),
             uninhabited: us.iter().all(|u| u.uninhabited),
-            ext: None,
         })
     }
 
@@ -1358,7 +1306,6 @@ impl Layouts {
             leaves,
             niche: tag_niche.some(),
             uninhabited: us.iter().all(|u| u.uninhabited),
-            ext: None,
         }
     }
 
@@ -1540,42 +1487,9 @@ pub fn root_crate() -> u32 {
     ROOT_CRATE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// `makepad live`: the crate under test is the program's own crate (live_editable).
+/// `makepad live`: the crate under test is the program's own crate.
 pub fn set_root_crate(c: u32) {
     ROOT_CRATE.store(c, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Crates outside the app scope whose structs this run lays out for live edits (as
-/// their normalized root paths): a layout edit an earlier run of the live session refused only
-/// because its crate was outside the scope (a library's struct the app's work edits) hands the
-/// crate to the next run (MAKEPAD_RUN_LIVE_CRATES), whose edits of it then apply live. Set at the
-/// run's boot, before anything is laid out.
-static LIVE_CRATES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
-pub fn set_live_crates(roots: Vec<String>) {
-    let _k = crate::zone_alloc::kept();
-    let roots = roots.iter().map(|r| crate::vfs::normalize_path(r)).collect();
-    *LIVE_CRATES.lock().unwrap_or_else(|e| e.into_inner()) = roots;
-}
-
-/// The crates set_live_crates named.
-pub fn live_crates() -> Vec<String> {
-    LIVE_CRATES.lock().unwrap_or_else(|e| e.into_inner()).clone()
-}
-
-/// Whether crate `krate`'s structs take live layouts (M10: a struct's hidden extension word): a
-/// live session, not a provided crate's (`rustc_laid`: its values are rustc's bytes), and of the
-/// app scope or set_live_crates. What a crate's code is built for (its cache key holds it:
-/// crate_views).
-pub fn live_laid(prog: &crate::program::Program, krate: u32) -> bool {
-    if !LIVE_SESSION.load(std::sync::atomic::Ordering::Relaxed) || prog.crates[krate as usize].rustc_laid {
-        return false;
-    }
-    if crate::borrowck::event::app_crate(prog, krate) {
-        return true;
-    }
-    let crates = LIVE_CRATES.lock().unwrap_or_else(|e| e.into_inner());
-    !crates.is_empty() && crates.contains(&crate::vfs::normalize_path(prog.crates[krate as usize].root_path()))
 }
 
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
@@ -1583,5 +1497,4 @@ pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     reset(&LIVE_SESSION, std::sync::atomic::AtomicBool::new(false));
     reset(&ROOT_CRATE, std::sync::atomic::AtomicU32::new(0));
-    reset(&LIVE_CRATES, std::sync::Mutex::new(Vec::new()));
 }

@@ -6,8 +6,9 @@
 //! 1. Parse every edited file as a new version (nothing the running program reads changes).
 //! 2. Classify each item against the running version: body edits (class B), const value
 //!    edits (B, with the readers recompiled) and initializer edits of statics not placed yet
-//!    apply, as do supported layout, macro and visibility edits. Eligible named-field structs
-//!    keep existing field slots and add defaulted fields in extension blocks. Unsupported edits
+//!    apply, as do supported layout, macro and visibility edits. Types are laid out as rustc lays
+//!    them: a field renamed applies, a type no running value of is left takes its new layout,
+//!    and an enum's added variant takes a free tag where one passes the check. Unsupported edits
 //!    offer a restart with a reason; the app keeps running until `session relaunch` is requested.
 //!    The landing check also offers a restart when old code remains on a thread's stack.
 //! 3. Freeze: closures of the functions about to be rebuilt that were never compiled are
@@ -26,7 +27,6 @@ use crate::lang_items::LangItem;
 use crate::jit::{self, FnKey, Unit};
 use crate::program::{DefId, DefKind, Program};
 use crate::types::TyId;
-use relax_types::mir::transform::const_check::is_live_default;
 use std::time::Instant;
 use std::sync::atomic::Ordering;
 #[path = "reload_watch.rs"]
@@ -712,8 +712,8 @@ pub(crate) enum Change {
     Body(DefId),
     Const(DefId),
     StaticInit(DefId),
-    /// a named-field struct's field list changed (M10): reconciled with the running layout at
-    /// apply time (layout_edit), or the restart rung
+    /// a named-field struct's field list changed: applied when no field moves (a rename), a new
+    /// layout when no running value of it is left (layout_edit), or the restart rung
     Layout(DefId),
     /// a `macro_rules!` changed: the fns of this file that invoke it are rebuilt from their new
     /// expansions (a macro used from another file takes the restart rung)
@@ -2203,8 +2203,8 @@ fn classify_moving(prog: &crate::program::Program, old_file: u32, new: &crate::p
                     None => why.push(format!("{}: static `{}` has no definition -- restart the app", pos(new, b.lo), name)),
                 }
             }
-            // a named-field struct whose fields changed and nothing else (M10, hotreload.md
-            // section 13): in place when the running layout can take it (decided with the types)
+            // a named-field struct whose fields changed and nothing else: in place when no field
+            // moves, a new layout when no running value is left (decided with the types)
             (ItemKind::MacroRules(_), ItemKind::MacroRules(_)) if attrs_same => {
                 let mut call = new.src[b.name.lo as usize..b.name.hi as usize].to_vec();
                 call.push(b'!');
@@ -2387,11 +2387,11 @@ fn const_code_using(u: &Unit, d: DefId, gone: &[u32], names: &[&[u8]], visible: 
     None
 }
 
-/// The running struct `d` (its fields in slot order) and its new version (`fresh`, fields in
-/// declaration order) reconciled into the struct the running values can be (M10): a field keeps
-/// its slot by name and type (a renamed one by type, when exactly one field went and one came
-/// with that type), an added one goes to the extension block, a removed one whose type needs no
-/// drop stays as a dead slot. Anything else: Err with the reason (restart rung).
+/// The running struct `d` and its new version (`fresh`) in a live session, where every struct is
+/// laid out as rustc lays it: the edit applies in place when no field moves (struct_change) --
+/// the same field types in the same order, a field whose name changed renamed (its old name gone,
+/// its new one new), its value kept. A field added, removed, retyped or moved changes the layout:
+/// Err with the reason (restart rung).
 ///
 /// `new_layout`: a struct no running value of is left (fresh_layout_struct, no_live_values),
 /// which takes its new definition as it is.
@@ -2401,132 +2401,55 @@ fn layout_edit(u: &Unit, d: DefId, fresh: &crate::tcx::AdtT, running_discriminan
     if old.is_enum {
         return enum_edit(u, d, old, fresh, running_discriminants, fresh_discriminants);
     }
-    if new_layout {
-        if fresh.is_enum || fresh.n_generics != 0 || fresh.variants.len() != 1 {
-            return Err(format!("struct `{}`: its generics changed -- restart the app", name));
-        }
-        return Ok((fresh.clone(), vec![format!("struct `{}` takes its new layout: no running value of it is left, and the code using it is rebuilt", name)]));
-    }
-    let t = {
-        let args: Vec<TyId> = (0..old.n_generics).map(|_| u.tcx.tys.unit).collect();
-        u.tcx.tys.intern(crate::types::TyKind::Adt(d, u.tcx.tys.mk_list(&args), crate::types::RegionArgsId::EMPTY))
-    };
-    if !u.lay.live_editable(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, d, old, t) {
-        return Err(struct_layout_refusal(u, d, old, &name));
-    }
-    trace_sub("layout_edit_live_editable");
-    // An outer type that holds the struct by value (`Option<App>` of the platform, anywhere) keeps
-    // working: the struct keeps its first layout (size, alignment, the running fields' offsets and
-    // its niche; added fields go to the extension block), the outer types' drop glue reaches the
-    // rebuilt glue through its slot or the inlined-into closure, and every crate that sees the
-    // edit is checked for users of a removed field. What it cannot take is a niche that goes dead:
-    // removed and retyped fields leave their slot unwritten in values built after the edit, so the
-    // one holding the niche an outer enum reads its tag from must stay (below).
-    if fresh.n_generics != old.n_generics || fresh.variants.len() != 1 {
+    if fresh.is_enum || fresh.n_generics != old.n_generics || fresh.variants.len() != 1 {
         return Err(format!("struct `{}`: its generics changed -- restart the app", name));
     }
-    let dead = |s: &str| s.starts_with("__relax_dead_");
-    let mut fields = old.variants[0].fields.clone();
-    let n_old = fields.len();
-    let mut notes = Vec::new();
-    let new_fields = &fresh.variants[0].fields;
-    let mut taken = vec![false; n_old];
-    let mut placed: Vec<Option<usize>> = vec![None; new_fields.len()];
-    for (j, nf) in new_fields.iter().enumerate() {
-        if let Some(k) = fields.iter().position(|f| f.name == nf.name) {
-            if fields[k].ty != nf.ty {
-                // retyped: the old slot goes dead (below), the field comes again as an added one
-                // with its default in running values
-                notes.push(format!("field `{}` of `{}` changed its type: running values get the new type's default", u.prog.syms.str(nf.name), name));
-                continue;
-            }
-            taken[k] = true;
-            placed[j] = Some(k);
+    if new_layout {
+        return Ok((fresh.clone(), vec![format!("struct `{}` takes its new layout: no running value of it is left, and the code using it is rebuilt", name)]));
+    }
+    if u.prog.crates[u.prog.def(d).krate as usize].rustc_laid {
+        return Err(format!("struct `{name}` is a provided crate's, laid out by rustc into the loader (its values are rustc's bytes): it keeps its first layout -- restart the app"));
+    }
+    if let Some(change) = struct_change(u, old, fresh) {
+        return Err(format!("struct `{name}`: {change}, and the values of `{name}` made before the edit would be read wrong -- restart the app"));
+    }
+    let notes = old.variants[0].fields.iter().zip(&fresh.variants[0].fields).filter(|(o, f)| o.name != f.name)
+        .map(|(o, f)| format!("field `{}` of `{}` renamed to `{}` (value kept)", u.prog.syms.str(o.name), name, u.prog.syms.str(f.name))).collect();
+    Ok((fresh.clone(), notes))
+}
+
+/// What the edit of struct `old` (its new version `fresh`) changes of its layout, as rustc lays it
+/// out from its repr and its field types in order, said for the restart's reason; None: every
+/// field keeps its type and place, a field whose name changed being a rename (its old name gone,
+/// its new one new). (Names of tuple fields are their positions.)
+fn struct_change(u: &Unit, old: &crate::tcx::AdtT, fresh: &crate::tcx::AdtT) -> Option<String> {
+    let repr = |a: &crate::tcx::AdtT| (a.is_union, a.repr_c, a.repr_int, a.repr_align, a.repr_packed, a.valid_start, a.valid_end, a.no_niche, a.flags);
+    if repr(old) != repr(fresh) {
+        return Some("its repr changed".to_string());
+    }
+    let (was, now) = (&old.variants[0].fields, &fresh.variants[0].fields);
+    let named = |n: u32| if n & 0x8000_0000 != 0 { (n & 0x7fff_ffff).to_string() } else { u.prog.syms.str(n).to_string() };
+    if let Some(f) = now.iter().find(|f| !was.iter().any(|o| o.name == f.name)).filter(|_| now.len() > was.len()) {
+        return Some(format!("field `{}` was added", named(f.name)));
+    }
+    if let Some(o) = was.iter().find(|o| !now.iter().any(|f| f.name == o.name)).filter(|_| now.len() < was.len()) {
+        return Some(format!("field `{}` was removed", named(o.name)));
+    }
+    if now.len() != was.len() {
+        return Some("its fields changed".to_string());
+    }
+    for (o, f) in was.iter().zip(now) {
+        if o.ty != f.ty {
+            return Some(match now.iter().find(|x| x.name == o.name) {
+                Some(_) if o.name == f.name => format!("field `{}` changed its type", named(o.name)),
+                _ => format!("field `{}` took the place of `{}` with another type", named(f.name), named(o.name)),
+            });
+        }
+        if o.name != f.name && (now.iter().any(|x| x.name == o.name) || was.iter().any(|x| x.name == f.name)) {
+            return Some(format!("field `{}` moved", named(f.name)));
         }
     }
-    // renames: one field went and one came with the same type
-    let gone: Vec<usize> = (0..n_old).filter(|&k| !taken[k] && !dead(u.prog.syms.str(fields[k].name))).collect();
-    let came: Vec<usize> = (0..new_fields.len()).filter(|&j| placed[j].is_none()).collect();
-    for &j in &came {
-        let same: Vec<usize> = gone.iter().copied().filter(|&k| !taken[k] && fields[k].ty == new_fields[j].ty).collect();
-        let others: Vec<usize> = came.iter().copied().filter(|&x| placed[x].is_none() && new_fields[x].ty == new_fields[j].ty).collect();
-        if same.len() == 1 && others.len() == 1 {
-            let k = same[0];
-            notes.push(format!("field `{}` of `{}` renamed to `{}` (value kept)", u.prog.syms.str(fields[k].name), name, u.prog.syms.str(new_fields[j].name)));
-            fields[k].name = new_fields[j].name;
-            fields[k].is_pub = new_fields[j].is_pub;
-            fields[k].vis_mod = new_fields[j].vis_mod;
-            taken[k] = true;
-            placed[j] = Some(k);
-        }
-    }
-    // removed: a dead slot, when nothing needs dropping in it and it holds no niche
-    let niche = niche_fields(u, d);
-    for k in 0..n_old {
-        if taken[k] || dead(u.prog.syms.str(fields[k].name)) {
-            continue;
-        }
-        if niche.contains(&k) {
-            return Err(format!("struct `{}`: field `{}` was removed or retyped, and it holds the niche an outer type (e.g. `Option<{}>`) may keep its tag in; values built after the edit leave it unset -- restart the app", name, u.prog.syms.str(fields[k].name), name));
-        }
-        // a dead slot that owns memory is dropped with the values built before the edit (their ext
-        // word says they set it; lower.rs ext_drop_fn); values built after it leave it unset.
-        // In the extension block a running value may set it after the edit (its block grows
-        // later): that needs its type's Default (the declared default went with the field)
-        if adt_ext_field(old, k) && u.needs_drop_glue(fields[k].ty) && !u.has_default(fields[k].ty) {
-            return Err(format!("struct `{}`: field `{}` (added live earlier) removed, and its type owns memory without a Default -- restart the app", name, u.prog.syms.str(fields[k].name)));
-        }
-        let hidden = format!("__relax_dead_{}_{}", k, u.prog.syms.str(fields[k].name));
-        if !notes.iter().any(|n| n.contains(&format!("field `{}` of `{}` changed its type", u.prog.syms.str(fields[k].name), name))) {
-            notes.push(format!("field `{}` of `{}` removed (its slot stays unused)", u.prog.syms.str(fields[k].name), name));
-        }
-        fields[k].name = u.prog.syms.intern_late(&hidden);
-    }
-    // added: in the extension block, after the ones earlier edits added; a retyped scalar
-    // takes its old value converted when the widening is lossless
-    let mut adt = old.clone();
-    let fsize = |p: crate::program::Prim| -> u32 { if p == crate::program::Prim::F64 { 8 } else { 4 } };
-    let widens = |from: TyId, to: TyId| -> bool {
-        use crate::types::TyKind::*;
-        match (u.tcx.tys.kind(from), u.tcx.tys.kind(to)) {
-            (Int(a), Int(b)) => {
-                let (sa, ga) = u.tcx.tys.int_info(*a);
-                let (sb, gb) = u.tcx.tys.int_info(*b);
-                (ga == gb && sb >= sa) || (!ga && gb && sb > sa)
-            }
-            (Float(a), Float(b)) => fsize(*a) <= fsize(*b),
-            (Int(a), Float(b)) => u.tcx.tys.int_info(*a).0 < fsize(*b),
-            _ => false,
-        }
-    };
-    for (j, nf) in new_fields.iter().enumerate() {
-        if placed[j].is_none() {
-            // the retyped field's old slot (by its old name, in the base layout)
-            let src = (0..n_old).find(|&k| old.variants[0].fields[k].name == nf.name && (adt.ext_from == u32::MAX || (k as u32) < adt.ext_from));
-            if let Some(k) = src {
-                if widens(old.variants[0].fields[k].ty, nf.ty) {
-                    adt.ext_conv.push((fields.len() as u32, k as u32));
-                    notes.retain(|n| !n.starts_with(&format!("field `{}` of `{}` changed its type", u.prog.syms.str(nf.name), name)));
-                    notes.push(format!("field `{}` of `{}` widened (values kept)", u.prog.syms.str(nf.name), name));
-                    if adt.ext_from == u32::MAX {
-                        adt.ext_from = n_old as u32;
-                    }
-                    fields.push(nf.clone());
-                    continue;
-                }
-            }
-            if !u.has_default(nf.ty) && u.field_default_const(d, nf.name).is_none() {
-                return Err(format!("struct `{}`: field `{}` added, and its type has no Default for the running values -- restart the app", name, u.prog.syms.str(nf.name)));
-            }
-            notes.push(format!("field `{}` added to `{}` (running values get its default)", u.prog.syms.str(nf.name), name));
-            if adt.ext_from == u32::MAX {
-                adt.ext_from = n_old as u32;
-            }
-            fields.push(nf.clone());
-        }
-    }
-    adt.variants[0].fields = fields;
-    Ok((adt, notes))
+    None
 }
 
 /// The crates whose text differs from the text the run booted from: the files of a transaction
@@ -2752,8 +2675,8 @@ fn ty_adts(u: &Unit, t: TyId, out: &mut Vec<DefId>, depth: u32) {
 /// raw or `&mut` borrow of a place reached through the deref of a raw pointer, an assignment to
 /// one, a `&mut self` method called on one: `addr_of_mut!((*p).f)`, `&raw mut (*p).f`,
 /// `&mut *p`, `(*u.as_mut_ptr()).f = x`, `(*p).f.write(x)`, and the `&raw const (*base).f` of
-/// `offset_of!`. Such code makes a value without writing its ext word: the memory keeps what it
-/// held there, a moved-out value's word maybe. The places' types are typeck's. Into `conv`: the
+/// `offset_of!`. Such code reaches the fields at the offsets it was built for, so a value it
+/// made may be kept where no type shows it. The places' types are typeck's. Into `conv`: the
 /// structs whose bytes it reaches as other data, at offsets nothing checks, and those a pointer
 /// handed to inline assembly points at (`converted`).
 fn raw_written(u: &Unit, d: DefId, out: &mut Vec<DefId>, conv: &mut Vec<DefId>) {
@@ -2843,8 +2766,8 @@ fn pointer_like(u: &Unit, t: TyId, ints: bool) -> bool {
 /// made from those: `as *mut u8`, `bytes.as_ptr() as *const T`, `.cast::<U>()`, `.byte_add(n)`,
 /// `.addr()`, `transmute`, a method of one returning a pointer to bytes, a call taking a pointer
 /// of one type and returning one of another (two references to structs are a field accessor's,
-/// not this) -- and the structs an `asm!` operand points at. Code writing there makes a value
-/// whose ext word nothing wrote; which code writes is not followed (a restart is cheap).
+/// not this) -- and the structs an `asm!` operand points at. Code writing there keeps a value
+/// where no type shows it; which code writes is not followed (a restart is cheap).
 fn converted(u: &Unit, body: &relax_types::typeck::Body, pf: &crate::parser::ParsedFile, e: crate::ast::ExprId, out: &mut Vec<DefId>) {
     use crate::ast::ExprKind;
     let ast = &pf.ast;
@@ -2914,19 +2837,6 @@ fn text_converts(text: &[&[u8]]) -> bool {
     text.windows(2).any(|w| w[0] == b"as" && matches!(w[1], b"*" | b"usize" | b"isize" | b"u64" | b"i64" | b"u128"))
         || text.iter().any(|t| matches!(*t, b"cast" | b"cast_mut" | b"cast_const" | b"byte_add" | b"byte_sub" | b"byte_offset" | b"wrapping_byte_add"
             | b"wrapping_byte_sub" | b"wrapping_byte_offset" | b"addr" | b"expose_provenance" | b"transmute" | b"transmute_copy" | b"asm"))
-}
-
-/// Live sessions (M10): the structs whose running layout needs their values' ext word -- fields
-/// in the extension block (a block a stale word would share), or a dead slot to drop (a stale
-/// EXT_BUILT word would drop what the value never set).
-fn structs_needing_ext_word(u: &Unit) -> Vec<DefId> {
-    let mut out: Vec<DefId> = u.tcx.adts.iter().filter(|(_, a)| !a.is_enum && !a.is_union && a.variants.len() == 1 && {
-        let fields = &a.variants[0].fields;
-        (a.ext_from as usize) < fields.len()
-            || fields.iter().enumerate().any(|(k, f)| !adt_ext_field(a, k) && crate::lower::is_dead_field(u, f.name) && u.needs_drop_glue(f.ty))
-    }).map(|(d, _)| *d).collect();
-    out.sort();
-    out
 }
 
 /// Live sessions (M10): whether code can write through a raw pointer, which takes an unsafe
@@ -3113,7 +3023,7 @@ fn parsed_raw_write(prog: &Program, d: DefId) -> bool {
     f.found || (f.saw_unsafe && f.converts)
 }
 
-/// Live sessions (M10): of the structs `need` (structs_needing_ext_word), one whose fields code
+/// Live sessions: of the types `need` (taking their new layout), one whose fields code
 /// writes in place through a raw pointer (raw_written), with that code and whether it reaches
 /// the struct's bytes as other data (its own, or a holder's: Reach). The program is read, not its
 /// compiled code: a builder compiled only after the edit counts. So does `replaced` (the earlier
@@ -3133,14 +3043,7 @@ fn raw_builder(u: &Unit, need: &[DefId], replaced: &[(DefId, DefId, bool)]) -> O
     let mut fields: Vec<&[u8]> = Vec::new();
     for &s in need {
         let Some(adt) = u.tcx.adts.get(&s) else { continue };
-        // a dead slot's field went by its own name (`__relax_dead_<k>_<name>`)
-        fields.extend(adt.variants[0].fields.iter().map(|f| {
-            let n = prog.syms.str(f.name).as_bytes();
-            match n.strip_prefix(b"__relax_dead_") {
-                Some(rest) => rest.iter().position(|c| *c == b'_').map_or(n, |at| &rest[at + 1..]),
-                None => n,
-            }
-        }));
+        fields.extend(adt.variants.iter().flat_map(|v| v.fields.iter().map(|f| prog.syms.str(f.name).as_bytes())));
     }
     let names = through_macros(prog, &visible, &fields);
     let names: Vec<&[u8]> = names.iter().map(|n| n.as_slice()).collect();
@@ -3323,93 +3226,10 @@ fn head_toks(pf: &crate::parser::ParsedFile, lo: u32, hi: u32, sig: bool) -> Vec
     out
 }
 
-fn adt_ext_field(a: &crate::tcx::AdtT, k: usize) -> bool {
-    a.ext_from != u32::MAX && k as u32 >= a.ext_from
-}
-
-/// The fields of struct `d` (running slot order) that hold the niche of one of its compiled
-/// instances: an outer enum (`Option<T>`) may keep its tag there.
-fn niche_fields(u: &Unit, d: DefId) -> Vec<usize> {
-    use crate::types::TyKind;
-    let mut out = Vec::new();
-    for i in 0..u.tcx.tys.len() {
-        let t = TyId(i as u32);
-        let TyKind::Adt(dd, args, _) = u.tcx.tys.kind(t) else { continue };
-        if *dd != d || !u.tcx.tys.is_concrete(t) || u.tcx.tys.has_escaping_bound_vars(t) {
-            continue;
-        }
-        let args = *args;
-        let (fields, niche) = {
-            let l = u.layout_of(t);
-            (l.fields.clone(), l.niche.as_ref().map(|n| (n.off, n.bytes)))
-        };
-        let Some((n_off, n_bytes)) = niche else { continue };
-        for (k, off) in fields.into_iter().enumerate() {
-            if off == u32::MAX || out.contains(&k) {
-                continue;
-            }
-            let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, 0, k as u32, u.tcx.tys.list(args));
-            let size = u.layout_of(ft).size;
-            if off < n_off + n_bytes && n_off < off + size {
-                out.push(k);
-            }
-        }
-    }
-    out
-}
 
 /// Use the same formatter as lower.rs's `type_name` intrinsic. Generic structs publish
 /// each concrete instantiation known to the session, matching the widget registry's keys.
 
-
-/// Crates a layout edit of this run was refused in only because they are outside the app scope
-/// (layout_scope_refusal): the session's next run lays them out for live edits, with this run's
-/// (live_crates_next, MAKEPAD_RUN_LIVE_CRATES).
-static LIVE_CRATES_NEXT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
-/// The crates outside the app scope the session's next run lays out for live edits: this run's
-/// (layout::live_crates) and those a refusal of this run added.
-pub(crate) fn live_crates_next() -> Vec<String> {
-    let mut all = crate::layout::live_crates();
-    for c in LIVE_CRATES_NEXT.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-        if !all.contains(c) {
-            all.push(c.clone());
-        }
-    }
-    all
-}
-
-/// The restart reason of a layout edit of struct `name`, of crate `krate` outside the app scope:
-/// the crate goes to the next run (live_crates_next), whose edits of it apply live.
-fn layout_scope_refusal(u: &Unit, krate: u32, name: &str) -> String {
-    let root = crate::vfs::normalize_path(u.prog.crates[krate as usize].root_path());
-    {
-        let _k = crate::zone_alloc::kept();
-        let mut next = LIVE_CRATES_NEXT.lock().unwrap_or_else(|e| e.into_inner());
-        if !next.contains(&root) {
-            next.push(root);
-        }
-    }
-    format!("struct `{name}` kept its first layout: its crate `{}` is outside the app scope; the restart lays the crate out for live edits, and its next edits apply live -- restart the app",
-        u.prog.syms.str(u.prog.crates[krate as usize].name))
-}
-
-/// Why struct `d` (its running definition `adt`) cannot take a layout edit in place, naming the
-/// condition it fails (Layouts::live_editable): a provided crate's, its form, its crate's scope,
-/// its Copy impl.
-fn struct_layout_refusal(u: &Unit, d: DefId, adt: &crate::tcx::AdtT, name: &str) -> String {
-    let krate = u.prog.def(d).krate;
-    if u.prog.crates[krate as usize].rustc_laid {
-        return format!("struct `{name}` is a provided crate's, laid out as rustc lays it (its values are rustc's bytes): it keeps its first layout -- restart the app");
-    }
-    if !crate::layout::Layouts::struct_form(adt) {
-        return format!("struct `{name}` keeps its first layout in a live session only with named fields and Rust's repr -- restart the app");
-    }
-    if !crate::layout::live_laid(&u.prog, krate) {
-        return layout_scope_refusal(u, krate, name);
-    }
-    format!("struct `{name}` is Copy, and a bitwise copy would share the extension block of added fields: it keeps its first layout -- restart the app")
-}
 
 /// An enum's edit in a live session: the running variants keep their names, fields and order, and
 /// their discriminants keep their order. A variant may be added anywhere, or a discriminant
@@ -3667,7 +3487,7 @@ fn running_change(was: &crate::layout::Layout, now: &crate::layout::Layout, inst
     if was.tag != now.tag {
         return Some("its tag would change".to_string());
     }
-    if was.fields != now.fields || was.ext != now.ext {
+    if was.fields != now.fields {
         return Some("its fields would move".to_string());
     }
     match inst {
@@ -3724,7 +3544,8 @@ fn same_as_rustc(l: &crate::layout::Layout, r: &crate::layout::Layout) -> bool {
 /// Live sessions (M10): whether a value of type `t` can hold a value of one of the ADTs `s`, by
 /// value or behind a pointer, as far as its type shows: through ADT arguments, references,
 /// pointers, arrays, slices, tuples, fn pointers and fn items (their signatures), closures (their
-/// captures and signature), a trait object's arguments, an alias's arguments, and an opaque
+/// captures, signature and owner's generic arguments; a coroutine's saved locals too), a trait
+/// object's arguments, an alias's arguments, and an opaque
 /// type's hidden type (as its defining fn's check found it; one not found counts as holding one).
 /// Trait objects made from one are asked apart (no_live_values: the vtables).
 fn ty_holds(u: &Unit, t: TyId, s: &[DefId], depth: u32) -> bool {
@@ -3740,7 +3561,19 @@ fn ty_holds(u: &Unit, t: TyId, s: &[DefId], depth: u32) -> bool {
         Tuple(v) => any(v),
         FnPtr(ps, r, _, _) => any(ps) || ty_holds(u, r, s, depth + 1),
         FnDef(d, args, _) => any(args) || u.tcx.fn_item_sig(&u.prog, d).is_some_and(|g| g.params.iter().chain([&g.ret]).any(|p| ty_holds(u, *p, s, depth + 1))),
-        Closure(_, _, c) => [c.parent_args, c.closure_sig_as_fn_ptr_ty, c.tupled_upvars_ty].into_iter().any(|x| ty_holds(u, x, s, depth + 1)),
+        // (a closure's `parent_args` is its owner fn as a FnDef: its generic arguments are the
+        // closure's, its signature is not -- an owner returning the closure, `-> impl Fn`, leads
+        // back to it, and the depth cap answered that cycle with a holder)
+        Closure(file, expr, c) => {
+            let owner = match tys.kind(c.parent_args).clone() {
+                FnDef(_, args, _) => any(args),
+                _ => ty_holds(u, c.parent_args, s, depth + 1),
+            };
+            owner || [c.closure_sig_as_fn_ptr_ty, c.tupled_upvars_ty].into_iter().any(|x| ty_holds(u, x, s, depth + 1))
+                // a coroutine also keeps the locals live across its suspension points (an awaited
+                // future's, and so on); not known: counted as holding one
+                || u.tcx.is_coroutine(t) && coroutine_saved(u, file, expr, c.parent_args).map_or(true, |v| v.iter().any(|x| ty_holds(u, *x, s, depth + 1)))
+        }
         Dyn(_, args, bounds, ..) => any(args) || tys.list(bounds).iter().any(|b| ty_holds(u, b.1, s, depth + 1)),
         Alias(_, a) => any(a.args) || match a.kind {
             crate::types::AliasTyKind::Opaque { def_id } => opaque_hidden(u, def_id).map_or(true, |h| ty_holds(u, h, s, depth + 1)),
@@ -3748,6 +3581,20 @@ fn ty_holds(u: &Unit, t: TyId, s: &[DefId], depth: u32) -> bool {
         },
         _ => false,
     }
+}
+
+/// The types of the locals coroutine `(file, expr)` (of the fn `owner`, a FnDef) keeps across its
+/// suspension points -- its witness, rustc's coroutine_hidden_types -- with the owner's arguments
+/// (built on demand). None: not known.
+fn coroutine_saved(u: &Unit, file: u32, expr: u32, owner: TyId) -> Option<Vec<TyId>> {
+    let crate::types::TyKind::FnDef(def, args, regions) = *u.tcx.tys.kind(owner) else { return None };
+    let mut hidden = u.tcx.coroutine_hidden_types.get(&(file, expr));
+    if hidden.is_none() {
+        relax_types::borrowck::driver::ensure_coroutine_witnesses(&u.prog, &u.tcx, def);
+        hidden = u.tcx.coroutine_hidden_types.get(&(file, expr));
+    }
+    let full = u.tcx.complete_args(&u.prog, def, u.tcx.tys.list(args), regions);
+    Some(hidden?.iter().map(|&t| u.tcx.instantiate_ty(&u.prog, def, &full, t)).collect())
 }
 
 /// The hidden type of opaque type `o`, as the check of the fn defining it found it.
@@ -3785,28 +3632,37 @@ fn holding_adts(u: &Unit, d: DefId) -> Vec<DefId> {
     }
 }
 
-/// Live sessions (M10): a struct whose layout can change in place, because no running value of it
-/// is left (no_live_values) and every user of its layout is rebuilt with the edit (fresh_users):
-/// one with the form of a live-editable struct that is Copy (a bitwise copy would share the
-/// extension block, so it cannot keep its first layout), and no generics.
-fn fresh_layout_struct(u: &Unit, d: DefId) -> bool {
+/// Live sessions: a struct whose edit may take rustc's layout of its new text, because no running
+/// value of it is left (no_live_values) and every user of its layout is rebuilt with the edit
+/// (fresh_users): one of the program's own non-generic structs whose fields in the edit's text
+/// are no rename of the running ones (one added, removed, retyped or moved: struct_change).
+fn fresh_layout_struct(u: &Unit, d: DefId, versions: &[(crate::program::FileVersion, Plan)]) -> bool {
     let Some(adt) = u.tcx.adts.get(&d) else { return false };
-    let lcx = crate::layout::LayoutCx::new(&u.prog);
-    if adt.n_generics != 0 || !u.lay.live_editable_form(&lcx, d, adt) {
+    if adt.is_enum || adt.n_generics != 0 || u.prog.crates[u.prog.def(d).krate as usize].rustc_laid {
         return false;
     }
-    let t = u.tcx.tys.intern(crate::types::TyKind::Adt(d, crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
-    crate::layout::Layouts::is_copy(&lcx, &u.tcx, t) == Some(true)
+    for (v, plan) in versions {
+        for &(i, j) in &plan.pairs {
+            if u.prog.item_defs.get(&(v.old, i)) != Some(&d) {
+                continue;
+            }
+            let old_pf = &u.prog.files[v.old as usize];
+            let (was, now) = (struct_fields(old_pf, &old_pf.ast.items[i as usize]), struct_fields(&v.pf, &v.pf.ast.items[j as usize]));
+            return was.len() != now.len() || was.iter().zip(&now).any(|(o, f)| o.1 != f.1 || (o.0 != f.0 && (now.iter().any(|x| x.0 == o.0) || was.iter().any(|x| x.0 == f.0))));
+        }
+    }
+    false
 }
 
 /// Live sessions (M10), for a struct that takes its new layout (fresh_layout_struct; `s`: it and
 /// the ADTs holding it, holding_adts): where a running value of it may be, as the restart's reason.
 /// A static or thread-local the run knows (placed, or with its place reserved) whose type can hold
 /// one; a trait object made from a type that can (its vtable, made this run: the object may be
-/// alive).
+/// alive); a static of a crate that can name it (`visible`) whose value was computed from its
+/// layout (value_reads_layout: it is not evaluated again).
 /// Values behind pointers converted to other types, and frames, are asked apart (raw_builder; the
 /// frames at the install). None: no running value of it is left.
-fn no_live_values(u: &Unit, d: DefId, s: &[DefId]) -> Option<String> {
+fn no_live_values(u: &Unit, d: DefId, s: &[DefId], visible: &[bool]) -> Option<String> {
     let name = def_name(&u.prog, d);
     let held = |t: TyId| ty_holds(u, t, s, 0);
     let mut at: Vec<DefId> = u.statics.keys().chain(u.tls_places.keys()).copied().collect();
@@ -3823,7 +3679,33 @@ fn no_live_values(u: &Unit, d: DefId, s: &[DefId]) -> Option<String> {
     if let Some((src, _)) = u.vtables.snapshot().into_iter().map(|(k, _)| k).find(|(src, _)| held(*src)) {
         return Some(format!("struct `{}` changed its layout, and the running code made trait objects of `{}`, which may hold values of it in the old one -- restart the app", name, crate::typeck::type_name(&u.prog, &u.tcx, src)));
     }
+    // a static is evaluated once: a value computed from the old layout (`size_of`) stays
+    // (in the crates that can name it: `visible`)
+    let mut placed: Vec<DefId> = u.statics.keys().copied().filter(|st| visible[u.prog.def(*st).krate as usize]).collect();
+    placed.sort_unstable_by_key(|s| s.0);
+    if let Some((st, from)) = placed.into_iter().find_map(|st| value_reads_layout(u, st, s).map(|f| (st, f))) {
+        let via = if from == st { String::new() } else { format!(" (through `{}`)", u.prog.def_path(from)) };
+        return Some(format!("struct `{}` changed its layout, and the value of `{}` was computed from the old one{} -- restart the app", name, u.prog.def_path(st), via));
+    }
     None
+}
+
+/// Live sessions (M10): whether the value of constant or static `c` was computed from the layout
+/// of one of the ADTs `s`: its checked body handles a value of one (body_holds: `size_of::<S>()`,
+/// a value built and read) or uses one's fields (`offset_of!`), or a `const fn` its evaluation
+/// ran (its certificate's bodies) does or was instantiated over one. Some: the body that does.
+fn value_reads_layout(u: &Unit, c: DefId, s: &[DefId]) -> Option<DefId> {
+    let reads = |f: DefId| body_holds(u, f, s).is_some() || u.tcx.typeck(&u.prog, f).field_uses.iter().any(|(ud, _)| s.contains(ud));
+    if reads(c) {
+        return Some(c);
+    }
+    let cert = u.const_certs.get(&(c, Vec::new()))?;
+    cert.keys.iter().find_map(|k| match k {
+        FnKey::Inst(f, args) if *f != c && matches!(u.prog.def(*f).kind, DefKind::Fn | DefKind::AssocFn) && def_is_bound(&u.prog, *f) => {
+            (args.iter().any(|a| ty_holds(u, *a, s, 0)) || reads(*f)).then_some(*f)
+        }
+        _ => None,
+    })
 }
 
 /// Live sessions (M10): whether the code of `f` (its signature and its checked body: the types
@@ -4576,8 +4458,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     Ok(plan) if module && (plan.removed.iter().any(|d| u.prog.defs[d.0 as usize].is_pub) || plan.changes.iter().any(|c| matches!(c, Change::Layout(_)))) => {
                         // the host holds typed pointers to a module's pub items (exports): one
                         // removed or re-signatured (remove + add) needs a fresh module, and its
-                        // types have no live layout migration (M10 covers the root crate's
-                        // structs). Private items removed unbind as in a program file.
+                        // types have no live layout migration. Private items removed unbind as in
+                        // a program file.
                         restart.push(format!("{}:1:1: a pub item of the module was removed or changed its signature, or a layout changed -- unload and load the new text", e.path));
                     }
                     Ok(mut plan) => {
@@ -4725,10 +4607,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             }
         }
     }
-    // a struct's field-list edit (M10): a field that went, was renamed or changed its type leaves
-    // its slot (layout_edit), and every fn using it is type-checked and rebuilt with the edit. An
-    // added one, or one that only moved in the declaration, concerns only code that names it
-    // (its text changed)
+    // a struct's field-list edit: every fn using a field that went, was renamed or changed its
+    // type is type-checked and rebuilt with the edit (a rename applies in place; any other change
+    // takes the new layout or restarts: layout_edit). An added one concerns only code that names
+    // it (its text changed)
     let layout_defs: Vec<DefId> = changes.iter().filter_map(|c| if let Change::Layout(d) = c { Some(*d) } else { None }).collect();
     // where each is in the edit's text: a restart its running frames ask for names it, so that
     // hold_back keeps it alone at its running text
@@ -4736,6 +4618,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let mut moved_fields: Vec<(DefId, Vec<u32>)> = Vec::new();
     // the structs that take their new layout (fresh_layout_struct), each with the ADTs holding it
     let mut fresh_structs: Vec<(DefId, Vec<DefId>)> = Vec::new();
+    // the structs whose layout an edit changes while a running value may be left: where
+    let mut held_values: Vec<(DefId, String)> = Vec::new();
     // what the running values (or the numbers and constants code read) cannot take: a restart
     // decided after the commit, where the edit's text is type-checked -- its errors refuse it
     let mut late_restart: Vec<String> = Vec::new();
@@ -4751,18 +4635,20 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             // rebuilt with the edit, as a struct's that takes its new layout
             if fresh_layout_enum(u, d, &versions) {
                 let s = holding_adts(u, d);
-                if no_live_values(u, d, &s).is_none() {
+                if no_live_values(u, d, &s, &visible_crates).is_none() {
                     fresh_structs.push((d, s));
                 }
             }
             continue;
         }
-        if fresh_layout_struct(u, d) {
+        // one whose fields move takes its new layout when no running value of it is left; with one
+        // left, the edit restarts at the commit (layout_edit), naming where it may be
+        if fresh_layout_struct(u, d, &versions) {
             let s = holding_adts(u, d);
-            if let Some(line) = no_live_values(u, d, &s) {
-                late_restart.push(format!("{}{line}", new_pos(u, &versions, d)));
+            match no_live_values(u, d, &s, &visible_crates) {
+                Some(line) => held_values.push((d, line)),
+                None => fresh_structs.push((d, s)),
             }
-            fresh_structs.push((d, s));
         }
         let old_names: Vec<Vec<u8>> = u.tcx.adts.get(&d).map(|a| a.variants[0].fields.iter().map(|f| u.prog.syms.str(f.name).as_bytes().to_vec()).collect()).unwrap_or_default();
         // what the text shows; the commit compares the resolved types (layout_edit), and a field
@@ -4778,7 +4664,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 new_fields.extend(struct_fields(&v.pf, &v.pf.ast.items[j as usize]));
             }
         }
-        let stays = |n: &[u8]| n.starts_with(b"__relax_dead_") || new_fields.iter().any(|(m, t)| *m == n && old_fields.iter().any(|(o, ot)| *o == n && ot == t));
+        let stays = |n: &[u8]| new_fields.iter().any(|(m, t)| *m == n && old_fields.iter().any(|(o, ot)| *o == n && ot == t));
         // a field that left its slot: the fns that use it (resolved field uses on this struct,
         // found by type-checking the fns whose text can reach it), not every fn naming a
         // same-named thing
@@ -4851,7 +4737,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 _ => {}
             }
         }
-        let held = |c: DefId| u.tcx.const_ty(&u.prog, c).map_or(true, |t| ty_holds(u, t, &fresh_held, 0));
+        // (a const whose value was computed from the layout -- `size_of::<S>()` -- is evaluated
+        // again too, as one whose type holds it)
+        let held = |c: DefId| u.tcx.const_ty(&u.prog, c).map_or(true, |t| ty_holds(u, t, &fresh_held, 0)) || value_reads_layout(u, c, &fresh_held).is_some();
         fresh_consts.retain(|&c| held(c));
         for (c, _) in u.consts.keys() {
             if !fresh_consts.contains(c) && visible_crates[u.prog.def(*c).krate as usize] && held(*c) {
@@ -5284,7 +5172,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             for (i, f) in u.fns.iter().enumerate() {
             trace_count("slot_visits", 1);
                 let hit = match &f.key {
-                    FnKey::Glue(k, t) => (*k == crate::jit::GLUE_DROP || *k == crate::jit::GLUE_EXT_DROP) && is_it(*t),
+                    FnKey::Glue(k, t) => *k == crate::jit::GLUE_DROP && is_it(*t),
                     _ => false,
                 };
                 if hit && !slots.contains(&(i as u32)) && !fresh.contains(&(i as u32)) {
@@ -5517,7 +5405,6 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // not apply live (its restart's reason says why): bodies checked against them would report
     // errors the new text does not have
     let mut types_unapplied = false;
-    let mut added_defaults: Vec<(DefId, u32, DefId)> = Vec::new();
     let retry_sources: Vec<_> = if kept.is_some() && retries > 0 {
         versions.iter().map(|(v, _)| (v.old, v.path.clone(), v.pf.src[..v.pf.src_len as usize].to_vec())).collect()
     } else { Vec::new() };
@@ -5741,8 +5628,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             add_errs.extend(e);
         }
         trace_sub("collect_added");
-        // struct field-list edits (M10): reconciled with the running layout, or the restart rung
-
+        // field-list edits: a struct's rename in place, a new layout with no running value left, or
+        // the restart rung; an enum's variants placed (enum_place)
         // the enums that took their new layout (enum_place)
         let mut fresh_enums: Vec<DefId> = Vec::new();
         for &d in &layout_defs {
@@ -5774,7 +5661,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 Ok((mut adt, notes)) => {
                     if let (false, Some(old), Some((_, moved))) = (new_layout, u.tcx.adts.get(&d), moved_fields.iter().find(|m| m.0 == d)) {
                         for (k, (o, n)) in old.variants[0].fields.iter().zip(&adt.variants[0].fields).enumerate() {
-                            if o.name != n.name && !u.prog.syms.str(o.name).starts_with("__relax_dead_") && !moved.contains(&(k as u32)) {
+                            if o.name != n.name && !moved.contains(&(k as u32)) {
                                 layout_restart.push(format!("struct `{}`: field `{}` changed its type though its text did not (what the type names changed), and its readers are not known -- restart the app", def_name(&u.prog, d), u.prog.syms.str(o.name)));
                             }
                         }
@@ -5796,22 +5683,27 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                         u.tcx.insert_ctor_sigs(d, &adt);
                     }
                     if let Some(old) = u.tcx.adts.insert(d, adt) {
-                        if !old.is_enum && !new_layout {
-                            for f in &u.tcx.adts[&d].variants[0].fields {
-                                if old.variants[0].fields.iter().any(|o| o.name == f.name) { continue; }
-                                if let Some(c) = u.field_default_const(d, f.name).filter(|&c| is_live_default(&u.prog, c)) {
-                                    added_defaults.push((d, f.name, c));
-                                }
-                            }
-                        }
                         saved_adts.push((d, old));
                     }
                     out.lines.extend(notes);
                 }
-                Err(r) => {
-                    layout_restart.push(r);
-                    types_unapplied = true;
-                }
+                Err(r) => match held_values.iter().find(|h| h.0 == d) {
+                    // the edit moved its fields and a running value may be left (where, said with
+                    // its position): a restart, the bodies checked against the new definition
+                    // first (their errors refuse the edit, which the restart would stop at); the
+                    // restart undoes the commit
+                    Some(h) => {
+                        let pos = layout_pos.iter().find(|x| x.0 == d).map_or("", |x| x.1.as_str());
+                        layout_restart.push(format!("{pos}{}", h.1));
+                        if let Some(old) = u.tcx.adts.insert(d, fresh_adt) {
+                            saved_adts.push((d, old));
+                        }
+                    }
+                    None => {
+                        layout_restart.push(r);
+                        types_unapplied = true;
+                    }
+                },
             }
         }
         trace_sub("layout_fresh");
@@ -5844,15 +5736,6 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             }
         }
         trace_sub("layout");
-        // a value code builds by raw writes keeps the ext word its memory held (M10): a struct
-        // whose running layout needs that word is built so by no code, running or to be compiled
-        let need = structs_needing_ext_word(u);
-        if !need.is_empty() {
-            if let Some((s, by, conv)) = raw_builder(u, &need, &replaced_raw) {
-                let how = if conv { "reaches its bytes as other data (a pointer cast to another type, an address, inline assembly)" } else { "writes its fields in place through a raw pointer" };
-                layout_restart.push(format!("struct `{}`: `{}` {}, which leaves the hidden word of its live layout as the memory had it, and after this edit its values need that word (fields added live, or a removed field to drop) -- restart the app", u.prog.def_path(s), u.prog.def_path(by), how));
-            }
-        }
         // a struct taking its new layout: a value of it behind a pointer converted to another type
         // (an address kept as a number, bytes) is not seen by its holders' types
         let fresh_defs: Vec<DefId> = fresh_structs.iter().map(|x| x.0).filter(|d| u.prog.def(*d).kind != DefKind::Enum || fresh_enums.contains(d)).collect();
@@ -6274,9 +6157,6 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         trace_count("typecheck_items", uniq.len());
         let mut mir_checked: Vec<DefId> = Vec::new();
         for (d, a) in uniq {
-            // Derive code, not the program's items; whether running values can take a default
-            // is decided by evaluating it below.
-            if is_live_default(&u.prog, d) { continue; }
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::checked_body(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, d, &a)));
             match r {
                 Ok(b) => {
@@ -6340,43 +6220,6 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     if as_restart && !real.is_empty() {
         errs = real.clone();
         as_restart = false;
-    }
-    // The running values cannot take such an initial value: a restart, unless the edit also
-    // has real errors (those alone refuse it).
-    if errs.is_empty() {
-        let mut default_restart = Vec::new();
-        let mut default_errs = Vec::new();
-        for (d, name, c) in added_defaults {
-            // The derive runs the initial value where its `vm` is bound; the const the front makes
-            // of it binds nothing. One that names `vm` is never evaluated here (its build fails), and
-            // any other error in it is the edit's own.
-            let checked = {
-                let u = &*up;
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::checked_body(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, c, &[])))
-            };
-            let names_vm = match &checked {
-                Ok(b) if !b.errors.is_empty() && b.errors.iter().all(|e| e.contains("E0425: cannot find value `vm` in this scope")) => true,
-                Ok(b) if !b.errors.is_empty() => {
-                    default_errs.extend(b.errors.iter().cloned());
-                    continue;
-                }
-                Ok(_) => false,
-                Err(p) => {
-                    default_errs.push(format!("internal compiler error type-checking {} ({}) -- makepad run bug, report it", (&*up).prog.def_path(c), crate::lifeline::panic_line(&*p)));
-                    continue;
-                }
-            };
-            if names_vm || (&*up).const_addr_shared(c, Vec::new()).is_none() {
-                let u = &*up;
-                default_restart.push(format!("struct `{}`: field `{}` added; its `#[rust(..)]` initial value is its derive's code ({}), running values cannot take it -- restart the app", u.prog.def_path(d), u.prog.syms.str(name), if names_vm { "it names the derive's `vm`" } else { "not a constant" }));
-            }
-        }
-        if !default_errs.is_empty() {
-            errs = default_errs;
-        } else if !default_restart.is_empty() {
-            errs = default_restart;
-            as_restart = true;
-        }
     }
     let u = &mut *up;
     trace_stage("typecheck");
@@ -6730,10 +6573,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let u = &mut *up;
     // A layout that changes under the running code: an enum's variants (code built before can
     // meet a variant it does not know, a match falls through, and the discriminants it reads may
-    // have moved) or a struct taking its new layout. A struct edit (M10) otherwise keeps the
-    // running layout -- its first fields stay where they are and added fields live in the
-    // extension block -- so code built before it stays valid for every value and its frames run
-    // on. No program thread may be in code the patch rebuilds (built for the old layout) when it
+    // have moved) or a struct taking its new layout. A struct edit applied otherwise keeps its
+    // layout (a rename: every field where it was), so code built before it stays valid for every
+    // value and its frames run on. No program thread may be in code the patch rebuilds (built for the old layout) when it
     // installs. The threads stand still from here to the install (pause_for_patch), so none enters
     // that code before the patch is in; one in it, or a stack not read to its end, makes the edit a
     // restart: nothing installs, the running code goes on as it was, and the restart is offered.
@@ -7757,7 +7599,7 @@ const LANDING: std::time::Duration = std::time::Duration::from_secs(1);
 /// still there a while later never picks the edit up (a loop in it, or in a caller that inlined
 /// the edited code).
 ///
-/// Code from before a struct's layout changed reads the dead slots, so after such an edit a walk
+/// Code from before a type's layout changed reads the old one, so after such an edit a walk
 /// that ended short (a thread blocked in a libc call whose caller its CFI does not give) is not
 /// enough: the rest of that thread's stack is read for return addresses into the old code. A
 /// stale word there costs a restart; a frame missed would draw wrong data with no word said.
@@ -8006,11 +7848,7 @@ pub(crate) fn next_run_env(state: Option<&[u8]>) -> Result<Vec<(&'static str, Op
         None => None,
     };
     let saved = RESTART_SAVED_MS.load(std::sync::atomic::Ordering::Relaxed).to_string();
-    // the crates the next run lays out for live edits beyond the app scope (live_crates_next), one
-    // root path a line
-    let live = live_crates_next();
-    let live = (!live.is_empty()).then(|| std::ffi::OsString::from(live.join("\n")));
-    Ok(vec![("MAKEPAD_JIT_RECOVERY", recovery), ("MAKEPAD_RUN_RESTORE", restore), ("MAKEPAD_RUN_RESTART_T0", Some(saved.into())), ("MAKEPAD_RUN_LIVE_CRATES", live)])
+    Ok(vec![("MAKEPAD_JIT_RECOVERY", recovery), ("MAKEPAD_RUN_RESTORE", restore), ("MAKEPAD_RUN_RESTART_T0", Some(saved.into()))])
 }
 
 /// A restart that waited out the run's boot (run_end::restart) and hands no state of its own: the
@@ -10930,7 +10768,6 @@ mod commit_tests {
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     host::reset_statics();
-    reset(&LIVE_CRATES_NEXT, std::sync::Mutex::new(Vec::new()));
     reset(&EDITED_CRATES, relax_session::sync::Mutex::new(Vec::new()));
     reset(&INCLUDES_EDITED, relax_session::sync::Mutex::new(Vec::new()));
     reset(&PROGRAM_EDITS, std::sync::atomic::AtomicU64::new(0));

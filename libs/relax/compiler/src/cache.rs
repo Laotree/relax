@@ -732,9 +732,9 @@ pub struct Cache {
     /// per crate: a const edit reached it, so its startup fingerprint no longer vouches for its
     /// keys (`cert_fps`)
     keys_moved_crates: Vec<bool>,
-    /// the crates that can see a struct field list a live edit changed. Values of that struct have
-    /// a layout no new run gives them (dead slots, the extension block), so no key says what such
-    /// code is made for: these crates' slots neither link stored code nor store their own
+    /// the crates that can see a type a live edit changed. Values of it may have a layout no new
+    /// run gives them (an enum's running tags kept), so no key says what such code is made for:
+    /// these crates' slots neither link stored code nor store their own
     layout_edited: Vec<bool>,
     /// (crate, name) -> what the name finds from the crate (deps.rs name_closure)
     name_memo: HashMap<(u32, deps::Name), u128>,
@@ -8955,7 +8955,7 @@ impl Linker {
     fn link_symbol(&mut self, u: &mut Unit, d: &mut D, rw: &mut Vec<Sym>) -> Option<Sym> {
         let tag = d.u8()?;
         let mut s = match tag {
-            // runtime helpers the lowering interns on first use (ext_get / ext_free / divrem128) are interned here the
+            // runtime helpers the lowering interns on first use (divrem128 and the like) are interned here the
             // same way: a warm start links the entry before any lowering has asked for them
             1 => { let n = d.str()?; match u.syms.find_rt(n) { Some(s) => s, None => crate::lower::intern_lazy_rt(u, n)? } }
             2 => {
