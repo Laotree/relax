@@ -180,7 +180,7 @@ h3.h{font-size:clamp(1.35rem,3.6vw,2rem);letter-spacing:-.03em;line-height:1.1;m
 .in .dt i{transform:scaleX(var(--s))}
 .dots{display:flex;flex-wrap:wrap;gap:4px}
 .dots i{width:9px;height:9px;border-radius:3px;background:var(--relax);opacity:.14;transform:scale(.6);transition:opacity .25s,transform .25s var(--ease)}
-.dots i.ok{opacity:1;transform:none}
+.in .dots i{opacity:1;transform:none}
 
 /* versus rows */
 .vs{display:grid;gap:10px 22px;padding:20px 0;border-bottom:1px solid var(--line)}
@@ -438,7 +438,8 @@ noscript p{padding:14px 20px;background:#2a1c08;color:#ffe2a8;text-align:center}
   *,*::before,*::after{animation:none!important;transition:none!important}
   .js .reveal,.js .vs .vs-c,.js .vs .vs-r{opacity:1;transform:none}
   .wire,.rail::after,.caret{display:none}
-  .gover,.stack i,.vs-r::before,.mt i{transform:none!important}
+  .gover,.stack i,.vs-r::before,.mt i,.dots i{transform:none!important}
+  .dots i{opacity:1}
   .brow.ax{position:static}
   .dt i{transform:scaleX(var(--s))!important}
   .step{opacity:1}
@@ -1175,8 +1176,6 @@ DATA.hero.stats.forEach((s, i) => {
     if (r.dots) {
       const d = add(c, "div", "dots"); d.setAttribute("aria-hidden", "true");
       for (let k = 0; k < r.dots; k++) add(d, "i").style.transitionDelay = (300 + k * 16) + "ms";
-      let done = false;
-      onVisible(c, v => { if (v && !done) { done = true; $$("i", d).forEach(x => x.classList.add("ok")); } }, 0.4);
     }
     add(c, "p", "them", "<span class=\"tag c\">rustc + Cargo</span> " + (r.strike === false ? esc(r.rustc) : "<s>" + esc(r.rustc) + "</s>"));
   });
@@ -1385,7 +1384,7 @@ versus($("#vsFeat"), ["rustc + Cargo", "Relax"], DATA.features);
   const cFast = add(call, "div", "card bigcard reveal"), fNum = add(cFast, "strong"), fLab = add(cFast, "span"), fEx = add(cFast, "small");
   const spec = add(add(call, "div", "card bigcard spec reveal"), "dl");
   cFast.style.setProperty("--d", 1);
-  if (B.placeholder) add(spec.parentNode, "span", "badge", esc(T.placeholder)).style.marginTop = "14px";
+  if (B.placeholder) add(spec.parentNode, "em", "badge", esc(T.placeholder)).style.cssText = "margin-top:14px;font-style:normal";
 
   const ax = add(chart, "div", "brow ax"); ax.setAttribute("aria-hidden", "true");
   add(ax, "div", "btrack", T.axis.map(a => "<span>" + esc(a) + "</span>").join(""));
