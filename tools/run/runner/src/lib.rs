@@ -135,6 +135,7 @@ fn plain(p: std::path::PathBuf) -> std::path::PathBuf {
 /// The runner on this process's command line, with `host` added.
 pub fn main(host: &'static Host) {
     set_host(host);
+    relax_compiler::set_tool_name(help::command());
     relax_compiler::wasm_export::startup();
     run(relax_compiler::os::proc::args_bytes())
 }
