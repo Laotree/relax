@@ -89,6 +89,16 @@ fn frame_round_trip_and_limit() {
     assert_eq!((f.chan, f.kind, f.flags, f.payload.as_slice()), (7, kind::DATA, 1, &b"hello"[..]));
     assert_eq!(r.next().unwrap().kind, kind::CLOSE);
     assert!(r.next().is_err());
+    // OPEN carries large JSON arguments without DATA fragmentation.
+    let envelope_bytes = "app\ncall editor.replace_source\n{\"source\":\"\"}".len();
+    for bytes in [100 * 1024, 192 * 1024, crate::frame::MAX_PAYLOAD - envelope_bytes] {
+        let payload = format!("app\ncall editor.replace_source\n{{\"source\":\"{}\"}}", "x".repeat(bytes));
+        let mut buf = Vec::new();
+        write_frame(&mut buf, 11, kind::OPEN, 0, payload.as_bytes()).unwrap();
+        let f = FrameReader::new(Box::new(std::io::Cursor::new(buf))).next().unwrap();
+        assert_eq!((f.chan, f.kind, f.flags), (11, kind::OPEN, 0));
+        assert_eq!(f.payload, payload.as_bytes());
+    }
     // a frame announcing more than 1 MiB is refused
     let mut big = ((MAX_FRAME + 1) as u32).to_le_bytes().to_vec();
     big.extend_from_slice(&[0; 16]);
@@ -102,6 +112,12 @@ fn big_message_is_split_and_reassembled() {
     let ep = Endpoint::new("t");
     ep.register("echo", 1, echo());
     let conn = pair(&ep);
+    let oversized = "x".repeat(crate::frame::MAX_PAYLOAD);
+    let Err((code, reason)) = conn.open("echo", &oversized) else { panic!("oversized OPEN accepted") };
+    assert_eq!(code, crate::conn::CLOSE_REFUSED);
+    assert!(reason.contains(&format!("the encoded call is {} bytes", oversized.len() + "echo\n".len())));
+    assert!(reason.contains(&format!("one call carries {}", crate::frame::MAX_PAYLOAD)));
+    // Refusing OPEN must leave the connection usable for the next call.
     let ch = conn.open("echo", "").unwrap();
     let msg: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
     ch.send(msg.clone()).unwrap();
