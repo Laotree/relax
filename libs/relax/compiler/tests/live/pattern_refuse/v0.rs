@@ -2,9 +2,9 @@
 // a method's match on `Self` sees its enum's new variants.
 //  v1: an arm of an exhaustive match is removed: E0004, refused (the running code is unchanged).
 //  v2: a `let` with a refutable pattern: E0005, refused.
-//  v3: a unit variant appended (an added variant restarts) that `Mode::label`'s match on `Self`
+//  v3: a unit variant appended (it fits the running layout) that `Mode::label`'s match on `Self`
 //      misses: E0004, refused.
-//  v4: its arm added: the added variant alone, a restart.
+//  v4: its arm added: applied.
 #[derive(Clone, Copy)]
 enum Mode {
     A,

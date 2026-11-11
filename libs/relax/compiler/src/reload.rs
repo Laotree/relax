@@ -3411,9 +3411,10 @@ fn struct_layout_refusal(u: &Unit, d: DefId, adt: &crate::tcx::AdtT, name: &str)
     format!("struct `{name}` is Copy, and a bitwise copy would share the extension block of added fields: it keeps its first layout -- restart the app")
 }
 
-/// An enum's edit in a live session: the running variants keep their names, fields and order. An
-/// added variant or a changed discriminant goes in, so that the edit's text is checked against it
-/// (its errors refuse the edit), and restarts the app (enum_restart).
+/// An enum's edit in a live session: the running variants keep their names, fields and order, and
+/// their discriminants keep their order. A variant may be added anywhere, or a discriminant
+/// change; where that goes (its tags, or a restart) is enum_place's, once the edit's text is
+/// checked against it (its errors refuse the edit first).
 fn enum_edit(u: &Unit, d: DefId, old: &crate::tcx::AdtT, fresh: &crate::tcx::AdtT, running_discriminants: &[u128], fresh_discriminants: &[u128]) -> Result<(crate::tcx::AdtT, Vec<String>), String> {
     let name = u.prog.def_path(d);
     if !fresh.is_enum || fresh.n_generics != old.n_generics {
@@ -3433,20 +3434,265 @@ fn enum_edit(u: &Unit, d: DefId, old: &crate::tcx::AdtT, fresh: &crate::tcx::Adt
     if fresh.variants.len() == at.len() && running_discriminants == fresh_discriminants {
         return Ok((old.clone(), Vec::new()));
     }
-    Ok((fresh.clone(), Vec::new()))
+    // a derived `PartialOrd`/`Ord` orders variants by their discriminants: the running ones keep
+    // theirs in the same order (a written-out discriminant can change it in place)
+    if running_discriminants.len() == at.len() && fresh_discriminants.len() == fresh.variants.len() {
+        let ty = fresh.repr_int.unwrap_or(crate::program::Prim::Isize);
+        let bytes = u.tcx.tys.int_info(ty).0;
+        let signed = |v: u128| crate::tcx::Discr { val: v, ty, bytes }.signed_value();
+        let mut by_old: Vec<usize> = (0..at.len()).collect();
+        by_old.sort_by_key(|&i| signed(running_discriminants[i]));
+        if let Some(w) = by_old.windows(2).find(|w| signed(fresh_discriminants[at[w[0]]]) >= signed(fresh_discriminants[at[w[1]]])) {
+            return Err(format!("enum `{}`: the running variants' discriminants change their order (`{}` is no longer below `{}`); values kept in that order (a sorted list, a `BTreeMap`) would be out of it -- restart the app", name, u.prog.syms.str(old.variants[w[0]].name), u.prog.syms.str(old.variants[w[1]].name)));
+        }
+    }
+    let notes = fresh.variants.iter().enumerate().filter(|(j, _)| !at.contains(j)).map(|(_, v)| format!("variant `{}` added to `{}`", u.prog.syms.str(v.name), name)).collect();
+    Ok((fresh.clone(), notes))
 }
 
-/// Why enum `d`'s edit (`old` running, `new` its definition from enum_edit) restarts the app: an
-/// added variant, or a running variant's discriminant changed (None: it applies live). An enum is
-/// laid out as rustc lays it (layout.rs), so its running values hold the discriminants as their
-/// tags, and outer types (`Option<E>`) took values on either side of them as their niches: either
-/// edit can change what those bytes mean.
-fn enum_restart(u: &Unit, d: DefId, old: &crate::tcx::AdtT, new: &crate::tcx::AdtT, running_discriminants: &[u128], fresh_discriminants: &[u128]) -> Option<String> {
-    let name = u.prog.def_path(d);
-    if let Some(v) = new.variants.iter().find(|v| !old.variants.iter().any(|o| o.name == v.name)) {
-        return Some(format!("enum `{}`: variant `{}` was added; the enum is laid out as rustc lays it, and a new variant can change what running values' tags and niches mean -- restart the app", name, u.prog.syms.str(v.name)));
+/// Live sessions: how enum `d`'s edit goes in (`fresh`: its definition from enum_edit;
+/// `running`, `after`: its discriminants before and after the edit). One that keeps every
+/// variant and discriminant goes in as it is. One that adds a variant or changes a discriminant
+/// is tried in up to three placements: (a) as rustc lays the new text out; (b) the running
+/// variants' tags pinned (AdtT::tag_pin) and the added variants' tags just above theirs; (c) the
+/// same, just below them (wrapping). repr(int), repr(C) and generic enums get (a) only: their
+/// tags are their discriminants by contract, or not every instance is laid out to be checked.
+/// A placement is taken when, over every type this process laid out that holds the enum by value
+/// (enum_reach): (i) values made before the edit read the same: each layout is the one they
+/// were made with but for a wider valid range, and the enum's own instances may gain variants,
+/// the running ones keeping their tags and fields; and (ii) each layout has the size,
+/// alignment, offsets and number of spare values rustc gives the new text, so the program's own
+/// `size_of` asserts hold. Err: none is taken; the restart reason names the type (a) changed.
+fn enum_place(u: &mut Unit, d: DefId, old: &crate::tcx::AdtT, fresh: &crate::tcx::AdtT, running: &[u128], after: &[u128]) -> Result<crate::tcx::AdtT, String> {
+    let added = fresh.variants.iter().find(|v| !old.variants.iter().any(|o| o.name == v.name)).map(|v| v.name);
+    if added.is_none() && running == after {
+        return Ok(fresh.clone());
     }
-    (running_discriminants != fresh_discriminants).then(|| format!("enum `{}`: a running variant's discriminant changed; running values hold the old one as their tag -- restart the app", name))
+    let name = u.prog.def_path(d);
+    let change = match added {
+        Some(v) => format!("variant `{}` was added", u.prog.syms.str(v)),
+        None => "a running variant's discriminant changed".to_string(),
+    };
+    let restart = |why: &str| format!("enum `{name}`: {change}, and {why} -- restart the app");
+    if u.prog.crates[u.prog.def(d).krate as usize].rustc_laid {
+        return Err(restart("it is a provided crate's, whose values are rustc's bytes"));
+    }
+    let at = match running_variants_at(old, fresh) {
+        Ok(at) if running.len() == old.variants.len() && after.len() == fresh.variants.len() => at,
+        _ => return Err(restart("the tags its running values hold are not known")),
+    };
+    let old_tags: Vec<u128> = old.tag_pin.as_ref().map_or_else(|| running.to_vec(), |p| p.tags.clone());
+    let reach = enum_reach(u, d);
+    trace_sub("enum_reach");
+    let is_inst: Vec<bool> = reach.iter().map(|(t, _)| matches!(u.tcx.tys.kind(*t), crate::types::TyKind::Adt(a, _, _) if *a == d)).collect();
+    let mut cands = vec![fresh.clone()];
+    let tagged = reach.iter().zip(&is_inst).any(|((_, l), &i)| i && l.enc == crate::layout::TagEnc::Direct);
+    if tagged && !fresh.repr_c && fresh.repr_int.is_none() && fresh.n_generics == 0 {
+        let ptr = u.tcx.tys.ptr_bytes;
+        let (bytes, signed) = match &old.tag_pin {
+            Some(p) => (p.bytes, p.signed),
+            None => {
+                let v: Vec<i128> = running.iter().map(|&x| crate::tcx::Discr { val: x, ty: crate::program::Prim::Isize, bytes: ptr }.signed_value()).collect();
+                crate::layout::discr_int(v.iter().copied().min().unwrap_or(0), v.iter().copied().max().unwrap_or(0), 1)
+            }
+        };
+        for below in [false, true] {
+            if let Some(tags) = pinned_tags(&old_tags, &at, fresh.variants.len(), bytes, signed, below, ptr) {
+                let mut c = fresh.clone();
+                c.tag_pin = Some(crate::tcx::TagPin { bytes, signed, tags });
+                cands.push(c);
+            }
+        }
+    }
+    let running_adt = u.tcx.adts.get(&d).cloned();
+    let mut rustc: Option<Vec<crate::layout::Layout>> = None;
+    let mut why: Option<String> = None;
+    let mut taken = None;
+    for c in cands {
+        let tags_now: Vec<u128> = c.tag_pin.as_ref().map_or_else(|| after.to_vec(), |p| p.tags.clone());
+        u.tcx.adts.insert(d, c.clone());
+        let Some(lays) = probe_layouts(u, &reach) else {
+            why.get_or_insert_with(|| "a type holding it cannot be laid out again to check it (a coroutine's frame or a closure's captures are not known here)".to_string());
+            break;
+        };
+        let changed = reach.iter().zip(&lays).zip(&is_inst).find_map(|(((t, was), now), &inst)| {
+            running_change(was, now, inst.then_some((&at[..], &old_tags[..], &tags_now[..])))
+                .map(|w| format!("the values of `{}` made before the edit would be read wrong: {w}", crate::typeck::type_name(&u.prog, &u.tcx, *t)))
+        });
+        let as_rustc = rustc.as_ref().is_none_or(|r| r.iter().zip(&lays).all(|(r, l)| same_as_rustc(l, r)));
+        match changed {
+            None if as_rustc => {
+                taken = Some(c);
+                break;
+            }
+            Some(w) => {
+                why.get_or_insert(w);
+            }
+            None => {}
+        }
+        if rustc.is_none() {
+            rustc = Some(lays);
+        }
+    }
+    match running_adt {
+        Some(a) => { u.tcx.adts.insert(d, a); }
+        None => { u.tcx.adts.remove(&d); }
+    }
+    trace_sub("enum_place");
+    taken.ok_or_else(|| restart(why.as_deref().unwrap_or("no placement keeps its running values")))
+}
+
+/// The tags of an enum's `n` variants after an in-place edit with the running ones pinned:
+/// running variant `i`, now variant `at[i]`, keeps `old[i]`; the added ones take the values just
+/// above the smallest wrapping range of the running tags at `bytes` (`below`: just below it),
+/// in their order. A tag is kept as the enum's discriminant type (`ptr` bytes) holds it,
+/// sign-extended from `bytes` when `signed`. None: the range leaves too few values.
+fn pinned_tags(old: &[u128], at: &[usize], n: usize, bytes: u32, signed: bool, below: bool, ptr: u32) -> Option<Vec<u128>> {
+    let mask = |b: u32| if b >= 16 { u128::MAX } else { (1u128 << (b * 8)) - 1 };
+    let m = mask(bytes);
+    let (start, end) = crate::layout::tag_range(old, bytes);
+    let free = start.wrapping_sub(end).wrapping_sub(1) & m;
+    let k = n.checked_sub(at.len())? as u128;
+    if k > free {
+        return None;
+    }
+    let held = |t: u128| -> u128 {
+        let v = if signed && bytes < 16 { (((t << (128 - bytes * 8)) as i128) >> (128 - bytes * 8)) as u128 } else { t };
+        v & mask(ptr)
+    };
+    let mut tags: Vec<Option<u128>> = vec![None; n];
+    for (i, &j) in at.iter().enumerate() {
+        *tags.get_mut(j)? = Some(*old.get(i)?);
+    }
+    let mut next = if below { start.wrapping_sub(k) & m } else { end.wrapping_add(1) & m };
+    for t in tags.iter_mut().filter(|t| t.is_none()) {
+        *t = Some(held(next));
+        next = next.wrapping_add(1) & m;
+    }
+    tags.into_iter().collect()
+}
+
+/// Live sessions: every type this process laid out whose values hold a value of enum `d` in
+/// their own bytes (holds_by_value), with the layout values of it were made with
+/// (Layouts::laid_out).
+fn enum_reach(u: &Unit, d: DefId) -> Vec<(TyId, &'static crate::layout::Layout)> {
+    let mut memo = crate::fxhash::HashMap::default();
+    u.lay.laid_out().into_iter().filter(|(t, _)| holds_by_value(u, *t, d, &mut memo, 0)).collect()
+}
+
+/// Whether a value of type `t` holds a value of ADT `d` in its own bytes: `d` itself, or a field
+/// of an ADT, an element of a tuple or array, or a closure's capture that does (by value: what
+/// a pointer points to is not held). `memo`: the answers so far.
+fn holds_by_value(u: &Unit, t: TyId, d: DefId, memo: &mut crate::fxhash::HashMap<TyId, bool>, depth: u32) -> bool {
+    use crate::types::TyKind::*;
+    if let Some(&held) = memo.get(&t) {
+        return held;
+    }
+    if depth > 24 {
+        return true;
+    }
+    let tys = &u.tcx.tys;
+    let held = match tys.kind(t).clone() {
+        Adt(a, args, _) => a == d || {
+            let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
+            let args = tys.list(args).to_vec();
+            let fields: Vec<TyId> = u.tcx.adts.get(&a).map_or(Vec::new(), |adt| adt.variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect());
+            fields.into_iter().any(|f| {
+                let f = tys.subst(f, &args);
+                let f = u.tcx.try_normalize_erasing_regions(&u.prog, env, f).unwrap_or(f);
+                holds_by_value(u, f, d, memo, depth + 1)
+            })
+        },
+        Tuple(v) => tys.list(v).to_vec().into_iter().any(|x| holds_by_value(u, x, d, memo, depth + 1)),
+        Array(x, _) => holds_by_value(u, x, d, memo, depth + 1),
+        Closure(_, _, c) => holds_by_value(u, c.tupled_upvars_ty, d, memo, depth + 1),
+        _ => false,
+    };
+    memo.insert(t, held);
+    held
+}
+
+/// The layouts of `reach`'s types under the definitions the Tcx has now (a placement enum_place
+/// tries), laid out apart from the running ones (Layouts::probe). None: one needs what is not
+/// known there (a coroutine's frame, a closure's environment).
+fn probe_layouts(u: &Unit, reach: &[(TyId, &'static crate::layout::Layout)]) -> Option<Vec<crate::layout::Layout>> {
+    let probe = u.lay.probe();
+    reach.iter().map(|(t, _)| {
+        let lcx = crate::layout::LayoutCx::new(&u.prog);
+        let l = probe.of(&lcx, &u.tcx, *t).clone();
+        let known = lcx.missing.borrow().is_empty();
+        known.then_some(l)
+    }).collect()
+}
+
+/// How a value of a type, made with layout `was`, would be read wrong with layout `now`, or None:
+/// the same bytes mean the same, and its valid range only grew (the types holding it in their
+/// spare values are checked themselves). `inst`: the type is an instance of the edited enum,
+/// with where each running variant is now, the running variants' tags and the tags now: it may
+/// gain variants, the running ones keeping their tags and fields.
+fn running_change(was: &crate::layout::Layout, now: &crate::layout::Layout, inst: Option<(&[usize], &[u128], &[u128])>) -> Option<String> {
+    use crate::layout::TagEnc;
+    if was.size != now.size {
+        return Some(format!("it would change from {} to {} bytes", was.size, now.size));
+    }
+    if was.align != now.align {
+        return Some(format!("its alignment would change from {} to {}", was.align, now.align));
+    }
+    if was.tag != now.tag {
+        return Some("its tag would change".to_string());
+    }
+    if was.fields != now.fields || was.ext != now.ext {
+        return Some("its fields would move".to_string());
+    }
+    match inst {
+        Some((at, old_tags, tags)) => {
+            if was.variant_fields.iter().enumerate().any(|(i, f)| at.get(i).and_then(|&j| now.variant_fields.get(j)) != Some(f)) {
+                return Some("a running variant's fields would move".to_string());
+            }
+            match (was.enc, now.enc) {
+                (TagEnc::Direct, TagEnc::Direct) => {
+                    let m = match was.tag {
+                        Some((_, relax_backend::rir::Mem::Int(n, _))) if n < 16 => (1u128 << (n as u32 * 8)) - 1,
+                        _ => u128::MAX,
+                    };
+                    if (0..at.len()).any(|i| old_tags.get(i).map(|t| t & m) != tags.get(at[i]).map(|t| t & m)) {
+                        return Some("a running variant would get another tag".to_string());
+                    }
+                }
+                (a, b) if a == b && at.iter().enumerate().all(|(i, &j)| i == j) => {}
+                _ => return Some("its variants would be marked otherwise".to_string()),
+            }
+        }
+        None => {
+            if was.variant_fields != now.variant_fields {
+                return Some("a variant's fields would move".to_string());
+            }
+            if was.enc != now.enc {
+                return Some("its variants would sit in other spare values".to_string());
+            }
+        }
+    }
+    if was.leaves != now.leaves || was.uninhabited != now.uninhabited {
+        return Some("it would be passed otherwise".to_string());
+    }
+    let grew = match (was.niche, now.niche) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some(o), Some(n)) => {
+            let m = if n.bytes >= 16 { u128::MAX } else { (1u128 << (n.bytes * 8)) - 1 };
+            let len = n.end.wrapping_sub(n.start) & m;
+            let off = o.start.wrapping_sub(n.start) & m;
+            o.off == n.off && o.bytes == n.bytes && off.checked_add(o.end.wrapping_sub(o.start) & m).is_some_and(|e| e <= len)
+        }
+    };
+    (!grew).then(|| "values it may hold would become spare ones".to_string())
+}
+
+/// Whether `l` lays its type out as rustc does (`r`: the new text with no pinned tags) in all
+/// that code can see: size, alignment, offsets and the number of spare values outer types use.
+fn same_as_rustc(l: &crate::layout::Layout, r: &crate::layout::Layout) -> bool {
+    let spare = |l: &crate::layout::Layout| l.niche.map_or(0, |n| n.available());
+    l.size == r.size && l.align == r.align && l.fields == r.fields && l.variant_fields == r.variant_fields && spare(l) == spare(r)
 }
 
 /// Live sessions (M10): whether a value of type `t` can hold a value of one of the ADTs `s`, by
@@ -5488,7 +5734,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             let edited = layout_edit(u, d, &fresh_adt, before, &after, new_layout);
             trace_sub("layout_edit");
             match edited {
-                Ok((adt, notes)) => {
+                Ok((mut adt, notes)) => {
                     if let (false, Some(old), Some((_, moved))) = (new_layout, u.tcx.adts.get(&d), moved_fields.iter().find(|m| m.0 == d)) {
                         for (k, (o, n)) in old.variants[0].fields.iter().zip(&adt.variants[0].fields).enumerate() {
                             if o.name != n.name && !u.prog.syms.str(o.name).starts_with("__relax_dead_") && !moved.contains(&(k as u32)) {
@@ -5498,9 +5744,11 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     }
                     // (a tuple variant the edit adds: its constructor's signature)
                     if adt.is_enum {
-                        let uu: &Unit = &*u;
-                        if let Some(r) = uu.tcx.adts.get(&d).and_then(|old| enum_restart(uu, d, old, &adt, before, &after)) {
-                            layout_restart.push(r);
+                        if let Some(old) = u.tcx.adts.get(&d).cloned() {
+                            match enum_place(u, d, &old, &adt, before, &after) {
+                                Ok(placed) => adt = placed,
+                                Err(r) => layout_restart.push(r),
+                            }
                         }
                         u.tcx.insert_ctor_sigs(d, &adt);
                     }
@@ -9626,13 +9874,13 @@ mod round32_tests {
         crate::borrowck::lazy::disable_gandalf();
         let (old, new, accept) = match case.as_str() {
             "same" => ("enum E { A = 1, B }", "enum E { A = 1 + 0, B }", true),
-            // the running values hold the old numbers as their tags
-            "changed" => ("enum E { A = 1, B }", "enum E { A = 2, B }", false),
+            // the running values keep their tags (AdtT::tag_pin) and read the new numbers
+            "changed" => ("enum E { A = 1, B }", "enum E { A = 2, B }", true),
             // ... unless the running variants' numbers change their order (a derived `Ord`)
             "order" => ("enum E { A = 1, B = 2 }", "enum E { A = 3, B = 2 }", false),
             "removed" => ("enum E { A = 1, B }", "enum E { A = 1 }", false),
             "reordered" => ("enum E { A = 1, B }", "enum E { B = 1, A }", false),
-            "added" => ("enum E { A = 1, B }", "enum E { A = 1, B, C }", false),
+            "added" => ("enum E { A = 1, B }", "enum E { A = 1, B, C }", true),
             "larger" => ("enum E { A, B }", "enum E { A, B, C([u64; 4]) }", false),
             "named" => ("const N: isize = 1; enum E { A = N, B }", "const N: isize = 2; enum E { A = N, B }", false),
             "executable" => ("const fn d() -> isize { 1 } enum E { A = d(), B }", "const fn d() -> isize { 1 } enum E { A = d() + 1, B }", false),
@@ -9670,7 +9918,7 @@ mod round32_tests {
             "{case}: {:?}; queried values after transaction: {:?}", outcome.lines, values(&unit));
         assert_eq!(unit.stats.ctfe_code, runs, "{case}: the transaction must not run an initializer");
         if accept {
-            assert_eq!(values(&unit), before);
+            assert_eq!(&values(&unit)[..2], if case == "changed" { vec![2, 3] } else { before.clone() });
             unsafe { rollback(up, outcome.undo.unwrap(), "test"); }
         }
         assert_eq!(values(&unit), before, "running values restored");
