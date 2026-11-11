@@ -1,4 +1,5 @@
-// M10: v1 appends a unit variant fitting the enum layout; live A and B persist.
+// v1 appends a unit variant: an enum is laid out as rustc lays it, so the add restarts the app;
+// live A and B persist.
 // v2 removes A while the first static value still holds A and must restart.
 // B stabilises after its first mutation, keeping out=prev valid on rejection.
 

@@ -863,6 +863,9 @@ fn app_scope_live_layout_edits() {
         pub fn init(out: &mut State) { *out = State { value: 41 }; }
         pub fn value(out: &mut State) { out.value += 1; }
         pub fn name(out: &mut &str) { *out = std::any::type_name::<State>(); }
+        pub enum Ease { Linear, Pow(f64), Curve(f32, f32, f32, f32) }
+        pub enum Yoyo { Invert, Ease(Ease) }
+        pub enum Held { Nothing, Has(Yoyo) }
     "#;
     std::fs::write(&path, before).unwrap();
     let mut session = crate::Session::default();
@@ -895,6 +898,7 @@ fn app_scope_live_layout_edits() {
     let init = def("init", lib);
     let value = def("value", lib);
     let name = def("name", lib);
+    let enums = [def("Ease", lib), def("Yoyo", lib), def("Held", lib)];
     let mut roots = vec![bin_path.to_string_lossy().into_owned()];
     if case != "framework" && case != "live_crate" { roots.push(path.to_string_lossy().into_owned()); }
     crate::borrowck::event::set_app_scope(roots);
@@ -907,6 +911,7 @@ fn app_scope_live_layout_edits() {
     tcx.collect(&prog);
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
     let ty = tcx.tys.intern(TyKind::Adt(state, tcx.tys.mk_list(&[]), RegionArgsId::EMPTY));
+    let enums = enums.map(|e| tcx.tys.intern(TyKind::Adt(e, tcx.tys.mk_list(&[]), RegionArgsId::EMPTY)));
     if case.starts_with("bound_template") {
         use crate::consts::GenericArg;
         use crate::types::{AliasTyKind, BoundVar, RegionKind};
@@ -934,6 +939,10 @@ fn app_scope_live_layout_edits() {
     let name = entry(&mut u, name);
     let layout = u.layout_of(ty).clone();
     assert_eq!(layout.ext.is_some(), case != "framework");
+    // an enum is laid out as rustc lays it in a live session too (M84: a tagged layout with no
+    // niche to give made the program's own size assert fail): Yoyo and Held fill Ease's tag niche
+    let sizes = enums.map(|t| u.layout_of(t).size);
+    assert_eq!(sizes, [24, 24, 24], "Ease, Yoyo, Held");
     if case == "derive_default" {
         let after = before.replace("pub value: u64 }", "pub value: u64, #[rust(make(vm))] pub later: u64 }")
             .replace("State { value: 41 }", "State { value: 41, later: 5 }")

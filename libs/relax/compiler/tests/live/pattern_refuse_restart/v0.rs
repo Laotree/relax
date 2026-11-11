@@ -1,7 +1,7 @@
 // The edit's errors refuse it even where it also needs a restart (the restart would stop at them).
-//  v1: a variant whose payload grows the held enum (a restart), which `Mode::label`'s match on
-//      `Self` misses: E0004, refused.
-//  v2: its arm added: the layout change alone, a restart.
+//  v1: a variant added to the held enum (a restart), which `Mode::label`'s match on `Self`
+//      misses: E0004, refused.
+//  v2: its arm added: the added variant alone, a restart.
 //  v3: a field added to the struct a thread-local holds (a restart) and a type error in a body:
 //      refused.
 //  v4: the type error fixed: the field alone, a restart.

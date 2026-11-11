@@ -1,6 +1,6 @@
 #!/bin/bash
-# usage: run.sh <makepad binary>: compiles layout_diff.rs with rustc and runs it under Relax (a plain
-# run); diffs
+# usage: run.sh <makepad binary>: compiles layout_diff.rs with rustc and runs it under Relax, in a plain
+# run and in a live session (a live session lays out the program's own types as well); diffs each
 set -u
 H=$(cd "$(dirname "$0")" && pwd)
 T=$(mktemp -d) || exit 2
@@ -13,7 +13,7 @@ cat > "$T/u/units.json" <<J
 {"version":1,"roots":[0],"units":[{"pkg_id":"path+file://$T#layout_diff@0.0.0","target":{"kind":["bin"],"name":"layout_diff","src_path":"$H/layout_diff.rs","edition":"2021"},"mode":"build","features":[],"dependencies":[]}]}
 J
 fail=0
-for mode in plain; do
+for mode in plain live; do
   flags=(--quiet --units "$T/u/units.json")
   [ "$mode" = plain ] && flags+=(--no-live)
   t0=$SECONDS
