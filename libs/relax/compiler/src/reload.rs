@@ -2627,9 +2627,13 @@ pub(crate) fn gandalf_keeps(prog: &Program, visible: &[bool], d: DefId) -> bool 
 
 /// Whether `d` is still the program's (bound in its module, or in its impl's or bound trait's
 /// item list): an edit that replaced or removed a fn unbinds it, while code in flight keeps its
-/// slots.
+/// slots. An item an edit dropped from a fn body it changed (an inner struct's impl) is left in
+/// the version it came from, and is no longer the program's either.
 fn def_is_bound(prog: &crate::program::Program, d: DefId) -> bool {
     let def = prog.def(d);
+    if !prog.is_current_version(def.file) {
+        return false;
+    }
     let parent = def.parent;
     if parent != crate::program::NO_DEF && prog.def(parent).kind == DefKind::Impl {
         return prog.impls.get(prog.def(parent).sub as usize).map_or(false, |i| i.items.contains(&d));
@@ -4907,8 +4911,13 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         // Removed functions keep their old slots for code in flight. In particular, generated
         // child styles name their own entry: the dependency scan above must not schedule that
         // deleted body against the new namespace (or its retired lazy parse) when a child goes.
-        // (a removed trait's provided methods go with it)
-        body_defs.retain(|d| !versions.iter().any(|(_, plan)| plan.removed.contains(d) || plan.removed.contains(&u.prog.def(*d).parent)));
+        // (a removed trait's provided methods go with it, and so do the items an edit drops from
+        // a fn body it changes -- an inner struct's impl --, which no pair carries into the new
+        // version: def_is_bound once it is committed)
+        body_defs.retain(|d| {
+            let def = u.prog.def(*d);
+            !versions.iter().any(|(v, plan)| plan.removed.contains(d) || plan.removed.contains(&def.parent) || (def.file == v.old && !plan.pairs.iter().any(|&(old, _)| old == def.item.0)))
+        });
         let versioned: Vec<u32> = versions.iter().map(|(v, _)| v.old).collect();
         let mut touch: Vec<u32> = Vec::new();
         let mut moves: Vec<DefId> = Vec::new();
