@@ -1731,10 +1731,11 @@ fn realtime_tier_up_compiles_new_callees_before_its_install() {
 }
 
 /// The reach reads the references of the code a real-time slot runs, not those of another version
-/// of it. An earlier run stored `run`'s O2 code (the generic `twice` inlined); this
-/// run installs other code for it, which calls them (code built before its key's entry was there,
-/// or placed from the startup image). The walk must follow the installed code's calls: the fab arm
-/// lab's loop met lazy compiles of closures that only the code it ran called (11-11).
+/// of it. An earlier run stored `run`'s O2 code (the generic `twice` inlined); this run installs
+/// baseline code for it, which calls `twice` (code built before its key's entry was there, or
+/// placed from a startup image older than the entry). The walk must follow the installed code's
+/// calls: the fab arm lab's loop met lazy compiles of closures that only the code it ran called
+/// (11-11).
 #[test]
 fn realtime_reach_reads_the_installed_code() {
     const CHILD: &str = "MAKEPAD_RUN_RT_INSTALLED_TEST";
@@ -1801,10 +1802,11 @@ fn realtime_reach_reads_the_installed_code() {
         std::mem::forget(u);
         return;
     }
-    // this run: other code for `run`, built without the stored entry; its RIR dropped at the
-    // install, as drop_completed_body drops it
+    // this run: baseline code for `run` (no inlining), built without the stored entry; its RIR
+    // dropped at the install, as drop_completed_body drops it
     let (run_e, callees) = crate::owner::call(crate::owner::Class::Program, || {
         let cache = u.cache.take();
+        u.fns[run as usize].baseline_hint.store(true, Ordering::Relaxed);
         let (code, map, relocs) = unsafe { crate::jit::compile_fn(up, run) }.unwrap();
         u.cache = cache;
         u.install(run, &code, &relocs, map, 0).unwrap();
