@@ -896,13 +896,18 @@ pub fn serving_detail() -> String {
 }
 
 /// The request queue as a JSON object (makepad inspect; atomics only, never the queue's lock):
-/// queued requests, of which foreground (main + app) and main.
+/// queued requests, of which foreground (main + app) and main; and `demand`, 1 while a thread of
+/// the program is inside a demand compile (a first call's lazy compile, from its first request
+/// until it runs the code). A queued request is only part of that wait: once the owner served it,
+/// the thread still waits on its compile until it runs again, and an app whose threads
+/// wait so is not idle (makepad_test's idle rule reads it).
 pub fn queued_note() -> String {
     format!(
-        "{{\"total\":{},\"foreground\":{},\"main\":{}}}",
+        "{{\"total\":{},\"foreground\":{},\"main\":{},\"demand\":{}}}",
         QUEUED_N.load(Ordering::Relaxed),
         FOREGROUND.load(Ordering::Relaxed),
-        MAIN_QUEUED.load(Ordering::Relaxed)
+        MAIN_QUEUED.load(Ordering::Relaxed),
+        u8::from(crate::jit::demand_compile_age().0)
     )
 }
 
