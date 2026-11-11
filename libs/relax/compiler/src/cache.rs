@@ -5107,10 +5107,44 @@ impl Cache {
             return format!("pending {}/{}", cp.len(), fp.len());
         }
         if cl == fl {
-            return "dependency certificate".into();
+            let (cn, fnw) = (c.p, f.p);
+            return match (skip_nounwind_and_cert(&mut c), skip_nounwind_and_cert(&mut f)) {
+                (Some((_, ce)), Some((_, fe))) if cached[cn..ce] != fresh[fnw..fe] => "nounwind answers".into(),
+                _ => "dependency certificate".into(),
+            };
         }
         let fresh_only: Vec<String> = record_inlined(u, id, &[]).into_iter().filter(|&x| self.slot_bytes(u, x).is_some_and(|b| !cl.contains(&b))).map(|x| crate::syms::stable_fn_name(u, x)).collect();
         format!("inlined {}/{}, fresh only {:?}, cached only {}", cl.len(), fl.len(), fresh_only, cl.iter().filter(|b| !fl.contains(b)).count())
+    }
+
+    /// (verify report) how a cached nounwind answer list differs from the fresh build's: the
+    /// answers only one side has and those whose value differs, with the callee's state now
+    fn nounwind_diff(&mut self, u: &Unit, cached: &[u8], facts: &[(u32, bool)]) -> String {
+        let mut d = D { b: cached, p: 0 };
+        let Some(n) = d.u32() else { return "unreadable".into() };
+        let Some(c) = (0..n).map(|_| Some((d.bytes()?.to_vec(), d.u8()? != 0))).collect::<Option<Vec<_>>>() else { return "unreadable".into() };
+        let state = |x: u32| {
+            let f = &u.fns[x as usize];
+            let unv = if f.unverified.load(std::sync::atomic::Ordering::Relaxed) { " unverified" } else { "" };
+            match f.rir.as_ref() {
+                None => format!("no rir{unv}"),
+                Some(r) => format!("{}{}{}{unv}", if r.baseline { "baseline" } else if r.full { "full" } else { "normal" }, if r.plain_calls { " plain-calls" } else { "" }, if r.pending.is_empty() { "" } else { " provisional" }),
+            }
+        };
+        let mut fresh_only = Vec::new();
+        let mut value = Vec::new();
+        let mut keys = Vec::new();
+        for &(x, v) in facts {
+            let Some(k) = self.slot_bytes(u, x) else { continue };
+            match c.iter().find(|e| e.0 == k) {
+                None => fresh_only.push(format!("{}={} [{}]", crate::syms::stable_fn_name(u, x), v, state(x))),
+                Some(e) if e.1 != v => value.push(format!("{}: cached {} fresh {} [{}]", crate::syms::stable_fn_name(u, x), e.1, v, state(x))),
+                _ => {}
+            }
+            keys.push(k);
+        }
+        let cached_only: Vec<String> = c.iter().filter(|e| !keys.contains(&e.0)).map(|e| format!("{}={}", String::from_utf8_lossy(&e.0).chars().filter(|ch| ch.is_ascii_graphic()).take(60).collect::<String>(), e.1)).collect();
+        format!("answers {}/{}; fresh only {:?}; cached only {:?}; value differs {:?}", c.len(), facts.len(), fresh_only, cached_only, value)
     }
 
     fn verify_same_tier(&mut self, u: &Unit, id: u32, cached: &[u8], fresh: &[u8], relocs: &[RelocAt], provisional: bool) -> Option<bool> {
@@ -5125,14 +5159,20 @@ impl Cache {
         let same_nounwind = cached[start..end] == encoded;
         let mut fresh_inputs = E::default();
         let inputs_end = d.p;
-        let same_inputs = same_nounwind && self.encode_inputs(u, id, None, RecKind::First, None, &mut fresh_inputs).is_some() && fresh_inputs.0[..] == cached[inputs_at..inputs_end];
+        let encodable = self.encode_inputs(u, id, None, RecKind::First, None, &mut fresh_inputs).is_some();
+        let same_inputs = same_nounwind && encodable && fresh_inputs.0[..] == cached[inputs_at..inputs_end];
         if provisional && !same_inputs {
             self.stats.verify_provisional += 1;
             self.stats.verify_provisional_cached += 1;
             return None;
         }
-        if !same_nounwind {
-            eprintln!("makepad-run cache: VERIFY nounwind inputs differ: {}", crate::syms::stable_fn_name(u, id));
+        // only the nounwind answers differ (the cached inputs with the fresh answers in their place
+        // are the fresh inputs): its own class. Answers that differ beside other inlined or
+        // pending slots follow from those (another body asks about other calls): the code
+        // comparison below reports the inputs.
+        let only_nounwind = !same_nounwind && encodable && fresh_inputs.0[..] == [&cached[inputs_at..start], &encoded[..], &cached[end..inputs_end]].concat()[..];
+        if only_nounwind {
+            eprintln!("makepad-run cache: VERIFY nounwind inputs differ: {} ({})", crate::syms::stable_fn_name(u, id), self.nounwind_diff(u, &cached[start..end], facts));
             self.stats.verify_diff_inputs += 1;
             return Some(false);
         }

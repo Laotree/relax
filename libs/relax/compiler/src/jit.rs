@@ -13145,9 +13145,16 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     let mut func = func;
     // MAKEPAD_RUN_OPT=-tailfacts: no facts asked (calls in tail position after invokes and frame
     // addresses passed to calls then stay calls)
-    let facts = if relax_backend::stats::opt_off(options, "-tailfacts") { Vec::new() } else { tail_nounwind_facts(up, &func, mode) };
+    // (answers from a callee body that cannot be had complete now: its slot is pending)
+    let unknown = std::cell::RefCell::new(Vec::new());
+    let facts = if relax_backend::stats::opt_off(options, "-tailfacts") { Vec::new() } else { tail_nounwind_facts(up, &func, &unknown) };
     if !facts.is_empty() || !relax_backend::stats::opt_off(options, "-tailfacts") {
-        tail_nocapture_facts(up, id, &mut func, mode, &snap, &facts, cfg.inline);
+        tail_nocapture_facts(up, id, &mut func, mode, &snap, &facts, cfg.inline, &unknown);
+    }
+    let unknown = unknown.into_inner();
+    if !unknown.is_empty() {
+        PROVISIONAL_COUNT[4].fetch_add(1, Ordering::Relaxed);
+        left.extend(unknown);
     }
     nested_ns += cpu_ns() - tn;
     let prep_ns = (cpu_ns() - t0).saturating_sub(nested_ns);
@@ -13189,8 +13196,9 @@ impl Drop for GiveBack {
 /// inline candidates do (the call runs right before this body returns): the answer depends on
 /// the source, not on what happened to be compiled first. Every answer consulted, transitively,
 /// becomes a nounwind input of the body (store_rir notes them, the cache certifies them).
-/// Recursive and unbuildable callees are false, and so is any panic path.
-unsafe fn tail_nounwind_facts(up: *mut Unit, f: &relax_backend::rir::Func, mode: RirMode) -> Vec<(u32, bool)> {
+/// Recursive and unbuildable callees are false, and so is any panic path; a callee whose body
+/// cannot be had complete now is false too, and goes to `unknown` (rir_for_fact).
+unsafe fn tail_nounwind_facts(up: *mut Unit, f: &relax_backend::rir::Func, unknown: &std::cell::RefCell<Vec<u32>>) -> Vec<(u32, bool)> {
     use relax_backend::rir::{Callee, Inst, Term};
     let mut facts = Vec::new();
     for b in &f.blocks {
@@ -13199,7 +13207,7 @@ unsafe fn tail_nounwind_facts(up: *mut Unit, f: &relax_backend::rir::Func, mode:
         if !terminates(f, pad) || !relax_backend::tail::returns_results(f, n as usize, 0, rets) {
             continue;
         }
-        known_nounwind(up, *c, 3, mode, &mut facts);
+        known_nounwind(up, *c, 3, unknown, &mut facts);
     }
     facts.sort_unstable();
     facts
@@ -13210,7 +13218,7 @@ unsafe fn tail_nounwind_facts(up: *mut Unit, f: &relax_backend::rir::Func, mode:
 /// built for the answer as for tail_nounwind_facts, depth-limited) -- a frame address that
 /// reaches no callee but these does not stop the sibling call (LLVM: nocapture from
 /// FunctionAttrs, or the call inlined away). The bodies read are dependencies of this one.
-unsafe fn tail_nocapture_facts(up: *mut Unit, id: u32, func: &mut relax_backend::rir::Func, mode: RirMode, snap: &[(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], nounwind: &[(u32, bool)], inline: bool) {
+unsafe fn tail_nocapture_facts(up: *mut Unit, id: u32, func: &mut relax_backend::rir::Func, mode: RirMode, snap: &[(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], nounwind: &[(u32, bool)], inline: bool, unknown: &std::cell::RefCell<Vec<u32>>) {
     use relax_backend::rir::Callee;
     use relax_backend::tail::Escape;
     // (C ABI bodies only: a chain of `extern "C"` handlers needs its sibling calls for its
@@ -13248,7 +13256,7 @@ unsafe fn tail_nocapture_facts(up: *mut Unit, id: u32, func: &mut relax_backend:
                 continue;
             }
             let r = match &c {
-                Callee::Fn(x) => known_nocapture(up, *x, k, 3, &|c| rir_for_fact(up, c, mode), &mut memo, &mut reads),
+                Callee::Fn(x) => known_nocapture(up, *x, k, 3, &|c| rir_for_fact(up, c, unknown), &mut memo, &mut reads),
                 Callee::Host(s) => host_nocapture(&*up, *s).then_some((false, None)),
                 _ => None,
             };
@@ -13385,35 +13393,53 @@ unsafe fn o3_nocapture_facts(up: *mut Unit, id: u32, asks: &[(u32, u32)]) -> (Ve
     (facts, missing.into_inner())
 }
 
-/// Callee `c`'s RIR for a fact about it, built if it has none yet (as an inline candidate's:
-/// waiting for one in flight, never re-entering one being built on this request). None when it
-/// cannot be had.
-unsafe fn rir_for_fact(up: *mut Unit, c: u32, mode: RirMode) -> Option<std::sync::Arc<relax_backend::rir::Func>> {
+/// Callee `c`'s body for a fact about it: its normal body N(c), the one a caller below O2 inlines
+/// (never a baseline or unverified lowering, nor an O2 build's full body: an answer must not
+/// depend on which of them was built first), built if needed as an inline candidate's is
+/// (waiting for one in flight, never re-entering one being built on this request). None: it has
+/// none (a build error, open on the owner's stack). A normal body that cannot be had now (its
+/// verdict pending: None) or is provisional itself goes to `unknown`: the asking body is
+/// provisional (Func::pending), and completes once the slot is final.
+unsafe fn rir_for_fact(up: *mut Unit, c: u32, unknown: &std::cell::RefCell<Vec<u32>>) -> Option<std::sync::Arc<relax_backend::rir::Func>> {
     if (c as usize) >= (&*up).fns.len() || matches!((&*up).fns[c as usize].key, FnKey::Sandbox(_) | FnKey::Plain(_)) {
         return None;
     }
-    if (&*up).fns[c as usize].rir.is_none() {
-        let e = &(&*up).fns[c as usize];
-        if e.build_err.is_some() {
-            return None;
+    let stale = |e: &FnEntry| e.rir.as_ref().is_none_or(|r| upgradable(r)) || needs_normal(e);
+    let e = &(&*up).fns[c as usize];
+    if e.build_err.is_some() {
+        return None;
+    }
+    if stale(e) && e.inflight {
+        wait_inflight(up, c);
+    }
+    let e = &(&*up).fns[c as usize];
+    if e.rir.is_none() && e.building {
+        // open in an earlier request lower on the owner's stack: this build depends on that timing
+        if !open_here(c) {
+            TAINTED.with(|t| t.set(true));
         }
-        if e.inflight {
-            wait_inflight(up, c);
-        }
-        let e = &(&*up).fns[c as usize];
-        if e.rir.is_none() && e.building {
-            // open in an earlier request lower on the owner's stack: this build depends on that timing
-            if !open_here(c) {
-                TAINTED.with(|t| t.set(true));
-            }
-            return None;
-        }
+        return None;
+    }
+    if stale(e) && !e.building {
         let _w = BuildWhy::enter(2);
-        if e.rir.is_none() && build_rir_mode(up, c, mode).is_err() {
+        if build_rir_mode(up, c, RirMode::Normal).is_err() && (&*up).fns[c as usize].rir.is_none() {
             return None;
         }
     }
-    (&*up).fns[c as usize].rir.clone()
+    let r = inline_body(&(&*up).fns[c as usize]).cloned();
+    match r {
+        Some(r) if !upgradable(&r) => {
+            if !r.pending.is_empty() {
+                unknown.borrow_mut().push(c);
+            }
+            Some(r)
+        }
+        Some(_) => {
+            unknown.borrow_mut().push(c);
+            None
+        }
+        None => None,
+    }
 }
 
 /// Whether unwind pad `b` aborts (rustc's UnwindAction::Terminate: the cannot-unwind guard of a
@@ -13431,7 +13457,7 @@ fn terminates(f: &relax_backend::rir::Func, mut b: u32) -> bool {
     false
 }
 
-unsafe fn known_nounwind(up: *mut Unit, c: u32, depth: u32, mode: RirMode, facts: &mut Vec<(u32, bool)>) -> bool {
+unsafe fn known_nounwind(up: *mut Unit, c: u32, depth: u32, unknown: &std::cell::RefCell<Vec<u32>>, facts: &mut Vec<(u32, bool)>) -> bool {
     use relax_backend::rir::{Callee, Inst, Term};
     if let Some(&(_, v)) = facts.iter().find(|x| x.0 == c) {
         return v;
@@ -13439,7 +13465,7 @@ unsafe fn known_nounwind(up: *mut Unit, c: u32, depth: u32, mode: RirMode, facts
     // asked while its own answer is open (recursion): false
     facts.push((c, false));
     let v = 'v: {
-        let Some(r) = rir_for_fact(up, c, mode) else { break 'v false };
+        let Some(r) = rir_for_fact(up, c, unknown) else { break 'v false };
         let reach = relax_backend::regalloc::reachable(&r);
         let cold = cold_blocks(&*up, &r);
         // first what needs no callee: a Resume, a call that may unwind, any call on a panic path
@@ -13465,7 +13491,7 @@ unsafe fn known_nounwind(up: *mut Unit, c: u32, depth: u32, mode: RirMode, facts
             }
         }
         for x in fns {
-            if !known_nounwind(up, x, depth - 1, mode, facts) {
+            if !known_nounwind(up, x, depth - 1, unknown, facts) {
                 break 'v false;
             }
         }
@@ -13581,7 +13607,8 @@ fn optimize_rir(options: &crate::options::Options, id: u32, prep: Prep) -> Resul
 
 /// A body's pending slots after its inlining (Func::pending): the candidates its preparation left
 /// out for a pending verdict, and the inlined candidates whose own body was provisional (their
-/// completion comes first: complete_provisional).
+/// completion comes first: complete_provisional). (A nounwind answer taken from a provisional
+/// body is recorded with its value: an input of the record as it is.)
 fn note_inlined_pending(func: &mut relax_backend::rir::Func, callees: &[(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], inlined: &[(u32, usize)]) {
     let before = func.pending.len();
     for &(c, _) in inlined {
@@ -13662,7 +13689,6 @@ fn optimize_rir_inner(options: &crate::options::Options, id: u32, prep: Prep) ->
     });
     let mut result = result;
     if let Ok((optimized, inlined)) = &mut result {
-        note_inlined_pending(optimized, &callees, inlined);
         for &(c, v) in &facts {
             match optimized.nounwind_inputs.iter_mut().find(|x| x.0 == c) {
                 Some(x) => x.1 |= v,
@@ -13670,6 +13696,7 @@ fn optimize_rir_inner(options: &crate::options::Options, id: u32, prep: Prep) ->
             }
         }
         optimized.nounwind_inputs.sort_unstable();
+        note_inlined_pending(optimized, &callees, inlined);
     }
     if let (Some(mut input), Ok((optimized, _))) = (capture, &result) {
         input.nounwind_inputs = optimized.nounwind_inputs.clone();
@@ -17843,11 +17870,11 @@ static PROVISIONAL: relax_session::sync::Mutex<Vec<(usize, u32, Vec<u32>)>> = re
 /// (verbose run summary) provisional bodies stored, their completion builds queued, the
 /// provisional bodies replaced by a complete one, and preparations that left out slots whose
 /// fronts a take could not make
-pub static PROVISIONAL_COUNT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+pub static PROVISIONAL_COUNT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 pub(crate) fn provisional_summary() -> String {
     let n = |i: usize| PROVISIONAL_COUNT[i].load(Ordering::Relaxed);
-    format!("{} stored, {} completions queued, {} replaced by complete bodies, {} waiting at exit; {} preparations left out fronts a take could not make", n(0), n(1), n(2), PROVISIONAL.lock().unwrap_or_else(|e| e.into_inner()).len(), n(3))
+    format!("{} stored, {} completions queued, {} replaced by complete bodies, {} waiting at exit; {} preparations left out fronts a take could not make, {} had fact answers from a body not complete", n(0), n(1), n(2), PROVISIONAL.lock().unwrap_or_else(|e| e.into_inner()).len(), n(3), n(4))
 }
 
 /// Slot `m`, a pending slot of a provisional body, is final now: its verdict is in and the body
@@ -29324,7 +29351,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&SPECV_HOLD, std::sync::atomic::AtomicU8::new(u8::MAX));
     reset(&O1V_HELD, relax_session::sync::Mutex::new(Vec::new()));
     reset(&PROVISIONAL, relax_session::sync::Mutex::new(Vec::new()));
-    reset(&PROVISIONAL_COUNT, [const { AtomicU64::new(0) }; 4]);
+    reset(&PROVISIONAL_COUNT, [const { AtomicU64::new(0) }; 5]);
     reset(&SPECV_BORROWS, AtomicU64::new(0));
     reset(&SPECV_BORROWS_OWN, AtomicU64::new(0));
     reset(&TWINS_RAN, AtomicU64::new(0));
