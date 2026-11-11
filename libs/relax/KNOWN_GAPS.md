@@ -40,7 +40,7 @@ with rustc's output. A repro must find the shape that fails: the impl inside a d
 ## 3. One check run spun at full CPU for five minutes (not reproduced)
 
 Seen once (PR #1326) on a serde + `instability` graph: a check spun for five minutes and finished
-in 1.4 s on every repeat. If you see it, attach to the live process (`makepad inspect <pid>
+in 1.4 s on every repeat. If you see it, attach to the live process (`relax inspect <pid>
 why-hung`) before it ends; a stack beats a repeat.
 
 ## 4. Random tier fuzzer: seed 0x166db5d4c1538fe3 disagrees (register allocation)
