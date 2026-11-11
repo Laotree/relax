@@ -1,2 +1,3 @@
-v1 patch|reinst out=file
+# v1: a unit variant appended: enums are laid out as rustc lays them, and an added variant restarts the app
+v1 restart note=was added
 v2 restart out=prev

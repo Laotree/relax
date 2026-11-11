@@ -1,6 +1,6 @@
 // 4.3: enum variant edits while a live value holds a variant.
-//  v1: a variant is inserted before the held one (discriminants move) and describe() gains its arm:
-//      the held value is still C.
+//  v1: a variant inserted before the held one (its payload grows the enum) and describe() gains
+//      its arm: an added variant restarts the app, the held value is still C.
 //  v2: the held variant C is removed and the enum has no #[default]: refused, the value's home is
 //      named, the running code is unchanged.
 use std::cell::RefCell;
