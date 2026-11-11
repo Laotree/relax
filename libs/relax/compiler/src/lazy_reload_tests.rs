@@ -1823,7 +1823,13 @@ fn realtime_reach_reads_the_installed_code() {
         (u.entry(run), callees)
     });
     let called = names(&u, &callees);
-    assert!(called.iter().any(|n| n.contains("twice") || n.contains("closure")), "the installed code calls `twice` or the closure (else this fixture proves nothing): it calls {called:?}");
+    assert!(called.iter().any(|n| n.contains("twice")), "the installed code calls `twice` (else this fixture proves nothing): it calls {called:?}");
+    // the earlier run's entry is what a lookup of `run` links now, and it does not call `twice`
+    let stored = crate::owner::call(crate::owner::Class::Program, || {
+        let linked = unsafe { crate::jit::cache_lookup(up, run) }.is_some();
+        (linked, names(&u, &u.cache.as_ref().unwrap().last_callees))
+    });
+    assert!(stored.0 && !stored.1.iter().any(|n| n.contains("twice")), "the disk cache holds `run`'s O2 entry, which does not call `twice` (else this fixture proves nothing): linked {}, it calls {:?}", stored.0, stored.1);
     let ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![run]) });
     for _ in 0..5000 {
         if crate::jit::__relax_realtime_compiled(ticket) {
