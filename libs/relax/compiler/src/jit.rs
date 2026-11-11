@@ -8923,24 +8923,28 @@ unsafe fn compile_slot_on_stack(up: *mut Unit, id: u32) -> u64 {
     // for the next run's mark).
     if !owner::is_owner() && is_realtime_thread() && !(&*up).fns[id as usize].compiled {
         realtime_live(None);
-        // MAKEPAD_RUN_RT_TRACE: the JIT code that called it (which code version missed it)
+        // the JIT code that called it (which code version missed it, and whether the reach had
+        // walked it): a frame-pointer walk, taken on every miss (the thread stalls for a compile
+        // anyway), so a miss in a run nobody traced still says where the reach has its hole
         let mut frames = [0u64; crate::inspect::heap::DEPTH];
-        let nframes = if rt_trace() { crate::inspect::heap::capture_host(&mut frames) as usize } else { 0 };
+        let nframes = crate::inspect::heap::capture_host(&mut frames) as usize;
         let t = wall_ns();
         let a = compile_slot_on_stack_rt(up, id);
         realtime_reach(up, vec![id], "miss");
-        if nframes > 0 {
-            let upn = up as usize;
-            owner::post(owner::Class::Publish, move || unsafe { realtime_miss_caller(upn as *mut Unit, id, &frames[..nframes]) });
-        }
         let dt = wall_ns() - t;
         crate::postframe::rt_compile(t, dt);
         let n = RT_LAZY.fetch_add(1, Ordering::Relaxed);
         RT_LAZY_NS.fetch_add(dt, Ordering::Relaxed);
-        // the first few and every long stall by name; the total at exit (run.rs summary)
-        if n < 3 || dt >= 1_000_000 {
+        // the first few and every long stall by name, with their caller (MAKEPAD_RUN_RT_TRACE: every
+        // miss's caller); the total at exit (run.rs summary)
+        let named = n < 3 || dt >= 1_000_000;
+        if named {
             let name = (&*up).fns[id as usize].name.clone();
             eprintln!("makepad: real-time thread `{}` stalled {:.2} ms compiling `{}` on its first call (a lazy compile on a real-time thread)", os::thread::name(os::thread::current()), dt as f64 / 1e6, name);
+        }
+        if nframes > 0 && (named || rt_trace()) {
+            let upn = up as usize;
+            owner::post(owner::Class::Publish, move || unsafe { realtime_miss_caller(upn as *mut Unit, id, &frames[..nframes]) });
         }
         return a;
     }
@@ -28591,8 +28595,9 @@ fn call_wake(scope: Option<crate::domain::Callback>, wake: usize) {
     }
 }
 
-/// MAKEPAD_RUN_RT_TRACE: who called slot `id` that a real-time thread compiled lazily: the first JIT
-/// frame of the thread's stack then, its code version and whether it is in the real-time set.
+/// Who called slot `id` that a real-time thread compiled lazily (a named stall, every one under
+/// MAKEPAD_RUN_RT_TRACE): the first JIT frame of the thread's stack then, its code version and
+/// whether it is in the real-time set.
 unsafe fn realtime_miss_caller(up: *mut Unit, id: u32, frames: &[u64]) {
     let u = &*up;
     let caller = frames.iter().map(|r| r.wrapping_sub(1)).find(|pc| u.find_fn(*pc).is_some());
