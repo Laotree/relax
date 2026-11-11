@@ -148,6 +148,10 @@ pub struct FnEntry {
     /// (instrument) the build that stored its RIR (RIR_OWN / RIR_BESIDE / RIR_TIER_UP): the inline
     /// state counter (INLINE_STATE) tells its callers' candidates apart by it
     pub rir_from: u8,
+    /// While `rir` is an O2 build's full body: the slot's normal O1 RIR, the body callers below O2
+    /// inline (inline_body). Kept when the full body replaces it, or built after it (once); read
+    /// only while `rir` is full, so a reset of `rir` needs no reset of it.
+    pub normal_rir: Option<std::sync::Arc<relax_backend::rir::Func>>,
 }
 
 /// SPEC-V: a body's standing with the borrow checker.
@@ -6543,7 +6547,7 @@ impl Unit {
         // Copy explicitly: converting an existing String can keep its old allocation.
         // Clone also copies both Inst's and Shim's owned type arguments.
         let (key, name) = crate::zone_alloc::slots_with(|| (key.clone(), Box::<str>::from(name)));
-        FnEntry { key, name, code: stub_addr, code_len: stub_len, pc_map: PcMap::default(), file, history: None, compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, build_ns: 0, cg_ns: 0, version: 0, inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), unverified: AtomicBool::new(false), d3_lowered: AtomicBool::new(false), ran_before: AtomicBool::new(false), twin_ran: AtomicBool::new(false), patched: AtomicBool::new(false), borrowed: false, rir_from: RIR_OWN, calls: Box::default() }
+        FnEntry { key, name, code: stub_addr, code_len: stub_len, pc_map: PcMap::default(), file, history: None, compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, build_ns: 0, cg_ns: 0, version: 0, inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), unverified: AtomicBool::new(false), d3_lowered: AtomicBool::new(false), ran_before: AtomicBool::new(false), twin_ran: AtomicBool::new(false), patched: AtomicBool::new(false), borrowed: false, rir_from: RIR_OWN, normal_rir: None, calls: Box::default() }
     }
 
     /// Slot `id` has its key: the front's slot keys and its ahead check (before the slot is
@@ -6798,6 +6802,21 @@ impl Unit {
     /// All O1 RIR installations, including sandbox twins, pass through here.
     fn set_rir(&mut self, id: u32, mut func: relax_backend::rir::Func) {
         func.patch_flag = patch_flag(self, id);
+        // a normal body built while the RIR is an O2 build's full body (for callers below O2): kept
+        // beside it, once; the full body stays the RIR
+        if beside_full(self.fns[id as usize].rir.as_deref(), &func) {
+            let f = &mut self.fns[id as usize];
+            if f.normal_rir.is_none() {
+                f.normal_rir = Some(std::sync::Arc::new(func));
+            }
+            return;
+        }
+        // the normal RIR a full body replaces is kept beside it; any other RIR drops what was kept
+        let keep = match self.fns[id as usize].rir.as_ref() {
+            Some(r) if func.full && r.full => self.fns[id as usize].normal_rir.take(),
+            Some(r) if func.full && !upgradable(r) => Some(r.clone()),
+            _ => None,
+        };
         if !self.aux { crate::harness::reach::note(id, func.inl_slots.iter().copied()); }
         if func.cabi.is_some() {
             self.fns[id as usize].entry_ref.store(true, Ordering::Relaxed);
@@ -6876,6 +6895,7 @@ impl Unit {
             if let Some(changed) = &mut self.reload_rir { changed.insert(id); }
         }
         self.fns[id as usize].rir = Some(std::sync::Arc::new(func));
+        self.fns[id as usize].normal_rir = keep;
         if let FnKey::Closure(_, _, parent) = self.fns[id as usize].key {
             drop_completed_body(self, parent);
         }
@@ -10678,6 +10698,23 @@ fn o2_build() -> bool {
     O2_BUILD.try_with(|c| c.get()).unwrap_or(false)
 }
 
+/// The O2 flag for the builds one preparation makes (prepare_rir_from): set while the preparation
+/// is full (an O2 build's root, or a hot candidate of one: their candidates get the same choice),
+/// clear while it is not (its candidates are normal bodies, what it inlines). Restored after.
+struct O2Scope(bool);
+
+impl O2Scope {
+    fn set(full: bool) -> Self {
+        O2Scope(O2_BUILD.try_with(|c| c.replace(full)).unwrap_or(false))
+    }
+}
+
+impl Drop for O2Scope {
+    fn drop(&mut self) {
+        let _ = O2_BUILD.try_with(|c| c.set(self.0));
+    }
+}
+
 thread_local! {
     /// a wasm export's shipping build on this thread (export_rir): normal RIR is built as O1 builds
     /// without O3 (`Func::full`: the whole O1 pipeline, Relax core's helpers inlined everywhere),
@@ -12197,6 +12234,7 @@ fn drop_completed_body(u: &mut Unit, id: u32) {
     let before = crate::memstat::live_total();
     // Inline candidates still have startup readers, including callers not lowered yet.
     // Their source-driven eligibility is exactly the inliner's, not a new size heuristic.
+    if drop_rir { u.fns[id as usize].normal_rir = None; }
     let rir = if drop_rir { u.fns[id as usize].rir.take() } else { None };
     if let Some(r) = rir {
         let bytes = if std::sync::Arc::strong_count(&r) == 1 { crate::memreport::rir_bytes(&r) } else { 0 };
@@ -12372,6 +12410,7 @@ impl SettleSweep {
                         let f = &mut u.fns[id];
                         if f.compiled && !f.inflight && !f.building && !self.pinned.contains(&(id as u32)) {
                             // Arc snapshots remain valid even after the slot drops its ownership.
+                            f.normal_rir = None;
                             if let Some(r) = f.rir.take() {
                                 self.drops.fns += 1;
                                 self.drops.retired_rir.push(r);
@@ -12514,6 +12553,28 @@ fn upgradable(r: &relax_backend::rir::Func) -> bool {
     r.baseline || r.plain_calls || !r.withheld_noalias.is_empty()
 }
 
+/// `f` is a normal body and the slot's RIR `cur` an O2 build's full body: `f` goes beside it
+/// (FnEntry::normal_rir), not over it. (A wasm export's bodies are all full.)
+fn beside_full(cur: Option<&relax_backend::rir::Func>, f: &relax_backend::rir::Func) -> bool {
+    !export_full() && cur.is_some_and(|r| r.full) && !f.full && !upgradable(f)
+}
+
+/// The RIR a caller below O2 inlines for slot `f`: its normal O1 body, never an O2 build's full
+/// one (read only by O2 and O3 builds) -- O1 code is a function of its recorded inputs, not of
+/// which tier-up ran first. None while the slot's RIR is full and no normal body was built yet.
+fn inline_body(f: &FnEntry) -> Option<&std::sync::Arc<relax_backend::rir::Func>> {
+    match &f.rir {
+        Some(r) if r.full && !export_full() => f.normal_rir.as_ref(),
+        r => r.as_ref(),
+    }
+}
+
+/// Slot `f`'s RIR is an O2 build's full body with no normal body beside it: a caller below O2 has
+/// it built (from a fresh lowering, as the slot's first normal build would be).
+fn needs_normal(f: &FnEntry) -> bool {
+    !export_full() && f.rir.as_ref().is_some_and(|r| r.full) && f.normal_rir.is_none()
+}
+
 unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(), String> {
     let normal = mode == RirMode::Normal;
     (&mut *up).check_before_lowering(id);
@@ -12522,18 +12583,22 @@ unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(
         return Ok(());
     }
     let mut lowered = None;
+    // a normal build for callers below O2 while the RIR is an O2 build's full body
+    let fresh = normal && !o2_build() && needs_normal(&(&*up).fns[id as usize]);
     {
         let u = &mut *up;
         if let Some(r) = &u.fns[id as usize].rir {
             let to_o2 = normal && (o2_build() || export_full()) && !r.full;
-            if !normal || !(upgradable(r) || to_o2) || u.fns[id as usize].building || u.fns[id as usize].inflight {
+            if !normal || !(upgradable(r) || to_o2 || fresh) || u.fns[id as usize].building || u.fns[id as usize].inflight {
                 return Ok(());
             }
             // the verdict is clean (checked above). An unverified lowering is lowered again (below)
             // instead of upgraded when it sends calls to unverified-mode twins (SPEC-V: verified code
             // calls the slots themselves) or lacks the run-time disjoint-index checks the verdict
             // asks for (D3); otherwise it is reused (prepare_rir_from gives it its noalias facts back)
-            if r.plain_calls || !u.fns[id as usize].d3_lowered.load(Ordering::Relaxed) && u.disjoint_checks(id).is_some() {
+            if fresh {
+                // the normal body beside a full one: from a fresh lowering (set_rir keeps it beside)
+            } else if r.plain_calls || !u.fns[id as usize].d3_lowered.load(Ordering::Relaxed) && u.disjoint_checks(id).is_some() {
                 u.fns[id as usize].rir = None;
             } else {
                 lowered = Some((**r).clone());
@@ -12549,7 +12614,7 @@ unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(
         (&mut *up).set_rir(id, f);
         return Ok(());
     }
-    if lowered.is_none() && (&*up).fns[id as usize].rir.is_some() {
+    if lowered.is_none() && !fresh && (&*up).fns[id as usize].rir.is_some() {
         return Ok(());
     }
     if let Some(e) = &(&*up).fns[id as usize].build_err {
@@ -12750,6 +12815,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     // O3; its on-demand builds on the program's threads stay O1
     let full = !baseline && (o2_build() && marked_hot(u, id) || export_full());
     func.full = full;
+    let _o2_scope = O2Scope::set(full);
     let mut cfg = u.opt;
     if baseline {
         // baseline code inlines only Relax core's tiniest callees (base_inline_wanted); user
@@ -12895,7 +12961,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             // function of the source alone: the disk cache's keys and O3's inputs assume it)
             // (also an upgrade deferred by another split compile: its normal RIR, not the baseline RIR
             // it has until that finish)
-            if want && u.fns[*c as usize].rir.as_ref().map_or(true, |r| !baseline && upgradable(r)) && u.fns[*c as usize].inflight && u.fns[*c as usize].build_err.is_none() {
+            if want && u.fns[*c as usize].rir.as_ref().map_or(true, |r| !baseline && (upgradable(r) || !full && needs_normal(&u.fns[*c as usize]))) && u.fns[*c as usize].inflight && u.fns[*c as usize].build_err.is_none() {
                 wait_inflight(up, *c);
             }
             let u = &mut *up;
@@ -12921,8 +12987,9 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                     let _ = collect_fronts(&mut needs, || build_rir_mode(up, *c, RirMode::Baseline));
                 } else if defer {
                     // only the callee's front end now (a baseline caller's: as baseline, its frozen
-                    // tier); its optimisation runs with the caller's back end, off the lock
-                    let Some(r) = collect_fronts(&mut needs, || split_front_as(up, *c, if baseline { RirMode::Baseline } else { RirMode::Tier0 })) else { continue };
+                    // tier; any other caller's: as normal RIR, never a start tier's raw body); its
+                    // optimisation runs with the caller's back end, off the lock
+                    let Some(r) = collect_fronts(&mut needs, || split_front_as(up, *c, if baseline { RirMode::Baseline } else { RirMode::Normal })) else { continue };
                     if matches!(&r, Err(e) if e == YIELDED) {
                         return Err(YIELDED.to_string());
                     }
@@ -12940,7 +13007,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                         if attrs.is_none() && sig_dir().is_some() && inline_cycle(u, id, *c) {
                             skipped.push((*c, "cycle"));
                         }
-                        if attrs.is_some() { inline_state(tier, INLINE_BUILT_HERE); }
+                        if attrs.is_some() { inline_state(tier, if p.func.baseline { 0 } else { INLINE_BUILT_HERE }); }
                         deferred.push((*c, attrs, p));
                     }
                 } else {
@@ -12949,12 +13016,15 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                 }
                 nested_ns += cpu_ns() - tn;
             }
-            if want && !baseline && (&*up).fns[*c as usize].rir.as_ref().is_some_and(|r| upgradable(r)) {
+            // (a caller below O2 whose callee's RIR is an O2 build's full body: the callee's normal
+            // body, built from a fresh lowering and kept beside the full one)
+            let fresh = !baseline && !full && needs_normal(&(&*up).fns[*c as usize]);
+            if want && !baseline && ((&*up).fns[*c as usize].rir.as_ref().is_some_and(|r| upgradable(r)) || fresh) {
                 let tn = cpu_ns();
                 if defer {
                     // the upgrade's preparation now, its optimisation with the caller's back end
                     // (off the owner); its RIR replaces the baseline RIR at the finish
-                    if let Some(Some(p)) = collect_fronts(&mut needs, || split_upgrade(up, *c)) {
+                    if let Some(Some(p)) = collect_fronts(&mut needs, || if fresh { split_normal(up, *c) } else { split_upgrade(up, *c) }) {
                         let u = &*up;
                         let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false).ok() };
                         if attrs.is_some() { inline_state(tier, INLINE_BUILT_HERE); }
@@ -12988,8 +13058,17 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                 }
                 continue;
             }
-            if let Some(r) = &u.fns[c as usize].rir {
-                inline_state(tier, rir_state(&u.fns[c as usize], r));
+            // a caller below O2 inlines the callee's normal body; an O2 build (full) the RIR as it is
+            let f = &u.fns[c as usize];
+            let body = if full || baseline { f.rir.as_ref() } else { inline_body(f) };
+            if body.is_none() && f.rir.is_some() {
+                // its normal body is being built elsewhere: left out, and this request's builds
+                // are not kept (they depend on that timing)
+                inline_state(tier, INLINE_OPEN);
+                TAINTED.with(|t| t.set(true));
+            }
+            if let Some(r) = body {
+                inline_state(tier, if f.rir.as_ref().is_some_and(|x| !std::sync::Arc::ptr_eq(x, r)) { INLINE_BESIDE_FULL } else { rir_state(f, r) });
                 snap.push((c, r.clone(), attrs));
             }
         }
@@ -13583,10 +13662,12 @@ pub(crate) const RIR_TIER_UP: u8 = 2;
 /// by the state of the callee RIR it took (INLINE_STATE_NAMES), and the candidates it left out
 /// because their borrow-check verdict was pending: what a caller's O1 RIR depended on besides the
 /// source. Verbose summary.
-pub static INLINE_STATE: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
-const INLINE_STATE_NAMES: [&str; 8] = ["raw lowering", "unverified lowering", "O2", "own build", "built beside an O1 build", "built by a tier-up", "built for this caller", "left out (verdict pending)"];
+pub static INLINE_STATE: [AtomicU64; 30] = [const { AtomicU64::new(0) }; 30];
+const INLINE_STATE_NAMES: [&str; 10] = ["raw lowering", "unverified lowering", "O2", "own build", "built beside an O1 build", "built by a tier-up", "built for this caller", "left out (verdict pending)", "normal beside an O2 body", "left out (normal body open)"];
 const INLINE_BUILT_HERE: usize = 6;
 const INLINE_LEFT_OUT: usize = 7;
+const INLINE_BESIDE_FULL: usize = 8;
+const INLINE_OPEN: usize = 9;
 
 fn inline_state(caller: usize, state: usize) {
     INLINE_STATE[caller * INLINE_STATE_NAMES.len() + state].fetch_add(1, Ordering::Relaxed);
@@ -13632,9 +13713,19 @@ unsafe fn store_rir(up: *mut Unit, id: u32, func: relax_backend::rir::Func, inli
     }
     u.stats.opt_ns += opt_ns;
     u.stats.rir_insts += relax_codegen::opt::inst_count(&func) as u64;
+    let beside = beside_full(u.fns[id as usize].rir.as_deref(), &func);
+    let tainted = TAINTED.with(|t| t.get());
+    if beside {
+        // a normal body for callers below O2, kept beside the full one -- not when this request's
+        // builds depend on timing
+        if !tainted {
+            u.set_rir(id, func);
+        }
+        return;
+    }
     u.set_rir(id, func);
     u.fns[id as usize].rir_from = from;
-    if TAINTED.with(|t| t.get()) {
+    if tainted {
         TAINT_BUILT.with(|b| b.borrow_mut().push((up as usize, id)));
     }
 }
@@ -22615,6 +22706,7 @@ fn expire_spec_now(now: u64, ttl: u64) -> ExpiredSpec {
             f.spec_state = 3;
             n += 1;
             if f.history().inlined_into.is_empty() {
+                f.normal_rir = None;
                 if let Some(r) = f.rir.take() {
                     bytes += relax_codegen::opt::inst_count(&r) as u64 * 80;
                     out.rir.push(r);
@@ -23621,10 +23713,38 @@ unsafe fn split_upgrade(up: *mut Unit, id: u32) -> Option<Prep> {
     }
 }
 
+/// split_upgrade's counterpart for a slot whose RIR is an O2 build's full body: the preparation of its
+/// normal body from a fresh lowering (needs_normal), kept beside the full body at the finish.
+unsafe fn split_normal(up: *mut Unit, id: u32) -> Option<Prep> {
+    (&mut *up).check_before_lowering(id);
+    if !(&*up).refresh_verified(id) {
+        return None;
+    }
+    let f = &(&*up).fns[id as usize];
+    if !needs_normal(f) || f.building || f.inflight || f.build_err.is_some() || matches!(f.key, FnKey::Sandbox(_)) {
+        return None;
+    }
+    begin_build(up, id).ok()?;
+    let depth0 = BUILD_STACK.try_with(|s| s.borrow().len()).unwrap_or(0);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare_rir_from(up, id, true, None, RirMode::Normal)));
+    if r.is_err() {
+        let open: Vec<u32> = BUILD_STACK.try_with(|s| s.borrow()[depth0.min(s.borrow().len())..].to_vec()).unwrap_or_default();
+        for x in open.into_iter().rev() {
+            end_build(up, x);
+        }
+    }
+    end_build(up, id);
+    match r {
+        Ok(Ok((p, _))) => Some(p),
+        Ok(Err(_)) => None,
+        Err(p) => std::panic::resume_unwind(p),
+    }
+}
+
 /// A deferred build's RIR `f` for a slot that has RIR `cur` already: stored only as the upgrade
 /// of baseline / unverified RIR to normal RIR (split_upgrade).
 fn upgrade_replaces(cur: &relax_backend::rir::Func, f: &relax_backend::rir::Func) -> bool {
-    upgradable(cur) && !upgradable(f)
+    upgradable(cur) && !upgradable(f) || beside_full(Some(cur), f)
 }
 
 unsafe fn split_front(up: *mut Unit, id: u32) -> Result<Front, String> {
@@ -29056,7 +29176,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&TIER1_SNAP_FRONTS, [AtomicU64::new(0), AtomicU64::new(0)]);
     reset(&TIER1_SNAP_OFF, [AtomicU64::new(0), AtomicU64::new(0)]);
     reset(&CAND_SKIP, [const { AtomicU64::new(0) }; 27]);
-    reset(&INLINE_STATE, [const { AtomicU64::new(0) }; 24]);
+    reset(&INLINE_STATE, [const { AtomicU64::new(0) }; 30]);
     reset(&O3_INSTALL_REC, [AtomicU64::new(0), AtomicU64::new(0)]);
     reset(&O3_OWNER, [const { AtomicU64::new(0) }; 24]);
     reset(&SPEC_BUILT, relax_session::sync::Mutex::new(Vec::new()));
