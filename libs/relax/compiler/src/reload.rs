@@ -3462,11 +3462,13 @@ fn enum_edit(u: &Unit, d: DefId, old: &crate::tcx::AdtT, fresh: &crate::tcx::Adt
 /// were made with but for a wider valid range, and the enum's own instances may gain variants,
 /// the running ones keeping their tags and fields; and (ii) each layout has the size,
 /// alignment, offsets and number of spare values rustc gives the new text, so the program's own
-/// `size_of` asserts hold. Err: none is taken; the restart reason names the type (a) changed.
-fn enum_place(u: &mut Unit, d: DefId, old: &crate::tcx::AdtT, fresh: &crate::tcx::AdtT, running: &[u128], after: &[u128]) -> Result<crate::tcx::AdtT, String> {
+/// `size_of` asserts hold. None taken: an enum no running value of is left (`new_layout`:
+/// fresh_layout_enum, no_live_values) takes (a), with a note, and its users are rebuilt;
+/// otherwise Err, the restart reason naming the type (a) changed.
+fn enum_place(u: &mut Unit, d: DefId, old: &crate::tcx::AdtT, fresh: &crate::tcx::AdtT, running: &[u128], after: &[u128], new_layout: bool) -> Result<(crate::tcx::AdtT, Option<String>), String> {
     let added = fresh.variants.iter().find(|v| !old.variants.iter().any(|o| o.name == v.name)).map(|v| v.name);
     if added.is_none() && running == after {
-        return Ok(fresh.clone());
+        return Ok((fresh.clone(), None));
     }
     let name = u.prog.def_path(d);
     let change = match added {
@@ -3539,7 +3541,31 @@ fn enum_place(u: &mut Unit, d: DefId, old: &crate::tcx::AdtT, fresh: &crate::tcx
         None => { u.tcx.adts.remove(&d); }
     }
     trace_sub("enum_place");
-    taken.ok_or_else(|| restart(why.as_deref().unwrap_or("no placement keeps its running values")))
+    match taken {
+        Some(c) => Ok((c, None)),
+        None if new_layout => Ok((fresh.clone(), Some(format!("enum `{name}` takes its new layout ({change}): no running value of it is left, and the code using it is rebuilt")))),
+        None => Err(restart(why.as_deref().unwrap_or("no placement keeps its running values"))),
+    }
+}
+
+/// Live sessions: an enum whose edit may take rustc's layout of its new text when no running
+/// value of it is left (enum_place): one of the program's own non-generic enums whose variant
+/// list changed in the edit's text (names, order, or a discriminant written out).
+fn fresh_layout_enum(u: &Unit, d: DefId, versions: &[(crate::program::FileVersion, Plan)]) -> bool {
+    let Some(adt) = u.tcx.adts.get(&d) else { return false };
+    if adt.n_generics != 0 || u.prog.crates[u.prog.def(d).krate as usize].rustc_laid {
+        return false;
+    }
+    let mut new = None;
+    for (v, plan) in versions {
+        for &(i, j) in &plan.pairs {
+            if u.prog.item_defs.get(&(v.old, i)) == Some(&d) {
+                new = enum_variant_names(&v.pf, &v.pf.ast.items[j as usize]);
+            }
+        }
+    }
+    let Some(new) = new else { return false };
+    new.len() != adt.variants.len() || new.iter().zip(&adt.variants).any(|((n, written), v)| *n != u.prog.syms.str(v.name).as_bytes() || *written || matches!(v.discr, crate::tcx::VariantDiscr::Explicit(_)))
 }
 
 /// The tags of an enum's `n` variants after an in-place edit with the running ones pinned:
@@ -4720,6 +4746,15 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             if let Some(line) = enum_numbers_read(u, d, &versions, &visible_crates) {
                 late_restart.push(line);
             }
+            // one no running value of is left may take rustc's layout of its new text where the
+            // running layout cannot take the edit (enum_place): its users are type-checked and
+            // rebuilt with the edit, as a struct's that takes its new layout
+            if fresh_layout_enum(u, d, &versions) {
+                let s = holding_adts(u, d);
+                if no_live_values(u, d, &s).is_none() {
+                    fresh_structs.push((d, s));
+                }
+            }
             continue;
         }
         if fresh_layout_struct(u, d) {
@@ -5708,6 +5743,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         trace_sub("collect_added");
         // struct field-list edits (M10): reconciled with the running layout, or the restart rung
 
+        // the enums that took their new layout (enum_place)
+        let mut fresh_enums: Vec<DefId> = Vec::new();
         for &d in &layout_defs {
             let (fresh_adt, perrs) = u.tcx.adt_fresh(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, d);
             trace_sub("layout_adt_fresh");
@@ -5745,8 +5782,14 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     // (a tuple variant the edit adds: its constructor's signature)
                     if adt.is_enum {
                         if let Some(old) = u.tcx.adts.get(&d).cloned() {
-                            match enum_place(u, d, &old, &adt, before, &after) {
-                                Ok(placed) => adt = placed,
+                            match enum_place(u, d, &old, &adt, before, &after, new_layout) {
+                                Ok((placed, note)) => {
+                                    adt = placed;
+                                    if let Some(note) = note {
+                                        fresh_enums.push(d);
+                                        out.lines.push(note);
+                                    }
+                                }
                                 Err(r) => layout_restart.push(r),
                             }
                         }
@@ -5812,11 +5855,12 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
         // a struct taking its new layout: a value of it behind a pointer converted to another type
         // (an address kept as a number, bytes) is not seen by its holders' types
-        let fresh_defs: Vec<DefId> = fresh_structs.iter().map(|x| x.0).collect();
+        let fresh_defs: Vec<DefId> = fresh_structs.iter().map(|x| x.0).filter(|d| u.prog.def(*d).kind != DefKind::Enum || fresh_enums.contains(d)).collect();
         if !fresh_defs.is_empty() && layout_restart.is_empty() {
             if let Some((s, by, conv)) = raw_builder(u, &fresh_defs, &replaced_raw) {
                 let how = if conv { "reaches its bytes as other data (a pointer cast to another type, an address, inline assembly)" } else { "writes its fields in place through a raw pointer" };
-                layout_restart.push(format!("struct `{}` changed its layout, and `{}` {}: a value of it may be kept where its type does not show -- restart the app", u.prog.def_path(s), u.prog.def_path(by), how));
+                let kind = if u.prog.def(s).kind == DefKind::Enum { "enum" } else { "struct" };
+                layout_restart.push(format!("{kind} `{}` changed its layout, and `{}` {}: a value of it may be kept where its type does not show -- restart the app", u.prog.def_path(s), u.prog.def_path(by), how));
             }
         }
         trace_sub("raw_builders");
@@ -9881,7 +9925,9 @@ mod round32_tests {
             "removed" => ("enum E { A = 1, B }", "enum E { A = 1 }", false),
             "reordered" => ("enum E { A = 1, B }", "enum E { B = 1, A }", false),
             "added" => ("enum E { A = 1, B }", "enum E { A = 1, B, C }", true),
-            "larger" => ("enum E { A, B }", "enum E { A, B, C([u64; 4]) }", false),
+            // no value of E is left (no static holds one): it takes rustc's larger layout, its
+            // users rebuilt (a held one restarts: lazy_reload_tests, the enums case)
+            "larger" => ("enum E { A, B }", "enum E { A, B, C([u64; 4]) }", true),
             "named" => ("const N: isize = 1; enum E { A = N, B }", "const N: isize = 2; enum E { A = N, B }", false),
             "executable" => ("const fn d() -> isize { 1 } enum E { A = d(), B }", "const fn d() -> isize { 1 } enum E { A = d() + 1, B }", false),
             "callee" => ("const fn d() -> isize { 1 } enum E { A = d(), B }", "const fn d() -> isize { 2 } enum E { A = d(), B }", false),

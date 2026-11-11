@@ -871,7 +871,8 @@ fn app_scope_live_layout_edits() {
     // Vec, in Options and in Options of Options; F's in Option<F> and in W, which keeps its own
     // variants in F's spare tag values; a niche-filled enum (Yoyo), a single-variant one, one of
     // 256 variants (the tag's full width) and a repr(u8) one. `read` folds every value into a
-    // decimal digit, and the sizes rustc gives E and its Options into the last
+    // decimal digit, and the sizes rustc gives E and its Options into the last. N's values live
+    // only in `transient`'s locals
     let before = if case == "enums" {
         let g: String = (0..256).map(|i| format!("V{i}, ")).collect();
         base.to_string() + &format!(r#"
@@ -882,6 +883,7 @@ fn app_scope_live_layout_edits() {
         pub enum One {{ Only(u32) }}
         pub enum G {{ {g} }}
         #[repr(u8)] pub enum R {{ A, B(u16), Q }}
+        pub enum N {{ A(u32), B }}
         static ES: Mutex<Vec<E>> = Mutex::new(Vec::new());
         static OS: Mutex<Vec<Option<E>>> = Mutex::new(Vec::new());
         static OOS: Mutex<Vec<Option<Option<E>>>> = Mutex::new(Vec::new());
@@ -898,6 +900,11 @@ fn app_scope_live_layout_edits() {
             RS.lock().unwrap().extend([R::A, R::B(9)]);
         }}
         pub fn step(_: &mut u64) {{}}
+        pub fn transient(out: &mut u64) {{
+            let mut n = 0u64;
+            for x in [N::A(7), N::B] {{ n = n * 10 + match x {{ N::A(k) => k as u64, N::B => 5 }}; }}
+            *out = n * 100 + std::mem::size_of::<N>() as u64;
+        }}
         fn e(x: &E) -> u64 {{ match x {{ E::A => 1, E::B(7) => 2, E::C(3) => 3, _ => 9 }} }}
         fn r(x: &R) -> u64 {{ match x {{ R::A => 1, R::B(9) => 2, _ => 9 }} }}
         pub fn read(out: &mut u64) {{
@@ -948,7 +955,7 @@ fn app_scope_live_layout_edits() {
     let value = def("value", lib);
     let name = def("name", lib);
     let enums = [def("Ease", lib), def("Yoyo", lib), def("Held", lib)];
-    let enum_fns = (case == "enums").then(|| [def("make", lib), def("step", lib), def("read", lib)]);
+    let enum_fns = (case == "enums").then(|| [def("make", lib), def("step", lib), def("read", lib), def("transient", lib)]);
     let mut roots = vec![bin_path.to_string_lossy().into_owned()];
     if case != "framework" && case != "live_crate" { roots.push(path.to_string_lossy().into_owned()); }
     crate::borrowck::event::set_app_scope(roots);
@@ -1016,7 +1023,7 @@ fn app_scope_live_layout_edits() {
         // M84: a variant added to an enum the program holds values of applies in place when
         // rustc's layout of the new text, or that layout with the running variants' tags kept,
         // reads every value made before as it was; otherwise the edit restarts, naming the type
-        let [make, step, read] = fns.map(|d| entry(&mut u, d));
+        let [make, step, read, transient] = fns.map(|d| entry(&mut u, d));
         let file = u.prog.def(state).file;
         let lib_path = path.to_string_lossy().into_owned();
         let apply = |src: &str| unsafe { reload::apply(up, vec![Edit { file, path: lib_path.clone(), src: src.as_bytes().to_vec() }]) };
@@ -1052,29 +1059,39 @@ fn app_scope_live_layout_edits() {
         run(step);
         let held = 123453058021211231;
         assert_eq!(run(read), held, "repr(u8) appended");
+        // R10: N's values live only in a fn's locals: a variant that makes rustc fill a niche
+        // (C's char) where it had a tag takes that new layout, and the code using N is rebuilt
+        assert_eq!(run(transient), 7508, "N before its edit");
+        let v4 = v3.replace("pub enum N { A(u32), B }", "pub enum N { A(u32), B, C(u32, char) }").replace("[N::A(7), N::B]", "[N::A(7), N::B, N::C(3, 'x')]")
+            .replace("N::B => 5 }", "N::B => 5, N::C(k, c) => k as u64 + (c == 'x') as u64 }");
+        let out = apply(&v4);
+        assert_eq!(out.rung, Rung::Patch, "no running value: {:?}", out.lines);
+        assert!(out.lines.iter().any(|l| l.contains("enum `app_lib::N` takes its new layout")), "{:?}", out.lines);
+        assert_eq!(run(transient), 75408, "N in its new layout");
+        assert_eq!(run(read), held, "the running values after N's edit");
         let restarts = |src: String, what: &str, says: &[&str]| {
             let out = apply(&src);
             assert_eq!(out.rung, Rung::Restart, "{what}: {:?}", out.lines);
             assert!(out.lines.iter().any(|l| says.iter().all(|s| l.contains(s)) && l.contains("restart the app")), "{what}: {:?}", out.lines);
             assert_eq!(run(read), held, "{what}: the running values after the restart is offered");
         };
-        restarts(v3.replace("pub enum R { A,", "pub enum R { Z, A,"), "repr(u8) inserted", &["variant `Z` was added", "app_lib::R", "another tag"]);
+        restarts(v4.replace("pub enum R { A,", "pub enum R { Z, A,"), "repr(u8) inserted", &["variant `Z` was added", "app_lib::R", "another tag"]);
         // R6, R7: a niche-filled enum, a single-variant one, a tag of full width, a payload that
         // grows the enum: restart, and the running sizes stay rustc's
-        restarts(v3.replace("pub enum Yoyo { Invert, Ease(Ease) }", "pub enum Yoyo { Invert, Ease(Ease), Back }"), "niche-filled", &["variant `Back` was added", "Yoyo"]);
-        restarts(v3.replace("pub enum One { Only(u32) }", "pub enum One { Only(u32), Two }"), "single variant", &["variant `Two` was added", "would change from"]);
-        restarts(v3.replace("V255, ", "V255, V256, "), "257 variants", &["variant `V256` was added", "would change from"]);
-        restarts(v3.replace("C(u8), D(u16) }", "C(u8), D(u16), Big([u64; 4]) }"), "grown payload", &["variant `Big` was added", "would change from"]);
+        restarts(v4.replace("pub enum Yoyo { Invert, Ease(Ease) }", "pub enum Yoyo { Invert, Ease(Ease), Back }"), "niche-filled", &["variant `Back` was added", "Yoyo"]);
+        restarts(v4.replace("pub enum One { Only(u32) }", "pub enum One { Only(u32), Two }"), "single variant", &["variant `Two` was added", "would change from"]);
+        restarts(v4.replace("V255, ", "V255, V256, "), "257 variants", &["variant `V256` was added", "would change from"]);
+        restarts(v4.replace("C(u8), D(u16) }", "C(u8), D(u16), Big([u64; 4]) }"), "grown payload", &["variant `Big` was added", "would change from"]);
         assert_eq!(enums.map(|t| u.layout_of(t).size), [24, 24, 24], "Ease, Yoyo, Held after the restarts");
-        // R5: F's spare tag values hold Option<F>'s None and W's own variants: the edit applies
-        // with every value read as before, or restarts naming a type holding F
-        let out = apply(&v3.replace("pub enum F { A, B(u32) }", "pub enum F { A, B(u32), C(u32) }"));
-        if out.rung == Rung::Patch {
-            assert_eq!(run(read), held, "F grown in place");
-        } else {
-            assert_eq!(out.rung, Rung::Restart, "{:?}", out.lines);
-            assert!(out.lines.iter().any(|l| l.contains("variant `C` was added") && !l.contains("values of `app_lib::F` ")), "{:?}", out.lines);
-        }
+        // R5: F's spare tag values hold Option<F>'s None and W's own variants. With two variants
+        // rustc's layout of a third moves them (Option<F>'s None from 2 to the top value; with
+        // tags kept, above or below, one of them moves too), so the running Options and Ws would
+        // be read wrong: a restart naming a type holding F, F's own values being fine
+        let out = apply(&v4.replace("pub enum F { A, B(u32) }", "pub enum F { A, B(u32), C(u32) }"));
+        assert_eq!(out.rung, Rung::Restart, "two-variant append: {:?}", out.lines);
+        assert!(out.lines.iter().any(|l| l.contains("variant `C` was added") && l.contains("made before the edit would be read wrong") && !l.contains("values of `app_lib::F` ")),
+            "two-variant append names a type holding F: {:?}", out.lines);
+        assert_eq!(run(read), held, "two-variant append: the running values after the restart is offered");
         std::mem::forget(u);
         std::fs::remove_dir_all(dir).unwrap();
         return;
