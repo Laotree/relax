@@ -1200,7 +1200,7 @@ const DATA = {
     heads: ["rustc", "Relax"],
     rows: [["构建它需要", "LLVM，外加一次自举", "**一套 stable Rust 工具链。crates.io 上的东西一个都不用。**"]],
     command: "cargo build --release -p relax-compiler",
-    after: "Relax 是一个库：由宿主工具嵌入 `relax_compiler` 并驱动它。",
+    after: "编译器是 `relax_compiler` 这个库；`relax`（`tools/run/runner`）是它的命令行运行器。",
     layout: [
       "Cargo.toml                           工作区",
       "libs/relax/",
@@ -1211,6 +1211,7 @@ const DATA = {
       "  attr/ native_macros/               #[relax(..)] 与原生过程宏",
       "  KNOWN_GAPS.md                      尚未支持的内容",
       "libs/relax_api/                      #[relax_api] 与按线程的堆路由",
+      "tools/run/runner/                    relax，命令行运行器",
       "libs/ platform/ tools/ widgets/      Relax 链接的几个小型支撑 crate：",
       "                                     token 模型、序列化、远程检视、",
       "                                     性能分析，以及它对照源码",

@@ -1125,7 +1125,7 @@ const DATA = {
     heads: ["rustc", "Relax"],
     rows: [["To build it", "LLVM plus a bootstrap", "**A stable Rust toolchain. Nothing from crates.io.**"]],
     command: "cargo build --release -p relax-compiler",
-    after: "Relax is a library: a host tool embeds `relax_compiler` and drives it.",
+    after: "The compiler is the `relax_compiler` library; `relax` (`tools/run/runner`) is its command-line runner.",
     layout: [
       "Cargo.toml                           the workspace",
       "libs/relax/",
@@ -1136,6 +1136,7 @@ const DATA = {
       "  attr/ native_macros/               #[relax(..)] and native proc macros",
       "  KNOWN_GAPS.md                      what isn't supported yet",
       "libs/relax_api/                      #[relax_api] and per-thread heap routing",
+      "tools/run/runner/                    relax, the command-line runner",
       "libs/ platform/ tools/ widgets/      the small support crates Relax links:",
       "                                     token model, serialisation, remote",
       "                                     inspection, profiling, and the native",
