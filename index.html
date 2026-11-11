@@ -9,6 +9,10 @@
 <link rel="icon" href="favicon.ico" sizes="32x32">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="canonical" href="https://makepad.github.io/relax/">
+<link rel="alternate" hreflang="en" href="https://makepad.github.io/relax/">
+<link rel="alternate" hreflang="zh-CN" href="https://makepad.github.io/relax/zh/">
+<link rel="alternate" hreflang="x-default" href="https://makepad.github.io/relax/">
 <style>
 :root{
   --bg:#06070b;--bg2:#0b0d14;--panel:#0f121b;--panel2:#141826;
@@ -499,6 +503,18 @@ noscript p{padding:14px 20px;background:#2a1c08;color:#ffe2a8;text-align:center}
   .dt i{transform:scaleX(var(--s))!important}
   .step{opacity:1}
 }
+
+/* language switch: top bar and footer, every width */
+.lang{display:inline-flex;align-items:center;gap:6px;min-height:44px;padding:0 12px;border:1px solid var(--line);border-radius:10px;color:var(--text);font-size:.86rem;font-weight:600;text-decoration:none;white-space:nowrap;transition:border-color .2s,color .2s}
+.lang:hover{border-color:var(--relax);color:var(--relax)}
+.lang svg{width:15px;height:15px;flex:none;fill:none;stroke:currentColor;stroke-width:1.3}
+.nav .lang{margin-left:auto}
+.nav .lang+.btn{margin-left:0}
+@media (min-width:1100px){.nav .lang{margin-left:0}}
+@media (max-width:379px){.nav .wrap{gap:8px}.nav .lang{padding:0 9px}}
+@media (max-width:339px){.nav .lang svg{display:none}}
+footer .sep{margin:0 10px}
+footer .lang{vertical-align:middle;color:var(--muted)}
 </style>
 <style>#speed{display:none!important}</style>
 </head>
@@ -523,6 +539,7 @@ noscript p{padding:14px 20px;background:#2a1c08;color:#ffe2a8;text-align:center}
       <a href="#gaps">Where LLVM wins</a>
       <a href="#architecture">Architecture</a>
     </nav>
+    <a class="lang" href="zh/" hreflang="zh-CN" lang="zh-CN"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.4"/><path d="M1.6 8h12.8M8 1.6c1.9 1.8 2.8 4 2.8 6.4S9.9 12.6 8 14.4M8 1.6C6.1 3.4 5.2 5.6 5.2 8s.9 4.6 2.8 6.4"/></svg>中文</a>
     <a class="btn small" href="https://github.com/makepad/relax">GitHub <span aria-hidden="true">&nearr;</span></a>
   </div>
 </header>
@@ -764,7 +781,7 @@ noscript p{padding:14px 20px;background:#2a1c08;color:#ffe2a8;text-align:center}
 
 </main>
 
-<footer><div class="wrap"><a href="https://github.com/makepad/relax">github.com/makepad/relax</a></div></footer>
+<footer><div class="wrap"><a href="https://github.com/makepad/relax">github.com/makepad/relax</a><span class="sep" aria-hidden="true">&middot;</span><a class="lang" href="zh/" hreflang="zh-CN" lang="zh-CN"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.4"/><path d="M1.6 8h12.8M8 1.6c1.9 1.8 2.8 4 2.8 6.4S9.9 12.6 8 14.4M8 1.6C6.1 3.4 5.2 5.6 5.2 8s.9 4.6 2.8 6.4"/></svg>中文</a></div></footer>
 
 <script>
 "use strict";
