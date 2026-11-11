@@ -12615,7 +12615,7 @@ fn beside_full(cur: Option<&relax_backend::rir::Func>, f: &relax_backend::rir::F
 /// The RIR a caller below O2 inlines for slot `f`: its normal O1 body, never an O2 build's full
 /// one (read only by O2 and O3 builds) -- O1 code is a function of its recorded inputs, not of
 /// which tier-up ran first. None while the slot's RIR is full and no normal body was built yet.
-fn inline_body(f: &FnEntry) -> Option<&std::sync::Arc<relax_backend::rir::Func>> {
+pub(crate) fn inline_body(f: &FnEntry) -> Option<&std::sync::Arc<relax_backend::rir::Func>> {
     match &f.rir {
         Some(r) if r.full && !export_full() => f.normal_rir.as_ref(),
         r => r.as_ref(),
