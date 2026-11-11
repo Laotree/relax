@@ -11496,16 +11496,35 @@ fn run_o2(unit: usize, id: u32, kind: queue::O2Kind) {
                 }
             };
             if let Some((up, w)) = begin {
-                let done = w.run();
-                if let Ok(Ok((_, _, c))) = &done.built {
-                    prebuild_callees(up, &c.relocs, &[]);
-                }
-                owner::publish(|| o2_finish(up, done));
+                o2_build_install(up, w);
             }
         }));
         if r.is_err() {
             if o1 { crate::cache::warm_count::add(crate::cache::warm_count::O1V_DROPPED, 1) } else { o2_drop(D_PANIC, std::ptr::null_mut(), id); }
         }
+}
+
+/// An O2 build's part on this thread: its code, then what that code calls that must have code
+/// first (SPEC-V callees that ran inside twin code, a real-time slot's new callees), then the
+/// install.
+unsafe fn o2_build_install(up: *mut Unit, w: O2Work) {
+    let done = w.run();
+    if let Ok(Ok((_, _, c))) = &done.built {
+        prebuild_callees(up, &c.relocs, &[]);
+        realtime_before_install(up, done.id, &c.relocs);
+    }
+    owner::publish(|| o2_finish(up, done));
+}
+
+/// (Unit tests) slot `id`'s O2 build now, on this thread, as the O2 worker makes one. False:
+/// its front dropped it.
+#[cfg(test)]
+pub(crate) unsafe fn o2_build_now(up: *mut Unit, id: u32) -> bool {
+    // (a hot slot's, as realtime_top_tier queues it: o2_hot)
+    (&*up).fns[id as usize].hot_hint.store(true, Ordering::Relaxed);
+    let Some(w) = owner::call(owner::Class::Program, || o2_begin(up, id)) else { return false };
+    o2_build_install(up, w);
+    true
 }
 
 /// One O2 build, in three parts: its front (`o2_begin`, a unit call), the optimisation and code
@@ -19526,6 +19545,7 @@ pub(crate) unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bo
         }
         return false;
     };
+    realtime_before_install(up, id, &c.relocs);
     let installed = owner::publish(|| {
         let u = &mut *up;
         let f = &u.fns[id as usize];
@@ -20610,8 +20630,10 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // SPEC-V: callees this replacement calls that have no code yet but ran inside twin code get
     // theirs before the swap (prebuild_callees)
     // (not for an O3-always first build: that is a program thread's lazy compile)
+    // (a real-time slot's new callees too: realtime_before_install)
     if let (Ok(Ok((_, _, relocs, extra))), false) = (&built, o3_first()) {
         prebuild_callees(up, relocs, &extra.3);
+        realtime_before_install(up, id, relocs);
     }
     // (an O3-always first build is a program thread's lazy compile: its finish is foreground)
     let ok = owner::publish(|| {
@@ -27567,6 +27589,9 @@ static RT_DYNS: AtomicBool = AtomicBool::new(false);
 static RT_ANY: AtomicBool = AtomicBool::new(false);
 /// vtables made for a real-time trait-object type, waiting for realtime_drain
 static RT_PENDING: relax_session::sync::Mutex<Vec<u64>> = relax_session::sync::Mutex::new(Vec::new());
+/// (unit tests) realtime_drain leaves its queues as they are
+#[cfg(test)]
+pub(crate) static RT_DRAIN_HOLD: AtomicBool = AtomicBool::new(false);
 /// slots new code of a real-time slot calls that the reach has not walked, waiting for realtime_drain
 static RT_PENDING_SLOTS: relax_session::sync::Mutex<Vec<u32>> = relax_session::sync::Mutex::new(Vec::new());
 /// slots compiled ahead for real-time code, and the owner's wall ns spent on it
@@ -27574,6 +27599,8 @@ pub static RT_AHEAD: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// the last ticket std::relax::realtime handed out, and the newest whose reach is compiled
 static RT_TICKET: AtomicU64 = AtomicU64::new(0);
 static RT_DONE: AtomicU64 = AtomicU64::new(0);
+/// realtime_done wakes the builds waiting for the reach (realtime_before_install)
+static RT_DONE_WAKE: (std::sync::Mutex<()>, std::sync::Condvar) = (std::sync::Mutex::new(()), std::sync::Condvar::new());
 /// owner wall ns one reach step may take before the program's requests get the owner back
 const RT_STEP_NS: u64 = 2_000_000;
 
@@ -27792,6 +27819,12 @@ pub(crate) unsafe fn realtime_reach_queued(up: *mut Unit, roots: Vec<u32>, why: 
 /// ahead, then compiles and walks slots until the reach is done or RT_STEP_NS passed; the rest is posted
 /// behind the program's requests. Done: the set's top tier, its disk cache record, the tickets.
 unsafe fn realtime_step(up: *mut Unit) {
+    realtime_step_for(up, RT_STEP_NS);
+}
+
+/// realtime_step with `budget` wall ns (u64::MAX: the whole reach now, realtime_before_install on
+/// the owner).
+unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
     let t0 = wall_ns();
     // the earlier runs' set, once, first: on a warm run most of it links from the disk cache. It is
     // only what to compile ahead: the reach is what the walk from the roots takes. A slot's key names
@@ -27824,7 +27857,7 @@ unsafe fn realtime_step(up: *mut Unit) {
     }
     let mut compiled = 0u64;
     let done = loop {
-        if wall_ns() - t0 >= RT_STEP_NS {
+        if wall_ns() - t0 >= budget {
             break false;
         }
         enum Next {
@@ -27976,6 +28009,10 @@ unsafe fn realtime_step(up: *mut Unit) {
 fn realtime_done() {
     let wakes = with_rt(|rt| {
         rt.scheduled = false;
+        // (a step posted before a whole reach ran on the owner finds nothing new: no top tier again)
+        rt.n0 = rt.set.len();
+        rt.d0 = rt.dyns.len();
+        rt.compiled = 0;
         RT_DONE.fetch_max(rt.added, Ordering::AcqRel);
         let done = rt.added;
         let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut rt.wakes).into_iter().partition(|w| w.0 <= done);
@@ -27988,6 +28025,8 @@ fn realtime_done() {
         });
         now
     });
+    drop(RT_DONE_WAKE.0.lock().unwrap_or_else(|e| e.into_inner()));
+    RT_DONE_WAKE.1.notify_all();
     if !wakes.is_empty() {
         let _ = crate::run_threads::spawn("run-rt-wake", move || {
             for (_, scope, wake) in wakes {
@@ -28131,13 +28170,14 @@ pub(crate) unsafe fn realtime_reach(up: *mut Unit, roots: Vec<u32>, why: &'stati
     realtime_reach_queued(up, roots, why);
 }
 
-/// New code for slot `id` was installed (Unit::install_unchecked): when `id` is real-time code, the
-/// slots that code calls or names which the reach has not walked are walked after the current
-/// request (realtime_drain). An O2/O3 build or a verdict's rebuild can call slots the code it
+/// The slots new code of slot `id` calls or names (`relocs`: calls, thunks, table words, and the
+/// slots of the data it names: vtables, a static's fn pointers, a thread-local's accessor) that
+/// the reach has not walked; none when `id` is not real-time code. A diverging slot stays out
+/// (the walk stops there). An O2/O3 build or a verdict's rebuild can call slots the code it
 /// replaces did not (SPEC-V twins and their verified bodies are separate slots).
-fn realtime_installed(u: &Unit, id: u32, relocs: &[relax_backend::rir::RelocAt]) {
-    if !RT_ANY.load(Ordering::Acquire) || RT_KEEP.with(|k| k.get()) {
-        return;
+fn realtime_new_refs(u: &Unit, id: u32, relocs: &[relax_backend::rir::RelocAt]) -> Vec<u32> {
+    if !REALTIME.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|rt| rt.seen.contains(&id)) {
+        return Vec::new();
     }
     use relax_backend::rir::Reloc;
     let mut refs = Vec::new();
@@ -28152,16 +28192,70 @@ fn realtime_installed(u: &Unit, id: u32, relocs: &[relax_backend::rir::RelocAt])
             _ => {}
         }
     }
-    let new: Vec<u32> = {
-        let g = REALTIME.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(rt) = g.as_ref().filter(|rt| rt.seen.contains(&id)) else { return };
-        refs.into_iter().filter(|c| !rt.seen.contains(c) && (*c as usize) < u.fns.len() && !realtime_cut(u, *c)).collect()
-    };
+    refs.sort_unstable();
+    refs.dedup();
+    let g = REALTIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(rt) = g.as_ref() else { return Vec::new() };
+    refs.into_iter().filter(|c| !rt.seen.contains(c) && (*c as usize) < u.fns.len() && !realtime_cut(u, *c)).collect()
+}
+
+/// New code for slot `id` was installed (Unit::install_unchecked): when `id` is real-time code, the
+/// slots that code calls or names which the reach has not walked are walked after the current
+/// request (realtime_drain). A tier-up build has had them walked before its install
+/// (realtime_before_install); this is for the other installs (a verdict's rebuild, an inspect
+/// build, a forwarder).
+fn realtime_installed(u: &Unit, id: u32, relocs: &[relax_backend::rir::RelocAt]) {
+    if !RT_ANY.load(Ordering::Acquire) || RT_KEEP.with(|k| k.get()) {
+        return;
+    }
+    let new = realtime_new_refs(u, id, relocs);
     if !new.is_empty() {
         if rt_trace() {
             eprintln!("makepad-run rt: new code of `{}` calls {} slots the reach has not walked", short_name(&u.fns[id as usize].name), new.len());
         }
         crate::zone_alloc::kept_with(|| RT_PENDING_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).extend(new));
+    }
+}
+
+/// A tier-up build of slot `id` (O2, a verified O1 rebuild, a counted build, O3) is built and
+/// about to replace its code: when `id` is real-time code, the slots the new code (`relocs`)
+/// calls or names that the reach has not walked are walked now -- compiled, with everything they
+/// reach -- and the install waits for that. The old code runs until then, so a real-time thread
+/// never meets a lazy stub in the new code. (Queued for the drain after the install instead, a
+/// real-time thread could call a new callee first and compile it: a stall.) The walk is the
+/// reach's own, in its bounded owner steps, and this build's thread waits for it; a build the
+/// owner runs itself walks them here.
+unsafe fn realtime_before_install(up: *mut Unit, id: u32, relocs: &[relax_backend::rir::RelocAt]) {
+    if !RT_ANY.load(Ordering::Acquire) || RT_KEEP.with(|k| k.get()) {
+        return;
+    }
+    let ticket = owner::publish(|| {
+        let u = &*up;
+        let new = realtime_new_refs(u, id, relocs);
+        if new.is_empty() {
+            return 0;
+        }
+        if rt_trace() {
+            eprintln!("makepad-run rt: new code of `{}` calls {} slots the reach has not walked: walked before its install", short_name(&u.fns[id as usize].name), new.len());
+        }
+        let t = RT_TICKET.fetch_add(1, Ordering::AcqRel) + 1;
+        realtime_reach_queued(up, new, "new code");
+        with_rt(|rt| rt.added = rt.added.max(t));
+        t
+    });
+    if ticket == 0 {
+        return;
+    }
+    if owner::is_owner() {
+        realtime_step_for(up, u64::MAX);
+        return;
+    }
+    let _budget = crate::pool::suspend();
+    let _idle = JobIdle::enter();
+    let mut g = RT_DONE_WAKE.0.lock().unwrap_or_else(|e| e.into_inner());
+    // (a stop ends the wait: the process is ending, or the tiers stopped for a cache write)
+    while RT_DONE.load(Ordering::Acquire) < ticket && !TIER_STOP.load(Ordering::SeqCst) && !SPEC_STOP.load(Ordering::SeqCst) {
+        g = RT_DONE_WAKE.1.wait_timeout(g, TIER1_POLL).unwrap_or_else(|e| e.into_inner()).0;
     }
 }
 
@@ -28534,6 +28628,10 @@ pub(crate) fn const_drain() {
 /// code of real-time slots calls (realtime_installed).
 pub(crate) fn realtime_drain() {
     if !RT_ANY.load(Ordering::Acquire) {
+        return;
+    }
+    #[cfg(test)]
+    if RT_DRAIN_HOLD.load(Ordering::Acquire) {
         return;
     }
     let up = cur_unit();

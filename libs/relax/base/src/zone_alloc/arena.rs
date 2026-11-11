@@ -1362,9 +1362,9 @@ impl Arena {
     /// owner is blocked in a wait, as the owner's own pass would: the blocks other threads freed
     /// into it are its free list's again, and, sparse, it gives its whole free pages back. A pool
     /// worker that did a job and now waits for the next kept what the others freed of its blocks
-    /// (Scope: 25-55 MB on the remote lists of waiting workers). A chunk that sat through a whole
+    /// (25-55 MB on the remote lists of waiting workers in one measured app). A chunk that sat through a whole
     /// epoch unchanged gives its whole free pages back at any fill, once: the waiting pool workers
-    /// of a Fab session held 155 MB of whole free pages in current chunks at least a quarter
+    /// of one measured app session held 155 MB of whole free pages in current chunks at least a quarter
     /// live, which the sparse rule never trims. A busy owner changes its chunks between passes and
     /// is never walked for it. A trim the program asks for (`trim`, `force`) walks it at once, at
     /// any fill, unless it was walked at this very state. The owner's `quiet` word makes it safe:
