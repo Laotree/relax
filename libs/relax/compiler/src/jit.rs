@@ -23999,8 +23999,8 @@ impl BackWork {
             let mut memo = None;
             if let Front::Opt(p, _) = &front {
                 if worthy && bmemo::on(options) {
-                    let k = bmemo::key(id, p, (fold, rotate, env.opt_regs, epoch));
-                    if let Some((opt, code, map, relocs, cg_ns, mut done, frame)) = bmemo::lookup(&k, p) {
+                    let k = bmemo::key(id, p, (fold, rotate, env.opt_regs, lc.is_some(), epoch));
+                    if let Some((opt, code, map, relocs, cg_ns, mut done, frame)) = bmemo::lookup(&k, p, lc.map(|x| x.0)) {
                         // (the memo's copies carry no lowering: a baseline body gets this
                         // preparation's own, the input of its upgrade)
                         let opt = opt.map(|(f, inl, ns)| (std::sync::Arc::new(relax_backend::rir::Func { lowering: p.func.lowering.clone(), ..std::sync::Arc::unwrap_or_clone(f) }), inl, ns));
@@ -24069,7 +24069,7 @@ impl BackWork {
                 });
             }
             if let Some((k, prep)) = memo {
-                bmemo::store(k, prep, &opt, &c.code, &c.pc_map, &c.relocs, t2 - t1, &done_out.lock().unwrap(), frame, t2 - t0);
+                bmemo::store(k, prep, &opt, &c.code, &c.pc_map, &c.relocs, t2 - t1, &done_out.lock().unwrap(), frame, t2 - t0, lc.map(|x| x.0));
             }
             Ok((opt, c.code, c.pc_map, c.relocs, t2 - t1))
         }));

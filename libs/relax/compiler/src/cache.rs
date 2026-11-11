@@ -5108,7 +5108,10 @@ impl Cache {
             };
             let cbytes = d.b.get(d.p..d.p + e.0.len()).map(|x| x.to_vec());
             if co != *o || ck != Some(rl.kind) || !ok || cbytes.as_deref() != Some(&e.0[..]) {
-                eprintln!("makepad-run cache: VERIFY RELOC differs: {} at {} ({:?} -> {}, {})", name, o, r, match r { Reloc::Sym(s) => crate::syms::describe(u, *s), Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => crate::syms::stable_fn_name(u, *x), _ => String::new() }, inputs_word);
+                // (what differs: the cached offset, kind and target bytes against the fresh ones)
+                let first = cbytes.as_deref().map_or(0, |b| b.iter().zip(&e.0).take_while(|(x, y)| x == y).count());
+                let hex = |b: &[u8]| format!("[{}/{}] {}", first, b.len(), b.iter().skip(first.saturating_sub(4)).take(16).map(|x| format!("{:02x}", x)).collect::<String>());
+                eprintln!("makepad-run cache: VERIFY RELOC differs: {} at {} ({:?} -> {}, {}; cached at {} kind {}, target {} / fresh {})", name, o, r, match r { Reloc::Sym(s) => crate::syms::describe(u, *s), Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => crate::syms::stable_fn_name(u, *x), _ => String::new() }, inputs_word, co, if ck == Some(rl.kind) { "same" } else { "differs" }, cbytes.as_deref().map_or(String::from("-"), |b| hex(b)), if ok { hex(&e.0) } else { String::from("unencodable") });
                 if same_inputs { self.stats.verify_diff_reloc += 1 } else { self.stats.verify_diff_inputs += 1 }
                 return false;
             }
