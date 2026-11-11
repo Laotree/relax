@@ -536,6 +536,7 @@ footer .lang{vertical-align:middle;color:var(--muted)}
 <li><b>Change:</b> save a file and the changed functions are patched into the running program, state kept. <b>92 tests re-run in 2.2 s.</b>
 <li><b>Speed:</b> optimised code is still slower than rustc <code>--release</code>. A broader run this week came out slower than our earlier numbers and we're re-measuring; see <a href="#plain-where-llvm-still-wins">where LLVM still wins</a>.
 <li><b>Size:</b> one Rust library: <b>438k lines, 0 crates.io dependencies.</b>
+<li><b>Platforms:</b> code generation for x86-64 and AArch64. From a fresh clone the repository builds and its tests pass on Linux x86-64 and macOS arm64; Windows isn't tested here.
 </ul>
 <h2><a name="plain-relax-vs-rustc">Relax vs rustc</a></h2>
 <table border="1" cellpadding="4" cellspacing="0">
@@ -1076,7 +1077,8 @@ const DATA = {
       ["Start", "On an M4 MacBook a large 3D game shows its first frame **11 s** after a clean checkout, where rustc builds for ~3 min first. The second run takes **1.15 s**."],
       ["Change", "Save a file and the changed functions are patched into the running program, state kept. **92 tests re-run in 2.2 s.**"],
       ["Speed", "Optimised code is still slower than rustc `--release`. A broader run this week came out slower than our earlier numbers and we're re-measuring; see [where LLVM still wins](#gaps)."],
-      ["Size", "One Rust library: **438k lines, 0 crates.io dependencies.**"]
+      ["Size", "One Rust library: **438k lines, 0 crates.io dependencies.**"],
+      ["Platforms", "Code generation for x86-64 and AArch64. From a fresh clone the repository builds and its tests pass on Linux x86-64 and macOS arm64; Windows isn't tested here."]
     ]
   },
 

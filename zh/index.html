@@ -607,6 +607,7 @@ code.nw{white-space:nowrap}
 <li><b>改动</b>：保存文件，改过的函数就被热补丁进运行中的程序，状态不丢。<b>92 个测试 2.2 s 重跑完。</b>
 <li><b>速度</b>：优化后的代码仍然比 rustc <code>--release</code> 慢。本周一次范围更广的测试，结果比我们之前公布的数字更慢，我们正在重新测量；详见 <a href="#plain-gaps">LLVM 仍然领先的地方</a>。
 <li><b>体积</b>：就一个 Rust 库：<b>438k 行代码，0 个 crates.io 依赖。</b>
+<li><b>平台</b>：为 x86-64 和 AArch64 生成机器码。从全新克隆开始，本仓库在 Linux x86-64 和 macOS arm64 上都能构建，测试全部通过；Windows 还没有在这里测试过。
 </ul>
 <h2><a name="plain-race">Relax 对决 rustc</a></h2>
 <table border="1" cellpadding="4" cellspacing="0">
@@ -1069,7 +1070,8 @@ const DATA = {
       ["启动", "在 M4 MacBook 上，一个大型 3D 游戏从全新检出到出首帧只要 **11 s**，而 rustc 光是构建就得先花 ~3 min。第二次运行只要 **1.15 s**。"],
       ["改动", "保存文件，改过的函数就被热补丁进运行中的程序，状态不丢。**92 个测试 2.2 s 重跑完。**"],
       ["速度", "优化后的代码仍然比 rustc `--release` 慢。本周一次范围更广的测试，结果比我们之前公布的数字更慢，我们正在重新测量；详见 [LLVM 仍然领先的地方](#gaps)。"],
-      ["体积", "就一个 Rust 库：**438k 行代码，0 个 crates.io 依赖。**"]
+      ["体积", "就一个 Rust 库：**438k 行代码，0 个 crates.io 依赖。**"],
+      ["平台", "为 x86-64 和 AArch64 生成机器码。从全新克隆开始，本仓库在 Linux x86-64 和 macOS arm64 上都能构建，测试全部通过；Windows 还没有在这里测试过。"]
     ]
   },
 

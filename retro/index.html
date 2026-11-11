@@ -24,6 +24,7 @@
 <li><b>Change:</b> save a file and the changed functions are patched into the running program, state kept. <b>92 tests re-run in 2.2 s.</b>
 <li><b>Speed:</b> optimised code is still slower than rustc <code>--release</code>. A broader run this week came out slower than our earlier numbers and we're re-measuring; see <a href="#where-llvm-still-wins">where LLVM still wins</a>.
 <li><b>Size:</b> one Rust library: <b>438k lines, 0 crates.io dependencies.</b>
+<li><b>Platforms:</b> code generation for x86-64 and AArch64. From a fresh clone the repository builds and its tests pass on Linux x86-64 and macOS arm64; Windows isn't tested here.
 </ul>
 <h2><a name="relax-vs-rustc">Relax vs rustc</a></h2>
 <table border="1" cellpadding="4" cellspacing="0">

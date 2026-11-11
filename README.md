@@ -16,6 +16,7 @@ running process when you save a file.
 - **Change:** save a file and the changed functions are patched into the running program, state kept. **92 tests re-run in 2.2 s.**
 - **Speed:** optimised code is still slower than rustc `--release`. A broader run this week came out slower than our earlier numbers and we're re-measuring; see [where LLVM still wins](#where-llvm-still-wins).
 - **Size:** one Rust library: **438k lines, 0 crates.io dependencies.**
+- **Platforms:** code generation for x86-64 and AArch64. From a fresh clone the repository builds and its tests pass on Linux x86-64 and macOS arm64; Windows isn't tested here.
 
 ## Relax vs rustc
 
