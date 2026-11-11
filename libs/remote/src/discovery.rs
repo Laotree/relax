@@ -340,6 +340,17 @@ fn no_endpoint(spec: &str) -> String {
     format!("no running makepad-remote endpoint `{spec}`")
 }
 
+/// Lists [`apps`] on a thread of its own, which removes the files killed launches left in a phone
+/// app's temp dir. A desktop keeps them, since the devhub reads one left behind as a crash.
+#[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
+pub(crate) fn remove_stale(hooks: crate::conn::Hooks) {
+    let _ = std::thread::Builder::new().name("makepad-remote-sweep".into()).spawn(move || {
+        (hooks.enter)();
+        let _ = apps();
+        (hooks.exit)();
+    });
+}
+
 /// `spec` is a pid, an app name for `caller` ([`named`]), or a
 /// `tcp:` socket a discovery file names.
 pub fn find(spec: &str, caller: &Caller) -> Result<App, String> {
