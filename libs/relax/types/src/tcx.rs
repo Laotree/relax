@@ -122,14 +122,6 @@ pub struct AdtT {
     pub no_niche: bool,
     /// per generic type param (lifetimes excluded): bounded `?Sized`
     pub param_maybe_unsized: Vec<bool>,
-    /// Live sessions (M10, hotreload.md section 13): fields from this index on were added by
-    /// edits and live in the value's extension block (layout.rs ext word); u32::MAX: none.
-    /// Fields before it keep the slots of the struct's first version (a removed one stays as a
-    /// dead slot, renamed so no code names it).
-    pub ext_from: u32,
-    /// Live sessions (M10): (added field, dead base slot) for a retyped scalar field -- running
-    /// values get the old value converted (`as`, lossless widening) instead of the default.
-    pub ext_conv: Vec<(u32, u32)>,
     /// Live sessions: the tags an in-place edit kept for the enum's running variants, and the
     /// integer they are read at (reload.rs enum_place). The discriminants are the new text's
     /// (`discriminant_for_variant`); reading one decodes the tag. None: each tag is the
@@ -1561,7 +1553,7 @@ impl Tcx {
             };
             flags.insert(identity);
         }
-        let mut adt = AdtT { region_contract: self.region_contract(cx, prog, d, &env), generic_indices: crate::types::variance::GenericIndices::from_env(&env), flags, region_params: env.regions.identity_args(&self.tys), is_enum: false, is_union: false, n_generics, variants: Vec::new(), repr_c, repr_int, repr_align, repr_packed, valid_start, valid_end, no_niche, param_maybe_unsized, ext_from: u32::MAX, ext_conv: Vec::new(), tag_pin: None };
+        let mut adt = AdtT { region_contract: self.region_contract(cx, prog, d, &env), generic_indices: crate::types::variance::GenericIndices::from_env(&env), flags, region_params: env.regions.identity_args(&self.tys), is_enum: false, is_union: false, n_generics, variants: Vec::new(), repr_c, repr_int, repr_align, repr_packed, valid_start, valid_end, no_niche, param_maybe_unsized, tag_pin: None };
         match &it.kind {
             ItemKind::Struct(r) => {
                 let (shape, fields) = self.lower_fields(cx, prog, file, module, &env, &ast.row(*r).data);
@@ -3776,8 +3768,7 @@ fn read_repr(prog: &Program, file: u32, attrs: &[ast::Attr], repr_c: &mut bool, 
         }
         for i in a.toks.lo + 1..a.toks.hi {
             let t = f.tok_text(i);
-            // repr(transparent) lays out as its one field: as repr(C) does for it (and it keeps
-            // the type out of live layout edits, layout.rs live_editable)
+            // repr(transparent) lays out as its one field: as repr(C) does for it
             if t == "C" || t == "transparent" {
                 *repr_c = true;
             }

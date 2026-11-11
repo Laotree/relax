@@ -842,7 +842,7 @@ fn gandalf_scope_uses_package_source_and_project_boundaries() {
 fn app_scope_live_layout_edits() {
     const CHILD: &str = "MAKEPAD_RUN_APP_LAYOUT_TEST";
     let Ok(case) = std::env::var(CHILD) else {
-        for case in ["app_lib", "path_crate", "framework", "embedded", "generic_embedded", "pointer", "bound_template", "bound_template_embedded", "derive_default", "live_crate", "enums"] {
+        for case in ["app_lib", "path_crate", "framework", "embedded", "generic_embedded", "pointer", "bound_template", "bound_template_embedded", "enums"] {
             let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "lazy_reload_tests::app_scope_live_layout_edits", "--nocapture", "--test-threads=1"])
                 .env(CHILD, case));
@@ -863,6 +863,22 @@ fn app_scope_live_layout_edits() {
         pub fn init(out: &mut State) { *out = State { value: 41 }; }
         pub fn value(out: &mut State) { out.value += 1; }
         pub fn name(out: &mut &str) { *out = std::any::type_name::<State>(); }
+        pub const SIZE: u64 = std::mem::size_of::<State>() as u64;
+        pub fn size(out: &mut [u64; 2]) { let s = &std::mem::size_of::<State>(); *out = [*s as u64, SIZE]; }
+        pub struct Measured { pub n: u32 }
+        static MEASURED: usize = std::mem::size_of::<Measured>();
+        pub fn measured(out: &mut u64) { *out = MEASURED as u64; }
+        pub fn adder(n: u64) -> impl Fn(u64) -> u64 { move |x| x + n }
+        pub fn add_dyn(out: &mut u64) { let f = adder(2); let d: &dyn Fn(u64) -> u64 = &f; *out = d(*out); }
+        pub struct Kept { pub n: u32 }
+        static KEPT: std::sync::Mutex<Vec<Kept>> = std::sync::Mutex::new(Vec::new());
+        pub fn keep(out: &mut u64) { let mut k = KEPT.lock().unwrap(); k.push(Kept { n: 5 }); *out = k.iter().map(|x| x.n as u64).sum(); }
+        pub struct Mixed { pub a: u8, pub s: String, pub c: u16, pub d: u32 }
+        pub fn mixed(out: &mut [u64; 7]) {
+            let m = Mixed { a: 1, s: String::from("xy"), c: 3, d: 4 };
+            *out = [std::mem::size_of::<Mixed>() as u64, std::mem::align_of::<Mixed>() as u64, std::mem::offset_of!(Mixed, a) as u64, std::mem::offset_of!(Mixed, s) as u64,
+                std::mem::offset_of!(Mixed, c) as u64, std::mem::offset_of!(Mixed, d) as u64, m.a as u64 + m.s.len() as u64 + m.c as u64 + m.d as u64];
+        }
         pub enum Ease { Linear, Pow(f64), Curve(f32, f32, f32, f32) }
         pub enum Yoyo { Invert, Ease(Ease) }
         pub enum Held { Nothing, Has(Yoyo) }
@@ -924,9 +940,7 @@ fn app_scope_live_layout_edits() {
     };
     let before = before.as_str();
     std::fs::write(&path, before).unwrap();
-    let mut session = crate::Session::default();
-    if case == "derive_default" { session.options.live = true; }
-    let session = Arc::new(session);
+    let session = Arc::new(crate::Session::default());
     let (mut prog, core, lib) = crate::load_with_std(&session, path.to_str().unwrap(), "app_lib", false).unwrap();
     let cfg = crate::cfg::CfgSet::host(&session, &[]);
     let bin_path = dir.join("main.rs");
@@ -954,20 +968,26 @@ fn app_scope_live_layout_edits() {
     let init = def("init", lib);
     let value = def("value", lib);
     let name = def("name", lib);
+    let keep = def("keep", lib);
+    let mixed = def("mixed", lib);
+    let size = def("size", lib);
+    let measured = def("measured", lib);
+    let add_dyn = def("add_dyn", lib);
+    let mixed_def = def("Mixed", lib);
     let enums = [def("Ease", lib), def("Yoyo", lib), def("Held", lib)];
     let enum_fns = (case == "enums").then(|| [def("make", lib), def("step", lib), def("read", lib), def("transient", lib)]);
     let mut roots = vec![bin_path.to_string_lossy().into_owned()];
-    if case != "framework" && case != "live_crate" { roots.push(path.to_string_lossy().into_owned()); }
+    // (the "framework" case: the edited crate is outside the app scope, which changes nothing of
+    // its layouts or edits)
+    if case != "framework" { roots.push(path.to_string_lossy().into_owned()); }
     crate::borrowck::event::set_app_scope(roots);
-    // a crate outside the scope that an earlier run of the session handed on (a refused layout
-    // edit of it: the "framework" case below) takes live layouts: its edits patch
-    if case == "live_crate" { crate::layout::set_live_crates(vec![path.to_string_lossy().into_owned()]); }
     crate::layout::set_root_crate(bin);
     crate::layout::LIVE_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut tcx = crate::tcx::Tcx::new();
     tcx.collect(&prog);
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
     let ty = tcx.tys.intern(TyKind::Adt(state, tcx.tys.mk_list(&[]), RegionArgsId::EMPTY));
+    let mixed_ty = tcx.tys.intern(TyKind::Adt(mixed_def, tcx.tys.mk_list(&[]), RegionArgsId::EMPTY));
     let enums = enums.map(|e| tcx.tys.intern(TyKind::Adt(e, tcx.tys.mk_list(&[]), RegionArgsId::EMPTY)));
     if case.starts_with("bound_template") {
         use crate::consts::GenericArg;
@@ -994,31 +1014,32 @@ fn app_scope_live_layout_edits() {
     let init = entry(&mut u, init);
     let value = entry(&mut u, value);
     let name = entry(&mut u, name);
+    let keep = entry(&mut u, keep);
+    let mixed = entry(&mut u, mixed);
+    let size = entry(&mut u, size);
+    let measured = entry(&mut u, measured);
+    let add_dyn = entry(&mut u, add_dyn);
     let layout = u.layout_of(ty).clone();
-    assert_eq!(layout.ext.is_some(), case != "framework");
+    assert_eq!((layout.size, &layout.fields[..]), (8, &[0][..]), "State");
     // an enum is laid out as rustc lays it in a live session too (M84: a tagged layout with no
     // niche to give made the program's own size assert fail): Yoyo and Held fill Ease's tag niche
     let sizes = enums.map(|t| u.layout_of(t).size);
     assert_eq!(sizes, [24, 24, 24], "Ease, Yoyo, Held");
-    if case == "derive_default" {
-        let after = before.replace("pub value: u64 }", "pub value: u64, #[rust(make(vm))] pub later: u64 }")
-            .replace("State { value: 41 }", "State { value: 41, later: 5 }")
-            + "\nfn make(_: u32) -> u64 { 5 }\n";
-        let restart = unsafe { reload::apply(up, vec![Edit { file: u.prog.def(state).file, path: path.to_string_lossy().into_owned(), src: after.as_bytes().to_vec() }]) };
-        assert_eq!(restart.rung, Rung::Restart, "{:?}", restart.lines);
-        assert!(restart.lines.iter().any(|l| l.contains("#[rust(..)]") && l.contains("restart the app")), "{:?}", restart.lines);
-        let after = after.replace("make(vm)", "make(3)");
-        let patch = unsafe { reload::apply(up, vec![Edit { file: u.prog.def(state).file, path: path.to_string_lossy().into_owned(), src: after.as_bytes().to_vec() }]) };
-        assert_eq!(patch.rung, Rung::Patch, "{:?}", patch.lines);
-        let after = after + "\npub struct Fresh { #[rust(make(vm))] pub n: u64 }\n";
-        let patch = unsafe { reload::apply(up, vec![Edit { file: u.prog.def(state).file, path: path.to_string_lossy().into_owned(), src: after.into_bytes() }]) };
-        assert_eq!(patch.rung, Rung::Patch, "{:?}", patch.lines);
-        std::mem::forget(u);
-        std::fs::remove_dir_all(dir).unwrap();
-        return;
-    }
     let mut old_value = vec![0u64; (layout.size as usize + 7) / 8];
     let call = |entry, arg| unsafe { jit::call_jit(up, entry, arg) }.unwrap_or_else(|p| panic!("JIT: {}", p.message));
+    // R11 (M84): a struct of the program that is not Copy is laid out as rustc lays it in a live
+    // session too: its layout, and size_of, align_of and offset_of! in its code, are this test
+    // binary's own for the same definition
+    struct Mixed { a: u8, s: String, c: u16, d: u32 }
+    let m = Mixed { a: 1, s: String::from("xy"), c: 3, d: 4 };
+    let rustc = [std::mem::size_of::<Mixed>(), std::mem::align_of::<Mixed>(), std::mem::offset_of!(Mixed, a), std::mem::offset_of!(Mixed, s),
+        std::mem::offset_of!(Mixed, c), std::mem::offset_of!(Mixed, d)].map(|x| x as u64);
+    let mut out = [0u64; 7];
+    call(mixed, out.as_mut_ptr() as u64);
+    assert_eq!((&out[..6], out[6]), (&rustc[..], m.a as u64 + m.s.len() as u64 + m.c as u64 + m.d as u64), "Mixed in the JIT's code");
+    let ml = u.layout_of(mixed_ty);
+    let laid: Vec<u64> = [ml.size, ml.align].into_iter().chain(ml.fields.iter().copied()).map(u64::from).collect();
+    assert_eq!(laid, rustc, "Mixed's layout");
     if let Some(fns) = enum_fns {
         // M84: a variant added to an enum the program holds values of applies in place when
         // rustc's layout of the new text, or that layout with the running variants' tags kept,
@@ -1110,41 +1131,92 @@ fn app_scope_live_layout_edits() {
     let actual_name = unsafe { std::slice::from_raw_parts(actual_name[0] as *const u8, actual_name[1]) };
     let actual_name = std::str::from_utf8(actual_name).unwrap();
     assert_eq!(actual_name, crate::typeck::type_name(&u.prog, &u.tcx, ty));
-    let after = before.replace("pub value: u64 }", "pub value: u64, pub extra: u64 }")
+    // M84 step 5, R12: an edit applies in place when no field moves (a rename); one that moves
+    // fields takes rustc's layout of the new text when no running value of the struct is left (the
+    // test holds its values in its own memory, which no static shows), and restarts when one may be
+    let file = u.prog.def(state).file;
+    let lib_path = path.to_string_lossy().into_owned();
+    let apply = |src: &str| unsafe { reload::apply(up, vec![Edit { file, path: lib_path.clone(), src: src.as_bytes().to_vec() }]) };
+    // size_of in code whose text no edit changes (`size`): rebuilt for each new layout, and in a
+    // const it reads (`SIZE`): evaluated again
+    let size_now = || {
+        let mut n = [0u64; 2];
+        call(size, n.as_mut_ptr() as u64);
+        (n[0], n[1])
+    };
+    assert_eq!(size_now(), (8, 8), "size_of::<State>() before the edits");
+    // a trait object of a closure its fn returns (`-> impl Fn`): it holds no State, whatever the
+    // closure's owner returns (that cycle once counted as a holder and restarted every struct edit)
+    let mut n = 1u64;
+    call(add_dyn, &mut n as *mut u64 as u64);
+    assert_eq!(n, 3);
+    let added = before.replace("pub value: u64 }", "pub value: u64, pub extra: u64 }")
         .replace("State { value: 41 }", "State { value: 41, extra: 0 }")
-        .replace("out.value += 1;", "assert_eq!(out.extra, 0); out.extra = 7; out.value += 1; obsolete_style();")
+        .replace("out.value += 1;", "out.value += 1; out.extra += 7; obsolete_style();")
         // Generated child styles register their own function entry. Removing the child
         // removes this helper too; its old body must not be checked against the new names.
         + "\nfn obsolete_style() { let _entry = obsolete_style as fn(); }\n";
-    let patch = unsafe { reload::apply(up, vec![Edit { file: u.prog.def(state).file, path: path.to_string_lossy().into_owned(), src: after.into_bytes() }]) };
-    // A struct outside the app scope keeps its layout fixed: restart. One embedded by value in a
-    // framework type (`Holder`, like the platform's `Option<App>`) patches: its first layout stays.
-    if case == "framework" {
-        assert_eq!(patch.rung, Rung::Restart, "{:?}", patch.lines);
-        assert!(patch.lines.iter().any(|l| l.contains("`app_lib` is outside the app scope") && l.contains("restart the app")), "{:?}", patch.lines);
-        // the refusal hands the crate to the session's next run, which lays it out for live edits
-        let root = crate::vfs::normalize_path(&path.to_string_lossy());
-        assert_eq!(crate::reload::live_crates_next(), vec![root.clone()]);
-        let next = crate::reload::next_run_env(None).unwrap();
-        assert!(next.iter().any(|(k, v)| *k == "MAKEPAD_RUN_LIVE_CRATES" && v.as_deref() == Some(std::ffi::OsStr::new(&root))), "{next:?}");
-        call(value, old_value.as_mut_ptr() as u64);
-    } else {
-        assert_eq!(patch.rung, Rung::Patch, "{:?}", patch.lines);
-        call(value, old_value.as_mut_ptr() as u64); // old allocation receives extra's default
-        let removed = unsafe { reload::apply(up, vec![Edit { file: u.prog.def(state).file, path: path.to_string_lossy().into_owned(), src: before.as_bytes().to_vec() }]) };
-        assert_eq!(removed.rung, Rung::Patch, "{:?}", removed.lines);
-        call(value, old_value.as_mut_ptr() as u64);
-        assert_eq!(old_value[layout.fields[0] as usize / 8], 44);
-        // The previously compiled drop entry was rebuilt in the same transaction.
-        assert!(patch.names.contains(&u.fns[drop_id as usize].name.to_string()));
-        call(drop_entry, old_value.as_mut_ptr() as u64);
-        // A layout-only edit must publish even when no function entry changed.
-        let dormant = before.replace("pub n: u32 }", "pub n: u32, pub added: bool }");
-        let pure = unsafe { reload::apply(up, vec![Edit { file: u.prog.def(state).file, path: path.to_string_lossy().into_owned(), src: dormant.into_bytes() }]) };
-        assert_eq!(pure.rung, Rung::Patch, "{:?}", pure.lines);
-        assert!(pure.names.is_empty(), "{:?}", pure.names);
-
-    }
+    let patch = apply(&added);
+    assert_eq!(patch.rung, Rung::Patch, "field added: {:?}", patch.lines);
+    assert!(patch.lines.iter().any(|l| l.contains("struct `app_lib::State` takes its new layout")), "{:?}", patch.lines);
+    // the drop glue compiled before was rebuilt in the same transaction
+    assert!(patch.names.contains(&u.fns[drop_id as usize].name.to_string()), "{:?}", patch.names);
+    let grown = u.layout_of(ty).clone();
+    assert_eq!((grown.size, size_now()), (16, (16, 16)), "State with its field added: its layout, and size_of in its code and its const (rebuilt: {:?})", patch.names);
+    let mut fresh = vec![0u64; 2];
+    call(init, fresh.as_mut_ptr() as u64);
+    call(value, fresh.as_mut_ptr() as u64);
+    let at = |l: &crate::layout::Layout, v: &[u64], i: usize| v[l.fields[i] as usize / 8];
+    assert_eq!((at(&grown, &fresh, 0), at(&grown, &fresh, 1)), (42, 7), "a value made in the new layout");
+    // a rename keeps every field in its place: the value made before reads on
+    let renamed = added.replace("pub extra: u64", "pub more: u64").replace("extra: 0", "more: 0").replace("out.extra += 7", "out.more += 7");
+    let patch = apply(&renamed);
+    assert_eq!(patch.rung, Rung::Patch, "field renamed: {:?}", patch.lines);
+    assert!(patch.lines.iter().any(|l| l.contains("field `extra` of `app_lib::State` renamed to `more` (value kept)")), "{:?}", patch.lines);
+    call(value, fresh.as_mut_ptr() as u64);
+    assert_eq!((at(&grown, &fresh, 0), at(&grown, &fresh, 1)), (43, 14), "the renamed field's value");
+    // the field removed again: the first layout, which the value made before the edits has
+    let removed = apply(before);
+    assert_eq!(removed.rung, Rung::Patch, "field removed: {:?}", removed.lines);
+    assert_eq!((u.layout_of(ty).size, size_now()), (8, (8, 8)), "State with its field removed: its layout, and size_of in its code and its const");
+    call(value, old_value.as_mut_ptr() as u64);
+    assert_eq!(old_value[layout.fields[0] as usize / 8], 43);
+    call(drop_entry, old_value.as_mut_ptr() as u64);
+    // a static holds values of Kept: a field added to it restarts, naming the static, and the
+    // running code reads them on
+    let mut sum = 0u64;
+    call(keep, &mut sum as *mut u64 as u64);
+    assert_eq!(sum, 5);
+    let held = before.replace("pub struct Kept { pub n: u32 }", "pub struct Kept { pub n: u32, pub m: u32 }").replace("Kept { n: 5 }", "Kept { n: 5, m: 1 }");
+    let restart = apply(&held);
+    assert_eq!(restart.rung, Rung::Restart, "a held struct's field added: {:?}", restart.lines);
+    assert!(restart.lines.iter().any(|l| l.contains("struct `Kept` changed its layout, and `app_lib::KEPT` may hold values of it in the old one") && l.contains("restart the app")),
+        "{:?}", restart.lines);
+    call(keep, &mut sum as *mut u64 as u64);
+    assert_eq!(sum, 10, "Kept's values after the restart is offered");
+    // a held field retyped to one of its size (the same bytes, read as another type) restarts too
+    let retyped = before.replace("pub struct Kept { pub n: u32 }", "pub struct Kept { pub n: f32 }").replace("Kept { n: 5 }", "Kept { n: 5.0 }");
+    let restart = apply(&retyped);
+    assert_eq!(restart.rung, Rung::Restart, "a held struct's field retyped: {:?}", restart.lines);
+    assert!(restart.lines.iter().any(|l| l.contains("struct `Kept` changed its layout, and `app_lib::KEPT` may hold values of it in the old one")), "{:?}", restart.lines);
+    call(keep, &mut sum as *mut u64 as u64);
+    assert_eq!(sum, 15, "Kept's values after the retype's restart is offered");
+    // a static's value was computed from Measured's layout (an initializer runs once): a field
+    // added to it restarts, naming the static, and the running code reads the old value on
+    let mut n = 0u64;
+    call(measured, &mut n as *mut u64 as u64);
+    assert_eq!(n, 4);
+    let restart = apply(&before.replace("pub struct Measured { pub n: u32 }", "pub struct Measured { pub n: u32, pub m: u32 }"));
+    assert_eq!(restart.rung, Rung::Restart, "a struct a static's value measured: {:?}", restart.lines);
+    assert!(restart.lines.iter().any(|l| l.contains("struct `Measured` changed its layout, and the value of `app_lib::MEASURED` was computed from the old one")), "{:?}", restart.lines);
+    call(measured, &mut n as *mut u64 as u64);
+    assert_eq!(n, 4, "MEASURED after the restart is offered");
+    // no code uses Dormant: its new layout publishes with no fn rebuilt
+    let dormant = before.replace("pub struct Dormant { pub n: u32 }", "pub struct Dormant { pub n: u32, pub added: bool }");
+    let pure = apply(&dormant);
+    assert_eq!(pure.rung, Rung::Patch, "{:?}", pure.lines);
+    assert!(pure.lines.iter().any(|l| l.contains("struct `app_lib::Dormant` takes its new layout")), "{:?}", pure.lines);
+    assert!(pure.names.is_empty(), "{:?}", pure.names);
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }

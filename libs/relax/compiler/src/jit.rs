@@ -60,8 +60,6 @@ pub const GLUE_CLONE: u8 = 4;
 
 /// a #[track_caller] fn as a value: forwards with its definition site as the location
 
-/// a live-editable struct's extension block (M10): drops the fields it holds and frees it
-pub const GLUE_EXT_DROP: u8 = 3;
 /// a tuple-struct / tuple-variant constructor used as a fn value: GLUE_CTOR + variant index,
 /// for the constructor's fn pointer type `fn(fields..) -> Adt`
 pub const GLUE_CTOR: u8 = 16;
@@ -5917,26 +5915,6 @@ impl Unit {
     /// Whether the monomorphic type `t` is Copy (rustc's Copy rules: primitives, shared
     /// references, raw and fn pointers, tuples / arrays of Copy, ADTs with a Copy impl; a
     /// closure only without captures here -- false is the safe answer for `is_copy` users).
-    /// The anonymous const holding struct `d`'s declared default for field `field` (`field: T =
-    /// expr`, or makepad's `#[rust(expr)]` in live sessions; parser derive.rs default_consts).
-    pub fn field_default_const(&self, d: crate::program::DefId, field: u32) -> Option<crate::program::DefId> {
-        if field & 0x8000_0000 != 0 {
-            return None;
-        }
-        let ty = self.prog.syms.str(self.prog.def(d).name).trim_start_matches("r#").to_string();
-        let cname = crate::parser::derive::default_const_name(&ty, None, self.prog.syms.str(field).trim_start_matches("r#"));
-        let s = self.prog.syms.get(&cname)?;
-        self.prog.lookup_in_scope(self.prog.def(d).scope, s, false)
-    }
-
-    /// Whether `t` has a `Default` impl (a field added live takes it in running values, M10).
-    pub fn has_default(&self, t: TyId) -> bool {
-        match self.core_path(&["default", "Default"]) {
-            Some(td) => self.tcx.type_implements_trait(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), TraitRef { def_id: td, args: vec![GenericArg::Type(t)] }).must_apply_modulo_regions(),
-            None => false,
-        }
-    }
-
     pub fn is_copy(&self, t: TyId) -> bool {
         let Some(td) = self.tcx.lang_items.get(LangItem::Copy) else { return false; };
         self.tcx.type_implements_trait(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), TraitRef { def_id: td, args: vec![GenericArg::Type(t)] }).must_apply_modulo_regions()
@@ -6185,35 +6163,9 @@ impl Unit {
         }
     }
 
-    /// Runtime cleanup includes live-session extension allocations, even when the
-    /// language needs_drop query is false. Walk owned fields so enclosing aggregates
-    /// schedule the glue that emits GLUE_EXT_DROP / rt_ext_free in lower.rs.
+    /// Whether a `t` needs drop glue (the language's needs_drop query).
     pub fn needs_drop_glue(&self, t: TyId) -> bool {
-        let env = crate::tcx::TypingEnv::fully_monomorphized(&self.prog);
-        if self.tcx.needs_drop(&self.prog, env, t) { return true; }
-        if !crate::layout::LIVE_SESSION.load(Ordering::Relaxed) { return false; }
-        let mut todo = vec![t];
-        let mut seen = crate::fxhash::HashSet::default();
-        while let Some(t) = todo.pop() {
-            if !seen.insert(t) { continue; }
-            match self.tcx.tys.kind(t) {
-                TyKind::Adt(d, args, _) => {
-                    let adt = &self.tcx.adts[d];
-                    if adt.is_manually_drop() || adt.is_union() || adt.is_phantom_data() { continue; }
-                    if self.tcx.tys.is_concrete(t) && self.layout_of(t).ext.is_some() { return true; }
-                    for (vi, v) in adt.variants.iter().enumerate() {
-                        for fi in 0..v.fields.len() {
-                            todo.push(self.tcx.field_ty(&self.prog, env, *d, vi as u32, fi as u32, self.tcx.tys.list(*args)));
-                        }
-                    }
-                }
-                TyKind::Tuple(fields) => todo.extend_from_slice(self.tcx.tys.list(*fields)),
-                TyKind::Array(elem, n) => { if n.try_to_target_usize(&self.tcx.tys) != Some(0) { todo.push(*elem); } }
-                TyKind::Slice(elem) | TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: elem, .. }) => todo.push(*elem),
-                _ => {}
-            }
-        }
-        false
+        self.tcx.needs_drop(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), t)
     }
 
     /// Whether dropping a `t` can unwind: some Drop impl in it outside Relax's std (core /
@@ -22659,7 +22611,7 @@ pub unsafe fn prepare_teardown(up: *mut Unit) {
                 owner::publish(|| {
                     let u = &*up;
                     for id in scanned..u.fns.len() {
-                        if matches!(u.fns[id].key, FnKey::Glue(GLUE_DROP | GLUE_EXT_DROP, _)) && seen.insert(id as u32) {
+                        if matches!(u.fns[id].key, FnKey::Glue(GLUE_DROP, _)) && seen.insert(id as u32) {
                             work.push((id as u32, 0));
                         }
                     }
@@ -22705,7 +22657,7 @@ pub unsafe fn prepare_teardown(up: *mut Unit) {
                             let relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) = i else { continue };
                             let c = *c;
                             let d = match &u.fns[c as usize].key {
-                                FnKey::Glue(GLUE_DROP | GLUE_EXT_DROP, _) => 0,
+                                FnKey::Glue(GLUE_DROP, _) => 0,
                                 FnKey::Inst(d, _) if u.prog.def(*d).kind != DefKind::ForeignFn => depth + 1,
                                 FnKey::Closure(cf, _, parent) if u.has_body(*parent, *cf) => depth + 1,
                                 _ => continue,
