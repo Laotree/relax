@@ -543,14 +543,18 @@ pub struct CacheStats {
     pub verify_diff_inputs: u64,
     pub verify_diff_code: u64,
     pub verify_diff_reloc: u64,
-    /// cached entries of another tier than the verifying build's (an O2 or O3 rebuild replaced
-    /// the first build's entry): not compared
+    /// cached entries of another tier than the verifying build's, both at O1 or below and
+    /// complete: not compared
     pub verify_other_tier: u64,
     /// entries one side built as provisional code (TIER_PROVISIONAL) and the other otherwise, or
-    /// with other pending inputs: not compared
+    /// with other pending inputs, both at O1 or below: not compared
     pub verify_provisional: u64,
-    /// of those, the pairs whose cached entry is provisional
-    pub verify_provisional_cached: u64,
+    /// cached entries outside the purity rule, O2 and O3 code (a rebuild replaced the first
+    /// build's entry; the verifying build is base or O1): not compared
+    pub verify_outside: [u64; 2],
+    /// (verify) purity breaches: complete records at O1 or below that name an inlined slot whose
+    /// inline body is provisional (encode_inputs)
+    pub purity_breaches: u64,
     pub packs: u64,
     pub packs_rejected: u64,
     pub index_entries: u64,
@@ -3597,7 +3601,7 @@ impl Cache {
     /// ones (each list by key, in key order: the same slots encode the same in every session), the
     /// nounwind answers and the dependency certificate. Verify compares a cached entry's with the
     /// fresh build's.
-    fn encode_inputs(&mut self, u: &Unit, id: u32, o3: Option<(&[u32], &[(u32, bool)])>, kind: RecKind, pending: Option<&PendingRecord>, e: &mut E) -> Option<()> {
+    fn encode_inputs(&mut self, u: &Unit, id: u32, o3: Option<(&[u32], &[(u32, bool)])>, kind: RecKind, pending: Option<&PendingRecord>, breaches: bool, e: &mut E) -> Option<()> {
         let o2 = kind == RecKind::O2;
         let base = o3.is_none() && kind == RecKind::First && match pending {
             Some(p) => p.baseline,
@@ -3614,7 +3618,8 @@ impl Cache {
             None => u.fns[id as usize].rir.as_ref().map_or(&[][..], |r| r.pending.as_slice()),
         };
         let level = if o3.is_some() { TIER_O3 } else if o2 { TIER_O2 } else if base { TIER_BASE } else { TIER_O1 };
-        e.u8(if unverified || !left.is_empty() { level | TIER_PROVISIONAL } else { level });
+        let provisional = unverified || !left.is_empty();
+        e.u8(if provisional { level | TIER_PROVISIONAL } else { level });
         let inlined;
         let inl = match pending {
             Some(p) => &p.inlined,
@@ -3623,6 +3628,19 @@ impl Cache {
                 &inlined
             }
         };
+        // (verify, `breaches`: a record) the purity rule's invariant: a complete record at O1 or
+        // below names no inlined slot whose inline body is provisional -- that slot would be one
+        // of its pending slots
+        if breaches && !provisional && level != TIER_O2 && level != TIER_O3 {
+            for &x in inl {
+                if x != id && (x as usize) < u.fns.len() && crate::jit::inline_body(&u.fns[x as usize]).is_some_and(|r| !r.pending.is_empty()) {
+                    self.stats.purity_breaches += 1;
+                    if self.verbose {
+                        eprintln!("makepad-run cache: purity breach: {} [{}] inlines {}, whose body is provisional", crate::syms::stable_fn_name(u, id), if level == TIER_BASE { "base" } else { "O1" }, crate::syms::stable_fn_name(u, x));
+                    }
+                }
+            }
+        }
         for (list, what) in [(inl.as_slice(), "inlined slot key"), (left, "pending slot key")] {
             let mut keys = Vec::with_capacity(list.len());
             for &x in list {
@@ -3700,7 +3718,7 @@ impl Cache {
         let mut e = E::default();
         e.u32(ENTRY_VERSION);
         e.str(&u.fns[id as usize].name);
-        self.encode_inputs(u, id, o3, kind, pending, &mut e)?;
+        self.encode_inputs(u, id, o3, kind, pending, self.mode == Mode::Verify, &mut e)?;
         e.bytes(code);
         e.u32(relocs.len() as u32);
         let mut rw = Vec::new();
@@ -4152,7 +4170,7 @@ impl Cache {
         }
         if self.verbose && self.mode == Mode::Verify {
             let s = &self.stats;
-            eprintln!("makepad-run cache: verify: {} identical, {} different ({} with other recorded inputs, {} code from the same inputs, {} only a relocation), {} of another tier, {} provisional (not compared; {} provisional in the cache)", s.verify_same, s.verify_diff, s.verify_diff_inputs, s.verify_diff_code, s.verify_diff_reloc, s.verify_other_tier, s.verify_provisional, s.verify_provisional_cached);
+            eprintln!("makepad-run cache: verify: {} identical, {} different ({} with other recorded inputs, {} code from the same inputs, {} only a relocation), {} of another tier, {} provisional (not compared), outside the rule (not compared): {} O2, {} O3; {} purity breaches", s.verify_same, s.verify_diff, s.verify_diff_inputs, s.verify_diff_code, s.verify_diff_reloc, s.verify_other_tier, s.verify_provisional, s.verify_outside[0], s.verify_outside[1], s.purity_breaches);
         }
         if self.mode == Mode::ReadOnly {
             return Ok(0);
@@ -5112,11 +5130,10 @@ impl Cache {
         let provisional = base && u.fns[id as usize].unverified.load(std::sync::atomic::Ordering::Relaxed) || rir.is_some_and(|r| !r.pending.is_empty());
         let fresh_tier = (if base { TIER_BASE } else { TIER_O1 }) | (if provisional { TIER_PROVISIONAL } else { 0 });
         if let Some(t) = payload_tier(&cached).filter(|t| *t != fresh_tier) {
-            if (t | fresh_tier) & TIER_PROVISIONAL != 0 {
-                self.stats.verify_provisional += 1;
-                self.stats.verify_provisional_cached += u64::from(t & TIER_PROVISIONAL != 0);
-            } else {
-                self.stats.verify_other_tier += 1;
+            match tier_level(t) {
+                l @ 2..=3 => self.stats.verify_outside[l as usize - 2] += 1,
+                _ if (t | fresh_tier) & TIER_PROVISIONAL != 0 => self.stats.verify_provisional += 1,
+                _ => self.stats.verify_other_tier += 1,
             }
             return None;
         }
@@ -5194,11 +5211,10 @@ impl Cache {
         let same_nounwind = cached[start..end] == encoded;
         let mut fresh_inputs = E::default();
         let inputs_end = d.p;
-        let encodable = self.encode_inputs(u, id, None, RecKind::First, None, &mut fresh_inputs).is_some();
+        let encodable = self.encode_inputs(u, id, None, RecKind::First, None, false, &mut fresh_inputs).is_some();
         let same_inputs = same_nounwind && encodable && fresh_inputs.0[..] == cached[inputs_at..inputs_end];
         if provisional && !same_inputs {
             self.stats.verify_provisional += 1;
-            self.stats.verify_provisional_cached += 1;
             return None;
         }
         // only the nounwind answers differ (the cached inputs with the fresh answers in their place
