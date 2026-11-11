@@ -1,6 +1,7 @@
 //! Live edits of async code: after a patch every new call runs the new code -- an edited async
 //! fn awaited from an async block or an async fn of a file the edit does not touch, an edited
-//! async block, and an edit that also retypes a field of a struct the coroutine holds.
+//! async block, and an edit that also retypes a field of a struct the coroutine holds (retyping
+//! one that holds a niche restarts).
 //! (`live_app` and `in_child` are the live-session harness of reload_items_tests too.)
 use std::sync::Arc;
 
@@ -204,6 +205,20 @@ fn edited_async_code_runs_on_the_next_call() {
                 assert_eq!((call("drive"), call("drive_job")), (101, 101), "nothing of the edit installed");
                 return;
             }
+            // retyping `from`, which holds the niche an `Option<Trace>` keeps its tag in (values
+            // built after the edit would leave it unset): restarts in place, nothing installed
+            let retype_from = [
+                ("pub from: Option<u64>,", "pub from: Option<(u64, u64)>,"),
+                ("Trace { from: Some(1), n: 0 };", "Trace { from: Some((1, 2)), n: 0 };"),
+                ("t.from.unwrap_or(0) + t.n + 100;", "t.from.map_or(0, |(a, b)| a + b) + t.n + 100;"),
+            ];
+            let outcome = edit("lib.rs", &retype_from);
+            assert_eq!(outcome.rung, crate::reload::Rung::Restart, "{:?}", outcome.lines);
+            assert!(outcome.lines.iter().any(|l| l.contains("field `from` was removed or retyped, and it holds the niche")), "{:?}", outcome.lines);
+            assert_eq!(call("drive"), 101, "nothing of the refused edit installed");
+            // the running text again: applies
+            let outcome = edit("lib.rs", &retype_from.map(|(a, b)| (b, a)));
+            assert_eq!(outcome.rung, crate::reload::Rung::Patch, "{:?}", outcome.lines);
             let mut patch = |subs: &[(&str, &str)]| {
                 let outcome = edit("lib.rs", subs);
                 assert_eq!(outcome.rung, crate::reload::Rung::Patch, "{subs:?}: {:?}", outcome.lines);
@@ -219,11 +234,13 @@ fn edited_async_code_runs_on_the_next_call() {
             // an async block edited in its fn
             patch(&[("*out = 7;", "*out = 8;")]);
             assert_eq!(call("drive_block"), 8, "the edited async block runs");
-            // a field of a struct the coroutine holds across its await retyped, with the async fn's body
+            // a field of a struct the coroutine holds across its await retyped, with the async fn's
+            // body (`n`: `from` holds the niche an `Option<Trace>` keeps its tag in, and retyping
+            // it restarts)
             patch(&[
-                ("pub from: Option<u64>,", "pub from: Option<(u64, u64)>,"),
-                ("Trace { from: Some(1), n: 4 };", "Trace { from: Some((1, 2)), n: 0 };"),
-                ("t.from.unwrap_or(0) + t.n + 200;", "t.from.map_or(0, |(a, b)| a + b) + t.n + 300;"),
+                ("pub n: u64 }", "pub n: (u64, u64) }"),
+                ("Trace { from: Some(1), n: 4 };", "Trace { from: Some(1), n: (2, 0) };"),
+                ("t.from.unwrap_or(0) + t.n + 200;", "t.from.unwrap_or(0) + t.n.0 + t.n.1 + 300;"),
             ]);
             assert_eq!(call("drive"), 303, "the async fn's body over the retyped field");
             assert_eq!(call("drive_outer"), 1303, "the same through the async fn awaiting it");
