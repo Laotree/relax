@@ -1221,6 +1221,7 @@ fn realtime_strict_ready_lazy_and_patch_freeze() {
     let o = edit(src(12, 6));
     assert_eq!(o.rung, Rung::Patch, "{:?}", o.lines);
     assert_eq!(run(value_entry), 12);
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -1327,6 +1328,7 @@ fn realtime_reach_follows_vtables_made_after_the_mark() {
     assert!(!compiled(ticket) || next_built(), "compiled right after the first `Box<Arc2> -> Box<dyn Route>`, with `<Arc2 as Route>::next` lazy");
     wait(ticket);
     assert_eq!(run_rt(cp), (42, 0), "the real-time thread met a lazy compile");
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -1397,6 +1399,7 @@ fn realtime_reach_follows_trait_objects_held_deep_in_the_roots_value() {
         (unsafe { *(cp as *const u32) }, crate::jit::__relax_realtime_misses() - before)
     }).join().unwrap();
     assert_eq!((out, misses), (8, 0), "the real-time thread met lazy compiles (MAKEPAD_RUN_RT_TRACE=1 names them)");
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -1473,6 +1476,7 @@ fn realtime_reach_skips_trait_objects_it_only_makes_itself() {
         (unsafe { *(cp as *const u32) }, crate::jit::__relax_realtime_misses() - before)
     }).join().unwrap();
     assert_eq!((out, misses), (6, 0), "the real-time thread met lazy compiles (MAKEPAD_RUN_RT_TRACE=1 names them)");
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -1551,6 +1555,7 @@ fn realtime_reach_walks_code_that_ran_before_the_mark() {
         (unsafe { *((cp + 4) as *const u32) }, crate::jit::__relax_realtime_misses() - before)
     }).join().unwrap();
     assert_eq!((out, misses), (3 + 5, 0), "the real-time thread met lazy compiles (MAKEPAD_RUN_RT_TRACE=1 names them)");
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -1627,6 +1632,7 @@ fn realtime_reach_covers_float_formatting_and_container_drops() {
     }).join().unwrap();
     let want = format!("{:.3} {}", 2f64 * 1.5, 2f32 / 3.0).len() as u32 + (2 + 2 + 3) + (2 + 7);
     assert_eq!((out, misses), (want, 0), "the real-time thread met lazy compiles (MAKEPAD_RUN_RT_TRACE=1 names them)");
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -1634,9 +1640,10 @@ fn realtime_reach_covers_float_formatting_and_container_drops() {
 /// A tier-up of real-time code whose new code calls fns that never had code (an O2 build, then an
 /// O3 build, each calling a fn nothing called before, which calls another such fn): those are
 /// compiled before the new code is installed, the old code running meanwhile, so the real-time
-/// thread meets no lazy compile. The drain that walks what an install names afterwards is held,
-/// so a pass never rests on it winning the race against the real-time thread. (Fab's arm lab met
-/// such compiles of thread-local accessors in its armed loop.)
+/// thread meets no lazy compile. An install whose references were not walked before it is a hole
+/// the install says and counts (realtime_holes), so a pass never rests on the walk after it
+/// winning the race against the real-time thread. (Fab's arm lab met such compiles of thread-local
+/// accessors in its armed loop.)
 #[test]
 fn realtime_tier_up_compiles_new_callees_before_its_install() {
     const CHILD: &str = "MAKEPAD_RUN_RT_TIER_UP_TEST";
@@ -1702,7 +1709,6 @@ fn realtime_tier_up_compiles_new_callees_before_its_install() {
     for (s, name) in [(second, "second"), (third, "third"), (twenty, "twenty"), (three_hundred, "three_hundred")] {
         assert!(!u.fns[s as usize].compiled, "`{name}` has code before any code calls it");
     }
-    crate::jit::RT_DRAIN_HOLD.store(true, Ordering::Release);
     // the new code's call goes to `to` where the code it replaces called `from`
     let redirect = |f: &mut Func, from: u32, to: u32| {
         let mut n = 0;
@@ -1729,14 +1735,140 @@ fn realtime_tier_up_compiles_new_callees_before_its_install() {
     assert_eq!(n, 1, "the root's RIR calls `first` once");
     assert!(unsafe { crate::jit::o2_build_now(up, root) }, "the O2 build was dropped at its front");
     assert_eq!(rt_call(), (20, 0), "O2: the new code (it calls `second`, which calls `twenty`) runs without lazy compiles");
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "O2: the new code was installed before its references were walked");
     // O3 (inspect's edit hook): its code calls `third`
     let mut n = 0;
     let mut edit = |f: &mut Func, _: &crate::jit::Unit| n += redirect(f, second, third);
     assert!(unsafe { crate::jit::compile_tier1_inspect(up, root, Some(&mut edit)) }, "the O3 build was not installed");
     assert_eq!(n, 1, "the O2 code's RIR calls `second` once");
     assert_eq!(rt_call(), (300, 0), "O3: the new code (it calls `third`, which calls `three_hundred`) runs without lazy compiles");
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "O3: the new code was installed before its references were walked");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The reach reads the references of the code a real-time slot runs, not those of another version
+/// of it. An earlier run stored `run`'s O2 code (the generic `twice` inlined, `more` called); this
+/// run installs baseline code for it, which calls `twice` (code built before its key's entry was
+/// there, or placed from a startup image older than the entry). The walk must follow the installed
+/// code's calls: the fab arm lab's loop met lazy compiles of closures that only the code it ran
+/// called (11-11).
+#[test]
+fn realtime_reach_reads_the_installed_code() {
+    const CHILD: &str = "MAKEPAD_RUN_RT_INSTALLED_TEST";
+    const DIR: &str = "MAKEPAD_RUN_RT_INSTALLED_TEST_DIR";
+    let Ok(phase) = std::env::var(CHILD) else {
+        let dir = std::env::temp_dir().join(format!("relax-rt-installed-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("app/src")).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+        std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        std::fs::write(dir.join("app/src/lib.rs"), "#[repr(C)]\n\
+            pub struct Cell { pub x: u32, pub out: u32 }\n\
+            fn twice<F: Fn(u32) -> u32>(f: F, x: u32) -> u32 { f(f(x)) }\n\
+            #[inline(never)] pub fn more(x: u32) -> u32 { x + 1 }\n\
+            pub fn run(c: &mut Cell) { let k = c.x; c.out = more(twice(|v| v * 3 + k, c.x)); }\n").unwrap();
+        for phase in ["earlier", "now"] {
+            let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "lazy_reload_tests::realtime_reach_reads_the_installed_code", "--nocapture", "--test-threads=1", "--format=terse"])
+                .env(CHILD, phase).env(DIR, &dir).env("MAKEPAD_RUN_GANDALF_ALL", "0").env("MAKEPAD_RUN_SPEC", "0"));
+            let out = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success() && out.contains("1 passed"), "{phase}: {out}\n{}", String::from_utf8_lossy(&output.stderr));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        return;
+    };
+    use std::sync::atomic::Ordering;
+    crate::jit::CHECK_FIRST.store(false, Ordering::Relaxed);
+    crate::borrowck::lazy::disable_gandalf();
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::path::PathBuf::from(std::env::var_os(DIR).unwrap());
+    std::env::set_var("MAKEPAD_RUN_CACHE_DIR", dir.join("cache"));
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "rt_installed_app", false).unwrap();
+    let run_d = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == "run").then_some(id)
+    }).unwrap();
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let upn = up as usize;
+    let run = crate::owner::call(crate::owner::Class::Program, || {
+        let mut cache = crate::cache::Cache::open(&u, crate::cache::Mode::ReadOnly).unwrap();
+        cache.mode = crate::cache::Mode::On;
+        u.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
+        u.fn_id(crate::jit::FnKey::Inst(run_d, vec![]))
+    });
+    let names = |u: &crate::jit::Unit, ids: &[u32]| ids.iter().map(|&s| u.fns[s as usize].name.clone()).collect::<Vec<_>>();
+    if phase == "earlier" {
+        // the earlier run: `run`'s O2 code, `twice` and the closure inlined, is its stored entry
+        crate::owner::call(crate::owner::Class::Program, || {
+            let (code, map, relocs) = unsafe { crate::jit::compile_fn(up, run) }.unwrap();
+            u.install(run, &code, &relocs, map, 0).unwrap();
+        });
+        crate::jit::FIRST_PRESENT.store(true, Ordering::Release);
+        assert!(unsafe { crate::jit::o2_build_now(up, run) }, "the O2 build was dropped at its front");
+        let spill = crate::owner::call(crate::owner::Class::Program, || {
+            let inlined = names(&u, u.body_deps.get(&run).map_or(&[][..], |v| &v[..]));
+            assert!(inlined.iter().any(|n| n.contains("twice")), "the O2 build inlines `twice` (else this fixture proves nothing): it took in {inlined:?}");
+            u.flush_cache_records();
+            u.cache.as_mut().unwrap().spill_take().unwrap()
+        });
+        assert!(spill.write().unwrap() > 0, "the O2 entry was not written");
+        std::mem::forget(u);
+        return;
+    }
+    // this run: baseline code for `run` (no inlining), built without the stored entry; its RIR
+    // dropped at the install, as drop_completed_body drops it
+    let (run_e, callees) = crate::owner::call(crate::owner::Class::Program, || {
+        let cache = u.cache.take();
+        u.fns[run as usize].baseline_hint.store(true, Ordering::Relaxed);
+        let (code, map, relocs) = unsafe { crate::jit::compile_fn(up, run) }.unwrap();
+        u.cache = cache;
+        u.install(run, &code, &relocs, map, 0).unwrap();
+        let f = &mut u.fns[run as usize];
+        f.rir = None;
+        f.normal_rir = None;
+        f.lowering = None;
+        let mut callees: Vec<u32> = relocs.iter().filter_map(|r| match r.target {
+            relax_backend::rir::Reloc::Call(c) | relax_backend::rir::Reloc::Thunk(c) | relax_backend::rir::Reloc::Slot(c) if c != run => Some(c),
+            _ => None,
+        }).collect();
+        callees.sort_unstable();
+        callees.dedup();
+        (u.entry(run), callees)
+    });
+    let called = names(&u, &callees);
+    assert!(called.iter().any(|n| n.contains("twice")), "the installed code calls `twice` (else this fixture proves nothing): it calls {called:?}");
+    // the earlier run's entry is what a lookup of `run` links now, and it does not call `twice`
+    let stored = crate::owner::call(crate::owner::Class::Program, || {
+        let linked = unsafe { crate::jit::cache_lookup(up, run) }.is_some();
+        (linked, names(&u, &u.cache.as_ref().unwrap().last_callees))
+    });
+    assert!(stored.0 && stored.1.iter().any(|n| n.contains("more")) && !stored.1.iter().any(|n| n.contains("twice")), "the disk cache holds `run`'s O2 entry, which calls `more` and not `twice` (else this fixture proves nothing): linked {}, it calls {:?}", stored.0, stored.1);
+    let ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![run]) });
+    for _ in 0..5000 {
+        if crate::jit::__relax_realtime_compiled(ticket) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(crate::jit::__relax_realtime_compiled(ticket), "the real-time reach was not compiled in 10 s");
+    let missed: Vec<String> = callees.iter().filter(|&&c| !crate::jit::realtime_reached(c)).map(|&c| u.fns[c as usize].name.to_string()).collect();
+    assert!(missed.is_empty(), "the reach did not take in what the installed code calls: {missed:?} (it read another version's references)");
+    let mut cell = [2u32, 0];
+    let cp = cell.as_mut_ptr() as u64;
+    let (out, misses) = std::thread::spawn(move || {
+        crate::jit::__relax_realtime_thread();
+        let before = crate::jit::__relax_realtime_misses();
+        unsafe { crate::jit::call_jit(upn as *mut crate::jit::Unit, run_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        (unsafe { *((cp + 4) as *const u32) }, crate::jit::__relax_realtime_misses() - before)
+    }).join().unwrap();
+    assert_eq!((out, misses), (27, 0), "the real-time thread met lazy compiles (MAKEPAD_RUN_RT_TRACE=1 names them)");
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
+    std::mem::forget(u);
 }
 
 /// Fab's live edit on a node (ICEs "key in collected table", "variance declaration"): a new module
