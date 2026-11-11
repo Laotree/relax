@@ -9,6 +9,14 @@ from source, with no rustc, LLVM or linker in the loop. It checks your code, com
 moment it is first called, optimises the hot ones while the program runs, and patches new code into the
 running process when you save a file.
 
+**TL;DR** Rust's speed and safety, without the compile-time wait.
+
+- **What:** a live compiler and JIT runtime for Rust that runs a Cargo package straight from source. No rustc, no LLVM, no linker.
+- **Start:** on an M4 MacBook a large 3D game shows its first frame **11 s** after a clean checkout, where rustc builds for ~3 min first. The second run takes **1.15 s**.
+- **Change:** save a file and the changed functions are patched into the running program, state kept. **92 tests re-run in 2.2 s.**
+- **Speed:** optimised code runs at **1.14–1.26×** rustc `--release` (native CPU) on real workloads. See [where LLVM still wins](#where-llvm-still-wins).
+- **Size:** one Rust library: **438k lines, 0 crates.io dependencies.**
+
 ## Relax vs rustc
 
 | | rustc + Cargo | **Relax** |
@@ -49,7 +57,7 @@ safety and drops the charge.
 | --- | --- | --- |
 | **Getting started** | Build everything first. On a large app, minutes pass before `main` runs. | **Start from source now.** On an M4 MacBook a small app shows its first frame 3.7 s after a cold start, and a large 3D game in 11 s. Run them again and it's 0.41 s and 1.15 s. |
 | **Making a change** | Rebuild the crate and everything that depends on it, relink, restart, and get back to where you were. | **Saving is the build.** Only the functions you changed are rechecked and recompiled, and they're swapped into the running program, which keeps its state, windows and connections. |
-| **Run-time speed** | Fast, after a long optimised build. | **Fast, while it runs.** Code starts on an interpreter and climbs to O1 and O3 in the background. On real workloads, optimised Relax code runs within 1.14–1.26× of rustc `--release` built for the native CPU, and the gap is closing every week. |
+| **Run-time speed** | Fast, after a long optimised build. | **Fast, while it runs.** Code starts on an interpreter and climbs to O1 and O3 in the background. On real workloads, optimised Relax code runs within 1.14–1.26× of rustc `--release` for the native CPU, and the gap is closing every week. |
 | **Safety** | Everything type- and borrow-checked. | **The same.** Relax never runs code it hasn't checked. |
 | **Your crates** | Path, git, crates.io, vendored, proc macros. | **The same crates, as written,** procedural macros included. |
 | **Caches** | Incremental artefacts on disk that can go stale and need `cargo clean`. | **Every result is keyed by the hashes of its inputs.** A hit is exactly what a fresh compile would produce. A warm start recompiles nothing. |
@@ -71,8 +79,8 @@ An AI agent can't feel a slow build, but it pays for every one in tokens, wall-c
 | **"Why was that slow?"** | read logs and guess | **ask the flight recorder**: which thread waited, on what, compiling which function |
 
 [Makepad](https://github.com/makepad/makepad) builds its apps with many AI agents working in parallel,
-each in its own lane, and Relax is what keeps them fast. Makepad's dev hub, **devhub**, runs the build
-and test machines around Relax so that nothing an agent touches is ever cold:
+each in its own lane, and Relax keeps them fast. Its dev hub, **devhub**, runs the build and test
+machines around Relax, so nothing an agent touches is ever cold:
 
 ```mermaid
 flowchart LR
@@ -87,13 +95,13 @@ flowchart LR
 ```
 
 - **A live session per lane.** Each agent's app or test run stays alive under Relax on a pool machine,
-  and every save patches it. Nothing is rebuilt and nothing is relaunched.
+  and every save patches it. Nothing is rebuilt or relaunched.
 - **Warm caches everywhere.** Each machine refreshes its Relax cache as changes land, so a fresh worker
   starts warm.
 - **No native builds in the loop.** devhub sends iteration and pre-landing checks to Relax, and counts
   every native build that slips through, per lane.
-- **Measured routing.** Jobs are sized by their measured times. Quick checks go to machines with warm
-  sessions, so they never queue behind a long build.
+- **Measured routing.** Jobs are sized by their measured times, and quick checks go to machines with
+  warm sessions, so they never queue behind a long build.
 
 **In practice:** nine agent lanes run side by side, devhub handles more than 300 build and test jobs an
 hour, and dozens of changes land every day, each checked under Relax before it merges.
@@ -120,8 +128,8 @@ hour, and dozens of changes land every day, each checked under Relax before it m
 ## Where LLVM still wins
 
 LLVM has decades of optimisation work behind it, and in steady state its code is still faster than
-Relax's. These are our own measurements: warm JIT against a native build of the same source, with the same
-inputs, as wall-clock ratios (lower is better, 1.00× = LLVM).
+Relax's. Our own measurements: warm JIT against a native build of the same source and inputs, as
+wall-clock ratios (lower is better, 1.00× = LLVM).
 
 | Workload | CPU | vs `--release`, native CPU | Measured |
 | --- | --- | --- | --- |
@@ -133,7 +141,7 @@ inputs, as wall-clock ratios (lower is better, 1.00× = LLVM).
 | Dense numeric kernel (Cholesky factorisation) | x86-64 (Zen 4) | **2.29×**: LLVM vectorises it with AVX-512, Relax doesn't vectorise loops yet | 2026-11-10 |
 | Any workload against plain `--release` (portable CPU baseline) | | **not measured yet** | |
 
-**Which `--release`?** Most Rust ships with plain `--release`, which targets a portable baseline CPU (on x86-64, no AVX). Our numbers are against the harder setting, `--release` with `-C target-cpu=native`, which lets LLVM use every instruction the machine has. Relax always compiles for the exact CPU it runs on, so against plain `--release` the gaps above shrink, and on vector-heavy code they can flip. That comparison hasn't been measured yet.
+**Which `--release`?** Most Rust ships with plain `--release`, built for a portable baseline CPU (on x86-64, no AVX). Our numbers are against the harder setting, `--release` with `-C target-cpu=native`, where LLVM may use every instruction the machine has. Relax always compiles for the CPU it runs on, so against plain `--release` these gaps shrink, and on vector-heavy code they can flip. That comparison hasn't been measured yet.
 
 **Where the gap comes from**, from instruction-level comparisons of the same functions. The gap is extra
 instructions rather than stalls: 1.26× the instructions cost only 1.15× the cycles.
@@ -159,8 +167,8 @@ Every row in this table is a work item, and the slicer gap went from 1.26× to 1
 rustc hands your program to LLVM and a linker, and Cargo glues the steps together. Relax owns the whole
 pipeline, from source bytes to executable memory, in one process.
 
-Relax is a stack of layers. Each layer builds only on the ones below it and re-exports them, so every
-module is `crate::<module>` at every layer. Each layer is its own crate, so they compile in parallel,
+Relax is a stack of layers. Each layer is its own crate, builds only on the ones below it and
+re-exports them, so every module is `crate::<module>` at every layer. The layers compile in parallel,
 and a change in an upper layer never rebuilds the ones below.
 
 ```mermaid

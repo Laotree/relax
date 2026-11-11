@@ -376,6 +376,57 @@ table.nt{border-collapse:collapse;width:100%;font-family:var(--mono);font-size:.
 .nt tr.bad td{color:var(--dim)}
 .nt caption{caption-side:bottom;text-align:left;padding:10px 12px;color:var(--dim)}
 
+/* tl;dr */
+.tl{margin-top:16px;padding:20px}
+@media (min-width:600px){.tl{padding:26px 28px}}
+.tl h2{font-family:var(--mono);font-size:.76rem;letter-spacing:.16em;color:var(--relax);font-weight:600}
+.tl>p{margin-top:8px;font-size:clamp(1.15rem,3.4vw,1.6rem);font-weight:700;letter-spacing:-.025em;line-height:1.2}
+.tl ul{margin-top:14px}
+.tl li{display:grid;grid-template-columns:3.9rem minmax(0,1fr);gap:2px 12px;padding:10px 0;border-top:1px solid var(--line);color:var(--muted);font-size:.95rem}
+.tl li b{font-family:var(--mono);font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:var(--relax);padding-top:.3em}
+.tl li strong{color:var(--text)}
+
+/* devhub illustration (inline SVG, transforms and opacity only) */
+.dh{margin:16px 0 0;overflow:hidden}
+.dh-bar{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line);font-size:.95rem}
+.dh-bar .tag{margin-left:auto;color:var(--warn)}
+.dh-grid{display:grid;gap:1px;background:var(--line)}
+@media (min-width:700px){.dh-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.dh-p{background:var(--panel);padding:16px}
+@media (min-width:600px){.dh-p{padding:22px}}
+.dh-p h3{font-size:.98rem;margin-bottom:12px}
+.dh-p h3 small{display:block;font-family:var(--mono);font-size:.7rem;font-weight:400;color:var(--dim);margin-top:2px}
+.dh svg{display:block;width:100%;height:auto;max-width:440px;margin:0 auto;font-family:var(--mono);font-size:11px}
+.dh figcaption{padding:12px 16px;border-top:1px solid var(--line);font-size:.8rem;color:var(--dim)}
+.dh text{fill:var(--muted)}
+.dh .dt{fill:var(--text)}.dh .dm{fill:var(--dim)}.dh .ds{fill:var(--relax)}.dh .sm{font-size:9.5px}
+.dbg{fill:rgba(255,255,255,.045)}
+.dbx{fill:rgba(255,255,255,.03);stroke:rgba(255,255,255,.14)}
+.dln{fill:rgba(255,255,255,.12)}
+.dfl{fill:var(--relax);opacity:0;animation:dhFl 5.4s linear infinite;animation-delay:calc(var(--i)*.6s)}
+.ddot,.dn{fill:var(--relax)}
+.ddot{animation:dhBl 2.4s ease-in-out infinite;animation-delay:calc(var(--i)*-.37s)}
+.dgt,.dg{fill:none;stroke:rgba(255,255,255,.1);stroke-width:6;stroke-linecap:round}
+.dg{stroke:var(--relax);stroke-dasharray:72 100;animation:dhWarm 3s ease-in-out infinite;animation-delay:calc(var(--i)*-.5s)}
+.drl{stroke:rgba(255,255,255,.16);stroke-width:2}
+.dq{fill:var(--relax2)}
+.dqg{animation:dhQ 1.6s linear infinite}
+.dq.a{animation:dhOut 1.6s linear infinite}.dq.z{animation:dhIn 1.6s linear infinite}
+.dst{animation:dhSt 4.8s linear infinite;animation-delay:calc(var(--i)*.68s)}
+.dtr{fill:#fff;animation:dhTr 4.8s linear infinite}
+.dpa{fill:var(--relax2);animation:dhA 6s linear infinite}
+.dpb{fill:var(--relax);opacity:0;animation:dhB 6s linear infinite}
+@keyframes dhFl{0%{opacity:.3}12%,100%{opacity:0}}
+@keyframes dhBl{50%{opacity:.3}}
+@keyframes dhWarm{50%{opacity:.62}}
+@keyframes dhQ{to{transform:translateX(-28px)}}
+@keyframes dhOut{to{opacity:0}}
+@keyframes dhIn{from{opacity:0}}
+@keyframes dhSt{0%,100%{opacity:.5}6%,22%{opacity:1}}
+@keyframes dhTr{0%{transform:translateY(0);opacity:0}6%{opacity:1}55%{transform:translateY(132px);opacity:1}70%,100%{transform:translateY(170px);opacity:0}}
+@keyframes dhA{0%,45%{opacity:1}55%,95%{opacity:0}}
+@keyframes dhB{0%,45%{opacity:0}55%,95%{opacity:1}100%{opacity:0}}
+
 /* architecture */
 .arch{padding:18px}
 @media (min-width:600px){.arch{padding:26px}}
@@ -441,6 +492,7 @@ noscript p{padding:14px 20px;background:#2a1c08;color:#ffe2a8;text-align:center}
   .gover,.stack i,.vs-r::before,.mt i,.dots i{transform:none!important}
   .dots i{opacity:1}
   .brow.ax{position:static}
+  .dtr,.dfl{display:none}
   .dt i{transform:scaleX(var(--s))!important}
   .step{opacity:1}
 }
@@ -502,6 +554,7 @@ noscript p{padding:14px 20px;background:#2a1c08;color:#ffe2a8;text-align:center}
       </aside>
     </div>
     <div class="stats" id="heroStats"></div>
+    <div class="card tl reveal" id="tldr"><h2>TL;DR</h2><p data-rich="tldr.lead"></p><ul id="tldrList"></ul></div>
   </div>
 </section>
 
@@ -598,6 +651,11 @@ noscript p{padding:14px 20px;background:#2a1c08;color:#ffe2a8;text-align:center}
       <div class="outs" id="loopOuts"></div>
       <div class="back"><span data-d="agents.back"></span><div class="rail" aria-hidden="true"></div></div>
     </div>
+    <figure class="card dh reveal" id="dhFig">
+      <div class="dh-bar"><i class="pulse"></i><b>devhub</b><span class="tag">illustration</span></div>
+      <div class="dh-grid" id="dhGrid"></div>
+      <figcaption data-d="devhub.caption"></figcaption>
+    </figure>
     <div class="grid g2" id="agentBullets"></div>
     <h3 class="h reveal">In practice</h3>
     <div class="grid g3" id="practice"></div>
@@ -743,6 +801,37 @@ const DATA = {
     marquee: ["No rustc", "No LLVM", "No linker", "Straight from source", "State kept", "Checked, then run", "Never stale", "Code only grows", "Lazy by default"]
   },
 
+  tldr: {
+    lead: "Rust's speed and safety, without the compile-time wait.",
+    items: [
+      ["What", "A live compiler and JIT runtime for Rust that runs a Cargo package straight from source. No rustc, no LLVM, no linker."],
+      ["Start", "On an M4 MacBook a large 3D game shows its first frame **11 s** after a clean checkout, where rustc builds for ~3 min first. The second run takes **1.15 s**."],
+      ["Change", "Save a file and the changed functions are patched into the running program, state kept. **92 tests re-run in 2.2 s.**"],
+      ["Speed", "Optimised code runs at **1.14–1.26×** rustc `--release` (native CPU) on real workloads. See [where LLVM still wins](#gaps)."],
+      ["Size", "One Rust library: **438k lines, 0 crates.io dependencies.**"]
+    ]
+  },
+
+  /* the devhub illustration: names are made up, figures repeat the README's */
+  devhub: {
+    caption: "Illustration: a stylised devhub, not a screenshot. Lane, app and box names are made up; the figures are the ones in the table above.",
+    panels: {
+      lanes: ["Lanes", "nine lanes, side by side"],
+      boxes: ["Boxes", "every machine keeps a warm cache at the tip"],
+      jit: ["Inside a box", "devhub hands the change to the live Relax session"],
+      live: ["Live session", "lane ui-tweak · app editor"]
+    },
+    lanes: [["parser-fix", "tests", "verdict"], ["ui-tweak", "editor", "frame"], ["perf", "game", "live"], ["audio-mix", "game", "patched"], ["text-layout", "editor", "live"], ["net-retry", "tests", "verdict"], ["shader-cache", "game", "patched"], ["importer", "editor", "live"], ["docs-search", "tests", "verdict"]],
+    boxes: ["linux · gpu", "linux · gpu", "linux · cpu", "linux · cpu", "linux · arm64", "mac · arm64"],
+    warm: "JIT warm",
+    queue: ["queue", "quick checks go to warm sessions"],
+    steps: [["change arrives", "~50–200 ms"], ["recheck what changed", "types"], ["recompile what changed", "codegen"], ["swap into the running app", "state kept"]],
+    outs: [["tests re-run", "92 tests · 2.2 s"], ["app frame", "PNG"], ["flight recorder", "why it was slow"]],
+    back: "back to the AI agent",
+    frame: "live app frame",
+    timeline: [["save", "file saved"], ["shipped to the box", "~50–200 ms"], ["verdict", "92 tests · 2.2 s"], ["frame", "grabbed as a PNG"]]
+  },
+
   race: {
     title: "Large 3D game, clean checkout → first frame",
     relax: { seconds: 11,  label: "11 s",   note: "on an M4 MacBook, straight from source", building: "starting from source", done: "first frame at 11 s", running: "running" },
@@ -787,7 +876,7 @@ const DATA = {
     rows: [
       ["Getting started", "Build everything first. On a large app, minutes pass before `main` runs.", "**Start from source now.** On an M4 MacBook a small app shows its first frame 3.7 s after a cold start, and a large 3D game in 11 s. Run them again and it's 0.41 s and 1.15 s."],
       ["Making a change", "Rebuild the crate and everything that depends on it, relink, restart, and get back to where you were.", "**Saving is the build.** Only the functions you changed are rechecked and recompiled, and they're swapped into the running program, which keeps its state, windows and connections."],
-      ["Run-time speed", "Fast, after a long optimised build.", "**Fast, while it runs.** Code starts on an interpreter and climbs to O1 and O3 in the background. On real workloads, optimised Relax code runs within 1.14–1.26× of rustc `--release` built for the native CPU, and the gap is closing every week."],
+      ["Run-time speed", "Fast, after a long optimised build.", "**Fast, while it runs.** Code starts on an interpreter and climbs to O1 and O3 in the background. On real workloads, optimised Relax code runs within 1.14–1.26× of rustc `--release` for the native CPU, and the gap is closing every week."],
       ["Safety", "Everything type- and borrow-checked.", "**The same.** Relax never runs code it hasn't checked."],
       ["Your crates", "Path, git, crates.io, vendored, proc macros.", "**The same crates, as written,** procedural macros included."],
       ["Caches", "Incremental artefacts on disk that can go stale and need `cargo clean`.", "**Every result is keyed by the hashes of its inputs.** A hit is exactly what a fresh compile would produce. A warm start recompiles nothing."],
@@ -796,7 +885,7 @@ const DATA = {
   },
 
   demo: {
-    intro: "With rustc, a change is a rebuild of the crate, a relink and a restart. With Relax, only the functions you changed are rechecked and recompiled, and they're **swapped into the running program, which keeps its state, windows and connections.**",
+    intro: "Only the functions you changed are rechecked and recompiled, then **swapped into the running program, which keeps its state, windows and connections.** With rustc, the same change is a rebuild, a relink and a restart.",
     file: "src/particles.rs",
     lines: [
       "// called for every particle, every frame",
@@ -839,7 +928,7 @@ const DATA = {
       ["New worker or lane", "cold build", "**starts warm**: every machine keeps a warm cache at the tip"],
       ["\"Why was that slow?\"", "read logs and guess", "**ask the flight recorder**: which thread waited, on what, compiling which function"]
     ],
-    makepad: "builds its apps with many AI agents working in parallel, each in its own lane, and Relax is what keeps them fast. Makepad's dev hub, **devhub**, runs the build and test machines around Relax so that nothing an agent touches is ever cold.",
+    makepad: "builds its apps with many AI agents working in parallel, each in its own lane, and Relax keeps them fast. Its dev hub, **devhub**, runs the build and test machines around Relax, so nothing an agent touches is ever cold.",
     loop: [
       { title: "AI agent", sub: "edits a file" },
       { title: "devhub", sub: "routes to a warm box" },
@@ -853,10 +942,10 @@ const DATA = {
     ],
     back: "back to the AI agent",
     bullets: [
-      { title: "A live session per lane", body: "Each agent's app or test run stays alive under Relax on a pool machine, and every save patches it. Nothing is rebuilt and nothing is relaunched." },
+      { title: "A live session per lane", body: "Each agent's app or test run stays alive under Relax on a pool machine, and every save patches it. Nothing is rebuilt or relaunched." },
       { title: "Warm caches everywhere", body: "Each machine refreshes its Relax cache as changes land, so a fresh worker starts warm." },
       { title: "No native builds in the loop", body: "devhub sends iteration and pre-landing checks to Relax, and counts every native build that slips through, per lane." },
-      { title: "Measured routing", body: "Jobs are sized by their measured times. Quick checks go to machines with warm sessions, so they never queue behind a long build." }
+      { title: "Measured routing", body: "Jobs are sized by their measured times, and quick checks go to machines with warm sessions, so they never queue behind a long build." }
     ],
     practice: [
       { word: "Nine", label: "agent lanes run side by side" },
@@ -901,7 +990,7 @@ const DATA = {
   },
 
   gaps: {
-    intro: "LLVM has decades of optimisation work behind it, and in steady state its code is still faster than Relax's. These are our own measurements: **warm JIT against a native build of the same source, with the same inputs, as wall-clock ratios** (lower is better, 1.00× = LLVM).",
+    intro: "LLVM has decades of optimisation work behind it, and in steady state its code is still faster than Relax's. Our own measurements: **warm JIT against a native build of the same source and inputs, as wall-clock ratios** (lower is better, 1.00× = LLVM).",
     chartTitle: "Relax vs `--release`, native CPU",
     baseline: { value: 1.00, label: "1.00× = LLVM, --release for the native CPU" },
     overLabel: "Relax, time over LLVM",
@@ -917,7 +1006,7 @@ const DATA = {
     ],
     which: {
       title: "Which `--release`?",
-      body: "Most Rust ships with plain `--release`, which targets a portable baseline CPU (on x86-64, no AVX). Our numbers are against the harder setting, `--release` with `-C target-cpu=native`, which lets LLVM use every instruction the machine has. Relax always compiles for the exact CPU it runs on, so against plain `--release` the gaps above shrink, and on vector-heavy code they can flip. **That comparison hasn't been measured yet.**"
+      body: "Most Rust ships with plain `--release`, built for a portable baseline CPU (on x86-64, no AVX). Our numbers are against the harder setting, `--release` with `-C target-cpu=native`, where LLVM may use every instruction the machine has. Relax always compiles for the CPU it runs on, so against plain `--release` these gaps shrink, and on vector-heavy code they can flip. **That comparison hasn't been measured yet.**"
     },
     causesIntro: "**Where the gap comes from**, from instruction-level comparisons of the same functions. The gap is extra instructions rather than stalls: 1.26× the instructions cost only 1.15× the cycles.",
     causesTitle: "Extra instructions (slicer run), by cause",
@@ -940,7 +1029,7 @@ const DATA = {
 
   arch: {
     intro: "rustc hands your program to LLVM and a linker, and Cargo glues the steps together. **Relax owns the whole pipeline, from source bytes to executable memory, in one process.**",
-    intro2: "Relax is a stack of layers. Each layer builds only on the ones below it and re-exports them, so every module is `crate::<module>` at every layer. Each layer is its own crate, so they compile in parallel, and a change in an upper layer never rebuilds the ones below.",
+    intro2: "Relax is a stack of layers. Each layer is its own crate, builds only on the ones below it and re-exports them, so every module is `crate::<module>` at every layer. The layers compile in parallel, and a change in an upper layer never rebuilds the ones below.",
     groups: [
       { title: "", items: [{ name: "Cargo package", sub: ".rs sources + Cargo.toml" }] },
       { title: "Front: what the program says", items: [
@@ -1353,6 +1442,62 @@ versus($("#vsWhy"), ["With rustc", "With Relax"], DATA.why.rows);
     i = (i + 1) % groups.length;
     groups[i].forEach(n => n.classList.add("on"));
   });
+})();
+
+/* ------------------------------ tl;dr ------------------------------ */
+DATA.tldr.items.forEach(it => add($("#tldrList"), "li", "", "<b>" + esc(it[0]) + "</b><span>" + rich(it[1]) + "</span>"));
+
+/* ------------------------------ devhub illustration ------------------------------ */
+(function () {
+  const D = DATA.devhub, grid = $("#dhGrid");
+  const T = (x, y, s, c, a) => "<text x=\"" + x + "\" y=\"" + y + "\" class=\"" + (c || "") + "\"" + (a ? " text-anchor=\"" + a + "\"" : "") + ">" + esc(s) + "</text>";
+  const R = (x, y, w, h, c, r) => "<rect x=\"" + x + "\" y=\"" + y + "\" width=\"" + w + "\" height=\"" + h + "\" rx=\"" + (r || 0) + "\" class=\"" + c + "\"/>";
+  const C = (x, y, r, c, i) => "<circle cx=\"" + x + "\" cy=\"" + y + "\" r=\"" + r + "\" class=\"" + c + "\" style=\"--i:" + (i || 0) + "\"/>";
+  const G = (c, i, body) => "<g class=\"" + c + "\" style=\"--i:" + i + "\">" + body + "</g>";
+  function panel(key, h, body) {
+    const p = add(grid, "div", "dh-p"), t = D.panels[key];
+    add(p, "h3", "", esc(t[0]) + "<small>" + esc(t[1]) + "</small>");
+    const wrap = add(p, "div", "", "<svg viewBox=\"0 0 320 " + h + "\" role=\"img\" aria-label=\"" + esc(t[0] + ": " + t[1]) + "\">" + body + "</svg>");
+    return wrap;
+  }
+  /* lanes */
+  panel("lanes", 4 + D.lanes.length * 27, D.lanes.map((l, i) => {
+    const y = 2 + i * 27;
+    return G("", i, R(0, y, 320, 22, "dbg", 6) + R(0, y, 320, 22, "dfl", 6) + C(13, y + 11, 4, "ddot", i) + T(26, y + 15, l[0], "dt") + T(168, y + 15, l[1], "dm") + T(310, y + 15, l[2], "ds", "end"));
+  }).join(""));
+  /* boxes, each with a warm JIT cache gauge, and the lease queue */
+  let b = D.boxes.map((name, i) => {
+    const x = (i % 3) * 108 + 2, y = Math.floor(i / 3) * 104 + 2, arc = "M" + (x + 24) + " " + (y + 64) + "a26 26 0 0 1 52 0";
+    let dots = "";
+    for (let k = 0, n = 1 + i % 3; k < n; k++) dots += C(x + 50 + (k - (n - 1) / 2) * 11, y + 58, 3, "ddot", i + k);
+    return R(x, y, 100, 96, "dbx", 10) + T(x + 50, y + 18, name, "dm sm", "middle") + "<path d=\"" + arc + "\" class=\"dgt\"/><path d=\"" + arc + "\" class=\"dg\" style=\"--i:" + i + "\"/>" + dots + T(x + 50, y + 84, D.warm, "ds sm", "middle");
+  }).join("");
+  let chips = "";
+  for (let k = 0; k < 7; k++) chips += R(60 + k * 28, 219, 22, 12, "dq" + (k === 0 ? " a" : k === 6 ? " z" : ""), 4);
+  b += T(2, 229, D.queue[0], "dm") + "<g class=\"dqg\">" + chips + "</g>" + T(2, 250, D.queue[1], "dm sm");
+  panel("boxes", 256, b);
+  /* inside a box: the change meets the JIT */
+  let j = "<line x1=\"12\" y1=\"21\" x2=\"12\" y2=\"" + (21 + (D.steps.length - 1) * 44) + "\" class=\"drl\"/>";
+  D.steps.forEach((s, i) => {
+    const y = 4 + i * 44;
+    j += G("dst", i, R(28, y, 290, 34, "dbx", 8) + C(12, y + 17, 4, "dn") + T(40, y + 21, s[0], "dt") + T(308, y + 21, s[1], "ds", "end"));
+  });
+  const oy = 12 + D.steps.length * 44;
+  D.outs.forEach((o, i) => {
+    const y = oy + i * 28;
+    j += G("dst", D.steps.length + i, R(28, y, 290, 22, "dbg", 6) + T(40, y + 15, o[0], "dt") + T(308, y + 15, o[1], "ds", "end"));
+  });
+  j += C(12, 21, 5, "dtr") + T(173, oy + D.outs.length * 28 + 16, D.back, "dm", "middle");
+  panel("jit", oy + D.outs.length * 28 + 24, j);
+  /* a live session: the app frame and the save, shipped, verdict, frame timeline */
+  let l = R(0, 1, 320, 126, "dbx", 10) + R(8, 9, 70, 110, "dbg", 5) + R(16, 18, 40, 6, "dln", 3) + R(16, 32, 52, 6, "dln", 3) + R(16, 46, 34, 6, "dln", 3) +
+    R(88, 12, 150, 8, "dln", 4) + R(88, 28, 214, 8, "dln", 4) + R(88, 44, 180, 8, "dln", 4) + R(88, 64, 96, 46, "dpa", 8) + R(88, 64, 214, 46, "dpb", 8) + T(310, 122, D.frame, "dm sm", "end");
+  l += "<line x1=\"12\" y1=\"158\" x2=\"12\" y2=\"" + (158 + (D.timeline.length - 1) * 34) + "\" class=\"drl\"/>";
+  D.timeline.forEach((s, i) => {
+    const y = 146 + i * 34;
+    l += G("dst", i * 1.75, C(12, y + 12, 5, "dn") + T(28, y + 16, s[0], "dt") + T(318, y + 16, s[1], "ds", "end"));
+  });
+  panel("live", 146 + D.timeline.length * 34, l);
 })();
 
 /* ------------------------------ features ------------------------------ */
