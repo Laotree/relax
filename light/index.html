@@ -1,0 +1,2030 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>document.documentElement.classList.add("jsp");try{if(localStorage.getItem("relax-theme")==="dark"){document.documentElement.style.visibility="hidden";location.replace("../"+location.hash)}}catch(e){}</script>
+<style>.jsp #plain{display:none}</style>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Relax: Rust without the wait</title>
+<meta name="description" content="Relax is a live compiler and JIT runtime for Rust, written in Rust. It runs a Cargo package straight from source, with no rustc, LLVM or linker in the loop.">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#f5f7f4">
+<link rel="icon" href="../favicon.ico" sizes="32x32">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="../apple-touch-icon.png">
+<link rel="canonical" href="https://makepad.github.io/relax/">
+<link rel="alternate" hreflang="en" href="https://makepad.github.io/relax/">
+<link rel="alternate" hreflang="zh-CN" href="https://makepad.github.io/relax/zh/">
+<link rel="alternate" hreflang="x-default" href="https://makepad.github.io/relax/">
+<style>
+/* An annotated timing sheet: cool paper, ink, booktabs rules. Two marks carry the meaning
+   everywhere: a highlighter stroke for code that is running, and a rust pen stroke through
+   what the usual toolchain makes you wait for. Light only; system faces only. */
+:root{
+  --paper:oklch(0.975 0.006 145);--paper2:oklch(0.945 0.009 145);--paper3:oklch(0.9 0.013 145);
+  --ink:oklch(0.21 0.015 150);--muted:oklch(0.4 0.015 150);--dim:oklch(0.49 0.014 150);
+  --line:oklch(0.21 0.015 150/.15);--line2:oklch(0.21 0.015 150/.34);
+  --mark:oklch(0.92 0.16 112);--mark2:oklch(0.92 0.16 112/.45);--go:oklch(0.47 0.12 150);
+  --rustc:oklch(0.5 0.16 40);--rustc2:oklch(0.6 0.16 45/.5);--rustc3:oklch(0.6 0.16 45/.2);
+  --warn:oklch(0.47 0.1 70);--gap:oklch(0.8 0.15 80);
+  --on-ink:oklch(0.975 0.006 145);--on-ink2:oklch(0.76 0.012 150);--rust-on-ink:oklch(0.78 0.13 50);
+  --serif:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",P052,"URW Palladio L",Georgia,"Noto Serif",serif;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --r:4px;--maxw:1320px;--ease:cubic-bezier(.2,.75,.2,1);
+  --hatch:repeating-linear-gradient(135deg,var(--rustc2) 0 2px,var(--rustc3) 2px 7px)
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%;scroll-padding-top:76px}
+body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--sans);line-height:1.55;overflow-x:hidden;overflow-x:clip;-webkit-font-smoothing:antialiased}
+::selection{background:var(--mark);color:var(--ink)}
+a{color:inherit}
+p a,li a,figcaption a{text-decoration-thickness:1px;text-underline-offset:3px;text-decoration-color:var(--go)}
+p a:hover,li a:hover{background:var(--mark)}
+code,.mono{font-family:var(--mono)}
+code{font-size:.9em;background:var(--paper2);border-radius:3px;padding:.08em .32em;overflow-wrap:anywhere}
+code.nw{white-space:nowrap}
+h1,h2,h3,p,dl,dd,figure{margin:0}
+h1,h2,h3{text-wrap:balance;overflow-wrap:break-word;min-width:0}
+p,li{text-wrap:pretty}
+ul,ol{margin:0;padding:0;list-style:none}
+button{font:inherit;color:inherit}
+s{text-decoration-color:var(--rustc);text-decoration-thickness:2px}
+:focus-visible{outline:2px solid var(--ink);outline-offset:2px;border-radius:2px}
+.skip{position:absolute;left:-999px;top:8px;background:var(--ink);color:var(--on-ink);padding:10px 14px;border-radius:var(--r);z-index:100;font-weight:700}
+.skip:focus{left:12px}
+.wrap{width:100%;max-width:var(--maxw);margin:0 auto;padding:0 16px}
+@media (min-width:600px){.wrap{padding:0 28px}}
+@media (min-width:1000px){.wrap{padding:0 48px}}
+.off *,.off *::before,.off *::after{animation-play-state:paused!important}
+
+#prog{position:fixed;left:0;top:0;right:0;height:2px;z-index:60;background:var(--ink);transform:scaleX(0);transform-origin:0 50%}
+.nav{position:sticky;top:0;z-index:50;background:var(--paper);border-bottom:1px solid var(--ink)}
+.nav .wrap{display:flex;align-items:center;gap:16px;height:56px}
+.brand{display:flex;align-items:center;gap:9px;font-family:var(--serif);font-weight:700;font-size:1.3rem;letter-spacing:-.01em;text-decoration:none;min-height:44px}
+.brand svg{width:24px;height:24px}
+.brand svg *{stroke:currentColor}
+.nav nav{margin-left:auto;display:none;gap:2px}
+.nav nav a{text-decoration:none;color:var(--muted);font-size:.88rem;padding:10px 9px;white-space:nowrap}
+.nav nav a:hover{color:var(--ink);text-decoration:underline;text-underline-offset:5px}
+.nav .btn{margin-left:auto}
+@media (min-width:1100px){.nav nav{display:flex}.nav .btn{margin-left:6px}}
+
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:44px;text-decoration:none;font-weight:650;font-size:.95rem;padding:10px 20px;border-radius:var(--r);border:1px solid var(--ink);background:none;cursor:pointer;white-space:nowrap;transition:background-color .12s}
+.btn:hover{background:var(--paper2)}
+.btn:active{transform:translateY(1px)}
+.btn.primary{background:var(--mark)}
+.btn.primary:hover{background:var(--ink);color:var(--on-ink)}
+.btn.small{font-size:.86rem;padding:8px 14px}
+/* the second action is typographic: one filled button a group */
+.cta .btn:not(.primary){border:0;padding:10px 2px;text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:5px}
+.cta .btn:not(.primary):hover{background:none;text-decoration-thickness:2px}
+
+/* hero */
+.hero{padding:36px 0 56px}
+@media (min-width:900px){.hero{padding:56px 0 88px}}
+h1{font-family:var(--serif);font-size:clamp(3rem,8.9vw,7.4rem);line-height:.98;letter-spacing:-.03em;font-weight:700}
+h1 .w{display:inline}
+/* the signature, once: the wait is struck out with the pen that strikes rustc's steps below */
+h1 .glow{position:relative;display:inline-block}
+h1 .glow::after{content:"";position:absolute;left:-.04em;right:.14em;top:54%;height:.075em;border-radius:1em;background:var(--rustc);transform:rotate(-2.2deg);transform-origin:0 50%;animation:draw .55s var(--ease) .35s both}
+@keyframes draw{from{transform:rotate(-2.2deg) scaleX(0)}}
+.hero-grid{display:grid;gap:28px;margin-top:22px;padding-top:22px;border-top:2px solid var(--ink)}
+@media (min-width:980px){.hero-grid{grid-template-columns:minmax(0,5fr) minmax(0,7fr);gap:64px;margin-top:30px;padding-top:28px}}
+.lede{font-family:var(--serif);font-size:clamp(1.35rem,2.5vw,1.95rem);line-height:1.22;letter-spacing:-.012em;max-width:24ch}
+.lede span{color:var(--dim)}
+.cta{display:flex;flex-wrap:wrap;align-items:center;gap:8px 22px;margin-top:24px}
+.sub{margin-top:22px;max-width:64ch;color:var(--muted)}
+.sub strong{color:var(--ink)}
+.mini h2,.cap{font-size:.84rem;font-weight:650;color:var(--ink)}
+.cap span+span::before{content:", "}
+.ml{margin-top:14px}
+.ml b{display:flex;justify-content:space-between;align-items:baseline;gap:12px;font-size:.92rem;margin-bottom:6px}
+.ml b span{font-weight:400;font-size:.84rem;color:var(--muted)}
+.ml.c b{color:var(--rustc)}
+.mt{position:relative;height:22px;background:var(--paper2);overflow:hidden}
+.mt i{position:absolute;inset:0;transform-origin:0 50%}
+.ml.c .mt i:first-child{right:22%;background:var(--hatch);animation:mB 9s linear infinite}
+.ml.c .mt i:last-child{left:78%;background:var(--mark);animation:mC 9s linear infinite}
+.ml.r .mt i{background:var(--mark);animation:mR 9s linear infinite}
+@keyframes mB{0%{transform:scaleX(0)}70%,100%{transform:scaleX(1)}}
+@keyframes mC{0%,70%{transform:scaleX(0)}90%,100%{transform:scaleX(1)}}
+@keyframes mR{0%{transform:scaleX(0)}90%,100%{transform:scaleX(1)}}
+.mini p{margin-top:12px;font-size:.84rem;color:var(--dim)}
+.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 20px;margin-top:48px}
+@media (min-width:860px){.stats{grid-template-columns:repeat(4,minmax(0,1fr));gap:0 32px;margin-top:64px}}
+@media (max-width:339px){.stats{grid-template-columns:minmax(0,1fr)}}
+.stat{border-top:2px solid var(--ink);padding:14px 0 22px}
+.grad{color:inherit}
+.stat strong{display:block;font-family:var(--serif);font-size:clamp(2.5rem,6vw,4rem);font-weight:700;letter-spacing:-.03em;line-height:1;font-variant-numeric:lining-nums tabular-nums}
+.stat span{display:block;margin-top:10px;color:var(--muted);font-size:.9rem;line-height:1.4;max-width:30ch}
+
+/* what is not there, set as a statement */
+.mq{background:var(--ink);color:var(--on-ink);padding:36px 0}
+@media (min-width:800px){.mq{padding:56px 0}}
+.mq div{display:flex;flex-wrap:wrap;gap:.1em 1.1em;width:100%;max-width:var(--maxw);margin:0 auto;padding:0 16px}
+@media (min-width:600px){.mq div{padding:0 28px}}
+@media (min-width:1000px){.mq div{padding:0 48px}}
+.mq span{font-family:var(--serif);font-size:clamp(1.5rem,3.6vw,2.9rem);font-weight:700;letter-spacing:-.02em;line-height:1.25;white-space:nowrap}
+.mq span:nth-child(n+4){color:var(--on-ink2)}
+
+/* sections: whitespace and one hairline; the label rides in the margin on wide screens */
+section{padding:64px 0;position:relative}
+@media (min-width:800px){section{padding:112px 0}}
+main>section+section{border-top:1px solid var(--line)}
+.kicker{font-size:.9rem;font-weight:650;color:var(--muted);margin-bottom:10px}
+h2.title{font-family:var(--serif);font-size:clamp(2.1rem,5.4vw,3.9rem);line-height:1.04;letter-spacing:-.025em;font-weight:700;max-width:19ch}
+h2.title em{font-style:normal}
+h3.h{font-family:var(--serif);font-size:clamp(1.5rem,3.4vw,2.2rem);letter-spacing:-.02em;line-height:1.12;margin-top:72px}
+.intro{margin-top:20px;max-width:66ch;color:var(--muted);font-size:1.06rem}
+.intro strong{color:var(--ink)}
+@media (min-width:1200px){
+  main>section:not(.hero):not(.final)>.wrap{display:grid;grid-template-columns:150px minmax(0,1fr);column-gap:64px}
+  main>section:not(.hero):not(.final)>.wrap>*{grid-column:2}
+  main>section:not(.hero):not(.final)>.wrap>.kicker{grid-column:1;grid-row:1/span 60;align-self:start;position:sticky;top:84px;margin:0;padding-top:12px;border-top:2px solid var(--ink);color:var(--ink);line-height:1.3}
+}
+.js .reveal{opacity:0;transform:translateY(10px);transition:opacity .45s var(--ease),transform .45s var(--ease);transition-delay:calc(var(--d,0)*40ms)}
+.js .reveal.in{opacity:1;transform:none}
+.card{min-width:0}
+.tag{display:inline-block;font-size:.8rem;font-weight:650;line-height:1.35;white-space:nowrap}
+.tag.r{background:var(--mark);padding:0 .35em;margin-left:-.1em}
+.tag.c{color:var(--rustc)}
+.note{font-size:.84rem;color:var(--dim);margin-top:14px}
+.mt48{margin-top:40px}
+.grid{display:grid;gap:0 40px;margin-top:40px}
+@media (min-width:720px){.g2{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (min-width:900px){.g3{grid-template-columns:repeat(3,minmax(0,1fr))}}
+/* figures sit in a tinted well, no border */
+.race,.chart,.tl{background:var(--paper2);border-radius:var(--r)}
+
+/* connecting lines are still: no streaks */
+.rail{position:relative}
+
+/* race */
+.race{padding:18px 16px}
+@media (min-width:600px){.race{padding:28px}}
+.race-head{display:flex;flex-wrap:wrap;align-items:center;gap:10px 16px;margin-bottom:8px}
+.race-head h3{font-size:1.08rem;flex:1 1 220px}
+.race .btn:hover{background:var(--paper3)}
+.clock{font-family:var(--mono);font-size:.9rem;padding:7px 12px;border-radius:3px;background:var(--paper);min-width:13ch;text-align:center;font-variant-numeric:tabular-nums}
+.lane{margin-top:22px}
+.lane-top{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;margin-bottom:9px}
+.lane-top .big{font-family:var(--serif);font-size:clamp(1.9rem,6vw,2.8rem);font-weight:700;letter-spacing:-.03em;line-height:1;font-variant-numeric:lining-nums tabular-nums}
+.lane.c b,.lane.c .big{color:var(--rustc)}
+.lane-top .n{color:var(--muted);font-size:.9rem}
+.lane-top .st{margin-left:auto;font-family:var(--mono);font-size:.76rem;color:var(--muted)}
+.track{position:relative;height:44px;background:var(--paper);overflow:hidden}
+.track i{position:absolute;top:0;bottom:0;left:0;right:0;transform:scaleX(0);transform-origin:0 50%;will-change:transform}
+.lane.r .fill{background:var(--ink);z-index:2}
+.lane.r .run{background:var(--mark)}
+.lane.r .lbl{position:absolute;top:50%;transform:translateY(-50%);margin-left:12px;font-size:.8rem;font-weight:650;opacity:0;transition:opacity .4s;z-index:3;display:flex;align-items:center;gap:8px}
+.lane.r.go .lbl{opacity:1}
+.lane.c .fill{background:var(--hatch)}
+.flag{position:absolute;right:8px;top:50%;transform:translateY(-50%);opacity:0;font-size:.78rem;padding:4px 9px;border-radius:3px;background:var(--rustc);color:var(--on-ink);font-weight:700;transition:opacity .3s;z-index:3}
+.lane.c.done .flag{opacity:1}
+.axis{position:relative;height:28px;margin-top:10px;font-family:var(--mono);font-size:.72rem;color:var(--dim)}
+.axis span{position:absolute;top:0;transform:translateX(-50%);white-space:nowrap}
+.axis span::before{content:"";display:block;width:1px;height:6px;background:var(--line2);margin:0 auto 3px}
+.axis span:first-child{transform:none}.axis span:first-child::before{margin-left:0}
+.axis span:last-child{transform:translateX(-100%)}.axis span:last-child::before{margin-right:0}
+@media (max-width:520px){.axis{font-size:.66rem}}
+.round{border-top:2px solid var(--ink);padding:16px 0 40px;display:flex;flex-direction:column;gap:12px}
+.round h3{font-size:.98rem;font-weight:650}
+.round .num{font-family:var(--serif);font-size:clamp(3.4rem,11vw,5rem);font-weight:700;letter-spacing:-.035em;line-height:.95;font-variant-numeric:lining-nums tabular-nums}
+.round .num.word{font-size:clamp(1.9rem,6vw,2.5rem);letter-spacing:-.025em;line-height:1.05}
+.round .rx{font-weight:600}
+.round .them{margin-top:auto;padding-top:12px;border-top:1px solid var(--line);color:var(--muted);font-size:.92rem}
+.duel{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:8px 10px;align-items:center;font-size:.8rem;color:var(--muted)}
+.duel b{color:var(--ink);font-family:var(--mono);font-weight:600}
+.dt{height:10px;background:var(--paper2);overflow:hidden}
+.dt i{display:block;height:100%;background:var(--ink);transform:scaleX(0);transform-origin:0 50%;transition:transform .8s linear .3s}
+.in .dt i{transform:scaleX(var(--s))}
+/* the count is set in type; no row of marks stands in for it */
+.dots{display:none}
+
+/* versus rows: a ruled table, heavy rule on top */
+.box{border-top:2px solid var(--ink);border-bottom:1px solid var(--ink)}
+.vs{display:grid;gap:10px 32px;padding:20px 0;border-bottom:1px solid var(--line)}
+.vs:last-child{border-bottom:0}
+.vs h3{font-size:1.04rem;line-height:1.35}
+.vs p{margin-top:4px;font-size:.97rem}
+.vs-c p{color:var(--muted)}
+.vs-r strong{font-weight:700}
+.js .vs .vs-c,.js .vs .vs-r{opacity:0;transition:opacity .45s var(--ease) .08s}
+.js .vs.in .vs-c,.js .vs.in .vs-r{opacity:1}
+@media (min-width:860px){.vs{grid-template-columns:minmax(0,.6fr) minmax(0,1fr) minmax(0,1.2fr);align-items:start}}
+
+/* pipeline */
+.took{display:grid;gap:40px;align-items:start}
+@media (min-width:980px){.took{grid-template-columns:minmax(0,1.6fr) minmax(0,.7fr);gap:56px}}
+.pipe{border-top:2px solid var(--ink);border-bottom:1px solid var(--ink)}
+.pipe .cap{padding:12px 0;border-bottom:1px solid var(--line2)}
+.pipe .rail{display:none}
+.prow{padding:12px 0;display:grid;gap:3px 20px;border-bottom:1px solid var(--line)}
+.prow:last-child{border-bottom:0}
+.prow .job{font-weight:650;font-size:.96rem}
+.prow .old{color:var(--dim);font-size:.9rem;text-decoration:line-through;text-decoration-color:var(--rustc);text-decoration-thickness:2px}
+.prow .new{font-family:var(--mono);font-size:.86rem;justify-self:start;padding:0 .3em;margin-left:-.3em;transition:background-color .25s}
+.prow.on .new{background:var(--mark)}
+@media (min-width:680px){
+  .prow,.pipe .cap{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,.85fr) minmax(0,1fr);gap:3px 20px;align-items:baseline}
+  .cap span+span::before{content:none}
+}
+.bigs{display:grid;gap:0 32px}
+@media (min-width:680px) and (max-width:979px){.bigs{grid-template-columns:repeat(3,minmax(0,1fr))}}
+.bigcard{border-top:2px solid var(--ink);padding:14px 0 32px}
+.bigcard strong{display:block;font-family:var(--serif);font-size:clamp(3.2rem,9vw,4.6rem);font-weight:700;letter-spacing:-.035em;line-height:.95;font-variant-numeric:lining-nums tabular-nums}
+.bigcard span{display:block;margin-top:10px;font-size:.96rem;font-weight:600}
+.bigcard small{display:block;margin-top:6px;color:var(--muted);font-size:.86rem}
+
+/* demo: an editor and the program it patches */
+.demo{display:grid;gap:16px}
+@media (min-width:940px){.demo{grid-template-columns:minmax(0,1.05fr) minmax(0,.95fr)}}
+.win{overflow:hidden;display:flex;flex-direction:column;border:1px solid var(--ink);border-radius:var(--r)}
+.win-bar{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line2);font-family:var(--mono);font-size:.78rem;color:var(--muted)}
+.win-bar .state{margin-left:auto;padding:2px 8px;border-radius:3px;border:1px solid var(--line2);white-space:nowrap}
+.state.hot{color:var(--ink);background:var(--mark);border-color:var(--ink)}
+.state.edit{color:var(--warn);border-color:var(--warn)}
+.code{margin:0;padding:14px 0;font-family:var(--mono);font-size:.75rem;line-height:1.8;overflow-x:auto;flex:1}
+@media (min-width:520px){.code{font-size:.84rem}}
+.code .ln{display:flex;white-space:pre;padding-right:14px;border-left:2px solid transparent}
+.code .no{flex:none;width:2.8em;text-align:right;padding-right:1em;color:var(--dim);user-select:none}
+.code .ln.hot{background:var(--mark);border-left-color:var(--ink)}
+.code .ln.typing{background:oklch(0.8 0.15 80/.25);border-left-color:var(--warn)}
+.caret{display:inline-block;width:.55em;height:1.15em;vertical-align:-.2em;background:var(--ink);animation:blink 1s steps(1) infinite}
+@keyframes blink{50%{opacity:0}}
+.t-k{color:oklch(0.43 0.15 320)}.t-n{color:var(--warn)}.t-f{color:oklch(0.42 0.13 255)}.t-t{color:var(--go)}.t-c{color:var(--dim)}
+.acts{display:flex;flex-wrap:wrap;gap:10px;padding:14px;border-top:1px solid var(--line2)}
+.stage{position:relative;aspect-ratio:16/10;background:var(--ink)}
+.stage canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+.overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;background:oklch(0.21 0.015 150/.96);color:var(--on-ink);opacity:0;pointer-events:none;transition:opacity .25s;font-family:var(--mono);font-size:.9rem;text-align:center;padding:16px}
+.overlay.show{opacity:1}
+.overlay span{color:var(--on-ink2)}.overlay span.on,.overlay strong{color:var(--rust-on-ink)}
+.hud{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border-top:1px solid var(--line2)}
+.hud div{padding:10px 14px}
+.hud div+div{border-left:1px solid var(--line)}
+.hud dt{font-size:.76rem;color:var(--muted);line-height:1.3}
+.hud dd{margin-top:3px;font-family:var(--mono);font-size:1.05rem;font-variant-numeric:tabular-nums;transform-origin:0 50%}
+.hud dd.bump{animation:bump .4s var(--ease)}
+@keyframes bump{from{opacity:.25}}
+.log{padding:12px 14px;font-family:var(--mono);font-size:.76rem;color:var(--muted);min-height:7.4em;border-top:1px solid var(--line2)}
+.log li{overflow-wrap:anywhere}
+.log li::before{content:"> ";color:var(--ink)}
+.log li.bad,.log li.bad::before{color:var(--rustc)}
+
+/* agents loop */
+.node{border:1px solid var(--line2);border-radius:var(--r);padding:12px 14px;transition:border-color .3s,background-color .3s;min-width:0}
+.node b{display:block;font-size:.98rem}
+.node span{display:block;color:var(--muted);font-size:.86rem;margin-top:2px}
+.node.on{border-color:var(--ink);background:var(--mark)}
+.node.on span{color:var(--ink)}
+.lrow{display:grid}
+.edge{display:flex;align-items:center;gap:10px;padding:6px 0 6px 22px;font-size:.78rem;color:var(--dim)}
+.edge .rail{flex:none;width:1px;height:24px;background:var(--ink)}
+.outs{display:grid;gap:10px}
+@media (min-width:860px){
+  .lrow{grid-template-columns:minmax(0,1fr) auto minmax(0,1fr) auto minmax(0,1fr);align-items:stretch}
+  .edge{flex-direction:column-reverse;justify-content:center;padding:0 10px;min-width:96px;text-align:center;gap:6px}
+  .edge .rail{width:100%;height:1px}
+  .edge.down{flex-direction:row;justify-content:flex-end;padding:0 16% 0 0;min-width:0}
+  .edge.down .rail{width:1px;height:30px}
+  .outs{grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+}
+.back{margin-top:14px;padding:10px 0 0;border-top:1px solid var(--ink);font-size:.84rem;color:var(--muted)}
+.back .rail{display:none}
+.fact{border-top:1px solid var(--ink);padding:16px 0 36px}
+.fact h3{font-family:var(--serif);font-size:1.3rem;letter-spacing:-.01em;line-height:1.2}
+.fact p{color:var(--muted);font-size:.95rem;margin-top:8px}
+
+/* gaps */
+.chart{padding:20px 16px}
+@media (min-width:600px){.chart{padding:28px}}
+.chart>h3{font-size:1.08rem}
+.legend{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:10px;font-size:.82rem;color:var(--muted)}
+.legend i{display:inline-block;width:10px;height:10px;margin-right:6px;vertical-align:-1px}
+.gbar{margin-top:24px}
+.gtop{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;margin-bottom:8px}
+.gtop b{display:block;font-size:.97rem;font-weight:650}
+.gtop small{display:block;font-size:.8rem;color:var(--dim);margin-top:2px}
+.gtop small span{white-space:nowrap}
+.gtop strong{font-family:var(--serif);font-size:clamp(1.8rem,6vw,2.5rem);font-weight:700;letter-spacing:-.03em;line-height:1;font-variant-numeric:lining-nums tabular-nums;white-space:nowrap}
+.gtrack{position:relative;height:16px;background:var(--paper)}
+.gtrack i{position:absolute;top:0;bottom:0}
+.gbase{left:0;width:var(--b);background:var(--hatch)}
+.gover{background:var(--gap);transform:scaleX(0);transform-origin:0 50%;transition:transform 1s var(--ease) calc(.2s + var(--d,0)*60ms)}
+.in .gover{transform:none}
+.gtrack::after{content:"";position:absolute;left:var(--b);top:-6px;bottom:-6px;width:2px;margin-left:-1px;background:var(--rustc)}
+.gbar .det{font-size:.84rem;color:var(--muted);margin-top:7px}
+.gbar.none .gtrack{background:none;border:1px dashed var(--line2)}
+.gbar.none strong{font-family:var(--sans);font-size:.95rem;letter-spacing:0;color:var(--muted);font-weight:500;white-space:normal;text-align:right}
+.which{border-top:2px solid var(--ink);padding:16px 0 0}
+.which h3{font-family:var(--serif);font-size:1.3rem;line-height:1.2}
+.which p{color:var(--muted);font-size:.97rem;margin-top:8px;max-width:72ch}
+.stack{display:flex;height:36px;overflow:hidden;margin-top:18px;gap:2px}
+.stack i{min-width:0;transform:scaleX(0);transform-origin:0 50%;transition:transform .5s var(--ease) calc(.15s + var(--d)*80ms)}
+.in .stack i{transform:none}
+.causes li{display:grid;grid-template-columns:14px minmax(0,1fr) auto;gap:4px 12px;align-items:baseline;padding:11px 0;border-bottom:1px solid var(--line);font-size:.94rem}
+.causes li:last-child{border-bottom:0}
+.causes i{width:12px;height:12px;align-self:center}
+.causes b{font-family:var(--mono);font-weight:600;white-space:nowrap}
+.causes li.text b{grid-column:2/-1;font-family:var(--sans);font-weight:400;color:var(--muted);white-space:normal;font-size:.86rem}
+.trend{border-top:2px solid var(--ink);padding:18px 0 0}
+.trend .nums{display:flex;align-items:baseline;gap:.3em;font-family:var(--serif);font-size:clamp(2.8rem,11vw,5.4rem);font-weight:700;letter-spacing:-.035em;line-height:1;font-variant-numeric:lining-nums tabular-nums}
+.trend .nums s{color:var(--dim);text-decoration-thickness:.06em}
+.trend .nums span{color:var(--dim);font-weight:400}
+.trend p{color:var(--muted);margin-top:14px;max-width:60ch}
+
+/* speed (DATA.bench) */
+.badge{display:inline-block;font-size:.78rem;padding:2px 8px;border-radius:3px;background:var(--gap);font-weight:700}
+.bctl{display:flex;flex-wrap:wrap;gap:10px 14px;margin-top:28px;align-items:center}
+.seg{display:inline-flex;max-width:100%;padding:3px;border-radius:var(--r);border:1px solid var(--ink)}
+.seg button{min-height:40px;padding:6px 13px;border:0;border-radius:2px;background:none;color:var(--muted);font-weight:650;font-size:.86rem;cursor:pointer;white-space:nowrap}
+.seg button[aria-pressed=true]{background:var(--ink);color:var(--on-ink)}
+.bcall{display:grid;gap:0 32px;margin-top:40px}
+@media (min-width:560px){.bcall{grid-template-columns:repeat(2,minmax(0,1fr))}.bcall .spec{grid-column:1/-1}}
+@media (min-width:980px){.bcall{grid-template-columns:repeat(3,minmax(0,1fr))}.bcall .spec{grid-column:auto}}
+.bcall .bigcard strong{white-space:nowrap}
+.bcall strong.slow{color:var(--warn)}
+.bcall strong small{display:inline;font-size:.36em;letter-spacing:-.01em;color:var(--dim);font-weight:650;margin:0}
+.spec dl{display:grid;grid-template-columns:auto minmax(0,1fr);gap:5px 14px;font-family:var(--mono);font-size:.78rem}
+.spec dt{color:var(--dim)}.spec dd{overflow-wrap:anywhere}
+.bchart{border-top:2px solid var(--ink);border-bottom:1px solid var(--ink)}
+.brow{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"lab val" "trk trk";gap:7px 12px;align-items:end;padding:13px 0;border-bottom:1px solid var(--line);transition:transform .5s var(--ease)}
+.brow:last-child{border-bottom:0}
+.brow .lab{grid-area:lab;min-width:0}
+.brow .lab b{display:block;font-size:.95rem;font-weight:650}
+.brow .lab small{display:block;font-size:.8rem;color:var(--dim);margin-top:1px}
+.brow .val{grid-area:val;font-family:var(--mono);font-size:1.1rem;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap;text-align:right}
+.brow .val.slow{color:var(--warn)}
+.btrack{grid-area:trk;position:relative;height:16px;background:var(--paper2)}
+.btrack::after{content:"";position:absolute;left:50%;top:-5px;bottom:-5px;width:2px;margin-left:-1px;background:var(--rustc)}
+.bb{position:absolute;left:50%;width:50%;top:0;bottom:0;background:var(--gap);transform:scaleX(0);transform-origin:0 50%;transition:transform .6s var(--ease)}
+.bb.fast{background:var(--mark)}
+.bw{position:absolute;left:0;width:100%;top:50%;height:2px;margin-top:-1px;background:var(--ink);transform:scaleX(0);transform-origin:0 50%;transition:transform .6s var(--ease),opacity .3s}
+.bchart:not(.in) .bb{transform:scaleX(0)!important}
+.bchart:not(.in) .bw{opacity:0}
+.brow.bad{opacity:.55}
+.brow.bad .val{font-size:.78rem;font-weight:500;color:var(--dim)}
+.brow.ax{position:sticky;top:56px;z-index:2;background:var(--paper);padding:10px 0 8px;font-size:.76rem;color:var(--dim);grid-template-areas:"trk trk"}
+.brow.ax .btrack{height:auto;background:none;display:flex;justify-content:space-between;gap:8px}
+.brow.ax .btrack::after{display:none}
+.brow.ax span:last-child{text-align:right}
+.brow.ax span:nth-child(2){color:var(--rustc)}
+@media (min-width:900px){
+  .brow{grid-template-columns:minmax(0,300px) minmax(0,1fr) 84px;grid-template-areas:"lab trk val";align-items:center}
+  .brow.ax{grid-template-areas:". trk ."}
+}
+details.nums{margin-top:16px}
+details.nums summary{display:inline-flex;align-items:center;min-height:44px;padding:8px 16px;border-radius:var(--r);border:1px solid var(--ink);font-weight:650;font-size:.9rem;cursor:pointer;list-style:none}
+details.nums summary::-webkit-details-marker{display:none}
+details.nums summary::before{content:"+";margin-right:8px}
+details.nums[open] summary::before{content:"\2212"}
+.scrollx{overflow-x:auto;margin-top:12px;border-top:2px solid var(--ink)}
+table.nt{border-collapse:collapse;width:100%;font-family:var(--mono);font-size:.76rem;font-variant-numeric:tabular-nums}
+.nt th,.nt td{padding:9px 12px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--line)}
+.nt th:first-child,.nt td:first-child{text-align:left;position:sticky;left:0;background:var(--paper)}
+.nt thead th{color:var(--muted);font-weight:600}
+.nt tr.bad td{color:var(--dim)}
+.nt caption{caption-side:bottom;text-align:left;padding:10px 12px;color:var(--dim)}
+
+/* tl;dr */
+.tl{margin-top:40px;padding:20px 16px}
+@media (min-width:600px){.tl{padding:28px 32px}}
+@media (min-width:980px){.tl{display:grid;grid-template-columns:minmax(0,5fr) minmax(0,7fr);column-gap:64px;padding:36px 40px}.tl h2,.tl>p{grid-column:1}.tl ul{grid-column:2;grid-row:1/span 3;margin-top:0}.tl li:first-child{border-top:0;padding-top:0}}
+.tl h2{font-size:.9rem;font-weight:650;color:var(--muted)}
+.tl>p{margin-top:8px;font-family:var(--serif);font-size:clamp(1.4rem,3.2vw,2rem);font-weight:700;letter-spacing:-.02em;line-height:1.15;max-width:18ch}
+.tl ul{margin-top:16px}
+.tl li{display:grid;grid-template-columns:5.2rem minmax(0,1fr);gap:2px 12px;padding:10px 0;border-top:1px solid var(--line);color:var(--muted);font-size:.96rem}
+.tl li b{font-size:.9rem;font-weight:650;color:var(--ink);padding-top:.05em}
+.tl li strong{color:var(--ink)}
+
+/* devhub illustration (inline SVG, transforms and opacity only) */
+.dh{margin:40px 0 0;overflow:hidden;border:1px solid var(--ink);border-radius:var(--r)}
+.dh-bar{display:flex;align-items:baseline;gap:10px;padding:10px 16px;border-bottom:1px solid var(--line2);font-size:.95rem}
+.dh-bar .tag{margin-left:auto;color:var(--muted);font-weight:400}
+.dh-grid{display:grid}
+@media (min-width:700px){.dh-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.dh-p:nth-child(odd){border-right:1px solid var(--line)}}
+.dh-p{padding:16px;border-bottom:1px solid var(--line)}
+@media (min-width:600px){.dh-p{padding:22px}}
+.dh-p h3{font-size:.98rem;margin-bottom:12px}
+.dh-p h3 small{display:block;font-size:.8rem;font-weight:400;color:var(--dim);margin-top:2px}
+.dh svg{display:block;width:100%;height:auto;max-width:440px;margin:0 auto;font-family:var(--mono);font-size:11px}
+.dh figcaption{padding:12px 16px;font-size:.84rem;color:var(--dim)}
+.dh text{fill:var(--muted)}
+.dh .dt{fill:var(--ink)}.dh .dm{fill:var(--dim)}.dh .ds{fill:var(--go)}.dh .sm{font-size:9.5px}
+.dbg{fill:var(--paper2)}
+.dbx{fill:var(--paper2);stroke:var(--line2)}
+.dln{fill:var(--line2)}
+.dfl{fill:var(--mark);opacity:0;animation:dhFl 5.4s linear infinite;animation-delay:calc(var(--i)*.6s)}
+.ddot,.dn{fill:var(--go)}
+.ddot{animation:dhBl 2.4s ease-in-out infinite;animation-delay:calc(var(--i)*-.37s)}
+.dgt,.dg{fill:none;stroke:var(--line);stroke-width:6;stroke-linecap:round}
+.dg{stroke:var(--go);stroke-dasharray:72 100;animation:dhWarm 3s ease-in-out infinite;animation-delay:calc(var(--i)*-.5s)}
+.drl{stroke:var(--line2);stroke-width:2}
+.dq{fill:var(--ink)}
+.dqg{animation:dhQ 1.6s linear infinite}
+.dq.a{animation:dhOut 1.6s linear infinite}.dq.z{animation:dhIn 1.6s linear infinite}
+.dst{animation:dhSt 4.8s linear infinite;animation-delay:calc(var(--i)*.68s)}
+.dtr{fill:var(--ink);animation:dhTr 4.8s linear infinite}
+.dpa{fill:var(--dim);animation:dhA 6s linear infinite}
+.dpb{fill:var(--go);opacity:0;animation:dhB 6s linear infinite}
+@keyframes dhFl{0%{opacity:1}12%,100%{opacity:0}}
+@keyframes dhBl{50%{opacity:.3}}
+@keyframes dhWarm{50%{opacity:.62}}
+@keyframes dhQ{to{transform:translateX(-28px)}}
+@keyframes dhOut{to{opacity:0}}
+@keyframes dhIn{from{opacity:0}}
+@keyframes dhSt{0%,100%{opacity:.5}6%,22%{opacity:1}}
+@keyframes dhTr{0%{transform:translateY(0);opacity:0}6%{opacity:1}55%{transform:translateY(132px);opacity:1}70%,100%{transform:translateY(170px);opacity:0}}
+@keyframes dhA{0%,45%{opacity:1}55%,95%{opacity:0}}
+@keyframes dhB{0%,45%{opacity:0}55%,95%{opacity:1}100%{opacity:0}}
+
+/* architecture */
+.grp>.cap{display:block;margin-bottom:10px;color:var(--muted)}
+.grp .items{display:grid;gap:10px}
+@media (min-width:720px){.grp .items{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}}
+.node.m b{font-family:var(--mono);font-size:.92rem}
+.node small{display:block;font-family:var(--mono);font-size:.76rem;color:var(--dim);margin-top:6px}
+.conn{width:1px;height:26px;margin:0 auto;background:var(--ink)}
+.layer{display:grid;gap:6px 32px;padding:18px 0;border-bottom:1px solid var(--line)}
+.layer:last-child{border-bottom:0}
+.layer h3{font-family:var(--mono);font-size:1rem}
+.layer .path{font-size:.78rem;font-weight:400;color:var(--dim);display:block;margin-top:3px}
+.layer p{font-size:.95rem;color:var(--muted)}
+.layer .was{font-size:.9rem}
+.layer .was b{display:block;font-size:.8rem;color:var(--rustc);font-weight:650;margin-bottom:2px}
+@media (min-width:860px){.layer{grid-template-columns:minmax(0,.7fr) minmax(0,1.5fr) minmax(0,.8fr)}}
+
+/* a function's life */
+.life{display:grid;gap:32px;align-items:start}
+@media (min-width:900px){.life{grid-template-columns:minmax(0,1.25fr) minmax(0,.75fr);gap:56px}.ladder{position:sticky;top:84px}}
+.steps{border-top:2px solid var(--ink);padding-top:10px}
+.step{position:relative;padding:9px 12px 9px 28px;opacity:.55;transition:opacity .3s,background-color .3s}
+.step::before{content:"";position:absolute;left:8px;top:1.3em;width:7px;height:7px;background:var(--line2);transition:background-color .3s}
+.step.seen{opacity:.85}
+.step.on{opacity:1;background:var(--mark)}
+.step.on::before,.step.seen::before{background:var(--ink)}
+.step .who{display:block;font-size:.8rem;color:var(--muted)}
+.step .who b{color:var(--rustc);font-weight:650}
+.step .msg{display:block;font-weight:600;font-size:.97rem}
+.step.nt{padding:8px 12px;font-size:.84rem;color:var(--warn);background:var(--paper2);margin:8px 0;opacity:1}
+.step.nt::before{display:none}
+.ladder{display:flex;flex-direction:column-reverse;gap:10px}
+.rung{border:1px solid var(--line2);border-radius:var(--r);padding:14px 16px;transition:border-color .4s,background-color .4s}
+.rung h3{font-family:var(--serif);font-size:1.6rem;letter-spacing:-.02em;line-height:1.15;color:var(--dim);transition:color .4s}
+.rung p{color:var(--dim);font-size:.88rem;margin-top:3px}
+.rung.on{border-color:var(--ink);background:var(--mark)}
+.rung.on h3,.rung.on p{color:var(--ink)}
+.closing{margin-top:40px;font-family:var(--serif);font-size:clamp(1.3rem,3vw,1.9rem);letter-spacing:-.015em;max-width:30ch;line-height:1.25}
+.closing s{color:var(--dim)}
+
+/* build */
+.cmd{display:block;margin-top:28px;padding:16px 18px;border-radius:var(--r);background:var(--ink);color:var(--on-ink);font-family:var(--mono);font-size:.88rem;overflow-wrap:anywhere}
+.cmd::before{content:"$ ";color:var(--mark)}
+pre.tree{margin:20px 0 0;padding:18px;border-radius:var(--r);background:var(--paper2);font-family:var(--mono);font-size:.76rem;line-height:1.7;color:var(--muted);overflow-x:auto}
+.final{background:var(--ink);color:var(--on-ink);padding:72px 0}
+@media (min-width:800px){.final{padding:120px 0 104px}}
+.final h2{font-family:var(--serif);font-size:clamp(2.8rem,8.9vw,7.4rem);letter-spacing:-.03em;line-height:.98;font-weight:700}
+.final p{color:var(--on-ink2);margin-top:28px;max-width:64ch;font-size:.92rem}
+.final .cta{margin-top:32px}
+.final .btn{border-color:var(--on-ink)}
+.final .btn.primary{color:var(--ink);border-color:var(--mark)}
+.final .btn.primary:hover{background:var(--on-ink);border-color:var(--on-ink);color:var(--ink)}
+.final :focus-visible{outline-color:var(--mark)}
+.final code{background:oklch(0.975 0.006 145/.12)}
+.final p a:hover{background:none;color:var(--mark)}
+footer{background:var(--ink);color:var(--on-ink2);border-top:1px solid oklch(0.975 0.006 145/.2);padding:20px 0 32px;font-size:.88rem}
+footer .wrap{display:flex;flex-wrap:wrap;align-items:center;gap:4px 28px}
+footer a{color:var(--on-ink);text-underline-offset:4px;text-decoration-thickness:1px;min-height:44px;display:inline-flex;align-items:center}
+noscript p{padding:14px 20px;background:var(--paper2);text-align:center}
+
+/* without JavaScript the page is its plain text: the block, then the links */
+html:not(.jsp) main,html:not(.jsp) #prog{display:none}
+html:not(.jsp) body{display:flex;flex-direction:column}
+html:not(.jsp) .nav{order:-1;position:static}
+#plain{width:100%;max-width:46rem;margin:0 auto;padding:32px 16px 64px;overflow-wrap:break-word}
+#plain h1{font-size:clamp(3rem,12vw,5rem);margin-top:24px}
+#plain h2{font-family:var(--serif);font-size:1.7rem;line-height:1.15;letter-spacing:-.015em;margin:48px 0 0;padding-top:14px;border-top:2px solid var(--ink)}
+#plain h3{font-size:1.1rem;margin:28px 0 0}
+#plain a[name]{text-decoration:none}
+#plain p,#plain ul,#plain ol,#plain pre,#plain table{margin:14px 0 0}
+#plain ul{list-style:disc;padding-left:1.2em}
+#plain ol{list-style:decimal;padding-left:1.4em}
+#plain li{margin-top:6px}
+#plain pre{padding:14px 16px;background:var(--paper2);border-radius:var(--r);font-family:var(--mono);font-size:.8rem;line-height:1.6;overflow-x:auto}
+#plain pre code{background:none;padding:0}
+#plain table{display:block;overflow-x:auto;border:0;border-collapse:collapse;border-top:2px solid var(--ink);font-size:.92rem}
+#plain th,#plain td{border:0;border-bottom:1px solid var(--line);padding:9px 14px 9px 0;text-align:left;vertical-align:top;min-width:5.5em}
+
+@media (prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  *,*::before,*::after{animation:none!important;transition:none!important}
+  .js .reveal,.js .vs .vs-c,.js .vs .vs-r{opacity:1;transform:none}
+  .caret{display:none}
+  .gover,.stack i,.mt i{transform:none!important}
+  .brow.ax{position:static}
+  .dtr,.dfl{display:none}
+  .dt i{transform:scaleX(var(--s))!important}
+  .step{opacity:1}
+}
+
+/* language switch: top bar and footer, every width */
+.lang{display:inline-flex;align-items:center;gap:6px;min-height:44px;padding:0 4px;color:var(--ink);font-size:.88rem;font-weight:600;text-decoration:none;white-space:nowrap}
+.lang:hover{text-decoration:underline;text-underline-offset:5px}
+.lang svg{width:15px;height:15px;flex:none;fill:none;stroke:currentColor;stroke-width:1.3}
+.nav .lang{margin-left:auto}
+.nav .lang+.btn{margin-left:0}
+@media (min-width:1100px){.nav .lang{margin-left:8px}}
+@media (max-width:379px){.nav .wrap{gap:10px}}
+@media (max-width:339px){.nav .lang svg{display:none}}
+footer .sep{display:none}
+/* mode switch: a link to the dark design */
+.theme{display:inline-flex;align-items:center;justify-content:center;flex:none;width:44px;height:44px;margin:0 -8px;border-radius:var(--r);color:var(--ink)}
+.theme:hover{background:var(--paper2)}
+.theme svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+.nav .theme+.btn{margin-left:0}
+@media (max-width:379px){.nav .btn.small{padding:8px 10px}}
+footer .lang{color:var(--on-ink)}
+</style>
+<style>#speed{display:none!important}</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<div id="prog" aria-hidden="true"></div>
+<div id="plain">
+<p>This is the page's full text as plain HTML, for readers without JavaScript. The same text is in the <a href="https://github.com/makepad/relax#readme">README</a> and on the <a href="../retro/">plain HTML page</a>.</p>
+<h1>Relax</h1>
+<p><b>Rust without the wait.</b></p>
+<p><b>rustc builds your program, then you run it. Relax runs your program while it builds it.</b></p>
+<p>Relax is a live compiler and JIT runtime for Rust, written in Rust. It runs a Cargo package straight from source, with no rustc, LLVM or linker in the loop. It checks your code, compiles each function the moment it is first called, optimises the hot ones while the program runs, and patches new code into the running process when you save a file.</p>
+<p><b>TL;DR</b> Rust's speed and safety, without the compile-time wait.</p>
+<ul>
+<li><b>What:</b> a live compiler and JIT runtime for Rust that runs a Cargo package straight from source. No rustc, no LLVM, no linker.
+<li><b>Start:</b> on an M4 MacBook a large 3D game shows its first frame <b>11 s</b> after a clean checkout, where rustc builds for ~3 min first. The second run takes <b>1.15 s</b>.
+<li><b>Change:</b> save a file and the changed functions are patched into the running program, state kept. <b>92 tests re-run in 2.2 s.</b>
+<li><b>Speed:</b> optimised code is still slower than rustc <code>--release</code>. A broader run this week came out slower than our earlier numbers and we're re-measuring; see <a href="#plain-where-llvm-still-wins">where LLVM still wins</a>.
+<li><b>Size:</b> one Rust library: <b>438k lines, 0 crates.io dependencies.</b>
+<li><b>Platforms:</b> code generation for x86-64 and AArch64. From a fresh clone the repository builds and its tests pass on Linux x86-64 and macOS arm64; Windows isn't tested here.
+</ul>
+<h2><a name="plain-relax-vs-rustc">Relax vs rustc</a></h2>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th></th><th>rustc + Cargo</th><th><b>Relax</b></th></tr>
+<tr valign="top"><td><b>Large 3D game, clean checkout → first frame</b></td><td>~3 min build, then start</td><td><b>11 s</b> on an M4 MacBook, straight from source</td></tr>
+<tr valign="top"><td><b>Same game, second run → first frame</b></td><td>start the built binary</td><td><b>1.15 s</b> on an M4 MacBook, nothing recompiled</td></tr>
+<tr valign="top"><td><b>Change one function in a running program</b></td><td>rebuild, relink, restart: program state lost</td><td><b>patched into the running process</b>: state kept</td></tr>
+<tr valign="top"><td><b>Save a file → 92 tests re-run</b></td><td>rebuild the test binary first</td><td><b>2.2 s</b> after the save</td></tr>
+<tr valign="top"><td><b>Small app, cold → first frame</b></td><td>build it first</td><td><b>3.7 s</b> cold, <b>0.41 s</b> warm (M4 MacBook)</td></tr>
+<tr valign="top"><td><b>Speed of optimised code</b></td><td>1.00× (LLVM, <code>--release</code> for the native CPU)</td><td><b>slower</b>: 1.14–1.26× on the workloads we profile most, 2.3× on dense numeric loops (not vectorised yet); being re-measured (<a href="#plain-where-llvm-still-wins">details</a>)</td></tr>
+<tr valign="top"><td><b>Type- and borrow-checked before it runs</b></td><td>yes</td><td><b>yes</b></td></tr>
+<tr valign="top"><td><b>Needs</b></td><td>rustc, LLVM, a linker</td><td><b>Relax</b>, one Rust library (438k lines, 0 crates.io dependencies)</td></tr>
+</table>
+<h3><a name="plain-what-it-took-a-new-rust-toolchain-from-source-bytes-to-machine-code">What it took: a new Rust toolchain, from source bytes to machine code</a></h3>
+<p>Relax isn't a wrapper around rustc or a plugin for LLVM. It replaces both, plus the parts of Cargo and the linker that sit between your source and a running program, in one Rust library with no dependencies.</p>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th>The job</th><th>In the usual toolchain</th><th><b>In Relax</b></th></tr>
+<tr valign="top"><td>Lex, parse and expand macros, <code>macro_rules!</code> and procedural</td><td>rustc</td><td><b>relax-lex, relax-front</b></td></tr>
+<tr valign="top"><td>Resolve names, solve traits, infer types, check borrows, evaluate constants</td><td>rustc</td><td><b>relax-types</b></td></tr>
+<tr valign="top"><td>Optimise: inlining, folding, loops, ranges</td><td>rustc's MIR passes + LLVM</td><td><b>relax-codegen</b> (O1 and O3)</td></tr>
+<tr valign="top"><td>Allocate registers, emit x86-64 and AArch64 machine code</td><td>LLVM</td><td><b>relax-backend</b></td></tr>
+<tr valign="top"><td>Link and load</td><td>the system linker and loader</td><td><b>relax-compiler</b>, straight into executable memory</td></tr>
+<tr valign="top"><td>Read manifests and resolve the crate graph</td><td>Cargo</td><td><b>relax-base</b></td></tr>
+<tr valign="top"><td>Build <code>core</code>, <code>alloc</code> and <code>std</code></td><td>shipped prebuilt</td><td><b>compiled from source by Relax</b></td></tr>
+<tr valign="top"><td>Size</td><td>millions of lines of Rust and C++</td><td><b>438k lines of Rust, 0 crates.io dependencies</b></td></tr>
+</table>
+<hr>
+<h2><a name="plain-why-this-changes-rust">Why this changes Rust</a></h2>
+<p>Rust gives you speed and safety, and charges for them in compile times. Relax keeps the speed and the safety and drops the charge.</p>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th></th><th>With rustc</th><th><b>With Relax</b></th></tr>
+<tr valign="top"><td><b>Getting started</b></td><td>Build everything first. On a large app, minutes pass before <code>main</code> runs.</td><td><b>Start from source now.</b> On an M4 MacBook a small app shows its first frame 3.7 s after a cold start, and a large 3D game in 11 s. Run them again and it's 0.41 s and 1.15 s.</td></tr>
+<tr valign="top"><td><b>Making a change</b></td><td>Rebuild the crate and everything that depends on it, relink, restart, and get back to where you were.</td><td><b>Saving is the build.</b> Only the functions you changed are rechecked and recompiled, and they're swapped into the running program, which keeps its state, windows and connections.</td></tr>
+<tr valign="top"><td><b>Run-time speed</b></td><td>Fast, after a long optimised build.</td><td><b>Fast, while it runs.</b> Code starts on an interpreter and climbs to O1 and O3 in the background. Optimised Relax code is still slower than rustc <code>--release</code> (see <a href="#plain-where-llvm-still-wins">where LLVM still wins</a>).</td></tr>
+<tr valign="top"><td><b>Safety</b></td><td>Everything type- and borrow-checked.</td><td><b>The same.</b> Relax never runs code it hasn't checked.</td></tr>
+<tr valign="top"><td><b>Your crates</b></td><td>Path, git, crates.io, vendored, proc macros.</td><td><b>The same crates, as written,</b> procedural macros included.</td></tr>
+<tr valign="top"><td><b>Caches</b></td><td>Incremental artefacts on disk that can go stale and need <code>cargo clean</code>.</td><td><b>Every result is keyed by the hashes of its inputs.</b> A hit is exactly what a fresh compile would produce. A warm start recompiles nothing.</td></tr>
+<tr valign="top"><td><b>When it's slow</b></td><td>You wait and guess.</td><td><b>The runtime tells you.</b> Every compile phase, stall and tier change goes to a flight recorder.</td></tr>
+</table>
+<hr>
+<h2><a name="plain-built-for-ai-agents-the-loop-that-stays-hot">Built for AI agents: the loop that stays hot</a></h2>
+<p>An AI agent can't feel a slow build, but it pays for every one in tokens, wall-clock and lost context.</p>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th>An agent's iteration</th><th>With rustc + Cargo</th><th><b>With Relax + devhub</b></th></tr>
+<tr valign="top"><td><b>Edit reaches the program</b></td><td>rebuild and relink: minutes on a large app</td><td><b>synced and patched in milliseconds</b> (~50–200 ms to the box)</td></tr>
+<tr valign="top"><td><b>Test verdict</b></td><td>rebuild the test binary, then run</td><td><b>92 tests back 2.2 s after the save</b></td></tr>
+<tr valign="top"><td><b>See the UI</b></td><td>rebuild, relaunch, navigate back</td><td><b>a frame of the live app, grabbed as a PNG</b></td></tr>
+<tr valign="top"><td><b>Layout change that can't be patched</b></td><td>full rebuild and restart</td><td><b>restart in place, automatically</b>: one log line, no error</td></tr>
+<tr valign="top"><td><b>New worker or lane</b></td><td>cold build</td><td><b>starts warm</b>: every machine keeps a warm cache at the tip</td></tr>
+<tr valign="top"><td><b>"Why was that slow?"</b></td><td>read logs and guess</td><td><b>ask the flight recorder</b>: which thread waited, on what, compiling which function</td></tr>
+</table>
+<p><a href="https://github.com/makepad/makepad">Makepad</a> builds its apps with many AI agents working in parallel, each in its own lane, and Relax keeps them fast. Its dev hub, <b>devhub</b>, runs the build and test machines around Relax, so nothing an agent touches is ever cold:</p>
+<pre>flowchart LR
+    A["AI agent&lt;br/&gt;edits a file"] --&gt;|"sync, ~50-200 ms"| B["devhub&lt;br/&gt;routes to a warm box"]
+    B --&gt; C["Live Relax session&lt;br/&gt;patches only what changed"]
+    C --&gt; D["Tests re-run&lt;br/&gt;verdict in seconds"]
+    C --&gt; E["App frame&lt;br/&gt;grabbed as a PNG"]
+    D --&gt; A
+    E --&gt; A
+    C --&gt;|"flight recorder"| F["why it was slow,&lt;br/&gt;what it compiled"]
+    F --&gt; A</pre>
+<ul>
+<li><b>A live session per lane.</b> Each agent's app or test run stays alive under Relax on a pool machine, and every save patches it. Nothing is rebuilt or relaunched.
+<li><b>Warm caches everywhere.</b> Each machine refreshes its Relax cache as changes land, so a fresh worker starts warm.
+<li><b>No native builds in the loop.</b> devhub sends iteration and pre-landing checks to Relax, and counts every native build that slips through, per lane.
+<li><b>Measured routing.</b> Jobs are sized by their measured times, and quick checks go to machines with warm sessions, so they never queue behind a long build.
+</ul>
+<p><b>In practice:</b> nine agent lanes run side by side, devhub handles more than 300 build and test jobs an hour, and dozens of changes land every day, each checked under Relax before it merges.</p>
+<hr>
+<h2><a name="plain-relax-vs-rustc-feature-by-feature">Relax vs rustc, feature by feature</a></h2>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th></th><th>rustc + Cargo</th><th><b>Relax</b></th></tr>
+<tr valign="top"><td><b>Start</b></td><td>Build the whole crate graph, link, then run <code>main</code>.</td><td><b>Resolve the crate graph and start <code>main</code> from source.</b> No native build of your code.</td></tr>
+<tr valign="top"><td><b>Checking</b></td><td>Type- and borrow-check every crate up front.</td><td><b>The same, before the first call.</b></td></tr>
+<tr valign="top"><td><b>Compiling</b></td><td>Whole crates, ahead of time.</td><td><b>One function at a time, the moment it's first called.</b> Hot functions move up in the background: interpreter → O1 → O3. <code>#[relax(O2)]</code> / <code>#[relax(O3)]</code> ask for a level ahead of time; under rustc the attribute does nothing.</td></tr>
+<tr valign="top"><td><b>Editing</b></td><td>Rebuild and restart.</td><td><b>Recheck, recompile and swap in only what changed, while the program runs.</b> Code already handed out stays valid. A change that can't be swapped restarts the program in place.</td></tr>
+<tr valign="top"><td><b>Caching</b></td><td>Incremental artefacts per crate.</td><td><b>Every result keyed by the hashes of its inputs.</b> An unchanged package recompiles nothing.</td></tr>
+<tr valign="top"><td><b>Procedural macros</b></td><td>Built as native dylibs, then loaded.</td><td><b>Run natively when they match a linked build, otherwise on the JIT.</b></td></tr>
+<tr valign="top"><td><b>The standard library</b></td><td>Ships precompiled.</td><td><b><code>core</code>, <code>alloc</code> and <code>std</code> (134k lines) compiled from source by Relax itself.</b></td></tr>
+<tr valign="top"><td><b>Native code</b></td><td>Everything is native.</td><td><b>Crates that must stay native (OS layers, GPU, audio) export an interface with <code>#[relax_api]</code>.</b> JIT code calls them through the C ABI planner, with per-thread heap routing across the boundary.</td></tr>
+<tr valign="top"><td><b>Visibility</b></td><td>Compiler timings after the fact.</td><td><b>A live flight recorder,</b> with hitch events and compile profilers.</td></tr>
+<tr valign="top"><td><b>Back ends</b></td><td>LLVM, then a system linker.</td><td><b>Its own x86-64 and AArch64 code generators,</b> with no linker and no LLVM.</td></tr>
+</table>
+<hr>
+<h2><a name="plain-where-llvm-still-wins">Where LLVM still wins</a></h2>
+<p>LLVM has decades of optimisation work behind it, and in steady state its code is still faster than Relax's. Our own measurements: warm JIT against a native build of the same source and inputs, as wall-clock ratios (lower is better, 1.00× = LLVM).</p>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th>Workload</th><th>CPU</th><th>vs <code>--release</code>, native CPU</th><th>Measured</th></tr>
+<tr valign="top"><td>3D-print slicer, first slice of a part, 4 threads</td><td>x86-64 (Zen 4)</td><td><b>1.14×</b> (cycles 1.15×, instructions 1.26×)</td><td>2026-11-11</td></tr>
+<tr valign="top"><td>Same, 8 threads</td><td>x86-64 (Zen 4)</td><td><b>1.17×</b></td><td>2026-11-11</td></tr>
+<tr valign="top"><td>Same, 4 threads</td><td>AArch64 (Apple M4)</td><td><b>1.24×</b> (before this week's x86 gains were ported)</td><td>2026-11-09</td></tr>
+<tr valign="top"><td>CAD B-rep modelling round</td><td>x86-64 (Zen 4)</td><td><b>1.26×</b></td><td>2026-11-10</td></tr>
+<tr valign="top"><td>Script VM interpreter loop</td><td>x86-64 (Zen 4)</td><td><b>1.19×</b></td><td>2026-11-11</td></tr>
+<tr valign="top"><td>Dense numeric kernel (Cholesky factorisation)</td><td>x86-64 (Zen 4)</td><td><b>2.29×</b>: LLVM vectorises it with AVX-512, Relax doesn't vectorise loops yet</td><td>2026-11-10</td></tr>
+<tr valign="top"><td>Any workload against plain <code>--release</code> (portable CPU baseline)</td><td></td><td><b>not measured yet</b></td><td></td></tr>
+</table>
+<p>These are the workloads we profile most. A broader run of 18 workloads this week came out slower than these, and slower than in October; we're finding out why and will update this section with the result.</p>
+<p><b>Which <code>--release</code>?</b> Most Rust ships with plain <code>--release</code>, built for a portable baseline CPU (on x86-64, no AVX). Our numbers are against the harder setting, <code>--release</code> with <code>-C target-cpu=native</code>, where LLVM may use every instruction the machine has. Relax always compiles for the CPU it runs on, so against plain <code>--release</code> these gaps shrink, and on vector-heavy code they can flip. That comparison hasn't been measured yet.</p>
+<p><b>Where the gap comes from</b>, from instruction-level comparisons of the same functions. The gap is extra instructions rather than stalls: 1.26× the instructions cost only 1.15× the cycles.</p>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th>Cause</th><th>Extra instructions (slicer run)</th></tr>
+<tr valign="top"><td>Compares kept as bool registers and recomputed</td><td>~25 G</td></tr>
+<tr valign="top"><td>Register copies (two-address form, coalescing misses)</td><td>~23 G</td></tr>
+<tr valign="top"><td>Stack traffic: loop state kept in stack slots; 12 allocatable registers against rustc's 15</td><td>~22 G</td></tr>
+<tr valign="top"><td>Extra loop-control and check branches, invariant tests left inside loops</td><td>~13 G</td></tr>
+<tr valign="top"><td>Loads not folded into compares, i128 arithmetic, rematerialised constants, smaller items</td><td>~33 G</td></tr>
+<tr valign="top"><td>Runtime outside the generated code (memcpy, allocator wrappers, TLS access, stubs)</td><td>~40 G</td></tr>
+<tr valign="top"><td>No loop vectorisation, shallow unrolling</td><td>most of the numeric-kernel gap</td></tr>
+</table>
+<p>What isn't a cause: inlining. Relax inlines more than rustc does.</p>
+<p>Every row in this table is a work item, and the slicer gap went from 1.26× to 1.14× in the last three days.</p>
+<hr>
+<h2><a name="plain-architecture">Architecture</a></h2>
+<p>rustc hands your program to LLVM and a linker, and Cargo glues the steps together. Relax owns the whole pipeline, from source bytes to executable memory, in one process.</p>
+<p>Relax is a stack of layers. Each layer is its own crate, builds only on the ones below it and re-exports them, so every module is <code>crate::&lt;module&gt;</code> at every layer. The layers compile in parallel, and a change in an upper layer never rebuilds the ones below.</p>
+<pre>flowchart TB
+    SRC["Cargo package&lt;br/&gt;.rs sources + Cargo.toml"]
+
+    subgraph FRONT["Front: what the program says"]
+        LEX["relax-lex&lt;br/&gt;lexer + proc-macro token model"]
+        BASE["relax-base&lt;br/&gt;hashing, arenas, syntax tree,&lt;br/&gt;manifests, git + source mounts"]
+        SES["relax-session&lt;br/&gt;compilation inputs, stable hashes"]
+        FE["relax-front&lt;br/&gt;parse, crate graph, name resolution,&lt;br/&gt;macro expansion, derives"]
+    end
+
+    subgraph MID["Types: what the program means"]
+        TY["relax-types&lt;br/&gt;interned types, impls, typeck,&lt;br/&gt;layouts, const eval, borrow check"]
+    end
+
+    subgraph LOW["Code: how it runs"]
+        CG["relax-codegen&lt;br/&gt;RIR optimisers O1 / O3,&lt;br/&gt;loops + ranges, threaded interpreter"]
+        BE["relax-backend&lt;br/&gt;RIR + vectors, register allocation,&lt;br/&gt;x86-64 / AArch64 code, C ABI, exec memory"]
+    end
+
+    subgraph RT["relax-compiler: the runtime"]
+        JIT["JIT runtime&lt;br/&gt;lazy compile, tiers, live swap,&lt;br/&gt;warm caches, flight recorder"]
+        STD["core / alloc / std&lt;br/&gt;from source"]
+        PM["proc-macro host"]
+    end
+
+    API["relax_api&lt;br/&gt;native crates"]
+
+    SRC --&gt; LEX --&gt; BASE --&gt; SES --&gt; FE --&gt; TY --&gt; CG --&gt; BE --&gt; JIT
+    PM --&gt; FE
+    STD --&gt; TY
+    API &lt;--&gt; JIT</pre>
+<h3><a name="plain-the-layers-and-what-they-replace">The layers, and what they replace</a></h3>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th>Crate</th><th>Path</th><th>Role</th><th>In the rustc world</th></tr>
+<tr valign="top"><td><code>relax-lex</code></td><td><code>libs/relax/lex</code></td><td>The one lexer and token model for Rust (every edition), and the token model procedural macros see.</td><td>the lexer and <code>proc_macro</code></td></tr>
+<tr valign="top"><td><code>relax-base</code></td><td><code>libs/relax/base</code></td><td>What every phase shares: hashing, memory accounting and zone allocation, concurrent containers and arenas, the syntax tree, <code>cfg</code>, manifests (TOML, resolution), the git read path and source mounts.</td><td>parts of Cargo and rustc's shared infrastructure</td></tr>
+<tr valign="top"><td><code>relax-session</code></td><td><code>libs/relax/session</code></td><td>The inputs of a compilation and their stable hashing: the keys every cache is built on.</td><td>the session and incremental keys</td></tr>
+<tr valign="top"><td><code>relax-front</code></td><td><code>libs/relax/front</code></td><td>Parsing, the crate graph and name resolution, macro expansion (<code>macro_rules!</code>, built-ins, <code>format_args!</code>, derives, proc-macro registration).</td><td>parser, resolver, macro expansion</td></tr>
+<tr valign="top"><td><code>relax-types</code></td><td><code>libs/relax/types</code></td><td>Interned types, signatures and impls, type checking, layouts, constant evaluation, the borrow checker, per-definition body queries and stable type hashes.</td><td>type checker, borrow checker, const eval</td></tr>
+<tr valign="top"><td><code>relax-codegen</code></td><td><code>libs/relax/codegen</code></td><td>The middle end on RIR (Relax IR): the O1 and O3 optimisers (inlining, folding, loop and range passes), the threaded interpreter tier and the compile profilers.</td><td>MIR optimisations and LLVM's optimiser</td></tr>
+<tr valign="top"><td><code>relax-backend</code></td><td><code>libs/relax/backend</code></td><td>Register allocation, machine code for the host (x86-64 or AArch64), jump tables, the C ABI planner and executable memory.</td><td>LLVM's code generator and the linker</td></tr>
+<tr valign="top"><td><code>relax-compiler</code></td><td><code>libs/relax/compiler</code></td><td>The compiler, JIT runtime and std as one library: lazy compilation, tiering, live edits, caches, the proc-macro host and the test runner.</td><td>Cargo, the rustc driver, the test harness and the OS loader</td></tr>
+<tr valign="top"><td><code>relax-native-macros</code></td><td><code>libs/relax/native_macros</code></td><td>Natively linked procedural macros, checked against their source so they expand exactly as they would under Cargo.</td><td>proc-macro dylibs</td></tr>
+<tr valign="top"><td>attribute</td><td><code>libs/relax/attr</code></td><td><code>#[relax(O2)]</code> / <code>#[relax(O3)]</code>: the optimisation-level attribute; a no-op under rustc.</td><td><code>opt-level</code> per profile</td></tr>
+<tr valign="top"><td><code>relax_api</code></td><td><code>libs/relax_api</code></td><td><code>#[relax_api]</code>: the interface a natively compiled crate offers to JIT code, and per-thread heap routing.</td><td>(no equivalent: everything is native)</td></tr>
+</table>
+<h3><a name="plain-a-functions-life">A function's life</a></h3>
+<pre>sequenceDiagram
+    participant App as Running program
+    participant RT as JIT runtime
+    participant TY as Types layer
+    participant CG as Codegen + backend
+
+    Note over RT,TY: before the first call, every crate of the program is type-checked
+    App-&gt;&gt;RT: first call of fn f
+    RT-&gt;&gt;CG: compile f (interpreter or O1)
+    CG--&gt;&gt;RT: machine code, published
+    RT--&gt;&gt;App: call proceeds
+    loop while f is hot
+        RT-&gt;&gt;CG: recompile f at O3 in the background
+        CG--&gt;&gt;RT: faster code, swapped in
+    end
+    Note over App,RT: you save a change to f
+    RT-&gt;&gt;TY: recheck what changed
+    TY--&gt;&gt;RT: ok
+    RT-&gt;&gt;CG: recompile f
+    CG--&gt;&gt;RT: new code, the old code stays valid
+    RT--&gt;&gt;App: next call runs the new f</pre>
+<p>With rustc, the same change is a rebuild of the crate, a relink and a restart.</p>
+<h3><a name="plain-design-rules">Design rules</a></h3>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th>Rule</th><th>What it means against rustc</th></tr>
+<tr valign="top"><td><b>Checked, then run</b></td><td>Same guarantee as rustc: nothing runs unchecked. Relax just doesn't make you wait for the rest of the program first.</td></tr>
+<tr valign="top"><td><b>Never stale</b></td><td>Every cached result is keyed by the hashes of its inputs. A hit is exactly what a fresh compile would produce, so there's no <code>cargo clean</code>.</td></tr>
+<tr valign="top"><td><b>Code only grows</b></td><td>Published machine code is never freed or rewritten while it can still be on a stack. A swap publishes new code and redirects future calls, and is safe where a native hot-reload hack isn't.</td></tr>
+<tr valign="top"><td><b>Lazy by default</b></td><td>rustc compiles everything you might call. Relax compiles what you do call, and optimises it in the background.</td></tr>
+<tr valign="top"><td><b>Rust as written</b></td><td>Ordinary crates, from crates.io and git. <code>libs/relax/KNOWN_GAPS.md</code> lists what doesn't work yet.</td></tr>
+<tr valign="top"><td><b>Inspectable</b></td><td>Every phase reports what it's doing; a stall can always be explained from its record.</td></tr>
+</table>
+<hr>
+<h2><a name="plain-building">Building</a></h2>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th></th><th>rustc</th><th><b>Relax</b></th></tr>
+<tr valign="top"><td><b>To build it</b></td><td>LLVM plus a bootstrap</td><td><b>A stable Rust toolchain. Nothing from crates.io.</b></td></tr>
+</table>
+<pre>cargo build --release -p relax-compiler</pre>
+<p>The compiler is the <code>relax_compiler</code> library; <code>relax</code> (<code>tools/run/runner</code>) is its command-line runner.</p>
+<h2><a name="plain-try-it">Try it</a></h2>
+<p>From a fresh clone, build <code>relax</code> and run a new package through the JIT:</p>
+<pre>git clone https://github.com/makepad/relax
+cargo build --release --manifest-path relax/Cargo.toml -p relax-runner --bin relax
+
+cargo new hello
+cd hello
+../relax/target/release/relax run --quiet hello    # run main under the JIT
+../relax/target/release/relax test hello           # run its #[test] fns
+../relax/target/release/relax check hello          # type- and borrow-check only</pre>
+<p>Run <code>relax</code> in the package's folder and give it the package's name, not a path. It reads Relax's std from the checkout it was built in, so keep the <code>relax</code> folder where it is.</p>
+<p>Each run also prints a <code>relax-remote: pid ...</code> line: the running program's inspect socket (<code>relax inspect &lt;pid&gt; help</code>).</p>
+<p>Measured from a fresh clone: on a 16-core x86-64 Linux box, building <code>relax</code> took 53 s, the first <code>relax run</code> of <code>hello</code> 0.24 s and the next ones 0.01 to 0.07 s. On a 10-core arm64 Mac, with cargo held to 4 jobs, the build took 78 s, the first run 0.97 s and the next ones 0.03 to 0.04 s. Relax keeps what it compiles in the package's <code>target/makepad-run</code>, beside cargo's build output (120 to 190 MB for <code>hello</code>; <code>relax clean</code> removes it), so each new package starts cold.</p>
+<p><b>Network.</b> A package with no dependencies, like <code>hello</code>, needs none: it also runs with <code>MAKEPAD_RUN_OFFLINE=1</code>. For a crates.io dependency Relax takes the package from <code>~/.cargo</code>'s registry when it is there, and otherwise downloads it itself: the sparse index from index.crates.io and the <code>.crate</code> file from static.crates.io, checked against the index's SHA-256 and kept in that package's <code>target/makepad-run</code>. With cargo's offline setting (<code>CARGO_NET_OFFLINE</code>) or <code>MAKEPAD_RUN_OFFLINE=1</code> it never downloads: a package whose dependencies it already fetched still runs, and one whose dependencies it has not fetched stops with an error naming the missing crate. <code>relax fetch &lt;git-url&gt;</code> (<code>tools/run/runner/src/fetch.rs</code>, also used by <code>relax run &lt;git-url&gt; &lt;package&gt;</code>) downloads a git repository over HTTPS into one store file under <code>~/.makepad-run</code> (<code>MAKEPAD_RUN_HOME</code>); this repository is a 4 MB store.</p>
+<p>Not everything runs yet: <a href="https://github.com/makepad/relax/blob/main/libs/relax/KNOWN_GAPS.md">libs/relax/KNOWN_GAPS.md</a> lists the open gaps, each with a repro.</p>
+<h2><a name="plain-repository-layout">Repository layout</a></h2>
+<pre>Cargo.toml                              the workspace
+libs/relax/
+  lex/ base/ session/ front/ types/     front end and type system
+  codegen/ backend/                     middle end and machine code
+  compiler/                             runtime, std (compiler/std), 96 end-to-end test packages
+  attr/ native_macros/                  #[relax(..)] and native proc macros
+  KNOWN_GAPS.md                         what isn't supported yet
+libs/relax_api/                         #[relax_api] and per-thread heap routing
+tools/run/runner/                       relax, the command-line runner
+libs/ platform/ tools/ widgets/         the small support crates Relax links: token model,
+                                        serialisation, remote inspection, profiling, and the
+                                        native proc macros it checks against their source</pre>
+<h2><a name="plain-license">License</a></h2>
+<p>MIT, see <a href="https://github.com/makepad/relax/blob/main/LICENSE">LICENSE</a>. The std sources Relax compiles carry their own notices; see <code>libs/relax/compiler/std/CREDITS.md</code> and the license files beside them.</p>
+</div>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="#top" aria-label="Relax, top of page">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><rect x="2" y="2" width="28" height="28" rx="8" fill="none" stroke="currentColor" stroke-width="2.5"/><path d="M11 22V10h6a4 4 0 0 1 0 8h-6m6 0 5 4" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Relax
+    </a>
+    <nav aria-label="Sections">
+      <a href="#race">vs rustc</a>
+      <a href="#toolchain">What it took</a>
+      <a href="#why">Why</a>
+      <a href="#agents">AI agents</a>
+      <a href="#features">Features</a>
+      
+      <a href="#gaps">Where LLVM wins</a>
+      <a href="#architecture">Architecture</a>
+    </nav>
+    <a class="lang" href="../zh/light/" hreflang="zh-CN" lang="zh-CN"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.4"/><path d="M1.6 8h12.8M8 1.6c1.9 1.8 2.8 4 2.8 6.4S9.9 12.6 8 14.4M8 1.6C6.1 3.4 5.2 5.6 5.2 8s.9 4.6 2.8 6.4"/></svg>中文</a>
+    <a class="theme" href="../" aria-label="Dark version" title="Dark version" onclick="try{localStorage.setItem('relax-theme','dark')}catch(e){}"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.4 9.7A5.7 5.7 0 0 1 6.3 2.6a5.7 5.7 0 1 0 7.1 7.1z"/></svg></a>
+    <a class="btn small" href="https://github.com/makepad/relax">GitHub</a>
+  </div>
+</header>
+
+<main id="main">
+
+<section class="hero" id="top" aria-labelledby="h-hero">
+  <div class="wrap">
+    <h1 id="h-hero"><span class="w" style="--i:0">Rust</span> <span class="w" style="--i:1">without</span> <span class="w" style="--i:2">the</span> <span class="w glow" style="--i:3">wait.</span></h1>
+    <div class="hero-grid">
+      <div>
+        <p class="lede"><span>rustc builds your program, then you run it.</span> Relax runs your program while it builds it.</p>
+        <div class="cta">
+          <a class="btn primary" href="https://github.com/makepad/relax">GitHub</a>
+          <a class="btn" href="#race">Watch the race</a>
+        </div>
+      </div>
+      <div>
+        <aside class="mini" aria-label="How the two toolchains spend your time">
+          <h2>The same program, two toolchains</h2>
+          <div class="ml c"><b>rustc + Cargo <span>build, then run</span></b><div class="mt" aria-hidden="true"><i></i><i></i></div></div>
+          <div class="ml r"><b>Relax <span>run while it builds</span></b><div class="mt" aria-hidden="true"><i></i></div></div>
+          <p>Schematic, not to scale. The measured race is below.</p>
+        </aside>
+        <p class="sub"><strong>A live compiler and JIT runtime for Rust, written in Rust.</strong> Relax runs a Cargo package straight from source, with no rustc, LLVM or linker in the loop. It checks your code, compiles each function the moment it is first called, optimises the hot ones while the program runs, and patches new code into the running process when you save a file.</p>
+      </div>
+    </div>
+    <div class="stats" id="heroStats"></div>
+    <div class="card tl reveal" id="tldr"><h2>TL;DR</h2><p data-rich="tldr.lead"></p><ul id="tldrList"></ul></div>
+  </div>
+</section>
+
+<div class="mq" aria-hidden="true"><div id="mq"></div></div>
+
+<section id="race" aria-labelledby="h-race">
+  <div class="wrap">
+    <p class="kicker o reveal">The scoreboard</p>
+    <h2 class="title reveal" id="h-race">Relax <em>vs rustc</em></h2>
+    <div class="card race reveal mt48" id="raceBox">
+      <div class="race-head">
+        <h3 data-d="race.title"></h3>
+        <span class="clock" id="raceClock" aria-hidden="true"></span>
+        <button class="btn small" id="raceReplay" type="button">Replay</button>
+      </div>
+      <div class="lane r" id="laneR">
+        <div class="lane-top"><b>Relax</b><span class="big" data-d="race.relax.label"></span><span class="n" data-d="race.relax.note"></span><span class="st" id="raceStR"></span></div>
+        <div class="track" aria-hidden="true"><i class="run" id="raceRun"></i><i class="fill" id="raceFillR"></i><span class="lbl" id="raceLbl"><span data-d="race.relax.running"></span></span></div>
+      </div>
+      <div class="lane c" id="laneC">
+        <div class="lane-top"><b>rustc + Cargo</b><span class="big" data-d="race.rustc.label"></span><span class="n" data-d="race.rustc.note"></span><span class="st" id="raceStC"></span></div>
+        <div class="track" aria-hidden="true"><i class="fill" id="raceFillC"></i><span class="flag" data-d="race.rustc.flag"></span></div>
+      </div>
+      <div class="axis" id="raceAxis" aria-hidden="true"></div>
+      <p class="note" data-d="race.note"></p>
+    </div>
+    <div class="grid g2" id="rounds"></div>
+    <div class="card box grid" id="vsRest"></div>
+  </div>
+</section>
+
+<section id="toolchain" class="alt" aria-labelledby="h-took">
+  <div class="wrap">
+    <p class="kicker reveal">What it took</p>
+    <h2 class="title reveal" id="h-took">A new Rust toolchain, <em>from source bytes to machine code.</em></h2>
+    <p class="intro reveal" data-rich="took.intro"></p>
+    <div class="took mt48">
+      <div class="card pipe reveal" id="pipeBox">
+        <p class="cap"><span>The job</span><span>in the usual toolchain</span><span>in Relax</span></p>
+        <ol id="pipeList"><li class="rail y" aria-hidden="true"></li></ol>
+      </div>
+      <div class="bigs" id="tookBigs"></div>
+    </div>
+  </div>
+</section>
+
+<section id="why" aria-labelledby="h-why">
+  <div class="wrap">
+    <p class="kicker reveal">Why this changes Rust</p>
+    <h2 class="title reveal" id="h-why">Keep the speed and the safety. <em>Drop the charge.</em></h2>
+    <p class="intro reveal" data-rich="why.intro"></p>
+    <div class="card box mt48" id="vsWhy"></div>
+
+    <h3 class="h reveal">Saving is the build</h3>
+    <p class="intro reveal" data-rich="demo.intro"></p>
+    <div class="demo reveal mt48" id="demoBox">
+      <div class="card win">
+        <div class="win-bar"><span data-d="demo.file"></span><span class="state" id="edState" role="status"></span></div>
+        <pre class="code" id="code" aria-label="Source of the function being edited"></pre>
+        <div class="acts">
+          <button class="btn small primary" id="btnEdit" type="button">Save an edit</button>
+          <button class="btn small" id="btnRustc" type="button">Do it the rustc way</button>
+          <button class="btn small" id="btnAuto" type="button"></button>
+        </div>
+      </div>
+      <div class="card win">
+        <div class="win-bar"><span>running program</span><span class="state hot" id="pgState"></span></div>
+        <div class="stage">
+          <canvas id="stage" role="img" aria-label="Particles whose motion changes each time the function is patched, without a restart"></canvas>
+          <div class="overlay" id="overlay" aria-hidden="true"></div>
+        </div>
+        <dl class="hud">
+          <div><dt>Frames since start</dt><dd id="hudFrame"></dd></div>
+          <div><dt>Patches</dt><dd id="hudPatch"></dd></div>
+          <div><dt>Restarts</dt><dd id="hudRestart"></dd></div>
+        </dl>
+        <ul class="log" id="log" aria-live="polite"></ul>
+      </div>
+    </div>
+    <p class="note reveal" data-d="demo.note"></p>
+  </div>
+</section>
+
+<section id="agents" class="alt" aria-labelledby="h-agents">
+  <div class="wrap">
+    <p class="kicker reveal">Built for AI agents</p>
+    <h2 class="title reveal" id="h-agents">The loop <em>that stays hot.</em></h2>
+    <p class="intro reveal" data-rich="agents.intro"></p>
+    <div class="card box mt48" id="vsAgents"></div>
+    <p class="intro reveal mt48"><a href="https://github.com/makepad/makepad">Makepad</a> <span data-rich="agents.makepad"></span></p>
+    <div class="card loop reveal mt48" id="loopBox">
+      <div class="lrow" id="loopRow"></div>
+      <div class="edge down" aria-hidden="true"><i class="rail y"></i></div>
+      <div class="outs" id="loopOuts"></div>
+      <div class="back"><span data-d="agents.back"></span><div class="rail" aria-hidden="true"></div></div>
+    </div>
+    <figure class="card dh reveal" id="dhFig">
+      <div class="dh-bar"><b>devhub</b><span class="tag">illustration</span></div>
+      <div class="dh-grid" id="dhGrid"></div>
+      <figcaption data-d="devhub.caption"></figcaption>
+    </figure>
+    <div class="grid g2" id="agentBullets"></div>
+    <h3 class="h reveal">In practice</h3>
+    <div class="grid g3" id="practice"></div>
+  </div>
+</section>
+
+<section id="features" aria-labelledby="h-feat">
+  <div class="wrap">
+    <p class="kicker o reveal">Feature by feature</p>
+    <h2 class="title reveal" id="h-feat">Relax vs rustc, <em>feature by feature.</em></h2>
+    <div class="card box mt48" id="vsFeat"></div>
+  </div>
+</section>
+
+<section id="speed" class="alt" aria-labelledby="h-speed">
+  <div class="wrap">
+    <p class="kicker o reveal">Speed</p>
+    <h2 class="title reveal" id="h-speed">Relax vs rustc, <em>on real workloads.</em></h2>
+    <p class="intro reveal" id="benchIntro"></p>
+    <div class="bctl reveal" id="benchCtl"></div>
+    <div class="bcall" id="benchCall"></div>
+    <div class="card bchart reveal grid" id="benchChart"></div>
+    <details class="nums reveal" id="benchNums"><summary>Show the numbers</summary><div class="scrollx"><table class="nt" id="benchTable"></table></div></details>
+  </div>
+</section>
+
+<section id="gaps" aria-labelledby="h-gaps">
+  <div class="wrap">
+    <p class="kicker o reveal">Honest numbers</p>
+    <h2 class="title reveal" id="h-gaps">Where LLVM <em>still wins.</em></h2>
+    <p class="intro reveal" data-rich="gaps.intro"></p>
+    <div class="card chart reveal mt48" id="gapChart">
+      <h3 data-rich="gaps.chartTitle"></h3>
+      <p class="legend" id="gapLegend"></p>
+      <div id="gapBars"></div>
+      <p class="note" data-rich="gaps.tableNote"></p>
+    </div>
+    <div class="card which reveal grid" id="gapWhich"></div>
+    <div class="card chart reveal grid" id="causeBox">
+      <p class="intro" style="margin-top:0" data-rich="gaps.causesIntro"></p>
+      <h3 style="margin-top:22px" data-d="gaps.causesTitle"></h3>
+      <div class="stack" id="causeStack" aria-hidden="true"></div>
+      <ul class="causes" id="causeList" style="margin-top:14px"></ul>
+      <p class="note" data-d="gaps.notCause" style="color:var(--ink);font-size:.95rem"></p>
+    </div>
+    <div class="card trend reveal grid" id="gapTrend"></div>
+  </div>
+</section>
+
+<section id="architecture" class="alt" aria-labelledby="h-arch">
+  <div class="wrap">
+    <p class="kicker reveal">Architecture</p>
+    <h2 class="title reveal" id="h-arch">One process, <em>from source bytes to executable memory.</em></h2>
+    <p class="intro reveal" data-rich="arch.intro"></p>
+    <p class="intro reveal" data-rich="arch.intro2"></p>
+    <div class="card arch reveal mt48" id="archBox"></div>
+    <h3 class="h reveal">The layers, and what they replace</h3>
+    <div class="card box mt48" id="layers"></div>
+  </div>
+</section>
+
+<section id="life" aria-labelledby="h-life">
+  <div class="wrap">
+    <p class="kicker reveal">Tiering and live patching</p>
+    <h2 class="title reveal" id="h-life">A function's <em>life.</em></h2>
+    <div class="life mt48">
+      <ol class="card steps reveal" id="steps"></ol>
+      <div class="card ladder reveal" id="ladder" aria-label="The tier ladder"></div>
+    </div>
+    <p class="closing reveal" id="lifeClose"></p>
+  </div>
+</section>
+
+<section id="rules" class="alt" aria-labelledby="h-rules">
+  <div class="wrap">
+    <p class="kicker reveal">Design rules</p>
+    <h2 class="title reveal" id="h-rules">Design rules, <em>and what they mean against rustc.</em></h2>
+    <div class="grid g3 mt48" id="ruleList"></div>
+  </div>
+</section>
+
+<section id="build" aria-labelledby="h-build">
+  <div class="wrap">
+    <p class="kicker reveal">Building</p>
+    <h2 class="title reveal" id="h-build">Building <em>Relax.</em></h2>
+    <div class="card box mt48" id="vsBuild"></div>
+    <code class="cmd reveal" data-d="build.command"></code>
+    <p class="intro reveal" data-rich="build.after"></p>
+    <h3 class="h reveal">Repository layout</h3>
+    <pre class="tree reveal" data-d="build.layout"></pre>
+  </div>
+</section>
+
+<section class="final" aria-labelledby="h-final">
+  <div class="wrap">
+    <h2 id="h-final" class="reveal">Rust without the wait.</h2>
+    <div class="cta reveal">
+      <a class="btn primary" href="https://github.com/makepad/relax">GitHub</a>
+      <a class="btn" href="#top">Back to top</a>
+    </div>
+    <p class="reveal" data-rich="build.license"></p>
+  </div>
+</section>
+
+</main>
+
+<footer><div class="wrap"><a href="https://github.com/makepad/relax">github.com/makepad/relax</a><span class="sep" aria-hidden="true">&middot;</span><a class="lang" href="../zh/light/" hreflang="zh-CN" lang="zh-CN"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.4"/><path d="M1.6 8h12.8M8 1.6c1.9 1.8 2.8 4 2.8 6.4S9.9 12.6 8 14.4M8 1.6C6.1 3.4 5.2 5.6 5.2 8s.9 4.6 2.8 6.4"/></svg>中文</a><span class="sep" aria-hidden="true">&middot;</span><a href="../retro/">Plain HTML</a></div></footer>
+
+<script>
+"use strict";
+/* Layout-only stand-in for DATA.bench. Every value it makes is fake and the
+   page shows a "placeholder data" badge while DATA.bench.placeholder is set.
+   Replace DATA.bench with the measured JSON (same shape, no placeholder flag). */
+function placeholderBench() {
+  const W = ["PNG decode", "Brotli decode", "Inflate decode", "Zip read", "Text shaping and raster", "SDF glyphs", "Map tile decode", "Widget layout", "Rust tokenizer", "Markdown parse", "HTML parse", "LLM host path", "Physical piano model", "Ogg decode", "Audio mix", "Script VM", "CSG booleans", "Rigid-body physics"];
+  const f = (v, d) => +v.toFixed(d == null ? 2 : d);
+  function plat(id, cpu, os, k) {
+    const rows = W.map((w, i) => {
+      const rn = f(0.74 + ((i * 37 + k * 11) % 17) / 17 * 0.66), rs = f(rn * 0.94), ms = 40 + i * 9;
+      return { workload: w, what: "placeholder", rustc_ms: ms, rustc_native_ms: f(ms * 0.94, 1), relax_ms: f(ms * rs, 1), ratio_stock: rs, ratio_native: rn,
+        spread_stock: [f(rs * 0.95), f(rs * 1.06)], spread_native: [f(rn * 0.95), f(rn * 1.06)], tts_ms: 100 + i * 7, checksum_ok: i !== 13 };
+    });
+    const ok = rows.filter(r => r.checksum_ok), gm = key => f(Math.exp(ok.reduce((a, r) => a + Math.log(r[key]), 0) / ok.length));
+    return { id: id, cpu: cpu, os: os, rustc: "placeholder", llvm: "placeholder", rows: rows,
+      geomean_stock: gm("ratio_stock"), geomean_native: gm("ratio_native"),
+      faster_than_stock: ok.filter(r => r.ratio_stock < 1).length, faster_than_native: ok.filter(r => r.ratio_native < 1).length, n: ok.length };
+  }
+  return { placeholder: true, date: "placeholder", sha: "placeholder", platforms: [plat("x64", "placeholder x86-64 CPU", "Linux", 0), plat("arm64", "placeholder Apple M4", "macOS", 1)] };
+}
+
+/* ------------------------------------------------------------------
+   Every figure and claim on this page lives in DATA and mirrors the
+   repository README, section by section. Update DATA; the layout reads it.
+   Strings take **bold**, `code` and [text](href).
+   ------------------------------------------------------------------ */
+const DATA = {
+  hero: {
+    stats: [
+      { value: 11,   decimals: 0, suffix: " s", label: "Large 3D game, clean checkout to first frame, on an M4 MacBook, straight from source" },
+      { value: 1.15, decimals: 2, suffix: " s", label: "Same game, second run to first frame: nothing recompiled" },
+      { value: 2.2,  decimals: 1, suffix: " s", label: "From saving a file to 92 tests re-run" },
+      { value: 0,   decimals: 0, label: "crates.io dependencies, in 438k lines of Rust" }
+    ],
+    marquee: ["No rustc", "No LLVM", "No linker", "Straight from source", "State kept", "Checked, then run", "Never stale", "Code only grows", "Lazy by default"]
+  },
+
+  tldr: {
+    lead: "Rust's speed and safety, without the compile-time wait.",
+    items: [
+      ["What", "A live compiler and JIT runtime for Rust that runs a Cargo package straight from source. No rustc, no LLVM, no linker."],
+      ["Start", "On an M4 MacBook a large 3D game shows its first frame **11 s** after a clean checkout, where rustc builds for ~3 min first. The second run takes **1.15 s**."],
+      ["Change", "Save a file and the changed functions are patched into the running program, state kept. **92 tests re-run in 2.2 s.**"],
+      ["Speed", "Optimised code is still slower than rustc `--release`. A broader run this week came out slower than our earlier numbers and we're re-measuring; see [where LLVM still wins](#gaps)."],
+      ["Size", "One Rust library: **438k lines, 0 crates.io dependencies.**"],
+      ["Platforms", "Code generation for x86-64 and AArch64. From a fresh clone the repository builds and its tests pass on Linux x86-64 and macOS arm64; Windows isn't tested here."]
+    ]
+  },
+
+  /* the devhub illustration: names are made up, figures repeat the README's */
+  devhub: {
+    caption: "Illustration: a stylised devhub, not a screenshot. Lane, app and box names are made up; the figures are the ones in the table above.",
+    panels: {
+      lanes: ["Lanes", "nine lanes, side by side"],
+      boxes: ["Boxes", "every machine keeps a warm cache at the tip"],
+      jit: ["Inside a box", "devhub hands the change to the live Relax session"],
+      live: ["Live session", "lane ui-tweak · app editor"]
+    },
+    lanes: [["parser-fix", "tests", "verdict"], ["ui-tweak", "editor", "frame"], ["perf", "game", "live"], ["audio-mix", "game", "patched"], ["text-layout", "editor", "live"], ["net-retry", "tests", "verdict"], ["shader-cache", "game", "patched"], ["importer", "editor", "live"], ["docs-search", "tests", "verdict"]],
+    boxes: ["linux · gpu", "linux · gpu", "linux · cpu", "linux · cpu", "linux · arm64", "mac · arm64"],
+    warm: "JIT warm",
+    queue: ["queue", "quick checks go to warm sessions"],
+    steps: [["change arrives", "~50–200 ms"], ["recheck what changed", "types"], ["recompile what changed", "codegen"], ["swap into the running app", "state kept"]],
+    outs: [["tests re-run", "92 tests · 2.2 s"], ["app frame", "PNG"], ["flight recorder", "why it was slow"]],
+    back: "back to the AI agent",
+    frame: "live app frame",
+    timeline: [["save", "file saved"], ["shipped to the box", "~50–200 ms"], ["verdict", "92 tests · 2.2 s"], ["frame", "grabbed as a PNG"]]
+  },
+
+  race: {
+    title: "Large 3D game, clean checkout → first frame",
+    relax: { seconds: 11,  label: "11 s",   note: "on an M4 MacBook, straight from source", building: "starting from source", done: "first frame at 11 s", running: "running" },
+    rustc: { seconds: 180, label: "~3 min", note: "build, then start",    building: "building…",            done: "~3 min build, then start", flag: "start" },
+    axis: { start: "clean checkout", unit: "min" },
+    note: "Animation is time-compressed; both lanes share one time axis.",
+    rounds: [
+      { title: "Same game, second run → first frame", count: { value: 1.15, decimals: 2, suffix: " s" }, relax: "on an M4 MacBook, nothing recompiled", rustc: "start the built binary", strike: false,
+        duel: [{ label: "clean checkout", value: 11, text: "11 s" }, { label: "second run", value: 1.15, text: "1.15 s" }] },
+      { title: "Small app, cold → first frame", count: { value: 3.7, decimals: 1, suffix: " s" }, relax: "cold, 0.41 s warm (M4 MacBook)", rustc: "build it first",
+        duel: [{ label: "cold", value: 3.7, text: "3.7 s" }, { label: "warm", value: 0.41, text: "0.41 s" }] },
+      { title: "Save a file → 92 tests re-run", count: { value: 2.2, decimals: 1, suffix: " s" }, relax: "after the save", rustc: "rebuild the test binary first", dots: 92 },
+      { title: "Change one function in a running program", word: "State kept.", relax: "patched into the running process", rustc: "rebuild, relink, restart: program state lost" }
+    ],
+    rest: [
+      ["Speed of optimised code", "1.00× (LLVM, `--release` for the native CPU)", "**slower**: 1.14–1.26× on the workloads we profile most, 2.3× on dense numeric loops (not vectorised yet); being re-measured ([details](#gaps))"],
+      ["Type- and borrow-checked before it runs", "yes", "**yes**"],
+      ["Needs", "rustc, LLVM, a linker", "**Relax**, one Rust library (438k lines, 0 crates.io dependencies)"]
+    ]
+  },
+
+  took: {
+    intro: "Relax isn't a wrapper around rustc or a plugin for LLVM. **It replaces both**, plus the parts of Cargo and the linker that sit between your source and a running program, in one Rust library with no dependencies.",
+    rows: [
+      { job: "Lex, parse and expand macros, `macro_rules!` and procedural", usual: "rustc", relax: "relax-lex, relax-front" },
+      { job: "Resolve names, solve traits, infer types, check borrows, evaluate constants", usual: "rustc", relax: "relax-types" },
+      { job: "Optimise: inlining, folding, loops, ranges", usual: "rustc's MIR passes + LLVM", relax: "relax-codegen (O1 and O3)" },
+      { job: "Allocate registers, emit x86-64 and AArch64 machine code", usual: "LLVM", relax: "relax-backend" },
+      { job: "Link and load", usual: "the system linker and loader", relax: "relax-compiler, straight into executable memory" },
+      { job: "Read manifests and resolve the crate graph", usual: "Cargo", relax: "relax-base" },
+      { job: "Build `core`, `alloc` and `std`", usual: "shipped prebuilt", relax: "compiled from source by Relax" }
+    ],
+    bigs: [
+      { count: { value: 438, decimals: 0, suffix: "k" }, label: "lines of Rust", small: "The usual toolchain: millions of lines of Rust and C++." },
+      { count: { value: 0,   decimals: 0 }, label: "crates.io dependencies", small: "One Rust library with no dependencies." },
+      { count: { value: 134, decimals: 0, suffix: "k" }, label: "lines of `core`, `alloc` and `std`, compiled from source by Relax itself", small: "With rustc, the standard library ships precompiled." }
+    ]
+  },
+
+  why: {
+    intro: "Rust gives you speed and safety, and charges for them in compile times. **Relax keeps the speed and the safety and drops the charge.**",
+    rows: [
+      ["Getting started", "Build everything first. On a large app, minutes pass before `main` runs.", "**Start from source now.** On an M4 MacBook a small app shows its first frame 3.7 s after a cold start, and a large 3D game in 11 s. Run them again and it's 0.41 s and 1.15 s."],
+      ["Making a change", "Rebuild the crate and everything that depends on it, relink, restart, and get back to where you were.", "**Saving is the build.** Only the functions you changed are rechecked and recompiled, and they're swapped into the running program, which keeps its state, windows and connections."],
+      ["Run-time speed", "Fast, after a long optimised build.", "**Fast, while it runs.** Code starts on an interpreter and climbs to O1 and O3 in the background. Optimised Relax code is still slower than rustc `--release` (see [where LLVM still wins](#gaps))."],
+      ["Safety", "Everything type- and borrow-checked.", "**The same.** Relax never runs code it hasn't checked."],
+      ["Your crates", "Path, git, crates.io, vendored, proc macros.", "**The same crates, as written,** procedural macros included."],
+      ["Caches", "Incremental artefacts on disk that can go stale and need `cargo clean`.", "**Every result is keyed by the hashes of its inputs.** A hit is exactly what a fresh compile would produce. A warm start recompiles nothing."],
+      ["When it's slow", "You wait and guess.", "**The runtime tells you.** Every compile phase, stall and tier change goes to a flight recorder."]
+    ]
+  },
+
+  demo: {
+    intro: "Only the functions you changed are rechecked and recompiled, then **swapped into the running program, which keeps its state, windows and connections.** With rustc, the same change is a rebuild, a relink and a restart.",
+    file: "src/particles.rs",
+    lines: [
+      "// called for every particle, every frame",
+      "fn update(p: &mut Particle, t: f32) {",
+      "    let a = p.phase + t;",
+      "",
+      "    p.frame += 1;",
+      "}"
+    ],
+    editLine: 3,
+    prefix: "    p.pos = ",
+    suffix: ";",
+    variants: [
+      { id: "orbit", code: "vec2(a.cos(), a.sin())" },
+      { id: "wave",  code: "vec2(p.lane, (a * 2.0).sin())" },
+      { id: "knot",  code: "vec2((a * 3.0).sin(), (a * 2.0).cos())" }
+    ],
+    particles: 32,
+    states: { idle: "saved", editing: "editing…", saved: "saved: patching", live: "live", rebuilding: "rebuilding" },
+    log: {
+      boot: "started from source",
+      recheck: "recheck what changed: ok",
+      patched: "new code published, the old code stays valid",
+      kept: "next call runs the new fn: state kept",
+      lost: "rebuild, relink, restart: program state lost"
+    },
+    rustcSteps: ["rebuild", "relink", "restart"],
+    rustcResult: "program state lost",
+    note: "Illustrative animation of the behaviour, running in your browser. It is not a live Relax session."
+  },
+
+  agents: {
+    intro: "An AI agent can't feel a slow build, but it pays for every one in **tokens, wall-clock and lost context.**",
+    heads: ["With rustc + Cargo", "With Relax + devhub"],
+    table: [
+      ["Edit reaches the program", "rebuild and relink: minutes on a large app", "**synced and patched in milliseconds** (~50–200 ms to the box)"],
+      ["Test verdict", "rebuild the test binary, then run", "**92 tests back 2.2 s after the save**"],
+      ["See the UI", "rebuild, relaunch, navigate back", "**a frame of the live app, grabbed as a PNG**"],
+      ["Layout change that can't be patched", "full rebuild and restart", "**restart in place, automatically**: one log line, no error"],
+      ["New worker or lane", "cold build", "**starts warm**: every machine keeps a warm cache at the tip"],
+      ["\"Why was that slow?\"", "read logs and guess", "**ask the flight recorder**: which thread waited, on what, compiling which function"]
+    ],
+    makepad: "builds its apps with many AI agents working in parallel, each in its own lane, and Relax keeps them fast. Its dev hub, **devhub**, runs the build and test machines around Relax, so nothing an agent touches is ever cold.",
+    loop: [
+      { title: "AI agent", sub: "edits a file" },
+      { title: "devhub", sub: "routes to a warm box" },
+      { title: "Live Relax session", sub: "patches only what changed" }
+    ],
+    edges: ["sync, ~50–200 ms", ""],
+    outs: [
+      { title: "Tests re-run", sub: "verdict in seconds" },
+      { title: "App frame", sub: "grabbed as a PNG" },
+      { title: "Flight recorder", sub: "why it was slow, what it compiled" }
+    ],
+    back: "back to the AI agent",
+    bullets: [
+      { title: "A live session per lane", body: "Each agent's app or test run stays alive under Relax on a pool machine, and every save patches it. Nothing is rebuilt or relaunched." },
+      { title: "Warm caches everywhere", body: "Each machine refreshes its Relax cache as changes land, so a fresh worker starts warm." },
+      { title: "No native builds in the loop", body: "devhub sends iteration and pre-landing checks to Relax, and counts every native build that slips through, per lane." },
+      { title: "Measured routing", body: "Jobs are sized by their measured times, and quick checks go to machines with warm sessions, so they never queue behind a long build." }
+    ],
+    practice: [
+      { word: "Nine", label: "agent lanes run side by side" },
+      { count: { value: 300, decimals: 0, suffix: "+" }, label: "build and test jobs an hour, handled by devhub" },
+      { word: "Dozens", label: "of changes land every day, each checked under Relax before it merges" }
+    ]
+  },
+
+  features: [
+    ["Start", "Build the whole crate graph, link, then run `main`.", "**Resolve the crate graph and start `main` from source.** No native build of your code."],
+    ["Checking", "Type- and borrow-check every crate up front.", "**The same, before the first call.**"],
+    ["Compiling", "Whole crates, ahead of time.", "**One function at a time, the moment it's first called.** Hot functions move up in the background: interpreter → O1 → O3. `#[relax(O2)]` / `#[relax(O3)]` ask for a level ahead of time; under rustc the attribute does nothing."],
+    ["Editing", "Rebuild and restart.", "**Recheck, recompile and swap in only what changed, while the program runs.** Code already handed out stays valid. A change that can't be swapped restarts the program in place."],
+    ["Caching", "Incremental artefacts per crate.", "**Every result keyed by the hashes of its inputs.** An unchanged package recompiles nothing."],
+    ["Procedural macros", "Built as native dylibs, then loaded.", "**Run natively when they match a linked build, otherwise on the JIT.**"],
+    ["The standard library", "Ships precompiled.", "**`core`, `alloc` and `std` (134k lines) compiled from source by Relax itself.**"],
+    ["Native code", "Everything is native.", "**Crates that must stay native (OS layers, GPU, audio) export an interface with `#[relax_api]`.** JIT code calls them through the C ABI planner, with per-thread heap routing across the boundary."],
+    ["Visibility", "Compiler timings after the fact.", "**A live flight recorder,** with hitch events and compile profilers."],
+    ["Back ends", "LLVM, then a system linker.", "**Its own x86-64 and AArch64 code generators,** with no linker and no LLVM."]
+  ],
+
+  /* measured speed: main pastes the benchmark JSON here */
+  bench: placeholderBench(),
+  benchText: {
+    intro: "{n} real-world workloads, each built three ways: rustc `cargo build --release` (stock, generic CPU), rustc `--release` with `-C target-cpu=native`, and Relax. **Ratio = Relax time / rustc time, so below 1.00× means Relax is faster.**",
+    placeholder: "placeholder data",
+    platforms: { x64: "x86-64", arm64: "Apple M4" },
+    baselines: { stock: "--release", native: "--release + native CPU" },
+    baselineLong: { stock: "rustc `cargo build --release` (stock, generic CPU)", native: "rustc `--release` with `-C target-cpu=native`" },
+    geomean: "geomean, Relax time / rustc time, against {b}",
+    faster: "workloads where Relax is faster than {b}",
+    of: "of",
+    excluded: "{k} excluded: checksum mismatch",
+    mismatch: "checksum mismatch, excluded from the geomean and the count",
+    excludedShort: "excluded",
+    axis: ["← Relax faster", "1.00× = rustc", "rustc faster →"],
+    whisker: "White line: spread, min to max.",
+    spec: { cpu: "CPU", os: "OS", rustc: "rustc", llvm: "LLVM", date: "measured", sha: "commit" },
+    ms: "Relax {a} ms · rustc {b} ms",
+    cols: ["Workload", "rustc ms", "rustc native ms", "Relax ms", "ratio, stock (spread)", "ratio, native (spread)", "tts ms", "checksum"],
+    ok: "ok", bad: "mismatch"
+  },
+
+  gaps: {
+    intro: "LLVM has decades of optimisation work behind it, and in steady state its code is still faster than Relax's. Our own measurements: **warm JIT against a native build of the same source and inputs, as wall-clock ratios** (lower is better, 1.00× = LLVM).",
+    chartTitle: "Relax vs `--release`, native CPU",
+    baseline: { value: 1.00, label: "1.00× = LLVM, --release for the native CPU" },
+    overLabel: "Relax, time over LLVM",
+    measuredLabel: "measured",
+    tableNote: "These are the workloads we profile most. A broader run of 18 workloads this week came out slower than these, and slower than in October; we're finding out why and will update this section with the result.",
+    rows: [
+      { workload: "3D-print slicer, first slice of a part, 4 threads", cpu: "x86-64 (Zen 4)", ratio: { value: 1.14, decimals: 2, suffix: "×" }, detail: "cycles 1.15×, instructions 1.26×", measured: "2026-11-11" },
+      { workload: "Same, 8 threads", cpu: "x86-64 (Zen 4)", ratio: { value: 1.17, decimals: 2, suffix: "×" }, measured: "2026-11-11" },
+      { workload: "Same, 4 threads", cpu: "AArch64 (Apple M4)", ratio: { value: 1.24, decimals: 2, suffix: "×" }, detail: "before this week's x86 gains were ported", measured: "2026-11-09" },
+      { workload: "CAD B-rep modelling round", cpu: "x86-64 (Zen 4)", ratio: { value: 1.26, decimals: 2, suffix: "×" }, measured: "2026-11-10" },
+      { workload: "Script VM interpreter loop", cpu: "x86-64 (Zen 4)", ratio: { value: 1.19, decimals: 2, suffix: "×" }, measured: "2026-11-11" },
+      { workload: "Dense numeric kernel (Cholesky factorisation)", cpu: "x86-64 (Zen 4)", ratio: { value: 2.29, decimals: 2, suffix: "×" }, detail: "LLVM vectorises it with AVX-512, Relax doesn't vectorise loops yet", measured: "2026-11-10" },
+      { workload: "Any workload against plain `--release` (portable CPU baseline)", cpu: "", ratio: null, detail: "not measured yet" }
+    ],
+    which: {
+      title: "Which `--release`?",
+      body: "Most Rust ships with plain `--release`, built for a portable baseline CPU (on x86-64, no AVX). Our numbers are against the harder setting, `--release` with `-C target-cpu=native`, where LLVM may use every instruction the machine has. Relax always compiles for the CPU it runs on, so against plain `--release` these gaps shrink, and on vector-heavy code they can flip. **That comparison hasn't been measured yet.**"
+    },
+    causesIntro: "**Where the gap comes from**, from instruction-level comparisons of the same functions. The gap is extra instructions rather than stalls: 1.26× the instructions cost only 1.15× the cycles.",
+    causesTitle: "Extra instructions (slicer run), by cause",
+    causes: [
+      { cause: "Compares kept as bool registers and recomputed", g: 25, text: "~25 G" },
+      { cause: "Register copies (two-address form, coalescing misses)", g: 23, text: "~23 G" },
+      { cause: "Stack traffic: loop state kept in stack slots; 12 allocatable registers against rustc's 15", g: 22, text: "~22 G" },
+      { cause: "Extra loop-control and check branches, invariant tests left inside loops", g: 13, text: "~13 G" },
+      { cause: "Loads not folded into compares, i128 arithmetic, rematerialised constants, smaller items", g: 33, text: "~33 G" },
+      { cause: "Runtime outside the generated code (memcpy, allocator wrappers, TLS access, stubs)", g: 40, text: "~40 G" },
+      { cause: "No loop vectorisation, shallow unrolling", g: null, text: "most of the numeric-kernel gap" }
+    ],
+    notCause: "What isn't a cause: inlining. Relax inlines more than rustc does.",
+    trend: {
+      from: "1.26×",
+      to: { from: 1.26, value: 1.14, decimals: 2, suffix: "×" },
+      text: "Every row in this table is a work item, and the slicer gap went from 1.26× to 1.14× in the last three days."
+    }
+  },
+
+  arch: {
+    intro: "rustc hands your program to LLVM and a linker, and Cargo glues the steps together. **Relax owns the whole pipeline, from source bytes to executable memory, in one process.**",
+    intro2: "Relax is a stack of layers. Each layer is its own crate, builds only on the ones below it and re-exports them, so every module is `crate::<module>` at every layer. The layers compile in parallel, and a change in an upper layer never rebuilds the ones below.",
+    groups: [
+      { title: "", items: [{ name: "Cargo package", sub: ".rs sources + Cargo.toml" }] },
+      { title: "Front: what the program says", items: [
+        { name: "relax-lex", sub: "lexer + proc-macro token model", chain: true },
+        { name: "relax-base", sub: "hashing, arenas, syntax tree, manifests, git + source mounts", chain: true },
+        { name: "relax-session", sub: "compilation inputs, stable hashes", chain: true },
+        { name: "relax-front", sub: "parse, crate graph, name resolution, macro expansion, derives", chain: true } ] },
+      { title: "Types: what the program means", items: [
+        { name: "relax-types", sub: "interned types, impls, typeck, layouts, const eval, borrow check", chain: true } ] },
+      { title: "Code: how it runs", items: [
+        { name: "relax-codegen", sub: "RIR optimisers O1 / O3, loops + ranges, threaded interpreter", chain: true },
+        { name: "relax-backend", sub: "RIR + vectors, register allocation, x86-64 / AArch64 code, C ABI, exec memory", chain: true } ] },
+      { title: "relax-compiler: the runtime", items: [
+        { name: "JIT runtime", sub: "lazy compile, tiers, live swap, warm caches, flight recorder", chain: true },
+        { name: "core / alloc / std", sub: "from source", link: "→ relax-types" },
+        { name: "proc-macro host", sub: "", link: "→ relax-front" },
+        { name: "relax_api", sub: "native crates", link: "↔ JIT runtime" } ] }
+    ],
+    layerHeads: { was: "In the rustc world" },
+    layers: [
+      ["relax-lex", "libs/relax/lex", "The one lexer and token model for Rust (every edition), and the token model procedural macros see.", "the lexer and `proc_macro`"],
+      ["relax-base", "libs/relax/base", "What every phase shares: hashing, memory accounting and zone allocation, concurrent containers and arenas, the syntax tree, `cfg`, manifests (TOML, resolution), the git read path and source mounts.", "parts of Cargo and rustc's shared infrastructure"],
+      ["relax-session", "libs/relax/session", "The inputs of a compilation and their stable hashing: the keys every cache is built on.", "the session and incremental keys"],
+      ["relax-front", "libs/relax/front", "Parsing, the crate graph and name resolution, macro expansion (`macro_rules!`, built-ins, `format_args!`, derives, proc-macro registration).", "parser, resolver, macro expansion"],
+      ["relax-types", "libs/relax/types", "Interned types, signatures and impls, type checking, layouts, constant evaluation, the borrow checker, per-definition body queries and stable type hashes.", "type checker, borrow checker, const eval"],
+      ["relax-codegen", "libs/relax/codegen", "The middle end on RIR (Relax IR): the O1 and O3 optimisers (inlining, folding, loop and range passes), the threaded interpreter tier and the compile profilers.", "MIR optimisations and LLVM's optimiser"],
+      ["relax-backend", "libs/relax/backend", "Register allocation, machine code for the host (x86-64 or AArch64), jump tables, the C ABI planner and executable memory.", "LLVM's code generator and the linker"],
+      ["relax-compiler", "libs/relax/compiler", "The compiler, JIT runtime and std as one library: lazy compilation, tiering, live edits, caches, the proc-macro host and the test runner.", "Cargo, the rustc driver, the test harness and the OS loader"],
+      ["relax-native-macros", "libs/relax/native_macros", "Natively linked procedural macros, checked against their source so they expand exactly as they would under Cargo.", "proc-macro dylibs"],
+      ["attribute", "libs/relax/attr", "`#[relax(O2)]` / `#[relax(O3)]`: the optimisation-level attribute; a no-op under rustc.", "`opt-level` per profile"],
+      ["relax_api", "libs/relax_api", "`#[relax_api]`: the interface a natively compiled crate offers to JIT code, and per-thread heap routing.", "(no equivalent: everything is native)"]
+    ]
+  },
+
+  life: {
+    actors: { app: "Running program", rt: "JIT runtime", ty: "Types layer", cg: "Codegen + backend" },
+    tiers: [
+      { name: "Interpreter", desc: "Where code starts." },
+      { name: "O1", desc: "Machine code, published." },
+      { name: "O3", desc: "Recompiled in the background while hot; faster code, swapped in." }
+    ],
+    loopLabel: "loop, while f is hot",
+    steps: [
+      { note: "before the first call, every crate of the program is type-checked" },
+      { from: "app", to: "rt", msg: "first call of fn f" },
+      { from: "rt", to: "cg", msg: "compile f (interpreter or O1)", tier: 1 },
+      { from: "cg", to: "rt", msg: "machine code, published" },
+      { from: "rt", to: "app", msg: "call proceeds" },
+      { from: "rt", to: "cg", msg: "recompile f at O3 in the background", loop: true },
+      { from: "cg", to: "rt", msg: "faster code, swapped in", loop: true, tier: 2 },
+      { note: "you save a change to f" },
+      { from: "rt", to: "ty", msg: "recheck what changed" },
+      { from: "ty", to: "rt", msg: "ok" },
+      { from: "rt", to: "cg", msg: "recompile f" },
+      { from: "cg", to: "rt", msg: "new code, the old code stays valid" },
+      { from: "rt", to: "app", msg: "next call runs the new f" }
+    ],
+    closing: ["With rustc, the same change is ", "a rebuild of the crate, a relink and a restart."]
+  },
+
+  rules: [
+    { title: "Checked, then run", body: "Same guarantee as rustc: nothing runs unchecked. Relax just doesn't make you wait for the rest of the program first." },
+    { title: "Never stale", body: "Every cached result is keyed by the hashes of its inputs. A hit is exactly what a fresh compile would produce, so there's no `cargo clean`." },
+    { title: "Code only grows", body: "Published machine code is never freed or rewritten while it can still be on a stack. A swap publishes new code and redirects future calls, and is safe where a native hot-reload hack isn't." },
+    { title: "Lazy by default", body: "rustc compiles everything you might call. Relax compiles what you do call, and optimises it in the background." },
+    { title: "Rust as written", body: "Ordinary crates, from crates.io and git. `libs/relax/KNOWN_GAPS.md` lists what doesn't work yet." },
+    { title: "Inspectable", body: "Every phase reports what it's doing; a stall can always be explained from its record." }
+  ],
+
+  build: {
+    heads: ["rustc", "Relax"],
+    rows: [["To build it", "LLVM plus a bootstrap", "**A stable Rust toolchain. Nothing from crates.io.**"]],
+    command: "cargo build --release -p relax-compiler",
+    after: "The compiler is the `relax_compiler` library; `relax` (`tools/run/runner`) is its command-line runner.",
+    layout: [
+      "Cargo.toml                           the workspace",
+      "libs/relax/",
+      "  lex/ base/ session/ front/ types/  front end and type system",
+      "  codegen/ backend/                  middle end and machine code",
+      "  compiler/                          runtime, std (compiler/std),",
+      "                                     96 end-to-end test packages",
+      "  attr/ native_macros/               #[relax(..)] and native proc macros",
+      "  KNOWN_GAPS.md                      what isn't supported yet",
+      "libs/relax_api/                      #[relax_api] and per-thread heap routing",
+      "tools/run/runner/                    relax, the command-line runner",
+      "libs/ platform/ tools/ widgets/      the small support crates Relax links:",
+      "                                     token model, serialisation, remote",
+      "                                     inspection, profiling, and the native",
+      "                                     proc macros it checks against their source"
+    ].join("\n"),
+    license: "MIT, see [LICENSE](https://github.com/makepad/relax/blob/main/LICENSE). The std sources Relax compiles carry their own notices; see `libs/relax/compiler/std/CREDITS.md` and the license files beside them."
+  }
+};
+
+/* ------------------------------ helpers ------------------------------ */
+const REDUCED = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+document.documentElement.classList.add("js");
+const $ = (s, r) => (r || document).querySelector(s);
+const $$ = (s, r) => Array.prototype.slice.call((r || document).querySelectorAll(s));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+function get(path) { return path.split(".").reduce((o, k) => (o == null ? o : o[k]), DATA); }
+function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
+function rich(s) {
+  return esc(s)
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, "<a href=\"$2\">$1</a>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/`([^`]+)`/g, (m, c) => "<code" + (c.length <= 24 ? " class=\"nw\"" : "") + ">" + c + "</code>");
+}
+function el(tag, cls, html) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (html != null) e.innerHTML = html;
+  return e;
+}
+function add(host, tag, cls, html) { return host.appendChild(el(tag, cls, html)); }
+function fmt(c, v) { return (c.prefix || "") + v.toFixed(c.decimals || 0) + (c.suffix || ""); }
+const counters = new WeakMap();
+function counter(node, c) { node.textContent = fmt(c, c.value); node.setAttribute("data-count", ""); counters.set(node, c); return node; }
+function runCounter(node) {
+  const c = counters.get(node), a = c ? (c.from || 0) : 0;
+  if (!c || REDUCED || c.value === a || node.dataset.done) return;
+  node.dataset.done = "1";
+  const t0 = performance.now(), dur = 1400;
+  (function step(now) {
+    const p = Math.max(0, Math.min(1, (now - t0) / dur)), e = 1 - Math.pow(1 - p, 3);
+    node.textContent = fmt(c, a + (c.value - a) * e);
+    if (p < 1) requestAnimationFrame(step);
+  })(t0);
+}
+function onVisible(node, cb, threshold) {
+  if (!("IntersectionObserver" in window)) { cb(true); return; }
+  new IntersectionObserver(es => es.forEach(e => cb(e.isIntersecting)), { threshold: threshold || 0 }).observe(node);
+}
+/* runs fn every ms, only while node is on screen and the tab is visible */
+function ticker(node, ms, fn) {
+  if (REDUCED) return;
+  let vis = false;
+  onVisible(node, v => { vis = v; }, 0.1);
+  setInterval(() => { if (vis && !document.hidden) fn(); }, ms);
+}
+function versus(host, heads, rows) {
+  rows.forEach(r => {
+    const a = el("article", "vs reveal");
+    add(a, "h3", "", rich(r[0]));
+    add(a, "div", "vs-c", "<span class=\"tag c\">" + esc(heads[0]) + "</span><p>" + rich(r[1]) + "</p>");
+    add(a, "div", "vs-r", "<span class=\"tag r\">" + esc(heads[1]) + "</span><p>" + rich(r[2]) + "</p>");
+    host.appendChild(a);
+  });
+}
+function cards(host, list) {
+  list.forEach((f, i) => {
+    const c = el("article", "card fact reveal"); c.style.setProperty("--d", i % 3);
+    add(c, "h3", "", esc(f.title)); add(c, "p", "", rich(f.body));
+    host.appendChild(c);
+  });
+}
+function bigcard(host, b, i) {
+  const c = el("div", "card bigcard reveal"); c.style.setProperty("--d", i);
+  c.appendChild(b.count ? counter(el("strong", "grad"), b.count) : el("strong", "grad", esc(b.word)));
+  add(c, "span", "", rich(b.label));
+  if (b.small) add(c, "small", "", rich(b.small));
+  host.appendChild(c);
+}
+
+/* ------------------------------ static binds ------------------------------ */
+$$("[data-d]").forEach(n => { n.textContent = get(n.getAttribute("data-d")); });
+$$("[data-rich]").forEach(n => { n.innerHTML = rich(get(n.getAttribute("data-rich"))); });
+
+/* hero */
+DATA.hero.stats.forEach((s, i) => {
+  const d = add($("#heroStats"), "div", "stat reveal"); d.style.setProperty("--d", i);
+  d.appendChild(counter(el("strong", "grad"), s));
+  add(d, "span", "", esc(s.label));
+});
+(function () {
+  const m = $("#mq"), words = DATA.hero.marquee;
+  words.forEach(w => add(m, "span", "", esc(w)));
+})();
+
+/* ------------------------------ race ------------------------------ */
+(function () {
+  const R = DATA.race, total = R.rustc.seconds, cut = R.relax.seconds;
+  const fillR = $("#raceFillR"), run = $("#raceRun"), fillC = $("#raceFillC"), laneC = $("#laneC"), laneR = $("#laneR");
+  const stR = $("#raceStR"), stC = $("#raceStC"), clock = $("#raceClock"), axis = $("#raceAxis");
+  const cutPct = cut / total * 100;
+  fillR.style.right = (100 - cutPct) + "%";
+  run.style.left = cutPct + "%";
+  $("#raceLbl").style.left = cutPct + "%";
+  const mins = Math.round(total / 60);
+  for (let m = 0; m <= mins; m++) add(axis, "span", "", esc(m === 0 ? R.axis.start : m + " " + R.axis.unit)).style.left = (m / mins * 100) + "%";
+  let lastSec = -1;
+  function draw(t) {
+    fillR.style.transform = "scaleX(" + Math.min(1, t / cut) + ")";
+    run.style.transform = "scaleX(" + Math.max(0, (t - cut) / (total - cut)) + ")";
+    fillC.style.transform = "scaleX(" + Math.min(1, t / total) + ")";
+    const s = Math.floor(t);
+    if (s === lastSec) return;
+    lastSec = s;
+    stR.textContent = t >= cut ? R.relax.done : R.relax.building;
+    stC.textContent = t >= total ? R.rustc.done : R.rustc.building;
+    laneR.classList.toggle("go", t >= cut);
+    laneC.classList.toggle("done", t >= total);
+    clock.textContent = s < 60 ? "t = " + s + " s" : "t = " + Math.floor(s / 60) + " min " + (s % 60) + " s";
+  }
+  let raf = 0, started = false;
+  function play() {
+    cancelAnimationFrame(raf);
+    if (REDUCED) { draw(total); return; }
+    const t0 = performance.now(), dur = 9000;
+    (function step(now) {
+      const p = Math.max(0, Math.min(1, (now - t0) / dur));
+      draw(p * total);
+      if (p < 1) raf = requestAnimationFrame(step);
+    })(t0);
+  }
+  draw(REDUCED ? total : 0);
+  onVisible($("#raceBox"), v => { if (v && !started) { started = true; play(); } }, 0.35);
+  $("#raceReplay").addEventListener("click", () => { started = true; play(); });
+
+  R.rounds.forEach((r, i) => {
+    const c = add($("#rounds"), "article", "card round reveal"); c.style.setProperty("--d", i);
+    add(c, "h3", "", esc(r.title));
+    if (r.count) c.appendChild(counter(el("div", "num"), r.count)); else add(c, "div", "num word", esc(r.word));
+    add(c, "p", "rx", "<span class=\"tag r\">Relax</span> " + esc(r.relax));
+    if (r.duel) {
+      const mx = Math.max.apply(null, r.duel.map(x => x.value)), d = add(c, "div", "duel");
+      r.duel.forEach(x => {
+        add(d, "span", "", esc(x.label));
+        const f = add(add(d, "div", "dt"), "i");
+        f.style.setProperty("--s", x.value / mx); f.style.transitionDuration = (x.value / mx * 2.4) + "s";
+        add(d, "b", "", esc(x.text));
+      });
+    }
+    if (r.dots) {
+      const d = add(c, "div", "dots"); d.setAttribute("aria-hidden", "true");
+      for (let k = 0; k < r.dots; k++) add(d, "i").style.transitionDelay = (300 + k * 16) + "ms";
+    }
+    add(c, "p", "them", "<span class=\"tag c\">rustc + Cargo</span> " + (r.strike === false ? esc(r.rustc) : "<s>" + esc(r.rustc) + "</s>"));
+  });
+  versus($("#vsRest"), ["rustc + Cargo", "Relax"], R.rest);
+})();
+
+/* ------------------------------ what it took ------------------------------ */
+(function () {
+  const T = DATA.took, list = $("#pipeList");
+  const rows = T.rows.map(r => {
+    const li = add(list, "li", "prow");
+    add(li, "span", "job", rich(r.job)); add(li, "span", "old", esc(r.usual)); add(li, "span", "new", esc(r.relax));
+    return li;
+  });
+  T.bigs.forEach((b, i) => bigcard($("#tookBigs"), b, i));
+  if (REDUCED) { rows.forEach(r => r.classList.add("seen")); return; }
+  let i = -1;
+  ticker($("#pipeBox"), 950, () => {
+    if (i >= 0) { rows[i].classList.remove("on"); rows[i].classList.add("seen"); }
+    i = (i + 1) % rows.length;
+    if (i === 0) rows.forEach(r => r.classList.remove("seen"));
+    rows[i].classList.add("on");
+  });
+})();
+
+/* ------------------------------ why + live patch demo ------------------------------ */
+versus($("#vsWhy"), ["With rustc", "With Relax"], DATA.why.rows);
+(function () {
+  const D = DATA.demo;
+  const code = $("#code"), edState = $("#edState"), pgState = $("#pgState");
+  const hudF = $("#hudFrame"), hudP = $("#hudPatch"), hudR = $("#hudRestart");
+  const log = $("#log"), overlay = $("#overlay"), btnAuto = $("#btnAuto");
+  const RE = /(\/\/.*$)|(\b(?:fn|let|mut|pub|self)\b)|(\b\d+(?:\.\d+)?\b)|(\b[a-z_][a-z0-9_]*(?=\())|(\b(?:[A-Z][A-Za-z0-9]*|f32)\b)/g;
+  function hl(s) {
+    let out = "", last = 0;
+    s.replace(RE, function (m, c, k, n, f, t, off) {
+      out += esc(s.slice(last, off)) + "<span class=\"t-" + (c ? "c" : k ? "k" : n ? "n" : f ? "f" : "t") + "\">" + esc(m) + "</span>";
+      last = off + m.length;
+      return m;
+    });
+    return out + esc(s.slice(last));
+  }
+  let cur = 0, busy = false, auto = !REDUCED, visible = false;
+  const lineEls = D.lines.map((txt, i) => {
+    const ln = add(code, "span", "ln");
+    add(ln, "span", "no", String(i + 1));
+    return { ln: ln, tx: add(ln, "span", "tx", hl(txt)) };
+  });
+  const edit = lineEls[D.editLine];
+  function setLine(v, typing) {
+    edit.tx.innerHTML = hl(D.prefix + v) + (typing ? "<span class=\"caret\"></span>" : hl(D.suffix));
+    edit.ln.classList.toggle("typing", !!typing);
+  }
+  function setEd(key, cls) { edState.textContent = D.states[key]; edState.className = "state" + (cls ? " " + cls : ""); }
+  function addLog(text, cls) {
+    add(log, "li", cls || "", esc(text));
+    while (log.children.length > 4) log.removeChild(log.firstChild);
+  }
+  function bump(n) { n.classList.remove("bump"); void n.offsetWidth; n.classList.add("bump"); }
+
+  /* the "running program": a small canvas, about 30 frames a second, paused off screen */
+  const cv = $("#stage"), ctx = cv.getContext && cv.getContext("2d");
+  const MOVES = {
+    orbit: (a, p) => [Math.cos(a), Math.sin(a)],
+    wave:  (a, p) => [p.lane, Math.sin(a * 2)],
+    knot:  (a, p) => [Math.sin(a * 3), Math.cos(a * 2)]
+  };
+  const N = D.particles, parts = [];
+  for (let i = 0; i < N; i++) parts.push({ phase: i / N * Math.PI * 2, lane: -1 + 2 * i / (N - 1), hue: 150 + i / N * 110 });
+  let t = 0, frames = 0, patches = 0, restarts = 0, from = MOVES[D.variants[0].id], to = from, blend = 1, w = 0, h = 0, halted = false;
+  function size() {
+    if (!ctx) return;
+    const r = cv.getBoundingClientRect(), dpr = Math.min(1.5, window.devicePixelRatio || 1);
+    w = r.width; h = r.height;
+    cv.width = Math.max(1, Math.round(w * dpr)); cv.height = Math.max(1, Math.round(h * dpr));
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  function render(clear) {
+    if (!ctx) return;
+    ctx.fillStyle = clear ? "#161d19" : "rgba(22,29,25,0.3)";
+    ctx.fillRect(0, 0, w, h);
+    const cx = w / 2, cy = h / 2, sx = w * 0.4, sy = h * 0.36;
+    const e = blend < 0.5 ? 2 * blend * blend : 1 - Math.pow(-2 * blend + 2, 2) / 2;
+    for (const p of parts) {
+      const a = p.phase + t, A = from(a, p), B = to(a, p);
+      ctx.fillStyle = "hsl(" + p.hue + ",90%,70%)";
+      ctx.beginPath();
+      ctx.arc(cx + (A[0] + (B[0] - A[0]) * e) * sx, cy + (A[1] + (B[1] - A[1]) * e) * sy, 3.2, 0, 6.2832);
+      ctx.fill();
+    }
+  }
+  function hud() { hudF.textContent = String(frames); hudP.textContent = String(patches); hudR.textContent = String(restarts); }
+  let raf = 0, lastNow = 0;
+  function loop(now) {
+    raf = 0;
+    if (!visible || document.hidden) { lastNow = 0; return; }
+    raf = requestAnimationFrame(loop);
+    if (lastNow && now - lastNow < 30) return;
+    const dt = lastNow ? Math.min(0.06, (now - lastNow) / 1000) : 0.033; lastNow = now;
+    if (halted) return;
+    t += dt * 0.9; frames++;
+    if (blend < 1) blend = Math.min(1, blend + dt / 0.9);
+    render(false); hudF.textContent = String(frames);
+  }
+  function kick() { if (!raf && !REDUCED) raf = requestAnimationFrame(loop); }
+
+  function applyPatch() {
+    from = to; to = MOVES[D.variants[cur].id]; blend = REDUCED ? 1 : 0;
+    patches++; hud(); bump(hudP);
+    addLog(D.log.recheck); addLog(D.log.patched); addLog(D.log.kept);
+    if (REDUCED) { frames++; hud(); render(true); }
+  }
+  async function doEdit() {
+    if (busy) return; busy = true;
+    const next = (cur + 1) % D.variants.length, a = D.variants[cur].code, b = D.variants[next].code;
+    if (!REDUCED) {
+      setEd("editing", "edit");
+      let keep = 0; while (keep < a.length && keep < b.length && a[keep] === b[keep]) keep++;
+      for (let n = a.length; n >= keep; n--) { setLine(a.slice(0, n), true); await sleep(16); }
+      for (let n = keep + 1; n <= b.length; n++) { setLine(b.slice(0, n), true); await sleep(30); }
+      setLine(b, false); edit.ln.classList.add("hot");
+      setEd("saved", "hot"); await sleep(420);
+    } else setLine(b, false);
+    cur = next; applyPatch(); setEd("idle");
+    if (!REDUCED) { await sleep(900); edit.ln.classList.remove("hot"); }
+    busy = false;
+  }
+  async function rustcWay() {
+    if (busy) return; busy = true; halted = true;
+    pgState.textContent = D.states.rebuilding; pgState.className = "state edit";
+    overlay.innerHTML = "";
+    const steps = D.rustcSteps.map(s => add(overlay, "span", "", esc(s)));
+    const res = add(overlay, "strong", "", "");
+    overlay.classList.add("show");
+    for (const s of steps) { s.classList.add("on"); await sleep(REDUCED ? 0 : 750); }
+    res.textContent = D.rustcResult;
+    await sleep(REDUCED ? 0 : 900);
+    frames = 0; patches = 0; t = 0; restarts++; blend = 1; from = to;
+    hud(); bump(hudF); bump(hudR);
+    log.innerHTML = ""; addLog(D.log.lost, "bad");
+    overlay.classList.remove("show");
+    pgState.textContent = D.states.live; pgState.className = "state hot";
+    halted = false; render(true); busy = false;
+  }
+  function paintAuto() { btnAuto.textContent = "Auto-edit: " + (auto ? "on" : "off"); btnAuto.setAttribute("aria-pressed", auto ? "true" : "false"); }
+
+  setLine(D.variants[0].code, false); setEd("idle"); pgState.textContent = D.states.live; hud(); addLog(D.log.boot);
+  size(); render(true);
+  window.addEventListener("resize", () => { size(); render(true); });
+  document.addEventListener("visibilitychange", kick);
+  onVisible($("#demoBox"), v => { visible = v; if (v) kick(); }, 0.1);
+  $("#btnEdit").addEventListener("click", doEdit);
+  $("#btnRustc").addEventListener("click", rustcWay);
+  btnAuto.addEventListener("click", () => { auto = !auto; paintAuto(); });
+  paintAuto();
+  if (REDUCED) btnAuto.hidden = true;
+  ticker($("#demoBox"), 5200, () => { if (auto && !busy) doEdit(); });
+})();
+
+/* ------------------------------ agents ------------------------------ */
+(function () {
+  const A = DATA.agents, row = $("#loopRow"), groups = [];
+  function node(host, n) { const d = add(host, "div", "node"); add(d, "b", "", esc(n.title)); add(d, "span", "", esc(n.sub)); return d; }
+  versus($("#vsAgents"), A.heads, A.table);
+  A.loop.forEach((n, i) => {
+    groups.push([node(row, n)]);
+    if (i < A.loop.length - 1) add(row, "div", "edge", "<i class=\"rail" + (window.innerWidth < 860 ? " y" : "") + "\" aria-hidden=\"true\"></i>" + esc(A.edges[i] || ""));
+  });
+  groups.push(A.outs.map(n => node($("#loopOuts"), n)));
+  cards($("#agentBullets"), A.bullets);
+  A.practice.forEach((p, i) => bigcard($("#practice"), p, i));
+  let i = -1;
+  ticker($("#loopBox"), 1150, () => {
+    if (i >= 0) groups[i].forEach(n => n.classList.remove("on"));
+    i = (i + 1) % groups.length;
+    groups[i].forEach(n => n.classList.add("on"));
+  });
+})();
+
+/* ------------------------------ tl;dr ------------------------------ */
+DATA.tldr.items.forEach(it => add($("#tldrList"), "li", "", "<b>" + esc(it[0]) + "</b><span>" + rich(it[1]) + "</span>"));
+
+/* ------------------------------ devhub illustration ------------------------------ */
+(function () {
+  const D = DATA.devhub, grid = $("#dhGrid");
+  const T = (x, y, s, c, a) => "<text x=\"" + x + "\" y=\"" + y + "\" class=\"" + (c || "") + "\"" + (a ? " text-anchor=\"" + a + "\"" : "") + ">" + esc(s) + "</text>";
+  const R = (x, y, w, h, c, r) => "<rect x=\"" + x + "\" y=\"" + y + "\" width=\"" + w + "\" height=\"" + h + "\" rx=\"" + (r || 0) + "\" class=\"" + c + "\"/>";
+  const C = (x, y, r, c, i) => "<circle cx=\"" + x + "\" cy=\"" + y + "\" r=\"" + r + "\" class=\"" + c + "\" style=\"--i:" + (i || 0) + "\"/>";
+  const G = (c, i, body) => "<g class=\"" + c + "\" style=\"--i:" + i + "\">" + body + "</g>";
+  function panel(key, h, body) {
+    const p = add(grid, "div", "dh-p"), t = D.panels[key];
+    add(p, "h3", "", esc(t[0]) + "<small>" + esc(t[1]) + "</small>");
+    const wrap = add(p, "div", "", "<svg viewBox=\"0 0 320 " + h + "\" role=\"img\" aria-label=\"" + esc(t[0] + ": " + t[1]) + "\">" + body + "</svg>");
+    return wrap;
+  }
+  /* lanes */
+  panel("lanes", 4 + D.lanes.length * 27, D.lanes.map((l, i) => {
+    const y = 2 + i * 27;
+    return G("", i, R(0, y, 320, 22, "dbg", 6) + R(0, y, 320, 22, "dfl", 6) + C(13, y + 11, 4, "ddot", i) + T(26, y + 15, l[0], "dt") + T(168, y + 15, l[1], "dm") + T(310, y + 15, l[2], "ds", "end"));
+  }).join(""));
+  /* boxes, each with a warm JIT cache gauge, and the lease queue */
+  let b = D.boxes.map((name, i) => {
+    const x = (i % 3) * 108 + 2, y = Math.floor(i / 3) * 104 + 2, arc = "M" + (x + 24) + " " + (y + 64) + "a26 26 0 0 1 52 0";
+    let dots = "";
+    for (let k = 0, n = 1 + i % 3; k < n; k++) dots += C(x + 50 + (k - (n - 1) / 2) * 11, y + 58, 3, "ddot", i + k);
+    return R(x, y, 100, 96, "dbx", 10) + T(x + 50, y + 18, name, "dm sm", "middle") + "<path d=\"" + arc + "\" class=\"dgt\"/><path d=\"" + arc + "\" class=\"dg\" style=\"--i:" + i + "\"/>" + dots + T(x + 50, y + 84, D.warm, "ds sm", "middle");
+  }).join("");
+  let chips = "";
+  for (let k = 0; k < 7; k++) chips += R(60 + k * 28, 219, 22, 12, "dq" + (k === 0 ? " a" : k === 6 ? " z" : ""), 4);
+  b += T(2, 229, D.queue[0], "dm") + "<g class=\"dqg\">" + chips + "</g>" + T(2, 250, D.queue[1], "dm sm");
+  panel("boxes", 256, b);
+  /* inside a box: the change meets the JIT */
+  let j = "<line x1=\"12\" y1=\"21\" x2=\"12\" y2=\"" + (21 + (D.steps.length - 1) * 44) + "\" class=\"drl\"/>";
+  D.steps.forEach((s, i) => {
+    const y = 4 + i * 44;
+    j += G("dst", i, R(28, y, 290, 34, "dbx", 8) + C(12, y + 17, 4, "dn") + T(40, y + 21, s[0], "dt") + T(308, y + 21, s[1], "ds", "end"));
+  });
+  const oy = 12 + D.steps.length * 44;
+  D.outs.forEach((o, i) => {
+    const y = oy + i * 28;
+    j += G("dst", D.steps.length + i, R(28, y, 290, 22, "dbg", 6) + T(40, y + 15, o[0], "dt") + T(308, y + 15, o[1], "ds", "end"));
+  });
+  j += C(12, 21, 5, "dtr") + T(173, oy + D.outs.length * 28 + 16, D.back, "dm", "middle");
+  panel("jit", oy + D.outs.length * 28 + 24, j);
+  /* a live session: the app frame and the save, shipped, verdict, frame timeline */
+  let l = R(0, 1, 320, 126, "dbx", 10) + R(8, 9, 70, 110, "dbg", 5) + R(16, 18, 40, 6, "dln", 3) + R(16, 32, 52, 6, "dln", 3) + R(16, 46, 34, 6, "dln", 3) +
+    R(88, 12, 150, 8, "dln", 4) + R(88, 28, 214, 8, "dln", 4) + R(88, 44, 180, 8, "dln", 4) + R(88, 64, 96, 46, "dpa", 8) + R(88, 64, 214, 46, "dpb", 8) + T(310, 122, D.frame, "dm sm", "end");
+  l += "<line x1=\"12\" y1=\"158\" x2=\"12\" y2=\"" + (158 + (D.timeline.length - 1) * 34) + "\" class=\"drl\"/>";
+  D.timeline.forEach((s, i) => {
+    const y = 146 + i * 34;
+    l += G("dst", i * 1.75, C(12, y + 12, 5, "dn") + T(28, y + 16, s[0], "dt") + T(318, y + 16, s[1], "ds", "end"));
+  });
+  panel("live", 146 + D.timeline.length * 34, l);
+})();
+
+/* ------------------------------ features ------------------------------ */
+versus($("#vsFeat"), ["rustc + Cargo", "Relax"], DATA.features);
+
+/* ------------------------------ speed (reads DATA.bench) ------------------------------ */
+(function () {
+  const B = DATA.bench, T = DATA.benchText;
+  if (!B || !B.platforms || !B.platforms.length) { $("#speed").hidden = true; return; }
+  const KEYS = ["stock", "native"], chart = $("#benchChart"), call = $("#benchCall"), ctl = $("#benchCtl"), tbl = $("#benchTable");
+  let pi = 0, base = KEYS[0], mx = 1.25;
+  B.platforms.forEach(p => p.rows.forEach(r => { if (r.checksum_ok) KEYS.forEach(k => [r["ratio_" + k]].concat(r["spread_" + k] || []).forEach(v => { if (v > 0) mx = Math.max(mx, v, 1 / v); })); }));
+  const LG = Math.log(mx), pos = v => Math.max(-1, Math.min(1, Math.log(v) / LG));
+  const x = v => v.toFixed(2) + "×", sub = (s, o) => s.replace(/\{(\w+)\}/g, (m, k) => o[k]);
+
+  $("#benchIntro").innerHTML = rich(sub(T.intro, { n: B.platforms[0].rows.length })) + (B.placeholder ? " <span class=\"badge\">" + esc(T.placeholder) + "</span>" : "");
+  function seg(label, opts, on) {
+    const g = add(ctl, "div", "seg"); g.setAttribute("role", "group"); g.setAttribute("aria-label", label);
+    const bs = opts.map((o, i) => {
+      const b = add(g, "button", "", esc(o)); b.type = "button"; b.setAttribute("aria-pressed", i ? "false" : "true");
+      b.addEventListener("click", () => { bs.forEach((y, j) => y.setAttribute("aria-pressed", j === i ? "true" : "false")); on(i); });
+      return b;
+    });
+  }
+  seg("Platform", B.platforms.map(p => T.platforms[p.id] || p.cpu), i => { pi = i; update(true); });
+  seg("Baseline", KEYS.map(k => T.baselines[k]), i => { base = KEYS[i]; update(true); });
+
+  const cGeo = add(call, "div", "card bigcard reveal"), gNum = add(cGeo, "strong"), gLab = add(cGeo, "span");
+  const cFast = add(call, "div", "card bigcard reveal"), fNum = add(cFast, "strong"), fLab = add(cFast, "span"), fEx = add(cFast, "small");
+  const spec = add(add(call, "div", "card bigcard spec reveal"), "dl");
+  cFast.style.setProperty("--d", 1);
+  if (B.placeholder) add(spec.parentNode, "em", "badge", esc(T.placeholder)).style.cssText = "margin-top:14px;font-style:normal";
+
+  const ax = add(chart, "div", "brow ax"); ax.setAttribute("aria-hidden", "true");
+  add(ax, "div", "btrack", T.axis.map(a => "<span>" + esc(a) + "</span>").join(""));
+  const list = add(chart, "div"), els = new Map();
+  add(chart, "p", "note", esc(T.whisker) + " " + esc(x(1 / mx)) + " – " + esc(x(mx)) + ", log scale.");
+  function make(name) {
+    const e = el("div", "brow"), lab = add(e, "div", "lab"), o = { el: e, name: add(lab, "b"), what: add(lab, "small"), val: add(e, "div", "val") };
+    const tr = add(e, "div", "btrack"); tr.setAttribute("aria-hidden", "true");
+    o.bar = add(tr, "i", "bb"); o.wh = add(tr, "i", "bw");
+    els.set(name, o);
+    return o;
+  }
+  let geoShown = 1;
+  function update(animate) {
+    const p = B.platforms[pi], rk = "ratio_" + base, sk = "spread_" + base;
+    const rows = p.rows.slice().sort((a, b) => (a.checksum_ok ? 0 : 1) - (b.checksum_ok ? 0 : 1) || a[rk] - b[rk]);
+    const before = new Map();
+    els.forEach((o, k) => { if (o.el.parentNode) before.set(k, o.el.getBoundingClientRect().top); });
+    const keep = {};
+    rows.forEach(r => {
+      const o = els.get(r.workload) || make(r.workload), ok = !!r.checksum_ok, v = ok ? pos(r[rk]) : 0, s = r[sk] || [];
+      keep[r.workload] = 1;
+      o.el.classList.toggle("bad", !ok);
+      o.name.textContent = r.workload;
+      o.what.textContent = ok ? [r.what, sub(T.ms, { a: r.relax_ms, b: base === "native" ? r.rustc_native_ms : r.rustc_ms })].filter(Boolean).join(" · ") : T.mismatch;
+      o.val.textContent = ok ? x(r[rk]) : T.excludedShort;
+      o.val.className = "val" + (!ok ? "" : r[rk] < 1 ? " fast" : r[rk] > 1 ? " slow" : "");
+      o.bar.classList.toggle("fast", v < 0);
+      o.bar.style.transform = "scaleX(" + v + ")";
+      const a = ok && s.length > 1 ? pos(s[0]) : 0, b = ok && s.length > 1 ? pos(s[1]) : 0;
+      o.wh.style.transform = "translateX(" + ((a + 1) * 50) + "%) scaleX(" + ((b - a) / 2) + ")";
+      list.appendChild(o.el);
+    });
+    els.forEach((o, k) => { if (!keep[k] && o.el.parentNode) list.removeChild(o.el); });
+    if (animate && !REDUCED) {
+      const moves = [];
+      rows.forEach(r => { const o = els.get(r.workload), a = before.get(r.workload); if (a != null) { const d = a - o.el.getBoundingClientRect().top; if (d) moves.push([o.el, d]); } });
+      moves.forEach(m => { m[0].style.transition = "none"; m[0].style.transform = "translateY(" + m[1] + "px)"; });
+      void list.offsetWidth;
+      moves.forEach(m => { m[0].style.transition = ""; m[0].style.transform = ""; });
+    }
+    /* callouts */
+    const geo = p["geomean_" + base], bl = T.baselineLong[base], from = geoShown;
+    geoShown = geo;
+    gNum.className = geo < 1 ? "fast" : geo > 1 ? "slow" : "";
+    if (animate && !REDUCED) {
+      const t0 = performance.now();
+      (function step(now) { const q = Math.max(0, Math.min(1, (now - t0) / 500)); gNum.textContent = x(from + (geo - from) * q); if (q < 1) requestAnimationFrame(step); })(t0);
+    } else gNum.textContent = x(geo);
+    gLab.innerHTML = rich(sub(T.geomean, { b: bl }));
+    fNum.innerHTML = esc(p["faster_than_" + base]) + " <small>" + esc(T.of) + " " + esc(p.n) + "</small>";
+    fLab.innerHTML = rich(sub(T.faster, { b: bl }));
+    const bad = p.rows.filter(r => !r.checksum_ok).length;
+    fEx.textContent = bad ? sub(T.excluded, { k: bad }) : "";
+    spec.innerHTML = [["cpu", p.cpu], ["os", p.os], ["rustc", p.rustc], ["llvm", p.llvm], ["date", B.date], ["sha", B.sha]]
+      .map(a => "<dt>" + esc(T.spec[a[0]]) + "</dt><dd>" + esc(a[1]) + "</dd>").join("");
+    /* the numbers */
+    const sp = a => (a && a.length > 1 ? " (" + a[0].toFixed(2) + "–" + a[1].toFixed(2) + ")" : "");
+    tbl.innerHTML = "<thead><tr>" + T.cols.map(c => "<th scope=\"col\">" + esc(c) + "</th>").join("") + "</tr></thead><tbody>" +
+      p.rows.map(r => "<tr" + (r.checksum_ok ? "" : " class=\"bad\"") + "><td>" + esc(r.workload) + "</td>" +
+        [r.rustc_ms, r.rustc_native_ms, r.relax_ms, x(r.ratio_stock) + sp(r.spread_stock), x(r.ratio_native) + sp(r.spread_native), r.tts_ms, r.checksum_ok ? T.ok : T.bad]
+          .map(v => "<td>" + esc(v) + "</td>").join("") + "</tr>").join("") + "</tbody>";
+  }
+  update(false);
+})();
+
+/* ------------------------------ where LLVM still wins (reads DATA.gaps) ------------------------------ */
+(function () {
+  const G = DATA.gaps, bars = $("#gapBars");
+  const max = Math.max.apply(null, G.rows.map(r => (r.ratio ? r.ratio.value : 0)).concat(G.baseline.value));
+  const basePct = G.baseline.value / max * 100;
+  $("#gapLegend").innerHTML = "<span><i style=\"background:var(--hatch)\"></i>" + esc(G.baseline.label) + "</span><span><i style=\"background:var(--gap)\"></i>" + esc(G.overLabel) + "</span>";
+  G.rows.forEach((r, i) => {
+    const b = add(bars, "div", "gbar" + (r.ratio ? "" : " none"));
+    const top = add(b, "div", "gtop");
+    const meta = [r.cpu, r.measured ? G.measuredLabel + " " + r.measured : ""].filter(Boolean).map(m => "<span>" + esc(m) + "</span>").join(" · ");
+    add(top, "div", "", "<b>" + rich(r.workload) + "</b>" + (meta ? "<small>" + meta + "</small>" : ""));
+    if (r.ratio) top.appendChild(counter(el("strong"), Object.assign({ from: G.baseline.value }, r.ratio)));
+    else add(top, "strong", "", esc(r.detail));
+    const tr = add(b, "div", "gtrack"); tr.setAttribute("aria-hidden", "true");
+    tr.style.setProperty("--b", basePct + "%");
+    if (r.ratio) {
+      add(tr, "i", "gbase");
+      const o = add(tr, "i", "gover");
+      o.style.left = basePct + "%"; o.style.width = ((r.ratio.value - G.baseline.value) / max * 100) + "%"; o.style.setProperty("--d", i);
+      if (r.detail) add(b, "p", "det", rich(r.detail));
+    }
+  });
+  const W = $("#gapWhich");
+  add(W, "h3", "", rich(G.which.title)); add(W, "p", "", rich(G.which.body));
+
+  const COL = ["#1c2420", "#4f6b5d", "#8fa89a", "#d9a21b", "#b8522a", "#7a7f7c"];
+  const stack = $("#causeStack"), list = $("#causeList");
+  G.causes.forEach((c, i) => {
+    const li = add(list, "li", c.g == null ? "text" : "");
+    const sw = add(li, "i"); add(li, "span", "", esc(c.cause)); add(li, "b", "", esc(c.text));
+    if (c.g == null) { sw.style.border = "1px dashed var(--line2)"; return; }
+    sw.style.background = COL[i % COL.length];
+    const seg = add(stack, "i"); seg.style.flex = c.g + " 1 0"; seg.style.background = COL[i % COL.length]; seg.style.setProperty("--d", i);
+  });
+
+  const T = $("#gapTrend"), nums = add(T, "div", "nums");
+  add(nums, "s", "", esc(G.trend.from)); add(nums, "span", "", "&rarr;").setAttribute("aria-hidden", "true");
+  nums.appendChild(counter(el("b", "grad"), G.trend.to));
+  add(T, "p", "", rich(G.trend.text));
+})();
+
+/* ------------------------------ architecture ------------------------------ */
+(function () {
+  const A = DATA.arch, box = $("#archBox"), chain = [];
+  A.groups.forEach((g, gi) => {
+    if (gi) add(box, "div", "conn rail y").setAttribute("aria-hidden", "true");
+    const grp = add(box, "div", "grp");
+    if (g.title) add(grp, "span", "cap", esc(g.title));
+    const items = add(grp, "div", "items");
+    g.items.forEach(it => {
+      const n = add(items, "div", "node m");
+      add(n, "b", "", esc(it.name));
+      if (it.sub) add(n, "span", "", esc(it.sub));
+      if (it.link) add(n, "small", "", esc(it.link));
+      if (it.chain) chain.push(n);
+    });
+  });
+  const L = $("#layers");
+  A.layers.forEach(r => {
+    const a = add(L, "article", "layer reveal");
+    add(a, "h3", "", esc(r[0]) + "<span class=\"path\">" + esc(r[1]) + "</span>");
+    add(a, "p", "", rich(r[2]));
+    add(a, "p", "was", "<b>" + esc(A.layerHeads.was) + "</b>" + rich(r[3]));
+  });
+  let i = -1;
+  ticker(box, 800, () => {
+    if (i >= 0) chain[i].classList.remove("on");
+    i = (i + 1) % chain.length;
+    chain[i].classList.add("on");
+  });
+})();
+
+/* ------------------------------ a function's life ------------------------------ */
+(function () {
+  const F = DATA.life, host = $("#steps"), ladder = $("#ladder");
+  const rungs = F.tiers.map(t => { const r = add(ladder, "div", "rung"); add(r, "h3", "", esc(t.name)); add(r, "p", "", esc(t.desc)); return r; });
+  const steps = F.steps.map(s => {
+    if (s.note) return add(host, "li", "step nt", esc(s.note));
+    const li = add(host, "li", "step");
+    add(li, "span", "who", (s.loop ? "<b>" + esc(F.loopLabel) + "</b> · " : "") + esc(F.actors[s.from]) + " &rarr; " + esc(F.actors[s.to]));
+    add(li, "span", "msg", esc(s.msg));
+    return li;
+  });
+  $("#lifeClose").innerHTML = esc(F.closing[0]) + "<s>" + esc(F.closing[1]) + "</s>";
+  function paint(i) {
+    let tier = -1;
+    steps.forEach((li, k) => {
+      li.classList.toggle("on", k === i);
+      li.classList.toggle("seen", k < i);
+      if (k <= i && F.steps[k].tier != null) tier = F.steps[k].tier;
+    });
+    rungs.forEach((r, k) => r.classList.toggle("on", k <= tier));
+  }
+  if (REDUCED) { paint(steps.length); return; }
+  let i = -1, hold = 0;
+  paint(-1);
+  ticker($("#life"), 1150, () => {
+    if (hold > 0) { hold--; if (!hold) { i = -1; paint(-1); } return; }
+    i++;
+    if (i >= steps.length) { paint(steps.length); hold = 3; return; }
+    paint(i);
+  });
+})();
+
+/* ------------------------------ rules, build ------------------------------ */
+cards($("#ruleList"), DATA.rules);
+versus($("#vsBuild"), DATA.build.heads, DATA.build.rows);
+
+/* ------------------------------ reveals, counters, off-screen pause, progress ------------------------------ */
+(function () {
+  const items = $$(".reveal");
+  function show(n) {
+    n.classList.add("in");
+    if (n.hasAttribute("data-count")) runCounter(n);
+    $$("[data-count]", n).forEach(runCounter);
+  }
+  if (REDUCED || !("IntersectionObserver" in window)) items.forEach(n => n.classList.add("in"));
+  else {
+    const io = new IntersectionObserver(es => {
+      es.forEach(e => { if (e.isIntersecting) { show(e.target); io.unobserve(e.target); } });
+    }, { threshold: 0.05, rootMargin: "0px 0px -6% 0px" });
+    items.forEach(n => io.observe(n));
+    $$("section,.mq").forEach(s => onVisible(s, v => s.classList.toggle("off", !v)));
+  }
+  const bar = $("#prog");
+  let queued = false;
+  function prog() {
+    queued = false;
+    const d = document.documentElement, max = d.scrollHeight - d.clientHeight;
+    bar.style.transform = "scaleX(" + (max > 0 ? Math.min(1, d.scrollTop / max) : 0) + ")";
+  }
+  window.addEventListener("scroll", () => { if (!queued) { queued = true; requestAnimationFrame(prog); } }, { passive: true });
+  prog();
+})();
+</script>
+</body>
+</html>
