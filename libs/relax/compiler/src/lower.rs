@@ -11097,6 +11097,30 @@ impl<'a> Lcx<'a> {
                 };
                 Val::L(vec![self.iconst(c as i64)])
             }
+            // `T: TrustedRandomAccess(NoCoerce)` of this instance (real core specializes Zip on them)
+            "is_trusted_random_access" | "is_trusted_random_access_no_coerce" => {
+                let tr = if name == "is_trusted_random_access" { "TrustedRandomAccess" } else { "TrustedRandomAccessNoCoerce" };
+                let c = match (g0, self.u.core_path(&["iter", tr])) {
+                    (Some(g), Some(td)) => self.u.tcx.type_implements_trait(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), TraitRef { def_id: td, args: vec![GenericArg::Type(g)] }).must_apply_modulo_regions(),
+                    _ => false,
+                };
+                Val::L(vec![self.iconst(c as i64)])
+            }
+            // `<T as TrustedRandomAccessNoCoerce>::MAY_HAVE_SIDE_EFFECT` of this instance; false
+            // when T is not one (Zip reads it only on its indexed path)
+            "may_have_side_effect" => {
+                let td = self.u.core_path(&["iter", "TrustedRandomAccessNoCoerce"]);
+                let c = match (g0, td) {
+                    (Some(g), Some(td)) if self.u.tcx.type_implements_trait(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), TraitRef { def_id: td, args: vec![GenericArg::Type(g)] }).must_apply_modulo_regions() => {
+                        self.u.prog.traits[self.u.prog.def(td).sub as usize].iter().copied().find(|it| self.u.prog.name(*it) == "MAY_HAVE_SIDE_EFFECT").map(|c| (c, g))
+                    }
+                    _ => None,
+                };
+                match c {
+                    Some((c, g)) => self.const_val(c, vec![g], t),
+                    None => Val::L(vec![self.iconst(0)]),
+                }
+            }
             // Primitive scalar values have no padding or inactive enum storage.
             "is_primitive_scalar" => {
                 let c = g0.is_some_and(|g| matches!(self.kind_ref(g), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char));
