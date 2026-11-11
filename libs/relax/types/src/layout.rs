@@ -1218,36 +1218,10 @@ impl Layouts {
 
     fn tagged(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, adt: &crate::tcx::AdtT, vfl: &[Vec<FieldL>], vls: &[Vec<&'static Layout>], repr: Repr) -> Layout {
         let nv = vfl.len();
-        // the tags of inhabited variants (their discriminants, or the tags a live edit kept), and
-        // the largest gap between them (wrapping)
+        // the tags of inhabited variants (their discriminants, or the tags a live edit kept)
         let mut ds: Vec<i128> = (0..nv).filter(|&i| adt.repr_c || !vfl[i].iter().any(|f| f.uninhabited)).map(|i| adt.tag_for_variant(tcx, lcx.prog, i as u32).expect("existing layout variant").signed_value()).collect();
         ds.sort();
-        ds.dedup();
-        let discr_signed = match adt.repr_int {
-            Some(p) => tcx.tys.int_info(p).1,
-            None => true,
-        };
-        let discr_bytes = match adt.repr_int {
-            Some(p) => tcx.tys.int_info(p).0,
-            None => tcx.tys.ptr_bytes,
-        };
-        let dmax = if discr_bytes >= 16 { u128::MAX } else { (1u128 << (discr_bytes * 8)) - 1 };
-        let smax: u128 = if discr_bytes >= 16 { i128::MAX as u128 } else { (1u128 << (discr_bytes * 8 - 1)) - 1 };
-        let mut best: Option<(i128, i128, u128)> = None;
-        for k in 0..ds.len() {
-            let (s, e) = (ds[k], ds[(k + 1) % ds.len()]);
-            let dist = if s > e {
-                let d = s.wrapping_sub(e);
-                if discr_signed { smax.wrapping_sub(d as u128) } else { dmax.wrapping_sub(d as u128) }
-            } else {
-                e.wrapping_sub(s) as u128
-            };
-            // max_by_key: the last of the largest
-            if best.map_or(true, |b| dist >= b.2) {
-                best = Some((s, e, dist));
-            }
-        }
-        let (max, min) = best.map_or((0, 0), |b| (b.0, b.1));
+        let (min, max) = (ds.first().copied().unwrap_or(0), ds.last().copied().unwrap_or(0));
         // rustc_middle discr_range_of_repr
         let (min_bytes, signed) = match adt.repr_int {
             Some(p) => {
@@ -1265,6 +1239,25 @@ impl Layouts {
                 }
             }
         };
+        // the tag's valid range: the smallest wrapping range at the tag's width that holds every
+        // tag, the largest gap between them (the last of the largest, the tags in unsigned order)
+        // left out. Discriminants {0, 254} are 254..=0, and their Option's None is 1 (rustc's)
+        let wmask = if min_bytes >= 16 { u128::MAX } else { (1u128 << (min_bytes * 8)) - 1 };
+        let mut ts: Vec<u128> = ds.iter().map(|&v| v as u128 & wmask).collect();
+        ts.sort();
+        ts.dedup();
+        if ts.is_empty() {
+            ts.push(0);
+        }
+        let mut gap_after = 0;
+        let mut widest = 0u128;
+        for k in 0..ts.len() {
+            let gap = ts[(k + 1) % ts.len()].wrapping_sub(ts[k]).wrapping_sub(1) & wmask;
+            if k == 0 || gap >= widest {
+                (gap_after, widest) = (k, gap);
+            }
+        }
+        let (range_start, range_end) = (ts[(gap_after + 1) % ts.len()], ts[gap_after]);
         let mut prefix_align = min_bytes;
         if adt.repr_c {
             for fl in vfl {
@@ -1310,7 +1303,7 @@ impl Layouts {
             }
         }
         let mask = if ity >= 16 { u128::MAX } else { (1u128 << (ity * 8)) - 1 };
-        let tag_niche = Niche { off: 0, bytes: ity, start: (min as u128) & mask, end: (max as u128) & mask };
+        let tag_niche = Niche { off: 0, bytes: ity, start: range_start & mask, end: range_end & mask };
         let mem = Mem::Int(ity as u8, signed);
         let leaves = if ity != size { None } else if ity == 16 {
             // The scalar tag uses the same two-word ABI as i128/u128.
