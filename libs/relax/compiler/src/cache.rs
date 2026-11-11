@@ -232,7 +232,7 @@ const LEDGER_KEY: u128 = 0;
 // closure is named by its owner's closure ordinal and its text (closure_ordinal), not by its
 // file version and position, in slot keys and types alike; a block-scoped item by its fn and
 // its ordinal there (stable::block_place), not its offset.
-const ENTRY_VERSION: u32 = 32;
+const ENTRY_VERSION: u32 = 33;
 /// the level of a code entry's code (its tier byte)
 const TIER_O1: u8 = 0;
 const TIER_O3: u8 = 1;
@@ -241,6 +241,10 @@ const TIER_O2: u8 = 2;
 /// a run that links it builds it again at O2 after its first present (jit.rs note_base), and
 /// that code replaces the entry
 const TIER_BASE: u8 = 3;
+/// baseline code built without a clean verdict (SPEC-V: calls to unverified-mode twins, its
+/// noalias facts withheld): provisional, linked and rebuilt like TIER_BASE, and compared only
+/// with code built the same way (verify)
+const TIER_BASE_UV: u8 = 4;
 
 /// What an earlier run decided for a slot's code below O3 (KIND_TIER; jit.rs stored_tier_verdict).
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -540,6 +544,9 @@ pub struct CacheStats {
     /// cached entries of another tier than the verifying build's (an O2 or O3 rebuild replaced
     /// the first build's entry): not compared
     pub verify_other_tier: u64,
+    /// of those, baseline code one side built without a clean verdict and the other with one
+    /// (TIER_BASE_UV): provisional, not compared
+    pub verify_provisional: u64,
     pub packs: u64,
     pub packs_rejected: u64,
     pub index_entries: u64,
@@ -614,6 +621,8 @@ pub(crate) struct PendingRecord {
     pc_map: Vec<(u32, u64)>,
     nounwind: Vec<(u32, bool)>,
     baseline: bool,
+    /// built without a clean verdict (TIER_BASE_UV)
+    unverified: bool,
     deps: Vec<u32>,
     inlined: Vec<u32>,
     /// jit::patch_epoch() at the install: a record is encoded only against the sources it was built from
@@ -3267,6 +3276,7 @@ impl Cache {
             pc_map: pc_map.to_vec(),
             nounwind: rir.map_or_else(Vec::new, |r| r.nounwind_inputs.clone()),
             baseline: rir.is_some_and(|r| r.baseline),
+            unverified: u.fns[id as usize].unverified.load(std::sync::atomic::Ordering::Relaxed),
             deps: record_deps(u, id, &[]),
             inlined: record_inlined(u, id, &[]),
             epoch: crate::jit::patch_epoch(),
@@ -3288,6 +3298,7 @@ impl Cache {
             pc_map: pc_map.to_vec(),
             nounwind: nounwind.to_vec(),
             baseline: false,
+            unverified: false,
             deps: record_deps(u, id, &extra),
             inlined: record_inlined(u, id, inlined),
             epoch: crate::jit::patch_epoch(),
@@ -3557,7 +3568,7 @@ impl Cache {
     }
 
     /// An entry's build inputs as encode_entry writes them: the code's level (TIER_O1 / TIER_O3 /
-    /// TIER_O2 / TIER_BASE), the inlined slots, the nounwind answers and the dependency
+    /// TIER_O2 / TIER_BASE / TIER_BASE_UV), the inlined slots, the nounwind answers and the dependency
     /// certificate. Verify compares a cached entry's with the fresh build's.
     fn encode_inputs(&mut self, u: &Unit, id: u32, o3: Option<(&[u32], &[(u32, bool)])>, kind: RecKind, pending: Option<&PendingRecord>, e: &mut E) -> Option<()> {
         let o2 = kind == RecKind::O2;
@@ -3565,7 +3576,11 @@ impl Cache {
             Some(p) => p.baseline,
             None => u.fns[id as usize].rir.as_ref().is_some_and(|r| r.baseline),
         };
-        e.u8(if o3.is_some() { TIER_O3 } else if o2 { TIER_O2 } else if base { TIER_BASE } else { TIER_O1 });
+        let unverified = base && match pending {
+            Some(p) => p.unverified,
+            None => u.fns[id as usize].unverified.load(std::sync::atomic::Ordering::Relaxed),
+        };
+        e.u8(if o3.is_some() { TIER_O3 } else if o2 { TIER_O2 } else if unverified { TIER_BASE_UV } else if base { TIER_BASE } else { TIER_O1 });
         let inlined;
         let inl = match pending {
             Some(p) => &p.inlined,
@@ -4067,7 +4082,7 @@ impl Cache {
     pub fn flush(&mut self) -> Result<usize, String> {
         if self.verbose && self.mode == Mode::Verify {
             let s = &self.stats;
-            eprintln!("makepad-run cache: verify: {} identical, {} different ({} with other recorded inputs, {} code from the same inputs, {} only a relocation), {} of another tier", s.verify_same, s.verify_diff, s.verify_diff_inputs, s.verify_diff_code, s.verify_diff_reloc, s.verify_other_tier);
+            eprintln!("makepad-run cache: verify: {} identical, {} different ({} with other recorded inputs, {} code from the same inputs, {} only a relocation), {} of another tier ({} built unverified on one side)", s.verify_same, s.verify_diff, s.verify_diff_inputs, s.verify_diff_code, s.verify_diff_reloc, s.verify_other_tier, s.verify_provisional);
         }
         if self.mode == Mode::ReadOnly {
             return Ok(0);
@@ -4347,7 +4362,7 @@ enum RecKind { First, O2, O1Up }
 
 /// A stored tier's order (the tier bytes are not in tier order): baseline < O1 < O2 < O3.
 fn tier_rank(t: u8) -> u8 {
-    match t { TIER_BASE => 0, TIER_O1 => 1, TIER_O2 => 2, TIER_O3 => 3, _ => 0 }
+    match t { TIER_BASE | TIER_BASE_UV => 0, TIER_O1 => 1, TIER_O2 => 2, TIER_O3 => 3, _ => 0 }
 }
 
 /// A code entry payload's tier byte.
@@ -5011,9 +5026,42 @@ impl Cache {
             Some((KIND_CODE, p)) => p.to_vec(),
             _ => return Some(true),
         };
-        let fresh_tier = if u.fns[id as usize].rir.as_ref().is_some_and(|r| r.baseline) { TIER_BASE } else { TIER_O1 };
-        if payload_tier(&cached).is_some_and(|t| t != fresh_tier) { return None; }
+        let fresh_tier = if !u.fns[id as usize].rir.as_ref().is_some_and(|r| r.baseline) {
+            TIER_O1
+        } else if u.fns[id as usize].unverified.load(std::sync::atomic::Ordering::Relaxed) {
+            TIER_BASE_UV
+        } else {
+            TIER_BASE
+        };
+        if let Some(t) = payload_tier(&cached).filter(|t| *t != fresh_tier) {
+            if tier_rank(t) == 0 && tier_rank(fresh_tier) == 0 {
+                self.stats.verify_provisional += 1;
+            }
+            return None;
+        }
         Some(self.verify_same_tier(u, id, &cached, fresh, relocs))
+    }
+
+    /// Verify mode: where two encodings of a record's build inputs part (encode_inputs): the
+    /// level, the inlined slots (the fresh build's that the cached record lacks, by name, and how
+    /// many the other way), else the dependency certificate (the nounwind answers are compared
+    /// before)
+    fn inputs_diff(&mut self, u: &Unit, id: u32, cached: &[u8], fresh: &[u8]) -> String {
+        fn slots(d: &mut D<'_>) -> Option<Vec<Vec<u8>>> {
+            let n = d.u32()?;
+            (0..n).map(|_| d.bytes().map(|b| b.to_vec())).collect()
+        }
+        let (mut c, mut f) = (D { b: cached, p: 0 }, D { b: fresh, p: 0 });
+        let (ct, ft) = (c.u8(), f.u8());
+        if ct != ft {
+            return format!("level {:?}/{:?}", ct, ft);
+        }
+        let (Some(cl), Some(fl)) = (slots(&mut c), slots(&mut f)) else { return "unreadable inputs".into() };
+        if cl == fl {
+            return "dependency certificate".into();
+        }
+        let fresh_only: Vec<String> = record_inlined(u, id, &[]).into_iter().filter(|&x| self.slot_bytes(u, x).is_some_and(|b| !cl.contains(&b))).map(|x| crate::syms::stable_fn_name(u, x)).collect();
+        format!("inlined {}/{}, fresh only {:?}, cached only {}", cl.len(), fl.len(), fresh_only, cl.iter().filter(|b| !fl.contains(b)).count())
     }
 
     fn verify_same_tier(&mut self, u: &Unit, id: u32, cached: &[u8], fresh: &[u8], relocs: &[RelocAt]) -> bool {
@@ -5031,7 +5079,8 @@ impl Cache {
         // the recorded inputs as the fresh build has them (level, inlined slots, nounwind answers,
         // dependency keys): a difference from other inputs is counted apart from one from the same
         let mut fresh_inputs = E::default();
-        let same_inputs = self.encode_inputs(u, id, None, RecKind::First, None, &mut fresh_inputs).is_some() && fresh_inputs.0[..] == cached[inputs_at..d.p];
+        let inputs_end = d.p;
+        let same_inputs = self.encode_inputs(u, id, None, RecKind::First, None, &mut fresh_inputs).is_some() && fresh_inputs.0[..] == cached[inputs_at..inputs_end];
         let inputs_word = if same_inputs { "same inputs" } else { "recorded inputs differ" };
         let Some(ccode) = d.bytes() else { return false };
         let ccode = ccode.to_vec();
@@ -5044,7 +5093,8 @@ impl Cache {
                     diffs.push(format!("{}: {:08x}/{:08x}", k, u32::from_le_bytes(ccode[k..k + 4].try_into().unwrap()), u32::from_le_bytes(fz[k..k + 4].try_into().unwrap())));
                 }
             }
-            eprintln!("makepad-run cache: VERIFY code differs: {} ({} vs {} bytes, {}) cached/fresh {:?}", name, ccode.len(), fz.len(), inputs_word, diffs);
+            let why = if same_inputs { String::new() } else { format!(": {}", self.inputs_diff(u, id, &cached[inputs_at..inputs_end], &fresh_inputs.0)) };
+            eprintln!("makepad-run cache: VERIFY code differs: {} ({} vs {} bytes, {}{}) cached/fresh {:?}", name, ccode.len(), fz.len(), inputs_word, why, diffs);
             if same_inputs { self.stats.verify_diff_code += 1 } else { self.stats.verify_diff_inputs += 1 }
             // the fresh relocations whose encoding the cached entry does not hold (what the two
             // builds' constant pools disagree on)
@@ -9185,7 +9235,7 @@ impl Linker {
         }
         self.cache().last_tier1 = if is_o3 { Some(inl) } else { None };
         self.cache().last_o2 = tier == TIER_O2;
-        self.cache().last_base = tier == TIER_BASE;
+        self.cache().last_base = tier == TIER_BASE || tier == TIER_BASE_UV;
         Some((code, pc, relocs))
     }
 }

@@ -4566,7 +4566,7 @@ fn summary_inner(why: &str) {
                 }
                 if c.mode == crate::cache::Mode::Verify {
                     let st = &c.stats;
-                    verbose!("makepad-run cache: verify: {} same, {} DIFFERENT ({} with other recorded inputs, {} code from the same inputs, {} only a relocation), {} of another tier", st.verify_same, st.verify_diff, st.verify_diff_inputs, st.verify_diff_code, st.verify_diff_reloc, st.verify_other_tier);
+                    verbose!("makepad-run cache: verify: {} same, {} DIFFERENT ({} with other recorded inputs, {} code from the same inputs, {} only a relocation), {} of another tier ({} built unverified on one side)", st.verify_same, st.verify_diff, st.verify_diff_inputs, st.verify_diff_code, st.verify_diff_reloc, st.verify_other_tier, st.verify_provisional);
                 }
             }
         }
