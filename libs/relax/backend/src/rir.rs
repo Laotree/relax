@@ -1369,7 +1369,8 @@ pub struct Func {
     pub lowering: Option<std::sync::Arc<Func>>,
     /// The slots whose final body this one could not take in yet: inline candidates its build
     /// left out because their verdict was pending (SPEC-V: unverified code is not inlined into
-    /// verified code), and candidates it inlined whose body was itself provisional. Build inputs
+    /// verified code), and candidates offered with a body that was itself provisional (inlined
+    /// or not: the inliner priced that body). Build inputs
     /// like `inl_slots`: a body with any is provisional (its cache record ranks below complete
     /// code; the JIT builds it once more when every one of them is final). Compared, hashed and
     /// renamed.

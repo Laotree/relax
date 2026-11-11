@@ -3496,7 +3496,13 @@ impl Cache {
         }
         if let Some(t) = payload_tier(&payload) {
             self.rec_tier.insert(key, t);
-            if trace_on() { trace_keyed(u, id, &format!("rec:{}{}", ["base", "O1", "O2", "O3"][tier_level(t) as usize], if t & TIER_PROVISIONAL != 0 { "-provisional" } else { "" }), Some(key)); }
+            if trace_on() {
+                // (what the record was made from: deferred or the slot as it is now, its RIR's kind
+                // and inlined slots, the code's length)
+                let r = u.fns[id as usize].rir.as_ref();
+                let rir = r.map_or("none".to_string(), |r| format!("{}{} inl {}", if r.baseline { "baseline" } else if r.full { "full" } else { "normal" }, if r.plain_calls { " plain-calls" } else { "" }, r.inl_slots.len()));
+                trace_keyed(u, id, &format!("rec:{}{} {:?}{} rir {} deps {} code {}", ["base", "O1", "O2", "O3"][tier_level(t) as usize], if t & TIER_PROVISIONAL != 0 { "-provisional" } else { "" }, kind, if pending.is_some() { " deferred" } else { "" }, rir, u.body_deps.get(&id).map_or(0, |v| v.len()), code.len()), Some(key));
+            }
         }
         let kc = self.cur_crate;
         self.push_pending(kc, NewEntry { key, kind: KIND_CODE, payload });
@@ -4392,7 +4398,7 @@ impl Cache {
 
 /// What a code record is: a first record (O1 / baseline / O3: recorded once, O3 replaces), an O2
 /// build (replaces), a verified O1 rebuild (replaces only an entry below O1)
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RecKind { First, O2, O1Up }
 
 /// A stored tier's order (the tier bytes are not in tier order): baseline < O1 < O2 < O3, and
@@ -5192,7 +5198,8 @@ impl Cache {
                 }
             }
             let why = if same_inputs { String::new() } else { format!(": {}", self.inputs_diff(u, id, &cached[inputs_at..inputs_end], &fresh_inputs.0)) };
-            eprintln!("makepad-run cache: VERIFY code differs: {} ({} vs {} bytes, {}{}) cached/fresh {:?}", name, ccode.len(), fz.len(), inputs_word, why, diffs);
+            let level = ["base", "O1", "O2", "O3"][tier_level(cached[inputs_at]) as usize];
+            eprintln!("makepad-run cache: VERIFY code differs: {} [{}] ({} vs {} bytes, {}{}) cached/fresh {:?}", name, level, ccode.len(), fz.len(), inputs_word, why, diffs);
             if same_inputs { self.stats.verify_diff_code += 1 } else { self.stats.verify_diff_inputs += 1 }
             // the fresh relocations whose encoding the cached entry does not hold (what the two
             // builds' constant pools disagree on)

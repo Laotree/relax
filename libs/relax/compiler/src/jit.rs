@@ -10266,6 +10266,24 @@ pub fn src_size(u: &Unit, id: u32) -> u32 {
 /// callee_attrs' answer for a callee without a clean verdict yet
 const NOT_INLINABLE_UNVERIFIED: &str = "not inlinable: unverified";
 
+/// SPEC-V: callee `c`, refused as unverified code, waits for its verdict (its caller's body is
+/// provisional, pending on it) unless that verdict is in and not clean: then it is never inlined
+/// into verified code, a refusal as final as any other.
+fn verdict_awaited(u: &Unit, c: u32) -> bool {
+    !matches!(u.verdict_state(c), Verdict::Failed(_) | Verdict::Unverifiable(_))
+}
+
+/// A candidate's attributes after its RIR was built for the caller: a callee found unverified by
+/// that build (its first preparation reads its verdict) is left out pending its verdict, as one
+/// found unverified before the build (`left`), never dropped from the body unrecorded.
+fn awaited_attrs(u: &Unit, c: u32, attrs: Result<u8, &'static str>, tier: usize, left: &mut Vec<u32>) -> Option<u8> {
+    if attrs == Err(NOT_INLINABLE_UNVERIFIED) && verdict_awaited(u, c) {
+        inline_state(tier, INLINE_LEFT_OUT);
+        left.push(c);
+    }
+    attrs.ok()
+}
+
 /// Inline attributes of callee slot `c` for the inliner, or why it may not be inlined (a
 /// why-tier note):
 /// #[inline]/#[inline(always)], rule 4 (core instances made for a closure / fn item), and
@@ -12942,11 +12960,6 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             if defer && owner::exit_tid() != 0 && !owner::serving_exit() {
                 return Err(YIELDED.to_string());
             }
-            if let FnKey::Closure(file, _, parent) = (&*up).fns[*c as usize].key {
-                if !(&*up).has_body(parent, file) {
-                    let _ = collect_fronts(&mut needs, || ensure_parent_body(up, parent, file, 0));
-                }
-            }
             let u = &mut *up;
             // O1 decides from the source before preparing a callee (its RIR build is the
             // cost: typeck + lower + opt of a body that may never run on its own): small bodies,
@@ -12954,13 +12967,14 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             // called from the adapter instance made for them). User code only with inline_all.
             let builtin = match &u.fns[*c as usize].key {
                 FnKey::Inst(d, _) => u.prog.def(*d).krate == u.core_crate,
-                // a closure body is lowered from its parent's checked body: only once that exists
-                FnKey::Closure(cf, _, parent) => u.has_body(*parent, *cf),
-                FnKey::Shim(_) | FnKey::Glue(..) => true,
+                // a closure is a candidate whether or not its parent's checked body is kept right
+                // now (settle drops it once its closures are built): a closure without RIR checks
+                // the parent again in its own build, which a take fronts as any other front
+                FnKey::Closure(..) | FnKey::Shim(_) | FnKey::Glue(..) => true,
                 FnKey::Sandbox(_) | FnKey::Plain(_) => continue,
             };
-            if !builtin && (!cfg.inline_all || matches!(u.fns[*c as usize].key, FnKey::Closure(..))) {
-                if relax_codegen::opt::inline_trace(&u.fns[id as usize].name) && !matches!(u.fns[*c as usize].key, FnKey::Closure(..)) {
+            if !builtin && !cfg.inline_all {
+                if relax_codegen::opt::inline_trace(&u.fns[id as usize].name) {
                     let why = if unverified { "the caller is unverified: baseline" } else if baseline { "baseline" } else { "user code without inline_all" };
                     eprintln!("inline-trace-o1 {}: out fn#{} {} ({})", u.fns[id as usize].name, c, u.fns[*c as usize].name, why);
                 }
@@ -12973,7 +12987,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             // MAKEPAD_RUN_NOINL) are not built for inlining: decided before the build, not after
             let attrs = callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false);
             let source_wanted = baseline && matches!(u.fns[*c as usize].key, FnKey::Glue(..)) || inline_source_wanted(u, *c, full);
-            if source_wanted && attrs == Err(NOT_INLINABLE_UNVERIFIED) {
+            if source_wanted && attrs == Err(NOT_INLINABLE_UNVERIFIED) && verdict_awaited(u, *c) {
                 inline_state(tier, INLINE_LEFT_OUT);
                 left.push(*c);
             }
@@ -13012,6 +13026,12 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                 TAINTED.with(|t| t.set(true));
             }
             let open = u.fns[*c as usize].building;
+            if want && u.fns[*c as usize].rir.is_none() && relax_codegen::opt::inline_trace(&u.fns[id as usize].name) {
+                let why = if open { if open_here(*c) { "open on this request: own recursion" } else { "open lower on the owner's stack: tainted" } } else if u.fns[*c as usize].build_err.is_some() { "build error" } else { "" };
+                if !why.is_empty() {
+                    eprintln!("inline-trace-o1 {}: out fn#{} {} ({})", u.fns[id as usize].name, c, u.fns[*c as usize].name, why);
+                }
+            }
             if want && sig_dir().is_some() && u.fns[*c as usize].rir.is_none() {
                 let why = if open { "own-open" } else if u.fns[*c as usize].build_err.is_some() { "err" } else { "" };
                 if !why.is_empty() {
@@ -13041,8 +13061,8 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                     if let Ok(Front::Opt(p, _)) = r {
                         let u = &*up;
                         // built (its RIR is stored) but not inlined when it calls this fn back
-                        let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false).ok() };
-                        if attrs.is_none() && sig_dir().is_some() && inline_cycle(u, id, *c) {
+                        let attrs = if inline_cycle(u, id, *c, full) { None } else { awaited_attrs(u, *c, callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false), tier, &mut left) };
+                        if attrs.is_none() && sig_dir().is_some() && inline_cycle(u, id, *c, full) {
                             skipped.push((*c, "cycle"));
                         }
                         if attrs.is_some() { inline_state(tier, if p.func.baseline { 0 } else { INLINE_BUILT_HERE }); }
@@ -13064,7 +13084,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                     // (off the owner); its RIR replaces the baseline RIR at the finish
                     if let Some(Some(p)) = collect_fronts(&mut needs, || if fresh { split_normal(up, *c) } else { split_upgrade(up, *c) }) {
                         let u = &*up;
-                        let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false).ok() };
+                        let attrs = if inline_cycle(u, id, *c, full) { None } else { awaited_attrs(u, *c, callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false), tier, &mut left) };
                         if attrs.is_some() { inline_state(tier, INLINE_BUILT_HERE); }
                         deferred.push((*c, attrs, p));
                     }
@@ -13086,7 +13106,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             if !wanted.contains(&c) || deferred.iter().any(|x| x.0 == c) {
                 continue;
             }
-            let Ok(attrs) = callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, c, inline_all, core_hint, false) else {
+            let Some(attrs) = awaited_attrs(u, c, callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, c, inline_all, core_hint, false), tier, &mut left) else {
                 continue;
             };
             if let Some(p) = noinl_callee {
@@ -13094,9 +13114,12 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                     continue;
                 }
             }
-            if u.fns[c as usize].rir.is_some() && inline_cycle(u, id, c) {
+            if u.fns[c as usize].rir.is_some() && inline_cycle(u, id, c, full) {
                 if sig_dir().is_some() {
                     skipped.push((c, "cycle"));
+                }
+                if relax_codegen::opt::inline_trace(&u.fns[id as usize].name) {
+                    eprintln!("inline-trace-o1 {}: out fn#{} {} (inline cycle)", u.fns[id as usize].name, c, u.fns[c as usize].name);
                 }
                 continue;
             }
@@ -13111,6 +13134,9 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                 TAINTED.with(|t| t.set(true));
             }
             if let Some(r) = body {
+                if relax_codegen::opt::inline_trace(&u.fns[id as usize].name) {
+                    eprintln!("inline-trace-o1 {}: candidate fn#{} {} ({}{}{})", u.fns[id as usize].name, c, f.name, if r.baseline { "baseline" } else if r.full { "full" } else { "normal" }, if r.pending.is_empty() { "" } else { ", provisional" }, if r.plain_calls { ", unverified lowering" } else { "" });
+                }
                 inline_state(tier, if f.rir.as_ref().is_some_and(|x| !std::sync::Arc::ptr_eq(x, r)) { INLINE_BESIDE_FULL } else { rir_state(f, r) });
                 snap.push((c, r.clone(), attrs));
             }
@@ -13503,14 +13529,44 @@ unsafe fn known_nounwind(up: *mut Unit, c: u32, depth: u32, unknown: &std::cell:
     v
 }
 
-/// Callee `c` calls caller `id` back directly (mutual recursion: derived impls of mutually
-/// recursive types, drop glue). Neither is inlined into the other, whichever is built first:
-/// before, the one built inside the other's open build left its caller out ("own-open") and the
-/// other inlined it, so O1 code followed the compile order (counter: PartialEq::eq of
-/// ScriptPodTypeData inlined ScriptPodTy's in 2 of 8 runs; cache verify gate,
-/// gc::mark_transient_bodies). Longer cycles still fall back to the open-build rule.
-fn inline_cycle(u: &Unit, id: u32, c: u32) -> bool {
-    u.fns[c as usize].calls.contains(&id)
+/// Callee `c` calls caller `id` back (recursion: derived impls of mutually recursive types, drop
+/// glue, `Box<T>::clone` of a `T` holding a `Box<T>`). Neither is inlined into the other, whichever
+/// is built first: before, the one built inside the other's open build left its caller out
+/// ("own-open") and the other inlined it, so O1 code followed the compile order (counter:
+/// PartialEq::eq of ScriptPodTypeData inlined ScriptPodTy's in 2 of 8 runs; cache verify gate,
+/// gc::mark_transient_bodies; a 3-cycle `T::clone` -> `U::clone` -> `Box<T>::clone`, test suite
+/// verify). The way back is followed through the lowered bodies' direct calls (FnEntry::calls) of
+/// the callees a caller of this tier prepares as inline candidates by their source
+/// (cycle_member): a cycle of candidates is built through, so each of its members is lowered by
+/// the time its callers decide, in every compile order.
+fn inline_cycle(u: &Unit, id: u32, c: u32, full: bool) -> bool {
+    if u.fns[c as usize].calls.contains(&id) {
+        return true;
+    }
+    let mut seen = vec![c];
+    let mut todo = vec![c];
+    while let Some(x) = todo.pop() {
+        for &y in u.fns[x as usize].calls.iter() {
+            if y == id {
+                return true;
+            }
+            if !seen.contains(&y) && cycle_member(u, y, full) {
+                seen.push(y);
+                todo.push(y);
+            }
+        }
+    }
+    false
+}
+
+/// A callee a caller of this tier prepares as an inline candidate by its source alone (the
+/// preparation's source_wanted without the verdict): the path of an inline cycle (inline_cycle).
+fn cycle_member(u: &Unit, c: u32, full: bool) -> bool {
+    match u.fns[c as usize].key {
+        FnKey::Sandbox(_) | FnKey::Plain(_) => false,
+        FnKey::Glue(..) => true,
+        _ => inline_source_wanted(u, c, full),
+    }
 }
 
 /// Inlining + the passes after it, from a preparation alone (no unit access: callable
@@ -13606,14 +13662,15 @@ fn optimize_rir(options: &crate::options::Options, id: u32, prep: Prep) -> Resul
 }
 
 /// A body's pending slots after its inlining (Func::pending): the candidates its preparation left
-/// out for a pending verdict, and the inlined candidates whose own body was provisional (their
-/// completion comes first: complete_provisional). (A nounwind answer taken from a provisional
+/// out for a pending verdict, and the candidates whose own body was provisional, inlined or not
+/// (the inliner's choice is made from that body: a complete one can be priced otherwise), whose
+/// completion comes first (complete_provisional). (A nounwind answer taken from a provisional
 /// body is recorded with its value: an input of the record as it is.)
-fn note_inlined_pending(func: &mut relax_backend::rir::Func, callees: &[(u32, std::sync::Arc<relax_backend::rir::Func>, u8)], inlined: &[(u32, usize)]) {
+fn note_provisional_candidates(func: &mut relax_backend::rir::Func, callees: &[(u32, std::sync::Arc<relax_backend::rir::Func>, u8)]) {
     let before = func.pending.len();
-    for &(c, _) in inlined {
-        if !func.pending.contains(&c) && callees.iter().any(|x| x.0 == c && !x.1.pending.is_empty()) {
-            func.pending.push(c);
+    for (c, body, _) in callees {
+        if !body.pending.is_empty() && !func.pending.contains(c) {
+            func.pending.push(*c);
         }
     }
     if func.pending.len() != before {
@@ -13638,7 +13695,7 @@ fn optimize_rir_inner(options: &crate::options::Options, id: u32, prep: Prep) ->
             // Candidates can be baseline bodies too: conservatively keep their unwind edges.
             inlined = relax_codegen::opt::inline_calls(options, &mut func, id, &get, &|_| false, &relax_codegen::opt::InlineLimits::baseline());
             relax_backend::stats::pass_time(5, ti);
-            note_inlined_pending(&mut func, &callees, &inlined);
+            note_provisional_candidates(&mut func, &callees);
         }
         baseline_rir(options, &mut func, ro);
         // Only tail_nounwind_facts were asked: other missing answers conservatively mean false.
@@ -13688,7 +13745,7 @@ fn optimize_rir_inner(options: &crate::options::Options, id: u32, prep: Prep) ->
         Ok(inlined)
     });
     let mut result = result;
-    if let Ok((optimized, inlined)) = &mut result {
+    if let Ok((optimized, _)) = &mut result {
         for &(c, v) in &facts {
             match optimized.nounwind_inputs.iter_mut().find(|x| x.0 == c) {
                 Some(x) => x.1 |= v,
@@ -13696,7 +13753,7 @@ fn optimize_rir_inner(options: &crate::options::Options, id: u32, prep: Prep) ->
             }
         }
         optimized.nounwind_inputs.sort_unstable();
-        note_inlined_pending(optimized, &callees, inlined);
+        note_provisional_candidates(optimized, &callees);
     }
     if let (Some(mut input), Ok((optimized, _))) = (capture, &result) {
         input.nounwind_inputs = optimized.nounwind_inputs.clone();
@@ -17879,10 +17936,14 @@ pub(crate) fn provisional_summary() -> String {
 
 /// Slot `m`, a pending slot of a provisional body, is final now: its verdict is in and the body
 /// callers take in (if it has one yet) is complete. A baseline body counts as final: the
-/// completion build builds the normal one.
+/// completion build builds the normal one. A verdict that is in and not clean is final too: the
+/// slot is never inlined into verified code.
 fn pending_final(u: &Unit, m: u32) -> bool {
     let f = &u.fns[m as usize];
-    !f.unverified.load(Ordering::Relaxed) && inline_body(f).is_none_or(|r| r.baseline || r.pending.is_empty())
+    if f.unverified.load(Ordering::Relaxed) {
+        return !verdict_awaited(u, m);
+    }
+    inline_body(f).is_none_or(|r| r.baseline || r.pending.is_empty())
 }
 
 /// Slot `s`'s provisional body (pending slots `pending`) can be completed now: the slot is
