@@ -815,10 +815,6 @@ pub struct Cache {
     linking_data: HashSet<u128>,
     /// the slots the last linked entry calls (speculative linking follows them)
     pub last_callees: Vec<u32>,
-    /// the slots whose address the last linked entry takes, and the data objects it reads
-    /// (real-time code's reach: jit.rs realtime)
-    pub last_thunks: Vec<u32>,
-    pub last_data: Vec<u64>,
     /// the hit just linked is O3 code; the slots its body inlined (live patches of those
     /// rebuild it)
     pub last_tier1: Option<Vec<u32>>,
@@ -1172,8 +1168,6 @@ impl Cache {
             slot_keys: HashMap::new(),
             key_waits: false,
             last_callees: Vec::new(),
-            last_thunks: Vec::new(),
-            last_data: Vec::new(),
             last_tier1: None,
             last_o2: false,
             last_provisional: None,
@@ -8955,11 +8949,6 @@ impl Linker {
         Some(s)
     }
 
-    fn link_sym(&mut self, u: &mut Unit, d: &mut D, rw: &mut Vec<Sym>) -> Option<u64> {
-        let s = self.link_symbol(u, d, rw)?;
-        Some(u.syms.value(s))
-    }
-
     /// Retain the encoded target's identity: reverse lookup by address loses aliases and
     /// cannot describe every linked symbol. Data folding must see the same target as cold code.
     /// `rw`: the writable blocks the entry's earlier symbols made, by ordinal (enc_sym).
@@ -9293,7 +9282,6 @@ impl Linker {
             if let Some(hook) = hook { hook(u); }
         }
         let mut callees = Vec::new();
-        let mut thunks = Vec::new();
         let mut data = Vec::new();
         let mut d = D { b: payload, p: 0 };
         if d.u32()? != ENTRY_VERSION {
@@ -9322,7 +9310,9 @@ impl Linker {
             let o = d.u32()? as usize;
             let kind = kind_of(d.u8()?)?;
             let tag = d.b.get(d.p).copied()?;
-            let v = match tag {
+            // the relocation keeps what it names (a slot, a symbol): the install records the
+            // code's references from these (jit CodeRefs), as it does for code built this run
+            let target = match tag {
                 20 | 21 | 25 => {
                     d.u8()?;
                     let b = d.bytes()?;
@@ -9331,31 +9321,37 @@ impl Linker {
                         let c = self.cache();
                         u.twin_link_target(id, sid, |b| c.has_stored_entry(u, b))
                     };
-                    if tag == 21 {
-                        thunks.push(sid);
-                    } else {
-                        callees.push(sid);
+                    match tag {
+                        20 => {
+                            callees.push(sid);
+                            Reloc::Slot(sid)
+                        }
+                        25 => {
+                            callees.push(sid);
+                            Reloc::Call(sid)
+                        }
+                        _ => Reloc::Thunk(sid),
                     }
-                    u.env.reloc_value(match tag { 20 => Reloc::Slot(sid), 25 => Reloc::Call(sid), _ => Reloc::Thunk(sid) })
                 }
                 22 => {
                     d.u8()?;
-                    u.env.reloc_value(Reloc::TlsKey)
+                    Reloc::TlsKey
                 }
                 23 => {
                     d.u8()?;
-                    u.env.reloc_value(Reloc::TlsSlow)
+                    Reloc::TlsSlow
                 }
                 24 => {
                     d.u8()?;
-                    u.env.reloc_value(Reloc::Resume)
+                    Reloc::Resume
                 }
                 _ => {
-                    let v = self.link_sym(u, &mut d, &mut rw)?;
+                    let s = self.link_symbol(u, &mut d, &mut rw)?;
+                    let v = u.syms.value(s);
                     if u.syms.data_at(v).is_some() {
                         data.push(v);
                     }
-                    v
+                    Reloc::Sym(s)
                 }
             };
             if o >= code.len() {
@@ -9363,10 +9359,10 @@ impl Linker {
             }
             if let Some(w) = dump_filter().filter(|_| self.cache().verbose) {
                 if _name.contains(w) {
-                    eprintln!("makepad-run cache: link {} at {} {:?} tag {} = {:#x}", _name, o, kind, tag, v);
+                    eprintln!("makepad-run cache: link {} at {} {:?} tag {} = {:#x}", _name, o, kind, tag, u.env.reloc_value(target));
                 }
             }
-            relocs.push(RelocAt { at: o as u32, kind, target: Reloc::Value(v) });
+            relocs.push(RelocAt { at: o as u32, kind, target });
         }
         if let Some(w) = dump_filter().filter(|_| self.cache().verbose) {
             if _name.contains(w) {
@@ -9384,14 +9380,12 @@ impl Linker {
         }
         let pc = raw.into_iter().map(|(o, p)| (o, (*files.get(relax_backend::rir::pos_file(p) as usize).unwrap_or(&u32::MAX) as u64) << 32 | (p & 0xffff_ffff) | (p & !relax_backend::rir::pos_plain(u64::MAX)))).collect();
         self.cache().last_callees = callees;
-        self.cache().last_thunks = thunks;
         // trait objects this code makes: the vtables it names (an impl's removal checks their makers)
         for &a in &data {
             if u.syms.is_vtable(a) {
                 u.note_vtable_maker(a, id);
             }
         }
-        self.cache().last_data = data;
         if !u.aux { crate::harness::reach::note(id, inl.iter().copied()); }
         if !is_o3 {
             // the slots this code took in run inside it: a replacement that calls one instead

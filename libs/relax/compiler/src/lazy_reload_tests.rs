@@ -1212,6 +1212,7 @@ fn realtime_strict_ready_lazy_and_patch_freeze() {
     let o = edit(src(12, 6));
     assert_eq!(o.rung, Rung::Patch, "{:?}", o.lines);
     assert_eq!(run(value_entry), 12);
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -1318,6 +1319,7 @@ fn realtime_reach_follows_vtables_made_after_the_mark() {
     assert!(!compiled(ticket) || next_built(), "compiled right after the first `Box<Arc2> -> Box<dyn Route>`, with `<Arc2 as Route>::next` lazy");
     wait(ticket);
     assert_eq!(run_rt(cp), (42, 0), "the real-time thread met a lazy compile");
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -1388,6 +1390,7 @@ fn realtime_reach_follows_trait_objects_held_deep_in_the_roots_value() {
         (unsafe { *(cp as *const u32) }, crate::jit::__relax_realtime_misses() - before)
     }).join().unwrap();
     assert_eq!((out, misses), (8, 0), "the real-time thread met lazy compiles (MAKEPAD_RUN_RT_TRACE=1 names them)");
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -1464,6 +1467,7 @@ fn realtime_reach_skips_trait_objects_it_only_makes_itself() {
         (unsafe { *(cp as *const u32) }, crate::jit::__relax_realtime_misses() - before)
     }).join().unwrap();
     assert_eq!((out, misses), (6, 0), "the real-time thread met lazy compiles (MAKEPAD_RUN_RT_TRACE=1 names them)");
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -1542,6 +1546,7 @@ fn realtime_reach_walks_code_that_ran_before_the_mark() {
         (unsafe { *((cp + 4) as *const u32) }, crate::jit::__relax_realtime_misses() - before)
     }).join().unwrap();
     assert_eq!((out, misses), (3 + 5, 0), "the real-time thread met lazy compiles (MAKEPAD_RUN_RT_TRACE=1 names them)");
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -1618,6 +1623,7 @@ fn realtime_reach_covers_float_formatting_and_container_drops() {
     }).join().unwrap();
     let want = format!("{:.3} {}", 2f64 * 1.5, 2f32 / 3.0).len() as u32 + (2 + 2 + 3) + (2 + 7);
     assert_eq!((out, misses), (want, 0), "the real-time thread met lazy compiles (MAKEPAD_RUN_RT_TRACE=1 names them)");
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -1625,9 +1631,10 @@ fn realtime_reach_covers_float_formatting_and_container_drops() {
 /// A tier-up of real-time code whose new code calls fns that never had code (an O2 build, then an
 /// O3 build, each calling a fn nothing called before, which calls another such fn): those are
 /// compiled before the new code is installed, the old code running meanwhile, so the real-time
-/// thread meets no lazy compile. The drain that walks what an install names afterwards is held,
-/// so a pass never rests on it winning the race against the real-time thread. (Fab's arm lab met
-/// such compiles of thread-local accessors in its armed loop.)
+/// thread meets no lazy compile. An install whose references were not walked before it is a hole
+/// the install says and counts (realtime_holes), so a pass never rests on the walk after it
+/// winning the race against the real-time thread. (Fab's arm lab met such compiles of thread-local
+/// accessors in its armed loop.)
 #[test]
 fn realtime_tier_up_compiles_new_callees_before_its_install() {
     const CHILD: &str = "MAKEPAD_RUN_RT_TIER_UP_TEST";
@@ -1693,7 +1700,6 @@ fn realtime_tier_up_compiles_new_callees_before_its_install() {
     for (s, name) in [(second, "second"), (third, "third"), (twenty, "twenty"), (three_hundred, "three_hundred")] {
         assert!(!u.fns[s as usize].compiled, "`{name}` has code before any code calls it");
     }
-    crate::jit::RT_DRAIN_HOLD.store(true, Ordering::Release);
     // the new code's call goes to `to` where the code it replaces called `from`
     let redirect = |f: &mut Func, from: u32, to: u32| {
         let mut n = 0;
@@ -1720,12 +1726,14 @@ fn realtime_tier_up_compiles_new_callees_before_its_install() {
     assert_eq!(n, 1, "the root's RIR calls `first` once");
     assert!(unsafe { crate::jit::o2_build_now(up, root) }, "the O2 build was dropped at its front");
     assert_eq!(rt_call(), (20, 0), "O2: the new code (it calls `second`, which calls `twenty`) runs without lazy compiles");
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "O2: the new code was installed before its references were walked");
     // O3 (inspect's edit hook): its code calls `third`
     let mut n = 0;
     let mut edit = |f: &mut Func, _: &crate::jit::Unit| n += redirect(f, second, third);
     assert!(unsafe { crate::jit::compile_tier1_inspect(up, root, Some(&mut edit)) }, "the O3 build was not installed");
     assert_eq!(n, 1, "the O2 code's RIR calls `second` once");
     assert_eq!(rt_call(), (300, 0), "O3: the new code (it calls `third`, which calls `three_hundred`) runs without lazy compiles");
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "O3: the new code was installed before its references were walked");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -1850,6 +1858,7 @@ fn realtime_reach_reads_the_installed_code() {
         (unsafe { *((cp + 4) as *const u32) }, crate::jit::__relax_realtime_misses() - before)
     }).join().unwrap();
     assert_eq!((out, misses), (27, 0), "the real-time thread met lazy compiles (MAKEPAD_RUN_RT_TRACE=1 names them)");
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
     std::mem::forget(u);
 }
 
