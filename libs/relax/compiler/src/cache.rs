@@ -4407,34 +4407,42 @@ impl Cache {
     /// Indexes the code and data entries this run's spills wrote to this cache's stores, as
     /// `open_written` found them: their entries replace what the index had for their keys, as the
     /// file's own index does. `open`: the stores not opened yet are opened here first (the exit:
-    /// nothing waits for the owner thread then). false: a spill wrote to this cache since the last
-    /// `open_written` (a mid-run startup image waits for the next write, which opens it).
+    /// nothing waits for the owner thread then), again until no spill is left that landed while
+    /// they opened. false: a spill wrote to this cache since the last `open_written` (a mid-run
+    /// startup image waits for the next write, which opens it).
     fn index_written(&mut self, open: bool) -> bool {
-        if open { open_written(&self.dir); }
-        let mine: Vec<(std::sync::Arc<Store>, Vec<(u128, u32)>)> = crate::zone_alloc::kept_with(|| {
-            let mut o = OPENED.lock().unwrap_or_else(|e| e.into_inner());
-            let mut mine = Vec::new();
-            let mut i = 0;
-            while i < o.len() {
-                if o[i].0 == self.dir {
-                    let (_, _, st, _, found) = o.swap_remove(i);
-                    mine.push((st, found));
-                } else {
-                    i += 1;
+        loop {
+            if open { open_written(&self.dir); }
+            let mine: Vec<(std::sync::Arc<Store>, Vec<(u128, u32)>)> = crate::zone_alloc::kept_with(|| {
+                let mut o = OPENED.lock().unwrap_or_else(|e| e.into_inner());
+                let mut mine = Vec::new();
+                let mut i = 0;
+                while i < o.len() {
+                    if o[i].0 == self.dir {
+                        let (_, _, st, _, found) = o.swap_remove(i);
+                        mine.push((st, found));
+                    } else {
+                        i += 1;
+                    }
                 }
+                mine
+            });
+            for (st, found) in &mine {
+                if found.is_empty() { continue; }
+                let si = self.stores.len() as u32;
+                for &(key, e) in found {
+                    self.index.insert(key, (si, e));
+                }
+                self.stores.push(st.clone());
             }
-            mine
-        });
-        for (st, found) in &mine {
-            if found.is_empty() { continue; }
-            let si = self.stores.len() as u32;
-            for &(key, e) in found {
-                self.index.insert(key, (si, e));
-            }
-            self.stores.push(st.clone());
+            crate::zone_alloc::kept_with(|| drop(mine));
+            let left = WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|w| w.0 == self.dir);
+            // at the exit a spill still in flight can land while the stores open: the exit's
+            // manifest gave up on it, and the next start ran without one (after a cold run, its
+            // first warm slice took 8.36 s against 7.13). The exit has stopped the compiles, so
+            // the spills end and these passes with them.
+            if !left || !open { return !left; }
         }
-        crate::zone_alloc::kept_with(|| drop(mine));
-        !WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|w| w.0 == self.dir)
     }
 
     /// The directory of this cache's stores
@@ -8441,7 +8449,8 @@ mod data_tests {
     /// A mid-run write indexes the code its spills wrote for the startup manifest, but the owner
     /// thread never opens their stores: the cache writer opens them first (`open_written`), and an
     /// unopened write makes the manifest wait. A store written again after it was opened is
-    /// opened again for its earlier keys and its new ones.
+    /// opened again for its earlier keys and its new ones. The exit's manifest never waits: it
+    /// opens what is left itself.
     #[test]
     fn written_code_is_indexed_only_from_stores_opened_off_the_owner() {
         isolated_test!(written_code_is_indexed_only_from_stores_opened_off_the_owner);
@@ -8462,6 +8471,9 @@ mod data_tests {
         open_written(&c.dir);
         assert!(c.index_written(false), "every write was opened");
         assert!(c.has_index(&first) && c.has_index(&second), "a store opened again keeps its earlier keys");
+        let third = 0x53u128 << 64 | 3;
+        spill(&mut c, third);
+        assert!(c.index_written(true) && c.has_index(&third), "the exit opens an unopened write itself");
         drop(c);
         std::fs::remove_dir_all(root).unwrap();
     }
