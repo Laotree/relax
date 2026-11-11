@@ -49,10 +49,12 @@ extern "C" fn cleanup() {
     let _ = std::fs::remove_file(disc);
 }
 
-/// Removes this process's socket and discovery file now, its exit's own work done: the atexit
-/// cleanup runs after every exit handler registered after it (a GPU driver's teardown, which can
-/// take seconds), and a process killed during those (a window manager's stop gives its apps a
-/// grace, then SIGKILL) left its discovery file behind, which the node's hub reads as a crash.
+/// Removes this process's socket and discovery file now: where the process ends without exit
+/// handlers (`_exit`, a Windows session end), or once its exit's own work is done, before slow
+/// ones run. The atexit cleanup runs after every exit handler registered after it (a GPU driver's
+/// teardown, which can take seconds), and a process killed during those (a window manager's stop
+/// gives its apps a grace, then SIGKILL) left its discovery file behind, which the node's hub
+/// reads as a crash.
 pub fn withdraw() {
     cleanup();
 }
@@ -210,6 +212,8 @@ mod imp {
     /// (`"socket_error"`, no caps): a client names the reason instead of finding no app.
     pub fn listen(ep: &Endpoint, extra: &str) -> io::Result<PathBuf> {
         let _ = crate::cmd::now_ms();
+        #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
+        crate::discovery::remove_stale(ep.hooks());
         let (sock, disc) = paths(std::process::id());
         let served = serve_announced(ep, extra, &sock, &disc, own_dir);
         {
