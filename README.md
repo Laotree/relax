@@ -324,7 +324,7 @@ Cargo.toml                              the workspace
 libs/relax/
   lex/ base/ session/ front/ types/     front end and type system
   codegen/ backend/                     middle end and machine code
-  compiler/                             runtime, std (compiler/std), 96 end-to-end test packages, benches
+  compiler/                             runtime, std (compiler/std), 96 end-to-end test packages
   attr/ native_macros/                  #[relax(..)] and native proc macros
   KNOWN_GAPS.md                         what isn't supported yet
 libs/relax_api/                         #[relax_api] and per-thread heap routing

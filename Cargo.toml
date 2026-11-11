@@ -17,10 +17,8 @@ members = [
     "tools/run/runner",
 ]
 exclude = [
-    "libs/relax/compiler/bench_rt",
     "libs/relax/compiler/std",
     "libs/relax/compiler/tests",
-    "libs/relax/compiler/rwbench",
     "libs/relax/types/tests",
     "libs/relax/attr",
     "libs/windows/sys",
