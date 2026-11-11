@@ -66,7 +66,9 @@ builds, point each one at its own commit's std:
 MAKEPAD_RUN_STD=/path/to/that/checkout/libs/relax/compiler/std /path/to/that/target/release/relax run ...
 ```
 
-Give each side its own `MAKEPAD_RUN_HOME` (caches) so neither reuses the other's compiled code.
+Compiled code is kept in the workspace's run dir, `target/makepad-run` (in `CARGO_TARGET_DIR` when
+that is set); `MAKEPAD_RUN_HOME` holds only fetched git repositories. Give each side its own run dir
+with `MAKEPAD_RUN_CACHE_DIR=<dir>` so neither reuses the other's compiled code.
 
 ## Traces
 
