@@ -250,7 +250,13 @@ fn run(raw_args: Vec<Vec<u8>>) {
     }
     let args: Vec<String> = raw_args.iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
     if args.get(1).map(String::as_str) == Some("--version") {
-        println!("makepad {} (compiler: {})", host().provenance, relax_compiler::PROVENANCE);
+        if help::bare() {
+            // the stamps read `makepad <host> jit <relax>`: the source tree's name, then the hashes
+            let ids = |p: &'static str| p.strip_prefix("makepad ").unwrap_or(p);
+            println!("relax {} (beta): runs a Rust crate from source through the Relax JIT (build {}, compiler {})", env!("CARGO_PKG_VERSION"), ids(host().provenance), ids(relax_compiler::PROVENANCE));
+        } else {
+            println!("makepad {} (compiler: {})", host().provenance, relax_compiler::PROVENANCE);
+        }
         return;
     }
     // every program this loader runs (and every program those start) finds it here: a program
