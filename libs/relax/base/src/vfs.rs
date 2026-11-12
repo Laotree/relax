@@ -1014,8 +1014,11 @@ pub fn write_out(text: std::fmt::Arguments<'_>) {
 /// MAKEPAD_RUN_SHARE=<name>: the workspace of the current folder (cargo's root for it) becomes
 /// the edits folder of an empty store mounted at `<run home>/vfs/<name>`, and the run's workspace
 /// is the current folder's place under that mount. It is said in the variables a virtual run
-/// already has (MAKEPAD_RUN_VFS, MAKEPAD_RUN_EDITS, MAKEPAD_RUN_WORKSPACE), which the processes this
-/// run starts inherit: one that finds the mount named keeps it.
+/// already has (MAKEPAD_RUN_VFS, MAKEPAD_RUN_EDITS, MAKEPAD_RUN_WORKSPACE), run facts like the
+/// name itself (progenv.rs): this run again (a self-exec child) and a build script of the mount
+/// (unitgraph.rs) are handed them and keep the mount they find named. No other child inherits
+/// them: a program's child runs on the checkout, and a runner it starts in another folder never
+/// mounts that folder under this run's name.
 fn share_from_env() -> Result<(), String> {
     let Some(name) = std::env::var("MAKEPAD_RUN_SHARE").ok().filter(|n| !n.is_empty()) else { return Ok(()) };
     if name.starts_with('.') || !name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')) {
@@ -1035,9 +1038,9 @@ fn share_from_env() -> Result<(), String> {
     let rel = relative_path(&cwd, &disk).unwrap_or_default();
     let (file, commit) = store::empty_store(&home.join("cache"))?;
     let _ = SHARE_ROOTS.set((root.clone(), normalize_path(&disk)));
-    std::env::set_var("MAKEPAD_RUN_VFS", format!("{root}\t{}\t{}", file.display(), store::hex(&commit)));
-    std::env::set_var("MAKEPAD_RUN_EDITS", &disk);
-    std::env::set_var("MAKEPAD_RUN_WORKSPACE", if rel.is_empty() { root } else { format!("{root}/{rel}") });
+    crate::progenv::set_run_fact("MAKEPAD_RUN_VFS", format!("{root}\t{}\t{}", file.display(), store::hex(&commit)));
+    crate::progenv::set_run_fact("MAKEPAD_RUN_EDITS", &disk);
+    crate::progenv::set_run_fact("MAKEPAD_RUN_WORKSPACE", if rel.is_empty() { root } else { format!("{root}/{rel}") });
     Ok(())
 }
 
