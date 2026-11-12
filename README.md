@@ -1,5 +1,8 @@
 # Relax
 
+> [!WARNING]
+> **Experimental.** Relax is for development iteration: running, testing and live-editing your program while you work on it. Build anything you release with Rust itself: `cargo build --release` with rustc.
+
 ### Rust without the wait.
 
 **rustc builds your program, then you run it. Relax runs your program while it builds it.**

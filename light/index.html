@@ -53,6 +53,11 @@ s{text-decoration-color:var(--rustc);text-decoration-thickness:2px}
 :focus-visible{outline:2px solid var(--ink);outline-offset:2px;border-radius:2px}
 .skip{position:absolute;left:-999px;top:8px;background:var(--ink);color:var(--on-ink);padding:10px 14px;border-radius:var(--r);z-index:100;font-weight:700}
 .skip:focus{left:12px}
+/* the experimental notice: a full-width bar above the sticky nav, in both the JS and the plain view */
+.xp{background:color-mix(in oklch,var(--gap) 30%,var(--paper));border-bottom:1px solid var(--ink);box-shadow:inset 0 3px 0 var(--warn);color:var(--ink);font-size:.92rem;line-height:1.45}
+.xp .wrap{padding-top:12px;padding-bottom:10px}
+.xp b{color:var(--warn)}
+.xp code{background:var(--paper)}
 .wrap{width:100%;max-width:var(--maxw);margin:0 auto;padding:0 16px}
 @media (min-width:600px){.wrap{padding:0 28px}}
 @media (min-width:1000px){.wrap{padding:0 48px}}
@@ -554,6 +559,7 @@ footer .lang{color:var(--on-ink)}
 <body>
 <a class="skip" href="#main">Skip to content</a>
 <div id="prog" aria-hidden="true"></div>
+<div class="xp" role="note"><div class="wrap"><b>Experimental</b> · Relax is for development iteration. Use Rust itself (<code>cargo build --release</code>) for any release build.</div></div>
 <div id="plain">
 <p>This is the page's full text as plain HTML, for readers without JavaScript. The same text is in the <a href="https://github.com/makepad/relax#readme">README</a> and on the <a href="../retro/">plain HTML page</a>.</p>
 <h1>Relax</h1>
