@@ -5984,6 +5984,11 @@ impl<'a> Lcx<'a> {
             // an inline const (`const { .. }`, `offset_of!`'s expansion) is a constant: rustc
             // promotes it (lowered here as code; promote_rvalue stores its value statically)
             ExprKind::ConstBlock(_) => true,
+            // rustc_mir_transform/src/promote_consts.rs: Validator::validate_rvalue: a closure is
+            // an aggregate of its captures, so one that captures nothing is a constant (`&VTable {
+            // f: |p| .., g: |p| .. }`, reified to `fn` pointers, outlives the fn that returns it)
+            ExprKind::Closure(_) => matches!(self.kind_ref(t), TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: captures, .. })
+                if matches!(self.kind_ref(*captures), TyKind::Tuple(ts) if ts.is_empty())),
             ExprKind::AddrOf(false, false, x) => self.promotable(x),
             ExprKind::Call(f, args) => {
                 let ctor = matches!(self.b.res.get(&strip_paren(ast, f).0), Some(Res::Def(d)) if matches!(self.u.prog.def(*d).kind, DefKind::Variant | DefKind::Struct));
