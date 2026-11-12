@@ -80,6 +80,12 @@ assert keys == sorted(p.name for p in native.iterdir() if (p / "messages.jsonl")
 assert receipts == {key: (native / key / "messages.jsonl").stat().st_mtime_ns for key in keys}, "warm launch rewrote native build receipt"
 print("PASS cache: reordered unused patches keep one key; second launch reuses native build")
 
+# `makepad selftest --allow-c` builds every fn against the libraries the run links: `add` reads the
+# C static cn_offset, which a selftest that linked nothing reported as "foreign static not found"
+selftest = run("selftest", [binary, "selftest", "--allow-c", "allow-c-fixture"])
+assert "foreign static" not in selftest.stderr, f"selftest: {selftest.stderr}"
+print("PASS selftest: every fn builds against the native library, its C static included")
+
 # Keep the loader case independent of Cargo's unused-patch order checks.
 manifest = fixture / "Cargo.toml"
 manifest.write_text(manifest.read_text().split("[patch.crates-io]")[0])

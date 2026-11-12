@@ -1975,6 +1975,19 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             let mut session = crate::serve::Session::new(u, root, pre);
             return session.watch(deep);
         }
+        // a selftest builds every fn as the run builds it: against the libraries the run links (the
+        // --allow-c native library, the build scripts' libraries). Without them a fn that reads a C
+        // static failed ("foreign static not found in the loaded libraries", relax#75) where the
+        // run binds it.
+        if selftest {
+            match link_libraries(&u.prog, &g.link_libs, g.native.as_ref(), 0, None) {
+                Ok((_, missing, _)) => if !missing.is_empty() { verbose!("makepad-run: libraries not found: {:?}", missing); },
+                Err(error) => {
+                    eprintln!("makepad-run: {error}");
+                    return 1;
+                }
+            }
+        }
         // the collected image is the program as its load left it, before the bodies make their
         // types (a run's boot snapshot): the record at the end encodes this snapshot
         let boot_cache = if selftest { None } else { check_boot_cache(&mut u, options) };
