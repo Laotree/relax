@@ -233,8 +233,10 @@ const LEDGER_KEY: u128 = 0;
 // follows the trait objects its roots are passed, not every one its code calls through). 32: a
 // closure is named by its owner's closure ordinal and its text (closure_ordinal), not by its
 // file version and position, in slot keys and types alike; a block-scoped item by its fn and
-// its ordinal there (stable::block_place), not its offset.
-const ENTRY_VERSION: u32 = 34;
+// its ordinal there (stable::block_place), not its offset. 35: a glue kind is a u32 (jit.rs
+// FnKey::Glue): one byte below 0xFF, else 0xFF and a u32; that byte used to be a constructor's
+// kind (GLUE_CTOR + variant 239), so an older entry is dropped rather than misread.
+const ENTRY_VERSION: u32 = 35;
 /// the level of a code entry's code (its tier byte)
 const TIER_O1: u8 = 0;
 const TIER_O3: u8 = 1;
@@ -2330,7 +2332,12 @@ impl Cache {
             }
             FnKey::Glue(g, t) => {
                 e.u8(KeyKind::Glue as u8);
-                e.u8(g);
+                if g < 0xFF {
+                    e.u8(g as u8);
+                } else {
+                    e.u8(0xFF);
+                    e.u32(g);
+                }
                 self.enc_ty(u, t, e, crates, 0)
             }
         }
@@ -7886,6 +7893,11 @@ mod data_tests {
         let owner_closures = cache.item_closures(&u, owner);
         assert_eq!(owner_closures.len(), 2);
         keys.extend(owner_closures.iter().map(|&expr| FnKey::Closure(owner_file, expr, owner_slot)));
+        // glue kinds: one byte below 0xFF, else the 0xFF escape and a u32 (constructors of variant
+        // 239 and past it); the image's skip_fnkey consumes the escape too (key_crates)
+        for g in [crate::jit::GLUE_DROP, 0xFE, 0xFF, crate::jit::GLUE_CTOR + 246, crate::jit::GLUE_CTOR + 70_000] {
+            keys.push(FnKey::Glue(g, callable));
+        }
         let mut encoded = Vec::new();
         for key in keys {
             let mut bytes = E::default();
@@ -8956,7 +8968,10 @@ impl Linker {
                 FnKey::Closure(file, expr, parent)
             }
             KeyKind::Glue => {
-                let g = d.u8()?;
+                let g = match d.u8()? {
+                    0xFF => d.u32()?,
+                    b => b as u32,
+                };
                 FnKey::Glue(g, self.cache().dec_ty(u, d, 0)?)
             }
             KeyKind::Shim => {

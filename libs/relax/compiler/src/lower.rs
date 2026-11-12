@@ -12982,9 +12982,9 @@ pub fn forward_func(u: &Unit, ps: &[TyId], ret: TyId, name: String, callee: u32)
     f
 }
 
-pub fn glue_func(u: &mut Unit, kind: u8, t: TyId) -> Func {
+pub fn glue_func(u: &mut Unit, kind: u32, t: TyId) -> Func {
     if kind >= crate::jit::GLUE_CTOR {
-        return ctor_fn(u, (kind - crate::jit::GLUE_CTOR) as u32, t);
+        return ctor_fn(u, kind - crate::jit::GLUE_CTOR, t);
     }
     if kind == crate::jit::GLUE_DROP
         && u.lay.is_unsized(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, t)
@@ -13046,7 +13046,7 @@ pub fn glue_func(u: &mut Unit, kind: u8, t: TyId) -> Func {
 
 /// `fn(fields..) -> Adt` building variant `vi` (tuple structs: 0) of the fn type's return ADT.
 fn ctor_fn(u: &mut Unit, vi: u32, t: TyId) -> Func {
-    let name = fn_name(u, &FnKey::Glue(crate::jit::GLUE_CTOR + vi as u8, t));
+    let name = fn_name(u, &FnKey::Glue(crate::jit::GLUE_CTOR + vi, t));
     let mut f = Func::new(name, 0);
     let b = f.block();
     let (ps, ret) = match u.tcx.tys.kind(t).clone() {
