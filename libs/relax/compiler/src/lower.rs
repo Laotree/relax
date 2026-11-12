@@ -13859,8 +13859,8 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
     // drop flags whose value is known where they are tested (a value moved out before a
     // suspension point: rustc's maybe-initialized analysis) -- the dead drop would keep the
     // value's slot saved across it
-    let cp = CoroFlags::new(f);
-    let (seen_g, known_g, inn_g) = cp.run(f, c, &[(0, None)]);
+    let cp = CoroFlags::new(f, c);
+    let (seen_g, known_g, inn_g) = cp.run(f, &[(0, None)]);
     for bi in 0..f.blocks.len() {
         if let (true, Some(t), Term::Branch(_, y, n)) = (seen_g[bi], known_g[bi], f.blocks[bi].term.clone()) {
             f.blocks[bi].term = Term::Jump(if t { y } else { n });
@@ -14350,36 +14350,51 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
             skill[bi * wd..(bi + 1) * wd].copy_from_slice(&k);
         }
     }
+    // the least fixpoint of live_in[b] = gen[b] | (union of its successors' live_in & !kill[b]) over
+    // the blocks `seen`, on a worklist: a block is queued at most once at a time, only blocks with
+    // something of their own start queued (the others stay empty until a successor's live-in
+    // grows), and a block whose live-in grows queues its predecessors again (lpreds: every edge, a
+    // superset under `known`). A reverse sweep of every block per change did not finish on a
+    // coroutine of ~180k blocks (relax PR #96)
     let exposed_from = |seen: &[bool], known: &[Option<bool>]| -> Vec<u64> {
         let mut live_in = vec![0u64; nb * wd];
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for bi in (0..nb).rev() {
-                if !seen[bi] {
-                    continue;
-                }
-                let mut out = vec![0u64; wd];
-                let mut succs: Vec<u32> = match (known[bi], &f.blocks[bi].term) {
-                    (Some(t), Term::Branch(_, y, n)) => vec![if t { *y } else { *n }],
-                    (_, t) => t.succs().into_iter().collect(),
-                };
-                for &(pend, resume, cancel) in &c.suspends {
-                    if pend as usize == bi {
-                        succs.push(resume);
-                        succs.push(cancel);
-                    }
-                }
-                for t in succs {
-                    for w in 0..wd {
-                        out[w] |= live_in[t as usize * wd + w];
-                    }
-                }
+        let mut in_work = vec![false; nb];
+        let mut work: Vec<u32> = Vec::new();
+        for bi in 0..nb {
+            if seen[bi] && sgen[bi * wd..(bi + 1) * wd].iter().any(|w| *w != 0) {
+                in_work[bi] = true;
+                work.push(bi as u32);
+            }
+        }
+        let mut out = vec![0u64; wd];
+        while let Some(b) = work.pop() {
+            let bi = b as usize;
+            in_work[bi] = false;
+            out.fill(0);
+            let mut gather = |t: u32| {
                 for w in 0..wd {
-                    let v = sgen[bi * wd + w] | (out[w] & !skill[bi * wd + w]);
-                    if v != live_in[bi * wd + w] {
-                        live_in[bi * wd + w] = v;
-                        changed = true;
+                    out[w] |= live_in[t as usize * wd + w];
+                }
+            };
+            match (known[bi], &f.blocks[bi].term) {
+                (Some(t), Term::Branch(_, y, n)) => gather(if t { *y } else { *n }),
+                (_, t) => t.succs().for_each(&mut gather),
+            }
+            susp_to[bi].iter().for_each(|&t| gather(t));
+            let mut grew = false;
+            for w in 0..wd {
+                let v = sgen[bi * wd + w] | (out[w] & !skill[bi * wd + w]);
+                if v != live_in[bi * wd + w] {
+                    live_in[bi * wd + w] = v;
+                    grew = true;
+                }
+            }
+            if grew {
+                for &p in &lpreds[bi] {
+                    let p = p as usize;
+                    if seen[p] && !in_work[p] {
+                        in_work[p] = true;
+                        work.push(p as u32);
                     }
                 }
             }
@@ -14415,7 +14430,7 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
         let mut sv = vec![0u64; wd];
         let mut own_addr = vec![false; ns];
         let st: Option<Vec<i64>> = if seen_g[pend as usize] && cp.nt > 0 { Some(inn_g[pend as usize * cp.nt..(pend as usize + 1) * cp.nt].to_vec()) } else { None };
-        let (seen_k, known_k, _) = cp.run(f, c, &[(resume, st.as_deref()), (cancel, st.as_deref())]);
+        let (seen_k, known_k, _) = cp.run(f, &[(resume, st.as_deref()), (cancel, st.as_deref())]);
         // the vregs live at its resume or cancel block in this point's view
         let mut live_rc = vec![0u64; (nv + 63) / 64];
         for &v in &cands[k] {
@@ -15205,14 +15220,21 @@ fn elaborate_drop_flags(f: &mut Func, flags: &[VReg]) {
 struct CoroFlags {
     idx: Vec<usize>,
     nt: usize,
+    /// per block, the resume and cancel blocks of the suspension points it is the Pending block of
+    susp_to: Vec<Vec<u32>>,
 }
 
 const CF_UNSEEN: i64 = i64::MIN;
 const CF_ANY: i64 = i64::MIN + 1;
 
 impl CoroFlags {
-    fn new(f: &Func) -> CoroFlags {
+    fn new(f: &Func, c: &Coro) -> CoroFlags {
         let nv = f.vregs.len();
+        let mut susp_to: Vec<Vec<u32>> = vec![Vec::new(); f.blocks.len()];
+        for &(pend, resume, cancel) in &c.suspends {
+            susp_to[pend as usize].push(resume);
+            susp_to[pend as usize].push(cancel);
+        }
         let mut flaglike = vec![true; nv];
         let (mut us, mut ds) = (Vec::new(), Vec::new());
         for b in &f.blocks {
@@ -15241,14 +15263,14 @@ impl CoroFlags {
         }
         if nt * f.blocks.len().max(1) > 1 << 24 {
             // too big to track: nothing is known
-            return CoroFlags { idx: vec![usize::MAX; nv], nt: 0 };
+            return CoroFlags { idx: vec![usize::MAX; nv], nt: 0, susp_to };
         }
-        CoroFlags { idx, nt }
+        CoroFlags { idx, nt, susp_to }
     }
 
     /// From `starts` (block, its state: a block's in-state from an earlier run, or all
     /// unknown): (blocks reached, decided branches, in-states).
-    fn run(&self, f: &Func, c: &Coro, starts: &[(u32, Option<&[i64]>)]) -> (Vec<bool>, Vec<Option<bool>>, Vec<i64>) {
+    fn run(&self, f: &Func, starts: &[(u32, Option<&[i64]>)]) -> (Vec<bool>, Vec<Option<bool>>, Vec<i64>) {
         let nb = f.blocks.len();
         let nt = self.nt;
         let idx = &self.idx;
@@ -15256,17 +15278,24 @@ impl CoroFlags {
         let mut seen = vec![false; nb];
         let mut known: Vec<Option<bool>> = vec![None; nb];
         let mut work = Vec::new();
+        // a block is on the work stack at most once (a bit per block: a scan of the stack never
+        // finished on a coroutine of ~180k blocks, relax PR #96)
+        let mut in_work = vec![false; nb];
         for (b, st) in starts {
             let b = *b as usize;
             seen[b] = true;
             for k in 0..nt {
                 inn[b * nt + k] = st.map_or(CF_ANY, |s| s[k]);
             }
-            work.push(b as u32);
+            if !in_work[b] {
+                in_work[b] = true;
+                work.push(b as u32);
+            }
         }
         let meet = |a: i64, b: i64| if a == CF_UNSEEN { b } else if b == CF_UNSEEN || a == b { a } else { CF_ANY };
         while let Some(bi) = work.pop() {
             let bi = bi as usize;
+            in_work[bi] = false;
             let mut st = inn[bi * nt..(bi + 1) * nt].to_vec();
             for i in &f.blocks[bi].insts {
                 if let Inst::Iconst(d, x) = i {
@@ -15286,12 +15315,7 @@ impl CoroFlags {
                     t.succs().into_iter().collect()
                 }
             };
-            for &(pend, resume, cancel) in &c.suspends {
-                if pend as usize == bi {
-                    succs.push(resume);
-                    succs.push(cancel);
-                }
-            }
+            succs.extend_from_slice(&self.susp_to[bi]);
             for sb in succs {
                 let sb = sb as usize;
                 let mut ch = !seen[sb];
@@ -15303,7 +15327,8 @@ impl CoroFlags {
                         ch = true;
                     }
                 }
-                if ch && !work.contains(&(sb as u32)) {
+                if ch && !in_work[sb] {
+                    in_work[sb] = true;
                     work.push(sb as u32);
                 }
             }
