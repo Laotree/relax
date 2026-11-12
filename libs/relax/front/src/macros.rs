@@ -1770,7 +1770,7 @@ impl MacroScope {
 
     /// `builtin_macro_path` of a lookup of its own (no walk in progress): the answer reads only
     /// the table, so each (crate, module, path) is walked once per table.
-    pub(crate) fn builtin_macro(&self, cur: &str, module: &str, path: &[String]) -> Option<String> {
+    pub fn builtin_macro(&self, cur: &str, module: &str, path: &[String]) -> Option<String> {
         let key = (cur.to_string(), module.to_string(), path.to_vec());
         if let Some((table, known)) = self.builtin_paths.borrow().as_ref() {
             if std::sync::Arc::ptr_eq(table, &self.table) {
