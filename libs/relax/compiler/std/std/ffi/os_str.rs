@@ -426,3 +426,21 @@ impl From<OsString> for alloc::rc::Rc<OsStr> {
         alloc::rc::Rc::from(&*s)
     }
 }
+
+/// `[S].join(&OsStr)` for `S: Borrow<OsStr>`: std's half of the slice `Join` impls (`[S].join(&str)`
+/// is alloc's). `ring`'s build.rs joins `Path` components with it.
+impl<S: Borrow<OsStr>> core::slice::Join<&OsStr> for [S] {
+    type Output = OsString;
+    fn join(slice: &[S], sep: &OsStr) -> OsString {
+        let mut out = OsString::new();
+        let mut i = 0;
+        while i < slice.len() {
+            if i > 0 {
+                out.push(sep);
+            }
+            out.push(slice[i].borrow());
+            i += 1;
+        }
+        out
+    }
+}
