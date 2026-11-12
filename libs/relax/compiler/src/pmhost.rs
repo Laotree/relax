@@ -264,6 +264,18 @@ pub fn world_alive() -> bool {
 }
 
 pub fn free_world() -> bool {
+    // A build in flight keeps the stage worlds until it is done: the final world's crates that use
+    // a stage's macros expand them there (world_for), and nothing else holds a stage. The load
+    // does not wait for every thread that can start a build (a demand plan's discovery runs a
+    // hosted item macro on its own thread): a warm load that parsed one file ended while that
+    // build went on, the stages went here, and every derive of the world's own crates failed
+    // ("a proc macro used while the macro world itself is being built": 85 errors of a check).
+    // The world stays for a later free.
+    let _building = match BUILDING.try_lock() {
+        Ok(held) => held,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return false,
+    };
     let bw: Vec<_> = {
         let mut g = BOOT_WORLDS.lock().unwrap_or_else(|e| e.into_inner());
         let (free, keep): (Vec<_>, Vec<_>) = g.drain(..).partition(|w| std::sync::Arc::strong_count(w) == 1);
