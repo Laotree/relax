@@ -148,6 +148,7 @@ pub fn run(core: &str) {
 /// NonZero<T> for one integer type (real core: nonzero_integer! / nonzero_integer_signedness_dependent_methods!).
 fn gen_nonzero(o: &mut String, t: &Int) {
     let n = t.name;
+    let u = t.unsigned;
     let min = if t.signed { format!("{}::MIN", n) } else { "1".to_string() };
     let _ = writeln!(o, "impl NonZero<{n}> {{");
     let _ = writeln!(o, "    pub const MIN: NonZero<{n}> = unsafe {{ NonZero::new_unchecked({min}) }};");
@@ -156,6 +157,10 @@ fn gen_nonzero(o: &mut String, t: &Int) {
     let _ = writeln!(o, "    pub const fn leading_zeros(self) -> u32 {{ self.get().leading_zeros() }}");
     let _ = writeln!(o, "    pub const fn trailing_zeros(self) -> u32 {{ self.get().trailing_zeros() }}");
     let _ = writeln!(o, "    pub const fn count_ones(self) -> NonZero<u32> {{ unsafe {{ NonZero::new_unchecked(self.get().count_ones()) }} }}");
+    let _ = writeln!(o, "    pub const fn isolate_highest_one(self) -> NonZero<{n}> {{ unsafe {{ NonZero::new_unchecked((((1 as {u}) << ({u}::BITS - 1)) >> self.leading_zeros()) as {n}) }} }}");
+    let _ = writeln!(o, "    pub const fn isolate_lowest_one(self) -> NonZero<{n}> {{ let v = self.get(); unsafe {{ NonZero::new_unchecked(v & v.wrapping_neg()) }} }}");
+    let _ = writeln!(o, "    pub const fn highest_one(self) -> u32 {{ {n}::BITS - 1 - self.leading_zeros() }}");
+    let _ = writeln!(o, "    pub const fn lowest_one(self) -> u32 {{ self.trailing_zeros() }}");
     let _ = writeln!(o, "    pub const fn checked_mul(self, other: NonZero<{n}>) -> Option<NonZero<{n}>> {{ match self.get().checked_mul(other.get()) {{ Some(v) => Some(unsafe {{ NonZero::new_unchecked(v) }}), None => None }} }}");
     let _ = writeln!(o, "    pub const fn saturating_mul(self, other: NonZero<{n}>) -> NonZero<{n}> {{ unsafe {{ NonZero::new_unchecked(self.get().saturating_mul(other.get())) }} }}");
     let _ = writeln!(o, "    pub const fn checked_pow(self, other: u32) -> Option<NonZero<{n}>> {{ match self.get().checked_pow(other) {{ Some(v) => Some(unsafe {{ NonZero::new_unchecked(v) }}), None => None }} }}");
@@ -169,7 +174,6 @@ fn gen_nonzero(o: &mut String, t: &Int) {
         let _ = writeln!(o, "    pub const fn is_power_of_two(self) -> bool {{ self.get().is_power_of_two() }}");
         let _ = writeln!(o, "    pub fn isqrt(self) -> NonZero<{n}> {{ unsafe {{ NonZero::new_unchecked(self.get().isqrt()) }} }}");
     } else {
-        let u = t.unsigned;
         let _ = writeln!(o, "    pub fn abs(self) -> NonZero<{n}> {{ unsafe {{ NonZero::new_unchecked(self.get().abs()) }} }}");
         let _ = writeln!(o, "    pub fn checked_abs(self) -> Option<NonZero<{n}>> {{ match self.get().checked_abs() {{ Some(v) => Some(unsafe {{ NonZero::new_unchecked(v) }}), None => None }} }}");
         let _ = writeln!(o, "    pub fn overflowing_abs(self) -> (NonZero<{n}>, bool) {{ let (v, f) = self.get().overflowing_abs(); (unsafe {{ NonZero::new_unchecked(v) }}, f) }}");
@@ -214,6 +218,16 @@ fn gen_int(o: &mut String, t: &Int) {
     let _ = writeln!(o, "    pub const fn trailing_zeros(self) -> u32 {{ unsafe {{ ii::cttz(self as {u}) }} }}");
     let _ = writeln!(o, "    pub const fn leading_ones(self) -> u32 {{ (!self).leading_zeros() }}");
     let _ = writeln!(o, "    pub const fn trailing_ones(self) -> u32 {{ (!self).trailing_zeros() }}");
+    // core 1.97: isolate_most_least_significant_one, int_lowest_highest_one
+    let _ = writeln!(o, "    pub const fn isolate_highest_one(self) -> {n} {{ self & (((1 as {n}) << ({n}::BITS - 1)).wrapping_shr(self.leading_zeros())) }}");
+    let _ = writeln!(o, "    pub const fn isolate_lowest_one(self) -> {n} {{ self & self.wrapping_neg() }}");
+    if t.signed {
+        let _ = writeln!(o, "    pub const fn highest_one(self) -> Option<u32> {{ (self as {u}).highest_one() }}");
+        let _ = writeln!(o, "    pub const fn lowest_one(self) -> Option<u32> {{ (self as {u}).lowest_one() }}");
+    } else {
+        let _ = writeln!(o, "    pub const fn highest_one(self) -> Option<u32> {{ if self == 0 {{ None }} else {{ Some({n}::BITS - 1 - self.leading_zeros()) }} }}");
+        let _ = writeln!(o, "    pub const fn lowest_one(self) -> Option<u32> {{ if self == 0 {{ None }} else {{ Some(self.trailing_zeros()) }} }}");
+    }
     let _ = writeln!(
         o,
         "    pub const fn rotate_left(self, n: u32) -> {n} {{ let k = n % {b}; if k == 0 {{ self }} else {{ (((self as {u}) << k) | ((self as {u}) >> ({b} - k))) as {n} }} }}"
