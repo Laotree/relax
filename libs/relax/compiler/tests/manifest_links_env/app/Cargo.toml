@@ -1,0 +1,6 @@
+[package]
+name = "mle-app"
+version = "0.1.0"
+edition = "2021"
+links = "mle_probe"
+build = "build.rs"

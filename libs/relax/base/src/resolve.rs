@@ -2093,6 +2093,11 @@ pub fn package_meta_env(dir: &str) -> Vec<(String, String)> {
         };
         out.push((env.to_string(), text));
     }
+    // cargo sets CARGO_MANIFEST_LINKS when the package declares `links`; build scripts such as
+    // prettyplease's read it with env::var and fail without it.
+    if let Some(Toml::Str(l, _)) = pkg.get("links") {
+        out.push(("CARGO_MANIFEST_LINKS".to_string(), l.clone()));
+    }
     out
 }
 
