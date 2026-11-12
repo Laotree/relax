@@ -1042,14 +1042,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         Ok(o) => {
             // the cause: the panic or error the script printed (Relax's report lines carry the
             // panic message as "message"), else its last lines
-            let err = String::from_utf8_lossy(&o.stderr);
-            let lines: Vec<&str> = err.lines().filter(|l| !l.trim().is_empty()).collect();
-            let cause = lines
-                .iter()
-                .find_map(|l| l.split("\"message\":\"").nth(1).and_then(|r| r.split("\",\"").next()))
-                .map(|m| m.to_string())
-                .or_else(|| lines.iter().find(|l| l.contains("panicked") || l.starts_with("error")).map(|l| l.to_string()))
-                .unwrap_or_else(|| lines.iter().rev().take(3).rev().cloned().collect::<Vec<_>>().join(" | "));
+            let cause = script_error_cause(&String::from_utf8_lossy(&o.stderr));
             {
                 #[cfg(unix)]
                 let signal = {
@@ -1068,6 +1061,33 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         }
         Err(e) => (Err(format!("{} (build script of {}): {}", exe.display(), name, e)), out_dir),
     }
+}
+
+/// The cause a failing build script's stderr gives. A panic's message comes first (Relax's report
+/// lines carry it as "message"); then the rustc-shaped `path:line:col: error` diagnostics, because
+/// the summary `error: could not compile ...: not started` names no cause; then the last lines.
+fn script_error_cause(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    // rustc prints `path:line:col: error[E0308]: …`; Relax prints `path:line:col: E0308: …`.
+    // The summary (`error: could not compile …: not started`) is a line of its own and names no
+    // cause, so it is not one of these.
+    let diagnostic = |l: &str| {
+        if l.contains(": error") || l.trim_start().starts_with("error[") {
+            return true;
+        }
+        match l.find(": E") {
+            Some(i) => l[i + 3..].chars().next().is_some_and(|c| c.is_ascii_digit()),
+            None => false,
+        }
+    };
+    let first: Vec<String> = lines.iter().copied().filter(|l| diagnostic(l)).take(3).map(str::to_string).collect();
+    lines
+        .iter()
+        .find_map(|l| l.split("\"message\":\"").nth(1).and_then(|r| r.split("\",\"").next()))
+        .map(|m| m.to_string())
+        .or_else(|| (!first.is_empty()).then(|| first.join(" | ")))
+        .or_else(|| lines.iter().find(|l| l.contains("panicked") || l.starts_with("error")).map(|l| l.to_string()))
+        .unwrap_or_else(|| lines.iter().rev().take(3).rev().cloned().collect::<Vec<_>>().join(" | "))
 }
 
 /// Why a stored rerun key no longer matches: the first differing line, and for the environment
@@ -1354,4 +1374,29 @@ pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     reset(&TO_REMOVE, Mutex::new(Vec::new()));
     reset(&SCRIPT_RUNNING, Mutex::new(0));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failing_build_script_reports_its_diagnostic_not_the_summary() {
+        // the shape a script's compile failure prints: the diagnostic first, the summary last
+        let stderr = "   Compiling build-script-build v0.1.0\n\
+/app/build.rs:1:22: E0308: mismatched types: expected `u32`, found `&str`\n\
+error: could not compile `build_script_build` due to 1 previous error: not started (`makepad run` checks the app's own crates whole before they run, as cargo builds them)\n";
+        assert_eq!(
+            script_error_cause(stderr),
+            "/app/build.rs:1:22: E0308: mismatched types: expected `u32`, found `&str`"
+        );
+    }
+
+    #[test]
+    fn a_panicking_build_script_reports_the_panic_message() {
+        assert_eq!(
+            script_error_cause("{\"message\":\"index out of bounds\",\"type\":\"panic\"}\n"),
+            "index out of bounds"
+        );
+    }
 }
