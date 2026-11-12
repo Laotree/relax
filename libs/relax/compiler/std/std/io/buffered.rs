@@ -171,6 +171,38 @@ impl<W> From<IntoInnerError<W>> for Error {
     }
 }
 
+/// The buffer `BufWriter::into_parts` could not pair with a successful flush, because the inner
+/// writer panicked. The bytes are what was still buffered; some of them may already have been
+/// written.
+pub struct WriterPanicked {
+    buf: Vec<u8>,
+}
+
+impl WriterPanicked {
+    pub fn into_inner(self) -> Vec<u8> {
+        self.buf
+    }
+
+    const DESCRIPTION: &'static str =
+        "BufWriter inner writer panicked, what data remains unwritten is not known";
+}
+
+impl fmt::Display for WriterPanicked {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(Self::DESCRIPTION)
+    }
+}
+
+impl fmt::Debug for WriterPanicked {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("WriterPanicked")
+            .field("buffer", &format_args!("{}/{}", self.buf.len(), self.buf.capacity()))
+            .finish()
+    }
+}
+
+impl core::error::Error for WriterPanicked {}
+
 impl<W: Write> BufWriter<W> {
     pub fn new(inner: W) -> BufWriter<W> {
         BufWriter::with_capacity(DEFAULT_BUF_SIZE, inner)
@@ -231,6 +263,15 @@ impl<W: Write> BufWriter<W> {
             Err(e) => Err(IntoInnerError(self, e)),
             Ok(()) => Ok(self.inner.take().unwrap()),
         }
+    }
+    /// The writer and the buffer, without flushing. `Err(WriterPanicked)` if the inner writer
+    /// panicked: the buffer is then what was still sitting here, and it is not known how much of
+    /// it the panicked write already took.
+    pub fn into_parts(mut self) -> (W, core::result::Result<Vec<u8>, WriterPanicked>) {
+        let buf = core::mem::take(&mut self.buf);
+        let buf = if !self.panicked { Ok(buf) } else { Err(WriterPanicked { buf }) };
+        let inner = self.inner.take().expect("BufWriter used after into_inner");
+        (inner, buf)
     }
 }
 

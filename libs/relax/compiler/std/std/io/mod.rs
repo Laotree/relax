@@ -9,7 +9,7 @@ mod cursor;
 mod error;
 mod stdio;
 
-pub use self::buffered::{BufReader, BufWriter, IntoInnerError, LineWriter};
+pub use self::buffered::{BufReader, BufWriter, IntoInnerError, LineWriter, WriterPanicked};
 pub use self::cursor::Cursor;
 mod pipe;
 pub use self::pipe::{pipe, PipeReader, PipeWriter};
