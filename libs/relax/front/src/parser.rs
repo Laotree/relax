@@ -157,6 +157,9 @@ pub struct Parser<'a> {
     next_scope: u32,
     /// (definition position, scope id) of the macro_rules! this file's written code defines
     rule_scopes: Vec<(u32, u32)>,
+    /// expansions of another crate's macro_rules!: (text lo, text hi, that crate), ascending
+    /// (`dollar_crate_of`)
+    foreign_rules: Vec<(u32, u32, String)>,
     /// token index -> expression of a `T::Interp` token
     interp: crate::fxhash::HashMap<u32, ExprId>,
     /// items generated after the last parsed item (derive expansions), for its container
@@ -234,6 +237,7 @@ impl<'a> Parser<'a> {
             rules_exp: Default::default(),
             body_origin: Default::default(),
             pm_editions: Default::default(),
+            foreign_rules: Vec::new(),
             tok_undo: Vec::new(),
             frag_groups: Default::default(),
             empty_vis: Default::default(),
@@ -1312,6 +1316,12 @@ impl<'a> Parser<'a> {
             invocation = call;
         }
         let scope_pos = (invocation != name.lo).then_some(invocation);
+        // (the macro is still this crate's: only its `$crate` is the other's, named here as a
+        // transcription names it)
+        let mt = match self.dollar_crate_of(name.lo) {
+            Some(krate) => crate::macros::name_dollar_crate(mt, krate),
+            None => mt,
+        };
         let scope = self.macros.as_mut().unwrap();
         scope.define_tokens(&n, &self.krate, edition, file, &def_mod, name.lo, scope_pos, exported, local_inner, &mt)
             .map_err(|msg| PErr { pos: name.lo, msg })?;
@@ -1319,6 +1329,36 @@ impl<'a> Parser<'a> {
             crate::macros::check_rules(d, edition).map_err(|msg| PErr { pos: name.lo, msg })?;
         }
         Ok(())
+    }
+
+    /// The crate `$crate` names in a `macro_rules!` that a proc macro wrote at `pos`, when it is
+    /// not this one. A proc macro's tokens are spanned at its call (rustc: `Span::call_site()`),
+    /// so a `$crate` it writes has the call's hygiene: called inside the expansion of another
+    /// crate's `macro_rules!`, it names that crate. proc-macro-hack rests on this: its exported
+    /// `macro_rules!` derives on an enum, the derive writes `macro_rules! proc_macro_call` with
+    /// the macro's output, and that output says `$crate::..` for the crate that exports the macro
+    /// (`unic_langid::langid!`: `$crate::subtags::Language`). A `macro_rules!` that a
+    /// `macro_rules!` expansion wrote itself has no `$crate` left to name (transcription named
+    /// it), or has the caller's own tokens: this crate's.
+    fn dollar_crate_of(&self, mut pos: u32) -> Option<&str> {
+        let src = self.src.len() as u32;
+        let mut called = false;
+        for _ in 0..64 {
+            if pos < src {
+                return None;
+            }
+            if self.rules_exp.floor(pos).is_some_and(|(_, r)| pos < r.1) {
+                if !called {
+                    return None;
+                }
+                let i = self.foreign_rules.partition_point(|r| r.0 <= pos);
+                return self.foreign_rules[..i].last().filter(|r| pos < r.1).map(|r| r.2.as_str());
+            }
+            // a proc macro's (or a built-in's) output: on to where it was called
+            pos = region_of(self.exp_map.view(), pos).filter(|&call| call < pos)?;
+            called = true;
+        }
+        None
     }
 
     /// rustc_expand `compile_declarative_macro`: the rules are `(matcher) => {body}` separated by
@@ -2056,6 +2096,9 @@ impl<'a> Parser<'a> {
         // the definition's edition (rustc ExpnData::edition); a built-in has none of its own
         let edition = if def.edition == 0 { self.edition } else { def.edition };
         self.rules_exp.push((base, base + text.len() as u32, def_pos, edition));
+        if def.builtin == 0 && !def.krate.is_empty() && def.krate != self.krate {
+            self.foreign_rules.push((base, base + text.len() as u32, def.krate.clone()));
+        }
         // a body token's position in the definition (same file only): its own context is the
         // parent of the expansion's mark (macros defined by macros)
         if same_file {
@@ -2232,7 +2275,7 @@ impl<'a> Parser<'a> {
             toks, pos, edition, ast, item_start, lazy_bodies, lazy_auto, lazy_part, lazy_mods, macros, krate,
             ext, exp_map, tok_origin, token_origins, token_input, exp_depth, rules_exp, body_origin,
             pm_editions, tok_undo, frag_groups, empty_vis, ty_frags, path_frags, meta_frags, block_frags, synth_parens,
-            mod_stack, scope_stack, no_prelude, range_dots, next_scope, rule_scopes, interp, extra_items,
+            mod_stack, scope_stack, no_prelude, range_dots, next_scope, rule_scopes, foreign_rules, interp, extra_items,
             extra_assoc_items, pending_inner, in_assoc, in_trait, stmt_ctx, cfg_select_rest,
             include_as_expr, foreign_abi, cfg_out, expansion_semi, list_elem_at, expn_attrs_ungated, pending_shape,
         } = self;
@@ -2241,7 +2284,7 @@ impl<'a> Parser<'a> {
         let frags = (sorted(frag_groups.iter().collect::<Vec<_>>()), sorted(ty_frags.iter().collect::<Vec<_>>()), sorted(path_frags.iter().collect::<Vec<_>>()),
             sorted(meta_frags.iter().collect::<Vec<_>>()), sorted(block_frags.iter().collect::<Vec<_>>()), sorted(synth_parens.iter().collect::<Vec<_>>()), sorted(empty_vis.iter().collect::<Vec<_>>()));
         let interp = sorted(interp.iter().map(|(k, e)| (*k, e.0)).collect::<Vec<_>>());
-        let tables = (ext.len(), exp_map.len(), tok_origin.len(), token_origins.len(), rules_exp.len(), body_origin.len(), pm_editions.len());
+        let tables = (ext.len(), exp_map.len(), tok_origin.len(), token_origins.len(), rules_exp.len(), body_origin.len(), pm_editions.len(), foreign_rules.len());
         let shapes: Vec<_> = pending_shape.iter().map(|(r, e)| (*r, e.as_ref().map(|e| (e.pos, e.msg.clone())))).collect();
         format!("toks {toks:?}\npos {pos} edition {edition} lazy {lazy_bodies} {lazy_auto} {lazy_part} {lazy_mods:?} macros {} krate {krate}\n\
             tables {tables:?} token_input {token_input} exp_depth {exp_depth} tok_undo {tok_undo:?} frags {frags:?} interp {interp:?}\n\

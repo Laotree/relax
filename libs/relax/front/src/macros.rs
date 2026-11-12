@@ -3966,6 +3966,28 @@ pub fn mtoks(p: &Parser, toks: &[Tok]) -> Vec<MTok> {
     definition_tokens(toks, |lo, hi| p.bytes(lo, hi))
 }
 
+/// A definition's tokens with each `$crate` named as crate `krate`, the way a transcription
+/// names it (`__relax_crate_<krate>`): for a `macro_rules!` whose `$crate` is not the crate that
+/// holds it (Parser::dollar_crate_of). `$$crate` stays: it writes a `$crate` for a later macro.
+pub(crate) fn name_dollar_crate(toks: Vec<MTok>, krate: &str) -> Vec<MTok> {
+    let mut out: Vec<MTok> = Vec::with_capacity(toks.len());
+    let mut escaped = false;
+    let mut i = 0;
+    while i < toks.len() {
+        let t = &toks[i];
+        if t.kind == T::Dollar && !escaped && toks.get(i + 1).is_some_and(|n| n.kind == T::KwCrate) {
+            out.push(MTok { kind: T::Ident, text: format!("__relax_crate_{krate}"), pos: t.pos });
+            i += 2;
+            continue;
+        }
+        // (`$$` is one escape: the `$` after it is the escaped one)
+        escaped = t.kind == T::Dollar && !escaped;
+        out.push(t.clone());
+        i += 1;
+    }
+    out
+}
+
 /// rustc_expand mbe/quoted.rs: parse_tree retains DocComment tokens in definitions.
 /// Recover the lexer trivia for both the prescan and the parser's definitions.
 pub(crate) fn definition_tokens<'a>(toks: &[Tok], bytes: impl Fn(u32, u32) -> &'a [u8]) -> Vec<MTok> {
@@ -3982,6 +4004,25 @@ pub(crate) fn definition_tokens<'a>(toks: &[Tok], bytes: impl Fn(u32, u32) -> &'
         prev = t.hi;
     }
     out
+}
+
+#[cfg(test)]
+mod dollar_crate_tests {
+    use super::*;
+
+    /// A `macro_rules!` a proc macro wrote inside another crate's expansion: its `$crate` is that
+    /// crate, named in the definition; an escaped `$$crate` and every other token stay.
+    #[test]
+    fn a_definitions_dollar_crate_is_named_as_a_transcription_names_it() {
+        let tok = |kind, text: &str| MTok { kind, text: text.to_string(), pos: 7 };
+        let toks = vec![
+            tok(T::Dollar, "$"), tok(T::KwCrate, "crate"), tok(T::PathSep, "::"), tok(T::Ident, "Language"),
+            tok(T::Dollar, "$"), tok(T::Dollar, "$"), tok(T::KwCrate, "crate"),
+            tok(T::Dollar, "$"), tok(T::Ident, "x"), tok(T::KwCrate, "crate"),
+        ];
+        let named: Vec<String> = name_dollar_crate(toks, "unic_langid_macros").into_iter().map(|t| t.text).collect();
+        assert_eq!(named, ["__relax_crate_unic_langid_macros", "::", "Language", "$", "$", "crate", "$", "x", "crate"]);
+    }
 }
 
 #[cfg(test)]
