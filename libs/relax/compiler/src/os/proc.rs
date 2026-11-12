@@ -11,6 +11,7 @@
 //! - `exit(code)`: ends the process once Relax is done with the program (see the Windows half).
 //! - `on_battery()`.
 //! - `symbol_at(pc)`: the nearest exported symbol of the image holding `pc` (dladdr's view).
+//! - `binary_id()`: the identity the linker gave the image holding this code.
 //! - `args_bytes()`: the process arguments as bytes (`set_args`: an embedder names them).
 //! - `create_private(path)`: a new file only this user can read (O_EXCL); `ensure_private_dir`:
 //!   a directory that is safe to load code from (owned by this user, not writable by others).
@@ -87,6 +88,124 @@ impl Drop for KeepLastError {
 /// what dladdr reports for a shared object (exported names only).
 pub fn symbol_at(pc: u64) -> Option<(String, u64, String)> {
     symbol_at_imp(pc)
+}
+
+/// The identity the linker gave the image holding this code (the `relax` or `makepad` executable,
+/// or the library the compiler is linked into), as hex: the Mach-O LC_UUID, the ELF GNU build-id
+/// note, the PE CodeView signature (GUID and age); an image without one: a hash of the executable
+/// file. It names the binary that was built, whatever the build scripts did: a stamp a build
+/// script computes from a list of source files stays as it was whenever cargo reuses the
+/// script's output, and two different binaries then print one id. Read from the image in memory,
+/// once (the file hash reads the executable).
+pub fn binary_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let here = binary_id as fn() -> &'static str as usize;
+        if let Some(id) = link_id(here).filter(|id| id.iter().any(|&b| b != 0)) {
+            return id.iter().map(|b| format!("{b:02x}")).collect();
+        }
+        match std::env::current_exe().and_then(std::fs::read) {
+            Ok(bytes) => format!("file-{}", &relax_base::sha256::sha256_hex(&bytes)[..32]),
+            Err(_) => "unknown".to_string(),
+        }
+    })
+}
+
+/// The linker's id of the image holding `addr` (binary_id).
+#[cfg(target_vendor = "apple")]
+fn link_id(addr: usize) -> Option<Vec<u8>> {
+    let mut info = DlInfo::default();
+    if unsafe { dladdr(addr as *const u8, &mut info) } == 0 || info.fbase.is_null() {
+        return None;
+    }
+    // SAFETY: dladdr's base is the image's mach_header_64, mapped with its load commands.
+    unsafe {
+        let h = info.fbase as *const u8;
+        let rd = |p: *const u8| std::ptr::read_unaligned(p as *const u32);
+        if rd(h) != 0xfeed_facf {
+            return None;
+        }
+        let mut c = h.add(32);
+        for _ in 0..rd(h.add(16)) {
+            // LC_UUID
+            if rd(c) == 0x1b {
+                return Some(std::slice::from_raw_parts(c.add(8), 16).to_vec());
+            }
+            c = c.add(rd(c.add(4)) as usize);
+        }
+    }
+    None
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn link_id(addr: usize) -> Option<Vec<u8>> {
+    let mut info = DlInfo::default();
+    if unsafe { dladdr(addr as *const u8, &mut info) } == 0 || info.fbase.is_null() {
+        return None;
+    }
+    // SAFETY: dladdr's base is where the image's first segment is mapped: the ELF header and its
+    // program headers; PT_NOTE segments are loaded.
+    unsafe {
+        let h = info.fbase as *const u8;
+        let r32 = |p: *const u8| std::ptr::read_unaligned(p as *const u32);
+        let r64 = |p: *const u8| std::ptr::read_unaligned(p as *const u64);
+        if std::slice::from_raw_parts(h, 5) != b"\x7fELF\x02" {
+            return None;
+        }
+        let (phoff, phentsize, phnum) = (r64(h.add(32)) as usize, std::ptr::read_unaligned(h.add(54) as *const u16) as usize, std::ptr::read_unaligned(h.add(56) as *const u16) as usize);
+        let ph = |i: usize| h.add(phoff + i * phentsize);
+        // the load bias: the base less the address of the segment that maps the file's start
+        let start = (0..phnum).map(ph).find(|&p| r32(p) == 1 && r64(p.add(8)) == 0).map(|p| r64(p.add(16)))?;
+        let bias = (h as u64).wrapping_sub(start);
+        let align = |n: u32| (n as usize + 3) & !3;
+        for p in (0..phnum).map(ph).filter(|&p| r32(p) == 4) {
+            let mut n = bias.wrapping_add(r64(p.add(16))) as *const u8;
+            let end = n.add(r64(p.add(32)) as usize);
+            while n.add(12) <= end {
+                let (namesz, descsz, kind) = (r32(n), r32(n.add(4)), r32(n.add(8)));
+                let desc = n.add(12 + align(namesz));
+                // NT_GNU_BUILD_ID
+                if kind == 3 && namesz == 4 && std::slice::from_raw_parts(n.add(12), 4) == b"GNU\0" {
+                    return Some(std::slice::from_raw_parts(desc, descsz as usize).to_vec());
+                }
+                n = desc.add(align(descsz));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn link_id(addr: usize) -> Option<Vec<u8>> {
+    use crate::os::win32::*;
+    // FROM_ADDRESS | UNCHANGED_REFCOUNT
+    let mut module: HANDLE = 0;
+    if unsafe { GetModuleHandleExW(0x4 | 0x2, addr as *const u16, &mut module) } == 0 || module == 0 {
+        return None;
+    }
+    let base = module as usize as *const u8;
+    // SAFETY: a loaded module's headers and debug directory are mapped readable for its life.
+    unsafe {
+        let rd32 = |off: usize| std::ptr::read_unaligned(base.add(off) as *const u32) as usize;
+        let rd16 = |off: usize| std::ptr::read_unaligned(base.add(off) as *const u16) as usize;
+        if rd16(0) != 0x5a4d {
+            return None;
+        }
+        let pe = rd32(0x3c);
+        if rd32(pe) != 0x4550 || rd16(pe + 24) != 0x20b {
+            return None; // not PE32+
+        }
+        // optional header (PE32+) at pe+24; data directory 6 (debug) at +112+48; 28-byte entries
+        let (dir, size) = (rd32(pe + 24 + 160), rd32(pe + 24 + 164));
+        for e in (0..size / 28).map(|k| dir + k * 28) {
+            // IMAGE_DEBUG_TYPE_CODEVIEW, an RSDS record: GUID and age
+            let data = rd32(e + 20);
+            if rd32(e + 12) == 2 && data != 0 && rd32(data) == 0x5344_5352 {
+                return Some(std::slice::from_raw_parts(base.add(data + 4), 20).to_vec());
+            }
+        }
+    }
+    None
 }
 
 /// dladdr's answer (`Dl_info`). The process's one declaration of dladdr: the profiler and the

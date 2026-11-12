@@ -48,9 +48,9 @@ pub mod remote;
 /// built into it and hosts HAL programs on the main thread; the `relax` binary adds nothing (no
 /// host), so every crate of a program, the HAL and Splash included, is JIT-compiled from source.
 pub struct Host {
-    /// what this binary was built from (its build.rs; the linked compiler's own stamp is
-    /// relax_compiler::PROVENANCE)
-    pub provenance: &'static str,
+    /// what the `makepad` loader was built from (tools/run/build.rs), for its `--version`; None:
+    /// the bare runner, whose `--version` names its binary by the linker's id (binary_id)
+    pub provenance: Option<&'static str>,
     /// once, before anything else (the compute crate's kernel store)
     pub init: fn(),
     /// before a session is made: registers the provided crates and the main-thread run host
@@ -77,7 +77,7 @@ pub struct Host {
 
 /// The bare runner (bin `relax`): provides nothing; tests, checks and agents' boots compile only
 /// what runs.
-pub const BARE: Host = Host { provenance: env!("RELAX_RUNNER_PROVENANCE"), init: || {}, provide: || {}, run_host: || {}, ahead: relax_compiler::options::AheadLevel::Minimal, proc_macros: relax_compiler::pmhost::Policy::Open, default_launch: None, package: env!("CARGO_PKG_NAME"), manifest: concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml") };
+pub const BARE: Host = Host { provenance: None, init: || {}, provide: || {}, run_host: || {}, ahead: relax_compiler::options::AheadLevel::Minimal, proc_macros: relax_compiler::pmhost::Policy::Open, default_launch: None, package: env!("CARGO_PKG_NAME"), manifest: concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml") };
 
 static HOST: std::sync::OnceLock<&'static Host> = std::sync::OnceLock::new();
 
@@ -280,11 +280,11 @@ fn run(raw_args: Vec<Vec<u8>>) {
     let args: Vec<String> = raw_args.iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
     if args.get(1).map(String::as_str) == Some("--version") {
         if help::bare() {
-            // the stamps read `makepad <host> jit <relax>`: the source tree's name, then the hashes
-            let ids = |p: &'static str| p.strip_prefix("makepad ").unwrap_or(p);
-            println!("{tool} {} (experimental): runs a Rust crate from source through the Relax JIT (build {}, compiler {})", env!("CARGO_PKG_VERSION"), ids(host().provenance), ids(relax_compiler::PROVENANCE), tool = relax_compiler::tool_name());
+            // build: the linker's id of this binary, so two binaries never print one id;
+            // compiler: the codegen identity, the key of every stored build (codegen_id.rs)
+            println!("{tool} {} (experimental): runs a Rust crate from source through the Relax JIT (build {}, compiler {:032x})", env!("CARGO_PKG_VERSION"), relax_compiler::os::proc::binary_id(), relax_compiler::codegen_id::id(), tool = relax_compiler::tool_name());
         } else {
-            println!("{tool} {} (compiler: {})", host().provenance, relax_compiler::PROVENANCE, tool = relax_compiler::tool_name());
+            println!("{tool} {} (compiler: {})", host().provenance.unwrap_or(relax_compiler::os::proc::binary_id()), relax_compiler::PROVENANCE, tool = relax_compiler::tool_name());
         }
         return;
     }
