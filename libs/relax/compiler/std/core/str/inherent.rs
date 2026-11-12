@@ -16,6 +16,20 @@ impl str {
         let p = crate::boxed::Box::into_raw(self) as *mut u8;
         unsafe { crate::boxed::Box::from_raw(crate::ptr::slice_from_raw_parts_mut(p, len)) }
     }
+    // `str::from_utf8` and its kin (inherent since Rust 1.87; time-macros 0.2.32's
+    // format_description lexer calls `str::from_utf8_unchecked`)
+    pub const fn from_utf8(v: &[u8]) -> Result<&str, Utf8Error> {
+        super::from_utf8(v)
+    }
+    pub const fn from_utf8_mut(v: &mut [u8]) -> Result<&mut str, Utf8Error> {
+        super::from_utf8_mut(v)
+    }
+    pub const unsafe fn from_utf8_unchecked(v: &[u8]) -> &str {
+        unsafe { super::from_utf8_unchecked(v) }
+    }
+    pub const unsafe fn from_utf8_unchecked_mut(v: &mut [u8]) -> &mut str {
+        unsafe { super::from_utf8_unchecked_mut(v) }
+    }
     #[rustc_no_implicit_autorefs]
     pub const fn len(&self) -> usize {
         unsafe { crate::intrinsics_mem::slice_len(crate::intrinsics_mem::str_as_bytes(self)) }
