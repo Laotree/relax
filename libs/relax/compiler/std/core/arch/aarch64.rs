@@ -3428,6 +3428,96 @@ pub fn vrecpsq_f32(a: float32x4_t, b: float32x4_t) -> float32x4_t {
     float32x4_t(r)
 }
 
+/// FRSQRTE on one f32: Arm's FPRSqrtEstimate under the FPCR every OS sets (round to nearest, no
+/// flush to zero, NaNs kept): an 8-bit estimate of 1/sqrt(x) from the exponent's parity and the
+/// top bits of x's fraction. A zero comes back as the infinity of its sign, a negative number as
+/// the default NaN, an infinity as zero.
+fn neon_rsqrte_f32(x: f32) -> f32 {
+    let bits = x.to_bits();
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let frac = bits & 0x7f_ffff;
+    if exp == 0xff && frac != 0 {
+        return f32::from_bits(bits | 0x40_0000);
+    }
+    if bits & 0x7fff_ffff == 0 {
+        return f32::from_bits(bits | 0x7f80_0000);
+    }
+    if bits & 0x8000_0000 != 0 {
+        return f32::from_bits(0x7fc0_0000);
+    }
+    if exp == 0xff {
+        return 0.0;
+    }
+    // the fraction as the pseudocode's 52 bits; a subnormal is normalised, its exponent below 0
+    const F52: u64 = (1 << 52) - 1;
+    let mut e = exp;
+    let mut f = (frac as u64) << 29;
+    if e == 0 {
+        while f & (1 << 51) == 0 {
+            f = (f << 1) & F52;
+            e -= 1;
+        }
+        f = (f << 1) & F52;
+    }
+    // x scaled into [0.25, 1) by an even power of two, in 1/512 steps: 128..512
+    let scaled = if e & 1 == 0 { 256 | (f >> 44) as u32 } else { 128 | (f >> 45) as u32 };
+    // RecipSqrtEstimate: `a` the scaled value at its midpoint (1/1024 below 0.5, 1/512 above),
+    // b the largest number with a * b^2 < 2^28 (b < 2^14 / sqrt(a)), at least 512, and the
+    // estimate (b + 1) / 2 in 256..512; the pseudocode finds b by counting up from 512
+    let a = if scaled < 256 { scaled * 2 + 1 } else { ((scaled >> 1) << 1) * 2 + 2 };
+    let b = (((1u32 << 28) - 1) / a).isqrt().max(512);
+    let estimate = (b + 1) / 2;
+    let result_exp = (380 - e) / 2;
+    f32::from_bits(((result_exp as u32) << 23) | ((estimate & 0xff) << 15))
+}
+
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vrsqrte_f32(a: float32x2_t) -> float32x2_t {
+    float32x2_t([neon_rsqrte_f32(a.0[0]), neon_rsqrte_f32(a.0[1])])
+}
+
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vrsqrteq_f32(a: float32x4_t) -> float32x4_t {
+    let mut r = [0.0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = neon_rsqrte_f32(a.0[i]);
+        i += 1;
+    }
+    float32x4_t(r)
+}
+
+/// FRSQRTS on one f32 pair: Arm's FPRSqrtStepFused, (3 - a * b) / 2 rounded once (the Newton
+/// step that refines FRSQRTE's estimate); an infinity times a zero is 1.5. A NaN comes back as
+/// FMSUB's does. With a halved first (exact for one above the smallest exponents) the fused step
+/// rounds the halved value itself, so a product near the top of the range does not overflow
+/// before the halving; below those exponents a * b is under 8 and the halving after is exact.
+fn neon_rsqrts_f32(a: f32, b: f32) -> f32 {
+    if (a.is_infinite() && b == 0.0) || (a == 0.0 && b.is_infinite()) {
+        return 1.5;
+    }
+    if !a.is_nan() && !b.is_nan() && a.abs() >= f32::from_bits(0x0100_0000) {
+        return (-(a * 0.5)).mul_add(b, 1.5);
+    }
+    (-a).mul_add(b, 3.0) * 0.5
+}
+
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vrsqrts_f32(a: float32x2_t, b: float32x2_t) -> float32x2_t {
+    float32x2_t([neon_rsqrts_f32(a.0[0], b.0[0]), neon_rsqrts_f32(a.0[1], b.0[1])])
+}
+
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vrsqrtsq_f32(a: float32x4_t, b: float32x4_t) -> float32x4_t {
+    let mut r = [0.0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = neon_rsqrts_f32(a.0[i], b.0[i]);
+        i += 1;
+    }
+    float32x4_t(r)
+}
+
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vrndmq_f32(a: float32x4_t) -> float32x4_t {
     let mut r = [0.0; 4];
