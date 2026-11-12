@@ -124,8 +124,9 @@ watch, etc.) keep their one-shot behavior and do not implicitly connect. Explici
 
 ## Validation
 
-Run `./run.sh /absolute/path/to/makepad` (without one, from the workspace root: makepad's host
-build; devhub's CI runs it as `live:check-server`). The Python socket client creates an isolated copy
+Run `./run.sh /absolute/path/to/relax` with the `relax` binary (or makepad's, which runs the
+same commands). Without one, it builds makepad's host binary, which only a makepad checkout has:
+run it from that workspace root, as devhub's CI does (`live:check-server`). The Python socket client creates an isolated copy
 of the adjacent fixture, sets both Relax and Cargo offline, and retains logs and sources
 under the printed temporary directory. It compares diagnostic lines and summary fields
 with one-shot output, normalizing only milliseconds, and prints warm check/edit timings.

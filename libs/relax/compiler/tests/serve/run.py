@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Loopback protocol and CLI integration. Fixture copies and logs survive for inspection.
-run.py [/path/to/makepad] (without one, from the workspace root: makepad's host build)."""
+run.py [/path/to/relax] (the relax binary, or makepad's; without one, from a makepad checkout's
+workspace root: makepad's host build)."""
 import concurrent.futures, json, os, pathlib, shutil, signal, socket, subprocess, sys, tempfile, time
 if len(sys.argv) > 1:
     relax = pathlib.Path(sys.argv[1]).resolve()
