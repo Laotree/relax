@@ -151,6 +151,15 @@ impl<T> *const [T] {
     pub const fn as_ptr(self) -> *const T {
         self as *const T
     }
+    /// A raw pointer to the underlying array, `None` when the length is not exactly `N` (stable
+    /// since 1.93).
+    pub const fn as_array<const N: usize>(self) -> Option<*const [T; N]> {
+        if self.len() == N {
+            Some(self.as_ptr() as *const [T; N])
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(not(relax_check))]
@@ -314,6 +323,15 @@ impl<T> *mut [T] {
     }
     pub const fn as_mut_ptr(self) -> *mut T {
         self as *mut T
+    }
+    /// A raw, mutable pointer to the underlying array, `None` when the length is not exactly `N`
+    /// (stable since 1.93).
+    pub const fn as_mut_array<const N: usize>(self) -> Option<*mut [T; N]> {
+        if self.len() == N {
+            Some(self.as_mut_ptr() as *mut [T; N])
+        } else {
+            None
+        }
     }
 }
 
