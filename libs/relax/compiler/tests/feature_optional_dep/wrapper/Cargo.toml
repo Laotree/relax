@@ -1,0 +1,14 @@
+[package]
+name = "wrapper"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+extra = { path = "../extra", optional = true }
+
+[features]
+# `dep:` hides the implicit feature; `fast` asks for `extra/boost`, which cargo reads as
+# "enable the feature `extra`" (the explicit one above) *and* "enable `boost` on the crate".
+extra = ["dep:extra"]
+fast = ["extra/boost"]

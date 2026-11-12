@@ -1638,8 +1638,9 @@ fn feature_requests(features: &BTreeMap<String, Vec<String>>, implicit: &BTreeSe
 }
 
 /// Package-local feature closure for target selection, without resolving or fetching dependencies.
-/// Dependency features are not local features; a strong `dep/feature` can enable an implicit
-/// optional-dependency feature, while `dep:dep` and `dep?/feature` cannot.
+/// Dependency features are not local features; a strong `dep/feature` can enable the package's
+/// feature of that name (implicit, or explicit even under `dep:`), while `dep:dep` and
+/// `dep?/feature` cannot.
 fn enabled_features(features: &BTreeMap<String, Vec<String>>, implicit: &BTreeSet<String>, o: &Options) -> Result<BTreeSet<String>, String> {
     let mut enabled = BTreeSet::new();
     let mut work = feature_requests(features, implicit, o);
@@ -1656,7 +1657,10 @@ fn enabled_features(features: &BTreeMap<String, Vec<String>>, implicit: &BTreeSe
                     return Err(format!("has no feature `{f}`"));
                 }
             }
-            Req::DepFeature(d, _, false) if implicit.contains(&d) => work.push(Req::Feature(d)),
+            // `x/f` (strong) enables the package's feature `x` when it has one: an implicit
+            // optional-dependency feature, or an explicit feature of that name even when
+            // `dep:x` hides the implicit one. `x?/f` enables neither.
+            Req::DepFeature(d, _, false) if implicit.contains(&d) || features.contains_key(&d) => work.push(Req::Feature(d)),
             _ => {}
         }
     }
@@ -1962,7 +1966,13 @@ impl<'a> Feat<'a> {
                         return Err(format!("package `{}`: feature value `{}/{}` names no dependency", mname, d, f));
                     }
                     if !weak && opt {
-                        if !syntax {
+                        // Cargo's strong `x/f`: the dependency is activated, and the package's
+                        // feature `x` is enabled when it has one. An explicit feature of that
+                        // name counts even when `dep:x` hides the implicit one (num-rational's
+                        // `num-bigint-std = ["num-bigint/std"]` with `num-bigint = ["dep:num-bigint"]`:
+                        // cargo enables the feature `num-bigint`, so `cfg(feature = "num-bigint")`
+                        // holds for the crate that gates items on it).
+                        if !syntax || m.features.contains_key(&d) {
                             self.work.push((k, Req::Feature(d.clone())));
                         }
                         self.switch_dep(k, &d)?;
@@ -2647,6 +2657,27 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
 #[cfg(test)]
 mod root_tests {
     use super::*;
+
+    #[test]
+    fn a_strong_dependency_feature_enables_an_explicit_feature_of_that_name() {
+        // num-rational: `num-bigint = ["dep:num-bigint"]` hides the implicit feature, and
+        // `num-bigint-std = ["num-bigint/std"]` still enables the *feature* `num-bigint` (cargo
+        // does: `cargo tree -e features` lists `num-rational feature "num-bigint"` under it), so
+        // `cfg(feature = "num-bigint")` holds for the crate that gates `BigRational` on it.
+        let manifest = parse_toml(r#"
+[dependencies]
+extra = { version = "1", optional = true }
+[features]
+extra = ["dep:extra"]
+fast = ["extra/boost"]
+"#).unwrap().root;
+        let definitions = table(&manifest, "features").unwrap();
+        let features = definitions.keys().map(|k| (k.clone(), strs(definitions, k))).collect();
+        let implicit = BTreeSet::new();
+        let flags: Vec<String> = ["--features", "fast"].iter().map(|f| f.to_string()).collect();
+        let enabled = enabled_features(&features, &implicit, &parse_flags(&flags).unwrap()).unwrap();
+        assert!(enabled.contains("extra"), "a strong `extra/boost` enables the explicit feature `extra`: {enabled:?}");
+    }
 
     #[test]
     fn required_features_follow_package_feature_flags() {
