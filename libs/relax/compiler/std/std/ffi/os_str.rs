@@ -207,6 +207,24 @@ impl ToOwned for OsStr {
     }
 }
 
+// std ffi/os_str.rs: `[S]::join` with an OsStr separator (a `Vec<&OsStr>` of path components
+// joined with "/", as ring's build script does)
+impl<S: Borrow<OsStr>> core::slice::Join<&OsStr> for [S] {
+    type Output = OsString;
+
+    fn join(slice: &Self, sep: &OsStr) -> OsString {
+        let Some((first, suffix)) = slice.split_first() else {
+            return OsString::new();
+        };
+        let first_owned = first.borrow().to_owned();
+        suffix.iter().fold(first_owned, |mut a, b| {
+            a.push(sep);
+            a.push(b.borrow());
+            a
+        })
+    }
+}
+
 impl AsRef<OsStr> for OsStr {
     fn as_ref(&self) -> &OsStr {
         self
