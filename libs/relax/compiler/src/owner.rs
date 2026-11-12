@@ -142,6 +142,9 @@ struct Req {
     yielded: Cell<Option<crate::jit::Yielded>>,
     /// the class of the requester: a job it waits for runs at that (`waiter_class`)
     waiter_class: u8,
+    /// the requester holds a front read (a background check asking for a constant): a front
+    /// write made for this request would wait for that read (`serving_reader`)
+    reader: bool,
     /// main-thread request accounting (0: not a main-thread request): wall ns at the push, and at
     /// the owner's completion
     t_push: u64,
@@ -1092,6 +1095,7 @@ fn request_dyn(site: &'static std::panic::Location<'static>, class: Class, deadl
         yields: yields && !on_main,
         yielded: Cell::new(None),
         waiter_class: thread_class(),
+        reader: crate::jit::front_reads_held() > 0,
         t_push: if class == Class::Program && on_main { crate::jit::wall_ns().max(1) } else { 0 },
         t_main: if main_after { crate::jit::wall_ns().max(1) } else { 0 },
         t_serve: AtomicU64::new(0),
@@ -1233,6 +1237,7 @@ pub fn post_queued(class: Class, f: impl FnOnce() + Send + 'static) {
         yields: false,
         yielded: Cell::new(None),
         waiter_class: makepad_cpu_budget::INTERACTIVE,
+        reader: false,
         t_push: 0,
         t_main: 0,
         t_serve: AtomicU64::new(0),
@@ -1770,6 +1775,12 @@ fn stack_blocked() -> ! {
 /// its callees' back ends, 2026-11-04.)
 pub fn may_yield() -> bool {
     is_owner() && !nested() && program_waiting() && with_serving(|r| r.yields).unwrap_or(false)
+}
+
+/// The owner serves a request whose requester holds a front read: a front write for it would
+/// wait for that read, and the read for this request.
+pub(crate) fn serving_reader() -> bool {
+    is_owner() && with_serving(|r| r.reader).unwrap_or(false)
 }
 
 /// `f` on the request the owner serves now (None: none).

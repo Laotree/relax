@@ -14701,8 +14701,40 @@ pub unsafe fn load_deferred(up: *mut Unit, id: u32) -> bool {
     if mods.is_empty() {
         return false;
     }
+    // served for a thread that holds a front read (the background coherence check asking for an
+    // impl header's array length): the load's front write would wait for that read, which waits
+    // for this request, and neither ever went on (relax issue 33: every later lazy compile and
+    // live edit waited behind them). The request ends as NeedsLoad instead; its requester loads
+    // these once its read has ended (`load_wanted`) and asks again.
+    if owner::serving_reader() {
+        let mut wanted = LOAD_WANTED.lock().unwrap_or_else(|e| e.into_inner());
+        for m in mods {
+            if !wanted.contains(&m) { crate::zone_alloc::kept_with(|| wanted.push(m)); }
+        }
+        drop(wanted);
+        std::panic::resume_unwind(Box::new(crate::preempt::NeedsLoad));
+    }
     load_modules(up, &mods, "demand");
     true
+}
+
+/// Skipped modules a front reader's request needed (`load_deferred`): it loads them once its
+/// read has ended (`load_wanted`).
+static LOAD_WANTED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Loads the skipped modules a front reader's request needed (the caller holds no front read),
+/// and names them. Each was skipped when its request ended, and a load takes it off the skipped
+/// list (also when it fails to load; DEFERRED_LOADS counts it): a reader that asks again cannot
+/// end the same way for the same module.
+pub(crate) unsafe fn load_wanted(up: *mut Unit) -> Vec<String> {
+    debug_assert_eq!(front_reads_held(), 0, "load_wanted under a front read");
+    owner::call(owner::Class::Program, || {
+        let mods = std::mem::take(&mut *LOAD_WANTED.lock().unwrap_or_else(|e| e.into_inner()));
+        let u = &*up;
+        let names = mods.iter().map(|&m| u.prog.def_path(u.prog.mods[m as usize].def)).collect();
+        load_modules(up, &mods, "wanted");
+        names
+    })
 }
 
 /// Loads skipped modules into the running program (unit lock held at depth 1).
@@ -27602,6 +27634,7 @@ pub fn start_background_coherence(u: &Unit) {
         }
     }
     let front = u.front.clone();
+    let up = u.self_ptr.0 as usize;
     { let _k = crate::zone_alloc::kept();
     let _ = crate::run_threads::spawn("run-coherence", move || { let _z = crate::zone_alloc::compiler_thread();
         let _mem = crate::memstat::tag(crate::memstat::Tag::Borrowck);
@@ -27611,6 +27644,7 @@ pub fn start_background_coherence(u: &Unit) {
         }
         let mut orphan_done = false;
         let emitted = crate::infer::diagnostics::DiagCtxt::thread_emitted();
+        let mut loads_seen = DEFERRED_LOADS.load(Ordering::Relaxed);
         loop {
             if SPEC_STOP.load(Ordering::SeqCst) || crate::preempt::is_stopped() || crate::run_threads::ending() { return; }
             let r = {
@@ -27639,6 +27673,21 @@ pub fn start_background_coherence(u: &Unit) {
                     return;
                 }
                 Err(p) if crate::preempt::is_preempted(&*p) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                // a constant it asked for needs a module the file selection skipped, which the
+                // owner does not load while this check holds its read (load_deferred): loaded now
+                // that the read has ended, and the check runs again. Each round takes a module
+                // off the skipped list; one after which none came off would only repeat itself:
+                // the check ends unfinished, says so, and stores no verdict (the next run checks)
+                Err(p) if p.is::<crate::preempt::NeedsLoad>() => {
+                    let wanted = unsafe { load_wanted(up as *mut Unit) };
+                    let loads = DEFERRED_LOADS.load(Ordering::Relaxed);
+                    if loads == loads_seen {
+                        let what = if wanted.is_empty() { "no module was named".to_string() } else { format!("wanted: {}", wanted.join(", ")) };
+                        eprintln!("makepad-run coherence: could not finish, the impls are not checked: a constant they need is in a skipped module that did not load ({what})");
+                        return;
+                    }
+                    loads_seen = loads;
+                }
                 Err(p) => {
                     let m = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
                     eprintln!("makepad-run coherence: checker failure (makepad run bug, please report): {}", m);

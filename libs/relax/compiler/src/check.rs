@@ -293,6 +293,10 @@ impl BodyCheck {
                 Err(p) if retry(&*p) => {
                     tries += usize::from(!beside || p.is::<crate::preempt::NeedsLoad>());
                     drop(r);
+                    // a constant it asked for needs a skipped module, which the owner does not
+                    // load for a request made under a front read (jit::load_deferred): loaded
+                    // now that the read has ended
+                    if beside && p.is::<crate::preempt::NeedsLoad>() { unsafe { jit::load_wanted(self.upn as *mut Unit) }; }
                     if beside {
                         // (a queued check's CPU permit goes back while the writer runs)
                         let _wait = crate::pool::suspend();
