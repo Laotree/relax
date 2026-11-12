@@ -4318,7 +4318,9 @@ impl Program {
                 tdef = self.lookup_in_scope(module, last, true);
                 vdef = if self.imports[i].bound & BOUND_SELF_ONLY != 0 { None } else { self.lookup_in_scope(module, last, false) };
             }
-        } else if segs.len() == 1 && last_kind != SegKind::Ident {
+        } else if last_kind != SegKind::Ident {
+            // a path that ends in a keyword names a module: `use super as p;`, `use crate as c;`,
+            // `use super::super as a;`, `use self::super::{self as b};`
             let m = match self.resolve_mod_path(module, global, &segs, edition < 2018, true) {
                 Some(m) => m,
                 None => return false,
@@ -4893,11 +4895,16 @@ impl Program {
     pub fn resolve_mod_path(&self, module: u32, global: bool, segs: &[(SegKind, Sym)], from_root: bool, in_use: bool) -> Option<DefId> {
         let krate = self.mods[module as usize].krate;
         let mut cur: Option<DefId> = None;
+        // rustc_resolve ident.rs resolve_path_with_ribs: `super` follows only `self` and other
+        // `super`s (`::super`, `crate::super` and `a::super` fail)
+        let mut allow_super = !global;
         for (i, (kind, name)) in segs.iter().enumerate() {
+            allow_super &= matches!(kind, SegKind::SelfValue | SegKind::Super);
             let next = if i == 0 {
                 match kind {
                     SegKind::Crate => Some(self.mods[self.crates[krate as usize].root_mod as usize].def),
                     SegKind::SelfValue => Some(self.mods[self.mods[module as usize].normal as usize].def),
+                    SegKind::Super if !allow_super => return None,
                     SegKind::Super => {
                         let n = self.mods[module as usize].normal;
                         let p = self.mods[n as usize].parent_mod?;
@@ -4938,7 +4945,7 @@ impl Program {
                 match kind {
                     SegKind::Super => {
                         let d = self.def(c);
-                        if d.kind != DefKind::Mod {
+                        if !allow_super || d.kind != DefKind::Mod {
                             return None;
                         }
                         let p = self.mods[d.sub as usize].parent_mod?;
