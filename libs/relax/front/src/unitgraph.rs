@@ -1045,16 +1045,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
             (Ok(stdout), out_dir)
         }
         Ok(o) => {
-            // the cause: the panic or error the script printed (Relax's report lines carry the
-            // panic message as "message"), else its last lines
-            let err = String::from_utf8_lossy(&o.stderr);
-            let lines: Vec<&str> = err.lines().filter(|l| !l.trim().is_empty()).collect();
-            let cause = lines
-                .iter()
-                .find_map(|l| l.split("\"message\":\"").nth(1).and_then(|r| r.split("\",\"").next()))
-                .map(|m| m.to_string())
-                .or_else(|| lines.iter().find(|l| l.contains("panicked") || l.starts_with("error")).map(|l| l.to_string()))
-                .unwrap_or_else(|| lines.iter().rev().take(3).rev().cloned().collect::<Vec<_>>().join(" | "));
+            let cause = script_error_cause(&String::from_utf8_lossy(&o.stderr));
             {
                 #[cfg(unix)]
                 let signal = {
@@ -1073,6 +1064,44 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         }
         Err(e) => (Err(format!("{} (build script of {}): {}", exe.display(), name, e)), out_dir),
     }
+}
+
+/// The cause a failing build script's stderr gives: the panic it printed (Relax's report lines
+/// carry the message as "message"), else the first errors its compile reported, else the first
+/// line that says it panicked or failed, else its last lines. A script that does not compile ends
+/// with `error: could not compile ..: not started`, which names no cause: its diagnostics come
+/// before it, in Relax's `path:line:col: E0308: ..` or rustc's `error[E0308]: ..` shape.
+fn script_error_cause(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    let is_error = |l: &str| match located_message(l) {
+        Some(m) => !["warning", "note", "help"].iter().any(|k| m.starts_with(k)),
+        None => l.starts_with("error[") || (l.starts_with("error:") && !l.starts_with("error: could not compile")),
+    };
+    let errors: Vec<&str> = lines.iter().copied().filter(|l| is_error(l)).take(3).collect();
+    lines
+        .iter()
+        .find_map(|l| l.split("\"message\":\"").nth(1).and_then(|r| r.split("\",\"").next()))
+        .map(|m| m.to_string())
+        .or_else(|| (!errors.is_empty()).then(|| errors.join(" | ")))
+        .or_else(|| lines.iter().find(|l| l.contains("panicked") || l.starts_with("error")).map(|l| l.to_string()))
+        .unwrap_or_else(|| lines.iter().rev().take(3).rev().cloned().collect::<Vec<_>>().join(" | "))
+}
+
+/// The message of a `path:line:col: message` line (Relax's diagnostics), None for another line.
+fn located_message(l: &str) -> Option<&str> {
+    let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let mut from = 0;
+    while let Some(i) = l[from..].find(": ") {
+        let at = from + i;
+        let mut head = l[..at].rsplitn(3, ':');
+        if let (Some(col), Some(line), Some(path)) = (head.next(), head.next(), head.next()) {
+            if number(col) && number(line) && !path.is_empty() {
+                return Some(&l[at + 2..]);
+            }
+        }
+        from = at + 2;
+    }
+    None
 }
 
 /// Why a stored rerun key no longer matches: the first differing line, and for the environment
@@ -1307,6 +1336,21 @@ fn platform_answer(sess: &std::sync::Arc<crate::Session>, out_dir: &str) -> Resu
         }
     }
     Ok(lines)
+}
+
+#[cfg(test)]
+mod script_error_tests {
+    /// The cause a failing build script names, by what its stderr holds (relax PR 59).
+    #[test]
+    fn a_failing_scripts_cause_is_what_it_printed_first() {
+        let summary = "error: could not compile `build_script_build` due to 1 previous error: not started (`makepad run` checks the app's own crates whole before they run, as cargo builds them)";
+        let relax = format!("/app/build.rs:2:9: warning: unused variable: `unused` [unused_variables]\n/app/build.rs:3:21: E0308: mismatched types: expected `u8`, found `&str`\n{summary}\n");
+        assert_eq!(super::script_error_cause(&relax), "/app/build.rs:3:21: E0308: mismatched types: expected `u8`, found `&str`", "a compile failure names its error, not a warning or the summary");
+        let rustc = "error[E0308]: mismatched types\n --> build.rs:3:21\n  |\nerror: could not compile `app` (build script) due to 1 previous error\n";
+        assert_eq!(super::script_error_cause(rustc), "error[E0308]: mismatched types", "rustc's own diagnostic shape");
+        assert_eq!(super::script_error_cause(&format!("{{\"message\":\"index out of bounds\",\"type\":\"panic\"}}\n{summary}\n")), "index out of bounds", "a panic's message");
+        assert_eq!(super::script_error_cause("one\ntwo\nthree\nfour\n"), "two | three | four", "else its last lines");
+    }
 }
 
 #[cfg(test)]
