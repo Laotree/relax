@@ -2,9 +2,11 @@
 // Each lane is widened to u16 before the add. The largest sum is 16 * 255 = 4080, which fits in
 // u16, so the accumulator does not wrap. Of the aarch64 intrinsics str_indices 0.4.4 calls, this
 // pair was the one Relax lacked; Red's buffer tests
-// (https://github.com/codersauce/red) use that crate. On an aarch64 machine this agrees with
-// rustc's std::arch. Elsewhere the intrinsics are not in rustc's std, so the file compiles empty.
-#![cfg(target_arch = "aarch64")]
+// (https://github.com/codersauce/red) use that crate.
+//
+// Relax's std provides the scalar loops on every host, so `relax test` runs this here. rustc's
+// std only has the intrinsics when the target is aarch64, and the two agree there.
+#![cfg(any(relax, target_arch = "aarch64"))]
 use std::arch::aarch64::*;
 
 #[test]
