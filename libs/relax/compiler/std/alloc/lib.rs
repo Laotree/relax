@@ -35,8 +35,8 @@ pub mod ffi {
 pub mod fmt {
     pub use core::fmt::format;
     pub use core::fmt::{
-        write, Alignment, Arguments, Binary, Debug, DebugList, DebugMap, DebugSet, DebugStruct, DebugTuple, Display, Error,
-        Formatter, LowerExp, LowerHex, Octal, Pointer, Result, UpperExp, UpperHex, Write,
+        from_fn, write, Alignment, Arguments, Binary, Debug, DebugList, DebugMap, DebugSet, DebugStruct, DebugTuple, Display,
+        Error, Formatter, FromFn, LowerExp, LowerHex, Octal, Pointer, Result, UpperExp, UpperHex, Write,
     };
 }
 

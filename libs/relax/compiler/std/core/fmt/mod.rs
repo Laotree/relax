@@ -642,6 +642,26 @@ pub trait UpperExp: crate::marker::PointeeSized {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result;
 }
 
+/// A value whose Debug and Display call `f` with the formatter (real core's `fmt::from_fn`).
+pub fn from_fn<F: Fn(&mut Formatter<'_>) -> Result>(f: F) -> FromFn<F> {
+    FromFn(f)
+}
+
+/// What `from_fn` returns. As in real core: no bound on the struct, Debug and Display only.
+pub struct FromFn<F>(F);
+
+impl<F: Fn(&mut Formatter<'_>) -> Result> Debug for FromFn<F> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        (self.0)(f)
+    }
+}
+
+impl<F: Fn(&mut Formatter<'_>) -> Result> Display for FromFn<F> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        (self.0)(f)
+    }
+}
+
 // References forward to the referent.
 impl<'a, T: crate::marker::PointeeSized + Debug> Debug for &'a T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
