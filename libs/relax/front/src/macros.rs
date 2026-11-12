@@ -306,6 +306,26 @@ impl CrateMods {
             m = parent;
         }
     }
+
+    /// Rank an in-scope binding by its nearest containing scope and the position
+    /// where it entered that scope. File-module definitions acquire the position
+    /// of the exporting `mod`, not an offset in the child file. Unknown generated
+    /// modules keep the resolver's existing precedence instead.
+    pub(crate) fn textual_binding_key(&self, d: &MacroDef, from: &str) -> Option<(usize, Vec<u32>)> {
+        if d.def_mod.is_empty() { return None; }
+        let mut module = d.def_mod.as_str();
+        let mut positions = vec![d.scope_pos.unwrap_or(d.def_pos)];
+        loop {
+            if from == module || from.strip_prefix(module).is_some_and(|rest| rest.starts_with("::")) {
+                // Two macros exported through the same module have the same
+                // outer position. Break ties by their order inside that module.
+                positions.reverse();
+                return Some((module.split("::").count(), positions));
+            }
+            positions.push(self.items.get(module)?.end);
+            module = module.rsplit_once("::")?.0;
+        }
+    }
 }
 
 /// A crate's module scopes resolved once (rustc_resolve's import fixpoint, for the macro and
