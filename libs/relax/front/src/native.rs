@@ -16,9 +16,10 @@
 //! which the run loads by path before the program starts.
 //!
 //! The cargo step and the link are cached under `<relax dir>/native/<key>/`: the key covers the
-//! cargo flags, the resolved packages of the native closure (versions, features, sources; a path
-//! package's files), the C compiler and the target -- not the package the run is for, so two
-//! packages whose native closure is the same share one build. A run with an unchanged key starts
+//! cargo flags, the resolved packages of the native closure (versions, features, sources; each
+//! path package's files, a workspace build-dependency's too), the C compiler and the target --
+//! not the package the run is for, so two packages whose native closure is the same share one
+//! build, nor what the resolution says outside that closure. A run with an unchanged key starts
 //! no cargo. The scripts' OUT_DIRs live in cargo's target for the selection
 //! (`native/cargo-target/<selection>`), which builds under other keys share: the receipt notes
 //! each script run cargo's `output` file stood for, and a later run of the script under another
@@ -255,6 +256,19 @@ fn resolved_packages_key<'a>(raw: impl IntoIterator<Item = &'a crate::unitgraph:
     fnv(format!("{packages:?}").as_bytes(), 0xcbf29ce484222325)
 }
 
+/// The directories of the path packages among the units of the closure `names` (sorted, each
+/// once), but `natives` (hashed with the native packages): their files are what cargo compiles.
+/// Registry, git and sysroot units are left out (RawUnit::path_source).
+fn closure_path_dirs(raw: &[crate::unitgraph::RawUnit], names: &[String], natives: &[&str]) -> Vec<String> {
+    let mut dirs: Vec<String> = raw.iter()
+        .filter(|u| u.path_source && names.binary_search(&u.pkg.1).is_ok() && !natives.contains(&u.pkg.0.as_str()))
+        .map(|u| u.pkg.0.clone())
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
 fn cc() -> String {
     std::env::var("CC").ok().filter(|c| !c.is_empty()).unwrap_or_else(|| "cc".to_string())
 }
@@ -365,6 +379,12 @@ fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
         if !registry {
             hash_dir(std::path::Path::new(&dir), &mut h);
         }
+    }
+    // and the closure's other path packages, by their files: a workspace crate the native scripts
+    // build-depend on is compiled into them (a registry or git package is its id, above)
+    let native_dirs: Vec<&str> = seeds.iter().map(|&s| g.pkg[g.build_scripts[s].krate].0.as_str()).collect();
+    for dir in closure_path_dirs(&g.raw, &script_pkgs, &native_dirs) {
+        hash_dir(std::path::Path::new(&dir), &mut h);
     }
     names.sort();
     names.dedup();
@@ -1480,7 +1500,7 @@ fn script_selection_follows_every_unit_of_a_package() {
     let unit = |name: &str, deps: &[usize]| crate::unitgraph::RawUnit {
         name: name.to_string(), src_path: String::new(), edition: 2021, features: Vec::new(), proc_macro: false,
         deps: deps.iter().map(|&d| (d, String::new())).collect(), run_script: false,
-        pkg: (String::new(), name.to_string(), "1.0.0".to_string()),
+        pkg: (String::new(), name.to_string(), "1.0.0".to_string()), path_source: false,
     };
     let raw = [unit("a", &[1]), unit("b", &[]), unit("a", &[3]), unit("c", &[]), unit("d", &[])];
     assert_eq!(dependency_packages(&raw, vec![0]), ["a", "b", "c"]);
@@ -1498,7 +1518,7 @@ fn native_key_uses_sorted_resolved_packages() {
         name: name.into(), src_path: String::new(), edition: 2021,
         features: features.iter().map(|f| f.to_string()).collect(), proc_macro: false,
         deps: Vec::new(), run_script: false,
-        pkg: (format!("packages/{name}"), name.into(), version.into()),
+        pkg: (format!("packages/{name}"), name.into(), version.into()), path_source: false,
     };
     let a = unit("a", "1.0.0", &["fast", "std"]);
     let b = unit("b", "2.0.0", &[]);
@@ -1513,6 +1533,61 @@ fn native_key_uses_sorted_resolved_packages() {
     other_source.pkg.0 = "other/a".into();
     assert_ne!(key, resolved_packages_key(&[other_source, b]),
         "a resolved source change must invalidate native artifacts");
+}
+
+/// The native key follows Relax's resolution of the native closure, features included, and the
+/// files of its path packages: never the package a run is for, nor what lies outside the closure
+/// (relax PR 115: a runner update whose resolver moves, but not the closure, keeps the build).
+#[cfg(test)]
+#[test]
+fn native_key_follows_the_resolved_closure_and_its_path_sources() {
+    let dir = std::env::temp_dir().join(format!("relax-native-key-{}", std::process::id()));
+    let ws = dir.join("ws");
+    for (rel, text) in [("n/build.rs", "fn main() {}\n"), ("h/src/lib.rs", "pub const LEVEL: u8 = 1;\n")] {
+        let p = ws.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+    let at = |rel: &str| ws.join(rel).display().to_string();
+    let unit = |name: &str, dir: String, features: &[&str], deps: &[usize], path_source: bool| crate::unitgraph::RawUnit {
+        name: name.into(), src_path: String::new(), edition: 2021, features: features.iter().map(|f| f.to_string()).collect(),
+        proc_macro: false, deps: deps.iter().map(|&d| (d, String::new())).collect(), run_script: false,
+        pkg: (dir, name.into(), "1.0.0".into()), path_source,
+    };
+    // the package a run is for (`root`), the native package n (its lib, and its script, which
+    // build-depends on the workspace crate h and the registry crate cc), and x outside the closure
+    let graph = |root: &str, n_features: &[&str], x_features: &[&str]| Graph {
+        crates: vec![crate::crates::CrateUnit { name: "n".into(), src_path: at("n/src/lib.rs"), edition: 2021, features: Vec::new(), deps: Vec::new(),
+            host: None, proc_macro: false, bin: false, harness: false, build_script: false, version: "1.0.0".into(), registry: false }],
+        root: 0,
+        build_scripts: vec![BuildScript { krate: 0, also: Vec::new(), src_path: at("n/build.rs"), edition: 2021,
+            features: n_features.iter().map(|f| f.to_string()).collect(), build_deps: vec![(3, "h".into()), (4, "cc".into())], links_deps: Vec::new() }],
+        pkg: vec![(at("n"), "n".into(), "1.0.0".into())],
+        cfgs: vec![Vec::new()],
+        env: vec![Vec::new()],
+        link_libs: Vec::new(),
+        native: None,
+        raw: vec![
+            unit(root, at(root), &[], &[1, 5], true),
+            unit("n", at("n"), n_features, &[], true),
+            unit("n", at("n"), n_features, &[3, 4], true),
+            unit("h", at("h"), &[], &[], true),
+            unit("cc", "registry/cc-1.0.0".into(), &["parallel"], &[], false),
+            unit("x", "registry/x-1.0.0".into(), x_features, &[], false),
+        ],
+        bins: Vec::new(),
+    };
+    let flags: Vec<String> = Vec::new();
+    let relax_dir = dir.join("relax");
+    let req = Request { workspace: ws.to_str().unwrap(), package: "app", cargo_flags: &flags, relax_dir: relax_dir.to_str().unwrap(), triple: "x86_64-unknown-linux-gnu", resolvable: |names, _, _, _| vec![false; names.len()] };
+    let key = |g: &Graph| plan(g, &[0], &req).key;
+    let k = key(&graph("app", &["std"], &["a"]));
+    assert_eq!(k, key(&graph("second", &["std"], &["a"])), "another package with the same native closure must share the build");
+    assert_eq!(k, key(&graph("app", &["std"], &["a", "b"])), "a resolution that moves outside the native closure (a runner update's resolver) must keep the build");
+    assert_ne!(k, key(&graph("app", &["std", "static"], &["a"])), "the closure's resolved features must be in the key");
+    std::fs::write(ws.join("h/src/lib.rs"), "pub const LEVEL: u8 = 2;\n").unwrap();
+    assert_ne!(k, key(&graph("app", &["std"], &["a"])), "a path build-dependency's source must be in the key");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(test)]
