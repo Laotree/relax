@@ -444,3 +444,16 @@ impl From<OsString> for alloc::rc::Rc<OsStr> {
         alloc::rc::Rc::from(&*s)
     }
 }
+
+impl<'a, 'b> PartialEq<&'b OsStr> for Cow<'a, OsStr> {
+    fn eq(&self, other: &&'b OsStr) -> bool { &**self == *other }
+}
+impl<'a> PartialEq<OsStr> for Cow<'a, OsStr> {
+    fn eq(&self, other: &OsStr) -> bool { &**self == other }
+}
+impl<'a, 'b> PartialEq<Cow<'a, OsStr>> for &'b OsStr {
+    fn eq(&self, other: &Cow<'a, OsStr>) -> bool { *self == &**other }
+}
+impl<'a> PartialEq<Cow<'a, OsStr>> for OsStr {
+    fn eq(&self, other: &Cow<'a, OsStr>) -> bool { self == &**other }
+}

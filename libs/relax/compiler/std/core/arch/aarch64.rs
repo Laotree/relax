@@ -5869,3 +5869,27 @@ neon_test_bits! { "neon":
     vtst_p16 poly16x4_t uint16x4_t; vtstq_p16 poly16x8_t uint16x8_t; vtst_p64 poly64x1_t uint64x1_t;
     vtstq_p64 poly64x2_t uint64x2_t;
 }
+
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vaddlvq_u8(a: uint8x16_t) -> u16 {
+    let mut s = 0u16;
+    let mut i = 0;
+    while i < 16 {
+        s = s.wrapping_add(a.0[i] as u16);
+        i += 1;
+    }
+    s
+}
+
+/// An estimate of `1.0 / x`; an exact division meets the intrinsic's contract and is at
+/// least as accurate as the hardware estimate.
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vrecpeq_f32(a: float32x4_t) -> float32x4_t {
+    float32x4_t([1.0 / a.0[0], 1.0 / a.0[1], 1.0 / a.0[2], 1.0 / a.0[3]])
+}
+
+/// The reciprocal step `2.0 - a * b` per lane, the refinement that follows `vrecpeq_f32`.
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vrecpsq_f32(a: float32x4_t, b: float32x4_t) -> float32x4_t {
+    float32x4_t([2.0 - a.0[0] * b.0[0], 2.0 - a.0[1] * b.0[1], 2.0 - a.0[2] * b.0[2], 2.0 - a.0[3] * b.0[3]])
+}
