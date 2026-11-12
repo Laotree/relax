@@ -511,6 +511,9 @@ noscript p{padding:14px 20px;background:#2a1c08;color:#ffe2a8;text-align:center}
   .dt i{transform:scaleX(var(--s))!important}
   .step{opacity:1}
 }
+.fact .use{display:flex;flex-wrap:wrap;gap:6px 8px;margin-top:12px}
+.fact .use code{font-size:.8rem;color:var(--text)}
+#try pre.tree{font-size:.82rem;color:var(--text)}
 
 /* language switch: top bar and footer, every width */
 .lang{display:inline-flex;align-items:center;gap:6px;min-height:44px;padding:0 12px;border:1px solid var(--line);border-radius:10px;color:var(--text);font-size:.86rem;font-weight:600;text-decoration:none;white-space:nowrap;transition:border-color .2s,color .2s}
@@ -600,20 +603,10 @@ code.nw{white-space:nowrap}
 <h1>Rust，告别等待。</h1>
 <p><b>rustc：先构建，再运行。Relax：边构建，边运行。</b></p>
 <ul>
-<li><b>11 s</b> 大型 3D 游戏：在 M4 MacBook 上从全新检出到首帧，直接跑源码
-<li><b>1.15 s</b> 同一个游戏再次运行到首帧：什么都不用重新编译
+<li><b>11 s</b> 大型 3D 游戏：从全新检出到首帧（M4 MacBook）
+<li><b>1.15 s</b> 同一个游戏再次运行：什么都不用重新编译
 <li><b>2.2 s</b> 从保存文件到 92 个测试重跑完毕
 <li><b>0</b> 个 crates.io 依赖，共 438k 行 Rust 代码
-</ul>
-<h2><a name="plain-tldr">太长不看</a></h2>
-<p>Rust 的速度与安全，不必再等编译。</p>
-<ul>
-<li><b>是什么</b>：一个 Rust 实时编译器与 JIT 运行时，直接从源码运行 Cargo 包。不要 rustc，不要 LLVM，不要链接器。
-<li><b>启动</b>：在 M4 MacBook 上，一个大型 3D 游戏从全新检出到出首帧只要 <b>11 s</b>，而 rustc 光是构建就得先花 ~3 min。第二次运行只要 <b>1.15 s</b>。
-<li><b>改动</b>：保存文件，改过的函数就被热补丁进运行中的程序，状态不丢。<b>92 个测试 2.2 s 重跑完。</b>
-<li><b>速度</b>：优化后的代码仍然比 rustc <code>--release</code> 慢。本周一次范围更广的测试，结果比我们之前公布的数字更慢，我们正在重新测量；详见 <a href="#plain-gaps">LLVM 仍然领先的地方</a>。
-<li><b>体积</b>：就一个 Rust 库：<b>438k 行代码，0 个 crates.io 依赖。</b>
-<li><b>平台</b>：为 x86-64 和 AArch64 生成机器码。从全新克隆开始，本仓库在 Linux x86-64 和 macOS arm64 上都能构建，测试全部通过；Windows 还没有在这里测试过。
 </ul>
 <h2><a name="plain-race">Relax 对决 rustc</a></h2>
 <table border="1" cellpadding="4" cellspacing="0">
@@ -622,13 +615,47 @@ code.nw{white-space:nowrap}
 <tr valign="top"><td>同一个游戏，再次运行 → 首帧</td><td>启动已经构建好的二进制</td><td><b>1.15 s</b> M4 MacBook，什么都不用重新编译</td></tr>
 <tr valign="top"><td>小应用，冷启动 → 首帧</td><td>得先构建</td><td><b>3.7 s</b> 冷启动；热启动只要 0.41 s（M4 MacBook）</td></tr>
 <tr valign="top"><td>保存文件 → 92 个测试重跑</td><td>得先重新构建测试二进制</td><td><b>2.2 s</b> 从保存那一刻算起</td></tr>
-<tr valign="top"><td>改动运行中程序里的一个函数</td><td>重新构建、重新链接、重启：程序状态全丢</td><td>热补丁进正在运行的进程</td></tr>
-<tr valign="top"><td>优化后代码的速度</td><td>基准 1.00×（LLVM，针对本机 CPU 的 <code>--release</code>）</td><td><b>更慢</b>：在我们最常剖析的负载上耗时为其 1.14–1.26 倍，密集数值循环上为 2.3 倍（尚未做向量化）；正在重新测量（<a href="#plain-gaps">详情</a>）</td></tr>
-<tr valign="top"><td>运行前完成类型检查和借用检查</td><td>是</td><td><b>是</b></td></tr>
-<tr valign="top"><td>需要什么</td><td>rustc、LLVM、链接器</td><td><b>Relax</b>，一个 Rust 库（438k 行，0 个 crates.io 依赖）</td></tr>
+<tr valign="top"><td>改动运行中程序里的一个函数</td><td>重新构建、重新链接、重启：状态全丢</td><td>热补丁进正在运行的进程</td></tr>
+<tr valign="top"><td>类型检查与借用检查</td><td><code>cargo check</code>；构建时先检查全部代码</td><td><b><code>relax check</code></b>；运行时每个函数先做类型检查再运行，借用检查在后台进行</td></tr>
+<tr valign="top"><td>优化后的代码</td><td>基准 1.00×（<code>--release</code>，本机 CPU）</td><td>耗时为其 <b>1.14–1.26 倍</b>，密集数值循环上为 2.3 倍（<a href="#plain-tradeoffs">取舍</a>）</td></tr>
+<tr valign="top"><td>需要什么</td><td>rustc、LLVM、链接器</td><td><b>一个 Rust 库</b>：438k 行，0 个 crates.io 依赖</td></tr>
 </table>
+<h2><a name="plain-tradeoffs">JIT 的代价。</a></h2>
+<ul>
+<li><b>优化后的代码更慢</b>：耗时是针对本机 CPU 的 <code>--release</code> 的 1.14–1.26 倍，密集数值循环上是 2.3 倍（还不做向量化）。<a href="#plain-gaps">详情</a>
+<li><b>占用更多内存</b>：编译器、它的缓存和所有已发布的代码都与你的程序同处一个进程；JIT 代码只增不减。见 <code>relax inspect &lt;pid&gt; memory</code>。
+<li><b>检查还不比 cargo 快</b>：在大型包上，冷启动的 <code>relax check</code> 比 <code>cargo check</code> 更慢、占用更多内存，一次编辑也可能重新检查超出需要的部分。我们正在改进。
+<li><b>有些改动需要重启</b>：函数体的改动实时打补丁。结构体布局、导入、trait 或 impl 头、宏的改动要等 <code>relax inspect &lt;pid&gt; session relaunch</code>。
+<li><b>借用检查在后台</b>：每个函数先做类型检查再运行；借用检查与程序并行，除非加上 <code>--check-first</code>。
+<li><b>已知缺口</b>：还不是每个 crate 都能跑：<a href="https://github.com/makepad/relax/blob/main/libs/relax/KNOWN_GAPS.md">KNOWN_GAPS.md</a> 逐项列出，每项附复现。
+<li><b>不能替代发布构建</b>：Relax 用于编辑—运行循环。发布时请用 <code>cargo build --release</code> 构建的产物。
+</ul>
+<h2><a name="plain-benefits">JIT 带给你的。</a></h2>
+<p><code>relax run</code> 会打印 <code>relax-remote: pid &lt;pid&gt;</code>。下面除 <code>run</code> 和 <code>test</code> 外的命令都发给 <code>relax inspect &lt;pid&gt;</code>，由运行中的程序回答。</p>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr valign="top"><td>热补丁，状态保留</td><td>保存文件，改过的函数就被重新检查、重新编译，并热替换进运行中的程序。调用到编译不过的代码时，调用会等你修好。</td><td><code>relax run &lt;package&gt;</code></td></tr>
+<tr valign="top"><td>保存即测</td><td>测试保持预热，只重跑进入过你所改函数的那些。</td><td><code>relax test --live &lt;package&gt;</code></td></tr>
+<tr valign="top"><td>panic 时暂停</td><td>panic 的线程停住，栈保持完整（终端里 10 分钟，无人值守 2 s）。读它的局部变量、在它的栈帧里求值 Rust，然后让它展开，或重跑一个 <code>restartable</code> 函数。</td><td><code>panics</code>、<code>locals panic=P1</code>、<code>eval &lt;expr&gt;</code>、<code>resume P1 panic</code></td></tr>
+<tr valign="top"><td>断点，不用调试器</td><td>命中时线程停在调用处，栈保持完整。</td><td><code>break &lt;file&gt;:&lt;line&gt;</code>、<code>locals break=K1</code>、<code>continue</code></td></tr>
+<tr valign="top"><td>卡死，讲清原因</td><td>死锁、阻塞、忙碌还是空闲：结论、等待链和相关线程的栈。</td><td><code>why-hung</code></td></tr>
+<tr valign="top"><td>性能剖析</td><td>对 JIT 帧和原生帧采样：每个线程的 CPU、最热的函数及其最热的一行、带层级的调用树、火焰图用的栈。</td><td><code>prof s=3</code>、<code>prof view=tree</code>、<code>why-slow</code></td></tr>
+<tr valign="top"><td>飞行记录器</td><td>始终开启，内存有上限：最近几分钟的线程、等待、编译和事件。遇到 panic、故障或超过 1 s 的卡顿时自动保存。</td><td><code>rec save</code></td></tr>
+<tr valign="top"><td>内存与泄漏</td><td>按类型划分的 RSS、malloc 在用与空闲持有的部分、Relax 自己的占用；按分配栈统计的程序堆，两次快照之间给出疑似泄漏。堆跟踪目前只支持 Linux x86-64 和 macOS arm64。</td><td><code>memory</code>、<code>heap start</code>、<code>heap snap a</code>、<code>heap diff a now</code></td></tr>
+</table>
+<p>只有你改过的函数会被重新检查、重新编译，然后<b>热替换进正在运行的程序，状态全都保留。</b></p>
+<h2><a name="plain-try">构建它，跑一个包。</a></h2>
+<pre>git clone https://github.com/makepad/relax
+cargo build --release --manifest-path relax/Cargo.toml -p relax-runner --bin relax
+
+cargo new hello
+cd hello
+../relax/target/release/relax run --quiet hello    # 在 JIT 下运行 main
+../relax/target/release/relax test hello           # 运行它的 #[test] 函数
+../relax/target/release/relax check hello          # 只做类型检查和借用检查</pre>
+<p>在包的目录里运行 <code>relax</code>，参数给包名；别移动 <code>relax</code> 的检出目录，std 从那里读取。在一台 16 核 x86-64 Linux 机器上构建用了 53 s；<code>hello</code> 随后 0.24 s 启动，之后不到 0.1 s。已在 Linux x86-64 和 macOS arm64 上测试。</p>
+<p>没有依赖的包不需要联网；crates.io 依赖取自 <code>~/.cargo</code>，或下载后按索引的 SHA-256 校验。更多见 <a href="https://github.com/makepad/relax#readme">README</a>。</p>
 <h2><a name="plain-toolchain">一套全新的 Rust 工具链，从源码字节到机器码。</a></h2>
-<p>Relax 不是 rustc 的套壳，也不是 LLVM 的插件。<b>它把两者都换掉了</b>，连同 Cargo 和链接器里夹在源码与运行中程序之间的那部分，全部装进一个零依赖的 Rust 库。</p>
+<p>Relax 不是 rustc 的套壳，也不是 LLVM 的插件：<b>它把两者都换掉了</b>，连同 Cargo 和链接器夹在中间的那部分。</p>
 <table border="1" cellpadding="4" cellspacing="0">
 <tr valign="top"><td>词法分析、语法分析、宏展开（<code>macro_rules!</code> 与过程宏）</td><td>rustc</td><td>relax-lex、relax-front</td></tr>
 <tr valign="top"><td>名称解析、trait 求解、类型推断、借用检查、常量求值</td><td>rustc</td><td>relax-types</td></tr>
@@ -639,56 +666,27 @@ code.nw{white-space:nowrap}
 <tr valign="top"><td>构建 <code>core</code>、<code>alloc</code> 和 <code>std</code></td><td>预编译好随工具链分发</td><td>由 Relax 从源码编译</td></tr>
 </table>
 <ul>
-<li><b>438k</b> 行 Rust 代码：常规工具链：数百万行 Rust 与 C++。
-<li><b>0</b> 个 crates.io 依赖：一个零依赖的 Rust 库。
-<li><b>134k</b> 行 <code>core</code>、<code>alloc</code> 与 <code>std</code>，由 Relax 自己从源码编译：用 rustc 时，标准库是预编译好再分发的。
+<li><b>438k</b> 行 Rust 代码
+<li><b>0</b> 个 crates.io 依赖
+<li><b>134k</b> 行 <code>core</code>、<code>alloc</code> 与 <code>std</code>，由 Relax 编译
 </ul>
-<h2><a name="plain-why">要速度，要安全，不要等。</a></h2>
-<p>Rust 给了你速度和安全，代价是拿编译时间来付账。<b>Relax 保留速度与安全，免掉这笔账。</b></p>
-<table border="1" cellpadding="4" cellspacing="0">
-<tr><th></th><th>用 rustc</th><th>用 Relax</th></tr>
-<tr valign="top"><td>启动</td><td>先把所有东西构建完。大型应用要等上几分钟，<code>main</code> 才开始跑。</td><td><b>现在就从源码启动。</b>在 M4 MacBook 上，小应用冷启动 3.7 s 出首帧，大型 3D 游戏 11 s。再次运行分别只要 0.41 s 和 1.15 s。</td></tr>
-<tr valign="top"><td>改代码</td><td>重新构建这个 crate 和所有依赖它的东西，重新链接，重启，再回到刚才的位置。</td><td><b>保存即构建。</b>只有你改过的函数会被重新检查、重新编译，然后热替换进运行中的程序，状态、窗口和连接都还在。</td></tr>
-<tr valign="top"><td>运行速度</td><td>快，但得先熬过漫长的优化构建。</td><td><b>运行中就变快。</b>代码从解释器起步，在后台逐级升到 O1、O3。Relax 优化后的代码仍然比 rustc <code>--release</code> 慢（见 <a href="#plain-gaps">LLVM 仍然领先的地方</a>）。</td></tr>
-<tr valign="top"><td>安全</td><td>所有代码都经过类型检查和借用检查。</td><td><b>一样。</b>Relax 绝不运行没检查过的代码。</td></tr>
-<tr valign="top"><td>你的 crate</td><td>path、git、crates.io、vendored、过程宏。</td><td><b>同样的 crate，原样使用，</b>过程宏也包括在内。</td></tr>
-<tr valign="top"><td>缓存</td><td>磁盘上的增量编译产物，可能过期，需要 <code>cargo clean</code>。</td><td><b>每个结果都以其输入的哈希为键。</b>命中的结果与全新编译的产物完全一致。热启动什么都不重新编译。</td></tr>
-<tr valign="top"><td>慢的时候</td><td>干等，靠猜。</td><td><b>运行时直接告诉你。</b>每个编译阶段、每次卡顿、每次层级切换，都会记进飞行记录器。</td></tr>
-</table>
 <h2><a name="plain-agents">迭代循环，始终是热的。</a></h2>
-<p>AI 智能体感觉不到构建有多慢，但每一次慢构建它都在付账：<b>token、时间，还有丢掉的上下文。</b></p>
+<p>AI 智能体每一次慢构建都在付账：<b>token、时间，还有丢掉的上下文。</b></p>
 <table border="1" cellpadding="4" cellspacing="0">
 <tr><th></th><th>用 rustc + Cargo</th><th>用 Relax + devhub</th></tr>
-<tr valign="top"><td>改动生效</td><td>重新构建、重新链接：大型应用要几分钟</td><td><b>毫秒级同步并打上补丁</b>（送到机器约 50–200 ms）</td></tr>
-<tr valign="top"><td>测试结果</td><td>先重新构建测试二进制，再运行</td><td><b>保存后 2.2 s，92 个测试的结果就回来了</b></td></tr>
-<tr valign="top"><td>查看界面</td><td>重新构建、重新启动、再点回原来的页面</td><td><b>直接抓取运行中应用的一帧，存成 PNG</b></td></tr>
-<tr valign="top"><td>无法热补丁的类型布局改动</td><td>完整重新构建并重启</td><td><b>自动原地重启</b>：只多一行日志，不报错</td></tr>
-<tr valign="top"><td>新 worker 或新泳道</td><td>冷构建</td><td><b>一上来就是热的</b>：每台机器都为最新提交保持热缓存</td></tr>
-<tr valign="top"><td>“刚才为什么慢？”</td><td>翻日志，靠猜</td><td><b>问飞行记录器</b>：哪个线程在等、在等什么、正在编译哪个函数</td></tr>
+<tr valign="top"><td>改动生效</td><td>重新构建、重新链接：几分钟</td><td><b>毫秒级打上补丁</b>（送到机器约 50–200 ms）</td></tr>
+<tr valign="top"><td>测试结果</td><td>先重新构建测试二进制，再运行</td><td><b>92 个测试，保存后 2.2 s</b></td></tr>
+<tr valign="top"><td>查看界面</td><td>重新构建、重新启动、再点回原来的页面</td><td><b>运行中应用的一帧，存成 PNG</b></td></tr>
+<tr valign="top"><td>新 worker</td><td>冷构建</td><td><b>一上来就是热的</b></td></tr>
 </table>
-<p>Makepad 用许多并行工作的 AI 智能体来构建自己的应用，每个智能体各占一条泳道，而 Relax 让它们都保持高速。它的开发中枢 <b>devhub</b> 围绕 Relax 调度构建与测试机器，所以智能体碰到的一切都不会是冷的。</p>
+<p>Makepad 用许多并行的 AI 智能体构建自己的应用；它的开发中枢 <b>devhub</b> 让每个智能体的运行在预热好的机器上由 Relax 持续保持。</p>
 <ul>
-<li><b>每条泳道一个实时会话</b>：每个智能体的应用或测试，都在机器池中的某台机器上由 Relax 持续运行，每次保存都给它打补丁。不重新构建，也不重新启动。
-<li><b>处处是热缓存</b>：每有改动合入，每台机器都会刷新自己的 Relax 缓存，所以新起的 worker 一启动就是热的。
-<li><b>循环里没有原生构建</b>：devhub 把迭代和合入前检查都交给 Relax，并按泳道统计每一次漏网的原生构建。
-<li><b>按实测调度</b>：任务按实测耗时估算大小，快速检查交给有热会话的机器，绝不会排在长时间构建后面。
+<li><b>九条</b> 智能体泳道并行运行
+<li><b>300+</b> 每小时由 devhub 处理的构建与测试任务
+<li><b>数十个</b> 改动每天合入，每一个都先在 Relax 下检查，再合并
 </ul>
-<h2><a name="plain-features">Relax 对比 rustc，逐项来看。</a></h2>
-<table border="1" cellpadding="4" cellspacing="0">
-<tr><th></th><th>rustc</th><th>Relax</th></tr>
-<tr valign="top"><td>启动</td><td>构建整张 crate 依赖图，链接，然后运行 <code>main</code>。</td><td><b>解析 crate 依赖图，直接从源码启动 <code>main</code>。</b>你的代码不需要原生构建。</td></tr>
-<tr valign="top"><td>检查</td><td>预先对每个 crate 做类型检查和借用检查。</td><td><b>一样，在第一次调用之前完成。</b></td></tr>
-<tr valign="top"><td>编译</td><td>整个 crate，提前编译。</td><td><b>一次一个函数，在它第一次被调用的那一刻。</b>热点函数在后台逐级升档：解释器 → O1 → O3。<code>#[relax(O2)]</code> / <code>#[relax(O3)]</code> 可以提前指定级别；在 rustc 下这个属性什么也不做。</td></tr>
-<tr valign="top"><td>编辑</td><td>重新构建，然后重启。</td><td><b>程序运行期间，只重新检查、重新编译、热替换改动的部分。</b>已经交出去的代码依然有效。无法热替换的改动会让程序原地重启。</td></tr>
-<tr valign="top"><td>缓存</td><td>按 crate 存放的增量编译产物。</td><td><b>每个结果都以其输入的哈希为键。</b>没有改动的包什么都不重新编译。</td></tr>
-<tr valign="top"><td>过程宏</td><td>构建成原生 dylib，再加载。</td><td><b>与已链接的构建一致时原生运行，否则在 JIT 上运行。</b></td></tr>
-<tr valign="top"><td>标准库</td><td>预编译好随工具链分发。</td><td><b><code>core</code>、<code>alloc</code> 和 <code>std</code>（134k 行）由 Relax 自己从源码编译。</b></td></tr>
-<tr valign="top"><td>原生代码</td><td>全部都是原生的。</td><td><b>必须保持原生的 crate（系统层、GPU、音频）用 <code>#[relax_api]</code> 导出接口。</b>JIT 代码通过 C ABI 规划器调用它们，跨越边界时按线程路由堆内存。</td></tr>
-<tr valign="top"><td>可观测性</td><td>事后看编译器计时。</td><td><b>实时飞行记录器，</b>附带卡顿事件和编译分析器。</td></tr>
-<tr valign="top"><td>后端</td><td>LLVM，再接系统链接器。</td><td><b>自研的 x86-64 与 AArch64 代码生成器，</b>不用链接器，也不用 LLVM。</td></tr>
-</table>
 <h2><a name="plain-gaps">LLVM 仍然领先的地方。</a></h2>
-<p>LLVM 背后是几十年的优化积累，在稳定状态下，它生成的代码仍然比 Relax 的快。以下是我们自己的测量：<b>热 JIT 对比同一份源码、同样输入的原生构建，取实际耗时之比。</b>越低越好，1.00× = LLVM。</p>
+<p>在稳定状态下，LLVM 生成的代码仍然更快。<b>热 JIT 对比同一份源码、同样输入的原生构建</b>，取实际耗时之比（越低越好，1.00× = LLVM）。</p>
 <table border="1" cellpadding="4" cellspacing="0">
 <tr valign="top"><td>3D 打印切片器：零件首次切片，4 线程</td><td>x86-64 (Zen 4)</td><td><b>1.14×</b>（周期数 1.15 倍，指令数 1.26 倍）</td><td>测于 2026-11-11</td></tr>
 <tr valign="top"><td>同上，8 线程</td><td>x86-64 (Zen 4)</td><td><b>1.17×</b></td><td>测于 2026-11-11</td></tr>
@@ -698,37 +696,9 @@ code.nw{white-space:nowrap}
 <tr valign="top"><td>密集数值内核（Cholesky 分解）</td><td>x86-64 (Zen 4)</td><td><b>2.29×</b>（LLVM 用 AVX-512 把它向量化了，Relax 目前还不做循环向量化）</td><td>测于 2026-11-10</td></tr>
 <tr valign="top"><td>任意负载对比普通 <code>--release</code>（可移植 CPU 基线）</td><td></td><td>尚未测量</td><td></td></tr>
 </table>
-<p>以上是我们最常剖析的负载。本周一次覆盖 18 个负载的更广泛测试，结果比这些数字更慢，也比十月份更慢；我们正在查明原因，查清后会在这里更新结果。</p>
-<p><b>哪个 <code>--release</code>？</b> 大多数 Rust 程序发布时用的是普通 <code>--release</code>，面向可移植的基线 CPU，在 x86-64 上就是不用 AVX。我们的数字对比的是更难的设定：带 <code>-C target-cpu=native</code> 的 <code>--release</code>，LLVM 可以用上这台机器的每一条指令。Relax 总是针对它所运行的 CPU 编译，所以对比普通 <code>--release</code> 时这些差距会缩小，在向量运算密集的代码上甚至可能反转。<b>这项对比还没有测过。</b></p>
-<p><b>差距从哪来</b>：基于同一批函数的指令级对比。差距来自多出来的指令，而不是停顿：指令数是 1.26 倍，周期数只有 1.15 倍。</p>
-<p><b>多出的指令按原因分类（切片器运行）</b></p>
-<ul>
-<li>比较结果存成 bool 寄存器，之后又重新计算：~25 G
-<li>寄存器间拷贝（二地址形式、拷贝合并遗漏）：~23 G
-<li>栈访问：循环状态放在栈槽里；可分配寄存器只有 12 个，rustc 有 15 个：~22 G
-<li>多余的循环控制与检查分支，循环不变的判断留在了循环内：~13 G
-<li>load 没有折叠进比较、i128 运算、重新物化的常量，以及其他小项：~33 G
-<li>生成代码之外的运行时开销（memcpy、分配器包装、TLS 访问、桩代码）：~40 G
-<li>没有循环向量化，循环展开较浅：数值内核差距的大头
-</ul>
-<p>不是原因的：内联。Relax 内联得比 rustc 还多。</p>
-<p>表里每一行都是一项待办，切片器的差距在过去三天里从 1.26 倍缩小到了 1.14 倍。</p>
-<h2><a name="plain-architecture">一个进程，从源码字节到可执行内存。</a></h2>
-<p>rustc 把你的程序交给 LLVM 和链接器，再由 Cargo 把各个步骤粘在一起。<b>Relax 在一个进程里包揽整条流水线，从源码字节一直到可执行内存。</b></p>
-<p>Relax 是一层层叠起来的。每一层都是独立的 crate，只依赖它下面的层并重新导出它们，所以在任何一层，每个模块都是 <code>crate::&lt;module&gt;</code>。各层并行编译，上层的改动永远不会让下层重新构建。</p>
-<table border="1" cellpadding="4" cellspacing="0">
-<tr valign="top"><td>relax-lex</td><td><code>libs/relax/lex</code></td><td>统一的 Rust 词法分析器和 token 模型（覆盖所有 edition），也是过程宏看到的那个 token 模型。</td><td><b>在 rustc 体系里</b>：词法分析器与 <code>proc_macro</code></td></tr>
-<tr valign="top"><td>relax-base</td><td><code>libs/relax/base</code></td><td>各阶段共用的基础：哈希、内存记账与分区分配、并发容器与 arena、语法树、<code>cfg</code>、manifest（TOML、依赖解析）、git 读取路径与源码挂载。</td><td><b>在 rustc 体系里</b>：Cargo 的一部分，以及 rustc 的共享基础设施</td></tr>
-<tr valign="top"><td>relax-session</td><td><code>libs/relax/session</code></td><td>一次编译的输入及其稳定哈希：所有缓存都建立在这些键之上。</td><td><b>在 rustc 体系里</b>：session 与增量编译的键</td></tr>
-<tr valign="top"><td>relax-front</td><td><code>libs/relax/front</code></td><td>语法解析、crate 依赖图与名称解析、宏展开：<code>macro_rules!</code>、内置宏、<code>format_args!</code>、derive 与过程宏注册。</td><td><b>在 rustc 体系里</b>：解析器、名称解析、宏展开</td></tr>
-<tr valign="top"><td>relax-types</td><td><code>libs/relax/types</code></td><td>驻留类型、签名与 impl、类型检查、布局、常量求值、借用检查器、按定义查询函数体，以及稳定的类型哈希。</td><td><b>在 rustc 体系里</b>：类型检查器、借用检查器、常量求值</td></tr>
-<tr valign="top"><td>relax-codegen</td><td><code>libs/relax/codegen</code></td><td>基于 RIR（Relax IR）的中端：O1 与 O3 优化器（内联、折叠、循环与范围 pass）、threaded-code 解释器这一层级，以及编译分析器。</td><td><b>在 rustc 体系里</b>：MIR 优化与 LLVM 优化器</td></tr>
-<tr valign="top"><td>relax-backend</td><td><code>libs/relax/backend</code></td><td>寄存器分配、面向宿主机的机器码（x86-64 或 AArch64）、跳转表、C ABI 规划器与可执行内存。</td><td><b>在 rustc 体系里</b>：LLVM 的代码生成器与链接器</td></tr>
-<tr valign="top"><td>relax-compiler</td><td><code>libs/relax/compiler</code></td><td>编译器、JIT 运行时和 std 合为一个库：惰性编译、分层、实时编辑、缓存、过程宏宿主和测试运行器。</td><td><b>在 rustc 体系里</b>：Cargo、rustc driver、测试框架与操作系统加载器</td></tr>
-<tr valign="top"><td>relax-native-macros</td><td><code>libs/relax/native_macros</code></td><td>原生链接的过程宏，会对照其源码校验，确保展开结果与在 Cargo 下完全一致。</td><td><b>在 rustc 体系里</b>：过程宏 dylib</td></tr>
-<tr valign="top"><td>属性</td><td><code>libs/relax/attr</code></td><td><code>#[relax(O2)]</code> / <code>#[relax(O3)]</code>：优化级别属性；在 rustc 下不起作用。</td><td><b>在 rustc 体系里</b>：按 profile 设置的 <code>opt-level</code></td></tr>
-<tr valign="top"><td>relax_api</td><td><code>libs/relax_api</code></td><td><code>#[relax_api]</code>：原生编译的 crate 向 JIT 代码提供的接口，以及按线程的堆路由。</td><td><b>在 rustc 体系里</b>：（没有对应物：一切都是原生的）</td></tr>
-</table>
+<p>以上是我们最常剖析的负载。本周一次覆盖 18 个负载的更广泛测试结果更慢；我们正在查明原因。</p>
+<p><b>哪个 <code>--release</code>？</b> 对比的是带 <code>-C target-cpu=native</code> 的 <code>--release</code>。大多数 Rust 程序用面向可移植 CPU 的普通 <code>--release</code> 发布，而 Relax 针对它所运行的 CPU 编译，所以那时差距会缩小。<b>尚未测量。</b></p>
+<p>切片器的差距在三天里从 1.26 倍缩小到 1.14 倍。其余差距从哪来：见 <a href="https://github.com/makepad/relax#where-llvm-still-wins">README</a>。</p>
 <h2><a name="plain-life">一个函数的一生。</a></h2>
 <ul>
 <li><b>解释器</b>：代码从这里起步。
@@ -736,36 +706,6 @@ code.nw{white-space:nowrap}
 <li><b>O3</b>：变热后在后台重新编译；更快的代码，热替换上线。
 </ul>
 <p>换成 rustc，同样的改动意味着：重新构建 crate、重新链接、重启。</p>
-<h2><a name="plain-rules">设计原则，以及相对 rustc 的意义。</a></h2>
-<ul>
-<li><b>先检查，再运行</b>：与 rustc 同样的保证：没检查过的代码绝不运行。只是 Relax 不会让你先等程序的其余部分。
-<li><b>永不过期</b>：每个缓存结果都以其输入的哈希为键。命中的结果与全新编译的产物完全一致，所以根本不需要 <code>cargo clean</code>。
-<li><b>代码只增不减</b>：已发布的机器码，只要还可能出现在某个栈上，就绝不会被释放或改写。热替换会发布新代码，并把之后的调用重定向过去；原生热重载的野路子不安全的地方，它是安全的。
-<li><b>默认按需</b>：rustc 会编译所有你可能调用的代码。Relax 只编译你真正调用的，并在后台优化它。
-<li><b>原样的 Rust</b>：普通的 crate，来自 crates.io 和 git。<code>libs/relax/KNOWN_GAPS.md</code> 列出了目前还不支持的部分。
-<li><b>可观测</b>：每个阶段都会报告自己在做什么；任何一次卡顿，都能从它的记录里找到原因。
-</ul>
-<h2><a name="plain-build">构建 Relax。</a></h2>
-<table border="1" cellpadding="4" cellspacing="0">
-<tr><th></th><th>rustc</th><th>Relax</th></tr>
-<tr valign="top"><td>构建它需要</td><td>LLVM，外加一次自举</td><td><b>一套 stable Rust 工具链。crates.io 上的东西一个都不用。</b></td></tr>
-</table>
-<pre>cargo build --release -p relax-compiler</pre>
-<p>编译器是 <code>relax_compiler</code> 这个库；<code>relax</code>（<code>tools/run/runner</code>）是它的命令行运行器。</p>
-<pre>Cargo.toml                           工作区
-libs/relax/
-  lex/ base/ session/ front/ types/  前端与类型系统
-  codegen/ backend/                  中端与机器码
-  compiler/                          运行时、std（compiler/std）、
-                                     96 个端到端测试包
-  attr/ native_macros/               #[relax(..)] 与原生过程宏
-  KNOWN_GAPS.md                      尚未支持的内容
-libs/relax_api/                      #[relax_api] 与按线程的堆路由
-tools/run/runner/                    relax，命令行运行器
-libs/ platform/ tools/ widgets/      Relax 链接的几个小型支撑 crate：
-                                     token 模型、序列化、远程检视、
-                                     性能分析，以及它对照源码
-                                     校验的原生过程宏</pre>
 <p>MIT 许可证，见 <a href="https://github.com/makepad/relax/blob/main/LICENSE">LICENSE</a>。Relax 编译的 std 源码带有各自的版权声明，见 <code>libs/relax/compiler/std/CREDITS.md</code> 及其旁边的许可证文件。</p>
 <h2>Rust，告别等待。</h2>
 </div>
@@ -778,13 +718,11 @@ libs/ platform/ tools/ widgets/      Relax 链接的几个小型支撑 crate：
     </a>
     <nav aria-label="页面导航">
       <a href="#race">对比 rustc</a>
+      <a href="#tradeoffs">取舍</a>
+      <a href="#benefits">好处</a>
+      <a href="#try">试一试</a>
       <a href="#toolchain">工具链</a>
-      <a href="#why">为什么</a>
-      <a href="#agents">AI 智能体</a>
-      <a href="#features">逐项对比</a>
-
       <a href="#gaps">LLVM 领先处</a>
-      <a href="#architecture">架构</a>
     </nav>
     <a class="lang" href="../" hreflang="en" lang="en"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.4"/><path d="M1.6 8h12.8M8 1.6c1.9 1.8 2.8 4 2.8 6.4S9.9 12.6 8 14.4M8 1.6C6.1 3.4 5.2 5.6 5.2 8s.9 4.6 2.8 6.4"/></svg>English</a>
     <a class="theme" href="light/" aria-label="浅色版" title="浅色版" onclick="try{localStorage.setItem('relax-theme','light')}catch(e){}"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1.3v1.6M8 13.1v1.6M1.3 8h1.6M13.1 8h1.6M3.3 3.3l1.1 1.1M11.6 11.6l1.1 1.1M3.3 12.7l1.1-1.1M11.6 4.4l1.1-1.1"/></svg></a>
@@ -808,10 +746,10 @@ libs/ platform/ tools/ widgets/      Relax 链接的几个小型支撑 crate：
         <p class="eyebrow"><i class="pulse"></i><span>用 Rust 写的 Rust 实时编译器<wbr>与 JIT 运行时</span></p>
         <h1 id="h-hero"><span class="w" style="--i:0">Rust<span class="pc">，</span></span><wbr><span class="nw"><span class="w" style="--i:1">告别</span><span class="w glow" style="--i:2">等待。</span></span></h1>
         <p class="lede"><span>rustc<span class="pc">：</span>先构建<span class="pc">，</span>再运行<span class="pc">。</span></span>Relax<span class="pc">：</span>边构建<span class="pc">，</span>边运行。</p>
-        <p class="sub">Relax 直接从源码运行 Cargo 包，全程不经过 rustc、LLVM 或链接器。它先检查你的代码；每个函数在第一次被调用时才编译；热点函数在程序运行期间被优化；你一保存文件，新代码就被热补丁进正在运行的进程。</p>
+        <p class="sub">Relax 直接从源码运行 Cargo 包，全程不经过 rustc、LLVM 或链接器。每个函数在第一次被调用时才编译，热点函数在程序运行期间被优化，你的修改被热补丁进正在运行的进程。</p>
         <div class="cta">
           <a class="btn primary" href="https://github.com/makepad/relax">GitHub <span aria-hidden="true">&nearr;</span></a>
-          <a class="btn" href="#race">观看竞速</a>
+          <a class="btn" href="#try">试一试</a>
         </div>
       </div>
       <aside class="mini" aria-label="两套工具链各自怎样花掉你的时间">
@@ -822,11 +760,8 @@ libs/ platform/ tools/ widgets/      Relax 链接的几个小型支撑 crate：
       </aside>
     </div>
     <div class="stats" id="heroStats"></div>
-    <div class="card tl reveal" id="tldr"><h2>太长不看</h2><p data-rich="tldr.lead"></p><ul id="tldrList"></ul></div>
   </div>
 </section>
-
-<div class="mq" aria-hidden="true"><div id="mq"></div></div>
 
 <section id="race" aria-labelledby="h-race">
   <div class="wrap">
@@ -854,27 +789,20 @@ libs/ platform/ tools/ widgets/      Relax 链接的几个小型支撑 crate：
   </div>
 </section>
 
-<section id="toolchain" class="alt" aria-labelledby="h-took">
+<section id="tradeoffs" class="alt" aria-labelledby="h-trade">
   <div class="wrap">
-    <p class="kicker reveal">背后的工程</p>
-    <h2 class="title reveal" id="h-took">一套全新的 Rust 工具链<span class="pc">，</span><em>从源码字节<wbr>到机器码。</em></h2>
-    <p class="intro reveal" data-rich="took.intro"></p>
-    <div class="took mt48">
-      <div class="card pipe reveal" id="pipeBox">
-        <p class="cap">环节 &middot; 常规工具链 &middot; Relax</p>
-        <ol id="pipeList"><li class="rail y" aria-hidden="true"></li></ol>
-      </div>
-      <div class="bigs" id="tookBigs"></div>
-    </div>
+    <p class="kicker o reveal">取舍</p>
+    <h2 class="title reveal" id="h-trade">JIT 的<em>代价。</em></h2>
+    <div class="grid g3 mt48" id="tradeList"></div>
   </div>
 </section>
 
-<section id="why" aria-labelledby="h-why">
+<section id="benefits" aria-labelledby="h-ben">
   <div class="wrap">
-    <p class="kicker reveal">它为什么会改变 Rust</p>
-    <h2 class="title reveal" id="h-why">要速度<span class="pc">，</span><wbr>要安全<span class="pc">，</span><wbr><em>不要等。</em></h2>
-    <p class="intro reveal" data-rich="why.intro"></p>
-    <div class="card box mt48" id="vsWhy"></div>
+    <p class="kicker reveal">好处</p>
+    <h2 class="title reveal" id="h-ben">JIT <em>带给你的。</em></h2>
+    <p class="intro reveal" data-rich="benefits.intro"></p>
+    <div class="grid g2 mt48" id="benefitList"></div>
 
     <h3 class="h reveal">保存即构建</h3>
     <p class="intro reveal" data-rich="demo.intro"></p>
@@ -906,6 +834,31 @@ libs/ platform/ tools/ widgets/      Relax 链接的几个小型支撑 crate：
   </div>
 </section>
 
+<section id="try" class="alt" aria-labelledby="h-try">
+  <div class="wrap">
+    <p class="kicker reveal">试一试</p>
+    <h2 class="title reveal" id="h-try">构建它<span class="pc">，</span><wbr><em>跑一个包。</em></h2>
+    <pre class="tree reveal mt48" data-d="tryit.commands"></pre>
+    <p class="intro reveal" data-rich="tryit.after"></p>
+    <p class="intro reveal" data-rich="tryit.network"></p>
+  </div>
+</section>
+
+<section id="toolchain" aria-labelledby="h-took">
+  <div class="wrap">
+    <p class="kicker reveal">背后的工程</p>
+    <h2 class="title reveal" id="h-took">一套全新的 Rust 工具链<span class="pc">，</span><em>从源码字节<wbr>到机器码。</em></h2>
+    <p class="intro reveal" data-rich="took.intro"></p>
+    <div class="took mt48">
+      <div class="card pipe reveal" id="pipeBox">
+        <p class="cap">环节 &middot; 常规工具链 &middot; Relax</p>
+        <ol id="pipeList"><li class="rail y" aria-hidden="true"></li></ol>
+      </div>
+      <div class="bigs" id="tookBigs"></div>
+    </div>
+  </div>
+</section>
+
 <section id="agents" class="alt" aria-labelledby="h-agents">
   <div class="wrap">
     <p class="kicker reveal">为 AI 智能体而生</p>
@@ -913,28 +866,8 @@ libs/ platform/ tools/ widgets/      Relax 链接的几个小型支撑 crate：
     <p class="intro reveal" data-rich="agents.intro"></p>
     <div class="card box mt48" id="vsAgents"></div>
     <p class="intro reveal mt48"><a href="https://github.com/makepad/makepad">Makepad</a> <span data-rich="agents.makepad"></span></p>
-    <div class="card loop reveal mt48" id="loopBox">
-      <div class="lrow" id="loopRow"></div>
-      <div class="edge down" aria-hidden="true"><i class="rail y"></i></div>
-      <div class="outs" id="loopOuts"></div>
-      <div class="back"><span data-d="agents.back"></span><div class="rail" aria-hidden="true"></div></div>
-    </div>
-    <figure class="card dh reveal" id="dhFig">
-      <div class="dh-bar"><i class="pulse"></i><b>devhub</b><span class="tag">示意图</span></div>
-      <div class="dh-grid" id="dhGrid"></div>
-      <figcaption data-d="devhub.caption"></figcaption>
-    </figure>
-    <div class="grid g2" id="agentBullets"></div>
     <h3 class="h reveal">实际运行中</h3>
     <div class="grid g3" id="practice"></div>
-  </div>
-</section>
-
-<section id="features" aria-labelledby="h-feat">
-  <div class="wrap">
-    <p class="kicker o reveal">逐项对比</p>
-    <h2 class="title reveal" id="h-feat">Relax 对比&nbsp;rustc<span class="pc">，</span><wbr><em>逐项来看。</em></h2>
-    <div class="card box mt48" id="vsFeat"></div>
   </div>
 </section>
 
@@ -962,30 +895,11 @@ libs/ platform/ tools/ widgets/      Relax 链接的几个小型支撑 crate：
       <p class="note" data-rich="gaps.tableNote"></p>
     </div>
     <div class="card which reveal grid" id="gapWhich"></div>
-    <div class="card chart reveal grid" id="causeBox">
-      <p class="intro" style="margin-top:0" data-rich="gaps.causesIntro"></p>
-      <h3 style="margin-top:22px" data-d="gaps.causesTitle"></h3>
-      <div class="stack" id="causeStack" aria-hidden="true"></div>
-      <ul class="causes" id="causeList" style="margin-top:14px"></ul>
-      <p class="note" data-d="gaps.notCause" style="color:var(--text);font-size:.95rem"></p>
-    </div>
     <div class="card trend reveal grid" id="gapTrend"></div>
   </div>
 </section>
 
-<section id="architecture" class="alt" aria-labelledby="h-arch">
-  <div class="wrap">
-    <p class="kicker reveal">架构</p>
-    <h2 class="title reveal" id="h-arch">一个进程<span class="pc">，</span><wbr><em>从源码字节<wbr>到可执行内存。</em></h2>
-    <p class="intro reveal" data-rich="arch.intro"></p>
-    <p class="intro reveal" data-rich="arch.intro2"></p>
-    <div class="card arch reveal mt48" id="archBox"></div>
-    <h3 class="h reveal">各层<span class="pc">，</span><wbr>以及它们取代了什么</h3>
-    <div class="card box mt48" id="layers"></div>
-  </div>
-</section>
-
-<section id="life" aria-labelledby="h-life">
+<section id="life" class="alt" aria-labelledby="h-life">
   <div class="wrap">
     <p class="kicker reveal">分层编译与实时补丁</p>
     <h2 class="title reveal" id="h-life">一个函数的<em>一生。</em></h2>
@@ -997,26 +911,6 @@ libs/ platform/ tools/ widgets/      Relax 链接的几个小型支撑 crate：
   </div>
 </section>
 
-<section id="rules" class="alt" aria-labelledby="h-rules">
-  <div class="wrap">
-    <p class="kicker reveal">设计原则</p>
-    <h2 class="title reveal" id="h-rules">设计原则<span class="pc">，</span><wbr><em>以及相对&nbsp;rustc 的意义。</em></h2>
-    <div class="grid g3 mt48" id="ruleList"></div>
-  </div>
-</section>
-
-<section id="build" aria-labelledby="h-build">
-  <div class="wrap">
-    <p class="kicker reveal">构建</p>
-    <h2 class="title reveal" id="h-build">构建 <em>Relax。</em></h2>
-    <div class="card box mt48" id="vsBuild"></div>
-    <code class="cmd reveal" data-d="build.command"></code>
-    <p class="intro reveal" data-rich="build.after"></p>
-    <h3 class="h reveal">仓库结构</h3>
-    <pre class="tree reveal" data-d="build.layout"></pre>
-  </div>
-</section>
-
 <section class="final" aria-labelledby="h-final">
   <div class="wrap">
     <h2 id="h-final" class="reveal">Rust<span class="pc">，</span><wbr>告别等待。</h2>
@@ -1024,7 +918,7 @@ libs/ platform/ tools/ widgets/      Relax 链接的几个小型支撑 crate：
       <a class="btn primary" href="https://github.com/makepad/relax">GitHub <span aria-hidden="true">&nearr;</span></a>
       <a class="btn" href="#top">回到顶部</a>
     </div>
-    <p class="reveal" data-rich="build.license"></p>
+    <p class="reveal" data-rich="license"></p>
   </div>
 </section>
 
@@ -1062,44 +956,11 @@ function placeholderBench() {
 const DATA = {
   hero: {
     stats: [
-      { value: 11,   decimals: 0, suffix: " s", label: "大型 3D 游戏：在 M4 MacBook 上从全新检出到首帧，直接跑源码" },
-      { value: 1.15, decimals: 2, suffix: " s", label: "同一个游戏再次运行到首帧：什么都不用重新编译" },
+      { value: 11,   decimals: 0, suffix: " s", label: "大型 3D 游戏：从全新检出到首帧（M4 MacBook）" },
+      { value: 1.15, decimals: 2, suffix: " s", label: "同一个游戏再次运行：什么都不用重新编译" },
       { value: 2.2,  decimals: 1, suffix: " s", label: "从保存文件到 92 个测试重跑完毕" },
       { value: 0,   decimals: 0, label: "个 crates.io 依赖，共 438k 行 Rust 代码" }
-    ],
-    marquee: ["不用 rustc", "不用 LLVM", "不用链接器", "直接跑源码", "状态保留", "先检查，再运行", "永不过期", "代码只增不减", "默认按需"]
-  },
-
-  tldr: {
-    lead: "Rust 的速度与安全，不必再等编译。",
-    items: [
-      ["是什么", "一个 Rust 实时编译器与 JIT 运行时，直接从源码运行 Cargo 包。不要 rustc，不要 LLVM，不要链接器。"],
-      ["启动", "在 M4 MacBook 上，一个大型 3D 游戏从全新检出到出首帧只要 **11 s**，而 rustc 光是构建就得先花 ~3 min。第二次运行只要 **1.15 s**。"],
-      ["改动", "保存文件，改过的函数就被热补丁进运行中的程序，状态不丢。**92 个测试 2.2 s 重跑完。**"],
-      ["速度", "优化后的代码仍然比 rustc `--release` 慢。本周一次范围更广的测试，结果比我们之前公布的数字更慢，我们正在重新测量；详见 [LLVM 仍然领先的地方](#gaps)。"],
-      ["体积", "就一个 Rust 库：**438k 行代码，0 个 crates.io 依赖。**"],
-      ["平台", "为 x86-64 和 AArch64 生成机器码。从全新克隆开始，本仓库在 Linux x86-64 和 macOS arm64 上都能构建，测试全部通过；Windows 还没有在这里测试过。"]
     ]
-  },
-
-  /* the devhub illustration: names are made up, figures repeat the README's */
-  devhub: {
-    caption: "示意图：风格化的 devhub，并非截图。泳道、应用和机器的名字都是虚构的；数字与上表一致。",
-    panels: {
-      lanes: ["泳道", "九条泳道并行"],
-      boxes: ["机器", "每台机器都为最新提交保持热缓存"],
-      jit: ["机器内部", "devhub 把改动交给运行中的 Relax 会话"],
-      live: ["实时会话", "泳道 ui-tweak · 应用 editor"]
-    },
-    lanes: [["parser-fix", "tests", "结论"], ["ui-tweak", "editor", "画面"], ["perf", "game", "运行中"], ["audio-mix", "game", "已打补丁"], ["text-layout", "editor", "运行中"], ["net-retry", "tests", "结论"], ["shader-cache", "game", "已打补丁"], ["importer", "editor", "运行中"], ["docs-search", "tests", "结论"]],
-    boxes: ["linux · gpu", "linux · gpu", "linux · cpu", "linux · cpu", "linux · arm64", "mac · arm64"],
-    warm: "JIT 已预热",
-    queue: ["队列", "快速检查交给热会话"],
-    steps: [["改动到达", "~50–200 ms"], ["重新检查改动", "类型"], ["重新编译改动", "代码生成"], ["热替换进运行中的应用", "状态保留"]],
-    outs: [["测试重跑", "92 个测试 · 2.2 s"], ["应用画面", "PNG"], ["飞行记录器", "为什么慢"]],
-    back: "返回给 AI 智能体",
-    frame: "运行中应用的画面",
-    timeline: [["保存", "文件已保存"], ["送到机器", "~50–200 ms"], ["结论", "92 个测试 · 2.2 s"], ["画面", "抓取为 PNG"]]
   },
 
   race: {
@@ -1114,48 +975,43 @@ const DATA = {
       { title: "小应用，冷启动 → 首帧", count: { value: 3.7, decimals: 1, suffix: " s" }, relax: "冷启动；热启动只要 0.41 s（M4 MacBook）", rustc: "得先构建",
         duel: [{ label: "冷启动", value: 3.7, text: "3.7 s" }, { label: "热启动", value: 0.41, text: "0.41 s" }] },
       { title: "保存文件 → 92 个测试重跑", count: { value: 2.2, decimals: 1, suffix: " s" }, relax: "从保存那一刻算起", rustc: "得先重新构建测试二进制", dots: 92 },
-      { title: "改动运行中程序里的一个函数", word: "状态保留。", relax: "热补丁进正在运行的进程", rustc: "重新构建、重新链接、重启：程序状态全丢" }
+      { title: "改动运行中程序里的一个函数", word: "状态保留。", relax: "热补丁进正在运行的进程", rustc: "重新构建、重新链接、重启：状态全丢" }
     ],
     rest: [
-      ["优化后代码的速度", "基准 1.00×（LLVM，针对本机 CPU 的 `--release`）", "**更慢**：在我们最常剖析的负载上耗时为其 1.14–1.26 倍，密集数值循环上为 2.3 倍（尚未做向量化）；正在重新测量（[详情](#gaps)）"],
-      ["运行前完成类型检查和借用检查", "是", "**是**"],
-      ["需要什么", "rustc、LLVM、链接器", "**Relax**，一个 Rust 库（438k 行，0 个 crates.io 依赖）"]
+      ["类型检查与借用检查", "`cargo check`；构建时先检查全部代码", "**`relax check`**；运行时每个函数先做类型检查再运行，借用检查在后台进行"],
+      ["优化后的代码", "基准 1.00×（`--release`，本机 CPU）", "耗时为其 **1.14–1.26 倍**，密集数值循环上为 2.3 倍（[取舍](#tradeoffs)）"],
+      ["需要什么", "rustc、LLVM、链接器", "**一个 Rust 库**：438k 行，0 个 crates.io 依赖"]
     ]
   },
 
-  took: {
-    intro: "Relax 不是 rustc 的套壳，也不是 LLVM 的插件。**它把两者都换掉了**，连同 Cargo 和链接器里夹在源码与运行中程序之间的那部分，全部装进一个零依赖的 Rust 库。",
-    rows: [
-      { job: "词法分析、语法分析、宏展开（`macro_rules!` 与过程宏）", usual: "rustc", relax: "relax-lex、relax-front" },
-      { job: "名称解析、trait 求解、类型推断、借用检查、常量求值", usual: "rustc", relax: "relax-types" },
-      { job: "优化：内联、折叠、循环、范围分析", usual: "rustc 的 MIR pass + LLVM", relax: "relax-codegen（O1 与 O3）" },
-      { job: "寄存器分配，生成 x86-64 与 AArch64 机器码", usual: "LLVM", relax: "relax-backend" },
-      { job: "链接与加载", usual: "系统链接器与加载器", relax: "relax-compiler，直接写入可执行内存" },
-      { job: "读取 manifest，解析 crate 依赖图", usual: "Cargo", relax: "relax-base" },
-      { job: "构建 `core`、`alloc` 和 `std`", usual: "预编译好随工具链分发", relax: "由 Relax 从源码编译" }
-    ],
-    bigs: [
-      { count: { value: 438, decimals: 0, suffix: "k" }, label: "行 Rust 代码", small: "常规工具链：数百万行 Rust 与 C++。" },
-      { count: { value: 0,   decimals: 0 }, label: "个 crates.io 依赖", small: "一个零依赖的 Rust 库。" },
-      { count: { value: 134, decimals: 0, suffix: "k" }, label: "行 `core`、`alloc` 与 `std`，由 Relax 自己从源码编译", small: "用 rustc 时，标准库是预编译好再分发的。" }
+  tradeoffs: {
+    items: [
+      { title: "优化后的代码更慢", body: "耗时是针对本机 CPU 的 `--release` 的 1.14–1.26 倍，密集数值循环上是 2.3 倍（还不做向量化）。[详情](#gaps)" },
+      { title: "占用更多内存", body: "编译器、它的缓存和所有已发布的代码都与你的程序同处一个进程；JIT 代码只增不减。见 `relax inspect <pid> memory`。" },
+      { title: "检查还不比 cargo 快", body: "在大型包上，冷启动的 `relax check` 比 `cargo check` 更慢、占用更多内存，一次编辑也可能重新检查超出需要的部分。我们正在改进。" },
+      { title: "有些改动需要重启", body: "函数体的改动实时打补丁。结构体布局、导入、trait 或 impl 头、宏的改动要等 `relax inspect <pid> session relaunch`。" },
+      { title: "借用检查在后台", body: "每个函数先做类型检查再运行；借用检查与程序并行，除非加上 `--check-first`。" },
+      { title: "已知缺口", body: "还不是每个 crate 都能跑：[KNOWN_GAPS.md](https://github.com/makepad/relax/blob/main/libs/relax/KNOWN_GAPS.md) 逐项列出，每项附复现。" },
+      { title: "不能替代发布构建", body: "Relax 用于编辑—运行循环。发布时请用 `cargo build --release` 构建的产物。" }
     ]
   },
 
-  why: {
-    intro: "Rust 给了你速度和安全，代价是拿编译时间来付账。**Relax 保留速度与安全，免掉这笔账。**",
-    rows: [
-      ["启动", "先把所有东西构建完。大型应用要等上几分钟，`main` 才开始跑。", "**现在就从源码启动。**在 M4 MacBook 上，小应用冷启动 3.7 s 出首帧，大型 3D 游戏 11 s。再次运行分别只要 0.41 s 和 1.15 s。"],
-      ["改代码", "重新构建这个 crate 和所有依赖它的东西，重新链接，重启，再回到刚才的位置。", "**保存即构建。**只有你改过的函数会被重新检查、重新编译，然后热替换进运行中的程序，状态、窗口和连接都还在。"],
-      ["运行速度", "快，但得先熬过漫长的优化构建。", "**运行中就变快。**代码从解释器起步，在后台逐级升到 O1、O3。Relax 优化后的代码仍然比 rustc `--release` 慢（见 [LLVM 仍然领先的地方](#gaps)）。"],
-      ["安全", "所有代码都经过类型检查和借用检查。", "**一样。**Relax 绝不运行没检查过的代码。"],
-      ["你的 crate", "path、git、crates.io、vendored、过程宏。", "**同样的 crate，原样使用，**过程宏也包括在内。"],
-      ["缓存", "磁盘上的增量编译产物，可能过期，需要 `cargo clean`。", "**每个结果都以其输入的哈希为键。**命中的结果与全新编译的产物完全一致。热启动什么都不重新编译。"],
-      ["慢的时候", "干等，靠猜。", "**运行时直接告诉你。**每个编译阶段、每次卡顿、每次层级切换，都会记进飞行记录器。"]
+  benefits: {
+    intro: "`relax run` 会打印 `relax-remote: pid <pid>`。下面除 `run` 和 `test` 外的命令都发给 `relax inspect <pid>`，由运行中的程序回答。",
+    items: [
+      { title: "热补丁，状态保留", body: "保存文件，改过的函数就被重新检查、重新编译，并热替换进运行中的程序。调用到编译不过的代码时，调用会等你修好。", cmd: ["relax run <package>"] },
+      { title: "保存即测", body: "测试保持预热，只重跑进入过你所改函数的那些。", cmd: ["relax test --live <package>"] },
+      { title: "panic 时暂停", body: "panic 的线程停住，栈保持完整（终端里 10 分钟，无人值守 2 s）。读它的局部变量、在它的栈帧里求值 Rust，然后让它展开，或重跑一个 `restartable` 函数。", cmd: ["panics", "locals panic=P1", "eval <expr>", "resume P1 panic"] },
+      { title: "断点，不用调试器", body: "命中时线程停在调用处，栈保持完整。", cmd: ["break <file>:<line>", "locals break=K1", "continue"] },
+      { title: "卡死，讲清原因", body: "死锁、阻塞、忙碌还是空闲：结论、等待链和相关线程的栈。", cmd: ["why-hung"] },
+      { title: "性能剖析", body: "对 JIT 帧和原生帧采样：每个线程的 CPU、最热的函数及其最热的一行、带层级的调用树、火焰图用的栈。", cmd: ["prof s=3", "prof view=tree", "why-slow"] },
+      { title: "飞行记录器", body: "始终开启，内存有上限：最近几分钟的线程、等待、编译和事件。遇到 panic、故障或超过 1 s 的卡顿时自动保存。", cmd: ["rec save"] },
+      { title: "内存与泄漏", body: "按类型划分的 RSS、malloc 在用与空闲持有的部分、Relax 自己的占用；按分配栈统计的程序堆，两次快照之间给出疑似泄漏。堆跟踪目前只支持 Linux x86-64 和 macOS arm64。", cmd: ["memory", "heap start", "heap snap a", "heap diff a now"] }
     ]
   },
 
   demo: {
-    intro: "只有你改过的函数会被重新检查、重新编译，然后**热替换进正在运行的程序，状态、窗口和连接全都保留。**换成 rustc，同样的改动就是重新构建、重新链接、重启。",
+    intro: "只有你改过的函数会被重新检查、重新编译，然后**热替换进正在运行的程序，状态全都保留。**",
     file: "src/particles.rs",
     lines: [
       "// 每一帧，对每个粒子调用一次",
@@ -1184,58 +1040,58 @@ const DATA = {
     },
     rustcSteps: ["重新构建", "重新链接", "重启"],
     rustcResult: "程序状态丢失",
-    note: "这是在你浏览器里运行的示意动画，演示上述行为，并不是真实的 Relax 会话。"
+    note: "这是在你浏览器里运行的示意动画，不是真实的 Relax 会话。"
+  },
+
+  tryit: {
+    commands: [
+      "git clone https://github.com/makepad/relax",
+      "cargo build --release --manifest-path relax/Cargo.toml -p relax-runner --bin relax",
+      "",
+      "cargo new hello",
+      "cd hello",
+      "../relax/target/release/relax run --quiet hello    # 在 JIT 下运行 main",
+      "../relax/target/release/relax test hello           # 运行它的 #[test] 函数",
+      "../relax/target/release/relax check hello          # 只做类型检查和借用检查"
+    ].join("\n"),
+    after: "在包的目录里运行 `relax`，参数给包名；别移动 `relax` 的检出目录，std 从那里读取。在一台 16 核 x86-64 Linux 机器上构建用了 53 s；`hello` 随后 0.24 s 启动，之后不到 0.1 s。已在 Linux x86-64 和 macOS arm64 上测试。",
+    network: "没有依赖的包不需要联网；crates.io 依赖取自 `~/.cargo`，或下载后按索引的 SHA-256 校验。更多见 [README](https://github.com/makepad/relax#readme)。"
+  },
+
+  took: {
+    intro: "Relax 不是 rustc 的套壳，也不是 LLVM 的插件：**它把两者都换掉了**，连同 Cargo 和链接器夹在中间的那部分。",
+    rows: [
+      { job: "词法分析、语法分析、宏展开（`macro_rules!` 与过程宏）", usual: "rustc", relax: "relax-lex、relax-front" },
+      { job: "名称解析、trait 求解、类型推断、借用检查、常量求值", usual: "rustc", relax: "relax-types" },
+      { job: "优化：内联、折叠、循环、范围分析", usual: "rustc 的 MIR pass + LLVM", relax: "relax-codegen（O1 与 O3）" },
+      { job: "寄存器分配，生成 x86-64 与 AArch64 机器码", usual: "LLVM", relax: "relax-backend" },
+      { job: "链接与加载", usual: "系统链接器与加载器", relax: "relax-compiler，直接写入可执行内存" },
+      { job: "读取 manifest，解析 crate 依赖图", usual: "Cargo", relax: "relax-base" },
+      { job: "构建 `core`、`alloc` 和 `std`", usual: "预编译好随工具链分发", relax: "由 Relax 从源码编译" }
+    ],
+    bigs: [
+      { count: { value: 438, decimals: 0, suffix: "k" }, label: "行 Rust 代码" },
+      { count: { value: 0,   decimals: 0 }, label: "个 crates.io 依赖" },
+      { count: { value: 134, decimals: 0, suffix: "k" }, label: "行 `core`、`alloc` 与 `std`，由 Relax 编译" }
+    ]
   },
 
   agents: {
-    intro: "AI 智能体感觉不到构建有多慢，但每一次慢构建它都在付账：**token、时间，还有丢掉的上下文。**",
+    intro: "AI 智能体每一次慢构建都在付账：**token、时间，还有丢掉的上下文。**",
     heads: ["用 rustc + Cargo", "用 Relax + devhub"],
     table: [
-      ["改动生效", "重新构建、重新链接：大型应用要几分钟", "**毫秒级同步并打上补丁**（送到机器约 50–200 ms）"],
-      ["测试结果", "先重新构建测试二进制，再运行", "**保存后 2.2 s，92 个测试的结果就回来了**"],
-      ["查看界面", "重新构建、重新启动、再点回原来的页面", "**直接抓取运行中应用的一帧，存成 PNG**"],
-      ["无法热补丁的类型布局改动", "完整重新构建并重启", "**自动原地重启**：只多一行日志，不报错"],
-      ["新 worker 或新泳道", "冷构建", "**一上来就是热的**：每台机器都为最新提交保持热缓存"],
-      ["“刚才为什么慢？”", "翻日志，靠猜", "**问飞行记录器**：哪个线程在等、在等什么、正在编译哪个函数"]
+      ["改动生效", "重新构建、重新链接：几分钟", "**毫秒级打上补丁**（送到机器约 50–200 ms）"],
+      ["测试结果", "先重新构建测试二进制，再运行", "**92 个测试，保存后 2.2 s**"],
+      ["查看界面", "重新构建、重新启动、再点回原来的页面", "**运行中应用的一帧，存成 PNG**"],
+      ["新 worker", "冷构建", "**一上来就是热的**"]
     ],
-    makepad: "用许多并行工作的 AI 智能体来构建自己的应用，每个智能体各占一条泳道，而 Relax 让它们都保持高速。它的开发中枢 **devhub** 围绕 Relax 调度构建与测试机器，所以智能体碰到的一切都不会是冷的。",
-    loop: [
-      { title: "AI 智能体", sub: "修改一个文件" },
-      { title: "devhub", sub: "分派到已预热的机器" },
-      { title: "Relax 实时会话", sub: "只给改动的部分打补丁" }
-    ],
-    edges: ["同步，~50–200 ms", ""],
-    outs: [
-      { title: "测试重跑", sub: "几秒出结果" },
-      { title: "应用画面", sub: "抓取为 PNG" },
-      { title: "飞行记录器", sub: "为什么慢、编译了什么" }
-    ],
-    back: "返回给 AI 智能体",
-    bullets: [
-      { title: "每条泳道一个实时会话", body: "每个智能体的应用或测试，都在机器池中的某台机器上由 Relax 持续运行，每次保存都给它打补丁。不重新构建，也不重新启动。" },
-      { title: "处处是热缓存", body: "每有改动合入，每台机器都会刷新自己的 Relax 缓存，所以新起的 worker 一启动就是热的。" },
-      { title: "循环里没有原生构建", body: "devhub 把迭代和合入前检查都交给 Relax，并按泳道统计每一次漏网的原生构建。" },
-      { title: "按实测调度", body: "任务按实测耗时估算大小，快速检查交给有热会话的机器，绝不会排在长时间构建后面。" }
-    ],
+    makepad: "用许多并行的 AI 智能体构建自己的应用；它的开发中枢 **devhub** 让每个智能体的运行在预热好的机器上由 Relax 持续保持。",
     practice: [
       { word: "九条", label: "智能体泳道并行运行" },
       { count: { value: 300, decimals: 0, suffix: "+" }, label: "每小时由 devhub 处理的构建与测试任务" },
       { word: "数十个", label: "改动每天合入，每一个都先在 Relax 下检查，再合并" }
     ]
   },
-
-  features: [
-    ["启动", "构建整张 crate 依赖图，链接，然后运行 `main`。", "**解析 crate 依赖图，直接从源码启动 `main`。**你的代码不需要原生构建。"],
-    ["检查", "预先对每个 crate 做类型检查和借用检查。", "**一样，在第一次调用之前完成。**"],
-    ["编译", "整个 crate，提前编译。", "**一次一个函数，在它第一次被调用的那一刻。**热点函数在后台逐级升档：解释器 → O1 → O3。`#[relax(O2)]` / `#[relax(O3)]` 可以提前指定级别；在 rustc 下这个属性什么也不做。"],
-    ["编辑", "重新构建，然后重启。", "**程序运行期间，只重新检查、重新编译、热替换改动的部分。**已经交出去的代码依然有效。无法热替换的改动会让程序原地重启。"],
-    ["缓存", "按 crate 存放的增量编译产物。", "**每个结果都以其输入的哈希为键。**没有改动的包什么都不重新编译。"],
-    ["过程宏", "构建成原生 dylib，再加载。", "**与已链接的构建一致时原生运行，否则在 JIT 上运行。**"],
-    ["标准库", "预编译好随工具链分发。", "**`core`、`alloc` 和 `std`（134k 行）由 Relax 自己从源码编译。**"],
-    ["原生代码", "全部都是原生的。", "**必须保持原生的 crate（系统层、GPU、音频）用 `#[relax_api]` 导出接口。**JIT 代码通过 C ABI 规划器调用它们，跨越边界时按线程路由堆内存。"],
-    ["可观测性", "事后看编译器计时。", "**实时飞行记录器，**附带卡顿事件和编译分析器。"],
-    ["后端", "LLVM，再接系统链接器。", "**自研的 x86-64 与 AArch64 代码生成器，**不用链接器，也不用 LLVM。"]
-  ],
 
   /* measured speed: main pastes the benchmark JSON here */
   bench: placeholderBench(),
@@ -1269,12 +1125,12 @@ const DATA = {
   },
 
   gaps: {
-    intro: "LLVM 背后是几十年的优化积累，在稳定状态下，它生成的代码仍然比 Relax 的快。以下是我们自己的测量：**热 JIT 对比同一份源码、同样输入的原生构建，取实际耗时之比。**越低越好，1.00× = LLVM。",
+    intro: "在稳定状态下，LLVM 生成的代码仍然更快。**热 JIT 对比同一份源码、同样输入的原生构建**，取实际耗时之比（越低越好，1.00× = LLVM）。",
     chartTitle: "Relax 对比 `--release`（本机 CPU）",
     baseline: { value: 1.00, label: "1.00× = LLVM，针对本机 CPU 的 --release" },
     overLabel: "Relax 比 LLVM 多用的时间",
     measuredLabel: "测于",
-    tableNote: "以上是我们最常剖析的负载。本周一次覆盖 18 个负载的更广泛测试，结果比这些数字更慢，也比十月份更慢；我们正在查明原因，查清后会在这里更新结果。",
+    tableNote: "以上是我们最常剖析的负载。本周一次覆盖 18 个负载的更广泛测试结果更慢；我们正在查明原因。",
     rows: [
       { workload: "3D 打印切片器：零件首次切片，4 线程", cpu: "x86-64 (Zen 4)", ratio: { value: 1.14, decimals: 2, suffix: "×" }, detail: "周期数 1.15 倍，指令数 1.26 倍", measured: "2026-11-11" },
       { workload: "同上，8 线程", cpu: "x86-64 (Zen 4)", ratio: { value: 1.17, decimals: 2, suffix: "×" }, measured: "2026-11-11" },
@@ -1286,63 +1142,15 @@ const DATA = {
     ],
     which: {
       title: "哪个 `--release`？",
-      body: "大多数 Rust 程序发布时用的是普通 `--release`，面向可移植的基线 CPU，在 x86-64 上就是不用 AVX。我们的数字对比的是更难的设定：带 `-C target-cpu=native` 的 `--release`，LLVM 可以用上这台机器的每一条指令。Relax 总是针对它所运行的 CPU 编译，所以对比普通 `--release` 时这些差距会缩小，在向量运算密集的代码上甚至可能反转。**这项对比还没有测过。**"
+      body: "对比的是带 `-C target-cpu=native` 的 `--release`。大多数 Rust 程序用面向可移植 CPU 的普通 `--release` 发布，而 Relax 针对它所运行的 CPU 编译，所以那时差距会缩小。**尚未测量。**"
     },
-    causesIntro: "**差距从哪来**：基于同一批函数的指令级对比。差距来自多出来的指令，而不是停顿：指令数是 1.26 倍，周期数只有 1.15 倍。",
-    causesTitle: "多出的指令按原因分类（切片器运行）",
-    causes: [
-      { cause: "比较结果存成 bool 寄存器，之后又重新计算", g: 25, text: "~25 G" },
-      { cause: "寄存器间拷贝（二地址形式、拷贝合并遗漏）", g: 23, text: "~23 G" },
-      { cause: "栈访问：循环状态放在栈槽里；可分配寄存器只有 12 个，rustc 有 15 个", g: 22, text: "~22 G" },
-      { cause: "多余的循环控制与检查分支，循环不变的判断留在了循环内", g: 13, text: "~13 G" },
-      { cause: "load 没有折叠进比较、i128 运算、重新物化的常量，以及其他小项", g: 33, text: "~33 G" },
-      { cause: "生成代码之外的运行时开销（memcpy、分配器包装、TLS 访问、桩代码）", g: 40, text: "~40 G" },
-      { cause: "没有循环向量化，循环展开较浅", g: null, text: "数值内核差距的大头" }
-    ],
-    notCause: "不是原因的：内联。Relax 内联得比 rustc 还多。",
     trend: {
       from: "1.26×",
       to: { from: 1.26, value: 1.14, decimals: 2, suffix: "×" },
-      text: "表里每一行都是一项待办，切片器的差距在过去三天里从 1.26 倍缩小到了 1.14 倍。"
+      text: "切片器的差距在三天里从 1.26 倍缩小到 1.14 倍。其余差距从哪来：见 [README](https://github.com/makepad/relax#where-llvm-still-wins)。"
     }
   },
 
-  arch: {
-    intro: "rustc 把你的程序交给 LLVM 和链接器，再由 Cargo 把各个步骤粘在一起。**Relax 在一个进程里包揽整条流水线，从源码字节一直到可执行内存。**",
-    intro2: "Relax 是一层层叠起来的。每一层都是独立的 crate，只依赖它下面的层并重新导出它们，所以在任何一层，每个模块都是 `crate::<module>`。各层并行编译，上层的改动永远不会让下层重新构建。",
-    groups: [
-      { title: "", items: [{ name: "Cargo 包", sub: ".rs 源码 + Cargo.toml" }] },
-      { title: "前端：程序写了什么", items: [
-        { name: "relax-lex", sub: "词法分析器 + 过程宏 token 模型", chain: true },
-        { name: "relax-base", sub: "哈希、arena、语法树、manifest、git 与源码挂载", chain: true },
-        { name: "relax-session", sub: "编译输入、稳定哈希", chain: true },
-        { name: "relax-front", sub: "解析、crate 依赖图、名称解析、宏展开、derive", chain: true } ] },
-      { title: "类型：程序是什么意思", items: [
-        { name: "relax-types", sub: "驻留类型、impl、类型检查、布局、常量求值、借用检查", chain: true } ] },
-      { title: "代码：程序怎么跑", items: [
-        { name: "relax-codegen", sub: "RIR 优化器 O1 / O3、循环 + 范围、threaded-code 解释器", chain: true },
-        { name: "relax-backend", sub: "RIR + 向量、寄存器分配、x86-64 / AArch64 代码、C ABI、可执行内存", chain: true } ] },
-      { title: "relax-compiler：运行时", items: [
-        { name: "JIT 运行时", sub: "惰性编译、分层、实时替换、热缓存、飞行记录器", chain: true },
-        { name: "core / alloc / std", sub: "从源码编译", link: "→ relax-types" },
-        { name: "过程宏宿主", sub: "", link: "→ relax-front" },
-        { name: "relax_api", sub: "原生 crate", link: "↔ JIT 运行时" } ] }
-    ],
-    layerHeads: { was: "在 rustc 体系里" },
-    layers: [
-      ["relax-lex", "libs/relax/lex", "统一的 Rust 词法分析器和 token 模型（覆盖所有 edition），也是过程宏看到的那个 token 模型。", "词法分析器与 `proc_macro`"],
-      ["relax-base", "libs/relax/base", "各阶段共用的基础：哈希、内存记账与分区分配、并发容器与 arena、语法树、`cfg`、manifest（TOML、依赖解析）、git 读取路径与源码挂载。", "Cargo 的一部分，以及 rustc 的共享基础设施"],
-      ["relax-session", "libs/relax/session", "一次编译的输入及其稳定哈希：所有缓存都建立在这些键之上。", "session 与增量编译的键"],
-      ["relax-front", "libs/relax/front", "语法解析、crate 依赖图与名称解析、宏展开：`macro_rules!`、内置宏、`format_args!`、derive 与过程宏注册。", "解析器、名称解析、宏展开"],
-      ["relax-types", "libs/relax/types", "驻留类型、签名与 impl、类型检查、布局、常量求值、借用检查器、按定义查询函数体，以及稳定的类型哈希。", "类型检查器、借用检查器、常量求值"],
-      ["relax-codegen", "libs/relax/codegen", "基于 RIR（Relax IR）的中端：O1 与 O3 优化器（内联、折叠、循环与范围 pass）、threaded-code 解释器这一层级，以及编译分析器。", "MIR 优化与 LLVM 优化器"],
-      ["relax-backend", "libs/relax/backend", "寄存器分配、面向宿主机的机器码（x86-64 或 AArch64）、跳转表、C ABI 规划器与可执行内存。", "LLVM 的代码生成器与链接器"],
-      ["relax-compiler", "libs/relax/compiler", "编译器、JIT 运行时和 std 合为一个库：惰性编译、分层、实时编辑、缓存、过程宏宿主和测试运行器。", "Cargo、rustc driver、测试框架与操作系统加载器"],
-      ["relax-native-macros", "libs/relax/native_macros", "原生链接的过程宏，会对照其源码校验，确保展开结果与在 Cargo 下完全一致。", "过程宏 dylib"],
-      ["属性", "libs/relax/attr", "`#[relax(O2)]` / `#[relax(O3)]`：优化级别属性；在 rustc 下不起作用。", "按 profile 设置的 `opt-level`"],
-      ["relax_api", "libs/relax_api", "`#[relax_api]`：原生编译的 crate 向 JIT 代码提供的接口，以及按线程的堆路由。", "（没有对应物：一切都是原生的）"]
-    ]
-  },
 
   life: {
     actors: { app: "运行中的程序", rt: "JIT 运行时", ty: "类型层", cg: "代码生成 + 后端" },
@@ -1353,7 +1161,7 @@ const DATA = {
     ],
     loopLabel: "循环：f 一直是热点",
     steps: [
-      { note: "首次调用之前，程序的每个 crate 都已完成类型检查" },
+      { note: "main 运行之前，程序自己的 crate 已完成类型检查" },
       { from: "app", to: "rt", msg: "首次调用 fn f" },
       { from: "rt", to: "cg", msg: "编译 f（解释器或 O1）", tier: 1 },
       { from: "cg", to: "rt", msg: "机器码，已发布" },
@@ -1370,40 +1178,9 @@ const DATA = {
     closing: ["换成 rustc，同样的改动意味着：", "重新构建 crate、重新链接、重启。"]
   },
 
-  rules: [
-    { title: "先检查，再运行", body: "与 rustc 同样的保证：没检查过的代码绝不运行。只是 Relax 不会让你先等程序的其余部分。" },
-    { title: "永不过期", body: "每个缓存结果都以其输入的哈希为键。命中的结果与全新编译的产物完全一致，所以根本不需要 `cargo clean`。" },
-    { title: "代码只增不减", body: "已发布的机器码，只要还可能出现在某个栈上，就绝不会被释放或改写。热替换会发布新代码，并把之后的调用重定向过去；原生热重载的野路子不安全的地方，它是安全的。" },
-    { title: "默认按需", body: "rustc 会编译所有你可能调用的代码。Relax 只编译你真正调用的，并在后台优化它。" },
-    { title: "原样的 Rust", body: "普通的 crate，来自 crates.io 和 git。`libs/relax/KNOWN_GAPS.md` 列出了目前还不支持的部分。" },
-    { title: "可观测", body: "每个阶段都会报告自己在做什么；任何一次卡顿，都能从它的记录里找到原因。" }
-  ],
 
-  build: {
-    heads: ["rustc", "Relax"],
-    rows: [["构建它需要", "LLVM，外加一次自举", "**一套 stable Rust 工具链。crates.io 上的东西一个都不用。**"]],
-    command: "cargo build --release -p relax-compiler",
-    after: "编译器是 `relax_compiler` 这个库；`relax`（`tools/run/runner`）是它的命令行运行器。",
-    layout: [
-      "Cargo.toml                           工作区",
-      "libs/relax/",
-      "  lex/ base/ session/ front/ types/  前端与类型系统",
-      "  codegen/ backend/                  中端与机器码",
-      "  compiler/                          运行时、std（compiler/std）、",
-      "                                     96 个端到端测试包",
-      "  attr/ native_macros/               #[relax(..)] 与原生过程宏",
-      "  KNOWN_GAPS.md                      尚未支持的内容",
-      "libs/relax_api/                      #[relax_api] 与按线程的堆路由",
-      "tools/run/runner/                    relax，命令行运行器",
-      "libs/ platform/ tools/ widgets/      Relax 链接的几个小型支撑 crate：",
-      "                                     token 模型、序列化、远程检视、",
-      "                                     性能分析，以及它对照源码",
-      "                                     校验的原生过程宏"
-    ].join("\n"),
-    license: "MIT 许可证，见 [LICENSE](https://github.com/makepad/relax/blob/main/LICENSE)。Relax 编译的 std 源码带有各自的版权声明，见 `libs/relax/compiler/std/CREDITS.md` 及其旁边的许可证文件。"
-  }
+  license: "MIT 许可证，见 [LICENSE](https://github.com/makepad/relax/blob/main/LICENSE)。Relax 编译的 std 源码带有各自的版权声明，见 `libs/relax/compiler/std/CREDITS.md` 及其旁边的许可证文件。"
 };
-
 /* ------------------------------ helpers ------------------------------ */
 const REDUCED = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
 document.documentElement.classList.add("js");
@@ -1484,10 +1261,6 @@ DATA.hero.stats.forEach((s, i) => {
   d.appendChild(counter(el("strong", "grad"), s));
   add(d, "span", "", esc(s.label));
 });
-(function () {
-  const m = $("#mq"), words = DATA.hero.marquee.concat(DATA.hero.marquee);
-  words.forEach(w => add(m, "span", "", esc(w)));
-})();
 
 /* ------------------------------ race ------------------------------ */
 (function () {
@@ -1571,8 +1344,7 @@ DATA.hero.stats.forEach((s, i) => {
   });
 })();
 
-/* ------------------------------ why + live patch demo ------------------------------ */
-versus($("#vsWhy"), ["用 rustc", "用 Relax"], DATA.why.rows);
+/* ------------------------------ live patch demo ------------------------------ */
 (function () {
   const D = DATA.demo;
   const code = $("#code"), edState = $("#edState"), pgState = $("#pgState");
@@ -1706,83 +1478,8 @@ versus($("#vsWhy"), ["用 rustc", "用 Relax"], DATA.why.rows);
 })();
 
 /* ------------------------------ agents ------------------------------ */
-(function () {
-  const A = DATA.agents, row = $("#loopRow"), groups = [];
-  function node(host, n) { const d = add(host, "div", "node"); add(d, "b", "", esc(n.title)); add(d, "span", "", esc(n.sub)); return d; }
-  versus($("#vsAgents"), A.heads, A.table);
-  A.loop.forEach((n, i) => {
-    groups.push([node(row, n)]);
-    if (i < A.loop.length - 1) add(row, "div", "edge", "<i class=\"rail" + (window.innerWidth < 860 ? " y" : "") + "\" aria-hidden=\"true\"></i>" + esc(A.edges[i] || ""));
-  });
-  groups.push(A.outs.map(n => node($("#loopOuts"), n)));
-  cards($("#agentBullets"), A.bullets);
-  A.practice.forEach((p, i) => bigcard($("#practice"), p, i));
-  let i = -1;
-  ticker($("#loopBox"), 1150, () => {
-    if (i >= 0) groups[i].forEach(n => n.classList.remove("on"));
-    i = (i + 1) % groups.length;
-    groups[i].forEach(n => n.classList.add("on"));
-  });
-})();
-
-/* ------------------------------ tl;dr ------------------------------ */
-DATA.tldr.items.forEach(it => add($("#tldrList"), "li", "", "<b>" + esc(it[0]) + "</b><span>" + rich(it[1]) + "</span>"));
-
-/* ------------------------------ devhub illustration ------------------------------ */
-(function () {
-  const D = DATA.devhub, grid = $("#dhGrid");
-  const T = (x, y, s, c, a) => "<text x=\"" + x + "\" y=\"" + y + "\" class=\"" + (c || "") + "\"" + (a ? " text-anchor=\"" + a + "\"" : "") + ">" + esc(s) + "</text>";
-  const R = (x, y, w, h, c, r) => "<rect x=\"" + x + "\" y=\"" + y + "\" width=\"" + w + "\" height=\"" + h + "\" rx=\"" + (r || 0) + "\" class=\"" + c + "\"/>";
-  const C = (x, y, r, c, i) => "<circle cx=\"" + x + "\" cy=\"" + y + "\" r=\"" + r + "\" class=\"" + c + "\" style=\"--i:" + (i || 0) + "\"/>";
-  const G = (c, i, body) => "<g class=\"" + c + "\" style=\"--i:" + i + "\">" + body + "</g>";
-  function panel(key, h, body) {
-    const p = add(grid, "div", "dh-p"), t = D.panels[key];
-    add(p, "h3", "", esc(t[0]) + "<small>" + esc(t[1]) + "</small>");
-    const wrap = add(p, "div", "", "<svg viewBox=\"0 0 320 " + h + "\" role=\"img\" aria-label=\"" + esc(t[0] + "：" + t[1]) + "\">" + body + "</svg>");
-    return wrap;
-  }
-  /* lanes */
-  panel("lanes", 4 + D.lanes.length * 27, D.lanes.map((l, i) => {
-    const y = 2 + i * 27;
-    return G("", i, R(0, y, 320, 22, "dbg", 6) + R(0, y, 320, 22, "dfl", 6) + C(13, y + 11, 4, "ddot", i) + T(26, y + 15, l[0], "dt") + T(168, y + 15, l[1], "dm") + T(310, y + 15, l[2], "ds", "end"));
-  }).join(""));
-  /* boxes, each with a warm JIT cache gauge, and the lease queue */
-  let b = D.boxes.map((name, i) => {
-    const x = (i % 3) * 108 + 2, y = Math.floor(i / 3) * 104 + 2, arc = "M" + (x + 24) + " " + (y + 64) + "a26 26 0 0 1 52 0";
-    let dots = "";
-    for (let k = 0, n = 1 + i % 3; k < n; k++) dots += C(x + 50 + (k - (n - 1) / 2) * 11, y + 58, 3, "ddot", i + k);
-    return R(x, y, 100, 96, "dbx", 10) + T(x + 50, y + 18, name, "dm sm", "middle") + "<path d=\"" + arc + "\" class=\"dgt\"/><path d=\"" + arc + "\" class=\"dg\" style=\"--i:" + i + "\"/>" + dots + T(x + 50, y + 84, D.warm, "ds sm", "middle");
-  }).join("");
-  let chips = "";
-  for (let k = 0; k < 7; k++) chips += R(60 + k * 28, 219, 22, 12, "dq" + (k === 0 ? " a" : k === 6 ? " z" : ""), 4);
-  b += T(2, 229, D.queue[0], "dm") + "<g class=\"dqg\">" + chips + "</g>" + T(2, 250, D.queue[1], "dm sm");
-  panel("boxes", 256, b);
-  /* inside a box: the change meets the JIT */
-  let j = "<line x1=\"12\" y1=\"21\" x2=\"12\" y2=\"" + (21 + (D.steps.length - 1) * 44) + "\" class=\"drl\"/>";
-  D.steps.forEach((s, i) => {
-    const y = 4 + i * 44;
-    j += G("dst", i, R(28, y, 290, 34, "dbx", 8) + C(12, y + 17, 4, "dn") + T(40, y + 21, s[0], "dt") + T(308, y + 21, s[1], "ds", "end"));
-  });
-  const oy = 12 + D.steps.length * 44;
-  D.outs.forEach((o, i) => {
-    const y = oy + i * 28;
-    j += G("dst", D.steps.length + i, R(28, y, 290, 22, "dbg", 6) + T(40, y + 15, o[0], "dt") + T(308, y + 15, o[1], "ds", "end"));
-  });
-  j += C(12, 21, 5, "dtr") + T(173, oy + D.outs.length * 28 + 16, D.back, "dm", "middle");
-  panel("jit", oy + D.outs.length * 28 + 24, j);
-  /* a live session: the app frame and the save, shipped, verdict, frame timeline */
-  let l = R(0, 1, 320, 126, "dbx", 10) + R(8, 9, 70, 110, "dbg", 5) + R(16, 18, 40, 6, "dln", 3) + R(16, 32, 52, 6, "dln", 3) + R(16, 46, 34, 6, "dln", 3) +
-    R(88, 12, 150, 8, "dln", 4) + R(88, 28, 214, 8, "dln", 4) + R(88, 44, 180, 8, "dln", 4) + R(88, 64, 96, 46, "dpa", 8) + R(88, 64, 214, 46, "dpb", 8) + T(310, 122, D.frame, "dm sm", "end");
-  l += "<line x1=\"12\" y1=\"158\" x2=\"12\" y2=\"" + (158 + (D.timeline.length - 1) * 34) + "\" class=\"drl\"/>";
-  D.timeline.forEach((s, i) => {
-    const y = 146 + i * 34;
-    l += G("dst", i * 1.75, C(12, y + 12, 5, "dn") + T(28, y + 16, s[0], "dt") + T(318, y + 16, s[1], "ds", "end"));
-  });
-  panel("live", 146 + D.timeline.length * 34, l);
-})();
-
-/* ------------------------------ features ------------------------------ */
-versus($("#vsFeat"), ["rustc + Cargo", "Relax"], DATA.features);
+versus($("#vsAgents"), DATA.agents.heads, DATA.agents.table);
+DATA.agents.practice.forEach((p, i) => bigcard($("#practice"), p, i));
 
 /* ------------------------------ speed (reads DATA.bench) ------------------------------ */
 (function () {
@@ -1902,51 +1599,10 @@ versus($("#vsFeat"), ["rustc + Cargo", "Relax"], DATA.features);
   const W = $("#gapWhich");
   add(W, "h3", "", rich(G.which.title)); add(W, "p", "", rich(G.which.body));
 
-  const COL = ["#a892ff", "#7ab8ff", "#5ef2c2", "#ffcf6b", "#f08a52", "#ff7fb0"];
-  const stack = $("#causeStack"), list = $("#causeList");
-  G.causes.forEach((c, i) => {
-    const li = add(list, "li", c.g == null ? "text" : "");
-    const sw = add(li, "i"); add(li, "span", "", esc(c.cause)); add(li, "b", "", esc(c.text));
-    if (c.g == null) { sw.style.border = "1px dashed var(--line2)"; return; }
-    sw.style.background = COL[i % COL.length];
-    const seg = add(stack, "i"); seg.style.flex = c.g + " 1 0"; seg.style.background = COL[i % COL.length]; seg.style.setProperty("--d", i);
-  });
-
   const T = $("#gapTrend"), nums = add(T, "div", "nums");
   add(nums, "s", "", esc(G.trend.from)); add(nums, "span", "", "&rarr;").setAttribute("aria-hidden", "true");
   nums.appendChild(counter(el("b", "grad"), G.trend.to));
   add(T, "p", "", rich(G.trend.text));
-})();
-
-/* ------------------------------ architecture ------------------------------ */
-(function () {
-  const A = DATA.arch, box = $("#archBox"), chain = [];
-  A.groups.forEach((g, gi) => {
-    if (gi) add(box, "div", "conn rail y").setAttribute("aria-hidden", "true");
-    const grp = add(box, "div", "grp");
-    if (g.title) add(grp, "span", "cap", esc(g.title));
-    const items = add(grp, "div", "items");
-    g.items.forEach(it => {
-      const n = add(items, "div", "node m");
-      add(n, "b", "", esc(it.name));
-      if (it.sub) add(n, "span", "", esc(it.sub));
-      if (it.link) add(n, "small", "", esc(it.link));
-      if (it.chain) chain.push(n);
-    });
-  });
-  const L = $("#layers");
-  A.layers.forEach(r => {
-    const a = add(L, "article", "layer reveal");
-    add(a, "h3", "", esc(r[0]) + "<span class=\"path\">" + esc(r[1]) + "</span>");
-    add(a, "p", "", rich(r[2]));
-    add(a, "p", "was", "<b>" + esc(A.layerHeads.was) + "</b>" + rich(r[3]));
-  });
-  let i = -1;
-  ticker(box, 800, () => {
-    if (i >= 0) chain[i].classList.remove("on");
-    i = (i + 1) % chain.length;
-    chain[i].classList.add("on");
-  });
 })();
 
 /* ------------------------------ a function's life ------------------------------ */
@@ -1981,9 +1637,13 @@ versus($("#vsFeat"), ["rustc + Cargo", "Relax"], DATA.features);
   });
 })();
 
-/* ------------------------------ rules, build ------------------------------ */
-cards($("#ruleList"), DATA.rules);
-versus($("#vsBuild"), DATA.build.heads, DATA.build.rows);
+/* ------------------------------ tradeoffs, benefits ------------------------------ */
+cards($("#tradeList"), DATA.tradeoffs.items);
+DATA.benefits.items.forEach((b, i) => {
+  const c = add($("#benefitList"), "article", "card fact reveal"); c.style.setProperty("--d", i % 2);
+  add(c, "h3", "", esc(b.title)); add(c, "p", "", rich(b.body));
+  add(c, "p", "use", b.cmd.map(x => "<code>" + esc(x) + "</code>").join(" "));
+});
 
 /* ------------------------------ reveals, counters, off-screen pause, progress ------------------------------ */
 (function () {
