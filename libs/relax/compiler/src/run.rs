@@ -2712,6 +2712,41 @@ pub(crate) struct NativeCallbacks {
     slots: Vec<(usize, DefId, String)>,
 }
 
+/// --allow-c's native libraries (handle, file, load base once a symbol of theirs was found): the
+/// program's own C, whose definitions its extern blocks bind to first.
+static NATIVE_BUNDLES: std::sync::Mutex<Vec<(usize, std::path::PathBuf, usize)>> = std::sync::Mutex::new(Vec::new());
+
+fn note_native_bundle(handle: usize, path: &str) {
+    let file = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+    let mut bundles = NATIVE_BUNDLES.lock().unwrap_or_else(|e| e.into_inner());
+    if !bundles.iter().any(|b| b.0 == handle) {
+        crate::zone_alloc::kept_with(|| bundles.push((handle, file, 0)));
+    }
+}
+
+/// `name`'s address when an --allow-c native library defines it itself: what the system linker
+/// binds first for a static library the program links. A process-wide lookup (RTLD_DEFAULT) finds
+/// the first image that defines the name, which can be a system library the host loaded before
+/// (macOS: libsqlite3 behind its frameworks, so a bundled SQLite ran as the system's; relax issue
+/// 78). A name the library only imports resolves in the library it comes from, not here.
+pub(crate) fn native_definition(name: &str) -> Option<u64> {
+    let mut bundles = NATIVE_BUNDLES.lock().unwrap_or_else(|e| e.into_inner());
+    for (handle, file, base) in bundles.iter_mut() {
+        let p = crate::os::proc::symbol_in(*handle, name);
+        if p == 0 {
+            continue;
+        }
+        let Some((image, image_file)) = crate::os::proc::image_of(p) else { continue };
+        if *base == 0 && std::fs::canonicalize(&image_file).is_ok_and(|f| f == *file) {
+            *base = image;
+        }
+        if *base != 0 && image == *base {
+            return Some(p as u64);
+        }
+    }
+    None
+}
+
 /// The stubs of the library `handle`, each matched to the program's fn of its name (one of the
 /// loader's crates, `crates`: a domain's own, None: any); a symbol no fn defines is the error a
 /// linker would report.
@@ -2798,6 +2833,7 @@ pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(Strin
             format!("cannot load {} (--allow-c native library of {}): {}", n.path, n.crates.join(", "), error)
         })?;
         callbacks = native_callbacks(prog, n, handle, crates)?;
+        note_native_bundle(handle, &n.path);
     }
     let provided_static = |name: &str| native.is_some_and(|n| n.statics.iter().any(|s| s == name));
     for (name, fw) in link_libs {

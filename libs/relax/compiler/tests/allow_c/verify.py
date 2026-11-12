@@ -60,6 +60,7 @@ command = [binary, "run", "--allow-c", "allow-c-fixture"]
 first = run("first", command)
 assert first.stdout == baseline.stdout, "native/JIT fixture output differs from cargo"
 assert "callback 50\n" in first.stdout, f"C code calling back into Rust: {first.stdout}"
+assert "shadowed cnative cnative\n" in first.stdout, f"a system library's copy of a name the C defines: {first.stdout}"
 assert "building native dependencies with cargo" in first.stderr, "cold native build was not exercised"
 
 native = scratch / "jit" / "native"

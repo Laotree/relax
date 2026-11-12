@@ -258,6 +258,16 @@ mod unix {
         unsafe { dlsym(handle as *mut u8, name.as_ptr().cast()) as usize }
     }
 
+    /// The image (its load base) holding `addr`, and that image's file (dladdr).
+    pub fn image_of(addr: usize) -> Option<(usize, std::path::PathBuf)> {
+        let mut info = super::DlInfo::default();
+        if unsafe { super::dladdr(addr as *const u8, &mut info) } == 0 || info.fname.is_null() {
+            return None;
+        }
+        let file = unsafe { std::ffi::CStr::from_ptr(info.fname) }.to_string_lossy().into_owned();
+        Some((info.fbase as usize, std::path::PathBuf::from(file)))
+    }
+
     // (Android's own `lookup` also asks the host library and the program's libraries)
     #[cfg(not(target_os = "android"))]
     pub unsafe fn lookup(handle: *mut u8, name: *const u8) -> *mut u8 {
@@ -382,7 +392,7 @@ mod imp {
     pub fn load_path(path: &str) -> Result<usize, String> {
         super::unix::load_path(path, 2 | 0x100)
     }
-    pub use super::unix::symbol_in;
+    pub use super::unix::{image_of, symbol_in};
 
     pub fn load_library(name: &str, framework: bool) -> bool {
         let path = if framework { format!("/System/Library/Frameworks/{}.framework/{}\0", name, name) } else { format!("lib{}.so\0", name) };
@@ -546,7 +556,7 @@ mod imp {
     pub fn load_path(path: &str) -> Result<usize, String> {
         super::unix::load_path(path, 2 | 0x100)
     }
-    pub use super::unix::symbol_in;
+    pub use super::unix::{image_of, symbol_in};
 
     pub fn load_library(name: &str, framework: bool) -> bool {
         let path = if framework { format!("/System/Library/Frameworks/{}.framework/{}\0", name, name) } else { format!("lib{}.so\0", name) };
@@ -615,7 +625,7 @@ mod imp {
     pub fn load_path(path: &str) -> Result<usize, String> {
         super::unix::load_path(path, 2 | 8)
     }
-    pub use super::unix::symbol_in;
+    pub use super::unix::{image_of, symbol_in};
 
     pub fn load_library(name: &str, framework: bool) -> bool {
         let path = if framework { format!("/System/Library/Frameworks/{}.framework/{}\0", name, name) } else { format!("lib{}.dylib\0", name) };
@@ -703,6 +713,10 @@ mod imp {
 
     pub fn symbol_in(_handle: usize, _name: &str) -> usize {
         0
+    }
+
+    pub fn image_of(_addr: usize) -> Option<(usize, std::path::PathBuf)> {
+        None
     }
 
     /// `#[link(name = "user32")]` / raw-dylib `name = "DINPUT8"`: the DLL of that name.

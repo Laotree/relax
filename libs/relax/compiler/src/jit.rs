@@ -7115,6 +7115,9 @@ impl Unit {
         if let Some(s) = self.syms.find_foreign(&link) {
             return Some(self.syms.value(s));
         }
+        if let Some(a) = crate::run::native_definition(&link) {
+            return Some(a);
+        }
         let name = format!("{}\0", link);
         let p = unsafe { os::proc::find(name.as_ptr()) };
         if p.is_null() { None } else { Some(p as u64) }
@@ -7144,6 +7147,10 @@ impl Unit {
         }
         if let Some(a) = loader_symbol(link.as_bytes()) {
             return Some(a as u64);
+        }
+        // the program's own C (--allow-c) before any image the host loaded (run.rs native_definition)
+        if let Some(a) = crate::run::native_definition(&link) {
+            return Some(a);
         }
         let name = format!("{}\0", link);
         let mut p = unsafe { os::proc::find(name.as_ptr()) };
