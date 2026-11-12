@@ -972,6 +972,19 @@ pub fn shown(text: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(text)
 }
 
+/// `path` as another program finds it: a shared workspace's file or folder is the checkout's
+/// (cargo's working folder for the native packages, native.rs); any other path is itself.
+pub fn on_disk(path: &str) -> std::borrow::Cow<'_, str> {
+    if SHARED.load(Ordering::Relaxed) {
+        if let Some((root, disk)) = SHARE_ROOTS.get() {
+            if let Some(rel) = relative(&normalize_path(path), root) {
+                return std::borrow::Cow::Owned(if rel.is_empty() { disk.clone() } else { format!("{disk}/{rel}") });
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(path)
+}
+
 /// The crates' print macros (lib.rs): a write whose error is dropped, a shared workspace's paths
 /// [`shown`].
 pub fn write_err(text: std::fmt::Arguments<'_>) {
@@ -1624,6 +1637,9 @@ mod tests {
         if SHARE_ROOTS.get().is_some_and(|r| r.0 == root) {
             assert_eq!(shown(&format!("{lib}:1:8: E0308")), format!("{}/src/lib.rs:1:8: E0308", normalize_path(&checkout.to_string_lossy())));
             assert_eq!(shown("/elsewhere/src/lib.rs:1:8"), "/elsewhere/src/lib.rs:1:8");
+            assert_eq!(on_disk(&format!("{root}/src")), format!("{}/src", normalize_path(&checkout.to_string_lossy())));
+            assert_eq!(on_disk(root), normalize_path(&checkout.to_string_lossy()));
+            assert_eq!(on_disk("/elsewhere/src"), "/elsewhere/src");
         }
         SHARED.store(false, Ordering::Release);
         assert_eq!(shown(&lib), lib.as_str(), "only a shared run's output is its checkout's");
