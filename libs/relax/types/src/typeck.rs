@@ -5874,10 +5874,13 @@ impl<'a> Fcx<'a> {
                             // (a generic index of a polymorphic body -- `I: SliceIndex<[T]>` --
                             // goes through std's `impl<T, I: SliceIndex<[T]>> Index<I> for [T]`:
                             // the result is `<I as SliceIndex<[T]>>::Output`)
+                            // only a usize (or a still-open integer) and the std range structs
+                            // index builtin; every other index type selects `Index` (rustc
+                            // lookup_indexing), std's `(Bound<usize>, Bound<usize>)` included
                             let std_range = match self.tcx.tys.kind(tis) {
                                 TyKind::Adt(..) => idx_is_range,
-                                TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) => false,
-                                _ => true,
+                                TyKind::Int(_) | TyKind::IntVar(_) | TyKind::Infer(_) | TyKind::Never | TyKind::Error => true,
+                                _ => false,
                             };
                             if !std_range {
                                 if let Some(td) = self.lang_item(&["ops", "Index"]) {
