@@ -308,6 +308,14 @@ pub fn _mm256_castsi128_si256(a: __m128i) -> __m256i {
     __m256i([a.0[0], a.0[1], 0, 0])
 }
 
+// rustc library/stdarch/crates/core_arch/src/x86/avx.rs: _mm256_zextsi128_si256, the upper
+// 128 bits zero (zlib-rs's AVX2 adler32).
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
+pub fn _mm256_zextsi128_si256(a: __m128i) -> __m256i {
+    __m256i([a.0[0], a.0[1], 0, 0])
+}
+
 #[inline]
 #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
 pub fn _mm256_set_epi64x(e3: i64, e2: i64, e1: i64, e0: i64) -> __m256i {
