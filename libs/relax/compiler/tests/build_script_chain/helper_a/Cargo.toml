@@ -1,0 +1,8 @@
+[package]
+name = "helper_a"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[build-dependencies]
+helper_b = { path = "../helper_b" }
