@@ -135,3 +135,40 @@ fn primitives_take_a_reference_to_a_primitive() {
     let scaled: Vec<f64> = [1.0, 2.0].iter().map(|t| 0.5 + t).collect();
     assert_eq!(scaled, [1.5, 2.5]);
 }
+
+/// The map's value type comes from the `insert` after the closure, so at `hit - t` the closure's
+/// `t` is a reference to a type not known yet: rustc takes `f64: Sub<&?V>`, which only core's
+/// `Sub<&f64> for f64` matches (a check once rejected it with E0308).
+fn deduped(hits: &[f64]) -> usize {
+    let mut last = std::collections::BTreeMap::new();
+    let mut kept = 0;
+    for &hit in hits {
+        if last.get(&0u8).is_some_and(|t| hit - t <= 1e-7) {
+            continue;
+        }
+        last.insert(0u8, hit);
+        kept += 1;
+    }
+    kept
+}
+
+/// The same with integers and a compound assignment through the reference.
+fn spread(xs: &[i64]) -> i64 {
+    let mut first = std::collections::HashMap::new();
+    let mut total = 0;
+    for &x in xs {
+        if let Some(f) = first.get(&1u8) {
+            let mut d = x;
+            d -= f;
+            total += d;
+        }
+        first.entry(1u8).or_insert(x);
+    }
+    total
+}
+
+#[test]
+fn a_reference_to_a_value_inferred_later() {
+    assert_eq!(deduped(&[1.0, 1.0, 2.0]), 2);
+    assert_eq!(spread(&[5, 7, 10]), 7);
+}

@@ -5189,7 +5189,7 @@ impl<'a> Fcx<'a> {
                 // `<Op>Assign` call (`n /= NonZero<u32>`, `x %= &big`; rustc is_builtin_binop needs
                 // both sides primitive)
                 let sb0 = self.shallow(tb);
-                if self.non_prim_operand(sb0) {
+                if self.non_prim_operand(sb0) || self.ref_to_var(sb0) {
                     self.cur_binop = e.0;
                     if self.prim_lhs_op(*op, e, sa, sb0, lo, true).is_some() {
                         return unit;
@@ -6644,12 +6644,15 @@ impl<'a> Fcx<'a> {
                 // both operands integral): built in, the shift took the reference's address
                 let tb0 = self.check_expr(b, None);
                 let sb0 = self.shallow(tb0);
-                if self.non_prim_operand(sb0) {
+                let non_prim = self.non_prim_operand(sb0);
+                if non_prim || self.ref_to_var(sb0) {
                     if let Some(r) = self.prim_lhs_op(op, e, sa, sb0, lo, false) {
                         return r;
                     }
-                    let (x, y) = (self.ty_str(sa), self.ty_str(sb0));
-                    self.err(lo, format!("E0277: {}", binop_unimplemented(op, &x, &y)));
+                    if non_prim {
+                        let (x, y) = (self.ty_str(sa), self.ty_str(sb0));
+                        self.err(lo, format!("E0277: {}", binop_unimplemented(op, &x, &y)));
+                    }
                 }
                 ta
             }
@@ -6689,7 +6692,7 @@ impl<'a> Fcx<'a> {
                 // a primitive left operand with a non-primitive right one is an operator trait
                 // call too (`3u32 * duration`: `impl Mul<Duration> for u32`; rustc is_builtin_binop
                 // needs both sides primitive)
-                if self.non_prim_operand(sb0) || matches!(self.tcx.tys.kind(sb0), TyKind::Infer(_)) {
+                if self.non_prim_operand(sb0) || self.ref_to_var(sb0) || matches!(self.tcx.tys.kind(sb0), TyKind::Infer(_)) {
                     let sa = self.shallow(ta);
                     if let Some(r) = self.prim_lhs_op(op, e, sa, sb0, lo, false) {
                         return r;
@@ -7612,6 +7615,17 @@ impl<'a> Fcx<'a> {
         if let TyKind::Ref(_, inner, _) = self.tcx.tys.kind(sb).clone() {
             let si = self.shallow(inner);
             return non_prim(self.tcx.tys.kind(si));
+        }
+        false
+    }
+
+    /// A reference to a type not known yet (`|t| x - t` where `t: &?V` comes from a map whose value
+    /// type a later `insert` gives): rustc's overloaded path, where `f64: Sub<&?V>` selects core's
+    /// `Sub<&f64> for f64`; the built-in one would unify `f64` with `&?V` (E0308).
+    fn ref_to_var(&mut self, sb: TyId) -> bool {
+        if let TyKind::Ref(_, inner, _) = self.tcx.tys.kind(sb).clone() {
+            let si = self.shallow(inner);
+            return matches!(self.tcx.tys.kind(si), TyKind::Infer(_));
         }
         false
     }
