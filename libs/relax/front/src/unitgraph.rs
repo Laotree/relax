@@ -466,7 +466,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
     // reads the cfgs, env and OUT_DIR a native build already in the cache produced, so it needs
     // no cargo and no link of its own.
     let builds = native.is_some_and(|m| m.builds());
-    let native_scripts: Vec<(usize, String)> = g.build_scripts.iter().enumerate().filter_map(|(i, bs)| {
+    let native_scripts: Vec<(usize, crate::native::NativeReason)> = g.build_scripts.iter().enumerate().filter_map(|(i, bs)| {
         let (_, pname, _) = &g.pkg[bs.krate];
         // A kept GPU-kernel script (`Artefact`) that links native code (makepad-ai-cuda's nvcc
         // archives, `links =`) is cargo's too with `--allow-c`: its archives join the run's
@@ -475,7 +475,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
         if noop::script(bs, &g.raw) || !(kept_native || matches!(script_role(pname, &bs.features), ScriptRole::ToRemove)) {
             return None;
         }
-        crate::native::native_reason(g, bs).map(|why| (i, why))
+        crate::native::native_reason(g, bs).map(|reason| (i, reason))
     }).collect();
     let cached = match native {
         Some(m) if !m.builds() && !native_scripts.is_empty() => {
@@ -486,9 +486,10 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
     };
     let mut native_seeds: Vec<usize> = Vec::new();
     let mut check_skipped: Vec<usize> = Vec::new();
-    for (i, why) in native_scripts {
+    for (i, reason) in native_scripts {
         let bs = &g.build_scripts[i];
         let (_, pname, _) = &g.pkg[bs.krate];
+        let why = reason.describe(pname);
         if builds || cached.is_some() {
             if builds && sess.runtime.profile {
                 eprintln!("makepad-run build-script: {} is native ({})", pname, why);
@@ -498,12 +499,12 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
         }
         // a script that runs a C compiler cannot work without one; `links =` / DEP_ metadata
         // alone run under Relax as before
-        if why.contains("build-dependency") && check_only {
+        if reason.compiles_c() && check_only {
             eprintln!("makepad check: `{}`'s build script compiles C ({}): not run without `--allow-c` (its cfgs and OUT_DIR are missing; a `--allow-c` run fills the cache this check reads)", pname, why);
             check_skipped.push(bs.krate);
             continue;
         }
-        if why.contains("build-dependency") {
+        if reason.compiles_c() {
             return Err(format!("`{}` compiles C ({}): it {}", pname, why, relax_session::options::C_GATE));
         }
     }
@@ -916,6 +917,8 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     }
     let chain = if chain.is_empty() { me } else { format!("{chain}>{me}") };
     let mut cmd = std::process::Command::new(&exe);
+    // a run of its own: nothing this run says of itself crosses; its folder's mount is set below
+    crate::progenv::scrub_run_facts(&mut cmd);
     cmd.args(["run", "--quiet", "--silent", "--run-dir", target_dir, "--units", &units_path, "build-script-build"]);
     cmd.env("OUT_DIR", &out_dir)
         // Build scripts may test this to skip work only rustc needs.
@@ -936,7 +939,6 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         .env("MAKEPAD_RUN_AS_RUSTC", "build-script")
         .env("MAKEPAD_RUN_SCRIPT_DEPTH", depth.to_string())
         .env("MAKEPAD_RUN_SCRIPT_CHAIN", &chain)
-        .env_remove("MAKEPAD_RUN_SELF_EXEC")
         // the script is compiled and run for the machine (cargo: build scripts are host
         // artifacts); the target it builds for reaches it only as TARGET / CARGO_CFG_TARGET_*
         .env_remove("MAKEPAD_RUN_CHECK_TARGET");
@@ -958,12 +960,15 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     // is handed over as the child's virtual workspace with the mount table
     if crate::vfs::is_virtual(dir) {
         cmd.env("MAKEPAD_RUN_WORKSPACE", dir).env("MAKEPAD_RUN_VFS", crate::vfs::mounts_text());
+        if let Some(e) = std::env::var_os("MAKEPAD_RUN_EDITS") {
+            cmd.env("MAKEPAD_RUN_EDITS", e);
+        }
     } else {
         // a package on disk (a registry crate of a store run): its folder is the current folder,
-        // not the run's virtual workspace (Relax's std resolves relative paths against
+        // and no virtual workspace crosses (Relax's std resolves relative paths against
         // MAKEPAD_RUN_WORKSPACE first: rustix's build.rs probed `src/backend/linux_raw/arch/x86_64.rs`
         // there, found nothing and chose its libc backend)
-        cmd.current_dir(dir).env_remove("MAKEPAD_RUN_WORKSPACE");
+        cmd.current_dir(dir);
     }
     // cargo's `[env]` configuration, after every variable set above (cargo apply_env_config)
     for (k, v) in crate::crates::config_env() {
@@ -976,7 +981,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     // script that names none: no file of its package changed)
     let mut env_key = format!("{:016x}", h);
     for (k, v) in cmd.get_envs() {
-        if k == "MAKEPAD_RUN_VFS" {
+        if SCRIPT_RUN_SHAPE_VARS.iter().any(|s| k == *s) {
             continue;
         }
         env_key.push_str(&format!("\n{}={}", k.to_string_lossy(), v.map(|v| v.to_string_lossy().into_owned()).unwrap_or_default()));
@@ -1040,16 +1045,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
             (Ok(stdout), out_dir)
         }
         Ok(o) => {
-            // the cause: the panic or error the script printed (Relax's report lines carry the
-            // panic message as "message"), else its last lines
-            let err = String::from_utf8_lossy(&o.stderr);
-            let lines: Vec<&str> = err.lines().filter(|l| !l.trim().is_empty()).collect();
-            let cause = lines
-                .iter()
-                .find_map(|l| l.split("\"message\":\"").nth(1).and_then(|r| r.split("\",\"").next()))
-                .map(|m| m.to_string())
-                .or_else(|| lines.iter().find(|l| l.contains("panicked") || l.starts_with("error")).map(|l| l.to_string()))
-                .unwrap_or_else(|| lines.iter().rev().take(3).rev().cloned().collect::<Vec<_>>().join(" | "));
+            let cause = script_error_cause(&String::from_utf8_lossy(&o.stderr));
             {
                 #[cfg(unix)]
                 let signal = {
@@ -1068,6 +1064,44 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         }
         Err(e) => (Err(format!("{} (build script of {}): {}", exe.display(), name, e)), out_dir),
     }
+}
+
+/// The cause a failing build script's stderr gives: the panic it printed (Relax's report lines
+/// carry the message as "message"), else the first errors its compile reported, else the first
+/// line that says it panicked or failed, else its last lines. A script that does not compile ends
+/// with `error: could not compile ..: not started`, which names no cause: its diagnostics come
+/// before it, in Relax's `path:line:col: E0308: ..` or rustc's `error[E0308]: ..` shape.
+fn script_error_cause(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    let is_error = |l: &str| match located_message(l) {
+        Some(m) => !["warning", "note", "help"].iter().any(|k| m.starts_with(k)),
+        None => l.starts_with("error[") || (l.starts_with("error:") && !l.starts_with("error: could not compile")),
+    };
+    let errors: Vec<&str> = lines.iter().copied().filter(|l| is_error(l)).take(3).collect();
+    lines
+        .iter()
+        .find_map(|l| l.split("\"message\":\"").nth(1).and_then(|r| r.split("\",\"").next()))
+        .map(|m| m.to_string())
+        .or_else(|| (!errors.is_empty()).then(|| errors.join(" | ")))
+        .or_else(|| lines.iter().find(|l| l.contains("panicked") || l.starts_with("error")).map(|l| l.to_string()))
+        .unwrap_or_else(|| lines.iter().rev().take(3).rev().cloned().collect::<Vec<_>>().join(" | "))
+}
+
+/// The message of a `path:line:col: message` line (Relax's diagnostics), None for another line.
+fn located_message(l: &str) -> Option<&str> {
+    let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let mut from = 0;
+    while let Some(i) = l[from..].find(": ") {
+        let at = from + i;
+        let mut head = l[..at].rsplitn(3, ':');
+        if let (Some(col), Some(line), Some(path)) = (head.next(), head.next(), head.next()) {
+            if number(col) && number(line) && !path.is_empty() {
+                return Some(&l[at + 2..]);
+            }
+        }
+        from = at + 2;
+    }
+    None
 }
 
 /// Why a stored rerun key no longer matches: the first differing line, and for the environment
@@ -1099,6 +1133,13 @@ fn rerun_reason(stored: &str, now: &str, stored_env: &str, env_key: &str) -> Str
 }
 
 /// Appends `why` to <build dir>/relax-rerun-why, keeping the last 20 lines.
+/// What a script's run is given that says how the run is shaped, not what the script reads: left
+/// out of its rerun key. The mount's table and edits folder name where the sources are read, not
+/// what they are; the nesting depth and chain say which script's run this one sits in, so a
+/// package reached at the top and inside another script's run (a dependency here and a
+/// build-dependency there) keeps one output (relax issue 69). No cargo script can read them.
+const SCRIPT_RUN_SHAPE_VARS: [&str; 4] = ["MAKEPAD_RUN_VFS", "MAKEPAD_RUN_EDITS", "MAKEPAD_RUN_SCRIPT_DEPTH", "MAKEPAD_RUN_SCRIPT_CHAIN"];
+
 fn note_rerun(build_dir: &str, why: &str) {
     let path = format!("{}/makepad-run-rerun-why", build_dir);
     let mut lines: Vec<String> = std::fs::read_to_string(&path).unwrap_or_default().lines().map(str::to_string).collect();
@@ -1302,6 +1343,21 @@ fn platform_answer(sess: &std::sync::Arc<crate::Session>, out_dir: &str) -> Resu
         }
     }
     Ok(lines)
+}
+
+#[cfg(test)]
+mod script_error_tests {
+    /// The cause a failing build script names, by what its stderr holds (relax PR 59).
+    #[test]
+    fn a_failing_scripts_cause_is_what_it_printed_first() {
+        let summary = "error: could not compile `build_script_build` due to 1 previous error: not started (`makepad run` checks the app's own crates whole before they run, as cargo builds them)";
+        let relax = format!("/app/build.rs:2:9: warning: unused variable: `unused` [unused_variables]\n/app/build.rs:3:21: E0308: mismatched types: expected `u8`, found `&str`\n{summary}\n");
+        assert_eq!(super::script_error_cause(&relax), "/app/build.rs:3:21: E0308: mismatched types: expected `u8`, found `&str`", "a compile failure names its error, not a warning or the summary");
+        let rustc = "error[E0308]: mismatched types\n --> build.rs:3:21\n  |\nerror: could not compile `app` (build script) due to 1 previous error\n";
+        assert_eq!(super::script_error_cause(rustc), "error[E0308]: mismatched types", "rustc's own diagnostic shape");
+        assert_eq!(super::script_error_cause(&format!("{{\"message\":\"index out of bounds\",\"type\":\"panic\"}}\n{summary}\n")), "index out of bounds", "a panic's message");
+        assert_eq!(super::script_error_cause("one\ntwo\nthree\nfour\n"), "two | three | four", "else its last lines");
+    }
 }
 
 #[cfg(test)]
