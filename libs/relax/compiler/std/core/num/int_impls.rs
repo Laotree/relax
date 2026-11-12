@@ -21,6 +21,8 @@ impl u8 {
     pub const fn trailing_zeros(self) -> u32 { unsafe { ii::cttz(self as u8) } }
     pub const fn leading_ones(self) -> u32 { (!self).leading_zeros() }
     pub const fn trailing_ones(self) -> u32 { (!self).trailing_zeros() }
+    pub const fn isolate_lowest_one(self) -> u8 { self & self.wrapping_neg() }
+    pub const fn isolate_highest_one(self) -> u8 { if self == 0 { 0 } else { 1 << (Self::BITS - 1 - self.leading_zeros()) } }
     pub const fn rotate_left(self, n: u32) -> u8 { let k = n % 8; if k == 0 { self } else { (((self as u8) << k) | ((self as u8) >> (8 - k))) as u8 } }
     pub const fn rotate_right(self, n: u32) -> u8 { let k = n % 8; if k == 0 { self } else { (((self as u8) >> k) | ((self as u8) << (8 - k))) as u8 } }
     pub const fn swap_bytes(self) -> u8 { self }
@@ -140,6 +142,8 @@ impl u16 {
     pub const fn trailing_zeros(self) -> u32 { unsafe { ii::cttz(self as u16) } }
     pub const fn leading_ones(self) -> u32 { (!self).leading_zeros() }
     pub const fn trailing_ones(self) -> u32 { (!self).trailing_zeros() }
+    pub const fn isolate_lowest_one(self) -> u16 { self & self.wrapping_neg() }
+    pub const fn isolate_highest_one(self) -> u16 { if self == 0 { 0 } else { 1 << (Self::BITS - 1 - self.leading_zeros()) } }
     pub const fn rotate_left(self, n: u32) -> u16 { let k = n % 16; if k == 0 { self } else { (((self as u16) << k) | ((self as u16) >> (16 - k))) as u16 } }
     pub const fn rotate_right(self, n: u32) -> u16 { let k = n % 16; if k == 0 { self } else { (((self as u16) >> k) | ((self as u16) << (16 - k))) as u16 } }
     pub const fn swap_bytes(self) -> u16 { unsafe { ii::bswap(self as u16) as u16 } }
@@ -259,6 +263,8 @@ impl u32 {
     pub const fn trailing_zeros(self) -> u32 { unsafe { ii::cttz(self as u32) } }
     pub const fn leading_ones(self) -> u32 { (!self).leading_zeros() }
     pub const fn trailing_ones(self) -> u32 { (!self).trailing_zeros() }
+    pub const fn isolate_lowest_one(self) -> u32 { self & self.wrapping_neg() }
+    pub const fn isolate_highest_one(self) -> u32 { if self == 0 { 0 } else { 1 << (Self::BITS - 1 - self.leading_zeros()) } }
     pub const fn rotate_left(self, n: u32) -> u32 { let k = n % 32; if k == 0 { self } else { (((self as u32) << k) | ((self as u32) >> (32 - k))) as u32 } }
     pub const fn rotate_right(self, n: u32) -> u32 { let k = n % 32; if k == 0 { self } else { (((self as u32) >> k) | ((self as u32) << (32 - k))) as u32 } }
     pub const fn swap_bytes(self) -> u32 { unsafe { ii::bswap(self as u32) as u32 } }
@@ -378,6 +384,8 @@ impl u64 {
     pub const fn trailing_zeros(self) -> u32 { unsafe { ii::cttz(self as u64) } }
     pub const fn leading_ones(self) -> u32 { (!self).leading_zeros() }
     pub const fn trailing_ones(self) -> u32 { (!self).trailing_zeros() }
+    pub const fn isolate_lowest_one(self) -> u64 { self & self.wrapping_neg() }
+    pub const fn isolate_highest_one(self) -> u64 { if self == 0 { 0 } else { 1 << (Self::BITS - 1 - self.leading_zeros()) } }
     pub const fn rotate_left(self, n: u32) -> u64 { let k = n % 64; if k == 0 { self } else { (((self as u64) << k) | ((self as u64) >> (64 - k))) as u64 } }
     pub const fn rotate_right(self, n: u32) -> u64 { let k = n % 64; if k == 0 { self } else { (((self as u64) >> k) | ((self as u64) << (64 - k))) as u64 } }
     pub const fn swap_bytes(self) -> u64 { unsafe { ii::bswap(self as u64) as u64 } }
@@ -497,6 +505,8 @@ impl u128 {
     pub const fn trailing_zeros(self) -> u32 { unsafe { ii::cttz(self as u128) } }
     pub const fn leading_ones(self) -> u32 { (!self).leading_zeros() }
     pub const fn trailing_ones(self) -> u32 { (!self).trailing_zeros() }
+    pub const fn isolate_lowest_one(self) -> u128 { self & self.wrapping_neg() }
+    pub const fn isolate_highest_one(self) -> u128 { if self == 0 { 0 } else { 1 << (Self::BITS - 1 - self.leading_zeros()) } }
     pub const fn rotate_left(self, n: u32) -> u128 { let k = n % 128; if k == 0 { self } else { (((self as u128) << k) | ((self as u128) >> (128 - k))) as u128 } }
     pub const fn rotate_right(self, n: u32) -> u128 { let k = n % 128; if k == 0 { self } else { (((self as u128) >> k) | ((self as u128) << (128 - k))) as u128 } }
     pub const fn swap_bytes(self) -> u128 { unsafe { ii::bswap(self as u128) as u128 } }
@@ -630,6 +640,8 @@ impl usize {
     pub const fn trailing_zeros(self) -> u32 { unsafe { ii::cttz(self as usize) } }
     pub const fn leading_ones(self) -> u32 { (!self).leading_zeros() }
     pub const fn trailing_ones(self) -> u32 { (!self).trailing_zeros() }
+    pub const fn isolate_lowest_one(self) -> usize { self & self.wrapping_neg() }
+    pub const fn isolate_highest_one(self) -> usize { if self == 0 { 0 } else { 1 << (Self::BITS - 1 - self.leading_zeros()) } }
     pub const fn rotate_left(self, n: u32) -> usize { let k = n % 64; if k == 0 { self } else { (((self as usize) << k) | ((self as usize) >> (64 - k))) as usize } }
     pub const fn rotate_right(self, n: u32) -> usize { let k = n % 64; if k == 0 { self } else { (((self as usize) >> k) | ((self as usize) << (64 - k))) as usize } }
     pub const fn swap_bytes(self) -> usize { unsafe { ii::bswap(self as usize) as usize } }
@@ -749,6 +761,8 @@ impl usize {
     pub const fn trailing_zeros(self) -> u32 { unsafe { ii::cttz(self as usize) } }
     pub const fn leading_ones(self) -> u32 { (!self).leading_zeros() }
     pub const fn trailing_ones(self) -> u32 { (!self).trailing_zeros() }
+    pub const fn isolate_lowest_one(self) -> usize { self & self.wrapping_neg() }
+    pub const fn isolate_highest_one(self) -> usize { if self == 0 { 0 } else { 1 << (Self::BITS - 1 - self.leading_zeros()) } }
     pub const fn rotate_left(self, n: u32) -> usize { let k = n % 32; if k == 0 { self } else { (((self as usize) << k) | ((self as usize) >> (32 - k))) as usize } }
     pub const fn rotate_right(self, n: u32) -> usize { let k = n % 32; if k == 0 { self } else { (((self as usize) >> k) | ((self as usize) << (32 - k))) as usize } }
     pub const fn swap_bytes(self) -> usize { unsafe { ii::bswap(self as usize) as usize } }

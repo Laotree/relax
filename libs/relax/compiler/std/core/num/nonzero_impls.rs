@@ -12,6 +12,8 @@ impl NonZero<u8> {
     pub const BITS: u32 = u8::BITS;
     pub const fn leading_zeros(self) -> u32 { self.get().leading_zeros() }
     pub const fn trailing_zeros(self) -> u32 { self.get().trailing_zeros() }
+    pub const fn isolate_lowest_one(self) -> NonZero<u8> { unsafe { NonZero::new_unchecked(self.get().isolate_lowest_one()) } }
+    pub const fn isolate_highest_one(self) -> NonZero<u8> { unsafe { NonZero::new_unchecked(self.get().isolate_highest_one()) } }
     pub const fn count_ones(self) -> NonZero<u32> { unsafe { NonZero::new_unchecked(self.get().count_ones()) } }
     pub const fn checked_mul(self, other: NonZero<u8>) -> Option<NonZero<u8>> { match self.get().checked_mul(other.get()) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn saturating_mul(self, other: NonZero<u8>) -> NonZero<u8> { unsafe { NonZero::new_unchecked(self.get().saturating_mul(other.get())) } }
@@ -38,6 +40,8 @@ impl NonZero<u16> {
     pub const BITS: u32 = u16::BITS;
     pub const fn leading_zeros(self) -> u32 { self.get().leading_zeros() }
     pub const fn trailing_zeros(self) -> u32 { self.get().trailing_zeros() }
+    pub const fn isolate_lowest_one(self) -> NonZero<u16> { unsafe { NonZero::new_unchecked(self.get().isolate_lowest_one()) } }
+    pub const fn isolate_highest_one(self) -> NonZero<u16> { unsafe { NonZero::new_unchecked(self.get().isolate_highest_one()) } }
     pub const fn count_ones(self) -> NonZero<u32> { unsafe { NonZero::new_unchecked(self.get().count_ones()) } }
     pub const fn checked_mul(self, other: NonZero<u16>) -> Option<NonZero<u16>> { match self.get().checked_mul(other.get()) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn saturating_mul(self, other: NonZero<u16>) -> NonZero<u16> { unsafe { NonZero::new_unchecked(self.get().saturating_mul(other.get())) } }
@@ -64,6 +68,8 @@ impl NonZero<u32> {
     pub const BITS: u32 = u32::BITS;
     pub const fn leading_zeros(self) -> u32 { self.get().leading_zeros() }
     pub const fn trailing_zeros(self) -> u32 { self.get().trailing_zeros() }
+    pub const fn isolate_lowest_one(self) -> NonZero<u32> { unsafe { NonZero::new_unchecked(self.get().isolate_lowest_one()) } }
+    pub const fn isolate_highest_one(self) -> NonZero<u32> { unsafe { NonZero::new_unchecked(self.get().isolate_highest_one()) } }
     pub const fn count_ones(self) -> NonZero<u32> { unsafe { NonZero::new_unchecked(self.get().count_ones()) } }
     pub const fn checked_mul(self, other: NonZero<u32>) -> Option<NonZero<u32>> { match self.get().checked_mul(other.get()) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn saturating_mul(self, other: NonZero<u32>) -> NonZero<u32> { unsafe { NonZero::new_unchecked(self.get().saturating_mul(other.get())) } }
@@ -90,6 +96,8 @@ impl NonZero<u64> {
     pub const BITS: u32 = u64::BITS;
     pub const fn leading_zeros(self) -> u32 { self.get().leading_zeros() }
     pub const fn trailing_zeros(self) -> u32 { self.get().trailing_zeros() }
+    pub const fn isolate_lowest_one(self) -> NonZero<u64> { unsafe { NonZero::new_unchecked(self.get().isolate_lowest_one()) } }
+    pub const fn isolate_highest_one(self) -> NonZero<u64> { unsafe { NonZero::new_unchecked(self.get().isolate_highest_one()) } }
     pub const fn count_ones(self) -> NonZero<u32> { unsafe { NonZero::new_unchecked(self.get().count_ones()) } }
     pub const fn checked_mul(self, other: NonZero<u64>) -> Option<NonZero<u64>> { match self.get().checked_mul(other.get()) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn saturating_mul(self, other: NonZero<u64>) -> NonZero<u64> { unsafe { NonZero::new_unchecked(self.get().saturating_mul(other.get())) } }
@@ -116,6 +124,8 @@ impl NonZero<u128> {
     pub const BITS: u32 = u128::BITS;
     pub const fn leading_zeros(self) -> u32 { self.get().leading_zeros() }
     pub const fn trailing_zeros(self) -> u32 { self.get().trailing_zeros() }
+    pub const fn isolate_lowest_one(self) -> NonZero<u128> { unsafe { NonZero::new_unchecked(self.get().isolate_lowest_one()) } }
+    pub const fn isolate_highest_one(self) -> NonZero<u128> { unsafe { NonZero::new_unchecked(self.get().isolate_highest_one()) } }
     pub const fn count_ones(self) -> NonZero<u32> { unsafe { NonZero::new_unchecked(self.get().count_ones()) } }
     pub const fn checked_mul(self, other: NonZero<u128>) -> Option<NonZero<u128>> { match self.get().checked_mul(other.get()) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn saturating_mul(self, other: NonZero<u128>) -> NonZero<u128> { unsafe { NonZero::new_unchecked(self.get().saturating_mul(other.get())) } }
@@ -142,6 +152,8 @@ impl NonZero<usize> {
     pub const BITS: u32 = usize::BITS;
     pub const fn leading_zeros(self) -> u32 { self.get().leading_zeros() }
     pub const fn trailing_zeros(self) -> u32 { self.get().trailing_zeros() }
+    pub const fn isolate_lowest_one(self) -> NonZero<usize> { unsafe { NonZero::new_unchecked(self.get().isolate_lowest_one()) } }
+    pub const fn isolate_highest_one(self) -> NonZero<usize> { unsafe { NonZero::new_unchecked(self.get().isolate_highest_one()) } }
     pub const fn count_ones(self) -> NonZero<u32> { unsafe { NonZero::new_unchecked(self.get().count_ones()) } }
     pub const fn checked_mul(self, other: NonZero<usize>) -> Option<NonZero<usize>> { match self.get().checked_mul(other.get()) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn saturating_mul(self, other: NonZero<usize>) -> NonZero<usize> { unsafe { NonZero::new_unchecked(self.get().saturating_mul(other.get())) } }
