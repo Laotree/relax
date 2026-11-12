@@ -5175,10 +5175,11 @@ impl<'a> Fcx<'a> {
                 }
                 let is_shift = matches!(op, BinOp::Shl | BinOp::Shr);
                 let tb = self.check_expr(*b, if is_shift { None } else { Some(ta) });
-                // a primitive place with a non-primitive right operand is an `<Op>Assign` call
-                // (`n /= NonZero<u32>`; rustc is_builtin_binop needs both sides primitive)
+                // a primitive place with a non-primitive right operand, or a reference to one, is an
+                // `<Op>Assign` call (`n /= NonZero<u32>`, `x %= &big`; rustc is_builtin_binop needs
+                // both sides primitive)
                 let sb0 = self.shallow(tb);
-                if matches!(self.tcx.tys.kind(sb0), TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(..)) {
+                if self.non_prim_operand(sb0) {
                     self.cur_binop = e.0;
                     if self.prim_lhs_op(*op, e, sa, sb0, lo, true).is_some() {
                         return unit;
@@ -6663,7 +6664,7 @@ impl<'a> Fcx<'a> {
                 // a primitive left operand with a non-primitive right one is an operator trait
                 // call too (`3u32 * duration`: `impl Mul<Duration> for u32`; rustc is_builtin_binop
                 // needs both sides primitive)
-                if matches!(self.tcx.tys.kind(sb0), TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(..) | TyKind::Infer(_)) {
+                if self.non_prim_operand(sb0) || matches!(self.tcx.tys.kind(sb0), TyKind::Infer(_)) {
                     let sa = self.shallow(ta);
                     if let Some(r) = self.prim_lhs_op(op, e, sa, sb0, lo, false) {
                         return r;
@@ -7561,6 +7562,21 @@ impl<'a> Fcx<'a> {
         self.norm(r)
     }
 
+    /// A right operand no primitive operator takes: a non-primitive type, or a reference to one
+    /// (`x %= &big` with `impl RemAssign<&BigUint> for u32`). rustc is_builtin_binop needs both
+    /// operands primitive; core's forward-ref operator impls take references to primitives only.
+    fn non_prim_operand(&mut self, sb: TyId) -> bool {
+        let non_prim = |k: &TyKind| matches!(k, TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(..));
+        if non_prim(self.tcx.tys.kind(sb)) {
+            return true;
+        }
+        if let TyKind::Ref(_, inner, _) = self.tcx.tys.kind(sb).clone() {
+            let si = self.shallow(inner);
+            return non_prim(self.tcx.tys.kind(si));
+        }
+        false
+    }
+
     /// `prim op adt`: the operator trait impl of the primitive for the right type. A literal
     /// left operand takes the type of the single primitive impl with that right type.
     /// With `assign`, `prim op= adt` through the `<Op>Assign` impl (`n /= NonZero<u32>`).
@@ -7574,6 +7590,8 @@ impl<'a> Fcx<'a> {
             (BinOp::BitAnd, true) => ("BitAndAssign", "bitand_assign"),
             (BinOp::BitOr, true) => ("BitOrAssign", "bitor_assign"),
             (BinOp::BitXor, true) => ("BitXorAssign", "bitxor_assign"),
+            (BinOp::Shl, true) => ("ShlAssign", "shl_assign"),
+            (BinOp::Shr, true) => ("ShrAssign", "shr_assign"),
             (_, true) => return None,
             (op, false) => match op {
                 BinOp::Add => ("Add", "add"),
@@ -7584,6 +7602,8 @@ impl<'a> Fcx<'a> {
                 BinOp::BitAnd => ("BitAnd", "bitand"),
                 BinOp::BitOr => ("BitOr", "bitor"),
                 BinOp::BitXor => ("BitXor", "bitxor"),
+                BinOp::Shl => ("Shl", "shl"),
+                BinOp::Shr => ("Shr", "shr"),
                 _ => return None,
             },
         };
