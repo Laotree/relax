@@ -142,6 +142,8 @@ pub struct Parser<'a> {
     pub(crate) meta_frags: crate::fxhash::HashMap<u32, &'static str>,
     /// starts of the `$b:block` substitutions of expansion text (check only)
     pub(crate) block_frags: crate::fxhash::HashSet<u32>,
+    /// starts of the `$s:stmt` substitutions of expansion text: a statement that ends with its group
+    pub(crate) stmt_frags: crate::fxhash::HashSet<u32>,
     /// Offsets of the parens a transcription added around multi-token `$e:expr` fragments.
     pub(super) synth_parens: crate::fxhash::HashSet<u32>,
     /// file context for built-in macros (file!, module_path!, env!, cfg of derive inputs)
@@ -245,6 +247,7 @@ impl<'a> Parser<'a> {
             path_frags: Default::default(),
             meta_frags: Default::default(),
             block_frags: Default::default(),
+            stmt_frags: Default::default(),
             synth_parens: Default::default(),
             bctx: None,
             mod_stack: Vec::new(),
@@ -2082,7 +2085,9 @@ impl<'a> Parser<'a> {
             if b & crate::macros::BLOCK_FRAG != 0 {
                 self.block_frags.insert(base + a);
             }
-            if b & (crate::macros::EXPR_FRAG | crate::macros::LIT_FRAG) != 0 {
+            if b & crate::macros::STMT_FRAG == crate::macros::STMT_FRAG {
+                self.stmt_frags.insert(base + a);
+            } else if b & (crate::macros::EXPR_FRAG | crate::macros::LIT_FRAG) != 0 {
                 self.meta_frags.insert(base + a, if b & crate::macros::EXPR_FRAG != 0 { "expr" } else { "literal" });
             }
             if b & crate::macros::WRAP_PAREN != 0 {
@@ -2276,7 +2281,7 @@ impl<'a> Parser<'a> {
             rec_limit: _, import_summary: _,
             toks, pos, edition, ast, item_start, lazy_bodies, lazy_auto, lazy_part, lazy_mods, macros, krate,
             ext, exp_map, tok_origin, token_origins, token_input, exp_depth, rules_exp, body_origin,
-            pm_editions, tok_undo, frag_groups, empty_vis, ty_frags, path_frags, meta_frags, block_frags, synth_parens,
+            pm_editions, tok_undo, frag_groups, empty_vis, ty_frags, path_frags, meta_frags, block_frags, stmt_frags, synth_parens,
             mod_stack, scope_stack, no_prelude, range_dots, next_scope, rule_scopes, foreign_rules, interp, extra_items,
             extra_assoc_items, pending_inner, in_assoc, in_trait, stmt_ctx, cfg_select_rest,
             include_as_expr, foreign_abi, cfg_out, expansion_semi, list_elem_at, expn_attrs_ungated, pending_shape,
@@ -2284,7 +2289,7 @@ impl<'a> Parser<'a> {
         fn sorted<T: Ord>(mut v: Vec<T>) -> Vec<T> { v.sort(); v }
         let toks: Vec<Tok> = (0..toks.len()).map(|i| toks.at(i)).collect();
         let frags = (sorted(frag_groups.iter().collect::<Vec<_>>()), sorted(ty_frags.iter().collect::<Vec<_>>()), sorted(path_frags.iter().collect::<Vec<_>>()),
-            sorted(meta_frags.iter().collect::<Vec<_>>()), sorted(block_frags.iter().collect::<Vec<_>>()), sorted(synth_parens.iter().collect::<Vec<_>>()), sorted(empty_vis.iter().collect::<Vec<_>>()));
+            sorted(meta_frags.iter().collect::<Vec<_>>()), sorted(block_frags.iter().collect::<Vec<_>>()), sorted(stmt_frags.iter().collect::<Vec<_>>()), sorted(synth_parens.iter().collect::<Vec<_>>()), sorted(empty_vis.iter().collect::<Vec<_>>()));
         let interp = sorted(interp.iter().map(|(k, e)| (*k, e.0)).collect::<Vec<_>>());
         let tables = (ext.len(), exp_map.len(), tok_origin.len(), token_origins.len(), rules_exp.len(), body_origin.len(), pm_editions.len(), foreign_rules.len());
         let shapes: Vec<_> = pending_shape.iter().map(|(r, e)| (*r, e.as_ref().map(|e| (e.pos, e.msg.clone())))).collect();
@@ -4179,6 +4184,7 @@ impl<'a> Parser<'a> {
         if self.ty_frags.contains(&lo) { flags |= crate::macros::TY_FRAG; }
         if self.path_frags.contains(&lo) { flags |= crate::macros::PATH_FRAG; }
         if self.block_frags.contains(&lo) { flags |= crate::macros::BLOCK_FRAG; }
+        if self.stmt_frags.contains(&lo) { flags |= crate::macros::STMT_FRAG; }
         match self.meta_frags.get(&lo) {
             Some(&"expr") => flags |= crate::macros::EXPR_FRAG,
             Some(&"literal") => flags |= crate::macros::LIT_FRAG,
@@ -4764,6 +4770,33 @@ impl<'a> Parser<'a> {
 
     /// `start`: the token the statement's attributes began at.
     fn stmt_after_attrs(&mut self, attrs: Vec<Attr>, start: usize) -> PResult<Stmt> {
+        // rustc_parse parser/stmt.rs parse_full_stmt (eat_metavar_seq of MetaVarKind::Stmt): a
+        // statement that is a `$s:stmt` fragment is parsed inside the fragment's invisible
+        // delimiters and ends with them, no `;` looked for after it: `$s next();` is two
+        // statements, and the `;` of `$s;` is an empty one of its own
+        let start_lo = self.toks.at(start).lo;
+        if !self.stmt_frags.is_empty() && self.stmt_frags.contains(&start_lo) {
+            if let Some(&hi) = self.frag_groups.get(&start_lo) {
+                if let Some(last) = (self.pos..self.toks.len()).find(|&i| self.toks.at(i).hi == hi) {
+                    let end = last + 1;
+                    if end < self.toks.len() {
+                        let next = self.toks.at(end);
+                        self.toks.edit(end, |t| *t = Tok { kind: T::Eof, lo: hi, hi });
+                        let result = self.stmt_in(attrs, true);
+                        let complete = self.pos == end;
+                        self.toks.edit(end, |t| *t = next);
+                        let s = result?;
+                        if !complete { return self.err("unexpected token in statement fragment"); }
+                        return Ok(s);
+                    }
+                }
+            }
+        }
+        self.stmt_in(attrs, false)
+    }
+
+    /// `fragment`: the statement is a `$s:stmt` fragment, the token after it an end of file.
+    fn stmt_in(&mut self, attrs: Vec<Attr>, fragment: bool) -> PResult<Stmt> {
         if self.kind() == T::KwLet {
             self.pos += 1;
             let pat = self.pat_top()?;
@@ -4785,10 +4818,7 @@ impl<'a> Parser<'a> {
             } else {
                 (None, None)
             };
-            // a `$s:stmt` fragment forwarded into a block is a whole statement, its `;` not part of it
-            let start_lo = self.toks.at(start).lo;
-            let interpolated = self.frag_groups.get(&start_lo).is_some_and(|&end| end == self.prev_hi());
-            if !interpolated {
+            if !(fragment && self.kind() == T::Eof) {
                 self.expect(T::Semi)?;
             }
             let attrs = self.ast.push_list(attrs);

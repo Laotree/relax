@@ -427,6 +427,9 @@ pub(crate) const WRAP_PAREN: u32 = 1 << 25;
 /// a `vis` fragment that matched nothing, forwarded here (rustc's empty invisible group): no tokens,
 /// only the token it stands before (`Parser::empty_vis`)
 pub(crate) const EMPTY_VIS: u32 = 1 << 24;
+/// A `$s:stmt` fragment (rustc's `MetaVarKind::Stmt`): the statement it begins ends with it, no `;`
+/// looked for after it. Both meta bits, as no fragment is an expression and a literal at once.
+pub(crate) const STMT_FRAG: u32 = EXPR_FRAG | LIT_FRAG;
 pub(crate) const FRAG_FLAGS: u32 = TY_FRAG | EXPR_FRAG | LIT_FRAG | META_ONLY | BLOCK_FRAG | PATH_FRAG | WRAP_PAREN | EMPTY_VIS;
 
 const GLOB_ID: Name = Name(0);
@@ -3714,8 +3717,10 @@ impl<'a> Parser<'a> {
                         // rustc_expand mbe/transcribe.rs: transcribe_pnr wraps even a
                         // one-token path in MetaVarKind::Path invisible delimiters.
                         let path_frag = *f == Frag::Path;
-                        let kind_flag = match f { Frag::Expr if !wrap => EXPR_FRAG, Frag::Literal => LIT_FRAG, Frag::Block if !wrap => BLOCK_FRAG, Frag::Path => PATH_FRAG, _ => 0 };
-                        let group = opaque && out.s.len() > group_start && (hi - lo + usize::from(taken.is_some()) > 1 || ty_frag || path_frag);
+                        let kind_flag = match f { Frag::Expr if !wrap => EXPR_FRAG, Frag::Literal => LIT_FRAG, Frag::Block if !wrap => BLOCK_FRAG, Frag::Path => PATH_FRAG, Frag::Stmt => STMT_FRAG, _ => 0 };
+                        // (a `$s:stmt` of one token too: `break` is a statement of its own before the next)
+                        let stmt_frag = *f == Frag::Stmt;
+                        let group = opaque && out.s.len() > group_start && (hi - lo + usize::from(taken.is_some()) > 1 || ty_frag || path_frag || stmt_frag);
                         if group || (kind_flag != 0 && out.s.len() > group_start) {
                             out.groups.push((group_start as u32, out.s.len() as u32 | if ty_frag { TY_FRAG } else { 0 } | kind_flag | if group { 0 } else { META_ONLY }));
                         }
