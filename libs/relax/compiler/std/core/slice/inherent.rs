@@ -535,6 +535,22 @@ impl<T> [T] {
     {
         Join::join(self, sep)
     }
+    /// The whole slice as an array reference, `None` when its length is not `N`.
+    pub const fn as_array<const N: usize>(&self) -> Option<&[T; N]> {
+        if self.len() == N {
+            Some(unsafe { &*(self.as_ptr() as *const [T; N]) })
+        } else {
+            None
+        }
+    }
+    /// The whole slice as a mutable array reference, `None` when its length is not `N`.
+    pub const fn as_mut_array<const N: usize>(&mut self) -> Option<&mut [T; N]> {
+        if self.len() == N {
+            Some(unsafe { &mut *(self.as_mut_ptr() as *mut [T; N]) })
+        } else {
+            None
+        }
+    }
     pub const fn first_chunk<const N: usize>(&self) -> Option<&[T; N]> {
         if self.len() < N {
             None

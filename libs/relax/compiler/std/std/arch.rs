@@ -165,7 +165,14 @@ pub mod detect {
         let fma = avx && p.ecx & (1 << 12) != 0;
         let f16c = avx && p.ecx & (1 << 29) != 0;
         // Rust's AVX-512 target feature also implies FMA and F16C.
-        let avx512 = avx && xcr0 & 0xe0 == 0xe0 && fma && f16c;
+        //
+        // The JIT's assembler has no EVEX encoding yet, so an `asm!` that names zmm registers
+        // fails when it is compiled at run time ("zmm registers need EVEX"). Crates that pick
+        // kernels from `is_x86_feature_detected!` then choose exactly those (pulp, and through it
+        // gpui), so the detector says what generated code can run, not what the CPU has. Set to
+        // true when `asm!` learns EVEX.
+        const EVEX_ASM: bool = false;
+        let avx512 = EVEX_ASM && avx && xcr0 & 0xe0 == 0xe0 && fma && f16c;
         // Intel SKL052: affected non-AVX chips falsely advertise BMI1/BMI2.
         let intel = root.ebx == 0x756e6547 && root.edx == 0x49656e69 && root.ecx == 0x6c65746e;
         let bmi = !intel || avx;
