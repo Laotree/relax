@@ -649,9 +649,22 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
                     }
                 }
                 ScriptRole::SelfStamp => {
-                    let out_dir = format!("{}/build/{}-answered/out", target_dir, name);
-                    let r = std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {}", out_dir, e)).and_then(|_| self_stamp_answer(&dir, &pname, &bs.features, &out_dir));
-                    results.lock().unwrap().push((bs.krates(), r.map(|_| String::new()), out_dir));
+                    let text = self_stamp_text(&dir, &pname, &bs.features);
+                    // (a shared workspace's checkouts have one run dir, vfs.rs SHARE: a stamp per
+                    // content, where each checkout wrote its own over the other's)
+                    let out_dir = match &text {
+                        Ok(text) if crate::vfs::shared() && crate::vfs::is_virtual(&dir) => format!("{}/build/{}-answered-{:016x}/out", target_dir, name, fnv(text.as_bytes(), 0xcbf29ce484222325)),
+                        _ => format!("{}/build/{}-answered/out", target_dir, name),
+                    };
+                    let r = text.and_then(|text| {
+                        std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {}", out_dir, e))?;
+                        let out = format!("{}/src_stamp.rs", out_dir);
+                        if std::fs::read_to_string(&out).ok().as_deref() != Some(text.as_str()) {
+                            std::fs::write(&out, text).map_err(|e| format!("{}: {}", out, e))?;
+                        }
+                        Ok(String::new())
+                    });
+                    results.lock().unwrap().push((bs.krates(), r, out_dir));
                     continue;
                 }
                 ScriptRole::Platform => {
@@ -770,6 +783,14 @@ fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrit
         o
     };
     let mut h = fnv(bs.src_path.as_bytes(), 0xcbf29ce484222325);
+    // a shared workspace's checkouts (vfs.rs SHARE) have one run dir and one path for the script:
+    // its text names its units' folder and its output's, or a checkout with another script would
+    // write its rewritten source and its output over this one's
+    if crate::vfs::shared() {
+        if let Ok(src) = crate::vfs::read(&bs.src_path) {
+            h = fnv(&src, h);
+        }
+    }
     let mut units: Vec<String> = Vec::new();
     let deps_json = |deps: &[(usize, String)]| -> String {
         deps.iter().filter_map(|(d, n)| idx(*d).map(|k| format!("{{\"index\":{},\"extern_crate_name\":{}}}", k, q(n)))).collect::<Vec<_>>().join(",")
@@ -881,7 +902,11 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     }
     let unit_dir = format!("{}/build-scripts/{:016x}", target_dir, h);
     let units_path = format!("{}/units.json", unit_dir);
-    let out_dir = format!("{}/build/{}-{:016x}/out", target_dir, name, fh);
+    // a package of a shared workspace (vfs.rs SHARE): its script's output is kept per content of
+    // its inputs (`shared_build_dir`), and `base_dir` holds the claim and what the script declared
+    let shared: Option<SharedContent> = (crate::vfs::shared() && crate::vfs::is_virtual(dir)).then(Default::default);
+    let base_dir = format!("{}/build/{}-{:016x}", target_dir, name, fh);
+    let mut out_dir = format!("{}/out", base_dir);
     {
         let _writing = path_lock(&units_path);
         let source_path = format!("{}/build.rs", unit_dir);
@@ -898,7 +923,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
             }
         }
     }
-    let _ = std::fs::create_dir_all(&out_dir);
+    let _ = std::fs::create_dir_all(if shared.is_some() { &base_dir } else { &out_dir });
     let exe = match self_exe() {
         Ok(e) => e,
         Err(e) => return (Err(format!("this executable: {e}")), out_dir),
@@ -962,6 +987,15 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         if let Some(e) = std::env::var_os("MAKEPAD_RUN_EDITS") {
             cmd.env("MAKEPAD_RUN_EDITS", e);
         }
+        if shared.is_some() {
+            // a shared workspace's package is a folder of the checkout too: the script's run is
+            // told its mount is a checkout's, and starts in that folder, where the script's own
+            // children run (they get no mount, progenv.rs; cargo runs a script in its package)
+            if let Some(n) = std::env::var_os("MAKEPAD_RUN_SHARE") {
+                cmd.env("MAKEPAD_RUN_SHARE", n);
+            }
+            cmd.current_dir(&*crate::vfs::on_disk(dir));
+        }
     } else {
         // a package on disk (a registry crate of a store run): its folder is the current folder,
         // and no virtual workspace crosses (Relax's std resolves relative paths against
@@ -981,27 +1015,32 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     let mut env_key = format!("{:016x}", h);
     for (k, v) in cmd.get_envs() {
         // (the mount's table and edits folder name where the sources are read, not what they are)
-        if k == "MAKEPAD_RUN_VFS" || k == "MAKEPAD_RUN_EDITS" {
+        // (a shared workspace's OUT_DIR is named by this key, below)
+        if k == "MAKEPAD_RUN_VFS" || k == "MAKEPAD_RUN_EDITS" || (shared.is_some() && k == "OUT_DIR") {
             continue;
         }
         env_key.push_str(&format!("\n{}={}", k.to_string_lossy(), v.map(|v| v.to_string_lossy().into_owned()).unwrap_or_default()));
     }
-    let build_dir = dir_of_path(&out_dir);
-    let output_path = format!("{}/output", build_dir);
-    let key_path = format!("{}/makepad-run-rerun", build_dir);
-    let env_path = format!("{}/makepad-run-rerun-env", build_dir);
-    // Ok: the previous output, which stands; Err: why the script runs again
-    let previous = || match (std::fs::read_to_string(&output_path), std::fs::read_to_string(&key_path)) {
+    // Ok: the output in `build_dir`, which stands; Err: why the script runs again
+    let previous = |build_dir: &str| match (std::fs::read_to_string(format!("{}/output", build_dir)), std::fs::read_to_string(format!("{}/makepad-run-rerun", build_dir))) {
         (Ok(old), Ok(key)) => {
-            let now = rerun_key(&old, dir, &env_key).unwrap_or_default();
-            if now == key { Ok(old) } else { Err(rerun_reason(&key, &now, &std::fs::read_to_string(&env_path).unwrap_or_default(), &env_key)) }
+            let now = rerun_key(&old, dir, &env_key, shared.as_ref()).unwrap_or_default();
+            if now == key { Ok(old) } else { Err(rerun_reason(&key, &now, &std::fs::read_to_string(format!("{}/makepad-run-rerun-env", build_dir)).unwrap_or_default(), &env_key)) }
         }
         _ => Err("no previous output".to_string()),
     };
-    let mut why = match previous() {
+    let declared_path = format!("{}/makepad-run-declared", base_dir);
+    // where this run's output is (its build dir), and whether one stands there
+    let place = || match &shared {
+        None => (base_dir.clone(), previous(&base_dir)),
+        Some(content) => shared_build_dir(&base_dir, &std::fs::read_to_string(&declared_path).unwrap_or_default(),
+            &|declared| rerun_key(declared, dir, &env_key, Some(content)).unwrap_or_default(), &previous),
+    };
+    let (mut build_dir, standing) = place();
+    let mut why = match standing {
         Ok(old) => {
             if sess.runtime.profile { eprintln!("makepad-run build-script: {} cached", pname); }
-            return (Ok(old), out_dir);
+            return (Ok(old), format!("{}/out", build_dir));
         }
         Err(why) => why,
     };
@@ -1013,17 +1052,31 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     // could wait on a slot whose script's nested run waits for this claim (a package that is
     // both a dependency here and a build-dependency of another script).
     let _slot = script_slot();
-    let claim = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(format!("{}/makepad-run-claim", build_dir)).ok();
+    let claim = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(format!("{}/makepad-run-claim", base_dir)).ok();
     if let Some(claim) = claim.as_ref().filter(|claim| claim.try_lock().is_err()) {
         let _ = claim.lock();
-        match previous() {
+        // (the wait can be long: the checkout's files are read again)
+        if let Some(content) = &shared {
+            content.borrow_mut().clear();
+        }
+        let (at, standing) = place();
+        build_dir = at;
+        match standing {
             Ok(old) => {
                 if sess.runtime.profile { eprintln!("makepad-run build-script: {} made by another run", pname); }
-                return (Ok(old), out_dir);
+                return (Ok(old), format!("{}/out", build_dir));
             }
             Err(now) => why = now,
         }
     }
+    if shared.is_some() {
+        out_dir = format!("{}/out", build_dir);
+        let _ = std::fs::create_dir_all(&out_dir);
+        cmd.env("OUT_DIR", &out_dir);
+    }
+    let output_path = format!("{}/output", build_dir);
+    let key_path = format!("{}/makepad-run-rerun", build_dir);
+    let env_path = format!("{}/makepad-run-rerun-env", build_dir);
     // why this script runs again, kept beside its output (relax-rerun-why: the last 20) and shown with MAKEPAD_RUN_PROFILE
     if sess.runtime.profile { eprintln!("makepad-run build-script: {} runs: {}", pname, why); }
     note_rerun(&build_dir, &why);
@@ -1035,12 +1088,19 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     match output {
         Ok(o) if o.status.success() => {
             let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
-            if let Some(key) = rerun_key(&stdout, dir, &env_key) {
+            if let Some(key) = rerun_key(&stdout, dir, &env_key, shared.as_ref()) {
                 let _ = std::fs::write(&output_path, &stdout);
                 let _ = std::fs::write(&key_path, key);
                 let _ = std::fs::write(&env_path, &env_key);
             } else {
                 let _ = std::fs::remove_file(&key_path);
+            }
+            // what the script declared names the place of its next output (`shared_build_dir`)
+            if shared.is_some() {
+                let declared = declared_inputs(&stdout);
+                if std::fs::read_to_string(&declared_path).ok().as_deref() != Some(declared.as_str()) {
+                    let _ = std::fs::write(&declared_path, &declared);
+                }
             }
             (Ok(stdout), out_dir)
         }
@@ -1142,14 +1202,100 @@ fn note_rerun(build_dir: &str, why: &str) {
     let _ = std::fs::write(&path, lines[skip..].join("\n") + "\n");
 }
 
-fn dir_of_path(p: &str) -> String {
-    std::path::Path::new(p).parent().map(|d| d.display().to_string()).unwrap_or_default()
+/// What the files of a shared workspace's checkout hold, per path (`content`), for one script's
+/// rerun keys.
+type SharedContent = std::cell::RefCell<std::collections::HashMap<(String, bool), u64>>;
+
+/// What a file holds, or a folder with everything below it (each entry's name and content; 0:
+/// missing). `pkg`: a package's own folder, without its target directories and hidden entries
+/// (`newest_mtime_pkg`).
+fn content(p: &std::path::Path, pkg: bool, depth: u32) -> u64 {
+    let h = 0xcbf29ce484222325;
+    let Ok(m) = std::fs::metadata(p) else { return 0 };
+    if !m.is_dir() {
+        return std::fs::read(p).map_or(0, |b| fnv(&b, fnv(&(b.len() as u64).to_le_bytes(), h)));
+    }
+    let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(p).map(|rd| rd.flatten().map(|e| e.file_name()).collect()).unwrap_or_default();
+    names.sort();
+    let mut h = fnv(b"/", h);
+    for n in names {
+        let name = n.to_string_lossy();
+        // (a folder that links to one above it ends at this depth)
+        if (pkg && (name.starts_with("target") || name.starts_with('.'))) || depth >= 64 {
+            continue;
+        }
+        h = fnv(name.as_bytes(), h);
+        h = fnv(&content(&p.join(&n), false, depth + 1).to_le_bytes(), h);
+    }
+    h
+}
+
+/// `path`'s part of a shared workspace's rerun key (vfs.rs SHARE): what the checkout holds there,
+/// not when it was written. The checkouts of one repository have one run dir: a file's time says
+/// which of them was written last, and the mount's identity is the same empty store for all.
+/// None: no shared workspace, or a path outside its mount (a registry package's, the same folder
+/// for every checkout).
+fn shared_content(shared: Option<&SharedContent>, path: &str, pkg: bool) -> Option<u64> {
+    let shared = shared.filter(|_| crate::vfs::is_virtual(path))?;
+    let at = (crate::vfs::normalize_path(path), pkg);
+    if let Some(c) = shared.borrow().get(&at) {
+        return Some(*c);
+    }
+    let c = content(std::path::Path::new(&*crate::vfs::on_disk(&at.0)), pkg, 0);
+    shared.borrow_mut().insert(at, c);
+    Some(c)
+}
+
+/// The inputs a script's output declares (its `rerun-if` lines, sorted).
+fn declared_inputs(output: &str) -> String {
+    let mut lines: Vec<&str> = output.lines().filter(|l| {
+        let rest = l.strip_prefix("cargo::").or_else(|| l.strip_prefix("cargo:")).unwrap_or("");
+        rest.starts_with("rerun-if-changed=") || rest.starts_with("rerun-if-env-changed=")
+    }).collect();
+    lines.sort();
+    lines.dedup();
+    lines.join("\n")
+}
+
+/// Where the output of a shared workspace's script is (vfs.rs SHARE), and whether one stands
+/// there (`previous`: the output of a build dir, or why it does not stand). The checkouts of one
+/// repository have one run dir. With one output per package, a checkout whose inputs differ ran
+/// the script into the folder another checkout's run was reading, and each made it again after
+/// the other. So an output is kept per content of its inputs, in `<base_dir>-<hash>`: the hash of
+/// the rerun key (`key_of`) that `declared`, the inputs the script's last output named, gives for
+/// this checkout now (none yet: the package's files, cargo's rule for a script that names none).
+/// An output made before its script's inputs were known, or one whose script names other inputs
+/// from run to run, has another name: when the named one does not stand, any output of this
+/// script that does is taken. Old outputs stay (nothing prunes a run dir's build folders).
+fn shared_build_dir(base_dir: &str, declared: &str, key_of: &dyn Fn(&str) -> String, previous: &dyn Fn(&str) -> Result<String, String>) -> (String, Result<String, String>) {
+    let named = format!("{}-{:016x}", base_dir, fnv(key_of(declared).as_bytes(), 0xcbf29ce484222325));
+    let why = match previous(&named) {
+        Ok(old) => return (named, Ok(old)),
+        Err(why) => why,
+    };
+    let Some((parent, name)) = base_dir.rsplit_once('/') else { return (named, Err(why)) };
+    let prefix = format!("{name}-");
+    let mut others: Vec<String> = std::fs::read_dir(parent)
+        .map(|rd| rd.flatten().filter_map(|e| e.file_name().into_string().ok()).filter(|n| n.starts_with(&prefix)).collect())
+        .unwrap_or_default();
+    others.sort();
+    for other in others {
+        let at = format!("{parent}/{other}");
+        if at == named {
+            continue;
+        }
+        if let Ok(old) = previous(&at) {
+            return (at, Ok(old));
+        }
+    }
+    (named, Err(why))
 }
 
 /// The rerun key of a script output: the environment it ran with, then per
 /// `rerun-if-changed` path its newest modification time (directories: recursively) and per
 /// `rerun-if-env-changed` variable its value; an output that names none: the package's newest file.
-fn rerun_key(output: &str, pkg_dir: &str, env_key: &str) -> Option<String> {
+/// A path of a shared workspace (`shared`): what it holds (`shared_content`), not its time.
+fn rerun_key(output: &str, pkg_dir: &str, env_key: &str, shared: Option<&SharedContent>) -> Option<String> {
     let mut key = format!("{:016x}\n", fnv(env_key.as_bytes(), 0xcbf29ce484222325));
     let mut any = false;
     for line in output.lines() {
@@ -1160,9 +1306,10 @@ fn rerun_key(output: &str, pkg_dir: &str, env_key: &str) -> Option<String> {
         if let Some(p) = rest.strip_prefix("rerun-if-changed=") {
             any = true;
             let path = if std::path::Path::new(p).is_absolute() { p.to_string() } else { format!("{}/{}", pkg_dir, p) };
-            match crate::vfs::identity(&path) {
-                Some(id) => key.push_str(&format!("f {} {}\n", id, path)),
-                None => key.push_str(&format!("f {} {}\n", newest_mtime(std::path::Path::new(&path)), path)),
+            match (shared_content(shared, &path, false), crate::vfs::identity(&path)) {
+                (Some(c), _) => key.push_str(&format!("f c{:016x} {}\n", c, path)),
+                (None, Some(id)) => key.push_str(&format!("f {} {}\n", id, path)),
+                (None, None) => key.push_str(&format!("f {} {}\n", newest_mtime(std::path::Path::new(&path)), path)),
             }
         } else if let Some(v) = rest.strip_prefix("rerun-if-env-changed=") {
             any = true;
@@ -1171,9 +1318,10 @@ fn rerun_key(output: &str, pkg_dir: &str, env_key: &str) -> Option<String> {
     }
     if !any {
         // cargo: a script that names no inputs reruns when any file of its package changes
-        match crate::vfs::identity(pkg_dir) {
-            Some(id) => key.push_str(&format!("p {} {}\n", id, pkg_dir)),
-            None => key.push_str(&format!("p {} {}\n", newest_mtime_pkg(std::path::Path::new(pkg_dir)), pkg_dir)),
+        match (shared_content(shared, pkg_dir, true), crate::vfs::identity(pkg_dir)) {
+            (Some(c), _) => key.push_str(&format!("p c{:016x} {}\n", c, pkg_dir)),
+            (None, Some(id)) => key.push_str(&format!("p {} {}\n", id, pkg_dir)),
+            (None, None) => key.push_str(&format!("p {} {}\n", newest_mtime_pkg(std::path::Path::new(pkg_dir)), pkg_dir)),
         }
     }
     Some(key)
@@ -1255,13 +1403,13 @@ fn path_lock(path: &str) -> relax_session::sync::MutexGuard<'static, ()> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A Relax crate's build script (libs/relax/self_stamp.rs), answered without running it: its
-/// OUT_DIR/src_stamp.rs. The stamp hashes what the script hashes of the package itself (its files,
+/// A Relax crate's build script (libs/relax/self_stamp.rs), answered without running it: the text
+/// of its OUT_DIR/src_stamp.rs. The stamp hashes what the script hashes of the package itself (its files,
 /// nested packages, `target`, hidden entries and its tests, benches and examples left out, read
 /// through the VFS; the enabled features), with this crate's own build in place of rustc's
 /// toolchain and flags. Only relax-compiler's codegen identity reads a stamp, from its native
 /// build: a program compiling these crates from source never compares it.
-fn self_stamp_answer(dir: &str, pkg: &str, features: &[String], out_dir: &str) -> Result<(), String> {
+fn self_stamp_text(dir: &str, pkg: &str, features: &[String]) -> Result<String, String> {
     fn files(dir: &std::path::Path, rel: &str, out: &mut Vec<(String, std::path::PathBuf)>) {
         let Ok(mut rd) = crate::vfs::read_dir(dir) else { return };
         rd.sort();
@@ -1303,12 +1451,7 @@ fn self_stamp_answer(dir: &str, pkg: &str, features: &[String], out_dir: &str) -
     put(env!("CARGO_PKG_VERSION").as_bytes(), &mut buf);
     let d = relax_base::sha256::sha256(&buf);
     let stamp = u128::from_le_bytes(d[..16].try_into().unwrap());
-    let text = format!("/// This crate's source stamp (libs/relax/self_stamp.rs).\npub const SRC_STAMP: u128 = 0x{:032x};\n", stamp);
-    let out = format!("{}/src_stamp.rs", out_dir);
-    if std::fs::read_to_string(&out).ok().as_deref() != Some(text.as_str()) {
-        std::fs::write(&out, text).map_err(|e| format!("{}: {}", out, e))?;
-    }
-    Ok(())
+    Ok(format!("/// This crate's source stamp (libs/relax/self_stamp.rs).\npub const SRC_STAMP: u128 = 0x{:032x};\n", stamp))
 }
 
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1350,6 +1493,92 @@ mod script_error_tests {
         assert_eq!(super::script_error_cause(rustc), "error[E0308]: mismatched types", "rustc's own diagnostic shape");
         assert_eq!(super::script_error_cause(&format!("{{\"message\":\"index out of bounds\",\"type\":\"panic\"}}\n{summary}\n")), "index out of bounds", "a panic's message");
         assert_eq!(super::script_error_cause("one\ntwo\nthree\nfour\n"), "two | three | four", "else its last lines");
+    }
+}
+
+#[cfg(test)]
+mod shared_script_tests {
+    use super::{content, declared_inputs, shared_build_dir};
+
+    /// A shared workspace's rerun key holds what a path holds: two checkouts with the same bytes
+    /// agree whenever they were written, and a changed, added or removed file below a folder
+    /// changes it. A package's folder leaves out its target directories and hidden entries.
+    #[test]
+    fn a_paths_content_is_its_bytes_not_its_time() {
+        let tmp = std::env::temp_dir().join(format!("relax-script-content-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (a, b) = (tmp.join("a"), tmp.join("b"));
+        for (checkout, sql) in [(&a, "create table t ();"), (&b, "create table t ();")] {
+            std::fs::create_dir_all(checkout.join("migrations")).unwrap();
+            std::fs::write(checkout.join("migrations/0001.sql"), sql).unwrap();
+            std::fs::write(checkout.join("build.rs"), "fn main() {}").unwrap();
+        }
+        assert_eq!(content(&a, true, 0), content(&b, true, 0), "the same files at another place and time");
+        assert_eq!(content(&a.join("migrations/0001.sql"), false, 0), content(&b.join("migrations/0001.sql"), false, 0));
+        assert_eq!(content(&a.join("missing"), false, 0), 0);
+        std::fs::create_dir_all(b.join("target/x")).unwrap();
+        std::fs::write(b.join("target/x/built"), "1").unwrap();
+        std::fs::write(b.join(".hidden"), "1").unwrap();
+        assert_eq!(content(&a, true, 0), content(&b, true, 0), "a package's target directories and hidden entries are not its content");
+        assert_ne!(content(&a, false, 0), content(&b, false, 0), "a folder a script names is read whole");
+        std::fs::write(b.join("migrations/0001.sql"), "create table u ();").unwrap();
+        assert_ne!(content(&a, true, 0), content(&b, true, 0), "a changed file");
+        assert_ne!(content(&a.join("migrations"), false, 0), content(&b.join("migrations"), false, 0));
+        std::fs::write(b.join("migrations/0001.sql"), "create table t ();").unwrap();
+        assert_eq!(content(&a, true, 0), content(&b, true, 0), "changed back");
+        std::fs::write(b.join("migrations/0002.sql"), "").unwrap();
+        assert_ne!(content(&a.join("migrations"), false, 0), content(&b.join("migrations"), false, 0), "an added file, even an empty one");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_scripts_declared_inputs_are_its_rerun_lines() {
+        let out = "cargo:rustc-cfg=x\ncargo::rerun-if-changed=migrations\ncargo:rerun-if-env-changed=DATABASE_URL\nnoise\ncargo:rerun-if-changed=build.rs\ncargo::rerun-if-changed=migrations\n";
+        assert_eq!(declared_inputs(out), "cargo::rerun-if-changed=migrations\ncargo:rerun-if-changed=build.rs\ncargo:rerun-if-env-changed=DATABASE_URL");
+        assert_eq!(declared_inputs("cargo:rustc-cfg=x\n"), "");
+    }
+
+    /// One output per content of a shared script's inputs: an output that stands is found under
+    /// the name its inputs give, or under another name of the same script; one whose inputs
+    /// differ is never taken, and the script's next output gets a folder of its own.
+    #[test]
+    fn a_shared_scripts_output_is_kept_per_content_of_its_inputs() {
+        let tmp = std::env::temp_dir().join(format!("relax-script-place-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let build = tmp.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        let base = format!("{}/app-00000000000000aa", build.display());
+        // a build dir's output stands when it was made from `inputs`
+        let previous = |inputs: &'static str| move |dir: &str| match std::fs::read_to_string(format!("{dir}/output")) {
+            Ok(made_from) if made_from == inputs => Ok(made_from),
+            Ok(_) => Err("inputs changed".to_string()),
+            Err(_) => Err("no previous output".to_string()),
+        };
+        let key_of = |inputs: &'static str| move |declared: &str| format!("{declared}\n{inputs}");
+        let make = |dir: &str, inputs: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(format!("{dir}/output"), inputs).unwrap();
+        };
+
+        // nothing made yet: the place the package's files name, and no output there
+        let (first, standing) = shared_build_dir(&base, "", &key_of("one"), &previous("one"));
+        assert!(first.starts_with(&format!("{base}-")) && standing == Err("no previous output".to_string()));
+        make(&first, "one");
+        // the script declared its inputs: the name changes, the output that stands is still found
+        let (found, standing) = shared_build_dir(&base, "cargo:rerun-if-changed=migrations", &key_of("one"), &previous("one"));
+        assert_eq!((found.as_str(), standing), (first.as_str(), Ok("one".to_string())), "an output made before its inputs were known");
+        // another checkout, other inputs: its own place, and the first output is left as it is
+        let (second, standing) = shared_build_dir(&base, "cargo:rerun-if-changed=migrations", &key_of("two"), &previous("two"));
+        assert!(second != first && standing.is_err(), "{second}");
+        make(&second, "two");
+        assert_eq!(std::fs::read_to_string(format!("{first}/output")).unwrap(), "one");
+        // each checkout finds its own again, the second under its name at once
+        assert_eq!(shared_build_dir(&base, "cargo:rerun-if-changed=migrations", &key_of("two"), &previous("two")), (second.clone(), Ok("two".to_string())));
+        assert_eq!(shared_build_dir(&base, "cargo:rerun-if-changed=migrations", &key_of("one"), &previous("one")), (first.clone(), Ok("one".to_string())));
+        // another script's outputs (another base) are not this one's
+        let other = format!("{}/app-00000000000000bb", build.display());
+        assert!(shared_build_dir(&other, "", &key_of("one"), &previous("one")).1.is_err());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 
