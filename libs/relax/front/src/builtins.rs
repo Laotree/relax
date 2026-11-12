@@ -1287,7 +1287,7 @@ fn expand_pm_ts(p: &crate::parser::Parser, span_needed: bool, lo: usize, hi: usi
             Span { file: 0, lo: a, hi: z, start: indexed_line_col(src, ls, cs, &src_cursor, a), end: indexed_line_col(src, ls, cs, &src_cursor, z.min(base)) }
         }
     };
-    let input = to_stream_buf(buf, &p.toks, lo, hi, &span_of).ok_or_else(|| "unbalanced delimiters in macro input".to_string())?;
+    let mut input = to_stream_buf(buf, &p.toks, lo, hi, &span_of).ok_or_else(|| "unbalanced delimiters in macro input".to_string())?;
     let call = span_of(call_lo, call_hi);
     drop(stream_timer);
     drop(input_timer);
@@ -1298,7 +1298,31 @@ fn expand_pm_ts(p: &crate::parser::Parser, span_needed: bool, lo: usize, hi: usi
         verify_pm_spans(&input, &expected);
         assert_eq!(call, expected_call, "macro call span");
     }
+    // rustc hands a proc macro a fragment a macro_rules arm forwards in an invisible group
+    // (proc_macro bridge: `OpenInvisible(MetaVar(..))` .. `CloseInvisible` becomes
+    // `Group(Delimiter::None)`), and syn reads through one (`Expr::Group`). The parentheses the
+    // transcriber wrote around a forwarded expression (synth_parens) stand for that group. As real
+    // parentheses, sqlx's expand_query! refused `("sql" + "sql")` for its `source` ("expected
+    // string literal") and kept the cast of `(x as _)`, whose `_` it looks for in an `Expr::Group`.
+    // What the macro returns of it is read as rustc reads a proc macro's invisible group: its
+    // tokens, ungrouped (rustc_ast token.rs InvisibleOrigin::ProcMacro; `render`).
+    if !p.synth_parens.is_empty() {
+        invisible_groups(&mut input.trees, &p.synth_parens);
+    }
     run(input, call)
+}
+
+/// The groups of `trees` whose opening parenthesis is one the transcriber wrote around a
+/// forwarded expression (`synth`: its position), as invisible groups.
+fn invisible_groups(trees: &mut [TokenTree], synth: &crate::fxhash::HashSet<u32>) {
+    for t in trees {
+        if let TokenTree::Group(g) = t {
+            if g.delim == Delimiter::Parenthesis && synth.contains(&g.span.lo) {
+                g.delim = Delimiter::None;
+            }
+            invisible_groups(&mut g.stream.trees, synth);
+        }
+    }
 }
 
 fn env_value(ctx: Option<&FileCtx>, name: &str) -> Option<String> {
