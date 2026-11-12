@@ -241,18 +241,43 @@ fn hash_dir(dir: &std::path::Path, h: &mut u64) {
     }
 }
 
-/// The resolved package identities and feature sets, independent of lockfile formatting,
-/// unused patches, and the traversal order of Cargo's units. Include build dependencies.
-fn resolved_packages_key<'a>(raw: impl IntoIterator<Item = &'a crate::unitgraph::RawUnit>) -> u64 {
-    let mut packages: Vec<_> = raw.into_iter().map(|unit| {
-        let mut features = unit.features.clone();
-        features.sort();
-        features.dedup();
-        (unit.pkg.clone(), features)
-    }).collect();
+/// The native build's inputs as cargo reads them: the packages and versions in the graph, each
+/// package's manifest, and the workspace's manifest, lock and cargo config. Relax's resolved
+/// feature lists are deliberately absent — cargo resolves the features itself in the native
+/// build, so a resolver fix in relax (or any change to how it spells a unit) must not invalidate
+/// a build whose cargo inputs are unchanged.
+fn resolved_packages_key<'a>(raw: impl IntoIterator<Item = &'a crate::unitgraph::RawUnit>, workspace: &str) -> u64 {
+    // The inputs cargo reads, not relax's resolution of them: the packages and versions in the
+    // graph, each package's manifest (cargo resolves the features from those), and the workspace's
+    // manifest, lock and cargo config. A resolved feature list is absent on purpose: the native
+    // build asks cargo, which resolves features itself, so a resolver fix in relax (or any change
+    // to how it spells a unit) must not invalidate a build whose cargo inputs are unchanged.
+    let mut packages: Vec<_> = raw.into_iter().map(|unit| unit.pkg.clone()).collect();
     packages.sort();
     packages.dedup();
-    fnv(format!("{packages:?}").as_bytes(), 0xcbf29ce484222325)
+    let mut h = fnv(b"native-inputs-v1", 0xcbf29ce484222325);
+    for (dir, name, version) in packages {
+        h = fnv(name.as_bytes(), h);
+        h = fnv(b"\0", h);
+        h = fnv(version.as_bytes(), h);
+        h = fnv(b"\0", h);
+        h = fnv(dir.as_bytes(), h);
+        h = fnv(b"\0", h);
+        if let Ok(manifest) = crate::vfs::read(format!("{dir}/Cargo.toml")) {
+            h = fnv(&manifest, h);
+        }
+        h = fnv(b"\xff", h);
+    }
+    // Not Cargo.lock: cargo rewrites it during the build it pins (unused patches, member order),
+    // and its resolved versions are already here per package. Not .cargo/config.toml either:
+    // `plan` hashes every config file cargo reads, content included.
+    for file in ["Cargo.toml"] {
+        if let Ok(bytes) = crate::vfs::read(format!("{workspace}/{file}")) {
+            h = fnv(file.as_bytes(), h);
+            h = fnv(&bytes, h);
+        }
+    }
+    h
 }
 
 fn cc() -> String {
@@ -318,14 +343,14 @@ fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
     // and of the resolved graph only the native closure (the packages whose scripts or libs
     // cargo builds for real): two packages whose closure resolves alike share the build.
     let selection = selection_key(&script_pkgs, &lib_pkgs);
-    let mut h = fnv(b"native-link-v15", 0xcbf29ce484222325);
+    let mut h = fnv(b"native-link-v16", 0xcbf29ce484222325);
     h = fnv(req.triple.as_bytes(), h);
     h = fnv(&selection.to_le_bytes(), h);
     for f in &flags {
         h = fnv(f.as_bytes(), h);
         h = fnv(b"\0", h);
     }
-    h = fnv(&resolved_packages_key(g.raw.iter().filter(|u| script_pkgs.binary_search(&u.pkg.1).is_ok())).to_le_bytes(), h);
+    h = fnv(&resolved_packages_key(g.raw.iter(), req.workspace).to_le_bytes(), h);
     // and the program's rustc flags, wherever cargo takes them from: the native library is linked
     // with the program's link arguments (`link_args`)
     let mut native_env: Vec<_> = std::env::vars().filter(|(k, _)| {
@@ -345,19 +370,14 @@ fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
     }
     let cc_version = Command::new(cc()).arg("--version").output().map(|o| o.stdout).unwrap_or_default();
     h = fnv(cc_version.split(|&b| b == b'\n').next().unwrap_or(&[]), h);
-    let mut native_packages: Vec<_> = seeds.iter().map(|&s| {
-        let bs = &g.build_scripts[s];
-        let mut features = bs.features.clone();
-        features.sort();
-        features.dedup();
-        (pk(bs), features, g.crates[bs.krate].registry)
-    }).collect();
+    let mut native_packages: Vec<_> = seeds.iter().map(|&s| (pk(&g.build_scripts[s]), g.crates[g.build_scripts[s].krate].registry)).collect();
     native_packages.sort();
     native_packages.dedup();
     let mut names: Vec<String> = Vec::new();
-    for ((dir, name, ver), features, registry) in native_packages {
+    for ((dir, name, ver), registry) in native_packages {
         names.push(format!("{} {}", name, ver));
-        h = fnv(format!("{} {} {:?}", name, ver, features).as_bytes(), h);
+        // the features are the manifests' business (resolved_packages_key); only the identity here
+        h = fnv(format!("{} {}", name, ver).as_bytes(), h);
         // a registry or git package's source is its id (the resolved packages above); a path
         // package's is its files
         if !registry {
@@ -1491,7 +1511,7 @@ fn script_selection_follows_every_unit_of_a_package() {
 
 #[cfg(test)]
 #[test]
-fn native_key_uses_sorted_resolved_packages() {
+fn native_key_follows_cargo_inputs_not_relax_features() {
     let unit = |name: &str, version: &str, features: &[&str]| crate::unitgraph::RawUnit {
         name: name.into(), src_path: String::new(), edition: 2021,
         features: features.iter().map(|f| f.to_string()).collect(), proc_macro: false,
@@ -1500,17 +1520,45 @@ fn native_key_uses_sorted_resolved_packages() {
     };
     let a = unit("a", "1.0.0", &["fast", "std"]);
     let b = unit("b", "2.0.0", &[]);
-    let key = resolved_packages_key(&[a.clone(), b.clone()]);
-    assert_eq!(key, resolved_packages_key(&[b.clone(), unit("a", "1.0.0", &["std", "fast"]), a.clone()]),
+    let key = resolved_packages_key(&[a.clone(), b.clone()], "");
+    assert_eq!(key, resolved_packages_key(&[b.clone(), unit("a", "1.0.0", &["std", "fast"]), a.clone()], ""),
         "unit order, duplicate targets and feature order must not change the key");
-    assert_ne!(key, resolved_packages_key(&[a.clone(), unit("b", "2.0.1", &[])]),
+    assert_ne!(key, resolved_packages_key(&[a.clone(), unit("b", "2.0.1", &[])], ""),
         "a resolved version change must invalidate native artifacts");
-    assert_ne!(key, resolved_packages_key(&[unit("a", "1.0.0", &["std"]), b.clone()]),
-        "a resolved feature change must invalidate native artifacts");
+    // cargo resolves the features itself when it builds the native packages; relax's resolution is
+    // not an input, and a resolver fix must not throw the build away
+    assert_eq!(key, resolved_packages_key(&[unit("a", "1.0.0", &["std"]), b.clone()], ""),
+        "relax's resolved feature list is not a native input");
     let mut other_source = a;
     other_source.pkg.0 = "other/a".into();
-    assert_ne!(key, resolved_packages_key(&[other_source, b]),
+    assert_ne!(key, resolved_packages_key(&[other_source, b], ""),
         "a resolved source change must invalidate native artifacts");
+
+    // a manifest is an input: cargo resolves features from it
+    let dir = std::env::temp_dir().join(format!("relax-native-key-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let manifest = dir.join("Cargo.toml");
+    std::fs::write(&manifest, "[package]\nname = \"m\"\nversion = \"1.0.0\"\n").unwrap();
+    let mut m = unit("m", "1.0.0", &[]);
+    m.pkg.0 = dir.display().to_string();
+    let before = resolved_packages_key([&m], "");
+    std::fs::write(&manifest, "[package]\nname = \"m\"\nversion = \"1.0.0\"\n[dependencies]\nx = \"1\"\n").unwrap();
+    assert_ne!(before, resolved_packages_key([&m], ""), "a manifest change is a cargo input");
+
+    // the workspace manifest is an input; its lock is not (cargo rewrites the lock during the
+    // build it pins, and the versions it holds are in the package identities above)
+    let ws = dir.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let ws_manifest = ws.join("Cargo.toml");
+    std::fs::write(&ws_manifest, "[workspace]\nmembers = []\n").unwrap();
+    let ws_key = resolved_packages_key([&m], &ws.display().to_string());
+    std::fs::write(ws.join("Cargo.lock"), "# a lock cargo would rewrite\nversion = 3\n").unwrap();
+    assert_eq!(ws_key, resolved_packages_key([&m], &ws.display().to_string()),
+        "a lockfile rewrite during the build must not invalidate it");
+    std::fs::write(&ws_manifest, "[workspace]\nmembers = [\"a\"]\n").unwrap();
+    assert_ne!(ws_key, resolved_packages_key([&m], &ws.display().to_string()),
+        "the workspace manifest is a cargo input");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(test)]
