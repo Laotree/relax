@@ -151,7 +151,7 @@ pub mod intrinsics_mem {
         #[rustc_intrinsic_const_stable_indirect]
         pub fn align_of_val<T: ?Sized>(v: *const T) -> usize;
         #[rustc_intrinsic_const_stable_indirect]
-        pub fn needs_drop<T>() -> bool;
+        pub fn needs_drop<T: ?Sized>() -> bool;
         /// `T: Copy` for this instantiation (a constant per instance): std's Copy fast paths
         /// (real std specializes Clone-for-Copy into memcpy)
         pub fn is_copy<T>() -> bool;
