@@ -119,6 +119,58 @@ pub fn __crc32d(crc: u32, data: u64) -> u32 {
     }
 }
 
+#[inline]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "crc"))]
+pub fn __crc32cb(crc: u32, data: u8) -> u32 {
+    unsafe {
+        crc32c::<1>(crc, data as u64)
+    }
+}
+
+#[inline]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "crc"))]
+pub fn __crc32ch(crc: u32, data: u16) -> u32 {
+    unsafe {
+        crc32c::<2>(crc, data as u64)
+    }
+}
+
+#[inline]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "crc"))]
+pub fn __crc32cw(crc: u32, data: u32) -> u32 {
+    unsafe {
+        crc32c::<4>(crc, data as u64)
+    }
+}
+
+#[inline]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "crc"))]
+pub fn __crc32cd(crc: u32, data: u64) -> u32 {
+    unsafe {
+        crc32c::<8>(crc, data)
+    }
+}
+
+/// CRC-32C (reflected 0x82F63B78, no inversions) of data's low BYTES bytes into crc: as crc32.
+#[inline(always)]
+unsafe fn crc32c<const BYTES: u32>(crc: u32, data: u64) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        vx::vx_crc32c(crc, data, BYTES)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut r = crc;
+        let mut i = 0;
+        while i < BYTES * 8 {
+            r ^= ((data >> i) & 1) as u32;
+            r = (r >> 1) ^ (0x82f6_3b78u32 & (0u32.wrapping_sub(r & 1)));
+            i += 1;
+        }
+        r
+    }
+}
+
 /// CRC-32 (reflected 0xEDB88320, no inversions) of data's low BYTES bytes into crc: the
 /// instruction on aarch64 targets, bit by bit elsewhere (this module compiles on every target).
 #[inline(always)]

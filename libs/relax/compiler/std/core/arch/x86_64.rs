@@ -1105,6 +1105,61 @@ pub unsafe fn _mm_clmulepi64_si128<const IMM8: i32>(a: __m128i, b: __m128i) -> _
     vx::vx_binary(a, b, 90 + ((IMM8 & 1) | ((IMM8 >> 3) & 2)) as u32, 64)
 }
 
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse4.2"))]
+pub fn _mm_crc32_u8(crc: u32, v: u8) -> u32 {
+    unsafe {
+        crc32c::<1>(crc, v as u64)
+    }
+}
+
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse4.2"))]
+pub fn _mm_crc32_u16(crc: u32, v: u16) -> u32 {
+    unsafe {
+        crc32c::<2>(crc, v as u64)
+    }
+}
+
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse4.2"))]
+pub fn _mm_crc32_u32(crc: u32, v: u32) -> u32 {
+    unsafe {
+        crc32c::<4>(crc, v as u64)
+    }
+}
+
+/// The 64-bit form reads the crc's low 32 bits; the result is zero-extended.
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse4.2"))]
+pub fn _mm_crc32_u64(crc: u64, v: u64) -> u64 {
+    unsafe {
+        crc32c::<8>(crc as u32, v) as u64
+    }
+}
+
+/// CRC-32C (reflected 0x82F63B78, no inversions) of data's low BYTES bytes into crc: SSE4.2
+/// `crc32` on x86_64 targets (Arm's crc32c on aarch64), bit by bit elsewhere (this module compiles
+/// on every target).
+#[inline(always)]
+unsafe fn crc32c<const BYTES: u32>(crc: u32, data: u64) -> u32 {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        vx::vx_crc32c(crc, data, BYTES)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let mut r = crc;
+        let mut i = 0;
+        while i < BYTES * 8 {
+            r ^= ((data >> i) & 1) as u32;
+            r = (r >> 1) ^ (0x82f6_3b78u32 & (0u32.wrapping_sub(r & 1)));
+            i += 1;
+        }
+        r
+    }
+}
+
 #[inline(always)]
 pub unsafe fn _mm_cmpeq_epi8(a: __m128i, b: __m128i) -> __m128i {
     vx::vx_binary(a, b, 10, 8)
