@@ -56,4 +56,5 @@ fn close_delimited_body_redirect_and_cap() {
 fn refuses_plain_http_off_loopback() {
     assert!(fetch(&Request::get("http://example.com/")).is_err());
     assert!(fetch(&Request::get("https://user@example.com/")).is_err());
+    assert!(fetch(&Request { headers: &[("X-Note", "a\x0bb")], ..Request::get("http://127.0.0.1:1/") }).is_err_and(|e| e.starts_with("invalid header")));
 }

@@ -105,7 +105,9 @@ pub(crate) fn parse_url(url: &str) -> Result<Url<'_>, String> {
 pub fn send(req: &Request, out: &mut dyn Write, progress: &mut dyn FnMut(u64, Option<u64>)) -> Result<Response, String> {
     let url = parse_url(req.url)?;
     for (n, v) in req.headers {
-        if n.is_empty() || n.bytes().any(|b| b <= b' ' || b == b':' || b >= 0x7f) || v.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+        // a value is visible characters, spaces and tabs (RFC 9110 field-value): a control
+        // character ends the line on some writer, or starts another header
+        if n.is_empty() || n.bytes().any(|b| b <= b' ' || b == b':' || b >= 0x7f) || v.bytes().any(|b| (b < b' ' && b != b'\t') || b == 0x7f) {
             return Err(format!("invalid header {n}"));
         }
     }
