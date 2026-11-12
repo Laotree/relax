@@ -8,8 +8,8 @@
 //! (`jit::compile_slot`), and so is every instance, closure and glue those reach (rustc's
 //! monomorphization collector for `build-pass`), on `MAKEPAD_RUN_JOBS` threads. Every failure prints
 //! as one line (`file:line:col: error|internal: ..`); `internal` marks a makepad run bug (a compiler
-//! panic, an error without a user-facing code, or an error inside std or a dependency rustc
-//! builds). `--root-only` and the watch session's deep check (`collect_deep`) cover the root
+//! panic, an error without a user-facing code, or an error inside std or outside any crate).
+//! `--root-only` and the watch session's deep check (`collect_deep`) cover the root
 //! crate (and what it reaches) only.
 
 macro_rules! eprintln {
@@ -72,6 +72,15 @@ pub fn foreign_errors<'e>(prog: &crate::program::Program, checked: &[u32], errs:
         }
     }
     out
+}
+
+/// Whether a crate named `name` comes from a registry (the cargo home's or the run dir's
+/// `registry/`): a published crate, which builds under rustc -- its error is most likely a
+/// makepad run divergence, and the check asks for a report (run.rs).
+pub fn published_crate(prog: &crate::program::Program, name: &str) -> bool {
+    use crate::vfs::canonical as canon;
+    let dirs = crate::dirs::registry_dirs().map(|d| format!("{}/", canon(&d.to_string_lossy()).trim_end_matches('/')));
+    prog.crates.iter().any(|c| prog.syms.str(c.name) == name && dirs.iter().any(|d| canon(c.root_path()).starts_with(d.as_str())))
 }
 
 /// The crates a one-shot `makepad check` covers: the root and every loaded crate whose root file
@@ -137,7 +146,7 @@ pub(crate) fn skipped_text_hash(c: u32) -> u128 {
     let Some(paths) = BOOT_SKIPPED.get().and_then(|v| v.get(c as usize)).filter(|v| !v.is_empty()) else { return 0 };
     let mut h = crate::sip::Sip128::new();
     for p in paths {
-        h.str(p);
+        h.str(&crate::dirs::anchored(p));
         // (an unreadable file: its absence is the input, its load reports it)
         h.u128(crate::vfs::read(p).map_or(0, |src| crate::crate_image::file_hash(p, &src)));
     }
@@ -791,15 +800,18 @@ fn par_map<T: Sync, R: Send>(items: &[T], jobs: usize, f: impl Fn(&T) -> R + Syn
 }
 
 /// Check the selected crates; `selftest` also compiles every function (see the module doc).
-pub fn check_crate(u: &mut Unit, root: u32, crates: &[u32], errors: Vec<String>, selftest: bool) -> i32 {
-    check_crate_impl(u, root, crates, errors, true, selftest, None).0
+/// Returns the exit code and the errors in other crates, counted by crate.
+pub fn check_crate(u: &mut Unit, root: u32, crates: &[u32], errors: Vec<String>, selftest: bool) -> (i32, Vec<(String, usize)>) {
+    let (code, _, foreign) = check_crate_impl(u, root, crates, errors, true, selftest, None);
+    (code, foreign)
 }
 
 /// `check_crate` reusing the verdicts of `reuse`'s unchanged crates (check_reuse.rs): their
 /// diagnostics replayed, the per-crate passes run on the other crates only; a passing check
 /// stores the others' verdicts.
-pub(crate) fn check_crate_reusing(u: &mut Unit, root: u32, crates: &[u32], errors: Vec<String>, reuse: &mut crate::check_reuse::Reuse) -> i32 {
-    check_crate_impl(u, root, crates, errors, true, false, Some(reuse)).0
+pub(crate) fn check_crate_reusing(u: &mut Unit, root: u32, crates: &[u32], errors: Vec<String>, reuse: &mut crate::check_reuse::Reuse) -> (i32, Vec<(String, usize)>) {
+    let (code, _, foreign) = check_crate_impl(u, root, crates, errors, true, false, Some(reuse));
+    (code, foreign)
 }
 
 /// Whether a check may reuse verdicts: nothing it was asked to do needs every body walked (a
@@ -1038,7 +1050,7 @@ pub(crate) fn live_lints(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, 
     crate::check_order::sort(prog, entries).into_iter().filter_map(|e| match e.out { Out::Warning(s) | Out::Error(s) => Some(s), Out::Borrow(_) => None }).collect()
 }
 
-fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>, emit: bool, compile: bool, mut reuse: Option<&mut crate::check_reuse::Reuse>) -> (i32, Vec<crate::diag::Diagnostic>) {
+fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>, emit: bool, compile: bool, mut reuse: Option<&mut crate::check_reuse::Reuse>) -> (i32, Vec<crate::diag::Diagnostic>, Vec<(String, usize)>) {
     use crate::check_order::{Phase, Stage};
     let t_check = std::time::Instant::now();
     // every error with where rustc reports it (check_order.rs); the front end's come first
@@ -1171,17 +1183,17 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     crate::borrowck::lazy::disable_gandalf();
     if options.borrowck_all != crate::options::BorrowckAll::Default {
         let n = crate::borrowck::check_all(&u.prog, &u.tcx, options.borrowck_all == crate::options::BorrowckAll::Std);
-        return (if n == 0 { 0 } else { 1 }, Vec::new());
+        return (if n == 0 { 0 } else { 1 }, Vec::new(), Vec::new());
     }
     // MIR borrowck pipeline harness (docs: relax_types::mir::build::driver_borrowck).
     if let Some(mode) = std::env::var_os("MAKEPAD_RUN_MIR_BORROWCK_ALL") {
         let errors = relax_types::mir::build::driver_borrowck::borrowck_all(&u.prog, &u.tcx, mode == "std");
-        return (if errors == 0 { 0 } else { 1 }, Vec::new());
+        return (if errors == 0 { 0 } else { 1 }, Vec::new(), Vec::new());
     }
     // MIR construction harness (docs: relax_types::mir::build::driver): build + validate every body.
     if let Some(mode) = std::env::var_os("MAKEPAD_RUN_MIR_BUILD_ALL") {
         let failures = relax_types::mir::build::driver::build_all(&u.prog, &u.tcx, mode == "std");
-        return (if failures == 0 { 0 } else { 1 }, Vec::new());
+        return (if failures == 0 { 0 } else { 1 }, Vec::new(), Vec::new());
     }
     // (the check's borrow errors are printed with its other diagnostics, in rustc's order)
     let borrow_events = crate::gandalf_out::Collector::start();
@@ -1270,9 +1282,22 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     // checker are queries over the shared program and type context (as the run's typeck-ahead
     // workers use them); results are merged in owner order
     struct Outcome { errors: Vec<(Stage, String)>, diags: Vec<crate::diag::Diagnostic>, seed: Option<crate::program::DefId>, needs_load: bool, unchecked: bool }
+    // body verdicts (check_bodies.rs): a fresh crate's body whose stored verdict stands is
+    // replayed, not checked (Verify mode compares them instead); an app check's, with the store
+    let (mut bodies, replay) = match reuse.as_deref_mut().filter(|_| !compile) {
+        Some(r) => { let (b, f) = crate::check_bodies::Bodies::open(r, &u.prog, &u.tcx, &fresh_crates, &fns); (Some(b), f) }
+        None => (None, Vec::new()),
+    };
+    // (the owners replayed as the body round starts: a second round may check some after all)
+    let replayed_set: std::collections::HashSet<crate::program::DefId> = bodies.as_ref().map_or_else(Default::default, |b| b.replayed().clone());
+    let replayed = &replayed_set;
+    // by crate: has bodies replayed, whose stored uses its import reports wait on (lint_imports::Judge)
+    let mut replayed_crates = vec![false; u.prog.crates.len()];
+    for &d in replayed { replayed_crates[u.prog.def(d).krate as usize] = true; }
     let jobs = jobs();
     let upn = up as usize;
-    let check_one = move |owner: &crate::borrowck::body::CheckedBody, generic: bool| -> Outcome {
+    // `replay`: an owner with a stored verdict standing is replayed (not in a second round)
+    let check_one = move |owner: &crate::borrowck::body::CheckedBody, generic: bool, replay: bool| -> Outcome {
         let uu = unsafe { &*(upn as *const Unit) };
         let (prog, tcx) = (&uu.prog, &uu.tcx);
         let d = owner.owner;
@@ -1280,9 +1305,15 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
         let mut out = Outcome { errors: Vec::new(), diags: Vec::new(), seed: None, needs_load: false, unchecked: false };
         // (work that unwound with no result is asked again in there, until it has an answer)
         let r = def_work(|said| def_ice(prog, d, "the body", said), || {
+            // a stored verdict stands: the body is parsed and its macros expanded as its check
+            // would (the late inputs and the expansion records the crate passes read), not checked
+            if replay && replayed.contains(&d) {
+                relax_types::body_facts::with_owner(prog, d, || { let def = prog.def(d); let _ = prog.fn_body(def.file, def.item); });
+                return (Vec::new(), Vec::new());
+            }
             #[cfg(test)]
             forced_body_unwind(prog, d);
-            let (errors, events) = body_errors(prog, tcx, options, owner, generic, true);
+            let (errors, events) = relax_types::body_facts::with_owner(prog, d, || body_errors(prog, tcx, options, owner, generic, true));
             (errors, events.iter().map(|ev| ev.error.to_diagnostic()).collect())
         });
         match r {
@@ -1302,6 +1333,8 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
         if !out.errors.is_empty() { out.needs_load = true; }
         out
     };
+    relax_types::body_facts::open();
+    for (d, f) in replay { relax_types::body_facts::replay(&u.prog, d, f); }
     let t_par = t_check.elapsed();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let mut outcomes: Vec<(usize, Outcome)> = Vec::new();
@@ -1315,7 +1348,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let Some((owner, generic)) = fns.get(i) else { break };
-                        local.push((i, check_one(owner, *generic)));
+                        local.push((i, check_one(owner, *generic, true)));
                         // return the allocator's free pages as the check goes (Stage held 4.6 GB)
                         if i % 20_000 == 19_999 { crate::memstat::trim(); }
                     }
@@ -1342,12 +1375,15 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
         .filter(|(_, (_, o))| skipped_left && o.needs_load)
         .map(|(idx, _)| idx)
         .collect();
+    // the owners whose verdicts are not stored: a check that failed, met a skipped file or was
+    // asked again
+    let mut unclean: std::collections::HashSet<crate::program::DefId> = retry_idxs.iter().map(|&idx| fns[outcomes[idx].0].0.owner).collect();
     if !retry_idxs.is_empty() {
         let t_retry = std::time::Instant::now();
         let retried = par_map(&retry_idxs, jobs, |&idx| {
             let fi = outcomes[idx].0;
             let (owner, generic) = &fns[fi];
-            check_one(owner, *generic)
+            check_one(owner, *generic, true)
         });
         for (idx, new_o) in retry_idxs.iter().copied().zip(retried) {
             outcomes[idx].1 = new_o;
@@ -1367,11 +1403,15 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
             o.errors.push((Stage::of(Phase::Typeck, 0, d), e));
         }
         if !o.errors.is_empty() || !o.diags.is_empty() { tainted.insert(fns[i].0.owner); }
+        if o.unchecked || !o.errors.is_empty() || !o.diags.is_empty() { unclean.insert(fns[i].0.owner); }
         errors.extend(o.errors);
         borrow_diagnostics.extend(o.diags);
         if let Some(d) = o.seed { seeds.push(d); }
     }
     let checked = seeds.len();
+    if let Some(b) = bodies.as_ref().filter(|_| subjects_mode() == 0) {
+        eprintln!("makepad check: {} of {} bodies replayed from stored verdicts", b.stats.replayed, n_own);
+    }
     let mut st = StepTimes::new("after bodies:");
     st.mark("merge");
     // the anonymous constants inside the bodies are body owners of their own (rustc
@@ -1380,22 +1420,46 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     // visit_nested_body: a const argument `U::<300>` is a body of its own, its literal typed as
     // the parameter). A repeat count its owner typed was linted with the owner, but its errors as
     // a constant (`[0; n]` with `n` a local) are its own
-    for &k in &fresh_crates {
-        let uu = unsafe { &*up };
-        for (anon, owner, e) in crate::borrowck::body::body_anon_consts(&uu.prog, &uu.tcx, k) {
-            let errs = settled_def(up, anon, "the constant", || {
-                let outer = uu.tcx.typeck(&uu.prog, owner);
-                let owner_typed = outer.has_expr(e) && outer.expr_typed.get(outer.expr_ix(e));
-                let body = uu.tcx.typeck(&uu.prog, anon);
-                if !owner_typed && body.errors.is_empty() && outer.errors.is_empty() {
-                    relax_types::lint::check_literals(&uu.prog, &uu.tcx, &body);
-                    relax_types::lint_dead::collect_body(&uu.prog, &uu.tcx, &body);
-                }
-                body.errors.to_vec()
-            }).unwrap_or_else(|failed| vec![failed]);
-            errors.extend(staged(Stage::of(Phase::Typeck, 0, anon), errs));
+    // (of the owners `of` takes; a replayed body's constants' facts are in its stored ones)
+    let body_anons = |of: &dyn Fn(crate::program::DefId) -> bool, errors: &mut Vec<(Stage, String)>, unclean: &mut std::collections::HashSet<crate::program::DefId>| {
+        for &k in &fresh_crates {
+            let uu = unsafe { &*up };
+            for (anon, owner, e) in crate::borrowck::body::body_anon_consts(&uu.prog, &uu.tcx, k) {
+                if !of(owner) { continue; }
+                let errs = settled_def(up, anon, "the constant", || relax_types::body_facts::with_owner(&uu.prog, owner, || {
+                    let outer = uu.tcx.typeck(&uu.prog, owner);
+                    let owner_typed = outer.has_expr(e) && outer.expr_typed.get(outer.expr_ix(e));
+                    let body = uu.tcx.typeck(&uu.prog, anon);
+                    if !owner_typed && body.errors.is_empty() && outer.errors.is_empty() {
+                        relax_types::lint::check_literals(&uu.prog, &uu.tcx, &body);
+                        relax_types::lint_dead::collect_body(&uu.prog, &uu.tcx, &body);
+                    }
+                    body.errors.to_vec()
+                })).unwrap_or_else(|failed| vec![failed]);
+                if !errs.is_empty() { unclean.insert(owner); }
+                errors.extend(staged(Stage::of(Phase::Typeck, 0, anon), errs));
+            }
+        }
+    };
+    body_anons(&|owner| !replayed.contains(&owner), &mut errors, &mut unclean);
+    relax_types::body_facts::close();
+    let facts = relax_types::body_facts::take();
+    // (the guard at the end: no replayed body was type-checked)
+    #[cfg(test)]
+    let mut replayed_guard: Vec<crate::program::DefId> = replayed.iter().copied().collect();
+    if let Some(b) = bodies.as_mut() {
+        errors.extend(b.collect(&u.prog, &facts, &unclean).into_iter().map(|e| (Stage::new(Phase::Post, 0), e)));
+        if b.verifying() && subjects_mode() == 0 {
+            eprintln!("makepad check: {} stored body verdicts verified, {} differ", b.stats.verified, b.stats.differ);
         }
     }
+    #[cfg(test)]
+    if crate::check_bodies::FACT_CODEC_CHECK.with(|f| f.get()) {
+        crate::check_bodies::assert_round_trip(&u.prog, &u.tcx, &own_all, &facts);
+    }
+    relax_types::body_facts::publish(&u.prog, facts);
+    #[cfg(test)]
+    assert_eq!(relax_types::body_facts::escaped(), 0, "BodyFacts escape guard: body-phase sink writes without an owner");
     st.mark("body anon consts");
     relax_types::lint_early::finish(&u.prog, &own); st.mark("lint_early::finish");
     errors.extend(staged(Stage::new(Phase::Typeck, 0), static_self_access(up, &own))); st.mark("static_self_access");
@@ -1416,7 +1480,54 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     // (unfulfilled_lint_expectations). misc_checking_3's own errors (privacy) do not count.
     let analyses_ok = !errors.iter().any(|(s, _)| s.required()) && borrow_diagnostics.is_empty() && !relax_types::lint::has_hard_error()
         && unsafe { (&*up).errors.iter().all(|e| e.starts_with("compile error in ")) };
-    relax_types::lint_dead::finish(&u.prog, &u.tcx, &own, root, analyses_ok, &erroneous_imports); st.mark("lint_dead::finish");
+    let deferred = relax_types::lint_dead::finish(&u.prog, &u.tcx, &own, root, analyses_ok, &erroneous_imports, &replayed_crates); st.mark("lint_dead::finish");
+    // a crate with replayed bodies held its import reports back: one the recorded uses decide
+    // would say something (lint_imports::Judge), and a stored verdict that lacks a use would make
+    // it false. Its replayed bodies are checked now, in a second round, their facts published, and
+    // its imports judged again on them
+    if !deferred.is_empty() {
+        let t_again = std::time::Instant::now();
+        let krates: std::collections::HashSet<u32> = deferred.iter().map(|d| d.krate).collect();
+        let again: Vec<usize> = (0..fns.len()).filter(|&i| replayed.contains(&fns[i].0.owner) && krates.contains(&u.prog.def(fns[i].0.owner).krate)).collect();
+        let again_owners: Vec<crate::program::DefId> = again.iter().map(|&i| fns[i].0.owner).collect();
+        let again_set: std::collections::HashSet<crate::program::DefId> = again_owners.iter().copied().collect();
+        relax_types::body_facts::open();
+        let mut outs = par_map(&again, jobs, |&i| check_one(&fns[i].0, fns[i].1, false));
+        // (an owner that met an unloaded module: every skipped file loaded, checked again)
+        if outs.iter().any(|o| o.needs_load) && unsafe { !(&*up).prog.skipped_files.is_empty() } {
+            unsafe { jit::load_all_skipped(up) };
+            let redo: Vec<usize> = (0..outs.len()).filter(|&j| outs[j].needs_load).collect();
+            let redone = par_map(&redo, jobs, |&j| check_one(&fns[again[j]].0, fns[again[j]].1, false));
+            for (j, o) in redo.into_iter().zip(redone) { outs[j] = o; }
+        }
+        let mut again_unclean: std::collections::HashSet<crate::program::DefId> = std::collections::HashSet::new();
+        for (j, mut o) in outs.into_iter().enumerate() {
+            let d = again_owners[j];
+            if o.unchecked { o.errors.push((Stage::of(Phase::Typeck, 0, d), def_ice(unsafe { &(*up).prog }, d, "the body", "it needs a file to be loaded and none is left"))); }
+            if o.unchecked || !o.errors.is_empty() || !o.diags.is_empty() { again_unclean.insert(d); }
+            errors.extend(o.errors);
+            borrow_diagnostics.extend(o.diags);
+        }
+        body_anons(&|owner| again_set.contains(&owner), &mut errors, &mut again_unclean);
+        relax_types::body_facts::close();
+        let facts = relax_types::body_facts::take();
+        let differ = match (bodies.as_mut(), reuse.as_deref()) {
+            (Some(b), Some(r)) => b.rechecked(&u.prog, &u.tcx, r.idents(), &facts, &again_unclean, &again_owners),
+            _ => Vec::new(),
+        };
+        let candidates: Vec<String> = deferred.iter().flat_map(|d| d.candidates.iter().cloned()).collect();
+        let cleared = relax_types::lint_dead::finish_imports(&u.prog, &u.tcx, deferred, &erroneous_imports, facts);
+        #[cfg(test)]
+        replayed_guard.retain(|d| !again_set.contains(d));
+        if subjects_mode() == 0 {
+            eprintln!("makepad check: unused-import candidates in {} crate(s) with replayed bodies: {} replayed bodies checked in {:.2} s", krates.len(), again.len(), t_again.elapsed().as_secs_f64());
+            for c in &candidates { eprintln!("makepad check:   candidate: {c}"); }
+            eprintln!("makepad check: unused-import candidates cleared by a recheck: {}", cleared.len());
+            for c in &cleared { eprintln!("makepad check:   cleared: {c}"); }
+            for w in &differ { eprintln!("makepad check:   a stored verdict differs from its recheck: {w}"); }
+        }
+        st.mark("recheck of replayed bodies");
+    }
     // rustc_monomorphize: a program's `main` and what it reaches, instantiated -- the constants
     // generic code evaluates there (post-monomorphization E0080) -- in the check of a build only
     // (Options::post_mono): cargo check runs no collector, its errors appear at the build
@@ -1440,7 +1551,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
         body_mem_report(unsafe { &(*up).prog });
     }
     for (_, e) in errors.iter_mut() {
-        if is_internal(unsafe { &*up }, &own_all, e) && !e.contains(": internal:") && !e.starts_with("internal: ") {
+        if is_internal(unsafe { &*up }, e) && !e.contains(": internal:") && !e.starts_with("internal: ") {
             *e = label_internal(e);
         }
     }
@@ -1452,13 +1563,13 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     // what the builds reported besides their own failures: constants that could not be
     // evaluated (CTFE panics), recorded instead of ending the check
     for e in unsafe { (&(*up).errors).iter().filter(|e| !e.starts_with("compile error in ")).cloned().collect::<Vec<_>>() } {
-        let e = if is_internal(unsafe { &*up }, &own_all, &e) { label_internal(&e) } else { e };
+        let e = if is_internal(unsafe { &*up }, &e) { label_internal(&e) } else { e };
         errors.push((unit_stage(&e), e));
     }
     let mut compile_errors = Vec::new();
     for (id, e) in failures {
         let name = unsafe { (&(*up).fns)[id as usize].name.clone() };
-        report(up, id, &name, &e, "compile", &own_all, &mut compile_errors);
+        report(up, id, &name, &e, "compile", &mut compile_errors);
     }
     errors.extend(staged(Stage::new(Phase::Post, 0), compile_errors));
     // MAKEPAD_RUN_BORROWCK_INSTANCES=1: every reached instance is borrow-checked too (the background
@@ -1482,12 +1593,18 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
             let _ = r;
         }
     }
+    let bodies_blocked;
     unsafe {
         // a delayed bug no error explains (rustc: an ICE at session end) is one internal failure
         // of the check, never the end of it
         // rustc DiagCtxt::flush_delayed: delayed bugs are ICEs only when no error was emitted
         let explained = !errors.is_empty() || !borrow_diagnostics.is_empty() || !(*up).errors.is_empty() || (*up).query_errors.has_errors();
-        for bug in (*up).query_errors.take_delayed() {
+        let delayed = (*up).query_errors.take_delayed();
+        // no body verdict is stored by a check that met a failure no body is charged with: a
+        // constant's evaluation, a query's error, a delayed bug, a site accepted only in relaxed Rust
+        bodies_blocked = !delayed.is_empty() || !(*up).errors.is_empty() || (*up).query_errors.has_errors()
+            || relax_types::borrowck::relaxed_pending() || crate::relaxed::pending();
+        for bug in delayed {
             if !explained { errors.push((Stage::new(Phase::Post, 0), format!("internal: delayed bug at the end of the check: {}", bug))); }
         }
         if !errors.is_empty() { (*up).query_errors.note_reported_error(); }
@@ -1542,8 +1659,21 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     // verdict reuse: a check with no error stores its crates' diagnostics; the unchanged crates'
     // stored ones join this check's, as this check would have reported them
     if let Some(r) = reuse.as_deref_mut() {
+        if let Some(b) = bodies.take() {
+            let stats = b.store(r, unsafe { &(*up).prog }, unsafe { &(*up).tcx }, bodies_blocked);
+            if std::env::var_os("MAKEPAD_RUN_CHECK_TIMES").is_some() {
+                eprintln!("makepad check: body verdicts: {} owners, {} replayed, {} stored anew; keys and decoding {:.1} ms, encoding {:.1} ms",
+                    stats.owners, stats.replayed, stats.stored, stats.open.as_secs_f64() * 1e3, stats.store.as_secs_f64() * 1e3);
+            }
+        }
         if late_ok && entries.iter().all(|e| matches!(e.out, Out::Warning(_))) { r.record(unsafe { &(*up).prog }, &entries, &flags); }
+        r.flush_bodies(options.verbose);
         entries.extend(r.replayed(late_ok, wf_ran));
+    }
+    #[cfg(test)]
+    for &d in &replayed_guard {
+        let uu = unsafe { &*up };
+        assert!(uu.tcx.typeck_peek(&uu.prog, d).is_none(), "a body replayed from its stored verdict was type-checked: {}", uu.prog.def_path(d));
     }
     let entries = crate::check_order::sort(unsafe { &(*up).prog }, entries);
     crate::check_order::print(&entries, emit, !quiet, crate::diag::enabled());
@@ -1583,7 +1713,9 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     crate::relaxed::finish_check();
     let mut diagnostics: Vec<_> = errors.iter().map(|e| crate::diag::from_legacy(e, "typeck")).collect();
     diagnostics.extend(borrow_diagnostics);
-    (i32::from(!errors.is_empty() || borrow_count != 0), diagnostics)
+    let foreign = foreign_errors(&u.prog, crates, errors.iter().filter(|e| !e.contains(": internal:") && !e.starts_with("internal: ")))
+        .into_iter().filter(|(name, _)| name != "?").collect();
+    (i32::from(!errors.is_empty() || borrow_count != 0), diagnostics, foreign)
 }
 
 /// Compiles every seed fn, then every slot the compiled code creates (callees, closures, glue,
@@ -1679,10 +1811,18 @@ unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u3
     out
 }
 
+fn std_crate(prog: &crate::program::Program, k: u32) -> bool {
+    use crate::vfs::canonical as canon;
+    let c = &prog.crates[k as usize];
+    if matches!(prog.syms.str(c.name), "core" | "alloc" | "std" | "proc_macro") { return true; }
+    let std_dir = format!("{}/", canon(&crate::std_dir()).trim_end_matches('/'));
+    canon(c.root_path()).starts_with(&std_dir)
+}
+
 /// Is a failure a makepad run bug rather than an error rustc would report? A compiler panic, an
-/// internal error, an error without an error code, or one located outside the checked crates
-/// (std or a dependency: rustc builds those).
-fn is_internal(u: &Unit, own: &[bool], e: &str) -> bool {
+/// internal error, an error without an error code, or one located in std or outside any crate.
+/// An error in any other crate belongs to the program, including a dependency cargo builds.
+fn is_internal(u: &Unit, e: &str) -> bool {
     let first = e.lines().next().unwrap_or("");
     if first.contains("internal compiler error") || first.contains("internal:") || first.contains("makepad run bug") {
         return true;
@@ -1700,7 +1840,7 @@ fn is_internal(u: &Unit, own: &[bool], e: &str) -> bool {
         return true;
     }
     match u.prog.file_paths.iter().position(|p| p == path) {
-        Some(i) => !u.prog.file_crate.get(i).is_some_and(|k| own.get(*k as usize).copied().unwrap_or(false)),
+        Some(i) => u.prog.file_crate.get(i).map_or(true, |&k| std_crate(&u.prog, k)),
         None => true,
     }
 }
@@ -1718,7 +1858,7 @@ fn label_internal(e: &str) -> String {
 
 /// One failed build as an error line: its location (the error's own, else the fn's), the
 /// message's first line, the instance it failed for, and `internal` for a makepad run bug.
-fn report(up: *mut Unit, id: u32, name: &str, e: &str, phase: &'static str, own: &[bool], errors: &mut Vec<String>) {
+fn report(up: *mut Unit, id: u32, name: &str, e: &str, phase: &'static str, errors: &mut Vec<String>) {
     let u = unsafe { &*up };
     let mut first = e.lines().next().unwrap_or("").to_string();
     // an error without a location takes its fn's
@@ -1733,7 +1873,7 @@ fn report(up: *mut Unit, id: u32, name: &str, e: &str, phase: &'static str, own:
             first = format!("{}:{}:{}: {}", path, l, c, first);
         }
     }
-    let internal = is_internal(u, own, &first);
+    let internal = is_internal(u, &first);
     // the type check of the fn reported it already (a non-generic body checked before compiling)
     let shown = if internal { label_internal(&first) } else { first.clone() };
     if errors.iter().any(|x| *x == shown) {

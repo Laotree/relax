@@ -92,6 +92,11 @@ pub struct Parser<'a> {
     pub lazy_auto: bool,
     /// parsing a file's skipped bodies (ParsedFile::part): macros resolve to built-ins only
     lazy_part: bool,
+    /// parsing a hole body (sip LATE_HOLE): the literals it reads belong only to its crate's check
+    hole_body: bool,
+    /// expanding an item-position macro call: the late inputs it reads reach other crates only
+    /// through the items it expands to
+    item_macro: bool,
     /// inline `mod` stacks of skipped bodies inside inline modules: (body's first token, names)
     lazy_mods: Vec<(u32, Vec<String>)>,
     /// `macro_rules!` definitions visible to this file (None: no expansion, e.g. discovery)
@@ -179,6 +184,9 @@ pub struct Parser<'a> {
     stmt_ctx: bool,
     /// the token ranges of the `cfg_select!` arms the last expansion did not choose (check only)
     pub cfg_select_rest: std::cell::RefCell<Vec<(usize, usize)>>,
+    /// where the name of the last macro call stands that names an import of the crate out of the
+    /// calling module's scope (rules_macro_inner; u32::MAX: none): rustc's "cannot find macro"
+    macro_scope_miss: std::cell::Cell<u32>,
     /// the `include!` being expanded is an expression or statement: its file keeps a leading `#!`
     pub include_as_expr: bool,
     foreign_abi: Option<Option<Ident>>,
@@ -224,6 +232,8 @@ impl<'a> Parser<'a> {
             lazy_bodies: false,
             lazy_auto: false,
             lazy_part: false,
+            hole_body: false,
+            item_macro: false,
             lazy_mods: Vec::new(),
             macros: None,
             krate: String::new(),
@@ -264,6 +274,7 @@ impl<'a> Parser<'a> {
             in_trait: false,
             stmt_ctx: false,
             cfg_select_rest: Default::default(),
+            macro_scope_miss: std::cell::Cell::new(u32::MAX),
             include_as_expr: false,
             foreign_abi: None,
             cfg_out: 0,
@@ -1824,6 +1835,19 @@ impl<'a> Parser<'a> {
                 // a macro this crate imported under another name (`use std::{eprintln as log_error}`)
                 let own = matches!(qual.as_deref(), None | Some("crate") | Some("self") | Some("super")) || qual.as_deref() == Some(self.krate.as_str());
                 let (q, target) = if own { m.table.alias(&self.krate, &name)?.clone() } else { return None };
+                // the aliases are the crate's, from every module's imports: the import must be one
+                // the calling module sees in the module the path names (its own for a plain
+                // name). A macro the crate root re-exports is not in scope in a module that does
+                // not import it: rustc says "cannot find macro" there.
+                if !m.import_binds(&self.krate, &module, &mpath, &name) {
+                    // MAKEPAD_RUN_TRACE=macscope: each call the crate's import of the name does not reach
+                    if (seg.name.lo as usize) < self.src.len() && crate::preload::relax_trace().is_some_and(|t| t.split(',').any(|x| x == "macscope")) {
+                        let line = self.src[..seg.name.lo as usize].iter().filter(|&&b| b == b'\n').count() + 1;
+                        eprintln!("macscope {}:{}: {}! in module {} of crate {}: its import is not in scope here", self.bctx.as_ref().map_or("?", |c| c.path.as_str()), line, name, module, self.krate);
+                    }
+                    self.macro_scope_miss.set(seg.name.lo);
+                    return None;
+                }
                 let q2 = match q.as_str() {
                     "std" | "core" | "alloc" | "" => None,
                     "crate" | "self" | "super" => Some("crate"),
@@ -1978,6 +2002,13 @@ impl<'a> Parser<'a> {
     }
 
     /// Expands a call: appends the expansion's tokens (ending in Eof) and returns their start.
+    /// The position bits of a late input read now (sip LATE_HOLE, LATE_ITEMS; none: interface).
+    /// `literal`: the read becomes a literal (include_str!, include_bytes!, env!), which defines no
+    /// item; an `include!` in a hole body could (an impl other crates see), so it is no hole read.
+    pub(crate) fn late_flags(&self, literal: bool) -> u8 {
+        if self.hole_body && literal { crate::sip::LATE_HOLE } else if self.item_macro { crate::sip::LATE_ITEMS } else { 0 }
+    }
+
     fn expand_call(&mut self, def: &crate::macros::MacroDef, toks: TokRange, call_lo: u32) -> PResult<usize> {
         self.expand_call_inner(def, toks, call_lo)
     }
@@ -2194,9 +2225,11 @@ impl<'a> Parser<'a> {
         let tail_expr = delim != b'{' && self.kind() == T::CloseBrace && def.builtin == 0 && (lo as usize) < self.src.len();
         let had_semi = self.eat(T::Semi);
         self.include_as_expr = as_expr;
+        self.item_macro = !as_expr;
         self.cfg_select_rest.borrow_mut().clear();
         let start = self.expand_call(&def, toks, lo);
         self.include_as_expr = false;
+        self.item_macro = false;
         let start = start?;
         let rest = std::mem::take(&mut *self.cfg_select_rest.borrow_mut());
         let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_id(def.builtin) == crate::builtins::Builtin::Include;
@@ -2244,6 +2277,7 @@ impl<'a> Parser<'a> {
         let lens = (self.item_start.len(), self.lazy_mods.len(), self.mod_stack.len(), self.scope_stack.len(), self.rule_scopes.len(), self.extra_items.len(), self.extra_assoc_items.len(), self.pending_shape.len());
         let flags = (self.next_scope, self.no_prelude, self.in_assoc, self.in_trait, self.stmt_ctx, self.range_dots, self.include_as_expr, self.foreign_abi, self.cfg_out, self.expansion_semi, self.exp_depth, self.list_elem_at, self.expn_attrs_ungated);
         let (pending_inner, cfg_select_rest) = (self.pending_inner.clone(), self.cfg_select_rest.borrow().clone());
+        let macro_scope_miss = self.macro_scope_miss.get();
         let r = f(self);
         self.pos = pos;
         // the `>>` / `>=` it split are whole again
@@ -2263,6 +2297,7 @@ impl<'a> Parser<'a> {
         (self.next_scope, self.no_prelude, self.in_assoc, self.in_trait, self.stmt_ctx, self.range_dots, self.include_as_expr, self.foreign_abi, self.cfg_out, self.expansion_semi, self.exp_depth, self.list_elem_at, self.expn_attrs_ungated) = flags;
         self.pending_inner = pending_inner;
         *self.cfg_select_rest.borrow_mut() = cfg_select_rest;
+        self.macro_scope_miss.set(macro_scope_miss);
         #[cfg(test)]
         assert_eq!(before, self.trace(), "Parser::look_ahead left a trace");
         r
@@ -2279,12 +2314,12 @@ impl<'a> Parser<'a> {
             // caches of answers that do not change once found: the recursion limit, the token scan
             // of the file's imports
             rec_limit: _, import_summary: _,
-            toks, pos, edition, ast, item_start, lazy_bodies, lazy_auto, lazy_part, lazy_mods, macros, krate,
+            toks, pos, edition, ast, item_start, lazy_bodies, lazy_auto, lazy_part, hole_body, item_macro, lazy_mods, macros, krate,
             ext, exp_map, tok_origin, token_origins, token_input, exp_depth, rules_exp, body_origin,
             pm_editions, tok_undo, frag_groups, empty_vis, ty_frags, path_frags, meta_frags, block_frags, stmt_frags, synth_parens,
             mod_stack, scope_stack, no_prelude, range_dots, next_scope, rule_scopes, foreign_rules, interp, extra_items,
             extra_assoc_items, pending_inner, in_assoc, in_trait, stmt_ctx, cfg_select_rest,
-            include_as_expr, foreign_abi, cfg_out, expansion_semi, list_elem_at, expn_attrs_ungated, pending_shape,
+            include_as_expr, foreign_abi, cfg_out, expansion_semi, list_elem_at, expn_attrs_ungated, pending_shape, macro_scope_miss,
         } = self;
         fn sorted<T: Ord>(mut v: Vec<T>) -> Vec<T> { v.sort(); v }
         let toks: Vec<Tok> = (0..toks.len()).map(|i| toks.at(i)).collect();
@@ -2293,12 +2328,12 @@ impl<'a> Parser<'a> {
         let interp = sorted(interp.iter().map(|(k, e)| (*k, e.0)).collect::<Vec<_>>());
         let tables = (ext.len(), exp_map.len(), tok_origin.len(), token_origins.len(), rules_exp.len(), body_origin.len(), pm_editions.len(), foreign_rules.len());
         let shapes: Vec<_> = pending_shape.iter().map(|(r, e)| (*r, e.as_ref().map(|e| (e.pos, e.msg.clone())))).collect();
-        format!("toks {toks:?}\npos {pos} edition {edition} lazy {lazy_bodies} {lazy_auto} {lazy_part} {lazy_mods:?} macros {} krate {krate}\n\
+        format!("toks {toks:?}\npos {pos} edition {edition} lazy {lazy_bodies} {lazy_auto} {lazy_part} {lazy_mods:?} hole {hole_body} {item_macro} macros {} krate {krate}\n\
             tables {tables:?} token_input {token_input} exp_depth {exp_depth} tok_undo {tok_undo:?} frags {frags:?} interp {interp:?}\n\
             mods {mod_stack:?} scopes {scope_stack:?} {next_scope} {rule_scopes:?} no_prelude {no_prelude} range_dots {range_dots}\n\
             items {item_start:?} {extra_items:?} {extra_assoc_items:?} {pending_inner:?} {in_assoc} {in_trait} {foreign_abi:?}\n\
-            stmt {stmt_ctx} {include_as_expr} {expansion_semi} {list_elem_at:?} {expn_attrs_ungated} cfg {cfg_out} {:?} shapes {shapes:?}\nast {ast:?}",
-            macros.is_some(), cfg_select_rest.borrow())
+            stmt {stmt_ctx} {include_as_expr} {expansion_semi} {list_elem_at:?} {expn_attrs_ungated} cfg {cfg_out} {:?} shapes {shapes:?} macro_scope_miss {}\nast {ast:?}",
+            macros.is_some(), cfg_select_rest.borrow(), macro_scope_miss.get())
     }
 
     /// After the one expression of an `include!` in expression position: tokens left are the
@@ -2807,7 +2842,16 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn item(&mut self, mut attrs: Vec<Attr>) -> PResult<Option<ItemId>> {
+    /// An item, also one inside a fn body: its own text is not the body's (an impl or a const in
+    /// a hole body is seen by other crates), so it is no hole until a fn of its own says so.
+    fn item(&mut self, attrs: Vec<Attr>) -> PResult<Option<ItemId>> {
+        let outer = std::mem::replace(&mut self.hole_body, false);
+        let r = self.item_here(attrs);
+        self.hole_body = outer;
+        r
+    }
+
+    fn item_here(&mut self, mut attrs: Vec<Attr>) -> PResult<Option<ItemId>> {
         self.expand_linkage_attrs(&mut attrs)?;
         // rustc_passes check_attr `check_doc_inline`: `doc(inline)` and `doc(no_inline)` on one item conflict
         if self.cfg_out == 0 && attrs.len() > 1 {
@@ -3271,8 +3315,12 @@ impl<'a> Parser<'a> {
         let name = self.ident_tok()?;
         let mut generics = self.generics()?;
         let (self_param, params, variadic) = self.fn_params()?;
+        let ret_at = self.pos;
         let ret = if self.eat(T::RArrow) { Some(self.ty_noplus_ret()?) } else { None };
         self.where_clause(&mut generics)?;
+        // a hole body (no other crate's check sees it): not const, not async, no `impl` from the
+        // return arrow to the body (ParsedFile::returns_impl, as cache/items.rs reads it)
+        let hole = !konst && !asyncness && !(ret.is_some() && (ret_at..self.pos).any(|i| self.toks.kind_at(i) == T::KwImpl));
         let mut lazy_body = None;
         let body = if self.eat(T::Semi) {
             None
@@ -3312,16 +3360,19 @@ impl<'a> Parser<'a> {
                     _ => "parse-body-no-scope",
                 };
                 let _profile = crate::load_profile::span(profile, phase, self.bctx.as_ref().map_or("", |c| c.path.as_str()));
-                if stats {
+                let outer = std::mem::replace(&mut self.hole_body, hole);
+                let b = if stats {
                     let mps = crate::memstat::peak_start();
-                    let b = crate::preload::timed(0, || self.block())?;
+                    let b = crate::preload::timed(0, || self.block());
                     let bytes = crate::memstat::peak_end(mps);
                     LAZY_STATS[why as usize * 2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     LAZY_STATS[why as usize * 2 + 1].fetch_add(bytes.max(0) as u64, std::sync::atomic::Ordering::Relaxed);
-                    Some(b)
+                    b
                 } else {
-                    Some(crate::preload::timed(0, || self.block())?)
-                }
+                    crate::preload::timed(0, || self.block())
+                };
+                self.hole_body = outer;
+                Some(b?)
             }
         };
         Ok((
@@ -5642,6 +5693,7 @@ impl<'a> Parser<'a> {
                     }
                     self.pos += 1;
                     let (delim, toks) = self.delim_tt()?;
+                    self.macro_scope_miss.set(u32::MAX);
                     if let Some(def) = self.rules_macro(&path) {
                         // rustc_expand InvocationCollector: the expression's outer attributes are
                         // gated (visit_expr), except where the call is a list element by itself
@@ -5677,6 +5729,12 @@ impl<'a> Parser<'a> {
                     }
                     if let Some(e) = self.builtin_mac_expr(&path, toks, lo)? {
                         return Ok(e);
+                    }
+                    // a macro the crate imports elsewhere, which no import of this module reaches
+                    // (rules_macro_inner): rustc's resolve error, not a call left unexpanded
+                    if let Some(seg) = self.ast.segs(path.segs).last().filter(|s| s.name.lo == self.macro_scope_miss.get()) {
+                        let name = String::from_utf8_lossy(self.bytes(seg.name.lo, seg.name.hi)).trim_start_matches("r#").to_string();
+                        return Err(PErr { pos: seg.name.lo, msg: format!("cannot find macro `{name}` in this scope") });
                     }
                     let args = self.mac_args(&path, toks);
                     return Ok({ let m = self.ast.push_row(MacCall { path, delim, toks, args }); self.mk_expr(ExprKind::Mac(m), lo) });
@@ -6205,6 +6263,26 @@ impl std::fmt::Debug for PartBodies {
 pub type BodyResult = Result<(BlockId, [u32; 4]), String>;
 
 impl ParsedFile {
+    /// Whether the fn item at `item_lo` with its body at `body_lo` returns an `impl Trait`.
+    pub fn returns_impl(&self, item_lo: u32, body_lo: u32) -> bool {
+        // `impl Trait` in the return type: callers' types are the body's. (In an argument the
+        // fn is generic: an instance is a slot of its own, keyed by this body.) An `impl` after
+        // the first `->` outside brackets: an arrow inside the generics (`F: Fn() -> u32`)
+        // comes first and only makes an argument's `impl` count as the return's.
+        let t0 = self.toks.partition_point(|t| t.lo < item_lo);
+        let mut depth = 0i32;
+        let mut ret = false;
+        self.toks.iter_from(t0).take_while(|t| t.lo < body_lo).any(|t| {
+            match t.kind {
+                T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
+                T::CloseParen | T::CloseBracket | T::CloseBrace => depth -= 1,
+                T::RArrow if depth <= 0 => ret = true,
+                _ => {}
+            }
+            ret && t.kind == T::KwImpl
+        })
+    }
+
     /// One file-aware diagnostic lookup. Rust retains macro invocation blame; token-file
     /// input follows copied fragments and full spans, regardless of the file extension.
     pub fn source_span(&self, pos: u32) -> SourceSpan {
@@ -6877,13 +6955,11 @@ pub fn parse_part(pf: &ParsedFile, cfg: &crate::cfg::CfgSet) -> (FilePart, Ast) 
     let mut bodies = Vec::new();
     let mut roots = Vec::new();
     for (ii, it) in pf.ast.items.iter().enumerate() {
-        let r = match &it.kind {
-            ItemKind::Fn(sig, body, _) if body.is_none() => match pf.ast.fn_sig(*sig).lazy_body.get() {
-                Some(r) => r,
-                None => continue,
-            },
+        let s = match &it.kind {
+            ItemKind::Fn(sig, body, _) if body.is_none() => pf.ast.fn_sig(*sig),
             _ => continue,
         };
+        let Some(r) = s.lazy_body.get() else { continue };
         if bodies.is_empty() { crate::why::event("parse-bodies", &ctx.path, 0, "", None); }
         if crate::why::enabled() {
             let name = String::from_utf8_lossy(pf.bytes(it.name.lo, it.name.hi));
@@ -6892,6 +6968,7 @@ pub fn parse_part(pf: &ParsedFile, cfg: &crate::cfg::CfgSet) -> (FilePart, Ast) 
         p.mod_stack = ctx.mods.iter().find(|m| m.0 == r.lo).map(|m| m.1.clone()).unwrap_or_default();
         p.pos = r.lo as usize - 1;
         let e0 = p.ast.ends();
+        p.hole_body = !s.konst && !s.asyncness && !pf.returns_impl(it.lo, pf.tok(r.lo - 1).lo);
         let res = match p.block() {
             Ok(b) => {
                 let e1 = p.ast.ends();
@@ -6914,6 +6991,7 @@ pub fn parse_part(pf: &ParsedFile, cfg: &crate::cfg::CfgSet) -> (FilePart, Ast) 
         };
         bodies.push((ii as u32, res));
     }
+    p.hole_body = false;
     if !p.ast.items.is_empty() {
         // body_outline let an item through: every body of the file fails loudly instead of
         // compiling against an item list that misses it

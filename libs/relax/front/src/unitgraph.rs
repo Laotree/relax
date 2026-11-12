@@ -973,14 +973,16 @@ fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrit
         o.push('"');
         o
     };
-    let mut h = fnv(bs.src_path.as_bytes(), 0xcbf29ce484222325);
+    let mut h = fnv(crate::dirs::anchored(&bs.src_path).as_bytes(), 0xcbf29ce484222325);
+    // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
+    h = fnv(&crate::dirs::anchors_key().to_le_bytes(), h);
     let mut units: Vec<String> = Vec::new();
     let deps_json = |deps: &[(usize, String)]| -> String {
         deps.iter().filter_map(|(d, n)| idx(*d).map(|k| format!("{{\"index\":{},\"extern_crate_name\":{}}}", k, q(n)))).collect::<Vec<_>>().join(",")
     };
     for &i in &seen {
         let u = &raw[i];
-        h = fnv(u.src_path.as_bytes(), h);
+        h = fnv(crate::dirs::anchored(&u.src_path).as_bytes(), h);
         if let Ok(src) = crate::vfs::read(&u.src_path) {
             h = fnv(&src, h);
         }

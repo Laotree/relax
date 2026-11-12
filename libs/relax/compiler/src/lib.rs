@@ -231,6 +231,8 @@ pub mod tui;
 pub mod check;
 mod check_order;
 mod check_reuse;
+/// Body verdicts: a body whose stored verdict stands is replayed, not checked.
+mod check_bodies;
 mod typeck_bg;
 mod gandalf_out;
 pub mod serve;

@@ -1929,7 +1929,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // the errors the load printed for crates this check does not check (a dependency's
         // unresolved import or signature error): cargo check fails compiling that crate, and so
         // does the check
-        let foreign = crate::check::foreign_errors(&u.prog, &checked, u.prog.errors.iter().chain(&u.tcx.errors).chain(&deferred_errors));
+        let mut foreign = crate::check::foreign_errors(&u.prog, &checked, u.prog.errors.iter().chain(&u.tcx.errors).chain(&deferred_errors));
         // every body is checked, so the files the selection skipped load first: all of them for
         // selftest or a watch session; the checked crates' for --root-only or the app check
         let t = Instant::now();
@@ -1991,12 +1991,21 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // the collected image is the program as its load left it, before the bodies make their
         // types (a run's boot snapshot): the record at the end encodes this snapshot
         let boot_cache = if selftest { None } else { check_boot_cache(&mut u, options) };
-        let code = match reuse.as_mut() {
+        let (code, check_foreign) = match reuse.as_mut() {
             Some(r) => crate::check::check_crate_reusing(&mut u, root, &checked, pre, r),
             None => crate::check::check_crate(&mut u, root, &checked, pre, selftest),
         };
+        for (name, n) in check_foreign {
+            match foreign.iter_mut().find(|(old, _)| *old == name) {
+                Some(x) => x.1 += n,
+                None => foreign.push((name, n)),
+            }
+        }
         for (name, n) in &foreign {
             eprintln!("error: could not compile `{name}` due to {n} previous error{}", if *n == 1 { "" } else { "s" });
+            if crate::check::published_crate(&u.prog, name) {
+                eprintln!("note: `{name}` is a published crate, and published crates build under rustc: this is most likely a makepad run divergence, not an error in `{name}` -- report it");
+            }
         }
         let code = if code == 0 && !foreign.is_empty() { 1 } else { code };
         // the parsed files go to the cache's front images as a run's do (one store shared with
@@ -2681,21 +2690,34 @@ pub(crate) fn exported_fns(prog: &crate::program::Program, prefixes: &[String]) 
 /// dynamic loader binds (what a native library's import resolves to without the program),
 /// searched as the program's own foreign calls are (proc::find_any). A library is the one the
 /// linker took: `lib<name>.so` (`.dylib`) of the first of the scripts' search folders that holds
-/// one, else the one the loader finds by its name.
+/// one, else the one the loader finds by its name. A library loaded from a search folder is given
+/// back after the lookup: the search folders are the linker's, and the run loads the library
+/// where the loader finds it (the program's rpath, the loader's path), as the rustc-built binary
+/// does. Kept loaded, it answered a native library's `@rpath` dependency on macOS (dyld matches a
+/// loaded image by its install name) where the rustc-built binary cannot load it.
 fn native_resolvable(names: &[String], dylibs: &[String], frameworks: &[String], search: &[String]) -> Vec<bool> {
     let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let mut linked_only = Vec::new();
     for l in dylibs {
         let linked = search.iter().map(|d| format!("{d}/lib{l}.{ext}")).find(|p| std::path::Path::new(p).is_file());
-        let _ = linked.is_some_and(|p| crate::os::proc::load_path(&p).is_ok())
-            || crate::os::proc::load_library(l, false) || crate::os::proc::load_library_versioned(l);
+        match linked.map(|p| crate::os::proc::load_path(&p)) {
+            Some(Ok(handle)) => linked_only.push(handle),
+            _ => {
+                let _ = crate::os::proc::load_library(l, false) || crate::os::proc::load_library_versioned(l);
+            }
+        }
     }
     for f in frameworks {
         let _ = crate::os::proc::load_library(f, true);
     }
-    names.iter().map(|n| {
+    let found = names.iter().map(|n| {
         let Ok(c) = std::ffi::CString::new(n.as_str()) else { return false };
         unsafe { !crate::os::proc::find_any(c.as_ptr().cast()).is_null() }
-    }).collect()
+    }).collect();
+    for handle in linked_only {
+        crate::os::proc::unload(handle);
+    }
+    found
 }
 
 #[cfg(test)]
@@ -3003,6 +3025,10 @@ pub(crate) fn check_test_subjects(u: &mut Unit, root: u32, subjects: &[u32], har
 /// program's children inherit them (a test's run of its own binary, a `makepad check` it starts);
 /// they steer no check (check_reuse.rs env_key).
 pub(crate) const RUN_STATE_VARS: [&str; 5] = ["MAKEPAD_RUN_STARTUP_T0", "MAKEPAD_RUN_MAIN_MS", "MAKEPAD_RUN_CACHE_STATE", "MAKEPAD_RUN_LIVE_LOG", "MAKEPAD_RUN_REPORT_TO"];
+
+/// Locations only: anchors_key covers workspace, run and std dirs, VFS content hashes cover
+/// edits, and the read log changes no checked input. Their spellings can leave env_key.
+pub(crate) const RUN_LOCATING_VARS: [&str; 5] = ["MAKEPAD_RUN_WORKSPACE", "MAKEPAD_RUN_EDITS", "MAKEPAD_RUN_CACHE_DIR", "MAKEPAD_RUN_READ_LOG", "MAKEPAD_RUN_STD"];
 
 static HAL_RUN: AtomicBool = AtomicBool::new(false);
 static APP_DOMAIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -4626,7 +4652,7 @@ fn summary_inner(why: &str) {
     if why != "stats" && std::env::var_os("MAKEPAD_RUN_CACHE_FP").is_some() {
         let late = crate::sip::late_inputs();
         for (c, k, n, h) in &late {
-            verbose!("makepad-run cache: late {} {} {} {:032x}", c, if *k == crate::sip::LATE_FILE { "file" } else { "env" }, n, h);
+            verbose!("makepad-run cache: late {} {}{} {} {:032x}", c, if crate::sip::late_base(*k) == crate::sip::LATE_FILE { "file" } else { "env" }, if *k & crate::sip::LATE_HOLE != 0 { " body" } else if *k & crate::sip::LATE_ITEMS != 0 { " items" } else { "" }, n, h);
         }
         verbose!("makepad-run cache: {} late inputs", late.len());
     }

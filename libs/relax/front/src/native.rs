@@ -248,7 +248,7 @@ fn resolved_packages_key<'a>(raw: impl IntoIterator<Item = &'a crate::unitgraph:
         let mut features = unit.features.clone();
         features.sort();
         features.dedup();
-        (unit.pkg.clone(), features)
+        ((crate::dirs::anchored(&unit.pkg.0).into_owned(), unit.pkg.1.clone(), unit.pkg.2.clone()), features)
     }).collect();
     packages.sort();
     packages.dedup();
@@ -319,6 +319,8 @@ fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
     // cargo builds for real): two packages whose closure resolves alike share the build.
     let selection = selection_key(&script_pkgs, &lib_pkgs);
     let mut h = fnv(b"native-link-v15", 0xcbf29ce484222325);
+    // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
+    h = fnv(&crate::dirs::anchors_key().to_le_bytes(), h);
     h = fnv(req.triple.as_bytes(), h);
     h = fnv(&selection.to_le_bytes(), h);
     for f in &flags {

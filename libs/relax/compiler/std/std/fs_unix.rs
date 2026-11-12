@@ -196,6 +196,7 @@ impl OpenOptions {
                 let disk = vfs::edit_target(&*abs, how).unwrap_or_else(|| Err(vfs::read_only()))?;
                 return run_path_with_cstr(&disk, &|c| self.open_c(c));
             }
+            vfs::note(&abs, b'f');
             return match k {
                 vfs::Kind::File(stat) => {
                     let data = vfs::read(&*abs)?;
@@ -220,6 +221,9 @@ impl OpenOptions {
                 }
                 vfs::Kind::Missing => Err(io::Error::from(io::ErrorKind::NotFound)),
             };
+        }
+        if self.read {
+            vfs::note(path.as_ref(), b'f');
         }
         run_path_with_cstr(path.as_ref(), &|c| self.open_c(c))
     }
@@ -998,6 +1002,7 @@ impl Default for DirBuilder {
 
 pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
     if let Some((abs, vfs::Kind::File(_))) = vfs::kind(path.as_ref()) {
+        vfs::note(&abs, b'f');
         return vfs::read(&*abs);
     }
     let mut file = File::open(path.as_ref())?;
@@ -1008,6 +1013,7 @@ pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
 
 pub fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
     if let Some((abs, vfs::Kind::File(_))) = vfs::kind(path.as_ref()) {
+        vfs::note(&abs, b'f');
         return String::from_utf8(vfs::read(&*abs)?).map_err(|_| io::Error::INVALID_UTF8);
     }
     let mut file = File::open(path.as_ref())?;
@@ -1021,12 +1027,14 @@ pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> io::Result
 }
 
 pub fn metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
-    if let Some((_, k)) = vfs::kind(path.as_ref()) {
+    if let Some((abs, k)) = vfs::kind(path.as_ref()) {
+        vfs::note(&abs, b'p');
         return match k {
             vfs::Kind::Missing => Err(io::Error::from(io::ErrorKind::NotFound)),
             k => Ok(Metadata { st: vfs_stat(&k) }),
         };
     }
+    vfs::note(path.as_ref(), b'p');
     run_path_with_cstr(path.as_ref(), &|c| {
         let mut st = stat_t::zeroed();
         cvt(unsafe { sys::os::stat(c.as_ptr(), &mut st as *mut stat_t) })?;
@@ -1038,6 +1046,7 @@ pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
     if vfs::kind(path.as_ref()).is_some() {
         return metadata(path);
     }
+    vfs::note(path.as_ref(), b'p');
     run_path_with_cstr(path.as_ref(), &|c| {
         let mut st = stat_t::zeroed();
         cvt(unsafe { sys::os::lstat(c.as_ptr(), &mut st as *mut stat_t) })?;
@@ -1177,6 +1186,7 @@ fn remove_dir_all_recursive(path: &Path) -> io::Result<()> {
 pub fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
     let path = path.as_ref();
     if let Some((abs, k)) = vfs::kind(path) {
+        vfs::note(&abs, b'd');
         return match k {
             vfs::Kind::Dir => {
                 let mut virt = vfs::list(&*abs)?;
@@ -1188,6 +1198,7 @@ pub fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
             vfs::Kind::Missing => Err(io::Error::from(io::ErrorKind::NotFound)),
         };
     }
+    vfs::note(path, b'd');
     run_path_with_cstr(path, &|c| {
         let dir = unsafe { sys::opendir(c.as_ptr()) };
         if dir.is_null() {

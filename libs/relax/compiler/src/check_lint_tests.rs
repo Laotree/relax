@@ -117,7 +117,7 @@ fn check_code_as(lib: &str, bins: &[&str], harness: bool, uses: Uses, post_mono:
         relax_front::program::set_record_import_uses(false);
         relax_front::program::set_record_import_uses(true);
     }
-    let code = crate::check::check_crate(&mut u, root, &crates, pre, false);
+    let code = crate::check::check_crate(&mut u, root, &crates, pre, false).0;
     for f in &files {
         std::fs::remove_file(f).unwrap();
     }
@@ -532,12 +532,20 @@ fn an_allow_in_a_macros_expansion_covers_the_tokens_passed_in() {
 /// WARNZERO class 1 (fab slice live_trace.rs:253 and :277, hal vulkan/device.rs:165): a tuple
 /// field read through an overloaded deref (`self: Pin<&mut Self>`, `self: Arc<Self>`, `&Arc<S>`)
 /// is a read of that struct's field; a tuple field nothing reads still is dead.
+///
+/// The same check proves the body-fact store codec (check_bodies.rs): every storable body's facts
+/// -- local refs and field reads, a std trait's method (`exercise`), imports, a glob, a fn nested
+/// in a body -- survive the table into a fresh resolver, and the one body whose facts carry a
+/// position (`warned`: a lint) is refused for storage, so it is checked again.
 #[test]
 fn a_tuple_field_read_through_pin_or_arc_is_read() {
     let Some(warnings) = warnings_in_child("check_lint_tests::a_tuple_field_read_through_pin_or_arc_is_read") else {
-        return check_package(r#"
+        crate::check_bodies::FACT_CODEC_CHECK.with(|f| f.set(true));
+        check_package(r#"
             use std::pin::Pin;
             use std::sync::Arc;
+            use std::fmt::Write;
+            use std::collections::*;
             struct Yield(bool);
             impl Yield { fn poll(mut self: Pin<&mut Self>) -> bool { if self.0 { return true } self.0 = true; false } }
             struct Wake(u32);
@@ -551,9 +559,22 @@ fn a_tuple_field_read_through_pin_or_arc_is_read() {
                 let _ = Unread(3);
                 Arc::new(Wake(1)).wake() + life(&Arc::new(Life(1, None))) as u32
             }
+            pub fn exercise() -> usize {
+                fn nested(n: usize) -> usize { n + 1 }
+                let mut s = String::new();
+                s.write_str("x").unwrap();
+                nested(HashMap::<u8, u8>::new().len() + s.len())
+            }
+            pub fn warned() -> usize {
+                let unused = 1;
+                2
+            }
         "#, &[]);
+        crate::check_bodies::FACT_CODEC_CHECK.with(|f| f.set(false));
+        let refused = crate::check_bodies::FACT_CODEC_REFUSED.with(|r| std::mem::take(&mut *r.borrow_mut()));
+        return assert!(refused.len() == 1 && refused[0].ends_with("warned"), "only the body whose facts carry a position is refused for storage: {refused:?}");
     };
-    assert_eq!(warnings, ["field `0` is never read [dead_code]"]);
+    assert_eq!(warnings, ["field `0` is never read [dead_code]", "unused variable: `unused` [unused_variables]"]);
 }
 
 /// WARNZERO class 8 (hal linux_ipc.rs:69 and :74): `IoSlice` and `IoSliceMut` are FFI-safe, as

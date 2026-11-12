@@ -252,6 +252,16 @@ mod unix {
         }
     }
 
+    /// Gives back a handle load_path took: the library unloads once nothing else holds it.
+    pub fn unload(handle: usize) {
+        extern "C" {
+            fn dlclose(handle: *mut u8) -> i32;
+        }
+        unsafe {
+            dlclose(handle as *mut u8);
+        }
+    }
+
     /// The address of `name` (a C symbol) in the library `handle` (load_path) and what it loaded.
     pub fn symbol_in(handle: usize, name: &str) -> usize {
         let Ok(name) = std::ffi::CString::new(name) else { return 0 };
@@ -392,7 +402,7 @@ mod imp {
     pub fn load_path(path: &str) -> Result<usize, String> {
         super::unix::load_path(path, 2 | 0x100)
     }
-    pub use super::unix::{image_of, symbol_in};
+    pub use super::unix::{image_of, symbol_in, unload};
 
     pub fn load_library(name: &str, framework: bool) -> bool {
         let path = if framework { format!("/System/Library/Frameworks/{}.framework/{}\0", name, name) } else { format!("lib{}.so\0", name) };
@@ -556,7 +566,7 @@ mod imp {
     pub fn load_path(path: &str) -> Result<usize, String> {
         super::unix::load_path(path, 2 | 0x100)
     }
-    pub use super::unix::{image_of, symbol_in};
+    pub use super::unix::{image_of, symbol_in, unload};
 
     pub fn load_library(name: &str, framework: bool) -> bool {
         let path = if framework { format!("/System/Library/Frameworks/{}.framework/{}\0", name, name) } else { format!("lib{}.so\0", name) };
@@ -625,7 +635,7 @@ mod imp {
     pub fn load_path(path: &str) -> Result<usize, String> {
         super::unix::load_path(path, 2 | 8)
     }
-    pub use super::unix::{image_of, symbol_in};
+    pub use super::unix::{image_of, symbol_in, unload};
 
     pub fn load_library(name: &str, framework: bool) -> bool {
         let path = if framework { format!("/System/Library/Frameworks/{}.framework/{}\0", name, name) } else { format!("lib{}.dylib\0", name) };
@@ -714,6 +724,9 @@ mod imp {
     pub fn symbol_in(_handle: usize, _name: &str) -> usize {
         0
     }
+
+    /// load_path takes no handle here.
+    pub fn unload(_handle: usize) {}
 
     pub fn image_of(_addr: usize) -> Option<(usize, std::path::PathBuf)> {
         None
