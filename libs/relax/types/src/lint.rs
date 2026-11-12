@@ -673,6 +673,7 @@ fn stmt_attrs_around(prog: &Program, owner: DefId, file: u32, item: crate::ast::
     let od = prog.def(owner);
     let ast = &prog.files[od.file as usize].ast;
     if od.file != file { return Vec::new(); }
+    parse_owner(prog, od.file, od.item);
     let mut f = Find { ast, item, stack: Vec::new(), found: None };
     match ast.item(od.item).kind {
         ItemKind::Fn(..) => {
@@ -710,6 +711,7 @@ fn attrs_around_expr(prog: &Program, def: DefId, file: u32, target: crate::ast::
     if owner == NO_DEF { return Vec::new(); }
     let od = prog.def(owner);
     if od.file != file || od.item.0 == u32::MAX { return Vec::new(); }
+    parse_owner(prog, od.file, od.item);
     let ast = &prog.files[od.file as usize].ast;
     let mut f = Find { ast, target, stack: Vec::new(), found: None };
     match ast.item(od.item).kind {
@@ -747,6 +749,7 @@ pub fn attrs_at_call(prog: &Program, owner: DefId, file: u32, call: u32) -> Vec<
     }
     let od = prog.def(owner);
     if od.file != file || od.item.0 == u32::MAX || !has_body_item(od.kind) { return Vec::new(); }
+    parse_owner(prog, od.file, od.item);
     let pf = &prog.files[od.file as usize];
     let ast = &pf.ast;
     let mut f = Find { ast, pf, call: pf.diagnostic_pos(call), stack: Vec::new(), found: None };
@@ -776,6 +779,15 @@ pub fn is_automatically_derived(prog: &Program, d: DefId) -> bool {
 /// Whether a definition of this kind is an item with parameters or a body whose nodes can sit
 /// under attributes (fns, consts, statics). A module's def has none: a crate root's, or a module
 /// whose def names no item of its own, carries a placeholder item id (no item of that file).
+/// An owner can be an item inside a body the file's load skipped and nothing demanded yet (an
+/// item in a fn body): the file's lazily parsed bodies are parsed first then, as a body reader
+/// (Program::fn_body) parses them on its first need, so the attribute lookups can read the item.
+pub(crate) fn parse_owner(prog: &Program, file: u32, item: crate::ast::ItemId) {
+    if !prog.files[file as usize].ast.has_item(item) {
+        prog.part_idents(file);
+    }
+}
+
 fn has_body_item(kind: DefKind) -> bool {
     matches!(kind, DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn | DefKind::Const | DefKind::AssocConst | DefKind::Static | DefKind::ForeignStatic)
 }
@@ -819,6 +831,7 @@ pub fn attrs_at(prog: &Program, def: DefId, file: u32, lo: u32, hi: u32) -> Vec<
     if owner == NO_DEF { return Vec::new(); }
     let od = prog.def(owner);
     if od.file != file || od.item.0 == u32::MAX || !has_body_item(od.kind) { return Vec::new(); }
+    parse_owner(prog, od.file, od.item);
     let pf = &prog.files[od.file as usize];
     let ast = &pf.ast;
     let item = ast.item(od.item);

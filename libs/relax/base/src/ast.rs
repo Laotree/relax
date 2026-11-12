@@ -1215,6 +1215,9 @@ pub enum ExprKind {
     /// `async { }` / `async move { }` / an async closure's body (ASYNC_*)
     Async(u8, BlockId),
     ConstBlock(BlockId),
+    /// `try { }` (feature `try_blocks`): its `?`s go to it, and its value is `Try::from_output` of
+    /// the block's
+    TryBlock(BlockId),
     If(ExprId, BlockId, OptExprId),
     Let(PatId, ExprId),
     Match(ExprId, List<Arm>),
@@ -1620,6 +1623,14 @@ impl Ast {
             Some(x) => x,
             None => self.part_or_panic("item", id.0).item(id),
         }
+    }
+    /// Whether this tree holds item `id`: in its own arrays, or in a lazily parsed part that is
+    /// present. A reader that may come before the part's parse asks first.
+    pub fn has_item(&self, id: ItemId) -> bool {
+        if (id.0.wrapping_sub(self.base[23]) as usize) < self.items.len() {
+            return true;
+        }
+        self.part.get().is_some_and(|p| p.has_item(id))
     }
     #[inline]
     pub fn block(&self, id: BlockId) -> &Block {
