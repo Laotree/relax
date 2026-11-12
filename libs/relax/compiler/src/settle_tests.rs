@@ -5,8 +5,8 @@ use super::*;
 #[test]
 fn settle_rebuild_segregates_slot_lifetimes() {
     isolated_test!(settle_rebuild_segregates_slot_lifetimes);
-    std::env::set_var("MAKEPAD_RUN_COMPILER_ARENA", "1");
-    std::env::set_var("MAKEPAD_RUN_CACHE", "on");
+    std::env::set_var("RELAX_COMPILER_ARENA", "1");
+    std::env::set_var("RELAX_CACHE", "on");
     crate::borrowck::lazy::disable_gandalf();
     let dir = std::env::temp_dir().join(format!("relax-slot-lifetimes-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -182,7 +182,7 @@ fn settle_rebuild_segregates_slot_lifetimes() {
 #[test]
 fn settle_rebuild_covers_a_crate_added_at_run_time() {
     isolated_test!(settle_rebuild_covers_a_crate_added_at_run_time);
-    std::env::set_var("MAKEPAD_RUN_CACHE", "on");
+    std::env::set_var("RELAX_CACHE", "on");
     crate::borrowck::lazy::disable_gandalf();
     let dir = std::env::temp_dir().join(format!("relax-added-crate-{}", std::process::id()));
     let (host, added) = (dir.join("host"), dir.join("added"));
@@ -266,11 +266,11 @@ fn settle_rebuild_covers_a_crate_added_at_run_time() {
 // Rounds 49-50: restarting leaves the running solver answers and native code intact.
 #[test]
 fn round47_const_fn_body_invalidates_solver_answer() {
-    const CHILD: &str = "MAKEPAD_RUN_R47_CONST_FN_CHILD";
+    const CHILD: &str = "RELAX_R47_CONST_FN_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "jit::settle_tests::round47_const_fn_body_invalidates_solver_answer", "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0"));
+            .env(CHILD, "1").env("RELAX_CACHE", "off").env("RELAX_GANDALF", "0"));
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         return;
     }
@@ -316,15 +316,15 @@ fn round47_const_fn_body_invalidates_solver_answer() {
 // candidate is diagnosed separately by a cold check.
 #[test]
 fn round48_const_fn_tentative_check_uses_new_body() {
-    const CHILD: &str = "MAKEPAD_RUN_R48_CONST_FN_CHILD";
+    const CHILD: &str = "RELAX_R48_CONST_FN_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "jit::settle_tests::round48_const_fn_tentative_check_uses_new_body", "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0"));
+            .env(CHILD, "1").env("RELAX_CACHE", "off").env("RELAX_GANDALF", "0"));
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         let cold = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "jit::settle_tests::round48_const_fn_tentative_check_uses_new_body", "--nocapture", "--test-threads=1"])
-            .env(CHILD, "cold").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0"));
+            .env(CHILD, "cold").env("RELAX_CACHE", "off").env("RELAX_GANDALF", "0"));
         assert!(cold.status.success(), "{}\n{}", String::from_utf8_lossy(&cold.stdout), String::from_utf8_lossy(&cold.stderr));
         return;
     }
@@ -447,8 +447,8 @@ fn allocator_swap_serves_background_finish() {
 #[test]
 fn hot_o3_cache_roundtrip() {
     // Tiering is process-global: the second unit is a fresh launch, sharing only disk cache.
-    const CHILD: &str = "MAKEPAD_RUN_HOT_O3_CACHE_TEST";
-    const DIR: &str = "MAKEPAD_RUN_HOT_O3_CACHE_TEST_DIR";
+    const CHILD: &str = "RELAX_HOT_O3_CACHE_TEST";
+    const DIR: &str = "RELAX_HOT_O3_CACHE_TEST_DIR";
     let Ok(phase) = std::env::var(CHILD) else {
         let dir = std::env::temp_dir().join(format!("relax-hot-o3-cache-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -464,16 +464,16 @@ fn main() {}
         for phase in ["cold", "warm"] {
             let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "jit::settle_tests::hot_o3_cache_roundtrip", "--nocapture", "--test-threads=1"])
-                .env(CHILD, phase).env(DIR, &dir).env("MAKEPAD_RUN_SPEC", "0"));
+                .env(CHILD, phase).env(DIR, &dir).env("RELAX_SPEC", "0"));
             assert!(output.status.success(), "{phase}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         }
         std::fs::remove_dir_all(dir).unwrap();
         return;
     };
     crate::borrowck::lazy::disable_gandalf();
-    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     let dir = std::path::PathBuf::from(std::env::var_os(DIR).unwrap());
-    std::env::set_var("MAKEPAD_RUN_CACHE_DIR", dir.join("cache"));
+    std::env::set_var("RELAX_CACHE_DIR", dir.join("cache"));
     let session = std::sync::Arc::new(crate::Session::default());
     let (prog, core, krate) = crate::load_with_std(&session, dir.join("input.rs").to_str().unwrap(), "hot_o3_cache", false).unwrap();
     let def = prog.defs.iter().enumerate().find_map(|(i, d)| {
@@ -563,8 +563,8 @@ fn prebuild_link_needing_initializer_bails() {
     // publish; the entry names a static whose value the cache does not hold, so the link ran its
     // initializer there. The link is a take now: it bails, and the program's own link (or a
     // later build) runs the initializer. A link inside a publish panics on every call.
-    const CHILD: &str = "MAKEPAD_RUN_PREBUILD_INIT_TEST";
-    const DIR: &str = "MAKEPAD_RUN_PREBUILD_INIT_TEST_DIR";
+    const CHILD: &str = "RELAX_PREBUILD_INIT_TEST";
+    const DIR: &str = "RELAX_PREBUILD_INIT_TEST_DIR";
     let Ok(phase) = std::env::var(CHILD) else {
         let dir = std::env::temp_dir().join(format!("relax-prebuild-init-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -579,16 +579,16 @@ fn main() {}
         for phase in ["cold", "warm"] {
             let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "jit::settle_tests::prebuild_link_needing_initializer_bails", "--nocapture", "--test-threads=1"])
-                .env(CHILD, phase).env(DIR, &dir).env("MAKEPAD_RUN_SPEC", "0"));
+                .env(CHILD, phase).env(DIR, &dir).env("RELAX_SPEC", "0"));
             assert!(output.status.success(), "{phase}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         }
         std::fs::remove_dir_all(dir).unwrap();
         return;
     };
     crate::borrowck::lazy::disable_gandalf();
-    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     let dir = std::path::PathBuf::from(std::env::var_os(DIR).unwrap());
-    std::env::set_var("MAKEPAD_RUN_CACHE_DIR", dir.join("cache"));
+    std::env::set_var("RELAX_CACHE_DIR", dir.join("cache"));
     let session = std::sync::Arc::new(crate::Session::default());
     let (prog, core, krate) = crate::load_with_std(&session, dir.join("input.rs").to_str().unwrap(), "prebuild_init", false).unwrap();
     let def = prog.defs.iter().enumerate().find_map(|(i, d)| {
@@ -654,7 +654,7 @@ fn prebuild_builds_callees_that_ran_before() {
     // them. Those that ran in the image's session are built before the replacement's install, not
     // on the program's threads at its first call; a callee with no sign of having run stays lazy.
     crate::borrowck::lazy::disable_gandalf();
-    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     let dir = std::env::temp_dir().join(format!("relax-prebuild-ran-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("input.rs"), "pub fn ran(x: u32) -> u32 { x + 1 }\npub fn never(x: u32) -> u32 { x + 2 }\nfn main() {}\n").unwrap();
@@ -690,21 +690,21 @@ fn prebuild_builds_callees_that_ran_before() {
 fn settle_rebuild_pins_tier1_and_closure_history() {
     // Unit installs process-global runtime state. Cache fixtures in the same harness can
     // leave a reentrant unit lock behind; run this fixture in its own runtime process.
-    const CHILD: &str = "MAKEPAD_RUN_SETTLE_TEST_CHILD";
+    const CHILD: &str = "RELAX_SETTLE_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let status = crate::test_child::status(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "jit::settle_tests::settle_rebuild_pins_tier1_and_closure_history", "--test-threads=1", "--nocapture"])
-            .env(CHILD, "1").env("MAKEPAD_RUN_ICE_BT", "1"));
+            .env(CHILD, "1").env("RELAX_ICE_BT", "1"));
         assert!(status.success());
         return;
     }
     crate::borrowck::lazy::disable_gandalf();
-    if std::env::var_os("MAKEPAD_RUN_STD").is_none() {
-        std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    if std::env::var_os("RELAX_STD").is_none() {
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     }
     let dir = std::env::temp_dir().join(format!("relax-settle-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::env::set_var("MAKEPAD_RUN_CACHE_DIR", dir.join("cache"));
+    std::env::set_var("RELAX_CACHE_DIR", dir.join("cache"));
     let path = dir.join("input.rs");
     let source = r#"
 const fn width() -> usize { 3 }
@@ -895,7 +895,7 @@ fn round23_fnptr_keys_preserve_receiver_abi() {
 
 #[test]
 fn round42_const_and_build_cancellation_are_retryable() {
-    const CHILD: &str = "MAKEPAD_RUN_CONST_PREEMPT_CHILD";
+    const CHILD: &str = "RELAX_CONST_PREEMPT_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let status = crate::test_child::status(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "jit::settle_tests::round42_const_and_build_cancellation_are_retryable", "--test-threads=1"])
@@ -962,14 +962,14 @@ fn round42_const_and_build_cancellation_are_retryable() {
 
 #[test]
 fn round50_initializer_reload_policy() {
-    const CHILD: &str = "MAKEPAD_RUN_R50_INITIALIZER_CHILD";
+    const CHILD: &str = "RELAX_R50_INITIALIZER_CHILD";
     let Ok(case) = std::env::var(CHILD) else {
         // (R2, lead decision 52: a foldable const read only by an ordinary fn, and a static,
         // stay on the per-file path)
         for case in ["body", "refuse", "literal", "static", "static_unused"] {
             let result = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "jit::settle_tests::round50_initializer_reload_policy", "--nocapture", "--test-threads=1"])
-                .env(CHILD, case).env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0"));
+                .env(CHILD, case).env("RELAX_CACHE", "off").env("RELAX_GANDALF", "0"));
             assert!(result.status.success(), "{case}: {}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
         }
         return;
@@ -1050,11 +1050,11 @@ fn round50_initializer_reload_policy() {
 /// pile up: a patch's working state goes when it is installed.
 #[test]
 fn edit_cost_does_not_grow_with_edits() {
-    const CHILD: &str = "MAKEPAD_RUN_EDIT_COST_CHILD";
+    const CHILD: &str = "RELAX_EDIT_COST_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "jit::settle_tests::edit_cost_does_not_grow_with_edits", "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0"));
+            .env(CHILD, "1").env("RELAX_CACHE", "off").env("RELAX_GANDALF", "0"));
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         return;
     }
@@ -1101,11 +1101,11 @@ fn edit_cost_does_not_grow_with_edits() {
 
 #[test]
 fn round50_opaque_body_invalidates_solver_answer() {
-    const CHILD: &str = "MAKEPAD_RUN_R50_OPAQUE_CHILD";
+    const CHILD: &str = "RELAX_R50_OPAQUE_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "jit::settle_tests::round50_opaque_body_invalidates_solver_answer", "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0"));
+            .env(CHILD, "1").env("RELAX_CACHE", "off").env("RELAX_GANDALF", "0"));
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         return;
     }
@@ -1147,11 +1147,11 @@ fn round50_opaque_body_invalidates_solver_answer() {
 // T11: reload evaluates candidates with running native code; owner: codegen2.
 #[test]
 fn round50_foldable_const_with_native_dependent() {
-    const CHILD: &str = "MAKEPAD_RUN_R50_FOLDED_DEPENDENT_CHILD";
+    const CHILD: &str = "RELAX_R50_FOLDED_DEPENDENT_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "jit::settle_tests::round50_foldable_const_with_native_dependent", "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0"));
+            .env(CHILD, "1").env("RELAX_CACHE", "off").env("RELAX_GANDALF", "0"));
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         return;
     }
@@ -1187,7 +1187,7 @@ fn round50_foldable_const_with_native_dependent() {
 fn round50_inline_const_reload() {
     let result = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "jit::settle_tests::round50_initializer_reload_policy", "--nocapture", "--test-threads=1"])
-        .env("MAKEPAD_RUN_R50_INITIALIZER_CHILD", "inline_literal").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0"));
+        .env("RELAX_R50_INITIALIZER_CHILD", "inline_literal").env("RELAX_CACHE", "off").env("RELAX_GANDALF", "0"));
     assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
 }
 
@@ -1201,11 +1201,11 @@ fn copy_versions_move_with_the_flags_their_code_reads() {
     // version that moved: a later session's starts at 0 and would reach the value again while the
     // code's copies may be stale. Control: the same record naming a version at 0 is encoded.
     crate::borrowck::lazy::disable_gandalf();
-    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     let dir = std::env::temp_dir().join(format!("relax-copy-versions-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("input.rs"), "pub fn hot(out: &mut u32) { *out = 7; }\npub fn cool(out: &mut u32) { *out = 8; }\npub fn early() {}\npub fn late() {}\nfn main() {}\n").unwrap();
-    std::env::set_var("MAKEPAD_RUN_CACHE_DIR", dir.join("cache"));
+    std::env::set_var("RELAX_CACHE_DIR", dir.join("cache"));
     let session = std::sync::Arc::new(crate::Session::default());
     let (prog, core, krate) = crate::load_with_std(&session, dir.join("input.rs").to_str().unwrap(), "copy_versions", false).unwrap();
     let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| (d.krate == krate && prog.name(DefId(i as u32)) == name).then_some(DefId(i as u32))).unwrap();
@@ -1263,7 +1263,7 @@ fn a_copy_that_reads_no_flag_moves_its_hosts_version() {
     // patched before the install moves it at the install. Control: a host of a copy of a body
     // that is not patched keeps its version.
     crate::borrowck::lazy::disable_gandalf();
-    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     let dir = std::env::temp_dir().join(format!("relax-copy-hosts-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("input.rs"), "pub fn leaf() {}\npub fn early() {}\npub fn calm() {}\npub fn host() {}\npub fn late_host() {}\npub fn calm_host() {}\nfn main() {}\n").unwrap();
@@ -1301,8 +1301,8 @@ fn deferred_cache_record_is_dropped_when_a_source_changed() {
     // A deferred record (Cache::defer_record) is encoded after the install; an edit, rollback or
     // reload in between (the patch epoch moves) must drop it, never key old code by new text.
     // Control: the same record with no change in between is encoded.
-    const CHILD: &str = "MAKEPAD_RUN_DEFERRED_RECORD_TEST";
-    const DIR: &str = "MAKEPAD_RUN_DEFERRED_RECORD_TEST_DIR";
+    const CHILD: &str = "RELAX_DEFERRED_RECORD_TEST";
+    const DIR: &str = "RELAX_DEFERRED_RECORD_TEST_DIR";
     let Ok(phase) = std::env::var(CHILD) else {
         let dir = std::env::temp_dir().join(format!("relax-deferred-record-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1310,18 +1310,18 @@ fn deferred_cache_record_is_dropped_when_a_source_changed() {
         for phase in ["current", "stale"] {
             let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "jit::settle_tests::deferred_cache_record_is_dropped_when_a_source_changed", "--nocapture", "--test-threads=1"])
-                .env(CHILD, phase).env(DIR, dir.join(phase)).env("MAKEPAD_RUN_SPEC", "0"));
+                .env(CHILD, phase).env(DIR, dir.join(phase)).env("RELAX_SPEC", "0"));
             assert!(output.status.success(), "{phase}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         }
         std::fs::remove_dir_all(dir).unwrap();
         return;
     };
     crate::borrowck::lazy::disable_gandalf();
-    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     let dir = std::path::PathBuf::from(std::env::var_os(DIR).unwrap());
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.parent().unwrap().join("input.rs");
-    std::env::set_var("MAKEPAD_RUN_CACHE_DIR", dir.join("cache"));
+    std::env::set_var("RELAX_CACHE_DIR", dir.join("cache"));
     let session = std::sync::Arc::new(crate::Session::default());
     let (prog, core, krate) = crate::load_with_std(&session, src.to_str().unwrap(), "deferred_record", false).unwrap();
     let def = prog.defs.iter().enumerate().find_map(|(i, d)| {
@@ -1360,11 +1360,11 @@ fn deferred_cache_record_is_dropped_when_a_source_changed() {
 // the restored source.
 #[test]
 fn invalid_inliner_built_after_patch_is_in_its_group() {
-    const CHILD: &str = "MAKEPAD_RUN_INVALID_INLINER_CHILD";
+    const CHILD: &str = "RELAX_INVALID_INLINER_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "jit::settle_tests::invalid_inliner_built_after_patch_is_in_its_group", "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0"));
+            .env(CHILD, "1").env("RELAX_CACHE", "off").env("RELAX_GANDALF", "0"));
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         return;
     }
@@ -1415,7 +1415,7 @@ fn preempted_check_under_a_front_read_gives_way() {
     // program's main thread queued behind it. Under a held read the preempted check gives its
     // work up instead.
     crate::borrowck::lazy::disable_gandalf();
-    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     let dir = std::env::temp_dir().join(format!("relax_preempted_read_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("input.rs");
@@ -1544,18 +1544,18 @@ fn a_settle_sweep_lets_main_through_between_steps() {
 /// push left it.
 #[test]
 fn hot_twin_asks_for_its_base_verdict() {
-    const CHILD: &str = "MAKEPAD_RUN_HOT_TWIN_VERDICT_TEST";
+    const CHILD: &str = "RELAX_HOT_TWIN_VERDICT_TEST";
     if std::env::var_os(CHILD).is_none() {
         let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "jit::settle_tests::hot_twin_asks_for_its_base_verdict", "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1").env("MAKEPAD_RUN_GANDALF_ALL", "0").env("MAKEPAD_RUN_SPEC", "0"));
+            .env(CHILD, "1").env("RELAX_GANDALF_ALL", "0").env("RELAX_SPEC", "0"));
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         return;
     }
     CHECK_FIRST.store(false, Ordering::Relaxed);
     SPECV_HOLD.store(1, Ordering::Relaxed);
     begin_startup_phase();
-    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     let dir = std::env::temp_dir().join(format!("relax-hot-twin-verdict-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("app/src")).unwrap();
     std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();

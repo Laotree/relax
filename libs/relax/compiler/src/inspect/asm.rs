@@ -314,7 +314,7 @@ fn matching_angle(s: &str, open: usize) -> Option<usize> {
 fn our_sides(q: &str, max: usize) -> Result<(Vec<(u32, Side)>, Vec<String>), String> {
     let up = crate::jit::current_unit();
     if up.is_null() {
-        return Err("no running unit (asm reads JIT code of a `makepad run` process)".into());
+        return Err(format!("no running unit (asm reads JIT code of a `{tool} run` process)", tool = crate::tool_name()));
     }
     let q = q.to_string();
     let r = crate::owner::call_within(crate::owner::Class::Job, 10_000, move || -> Result<(Vec<(u32, Side)>, Vec<String>), String> {
@@ -432,9 +432,9 @@ fn our_sides(q: &str, max: usize) -> Result<(Vec<(u32, Side)>, Vec<String>), Str
                     (rt.memset, "memset"),
                     (rt.str_eq, "str equality (runtime)"),
                     (rt.panicking, "std::thread::panicking"),
-                    (u.lazy_entry, "makepad run: lazy compile entry (first call of a slot)"),
-                    (u.hot_entry, "makepad run: tier-up counter entry"),
-                    (u.env.tls_slow, "makepad run: thread-local slow path"),
+                    (u.lazy_entry, "relax run: lazy compile entry (first call of a slot)"),
+                    (u.hot_entry, "relax run: tier-up counter entry"),
+                    (u.env.tls_slow, "relax run: thread-local slow path"),
                 ];
                 let (lo, hi) = (b.start, b.start + b.len as u64);
                 for k in 0..s.insns.len() {
@@ -613,7 +613,7 @@ fn auto_native(build: bool) -> Result<String, String> {
         .stdout(f)
         .stderr(f2);
     for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("MAKEPAD_RUN_") {
+        if k.to_string_lossy().starts_with("RELAX_") {
             cmd.env_remove(&k);
         }
     }

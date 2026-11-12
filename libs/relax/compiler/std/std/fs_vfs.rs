@@ -1,7 +1,7 @@
 //! Relax's VFS (both OS halves of std::fs, env and process): a program run from a git
 //! repository (`makepad run <git url>`) reads its files from the repository's store; the loader
 //! answers paths under its virtual folders (compiler vfs.rs). Every other path is the disk, as
-//! before. Virtual files are read-only, unless the run has an edits folder (MAKEPAD_RUN_EDITS, compiler
+//! before. Virtual files are read-only, unless the run has an edits folder (RELAX_EDITS, compiler
 //! vfs.rs): then a write into a virtual folder goes to that folder on disk (`edit_target`).
 
 use alloc::borrow::Cow;
@@ -82,12 +82,12 @@ pub(crate) enum Kind {
 static CHOSEN: crate::sync::Mutex<Option<Option<PathBuf>>> = crate::sync::Mutex::new(None);
 
 /// The program's virtual current folder: the one it changed to, else the workspace of a git run
-/// (the host's MAKEPAD_RUN_WORKSPACE, when it is a virtual folder).
+/// (the host's RELAX_WORKSPACE, when it is a virtual folder).
 pub(crate) fn cwd() -> Option<PathBuf> {
     if let Some(c) = chosen() {
         return c;
     }
-    let w = crate::env::host_var_os("MAKEPAD_RUN_WORKSPACE")?;
+    let w = crate::env::host_var_os("RELAX_WORKSPACE")?;
     let p = PathBuf::from(w);
     matches!(kind_abs(&p), Some(Kind::Dir)).then_some(p)
 }
@@ -193,5 +193,5 @@ pub(crate) fn mounts() -> String {
 }
 
 pub(crate) fn read_only() -> io::Error {
-    io::const_error!(io::ErrorKind::PermissionDenied, "a file of a git repository run (makepad run's VFS) is read-only")
+    io::const_error!(io::ErrorKind::PermissionDenied, "a file of a git repository run (Relax's VFS) is read-only")
 }

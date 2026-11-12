@@ -460,7 +460,7 @@ pub struct Hello {
     pub build: String,
     pub device: String,
     pub refresh_mhz: u64,
-    /// bit0: a JIT (makepad run) app; bit1: a native build
+    /// bit0: a JIT (Relax) app; bit1: a native build
     pub flags: u64,
     /// the process's start on the stream clock (0: unknown): answers say "at 896 s of the run"
     pub start_mono: u64,

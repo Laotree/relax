@@ -36,7 +36,7 @@ struct Ctx<'a> {
 
 pub(crate) fn trace_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_CTFE_TRACE").is_some())
+    *ON.get_or_init(|| std::env::var_os("RELAX_CTFE_TRACE").is_some())
 }
 
 /// Evaluates const/static `d` (instance `args`) into `buf` (its layout's size). Returns false
@@ -127,7 +127,7 @@ fn check_quiet(u: &mut Unit, d: crate::program::DefId, args: &[TyId]) -> Option<
     Some(b)
 }
 
-/// MAKEPAD_RUN_CTFE=check: evaluate here AND compile and run the initializer, compare the two values
+/// RELAX_CTFE=check: evaluate here AND compile and run the initializer, compare the two values
 /// by type (pointers by what they point to, padding ignored); a difference is reported.
 pub fn check_mode(options: &crate::options::Options) -> bool {
     options.ctfe == crate::options::Ctfe::Check
@@ -364,7 +364,7 @@ pub fn zero_undefined(u: &mut Unit, t: TyId, a: u64) {
     }
 }
 
-/// MAKEPAD_RUN_CTFE=0: every initializer is compiled and run (the reference behaviour).
+/// RELAX_CTFE=0: every initializer is compiled and run (the reference behaviour).
 /// (The evaluator models 8-byte pointer and usize words: a wasm32 program's initializers run as
 /// code, web32.rs, whatever the option says.)
 fn off(options: &crate::options::Options) -> bool {

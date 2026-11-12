@@ -24,7 +24,7 @@ Expansion implementations have no features; the program's proc-macro helper must
 `relax-tokens` disabled. The live-id library is an unused dependency
 of the widget wrapper, retained for complete graph validation; it is not linked here.
 
-`MAKEPAD_RUN_PARSE_VERIFY=1` compares worker results with fresh
+`RELAX_PARSE_VERIFY=1` compares worker results with fresh
 collection-scope parses, including AST arrays, tokens, source/hygiene maps, macro
 publications, and file preparation. Use it for verification, not timing.
 

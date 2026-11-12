@@ -39,7 +39,7 @@
 //! build-dependencies reach but not the run's key (its unit graph is a part of the run's). So the
 //! run writes what the native scripts produced (cfgs, env, OUT_DIR) and the library they were
 //! linked into to a script receipt, named by its content, and hands it to its script children in
-//! `MAKEPAD_RUN_NATIVE_RECEIPT` (`write_receipt` / `read_receipt`). A child matches the entries by
+//! `RELAX_NATIVE_RECEIPT` (`write_receipt` / `read_receipt`). A child matches the entries by
 //! the scripts' own paths, so a build script that calls into a native crate compiles and runs
 //! with that crate's outputs and library, without cargo and without the flag itself.
 //!
@@ -714,16 +714,16 @@ fn optimize_later(g: &Graph, req: &Request, exe: std::path::PathBuf, flags: &[&S
         let m = match run_cargo_with(&pkg, &scripts, &workspace, &package, &relax_dir, &triple, &exe, &flag_refs, &script_pkgs, &lib_pkgs, &seeds, Tier::Optimized) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("makepad-run: --allow-c: the optimized native build failed (the opt-level 0 library stays): {}", e.lines().next().unwrap_or(""));
+                eprintln!("relax: --allow-c: the optimized native build failed (the opt-level 0 library stays): {}", e.lines().next().unwrap_or(""));
                 return;
             }
         };
         let o = match outputs_with(&pkg, &scripts, &seeds, &m) {
             Ok(o) => o,
-            Err(e) => { eprintln!("makepad-run: --allow-c: the optimized native build: {}", e); return; }
+            Err(e) => { eprintln!("relax: --allow-c: the optimized native build: {}", e); return; }
         };
         if said(&o) != want {
-            eprintln!("makepad-run: --allow-c: the optimized native build's scripts said other cfgs or env than the first build's: its library is not taken");
+            eprintln!("relax: --allow-c: the optimized native build's scripts said other cfgs or env than the first build's: its library is not taken");
             return;
         }
         let tmp = format!("{}.opt{}", lib_path, std::process::id());
@@ -767,7 +767,7 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
         .map(|p| p.join("makepad-native").join(match tier { Tier::Fast => "fast", Tier::Optimized => "optimized" }).join(format!("{selection:016x}")))
         .unwrap_or_else(|| target.clone());
     if tier == Tier::Fast {
-        eprintln!("makepad run: --allow-c: building native dependencies with cargo (opt-level 0 now, optimized in the background; cached afterwards): {}", script_pkgs.iter().take(8).cloned().collect::<Vec<_>>().join(", "));
+        eprintln!("relax run: --allow-c: building native dependencies with cargo (opt-level 0 now, optimized in the background; cached afterwards): {}", script_pkgs.iter().take(8).cloned().collect::<Vec<_>>().join(", "));
     }
     // the program's link arguments: the wrapper writes them here, a file per binary or test
     // harness. A folder of its own per cargo run: the program's stubs depend on its name
@@ -797,14 +797,14 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
         .env("CARGO_BUILD_BUILD_DIR", &build)
         .env("CARGO_INCREMENTAL", "0")
         .env("RUSTC_WRAPPER", exe)
-        .env("MAKEPAD_RUN_NATIVE_SCRIPTS", script_pkgs.join(","))
-        .env("MAKEPAD_RUN_NATIVE_LIBS", lib_pkgs.join(","))
+        .env("RELAX_NATIVE_SCRIPTS", script_pkgs.join(","))
+        .env("RELAX_NATIVE_LIBS", lib_pkgs.join(","))
         .env("RUSTC", exe)
-        .env("MAKEPAD_RUN_NATIVE_RUSTC", "rustc")
-        .env("MAKEPAD_RUN_NATIVE_TARGET", triple)
-        .env("MAKEPAD_RUN_NATIVE_BUILD_DIR", &build)
-        .env("MAKEPAD_RUN_NATIVE_LINK_ARGS", &link_dir)
-        .env_remove("MAKEPAD_RUN_AS_RUSTC")
+        .env("RELAX_NATIVE_RUSTC", "rustc")
+        .env("RELAX_NATIVE_TARGET", triple)
+        .env("RELAX_NATIVE_BUILD_DIR", &build)
+        .env("RELAX_NATIVE_LINK_ARGS", &link_dir)
+        .env_remove("RELAX_AS_RUSTC")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .stdout(Stdio::piped())
@@ -1314,21 +1314,21 @@ fn is_target_out_dir(out_dir: &str, cargo_target: &std::path::Path, triple: &str
 /// An explicit target keeps Cargo's host and target script directories separate,
 /// including packages used on both sides with identical features.
 pub fn is_target_rustc_probe(args: &[String]) -> bool {
-    if std::env::var_os("MAKEPAD_RUN_NATIVE_RUSTC").is_none() {
+    if std::env::var_os("RELAX_NATIVE_RUSTC").is_none() {
         return false;
     }
     let Some(first) = args.first() else { return false };
     if std::env::var("RUSTC").is_ok_and(|rustc| first == &rustc) {
         return false;
     }
-    let (Ok(out), Some(target), Ok(triple)) = (std::env::var("OUT_DIR"), std::env::var_os("MAKEPAD_RUN_NATIVE_BUILD_DIR"), std::env::var("MAKEPAD_RUN_NATIVE_TARGET")) else { return false };
+    let (Ok(out), Some(target), Ok(triple)) = (std::env::var("OUT_DIR"), std::env::var_os("RELAX_NATIVE_BUILD_DIR"), std::env::var("RELAX_NATIVE_TARGET")) else { return false };
     is_target_out_dir(&out, std::path::Path::new(&target), &triple)
 }
 
-/// This executable as cargo's `RUSTC_WRAPPER` (`MAKEPAD_RUN_NATIVE_SCRIPTS` set) or as a stubbed
+/// This executable as cargo's `RUSTC_WRAPPER` (`RELAX_NATIVE_SCRIPTS` set) or as a stubbed
 /// build script. Returns the exit code when it acted, None when this is an ordinary start.
 pub fn wrapper() -> Option<i32> {
-    let scripts = std::env::var("MAKEPAD_RUN_NATIVE_SCRIPTS").ok()?;
+    let scripts = std::env::var("RELAX_NATIVE_SCRIPTS").ok()?;
     let args: Vec<String> = std::env::args().collect();
     // a build script stub (cargo runs what the wrapper left as the script): nothing to do
     let stem = std::path::Path::new(&args[0]).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1339,14 +1339,14 @@ pub fn wrapper() -> Option<i32> {
     if args.len() < 2 || std::env::var_os("RUSTC_WRAPPER").is_none() && std::env::var_os("CARGO_PKG_NAME").is_none() {
         return None;
     }
-    let native_rustc = std::env::var("MAKEPAD_RUN_NATIVE_RUSTC").ok();
+    let native_rustc = std::env::var("RELAX_NATIVE_RUSTC").ok();
     let direct = native_rustc.is_some() && std::env::var("RUSTC").is_ok_and(|rustc| args[1] != rustc);
     let rustc = native_rustc.as_ref().unwrap_or(&args[1]);
     let rest = if direct { &args[1..] } else { &args[2..] };
     if direct {
         return Some(match Command::new(rustc).args(rest).status() {
             Ok(s) => s.code().unwrap_or(1),
-            Err(e) => { eprintln!("makepad run: native compiler probe: {}: {}", rustc, e); 1 }
+            Err(e) => { eprintln!("relax run: native compiler probe: {}: {}", rustc, e); 1 }
         });
     }
     let value = |flag: &str| -> Option<String> {
@@ -1370,14 +1370,14 @@ pub fn wrapper() -> Option<i32> {
         Some(n) => {
             let pkg = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
             let list = |v: &str| std::env::var(v).unwrap_or_default().split(',').any(|x| x == pkg);
-            if n.starts_with("build_script_") { scripts.split(',').any(|x| x == pkg) } else { list("MAKEPAD_RUN_NATIVE_LIBS") }
+            if n.starts_with("build_script_") { scripts.split(',').any(|x| x == pkg) } else { list("RELAX_NATIVE_LIBS") }
         }
     };
     if real {
         return Some(match Command::new(rustc).args(rest).status() {
             Ok(s) => s.code().unwrap_or(1),
             Err(e) => {
-                eprintln!("makepad run: native wrapper: cannot run {}: {}", rustc, e);
+                eprintln!("relax run: native wrapper: cannot run {}: {}", rustc, e);
                 1
             }
         });
@@ -1401,7 +1401,7 @@ pub fn wrapper() -> Option<i32> {
     // the program's binaries and test harnesses: their link arguments, which the native library is
     // linked with (program_link_args). The stub's dep-info names the run's folder, so the next
     // cargo run, with a folder of its own, does not take this one as fresh.
-    let capture = std::env::var("MAKEPAD_RUN_NATIVE_LINK_ARGS").ok().filter(|_| {
+    let capture = std::env::var("RELAX_NATIVE_LINK_ARGS").ok().filter(|_| {
         std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some() && (types.iter().any(|t| t == "bin") || rest.iter().any(|a| a == "--test"))
     });
     if let Some(dir) = &capture {
@@ -1446,7 +1446,7 @@ pub fn wrapper() -> Option<i32> {
             let mut d = format!("{}: {}\n", path, src);
             if let Some(dir) = &capture {
                 // rustc's form of an `env!` the crate read (cargo's dep-info parser unescapes it)
-                d.push_str(&format!("\n# env-dep:MAKEPAD_RUN_NATIVE_LINK_ARGS={}\n", dir.replace('\\', "\\\\").replace('\n', "\\n")));
+                d.push_str(&format!("\n# env-dep:RELAX_NATIVE_LINK_ARGS={}\n", dir.replace('\\', "\\\\").replace('\n', "\\n")));
             }
             let _ = std::fs::write(path, d);
         } else {

@@ -696,7 +696,7 @@ impl<'a> Lcx<'a> {
                 return;
             }
             let key = crate::provided::key(&self.u.prog, &self.u.tcx, d);
-            self.provided_err(krate, format!("`{}` calls `{}` in JIT-compiled code, but `{}` lives in a provided crate: it works an object rustc allocated with makepad run's std, whose layout differs: mark it #[relax_api] (an op), or make it generic over the type JIT code allocates (an instance of a generic fn is compiled for its caller's type)", key, path, key));
+            self.provided_err(krate, format!("`{}` calls `{}` in JIT-compiled code, but `{}` lives in a provided crate: it works an object rustc allocated with Relax's std, whose layout differs: mark it #[relax_api] (an op), or make it generic over the type JIT code allocates (an instance of a generic fn is compiled for its caller's type)", key, path, key));
         }
     }
 
@@ -1095,7 +1095,7 @@ impl<'a> Lcx<'a> {
             if u.size_overflows(t) {
                 self.err(self.pos, format!("{}values of the type `{}` are too big for the target architecture", relax_front::diagnostics::UNCODED_PREFIX, ts));
             } else {
-                self.err(self.pos, format!("type `{}` is 4 GiB or larger, which makepad run does not lay out yet", ts));
+                self.err(self.pos, format!("type `{}` is 4 GiB or larger, which Relax does not lay out yet", ts));
             }
         }
         l
@@ -1383,7 +1383,7 @@ impl<'a> Lcx<'a> {
                 // unreachable code after a diverging expression legitimately has no value
                 if self.errors.is_empty() && !self.cur_unreachable() {
                     let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
-                    self.err(self.pos, format!("internal: value of `{}` has {} parts, expected {} -- makepad run bug, report it", ts, r.len(), leaves.len()));
+                    self.err(self.pos, format!("internal: value of `{}` has {} parts, expected {} -- Relax bug, report it", ts, r.len(), leaves.len()));
                 }
                 for lf in &leaves[r.len()..] {
                     let d = self.f.vreg(lf.cls);
@@ -1484,7 +1484,7 @@ impl<'a> Lcx<'a> {
         }
     }
 
-    /// MAKEPAD_RUN_FIELD_PROF: one field-access site of the body being lowered (jit.rs field_note).
+    /// RELAX_FIELD_PROF: one field-access site of the body being lowered (jit.rs field_note).
     #[allow(clippy::too_many_arguments)]
     fn field_note(&mut self, t: TyId, adt: &crate::tcx::AdtT, fi: u32, off: u32, fsz: u32, ssz: u32, salign: u32) {
         let prog = &self.u.prog;
@@ -1566,7 +1566,7 @@ impl<'a> Lcx<'a> {
                 } else {
                     l.fields.get(fi as usize).copied()
                 };
-                // MAKEPAD_RUN_FIELD_PROF: a struct field reached through memory, for the hot-field
+                // RELAX_FIELD_PROF: a struct field reached through memory, for the hot-field
                 // layout measurement (jit.rs field_note)
                 if !adt.is_enum && !adt.is_union && matches!(p, Place::Mem(..)) && crate::jit::field_prof_on() {
                     if let (Some(o), Some(ft)) = (off, ft) {
@@ -1578,14 +1578,14 @@ impl<'a> Lcx<'a> {
                     (Some(off), Some(ft)) => (ft, off, var.fields.len()),
                     _ => {
                         let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
-                        self.err(self.pos, format!("internal: no field {} in the layout of `{}` -- makepad run bug, report it", fi, ts));
+                        self.err(self.pos, format!("internal: no field {} in the layout of `{}` -- Relax bug, report it", fi, ts));
                         (self.u.tcx.tys.error, 0, var.fields.len())
                     }
                 }
             }
             _ => {
                 let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
-                self.err(self.pos, format!("internal: field {} of non-aggregate `{}` -- makepad run bug, report it", fi, ts));
+                self.err(self.pos, format!("internal: field {} of non-aggregate `{}` -- Relax bug, report it", fi, ts));
                 return (Place::Regs(Vec::new()), self.u.tcx.tys.error);
             }
         };
@@ -5505,7 +5505,7 @@ impl<'a> Lcx<'a> {
                     let cv = if matches!(k, TyKind::Ptr(..) | TyKind::FnPtr(..)) {
                         match self.const_ptr_val(cs, lf.off) {
                             Some(v) => v,
-                            None => return self.err(self.pos, "a pointer in a constant pattern whose target makepad run cannot name".to_string()),
+                            None => return self.err(self.pos, "a pointer in a constant pattern whose target Relax cannot name".to_string()),
                         }
                     } else {
                         let raw = unsafe { read_raw(c + lf.off as u64, lf.mem) };
@@ -5533,7 +5533,7 @@ impl<'a> Lcx<'a> {
                         let v = self.read_place(place, t);
                         let a = match self.const_ptr_val(cs, 0) {
                             Some(a) => a,
-                            None => return self.err(self.pos, "a string constant pattern whose bytes makepad run cannot name".to_string()),
+                            None => return self.err(self.pos, "a string constant pattern whose bytes Relax cannot name".to_string()),
                         };
                         let l = self.iconst(cl as i64);
                         let r = self.eq_vals(v, Val::L(vec![a, l]), t);
@@ -6756,7 +6756,7 @@ impl<'a> Lcx<'a> {
                 let st = self.body_ty(e);
                 let p = self.to_leaves(v, st);
                 if p.len() != 2 {
-                    self.err(self.pos, "internal: trait object upcast of a value without a vtable -- makepad run bug, report it".to_string());
+                    self.err(self.pos, "internal: trait object upcast of a value without a vtable -- Relax bug, report it".to_string());
                     return self.unit();
                 }
                 let vt = self.f.vreg(Cls::I);
@@ -8623,7 +8623,7 @@ impl<'a> Lcx<'a> {
                 let (bv, bt) = self.prim_leaves(bv, bt);
                 if av.is_empty() || bv.is_empty() {
                     let (x, y) = (crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, at), crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, bt));
-                    self.err(self.pos, format!("internal: arithmetic on `{}` and `{}` without values -- makepad run bug, report it", x, y));
+                    self.err(self.pos, format!("internal: arithmetic on `{}` and `{}` without values -- Relax bug, report it", x, y));
                     return self.dummy_val(t);
                 }
                 let r = self.arith(op, t, av[0], bv[0], bt);
@@ -12837,7 +12837,7 @@ pub fn takes_caller_loc(u: &Unit, id: u32) -> bool {
 /// array, the shim moves them out and writes the result to the result slot (or the caller's
 /// result address). A shim that caught a panic returns 1: its text is read through the crate's
 /// `__host_last_panic` and raised here as a Relax panic. One that caught this thread's own panic
-/// on its way through the op's frames (makepad_relax_api::CallerPanic) returns 2: it goes on.
+/// on its way through the op's frames (relax_api::CallerPanic) returns 2: it goes on.
 pub fn bridge_func(u: &Unit, d: DefId, name: String, shim: relax_backend::rir::Sym, last_panic: relax_backend::rir::Sym) -> Option<Func> {
     let s = u.tcx.fn_sig(&u.prog, d).cloned()?;
     let ps: Vec<TyId> = s.params.iter().map(|p| u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), *p)).collect();
@@ -13733,11 +13733,11 @@ fn rt_divrem128(mode: u64, alo: u64, ahi: u64, blo: u64, bhi: u64) -> WideRet {
 /// State word (rustc's discriminant): 0 unresumed, 1 returned, 2 poisoned (running: a panic
 /// leaves it), 3 + k suspended at point k. A poll with a null context (the coroutine dropped)
 /// runs the drops of its suspension point.
-/// MAKEPAD_RUN_CORO_VERIFY=1: every suspension point's live vregs (the per-vreg walks of
+/// RELAX_CORO_VERIFY=1: every suspension point's live vregs (the per-vreg walks of
 /// coroutine_transform) are checked against the dense block x vreg dataflow they replace.
 fn coro_verify() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("MAKEPAD_RUN_CORO_VERIFY").is_ok_and(|v| v == "1"))
+    *V.get_or_init(|| std::env::var("RELAX_CORO_VERIFY").is_ok_and(|v| v == "1"))
 }
 
 /// The dense backward liveness from one suspension point (its view `seen` / `known`): panics
@@ -13802,17 +13802,17 @@ fn dense_live_check(f: &Func, c: &Coro, nv: usize, seen: &[bool], known: &[Optio
 
 fn coro_transform_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_TRACE").is_ok_and(|v| v.split(',').any(|x| x == "coro")))
+    *ON.get_or_init(|| std::env::var("RELAX_TRACE").is_ok_and(|v| v.split(',').any(|x| x == "coro")))
 }
 
 fn coro_trace_level() -> u8 {
     static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("MAKEPAD_RUN_CORO_TRACE").as_deref() { Ok("2") => 2, Ok("3") => 3, _ => 0 })
+    *ON.get_or_init(|| match std::env::var("RELAX_CORO_TRACE").as_deref() { Ok("2") => 2, Ok("3") => 3, _ => 0 })
 }
 
 fn coro_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_CORO_TRACE").is_some())
+    *ON.get_or_init(|| std::env::var_os("RELAX_CORO_TRACE").is_some())
 }
 
 /// Single definitions of a body's address vregs: a slot's address and slot + constant, by vreg
@@ -13851,7 +13851,7 @@ fn slot_addrs(f: &Func) -> std::collections::HashMap<u32, (u32, i32)> {
 /// `tys`: the types of the body's locals by slot and by register (coro_local_tys), for the state's shape.
 fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::collections::HashMap<u32, Vec<TyId>>, std::collections::HashMap<u32, TyId>)) -> Result<(u32, u32, u64), String> {
     use relax_backend::regalloc::{term_uses, uses_defs};
-    // MAKEPAD_RUN_TRACE=coro: the transform's sizes and phase times (coro-transform line)
+    // RELAX_TRACE=coro: the transform's sizes and phase times (coro-transform line)
     let tr = coro_transform_trace();
     let t_start = std::time::Instant::now();
     let mut t_ph: Vec<(&str, f64)> = Vec::new();
@@ -14423,7 +14423,7 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
         seen
     };
     mark("gen/kill");
-    // MAKEPAD_RUN_CORO_TRACE=2: why each slot is saved at each point (3: slots of 1 MB and more)
+    // RELAX_CORO_TRACE=2: why each slot is saved at each point (3: slots of 1 MB and more)
     let coro_why = coro_trace_level();
     for (k, &(pend, resume, cancel)) in c.suspends.iter().enumerate() {
         let mut vs = Vec::new();
@@ -14731,7 +14731,7 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
         end = end.max(o);
     }
     let size = end;
-    // MAKEPAD_RUN_CORO_TRACE: the saved slots and values of each coroutine
+    // RELAX_CORO_TRACE: the saved slots and values of each coroutine
     if coro_trace() {
         for s in 0..ns {
             if !saved_at[s].is_empty() {
@@ -15414,7 +15414,7 @@ pub fn valid_moves(out: &mut usize) {
     fn moves_rustc_rejects_are_refused_at_lowering() {
         isolated_test!(moves_rustc_rejects_are_refused_at_lowering);
         crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
-        std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
         let dir = std::env::temp_dir().join(format!("relax-illegal-moves-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("lib.rs");

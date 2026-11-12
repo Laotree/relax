@@ -322,7 +322,7 @@ pub struct Tcx {
 
 
 
-/// `f` over `items` on the boot's worker count (MAKEPAD_RUN_JOBS), results in item order.
+/// `f` over `items` on the boot's worker count (RELAX_JOBS), results in item order.
 fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> where T: Copy {
     let jobs = crate::preload::jobs().min(items.len().max(1));
     if jobs < 2 {

@@ -524,8 +524,8 @@ impl Command {
             ChildDir::Same => {}
             ChildDir::Virtual(workspace, vfs) => {
                 flags |= 4;
-                wire_push(&mut plumbing, b"MAKEPAD_RUN_WORKSPACE", Some(workspace.as_encoded_bytes()));
-                wire_push(&mut plumbing, b"MAKEPAD_RUN_VFS", Some(vfs.as_encoded_bytes()));
+                wire_push(&mut plumbing, b"RELAX_WORKSPACE", Some(workspace.as_encoded_bytes()));
+                wire_push(&mut plumbing, b"RELAX_VFS", Some(vfs.as_encoded_bytes()));
             }
             ChildDir::Real => flags |= 8,
         }
@@ -557,18 +557,18 @@ impl Command {
     /// Under `makepad run` the program's executable is Relax itself: spawning it runs this
     /// program again (Relax's command line up to `--`, then the new arguments). A spawn of the
     /// loader whose first argument is `run` or `app` is a launcher starting another program through
-    /// it (`$MAKEPAD_RUN_LOADER run [flags] <package> ...`, `... app <id>`), and one whose first argument is
+    /// it (`$RELAX_LOADER run [flags] <package> ...`, `... app <id>`), and one whose first argument is
     /// `export` asks the loader for a source tree (the runner's Install natively): those run as written. `program` is the
     /// resolved executable (NUL-terminated UTF-16, with its `.exe`); the result is the argument
     /// list after argv[0] to run instead of this command's.
     fn self_exec_args(&self, program: &[u16]) -> Option<Vec<Arg>> {
-        let pre = crate::env::host_var_os("MAKEPAD_RUN_SELF_EXEC")?.into_string().ok()?;
+        let pre = crate::env::host_var_os("RELAX_SELF_EXEC")?.into_string().ok()?;
         if self.args.first().is_some_and(|a| matches!(a.as_os_str().as_encoded_bytes(), b"run" | b"app" | b"export")) {
             return None;
         }
-        // inside a build script (MAKEPAD_RUN_AS_RUSTC): its spawns of this executable are RUSTC
+        // inside a build script (RELAX_AS_RUSTC): its spawns of this executable are RUSTC
         // questions, answered as written (relax_as_rustc); re-running the script would recurse
-        if crate::env::host_var_os("MAKEPAD_RUN_AS_RUSTC").is_some() {
+        if crate::env::host_var_os("RELAX_AS_RUSTC").is_some() {
             return None;
         }
         let parts: Vec<&str> = pre.split('\u{1f}').collect();
@@ -592,7 +592,7 @@ impl Command {
 
     /// A child started in a virtual folder of a git run (Relax's VFS) cannot get it as its
     /// working directory: it runs from the current one and finds its workspace through
-    /// MAKEPAD_RUN_WORKSPACE + the mount table (MAKEPAD_RUN_VFS), as on unix (process_unix.rs).
+    /// RELAX_WORKSPACE + the mount table (RELAX_VFS), as on unix (process_unix.rs).
     fn spawn_with(&mut self, default: StdioKind, needs_stdin: bool) -> io::Result<Child> {
         let Some(dir) = self.cwd.clone() else {
             // the child runs in the folder set_current_dir chose, if the program changed it

@@ -1,5 +1,5 @@
 //! Where makepad run keeps what it writes: like cargo's build output, everything for a workspace
-//! lives in `<target dir>/makepad-run` (the "run dir"), where the target dir is what `cargo metadata`
+//! lives in `<target dir>/relax` (the "run dir"), where the target dir is what `cargo metadata`
 //! reports as `target_directory` (resolve::target_dir: CARGO_TARGET_DIR, then cargo config's
 //! `build.target-dir`, then `<workspace root>/target`). `cargo clean` removes it with the rest of
 //! the build output, and a fresh checkout is cold. There is no per-user cache.
@@ -20,7 +20,7 @@
 //! `<run home>/target/<8 hex of the virtual workspace root>`, next to the loader's git stores
 //! in the same per-user folder the loader installs to.
 //!
-//! MAKEPAD_RUN_CACHE_DIR replaces the whole run dir: for tests and measurement only. A run
+//! RELAX_CACHE_DIR replaces the whole run dir: for tests and measurement only. A run
 //! that starts another run for the same program (a build script) hands its run dir over
 //! with `makepad run --run-dir <dir>` (set_relax_dir).
 use std::path::{Path, PathBuf};
@@ -86,20 +86,20 @@ pub fn set_workspace_dir(dir: String) {
     let _ = SET_WORKSPACE.set(crate::zone_alloc::kept_clone(&dir));
 }
 
-/// The workspace: `--workspace-dir` (`set_workspace_dir`), else MAKEPAD_RUN_WORKSPACE (a git run's
+/// The workspace: `--workspace-dir` (`set_workspace_dir`), else RELAX_WORKSPACE (a git run's
 /// virtual folder, vfs.rs; it does not exist on disk, so it cannot be the current folder), else
 /// the current folder.
 pub fn workspace_dir() -> String {
     if let Some(w) = SET_WORKSPACE.get() {
         return w.clone();
     }
-    if let Some(w) = std::env::var_os("MAKEPAD_RUN_WORKSPACE").filter(|w| !w.is_empty()) {
+    if let Some(w) = std::env::var_os("RELAX_WORKSPACE").filter(|w| !w.is_empty()) {
         return w.to_string_lossy().into_owned();
     }
     std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".to_string())
 }
 
-/// This process's relax dir: the handed-over one, else MAKEPAD_RUN_CACHE_DIR, else the workspace's
+/// This process's relax dir: the handed-over one, else RELAX_CACHE_DIR, else the workspace's
 /// (relax_dir_for(workspace_dir())).
 pub fn relax_dir() -> PathBuf {
     if let Some(d) = SET.get() {
@@ -128,23 +128,23 @@ fn virtual_dir(root: &str) -> PathBuf {
     crate::gitstore::relax_home().join("target").join(format!("{:08x}", h as u32))
 }
 
-/// MAKEPAD_RUN_CACHE_DIR when set (tests and measurement).
+/// RELAX_CACHE_DIR when set (tests and measurement).
 pub fn override_dir() -> Option<PathBuf> {
-    std::env::var_os("MAKEPAD_RUN_CACHE_DIR").filter(|d| !d.is_empty()).map(|dir| {
+    std::env::var_os("RELAX_CACHE_DIR").filter(|d| !d.is_empty()).map(|dir| {
         let dir = PathBuf::from(dir);
         std::path::absolute(&dir).unwrap_or(dir)
     })
 }
 
-/// The relax dir of the workspace holding `start` (no override): `<cargo target dir>/makepad-run`; a
-/// folder with no Cargo.toml at or above it: `<start>/target/makepad-run`; a virtual (git store)
+/// The relax dir of the workspace holding `start` (no override): `<cargo target dir>/relax`; a
+/// folder with no Cargo.toml at or above it: `<start>/target/relax`; a virtual (git store)
 /// workspace: `<relax home>/target/<8 hex>`.
 pub fn relax_dir_for(start: &str) -> PathBuf {
     if crate::vfs::is_virtual(start) {
         return virtual_dir(&crate::vfs::outer_root(start).unwrap_or_else(|| crate::vfs::normalize_path(start)));
     }
     let target = crate::resolve::target_dir(start).unwrap_or_else(|_| format!("{}/target", crate::vfs::normalize_path(start)));
-    Path::new(&target).join("makepad-run")
+    Path::new(&target).join("relax")
 }
 
 /// The store files' folder: `<relax dir>/cache`.

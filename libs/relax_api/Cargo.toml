@@ -1,5 +1,5 @@
 [package]
-name = "makepad-relax-api"
+name = "relax-api"
 version = "1.0.0"
 authors = ["Makepad <info@makepad.nl>"]
 edition = "2021"
@@ -9,7 +9,7 @@ homepage = "https://github.com/makepad/makepad/"
 repository = "https://github.com/makepad/makepad/"
 
 [dependencies]
-makepad-relax-api-macro = { path = "macro", version = "1.0.0" }
+relax-api-macro = { path = "macro", version = "1.0.0" }
 makepad-alloc-phase = { path = "phase", version = "1.0.0" }
 
 [features]

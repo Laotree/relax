@@ -40,7 +40,7 @@
 //!   checked out). The commit: Cargo.lock's `git+<url>?<ref>#<commit>` source when it lists the
 //!   source (the lockfile wins); else the pin Relax recorded in `<relax dir>/git.lock` (the user's
 //!   Cargo.lock is never written); else the commit the remote's ref names now, recorded there.
-//!   Offline (Cargo's env/config, --offline/--frozen, MAKEPAD_RUN_OFFLINE or no answer), a pinned
+//!   Offline (Cargo's env/config, --offline/--frozen, RELAX_OFFLINE or no answer), a pinned
 //!   commit must be local; an unpinned ref uses the store's newest fetch of it. The package is
 //!   found in the repository as cargo does it: every Cargo.toml of the tree (not under hidden
 //!   folders, a package's `target` folder or a nested repository), the root first, the first
@@ -206,7 +206,7 @@ fn git_src(st: &TomlTable, at: &str, key: &str) -> Result<Option<GitSrc>, String
         return Err(format!("{}: dependency ({}) specification is ambiguous. Only one of `branch`, `tag` or `rev` is allowed.", at, key));
     }
     if crate::git::fetch::check_url(&url).is_err() {
-        return Err(format!("{}: `{}` is a git dependency on {}: makepad run fetches git repositories over https only", at, key, url));
+        return Err(format!("{}: `{}` is a git dependency on {}: Relax fetches git repositories over https only", at, key, url));
     }
     Ok(Some(GitSrc { url, reference: refs.pop().unwrap_or(GitRef::DefaultBranch) }))
 }
@@ -1102,7 +1102,7 @@ impl Resolver {
             let mut g = self.git.borrow_mut();
             let pins = g.pins.get_or_insert_with(BTreeMap::new);
             pins.insert(src.id(), crate::gitstore::hex(commit));
-            let mut text = String::from("# makepad run's pins of git dependencies Cargo.lock does not list: <source id>\t<commit>\n");
+            let mut text = String::from("# Relax's pins of git dependencies Cargo.lock does not list: <source id>\t<commit>\n");
             for (id, c) in pins.iter() {
                 text.push_str(&format!("{}\t{}\n", id, c));
             }
@@ -1344,7 +1344,7 @@ fn vendor_dir(dir: &str) -> Result<Option<(Vendor, String)>, String> {
     }
     match s(src, "directory") {
         Some(p) => Ok(Some((Vendor::Dir(join(d, &p)), config))),
-        None => Err(format!("{}/.cargo: [source.{}] is neither a `directory` nor a `git` source: makepad run reads vendored crates and git repositories only", d, with)),
+        None => Err(format!("{}/.cargo: [source.{}] is neither a `directory` nor a `git` source: Relax reads vendored crates and git repositories only", d, with)),
     }
 }
 
@@ -1807,7 +1807,7 @@ pub fn parse_flags(flags: &[String]) -> Result<Options, String> {
                 } else if let Some(v) = f.strip_prefix("--test=") {
                     tests.get_or_insert_with(Vec::new).push(v.to_string());
                 } else {
-                    return Err(format!("unit graph: flag `{}` is not supported by makepad run's resolver", f));
+                    return Err(format!("unit graph: flag `{}` is not supported by Relax's resolver", f));
                 }
             }
         }
@@ -2642,7 +2642,7 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
             deps,
         });
     }
-    if std::env::var("MAKEPAD_RUN_TRACE").is_ok_and(|v| v.split(',').any(|x| x == "units")) {
+    if std::env::var("RELAX_TRACE").is_ok_and(|v| v.split(',').any(|x| x == "units")) {
         for (i, u) in out.iter().enumerate() {
             let (k, _) = &units[i];
             let m = &r.manifests[k.0];
@@ -3079,7 +3079,7 @@ fn file_macro_paths_as_cargo_names_them() {
     std::fs::write(ws.join("Cargo.toml"), "workspace.members = [\"m\"]\nworkspace.resolver = \"2\"\n\n[workspace.dependencies]\n").unwrap();
     std::fs::write(ws.join("m/Cargo.toml"), "[package]\nname = \"m\"\nversion = \"0.1.0\"\n").unwrap();
     let ws = normalize(&ws.display().to_string());
-    let registry = format!("{}/target/makepad-run/registry", ws);
+    let registry = format!("{}/target/relax/registry", ws);
     let r = FileRoot { root: find_root(&format!("{}/m", ws)).unwrap(), not_path: vec![registry.clone()] };
     assert_eq!(r.relative(&format!("{}/m/src/main.rs", ws)).as_deref(), Some("m/src/main.rs"));
     assert_eq!(r.relative(&format!("{}/src/foo-1.0.0-0123456789abcdef/src/lib.rs", registry)), None);

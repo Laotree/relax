@@ -120,11 +120,11 @@ pub fn report_checked(prog: &Program, src: usize, epoch: u64, def: DefId, args: 
     admitted
 }
 
-/// MAKEPAD_RUN_FRONT_TRACE=1: background checks that hold the front end's read lock over 200 ms
+/// RELAX_FRONT_TRACE=1: background checks that hold the front end's read lock over 200 ms
 /// (a live patch's commit waits for them), with the phase they ended in.
 fn front_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_FRONT_TRACE").is_some())
+    *ON.get_or_init(|| std::env::var_os("RELAX_FRONT_TRACE").is_some())
 }
 
 /// A live patch moved the program from collect epoch `from` to `to` without changing what
@@ -403,7 +403,7 @@ const QUIET_NS: u64 = 500_000_000;
 /// Definitions discovery looks at per item (it yields the front read lock between items).
 const DISCOVERY_BATCH: usize = 4096;
 
-/// Background mode: MAKEPAD_RUN_GANDALF=0 turns it off (default on when the checker is on).
+/// Background mode: RELAX_GANDALF=0 turns it off (default on when the checker is on).
 pub fn gandalf_enabled(options: &crate::options::Options) -> bool {
     !DISABLED.load(Ordering::Relaxed) && (super::enabled(options) && options.gandalf)
 }
@@ -529,7 +529,7 @@ pub fn print_summary(options: &crate::options::Options) {
         s.push_str(&format!(", {} dropped (queued before the program was collected again, or by a retired unit)", stale));
     }
     if panics > 0 {
-        s.push_str(&format!(", {} NOT CHECKED: the checker failed on them (makepad run bug, please report)", panics));
+        s.push_str(&format!(", {} NOT CHECKED: the checker failed on them (Relax bug, please report)", panics));
     }
     eprintln!("{}", s);
     for n in PANIC_NOTES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -666,7 +666,7 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
                     crate::preempt::set_urgent(guard.as_ref().and_then(|q| q.order.first()).is_some_and(|a| a.0 == RANK_EDIT));
                     break item;
                 }
-                if verbose && std::env::var_os("MAKEPAD_RUN_GANDALF_STATS").is_some() && CHECKED.load(Ordering::Relaxed) > 0 && !IDLE_REPORTED.swap(true, Ordering::Relaxed) {
+                if verbose && std::env::var_os("RELAX_GANDALF_STATS").is_some() && CHECKED.load(Ordering::Relaxed) > 0 && !IDLE_REPORTED.swap(true, Ordering::Relaxed) {
                     eprintln!("gandalf: idle at t={:.0} ms: {} fns checked, {} violations, cpu {:.1} ms ({:.1} us/fn), {} clean from the cache",
                         crate::clock::wall_ns() as f64 / 1e6, CHECKED.load(Ordering::Relaxed), VIOLATIONS.load(Ordering::Relaxed),
                         CHECK_NS.load(Ordering::Relaxed) as f64 / 1e6, CHECK_NS.load(Ordering::Relaxed) as f64 / 1e3 / CHECKED.load(Ordering::Relaxed).max(1) as f64, CACHED_CLEAN.load(Ordering::Relaxed));
@@ -783,7 +783,7 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
                 if !body.errors.is_empty() { phase.set("typeck (errors)"); return None; }
                 phase.set("borrowck");
                 static COUNTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                if *COUNTS.get_or_init(|| std::env::var_os("MAKEPAD_RUN_BODY_COUNTS").is_some()) { eprintln!("body-count borrowck"); }
+                if *COUNTS.get_or_init(|| std::env::var_os("RELAX_BODY_COUNTS").is_some()) { eprintln!("body-count borrowck"); }
                 Some(super::check_body(cx, prog, tcx, &body))
             }));
             if result.as_ref().is_err_and(|p| crate::preempt::is_preempted(&**p)) {
@@ -865,10 +865,10 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
     }
 }
 
-/// MAKEPAD_RUN_SPECV_TRACE: the ranks asked for (set_ranks) and the hot checks run.
+/// RELAX_SPECV_TRACE: the ranks asked for (set_ranks) and the hot checks run.
 fn specv_trace() -> bool {
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *TRACE.get_or_init(|| std::env::var_os("MAKEPAD_RUN_SPECV_TRACE").is_some())
+    *TRACE.get_or_init(|| std::env::var_os("RELAX_SPECV_TRACE").is_some())
 }
 
 /// `makepad run` never executes a body its checker rejects (check-before-run): the verdict of

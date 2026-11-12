@@ -217,7 +217,7 @@ fn the_gain_check_after_an_earlier_unrolled_loop_in_the_same_pass() {
 /// b6: acc = acc + 1; stop2 = acc == 5 -> b4 (latch 2) : b1
 /// b4: ret acc + 1000;  b5: ret acc
 /// Unrolled (the counter indexes the array: the copies read it at constant offsets), and the result
-/// agrees; with MAKEPAD_RUN_OPT=-unrollearly it stays rolled.
+/// agrees; with RELAX_OPT=-unrollearly it stays rolled.
 fn slab_loop() -> Func {
     let mut f = Func::new("slab".into(), 0);
     let seed = f.vreg(Cls::I);

@@ -49,11 +49,11 @@ const STD_PRELUDE_MACROS: &[&str] = &[
     "eprint", "eprintln", "format", "print", "println", "thread_local", "vec", "panic",
 ];
 
-/// MAKEPAD_RUN_VERIFY_TOKENS: every macro_rules expansion's transcribed tokens are compared with the
+/// RELAX_VERIFY_TOKENS: every macro_rules expansion's transcribed tokens are compared with the
 /// lexed text.
 pub(crate) fn verify_tokens() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("MAKEPAD_RUN_VERIFY_TOKENS").is_some())
+    *V.get_or_init(|| std::env::var_os("RELAX_VERIFY_TOKENS").is_some())
 }
 
 /// Text with the tokens over it, built piece by piece (no lexing).
@@ -1674,7 +1674,7 @@ impl<'a> Parser<'a> {
 
     fn rules_macro(&self, path: &Path) -> Option<crate::macros::MacroRef> {
         let r = self.rules_macro_inner(path);
-        // MAKEPAD_RUN_TRACE=macnone:<name>: every unresolved call of a macro whose name contains <name>
+        // RELAX_TRACE=macnone:<name>: every unresolved call of a macro whose name contains <name>
         if r.is_none() {
             if let Some(want) = crate::preload::relax_trace().and_then(|t| t.split(',').find_map(|x| x.strip_prefix("macnone:"))) {
                 if let Some(seg) = self.ast.segs(path.segs).last() {
@@ -1823,7 +1823,7 @@ impl<'a> Parser<'a> {
                 .and_then(|entry| crate::builtins::hosted_macro_def(&entry));
             renamed.or_else(|| crate::builtins::macro_def_for(scope_krate, &name))
         };
-        // MAKEPAD_RUN_TRACE=macmiss: a qualified macro path that resolves to nothing (the call stays
+        // RELAX_TRACE=macmiss: a qualified macro path that resolves to nothing (the call stays
         // unexpanded and its body's check reports it as not supported)
         if r.is_none() && bdef.is_none() && qual.is_some() && crate::preload::relax_trace().is_some_and(|t| t.split(',').any(|x| x == "macmiss")) {
             eprintln!("macmiss {}! in crate {} module {:?} path {:?} lazy_part {} externs {:?}", name, self.krate, module, mpath, self.lazy_part,
@@ -1840,7 +1840,7 @@ impl<'a> Parser<'a> {
                 // name). A macro the crate root re-exports is not in scope in a module that does
                 // not import it: rustc says "cannot find macro" there.
                 if !m.import_binds(&self.krate, &module, &mpath, &name) {
-                    // MAKEPAD_RUN_TRACE=macscope: each call the crate's import of the name does not reach
+                    // RELAX_TRACE=macscope: each call the crate's import of the name does not reach
                     if (seg.name.lo as usize) < self.src.len() && crate::preload::relax_trace().is_some_and(|t| t.split(',').any(|x| x == "macscope")) {
                         let line = self.src[..seg.name.lo as usize].iter().filter(|&&b| b == b'\n').count() + 1;
                         eprintln!("macscope {}:{}: {}! in module {} of crate {}: its import is not in scope here", self.bctx.as_ref().map_or("?", |c| c.path.as_str()), line, name, module, self.krate);
@@ -2056,7 +2056,7 @@ impl<'a> Parser<'a> {
                     crate::builtins::Expansion::from_buf(crate::tokbuf::TokBuf::compile_error(self.edition, &format!("`{}!`: {}", def.name, m), !semi.is_empty()))
                 }
             };
-            // MAKEPAD_RUN_TRACE=expand:<macro name> prints expansions (debugger-free macro debugging)
+            // RELAX_TRACE=expand:<macro name> prints expansions (debugger-free macro debugging)
             if trace {
                 eprintln!("expand {}! => {}", def.name, x.text);
             }
@@ -2080,7 +2080,7 @@ impl<'a> Parser<'a> {
             x
         };
         if trace {
-            // MAKEPAD_RUN_TRACE=expand:<macro name>: the expansion, where it was called, at what depth and
+            // RELAX_TRACE=expand:<macro name>: the expansion, where it was called, at what depth and
             // on which thread; `bt` among the trace words adds a backtrace (which pass expands it)
             let thr = std::thread::current();
             eprintln!("expand {}! @{} base={} depth={} thr={} => {}", def.name, call_lo, self.src.len() + self.ext.len(), self.exp_depth, thr.name().unwrap_or("?"), text);
@@ -6890,22 +6890,22 @@ pub(crate) fn parse_owned_input(sess: &std::sync::Arc<crate::Session>, mut src: 
     Ok((pf, used))
 }
 
-/// MAKEPAD_RUN_LAZY_STATS=1 (measurement): per fn body parsed, whether a lazy parse could skip it;
+/// RELAX_LAZY_STATS=1 (measurement): per fn body parsed, whether a lazy parse could skip it;
 /// [n, arena bytes, nested bytes] for skippable bodies, then for the others
 pub static LAZY_STATS: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
-/// MAKEPAD_RUN_LAZY_STATS: the macros that kept bodies eager (`other macro`), by name
+/// RELAX_LAZY_STATS: the macros that kept bodies eager (`other macro`), by name
 pub static LAZY_MACROS: relax_session::sync::Mutex<std::collections::BTreeMap<String, u64>> = relax_session::sync::Mutex::new(std::collections::BTreeMap::new());
-/// MAKEPAD_RUN_LAZY_STATS: what made a file's skipped bodies parse (type-check origin, thread)
+/// RELAX_LAZY_STATS: what made a file's skipped bodies parse (type-check origin, thread)
 pub static LAZY_WHY_PARSED: relax_session::sync::Mutex<std::collections::BTreeMap<String, u64>> = relax_session::sync::Mutex::new(std::collections::BTreeMap::new());
 /// why a body is parsed at load (Parser::body_outline)
 pub const LAZY_WHY: [&str; 8] = ["skippable", "macro output", "item inside", "macro_rules call", "array length", "fragment", "other macro", "no macro scope"];
 
 fn lazy_stats_on() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var_os("MAKEPAD_RUN_LAZY_STATS").is_some())
+    *E.get_or_init(|| std::env::var_os("RELAX_LAZY_STATS").is_some())
 }
 
-/// MAKEPAD_RUN_LAZY_BODIES (default on for `makepad run`; 0: off): fn bodies a later parse can do
+/// RELAX_LAZY_BODIES (default on for `makepad run`; 0: off): fn bodies a later parse can do
 /// alone are skipped at load and parsed on the first need (ParsedFile::part). Set by the run
 /// driver before loading.
 pub static LAZY_AUTO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -6995,7 +6995,7 @@ pub fn parse_part(pf: &ParsedFile, cfg: &crate::cfg::CfgSet) -> (FilePart, Ast) 
     if !p.ast.items.is_empty() {
         // body_outline let an item through: every body of the file fails loudly instead of
         // compiling against an item list that misses it
-        let msg = format!("{}: a lazily parsed fn body defined an item (makepad run bug; MAKEPAD_RUN_LAZY_BODIES=0 works around it)", ctx.path);
+        let msg = format!("{}: a lazily parsed fn body defined an item (Relax bug; RELAX_LAZY_BODIES=0 works around it)", ctx.path);
         for b in bodies.iter_mut() {
             b.1 = Err(msg.clone());
         }
@@ -7029,7 +7029,7 @@ pub fn parse_part(pf: &ParsedFile, cfg: &crate::cfg::CfgSet) -> (FilePart, Ast) 
         next: Default::default(), ext: ext.into(), toks: toks.into(), exp_map, tok_origin, token_origins, bodies: PartBodies::Parsed(bodies), image: None }, ast)
 }
 
-/// MAKEPAD_RUN_LAZY_MACRO_OUTPUT=0: fn bodies in macro output (derives) stay eager.
+/// RELAX_LAZY_MACRO_OUTPUT=0: fn bodies in macro output (derives) stay eager.
 
 
 #[cfg(test)]

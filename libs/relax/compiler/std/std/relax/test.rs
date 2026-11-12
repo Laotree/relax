@@ -205,7 +205,7 @@ fn run_one(d: &Desc, fault: usize, reach: usize, verbose: bool) -> Outcome {
         let body_end = body_end.get().unwrap_or(caught);
         let body_ms = body_end.duration_since(body_begin).as_secs_f64() * 1000.0;
         let catch_ms = body_begin.duration_since(began).as_secs_f64() * 1000.0 + caught.duration_since(body_end).as_secs_f64() * 1000.0;
-        eprintln!("makepad test timing: test={:?} body_unwind_ms={:.3} catch_ms={:.3} result_ms={:.3}",
+        eprintln!("relax test timing: test={:?} body_unwind_ms={:.3} catch_ms={:.3} result_ms={:.3}",
             d.name, body_ms, catch_ms, caught.elapsed().as_secs_f64() * 1000.0);
     }
     if let Some(record) = record { record(d.index, if faulted { 2 } else { 1 }); }
@@ -221,7 +221,7 @@ pub fn main(t: &mut Tests) {
     };
     let (mut descs, mut filtered_out) = prepare(t, &opts);
     let mut revision = t.revision;
-    if t.verbose != 0 { eprintln!("makepad test timing: harness_setup_ms={:.3} reused=false", setup.elapsed().as_secs_f64() * 1000.0); }
+    if t.verbose != 0 { eprintln!("relax test timing: harness_setup_ms={:.3} reused=false", setup.elapsed().as_secs_f64() * 1000.0); }
     if opts.list {
         for d in descs.iter() { println!("{}: test", d.name); }
         if !opts.quiet { println!("\n{} tests, 0 benchmarks", descs.len()); }
@@ -234,7 +234,7 @@ pub fn main(t: &mut Tests) {
             let setup = crate::time::Instant::now();
             (descs, filtered_out) = prepare(t, &opts);
             revision = t.revision;
-            if t.verbose != 0 { eprintln!("makepad test timing: harness_setup_ms={:.3} reused=false", setup.elapsed().as_secs_f64() * 1000.0); }
+            if t.verbose != 0 { eprintln!("relax test timing: harness_setup_ms={:.3} reused=false", setup.elapsed().as_secs_f64() * 1000.0); }
         }
         t.code = run(t, &opts, descs.clone(), filtered_out);
         if t.next == 0 { break; }
@@ -284,7 +284,7 @@ fn run(t: &mut Tests, opts: &Opts, descs: Arc<Vec<Desc>>, filtered_out: usize) -
     let selected: Vec<usize> = (0..descs.len()).filter(|&i| unsafe { (*t.tests.add(descs[i].index)).selected != 0 }).collect();
     if t.verbose != 0 {
         let names: Vec<&str> = selected.iter().map(|&i| descs[i].name.as_str()).collect();
-        eprintln!("makepad test selection: selected={:?}", names);
+        eprintln!("relax test selection: selected={:?}", names);
     }
     let started = crate::time::Instant::now();
     println!();
@@ -357,7 +357,7 @@ fn run(t: &mut Tests, opts: &Opts, descs: Arc<Vec<Desc>>, filtered_out: usize) -
         let h = crate::thread::Builder::new().name(name).spawn(move || {
             let run = || {
                 if let Some(launched) = launched {
-                    eprintln!("makepad test timing: test={:?} thread_start_ms={:.3}", d[i].name, launched.elapsed().as_secs_f64() * 1000.0);
+                    eprintln!("relax test timing: test={:?} thread_start_ms={:.3}", d[i].name, launched.elapsed().as_secs_f64() * 1000.0);
                 }
                 run_one(&d[i], fault, reach, verbose)
             };
@@ -406,7 +406,7 @@ fn run(t: &mut Tests, opts: &Opts, descs: Arc<Vec<Desc>>, filtered_out: usize) -
     let join_count = threads.len();
     for thread in threads { let _ = thread.join(); }
     if let Some(joined) = joined {
-        eprintln!("makepad test timing: tests={} spawn_ms={:.3} report_ms={:.3} joins={} join_ms={:.3} capture=false new_domains=0 isolates=0",
+        eprintln!("relax test timing: tests={} spawn_ms={:.3} report_ms={:.3} joins={} join_ms={:.3} capture=false new_domains=0 isolates=0",
             selected.len() - ignored, spawn_ms, report_ms, join_count, joined.elapsed().as_secs_f64() * 1000.0);
     }
     // (terse: the line of characters ends with the next section's leading newline)

@@ -21,10 +21,10 @@
 //!   thunk) to the callee's interpreter code once (inline cache) and runs it on the same
 //!   interpreter stack without leaving the interpreter.
 //!
-//! Selection: `MAKEPAD_RUN_INTERP=all` or a comma list of name substrings (`MAKEPAD_RUN_INTERP_SKIP` for
-//! exclusions); `MAKEPAD_RUN_NO_CODEGEN=1` interprets everything. With a selection, a function using
+//! Selection: `RELAX_INTERP=all` or a comma list of name substrings (`RELAX_INTERP_SKIP` for
+//! exclusions); `RELAX_NO_CODEGEN=1` interprets everything. With a selection, a function using
 //! an operation the interpreter does not cover stays machine code (counted, with the first
-//! functions of each reason: `MAKEPAD_RUN_INTERP_STATS=1`); in no-codegen mode it is an error.
+//! functions of each reason: `RELAX_INTERP_STATS=1`); in no-codegen mode it is an error.
 //! Unwinding: a panic below an interpreted frame lands in `relax_interp_call` (the runtime's
 //! unwinder treats its return address as a frame with a landing, `unwind_boundary`); the call
 //! returns 1, the interpreter continues at the call's `Invoke` unwind block (the cleanup pad) or
@@ -61,13 +61,13 @@ pub struct Cx {
     /// set when the function that just ended did so by unwinding (a panic passed through it after
     /// its cleanups ran); whoever ran it clears it
     pub unwinding: u64,
-    /// dispatch counts (builds with MAKEPAD_RUN_INTERP_COUNT set at compile time): handlers run,
+    /// dispatch counts (builds with RELAX_INTERP_COUNT set at compile time): handlers run,
     /// interpreted -> interpreted calls, interpreted -> native calls, native -> interpreted entries
     pub n: [u64; 4],
 }
 
 /// Count dispatches and calls (a build-time switch: the counting costs time in every handler).
-const COUNT: bool = option_env!("MAKEPAD_RUN_INTERP_COUNT").is_some();
+const COUNT: bool = option_env!("RELAX_INTERP_COUNT").is_some();
 /// counting builds: dispatches per handler, and the RIR operation each handler was emitted for
 static HIST: relax_session::sync::Mutex<Vec<(u64, u64)>> = relax_session::sync::Mutex::new(Vec::new());
 static HNAMES: relax_session::sync::Mutex<Vec<(u64, String)>> = relax_session::sync::Mutex::new(Vec::new());
@@ -343,12 +343,12 @@ pub fn set_hot(f: extern "C" fn(u64) -> u64) {
 pub fn count_entry(rec: u64, slot: u32, code: u64, weight: u32) -> Result<u64, String> {
     let p = pool_base();
     if !(code >= p && code < p + 8 * POOL as u64) {
-        return Err(format!("makepad run interp: count stub for slot {} at {:#x}, which is no interpreted function", slot, code));
+        return Err(format!("relax run interp: count stub for slot {} at {:#x}, which is no interpreted function", slot, code));
     }
     let f = FUNCS[((code - p) / 8) as usize].load(Ordering::Acquire);
     let k = NEXT.fetch_add(1, Ordering::Relaxed);
     if k >= POOL {
-        return Err(format!("makepad run interp: more than {} interpreted entries (the entry thunk pool)", POOL));
+        return Err(format!("relax run interp: more than {} interpreted entries (the entry thunk pool)", POOL));
     }
     let c = Box::new(CountInfo { rec: rec as *const AtomicU64, slot, weight: weight.clamp(1, 4095) as u64 });
     COUNTERS[k].store(Box::into_raw(c), Ordering::Release);
@@ -402,7 +402,7 @@ pub fn unwind_boundary(ret: u64) -> Option<(u64, u64)> {
     None
 }
 static SLOTS: AtomicUsize = AtomicUsize::new(0);
-/// MAKEPAD_RUN_INTERP_TRACE: every entry and native call to stderr (debugging the prototype)
+/// RELAX_INTERP_TRACE: every entry and native call to stderr (debugging the prototype)
 static TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // ---------------------------------------------------------------- statistics
@@ -420,7 +420,7 @@ pub fn note_native(ns: u64, bytes: u64, insts: u64) {
     NATIVE[2].fetch_add(bytes, Ordering::Relaxed);
     NATIVE[3].fetch_add(insts, Ordering::Relaxed);
     if NATIVE[0].fetch_add(1, Ordering::Relaxed) % 2000 == 1999 {
-        eprintln!("makepad-run native: {} fns compiled to machine code ({} RIR insts -> {} KB, backend {:.1} ms)", NATIVE[0].load(Ordering::Relaxed), NATIVE[3].load(Ordering::Relaxed), NATIVE[2].load(Ordering::Relaxed) / 1024, NATIVE[1].load(Ordering::Relaxed) as f64 / 1e6);
+        eprintln!("relax native: {} fns compiled to machine code ({} RIR insts -> {} KB, backend {:.1} ms)", NATIVE[0].load(Ordering::Relaxed), NATIVE[3].load(Ordering::Relaxed), NATIVE[2].load(Ordering::Relaxed) / 1024, NATIVE[1].load(Ordering::Relaxed) as f64 / 1e6);
     }
 }
 static REFUSALS: relax_session::sync::Mutex<Vec<(String, u64)>> = relax_session::sync::Mutex::new(Vec::new());
@@ -440,7 +440,7 @@ fn refuse(why: &str, name: &str) {
     };
     // the first functions of each reason, by name (the summary only counts)
     if n <= 4 && interp_stats() {
-        eprintln!("makepad-run interp refused: {}: `{}`", why, name);
+        eprintln!("relax interp refused: {}: `{}`", why, name);
     }
 }
 
@@ -476,7 +476,7 @@ extern "C" fn print_stats() {
         eprintln!("relax-interp pairs: {}", pairs.iter().take(30).map(|(n, c)| format!("[{}] {:.1}%", n, 100.0 * *c as f64 / total as f64)).collect::<Vec<_>>().join(", "));
     }
     eprintln!(
-        "makepad-run interp: {} fns interpreted ({} RIR insts -> {} KB threaded code, lowered in {:.1} ms), {} stayed native{}",
+        "relax interp: {} fns interpreted ({} RIR insts -> {} KB threaded code, lowered in {:.1} ms), {} stayed native{}",
         N_INTERP.load(Ordering::Relaxed),
         N_INSTS.load(Ordering::Relaxed),
         N_WORDS.load(Ordering::Relaxed) * 8 / 1024,
@@ -492,7 +492,7 @@ struct Sel {
     skip: Vec<String>,
 }
 
-/// `MAKEPAD_RUN_NO_CODEGEN=1`: the process makes no machine code at all (the platforms without
+/// `RELAX_NO_CODEGEN=1`: the process makes no machine code at all (the platforms without
 /// writable+executable memory): every function runs in the interpreter, and a function the
 /// interpreter cannot run is an error, not a JIT fallback.
 pub fn no_codegen() -> bool {
@@ -502,35 +502,35 @@ pub fn no_codegen() -> bool {
 
 fn interp_stats() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_INTERP_STATS").is_some())
+    *ON.get_or_init(|| std::env::var_os("RELAX_INTERP_STATS").is_some())
 }
 
 fn no_coalesce() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_INTERP_NOCOALESCE").is_some())
+    *ON.get_or_init(|| std::env::var_os("RELAX_INTERP_NOCOALESCE").is_some())
 }
 
 fn fold_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_INTERP_NOFOLD").is_none())
+    *ON.get_or_init(|| std::env::var_os("RELAX_INTERP_NOFOLD").is_none())
 }
 
 fn preload_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_INTERP_NOPRELOAD").is_none())
+    *ON.get_or_init(|| std::env::var_os("RELAX_INTERP_NOPRELOAD").is_none())
 }
 
 fn frame_fold_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_INTERP_NOFRAMEFOLD").is_none())
+    *ON.get_or_init(|| std::env::var_os("RELAX_INTERP_NOFRAMEFOLD").is_none())
 }
 
 fn selection() -> Option<&'static Sel> {
     static S: std::sync::OnceLock<Option<Sel>> = std::sync::OnceLock::new();
     S.get_or_init(|| {
-        let v = if no_codegen() { "all".to_string() } else { std::env::var("MAKEPAD_RUN_INTERP").ok().filter(|v| !v.is_empty() && v != "0")? };
+        let v = if no_codegen() { "all".to_string() } else { std::env::var("RELAX_INTERP").ok().filter(|v| !v.is_empty() && v != "0")? };
         let split = |s: &str| s.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect::<Vec<_>>();
-        let skip = std::env::var("MAKEPAD_RUN_INTERP_SKIP").map(|s| split(&s)).unwrap_or_default();
+        let skip = std::env::var("RELAX_INTERP_SKIP").map(|s| split(&s)).unwrap_or_default();
         if interp_stats() {
             extern "C" {
                 fn atexit(f: extern "C" fn()) -> i32;
@@ -539,8 +539,8 @@ fn selection() -> Option<&'static Sel> {
                 atexit(print_stats);
             }
         }
-        TRACE.store(std::env::var_os("MAKEPAD_RUN_INTERP_TRACE").is_some(), Ordering::Relaxed);
-        if std::env::var_os("MAKEPAD_RUN_INTERP_TRACE").is_some() || std::env::var_os("MAKEPAD_RUN_INTERP_POOL").is_some() {
+        TRACE.store(std::env::var_os("RELAX_INTERP_TRACE").is_some(), Ordering::Relaxed);
+        if std::env::var_os("RELAX_INTERP_TRACE").is_some() || std::env::var_os("RELAX_INTERP_POOL").is_some() {
             // (to symbolize native pcs: nm's address of relax_interp_pool + the slide)
             eprintln!("interp: relax_interp_pool at {:#x}", pool_base());
         }
@@ -571,7 +571,7 @@ pub fn maybe_compile(options: &relax_session::Options, f: &Func, slots: SlotsPtr
         Ok(x) => x,
         Err(why) => {
             if no_codegen() {
-                panic!("makepad run: no-codegen mode: `{}` cannot run in the interpreter ({})", f.name, why);
+                panic!("relax run: no-codegen mode: `{}` cannot run in the interpreter ({})", f.name, why);
             }
             refuse(why, &f.name);
             return None;
@@ -645,7 +645,7 @@ unsafe fn cx_ptr() -> *mut Cx {
     let cx = CX.with(|c| c.get());
     if (*cx).top.is_null() {
         let p = interp_stack_map(STACK_WORDS * 8);
-        assert!(!p.is_null() && p as isize != -1, "makepad-run interp: no memory for the interpreter stack");
+        assert!(!p.is_null() && p as isize != -1, "relax interp: no memory for the interpreter stack");
         (*cx).top = p;
         (*cx).limit = p.add(STACK_WORDS);
     }
@@ -676,7 +676,7 @@ unsafe fn interp_stack_map(len: usize) -> *mut u64 {
 #[inline(never)]
 #[cold]
 fn overflow() -> ! {
-    eprintln!("makepad-run interp: interpreter stack overflow");
+    eprintln!("relax interp: interpreter stack overflow");
     std::process::abort()
 }
 
@@ -1647,7 +1647,7 @@ unsafe fn tls_block_first(cx: *mut Cx) {
         relax_interp_tls(glue)
     } else {
         let f = TLS_FN.load(Ordering::Acquire);
-        assert!(f != 0, "makepad run interp: no thread-local block source");
+        assert!(f != 0, "relax run interp: no thread-local block source");
         let f: extern "C" fn() -> u64 = std::mem::transmute(f);
         f()
     };
@@ -1696,7 +1696,7 @@ pub fn redirect_target(code: &[u8]) -> Option<u64> {
 pub fn const_call_entry(target: u64, arg0: u64) -> u64 {
     let code = vec![h_const_call as *const () as usize as u64, target, arg0, h_ret0 as *const () as usize as u64].into_boxed_slice();
     let k = NEXT.fetch_add(1, Ordering::Relaxed);
-    assert!(k < POOL, "makepad run interp: entry thunk pool exhausted");
+    assert!(k < POOL, "relax run interp: entry thunk pool exhausted");
     let f = IFunc { code, frame_words: 8, params: Vec::new(), cplan: None, name: format!("const_call {:#x}", target), align: 64, entry_mark: AtomicU64::new(0) };
     FUNCS[k].store(Box::into_raw(Box::new(f)), Ordering::Release);
     pool_base() + 8 * k as u64
@@ -2224,7 +2224,7 @@ unsafe extern "C" fn h_ret(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
     }
 }
 unsafe extern "C" fn h_trap(_pc: *const u64, _fp: *mut u64, _cx: *mut Cx) {
-    eprintln!("makepad-run interp: reached unreachable code");
+    eprintln!("relax interp: reached unreachable code");
     std::process::abort();
 }
 
@@ -2809,7 +2809,7 @@ impl<'a> Lw<'a> {
 ///   block, and d neither read nor written between the two: op writes d's cell directly;
 /// - copy propagation: `c = Mov s` with c defined only there and every use of c after it in the
 ///   same block, s not written from the move to c's last use: c reads s's cell.
-/// Scalar classes only. Off with MAKEPAD_RUN_INTERP_NOCOALESCE.
+/// Scalar classes only. Off with RELAX_INTERP_NOCOALESCE.
 fn coalesce(f: &Func) -> (Vec<u32>, std::collections::HashSet<(u32, u32)>) {
     let n = f.vregs.len();
     let mut alias: Vec<u32> = (0..n as u32).collect();

@@ -28,7 +28,7 @@ exclude = [
 [workspace.dependencies]
 makepad-cpu-budget = { path = "platform/cpu_budget", version = "1.0.0" }
 relax-lex = { path = "libs/relax/lex", version = "0.1.0" }
-makepad-relax = { path = "libs/relax/attr", version = "1.0.0" }
+relax-attr = { path = "libs/relax/attr", version = "1.0.0" }
 relax-base = { path = "libs/relax/base", version = "0.1.0" }
 relax-backend = { path = "libs/relax/backend", version = "0.1.0" }
 relax-codegen = { path = "libs/relax/codegen", version = "0.1.0" }
@@ -43,8 +43,8 @@ makepad-remote = { path = "libs/remote", version = "0.1.0" }
 makepad-strict-json = { path = "libs/strict_json", version = "0.1.0" }
 makepad-gpu-trace = { path = "libs/gpu_trace", version = "1.0.0" }
 makepad-prof-stream = { path = "libs/prof_stream", version = "1.0.0" }
-makepad-relax-api = { path = "libs/relax_api", version = "1.0.0" }
-makepad-relax-api-macro-impl = { path = "libs/relax_api/macro_impl", version = "1.0.0" }
+relax-api = { path = "libs/relax_api", version = "1.0.0" }
+relax-api-macro-impl = { path = "libs/relax_api/macro_impl", version = "1.0.0" }
 makepad-live-id-macros-impl = { path = "libs/live_id/id_macros_impl", version = "1.0.0" }
 makepad-derive-widget-impl = { path = "widgets/derive_widget_impl", version = "1.0.0" }
 makepad-micro-serde-derive-impl = { path = "libs/micro_serde/derive_impl", version = "1.0.0" }

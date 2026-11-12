@@ -64,8 +64,8 @@ fn main() {}
 fn hot_fns_reach_o3() {
     isolated_test!(hot_fns_reach_o3);
     crate::borrowck::lazy::disable_gandalf();
-    if std::env::var_os("MAKEPAD_RUN_STD").is_none() {
-        std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    if std::env::var_os("RELAX_STD").is_none() {
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     }
     let dir = std::env::temp_dir().join(format!("relax-tier-stuck-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -222,8 +222,8 @@ fn main() {
 fn an_opaque_types_own_methods_are_made_off_the_owner() {
     isolated_test!(an_opaque_types_own_methods_are_made_off_the_owner);
     crate::borrowck::lazy::disable_gandalf();
-    if std::env::var_os("MAKEPAD_RUN_STD").is_none() {
-        std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    if std::env::var_os("RELAX_STD").is_none() {
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     }
     let dir = std::env::temp_dir().join(format!("relax-opaque-front-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -269,8 +269,8 @@ fn an_opaque_types_own_methods_are_made_off_the_owner() {
 /// cold run's quicksort for good, 2.3x slower than with the disk cache off.
 #[test]
 fn linked_incomplete_o3_is_built_again() {
-    const PHASE: &str = "MAKEPAD_RUN_LINKED_INCOMPLETE_O3_TEST";
-    const DIR: &str = "MAKEPAD_RUN_LINKED_INCOMPLETE_O3_TEST_DIR";
+    const PHASE: &str = "RELAX_LINKED_INCOMPLETE_O3_TEST";
+    const DIR: &str = "RELAX_LINKED_INCOMPLETE_O3_TEST_DIR";
     let Ok(phase) = std::env::var(PHASE) else {
         let dir = std::env::temp_dir().join(format!("relax-linked-incomplete-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -279,17 +279,17 @@ fn linked_incomplete_o3_is_built_again() {
         for phase in ["cold", "warm"] {
             let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "jit::tier_stuck_tests::linked_incomplete_o3_is_built_again", "--nocapture", "--test-threads=1"])
-                .env(PHASE, phase).env(DIR, &dir).env("MAKEPAD_RUN_SPEC", "0")
+                .env(PHASE, phase).env(DIR, &dir).env("RELAX_SPEC", "0")
                 // (nothing turns hot by its counts: the O3 builds are the test's own, in order)
-                .env("MAKEPAD_RUN_O3_CALLS", "1000000000"));
+                .env("RELAX_O3_CALLS", "1000000000"));
             said += &format!("{phase}: {}\n{}\n", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
             assert!(output.status.success(), "{said}");
         }
         std::fs::remove_dir_all(dir).unwrap();
         return;
     };
-    if std::env::var_os("MAKEPAD_RUN_STD").is_none() {
-        std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    if std::env::var_os("RELAX_STD").is_none() {
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     }
     let dir = std::path::PathBuf::from(std::env::var_os(DIR).unwrap());
     if phase == "cold" {
@@ -302,7 +302,7 @@ fn linked_incomplete_o3_is_built_again() {
     } else {
         crate::borrowck::lazy::disable_gandalf();
     }
-    std::env::set_var("MAKEPAD_RUN_CACHE_DIR", dir.join("cache"));
+    std::env::set_var("RELAX_CACHE_DIR", dir.join("cache"));
     let (prog, core, krate) = crate::load_with_std(&std::sync::Arc::new(crate::Session::default()), dir.join("input.rs").to_str().unwrap(), "tier_stuck", false).unwrap();
     let sorted_d = prog.defs.iter().enumerate().find_map(|(i, d)| {
         let id = DefId(i as u32);
@@ -413,8 +413,8 @@ fn main() {
 fn a_thread_local_readers_front_is_made_after_the_settle_rebuild() {
     isolated_test!(a_thread_local_readers_front_is_made_after_the_settle_rebuild);
     crate::borrowck::lazy::disable_gandalf();
-    if std::env::var_os("MAKEPAD_RUN_STD").is_none() {
-        std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    if std::env::var_os("RELAX_STD").is_none() {
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     }
     let dir = std::env::temp_dir().join(format!("relax-tls-front-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -470,8 +470,8 @@ fn main() {
 fn a_bailed_take_gives_back_a_full_bodys_normal_lowering() {
     isolated_test!(a_bailed_take_gives_back_a_full_bodys_normal_lowering);
     crate::borrowck::lazy::disable_gandalf();
-    if std::env::var_os("MAKEPAD_RUN_STD").is_none() {
-        std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    if std::env::var_os("RELAX_STD").is_none() {
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     }
     let dir = std::env::temp_dir().join(format!("relax-take-back-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -529,8 +529,8 @@ fn main() {
 fn a_left_out_candidates_build_is_queued_again_after_the_drain() {
     isolated_test!(a_left_out_candidates_build_is_queued_again_after_the_drain);
     crate::borrowck::lazy::disable_gandalf();
-    if std::env::var_os("MAKEPAD_RUN_STD").is_none() {
-        std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    if std::env::var_os("RELAX_STD").is_none() {
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     }
     let dir = std::env::temp_dir().join(format!("relax-left-out-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -595,8 +595,8 @@ fn main() {
 fn a_twins_front_is_made_when_its_callee_has_no_slot_yet() {
     isolated_test!(a_twins_front_is_made_when_its_callee_has_no_slot_yet);
     crate::borrowck::lazy::disable_gandalf();
-    if std::env::var_os("MAKEPAD_RUN_STD").is_none() {
-        std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    if std::env::var_os("RELAX_STD").is_none() {
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     }
     let dir = std::env::temp_dir().join(format!("relax-twin-front-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -662,8 +662,8 @@ fn main() {
 fn a_closures_twin_gets_its_front_off_the_owner() {
     isolated_test!(a_closures_twin_gets_its_front_off_the_owner);
     crate::borrowck::lazy::disable_gandalf();
-    if std::env::var_os("MAKEPAD_RUN_STD").is_none() {
-        std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    if std::env::var_os("RELAX_STD").is_none() {
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     }
     let dir = std::env::temp_dir().join(format!("relax-closure-twin-front-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

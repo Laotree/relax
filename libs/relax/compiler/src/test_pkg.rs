@@ -33,7 +33,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
             i += 1;
             if takes_value {
                 let Some(v) = args.get(i) else {
-                    eprintln!("makepad test: {} needs a value", args[i - 1]);
+                    eprintln!("relax test: {} needs a value", args[i - 1]);
                     return 2;
                 };
                 feature_flags.push(v.clone());
@@ -53,7 +53,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         i += 1;
     }
     let Some(package) = args.get(i).cloned() else {
-        eprintln!("usage: makepad test <package> [--lib] [--bins] [--bin <name>] [--tests] [--test <name>] [cargo flags] [-- <test args>]");
+        eprintln!("usage: {tool} test <package> [--lib] [--bins] [--bin <name>] [--tests] [--test <name>] [cargo flags] [-- <test args>]", tool = crate::tool_name());
         return 2;
     };
     let mut lib = false;
@@ -78,7 +78,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
             "--bin" => match words.next() {
                 Some(b) => { bins.get_or_insert_with(Vec::new).push(b.clone()); selections += 1; }
                 None => {
-                    eprintln!("makepad test: --bin needs a target name");
+                    eprintln!("relax test: --bin needs a target name");
                     return 2;
                 }
             },
@@ -89,7 +89,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
             "--test" => match words.next() {
                 Some(t) => { tests.get_or_insert_with(Vec::new).push(t.clone()); selections += 1; }
                 None => {
-                    eprintln!("makepad test: --test needs a target name");
+                    eprintln!("relax test: --test needs a target name");
                     return 2;
                 }
             },
@@ -98,7 +98,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
             "--release" => {}
             "--features" | "-F" => {
                 let Some(v) = words.next() else {
-                    eprintln!("makepad test: {w} needs a value");
+                    eprintln!("relax test: {w} needs a value");
                     return 2;
                 };
                 feature_flags.extend([w.clone(), v.clone()]);
@@ -143,7 +143,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         &feature_flags, bins.as_deref().unwrap_or_default(), tests.as_deref().unwrap_or_default()) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("makepad test: {e}");
+            eprintln!("relax test: {e}");
             return 101;
         }
     };
@@ -155,7 +155,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
                 .chain(targets.iter().filter(|t| t.2).map(|t| ("--test", &t.0))).collect();
             if harness.len() != 1 {
                 let names = harness.iter().map(|(flag, name)| format!("{flag} {name}")).collect::<Vec<_>>().join(", ");
-                eprintln!("makepad test --live: package `{package}` has no lib and {} harness targets ({names}): select one", harness.len());
+                eprintln!("relax test --live: package `{package}` has no lib and {} harness targets ({names}): select one", harness.len());
                 return 2;
             }
             let (flag, name) = harness[0];
@@ -192,7 +192,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         match chosen(all, names) {
             Ok(r) => runs.extend(r.into_iter().map(Some)),
             Err(e) => {
-                eprintln!("makepad test: {e}");
+                eprintln!("relax test: {e}");
                 return 101;
             }
         }
@@ -213,7 +213,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("makepad test: the loader's own path: {e}");
+            eprintln!("relax test: the loader's own path: {e}");
             return 101;
         }
     };
@@ -255,7 +255,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         let c = match status {
             Ok(s) => s.code().unwrap_or(101),
             Err(e) => {
-                eprintln!("makepad test: starting {}: {e}", exe.display());
+                eprintln!("relax test: starting {}: {e}", exe.display());
                 101
             }
         };
@@ -287,7 +287,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         if let Some(lib_target) = has_lib.as_ref().filter(|l| l.doctest) {
             let n = count_doctests(&lib_target.path);
             if n > 0 {
-                eprintln!("makepad test: {n} doc test{} not run (makepad test runs no doc tests; `cargo test --doc` does)", if n == 1 { "" } else { "s" });
+                eprintln!("relax test: {n} doc test{} not run ({tool} test runs no doc tests; `cargo test --doc` does)", if n == 1 { "" } else { "s" }, tool = crate::tool_name());
             }
         }
     }
@@ -346,7 +346,7 @@ mod stop {
 }
 
 fn live_usage() -> i32 {
-    eprintln!("usage: makepad test --live <package> [--lib | --bin <name> | --test <name>] [-- <test args>] (exactly one harness target; default: the lib, else the package's only one)");
+    eprintln!("usage: {tool} test --live <package> [--lib | --bin <name> | --test <name>] [-- <test args>] (exactly one harness target; default: the lib, else the package's only one)", tool = crate::tool_name());
     2
 }
 

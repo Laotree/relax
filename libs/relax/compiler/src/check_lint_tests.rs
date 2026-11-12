@@ -21,7 +21,7 @@ fn warnings_in_child_with(name: &str, env: &[(&str, &str)]) -> Option<Vec<String
     let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture", "--test-threads=1", "--format=terse"])
         .env(CHILD, "1")
-        .env_remove("MAKEPAD_RUN_LINT_FLAGS")
+        .env_remove("RELAX_LINT_FLAGS")
         .envs(env.iter().copied()));
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}\n{stderr}");
@@ -68,10 +68,10 @@ fn check_code_uses(lib: &str, bins: &[&str], harness: bool, uses: Uses) -> i32 {
     check_code_as(lib, bins, harness, uses, false)
 }
 
-/// `check_code_uses`; `post_mono`: the check of a build (Options::post_mono, MAKEPAD_RUN_CHECK_BUILD).
+/// `check_code_uses`; `post_mono`: the check of a build (Options::post_mono, RELAX_CHECK_BUILD).
 fn check_code_as(lib: &str, bins: &[&str], harness: bool, uses: Uses, post_mono: bool) -> i32 {
     crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
-    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     // `makepad check`'s session (run.rs): constants go through the check-mode interpreter first
     let mut sess = crate::Session::default();
     sess.options.const_fuel = true;
@@ -127,7 +127,7 @@ fn check_code_as(lib: &str, bins: &[&str], harness: bool, uses: Uses, post_mono:
 
 /// A check whose load did not record its import uses reports no import unused: it cannot tell
 /// one (`Program::import_uses_recorded`). A test's run of its own binary, the variable
-/// `MAKEPAD_RUN_LINT_FLAGS=-D warnings` set by the test, had checked its crate again with no
+/// `RELAX_LINT_FLAGS=-D warnings` set by the test, had checked its crate again with no
 /// uses recorded: every import of relax-compiler read unused, each an error. The used and the
 /// unused import alike are left out here; the other lints stay.
 #[test]
@@ -345,7 +345,7 @@ fn a_const_reads_cfg_as_the_crate_sets_it() {
 
 /// `makepad check` is cargo check: a constant that fails only for the type arguments an instance
 /// gives it is a post-monomorphization error, reported when the program is built (rustc's
-/// collector), not by the check. The check of a build (MAKEPAD_RUN_CHECK_BUILD=1, the UI suite's
+/// collector), not by the check. The check of a build (RELAX_CHECK_BUILD=1, the UI suite's
 /// build-fail cases) reports it: E0080.
 #[test]
 fn a_post_monomorphization_error_is_the_builds_not_the_checks() {
@@ -366,7 +366,7 @@ fn a_post_monomorphization_error_is_the_builds_not_the_checks() {
         let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", NAME, "--nocapture", "--test-threads=1", "--format=terse"])
             .env(CHILD, "1")
-            .env_remove("MAKEPAD_RUN_LINT_FLAGS")
+            .env_remove("RELAX_LINT_FLAGS")
             .envs(env.iter().copied()));
         let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
         assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}\n{stderr}");

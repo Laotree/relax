@@ -4261,7 +4261,7 @@ mod spacing_tests {
         let session = std::sync::Arc::new(crate::Session::default());
         let mut p = Parser::new(&session, src.as_bytes(), toks.clone(), 2021);
         let (s, etoks, ..) = p.expand_rules(&def, call + 3, close(call + 2)).unwrap();
-        // the transcription's text lexes back to its tokens (MAKEPAD_RUN_VERIFY_TOKENS)
+        // the transcription's text lexes back to its tokens (RELAX_VERIFY_TOKENS)
         let mut lexed = Vec::new();
         crate::lexer::lex(s.as_bytes(), 2021, &mut lexed).unwrap_or_else(|e| panic!("{}", e.msg));
         lexed.retain(|t| t.kind != T::Eof);

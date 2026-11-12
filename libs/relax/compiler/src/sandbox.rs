@@ -314,7 +314,7 @@ pub unsafe fn twin(up: *mut Unit, base: u32) -> u32 {
         (k, s.sbt_base)
     });
     if k >= SBT_N {
-        panic!("makepad: sandbox thunk table full ({} functions)", SBT_N);
+        panic!("relax: sandbox thunk table full ({} functions)", SBT_N);
     }
     crate::os::mem::write_code(sbt + k as u64 * ts, &tgt::thunk(u.slots.table(t)));
     t
@@ -579,7 +579,7 @@ pub fn free_arena(a: &Arc<Arena>) {
     crate::stale::register(a.base - GUARD, a.base + WINDOW + GUARD, "unloaded module", a.name.clone(), a.module as u64, format!("Module::unload of module #{} (`{}`): its window is reserved and inaccessible for good", a.module, a.name));
     // the window's pages go, its addresses stay taken
     if !retire_window(a.base - GUARD, WINDOW + 2 * GUARD) {
-        eprintln!("makepad: an unloaded module's memory at {:#x} could not be made inaccessible", a.base);
+        eprintln!("relax: an unloaded module's memory at {:#x} could not be made inaccessible", a.base);
         std::process::abort();
     }
     // (the heap's bookkeeping is the only sizeable part of the tombstone)
@@ -1592,11 +1592,11 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
     with_sb(|s| s.refs.insert(twin_id, refs));
     f.verify().map_err(|e| format!("{}: sandbox transform made invalid RIR: {}", f.name, e))?;
     // the masks the transform added: common ones merged, loop-invariant ones hoisted. Only
-    // under O1 alone (MAKEPAD_RUN_O3=0, O2 pipeline): with O3 on, O1 keeps
+    // under O1 alone (RELAX_O3=0, O2 pipeline): with O3 on, O1 keeps
     // registers unoptimised and the hoisted masks cost more than they save (mini, particle
     // kernel: +25% with the clean-up, +0.5% without). Hot twins retain this confined RIR
     // for O3, whose full pipeline and register allocation perform the clean-up there.
-    // MAKEPAD_RUN_SANDBOX_OPT=0/1 forces the O1 clean-up.
+    // RELAX_SANDBOX_OPT=0/1 forces the O1 clean-up.
     let opt = options.sandbox_opt.unwrap_or(!jit::TIER1_ENABLED.load(std::sync::atomic::Ordering::Relaxed));
     if opt {
         relax_backend::passes::simplify(options, f, None, true, true);
@@ -1754,7 +1754,7 @@ fn add_fuel(f: &mut Func, words: VReg, site: Sym, panic_site: Sym, pos0: u64, co
 
 fn sandbox_dump() -> Option<&'static str> {
     static VALUE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    VALUE.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_SANDBOX_DUMP").ok())).as_deref()
+    VALUE.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("RELAX_SANDBOX_DUMP").ok())).as_deref()
 }
 
 /// The code of a twin (on the owner thread): the base slot's RIR, transformed.
@@ -1775,7 +1775,7 @@ pub unsafe fn twin_rir(up: *mut Unit, id: u32, base: u32) -> Result<Func, String
     jit::build_rir(up, base)?;
     let mut f = jit::sandbox_source_rir(up, base)?;
     transform(up, &mut f, id)?;
-    // MAKEPAD_RUN_SANDBOX_DUMP=<substring>: the transformed RIR of matching twins
+    // RELAX_SANDBOX_DUMP=<substring>: the transformed RIR of matching twins
     if let Some(pat) = sandbox_dump() {
         if f.name.contains(pat) {
             eprintln!("sandbox twin {} ({} insts):\n{}", f.name, relax_codegen::opt::inst_count(&f), f.dump());

@@ -511,7 +511,7 @@ mod imp {
         let a = pool.base + 16 * i as u64;
         pool.used.insert(target, a);
         // one stub per target, never reused: say how fast they go (Sandbox's race used up 4096)
-        if (i + 1).is_power_of_two() && i >= 1023 { eprintln!("makepad-run: {} of {} C-callable stubs in use", i + 1, pool.count); }
+        if (i + 1).is_power_of_two() && i >= 1023 { eprintln!("relax: {} of {} C-callable stubs in use", i + 1, pool.count); }
         a
     }
 
@@ -586,7 +586,7 @@ mod imp {
             }
             let e = dlerror();
             if !e.is_null() {
-                eprintln!("makepad: cannot load {}: {}", path.trim_end_matches('\0'), std::ffi::CStr::from_ptr(e).to_string_lossy());
+                eprintln!("relax: cannot load {}: {}", path.trim_end_matches('\0'), std::ffi::CStr::from_ptr(e).to_string_lossy());
             }
             false
         }

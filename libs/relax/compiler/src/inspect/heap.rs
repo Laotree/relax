@@ -850,7 +850,7 @@ fn host_alloc(p: *mut u8, size: usize) {
     IN_HOST_SAMPLE.with(|b| b.set(true));
     let mut frames = [0u64; DEPTH];
     let n = capture_host(&mut frames);
-    // frames kept per host stack (MAKEPAD_RUN_HEAP_DEPTH): a whole cold start at the full depth
+    // frames kept per host stack (RELAX_HEAP_DEPTH): a whole cold start at the full depth
     // fills the stack table before its end, and later samples go uncounted
     let k = host_depth();
     let n = if (n as usize) > k {
@@ -865,7 +865,7 @@ fn host_alloc(p: *mut u8, size: usize) {
 
 fn host_depth() -> usize {
     static D: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *D.get_or_init(|| std::env::var("MAKEPAD_RUN_HEAP_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(DEPTH).clamp(1, DEPTH))
+    *D.get_or_init(|| std::env::var("RELAX_HEAP_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(DEPTH).clamp(1, DEPTH))
 }
 
 /// Leaves this thread's allocations out of the host heap's samples (inspect's own threads).
@@ -961,7 +961,7 @@ fn start_life(host: bool, rate: u64, life: Option<u64>) -> Result<(), &'static s
     #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_vendor = "apple", target_arch = "aarch64")))]
     {
         if REAL[0].load(Relaxed) == 0 {
-            return Err("the program has not called the allocator through makepad run yet: ask again in a second (it hooks the allocator on its first call)");
+            return Err("the program has not called the allocator through Relax yet: ask again in a second (it hooks the allocator on its first call)");
         }
         PROGRAM.on.store(false, Release);
         PROGRAM.tables.store(new_tables_life(rate, life), Release);
@@ -1132,7 +1132,7 @@ fn tag_name(t: &Tables, id: usize) -> &'static str {
 pub fn cmd_heap(req: &Req, out: &mut Out) {
     let host = req.get("host") == Some("1");
     let tr = if host { &HOST } else { &PROGRAM };
-    let what = if host { "makepad run's own heap (compiler + compiled-in crates)" } else { "program heap" };
+    let what = if host { "Relax's own heap (compiler + compiled-in crates)" } else { "program heap" };
     let pre = if host { "R" } else { "H" };
     match req.pos.first().map(String::as_str).unwrap_or("status") {
         "start" => {

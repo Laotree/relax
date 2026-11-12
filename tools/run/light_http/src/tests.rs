@@ -28,7 +28,7 @@ fn content_length_body() {
     assert_eq!((r.status, body.as_slice(), r.header("etag")), (200, &b"hello"[..], Some("x")));
     let sent = String::from_utf8(t.join().unwrap()).unwrap();
     assert!(sent.starts_with("GET /a?b=c HTTP/1.1\r\n") && sent.contains(&format!("Host: 127.0.0.1:{port}\r\n")), "{sent}");
-    assert!(sent.contains("Git-Protocol: version=2\r\n") && sent.contains("User-Agent: makepad-run/0.1\r\n"));
+    assert!(sent.contains("Git-Protocol: version=2\r\n") && sent.contains("User-Agent: relax/0.1\r\n"));
 }
 
 #[test]

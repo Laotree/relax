@@ -1655,7 +1655,7 @@ impl NamespaceDelta {
 /// A part's closure delta, always as the bytes it is stored as: the recorder encodes it once, a
 /// stored part reads those bytes without decoding them (a decoded delta is one owned spelling per
 /// name, 0.4 GB on a cold Stage), and only a load that applies the delta decodes it. The legacy
-/// size is MAKEPAD_RUN_PROFILE's report, taken from the delta at the record (0 unprofiled or read).
+/// size is RELAX_PROFILE's report, taken from the delta at the record (0 unprofiled or read).
 pub(crate) struct ClosureDelta { image: Vec<u8>, legacy: usize }
 impl Codec for ClosureDelta {
     fn put(&self, w: &mut Vec<u8>) {

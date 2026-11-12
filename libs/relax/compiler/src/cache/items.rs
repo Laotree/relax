@@ -55,7 +55,7 @@ pub(crate) fn file_digest(pf: &ParsedFile) -> FileDigest {
     digest_into(pf, None)
 }
 
-/// The interface text of a file (holes marked `{..}`): MAKEPAD_RUN_CACHE_IFACE diagnostics.
+/// The interface text of a file (holes marked `{..}`): RELAX_CACHE_IFACE diagnostics.
 pub(crate) fn iface_text(pf: &ParsedFile) -> Vec<u8> {
     let mut v = Vec::new();
     digest_into(pf, Some(&mut v));

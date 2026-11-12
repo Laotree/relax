@@ -375,7 +375,7 @@ pub fn lookup(name: &str) -> Builtin {
 }
 
 /// A `macro_rules!` definition Relax replaces with a native expansion: the bitflags crate's
-/// 2.x `bitflags!` (MAKEPAD_RUN_NATIVE_BITFLAGS=0 keeps the crate's macro_rules, for A/B measurement).
+/// 2.x `bitflags!` (RELAX_NATIVE_BITFLAGS=0 keeps the crate's macro_rules, for A/B measurement).
 pub fn override_rules(options: &crate::options::Options, d: crate::macros::MacroRef) -> crate::macros::MacroRef {
     // Match the implementation the native expander replaces. Version 1 declares a named
     // `bits` field and supplies implicit derives; substituting the 2.x tuple breaks its API.
@@ -1021,7 +1021,7 @@ fn expand_buf(p: &crate::parser::Parser, id: u16, lo: usize, hi: usize, call_lo:
                     Some(s) => Ok(one_str(&s)),
                     None => Err(match args.get(1) {
                         Some(m) => m.clone(),
-                        None => format!("environment variable `{}` not defined at compile time -- set it before running makepad run", name),
+                        None => format!("environment variable `{}` not defined at compile time -- set it before running {tool} run", name, tool = crate::tool_name()),
                     }),
                 }
             };
@@ -1309,8 +1309,8 @@ fn expand_pm_ts(p: &crate::parser::Parser, span_needed: bool, lo: usize, hi: usi
     let call = span_of(call_lo, call_hi);
     drop(stream_timer);
     drop(input_timer);
-    let verify = std::env::var("MAKEPAD_RUN_PARSE_VERIFY").as_deref() == Ok("1");
-    let profile = std::env::var("MAKEPAD_RUN_PARSE_INPUT_PROFILE").as_deref() == Ok("1");
+    let verify = std::env::var("RELAX_PARSE_VERIFY").as_deref() == Ok("1");
+    let profile = std::env::var("RELAX_PARSE_INPUT_PROFILE").as_deref() == Ok("1");
     if verify || profile {
         let (expected, expected_call) = legacy_pm_input(p, span_needed, lo, hi, call_lo, call_hi, profile);
         verify_pm_spans(&input, &expected);
@@ -1868,7 +1868,7 @@ pub fn derive_items(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], lo: u
 
 fn derive_items_inner(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], lo: usize, hi: usize) -> Result<Option<Expansion>, (u32, String)> {
     let sess = p.session;
-    // MAKEPAD_RUN_DERIVES=0: derives are not expanded at all (baseline for measurements only)
+    // RELAX_DERIVES=0: derives are not expanded at all (baseline for measurements only)
     if crate::preload::derives_off(&p.session.options) {
         return Ok(None);
     }
@@ -1911,8 +1911,8 @@ fn derive_items_inner(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], lo:
     let _profile = crate::load_profile::span(p.session.runtime.profile, "derive", p.bctx.as_ref().map_or("", |c| c.path.as_str()));
     let key = if reusable && !crate::macro_reg::declaring() { crate::parse_work::key_tokens(p, "hosted-derive", item_lo, item_hi, lo..hi, item_location(p, item_lo)) } else { None };
     let reused = crate::parse_work::get(&key);
-    // MAKEPAD_RUN_REUSE_VERIFY=1: every reused derive expansion is recomputed and must be identical.
-    if reused.is_some() && std::env::var_os("MAKEPAD_RUN_REUSE_VERIFY").is_none() { return Ok(reused); }
+    // RELAX_REUSE_VERIFY=1: every reused derive expansion is recomputed and must be identical.
+    if reused.is_some() && std::env::var_os("RELAX_REUSE_VERIFY").is_none() { return Ok(reused); }
     crate::macro_reg::add_pre(false);
     // an item of expansion text has its tokens (as the source spelled them); an authored item's
     // tokens are the source's own (the parser's are the configured view: `#[cfg_attr]` expanded,
@@ -1932,7 +1932,7 @@ fn derive_items_inner(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], lo:
         ItemOut::Done(x) => {
             if let Some(reused) = reused {
                 assert!(reused.text == x.text && format!("{:?}{:?}", reused.toks, reused.origins) == format!("{:?}{:?}", x.toks, x.origins),
-                    "MAKEPAD_RUN_REUSE_VERIFY: reused derive expansion differs at {item_lo}");
+                    "RELAX_REUSE_VERIFY: reused derive expansion differs at {item_lo}");
                 return Ok(Some(reused));
             }
             if !x.text.contains("compile_error") { crate::parse_work::put(key, &x); }
@@ -1984,7 +1984,7 @@ pub fn attr_macro_at(p: &crate::parser::Parser, attrs: &[crate::ast::Attr]) -> O
             }
             i += 1;
         }
-        // `#[relax(O2)]` / `#[relax(O3)]` / `#[relax(O3, always)]` (makepad-relax): read by Relax
+        // `#[relax(O2)]` / `#[relax(O3)]` / `#[relax(O3, always)]` (relax-attr): read by Relax
         // itself from the item's attributes (relax_level), never expanded; other arguments run
         // the macro, whose compile_error! reports them
         if last == "relax" && (relax_level_toks(&text, toks, i, hi).is_some() || relax_keep_toks(&text, toks, i, hi)) {
@@ -2147,8 +2147,8 @@ pub fn expand_attr_macro(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], 
         crate::parse_work::key_tokens(p, &format!("hosted-attr-{}-{}", entry.unit, entry.fname), item_lo, item_hi, lo..hi, item_location(p, item_lo))
     } else { None };
     let reused = crate::parse_work::get(&key);
-    // MAKEPAD_RUN_REUSE_VERIFY=1: every reused expansion is recomputed and must be identical.
-    if reused.is_some() && std::env::var_os("MAKEPAD_RUN_REUSE_VERIFY").is_none() { return Ok(reused.unwrap()); }
+    // RELAX_REUSE_VERIFY=1: every reused expansion is recomputed and must be identical.
+    if reused.is_some() && std::env::var_os("RELAX_REUSE_VERIFY").is_none() { return Ok(reused.unwrap()); }
     let span_of = |a: u32, z: u32| p.input_span(a, z).unwrap_or(Span { file: 0, lo: a, hi: z, start: LineColumn { line: 1, column: 1 }, end: LineColumn { line: 1, column: 1 } });
     let stream = |text: &[u8], offset: u32| -> Result<TokenStream, (u32, String)> {
         let mut t = Vec::new();
@@ -2220,7 +2220,7 @@ pub fn expand_attr_macro(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], 
             out.text.push('\n');
             if let Some(reused) = reused {
                 assert!(reused.text == out.text && format!("{:?}{:?}", reused.toks, reused.origins) == format!("{:?}{:?}", out.toks, out.origins),
-                    "MAKEPAD_RUN_REUSE_VERIFY: reused #[{}] expansion differs at {item_lo}", name);
+                    "RELAX_REUSE_VERIFY: reused #[{}] expansion differs at {item_lo}", name);
             }
             crate::parse_work::put(key, &out);
             return Ok(out);

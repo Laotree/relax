@@ -106,7 +106,7 @@ pub fn say_why_hung(what: &str) {
     }
     let _k = crate::zone_alloc::kept();
     let (bytes, _) = makepad_remote::cmd::answer(answer, "why-hung");
-    eprintln!("makepad: {what}: where the threads wait:\n{}", String::from_utf8_lossy(&bytes));
+    eprintln!("relax: {what}: where the threads wait:\n{}", String::from_utf8_lossy(&bytes));
 }
 
 /// A retiring domain's outstanding threads, using the same wait registry and
@@ -116,7 +116,7 @@ pub fn say_teardown_threads(domain: u32, pending: &[(String, u64)]) {
     let captures = match capture_all(&|t| pending.iter().any(|(_, id)| *id != 0 && *id == t.os_id)) {
         Ok(captures) => captures,
         Err(error) => {
-            eprintln!("makepad-run domain: {domain}: teardown stacks unavailable: {error}");
+            eprintln!("relax domain: {domain}: teardown stacks unavailable: {error}");
             return;
         }
     };
@@ -127,13 +127,13 @@ pub fn say_teardown_threads(domain: u32, pending: &[(String, u64)]) {
     let symbols = symbolise_within(&frames, &mut partial, 300);
     for (name, id) in pending {
         let Some(index) = captures.iter().position(|c| *id != 0 && c.t.os_id == *id) else {
-            eprintln!("makepad-run domain: {domain}: thread {name}: {}", if *id == 0 { "reserved, not entered yet" } else { "exited during capture" });
+            eprintln!("relax domain: {domain}: thread {name}: {}", if *id == 0 { "reserved, not entered yet" } else { "exited during capture" });
             continue;
         };
         let c = &captures[index];
         let blocked = waits.iter().find(|w| w.thread == c.t.handle && w.kind != crate::waits::Kind::None)
             .map(|w| wait_text(w, &threads)).unwrap_or_else(|| c.t.state.to_string());
-        eprintln!("makepad-run domain: {domain}: thread {name} ({}): {blocked}", c.t.os_id);
+        eprintln!("relax domain: {domain}: thread {name} ({}): {blocked}", c.t.os_id);
         if let Some(error) = c.err {
             eprintln!("  stack unavailable: {error}");
         }
@@ -141,12 +141,12 @@ pub fn say_teardown_threads(domain: u32, pending: &[(String, u64)]) {
             eprintln!("  {} {}", frame.name, frame.at);
         }
     }
-    for note in partial { eprintln!("makepad-run domain: {domain}: {note}"); }
+    for note in partial { eprintln!("relax domain: {domain}: {note}"); }
 }
 
-/// Starts the inspect thread for program `app` (once per process; MAKEPAD_RUN_INSPECT=0: off).
+/// Starts the inspect thread for program `app` (once per process; RELAX_INSPECT=0: off).
 pub fn start(app: &str) {
-    if std::env::var("MAKEPAD_RUN_INSPECT").map_or(false, |v| v == "0") || STARTED.swap(true, Relaxed) {
+    if std::env::var("RELAX_INSPECT").map_or(false, |v| v == "0") || STARTED.swap(true, Relaxed) {
         return;
     }
     let _k = crate::zone_alloc::kept();
@@ -206,7 +206,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("session", "relaunch", "apply the edits waiting for a restart: the process starts again (an app that restarts itself, std::relax::restart_supported, with its state and window frames)"),
     ("why-hung", "[probe_ms=200]", "is it stuck and why: verdict (deadlock / blocked / busy / idle), the wait chain or cycle, stacks of the threads in it"),
     ("capture", "[why=<text>]", "capture the JIT's state and flight recording; answers the likely cause and report path"),
-    ("why-slow", "[s=3]", "where the time goes: ranked findings -- the main thread's CPU split (program / compiles / makepad run runtime / system), its hot fns, the owner's service, other busy threads"),
+    ("why-slow", "[s=3]", "where the time goes: ranked findings -- the main thread's CPU split (program / compiles / Relax runtime / system), its hot fns, the owner's service, other busy threads"),
     ("prof", "[s=3] [hz=200] [threads=all|main|owner|program|compiler|<name>] [ev=cpu|cycles|instructions|branch-misses|cache-misses] [view=top|tree|callers|flame] [focus=<fn>] [fn=<fn>] [min=1] [n=15] [save=1]", "sampling profile of JIT and host frames: per-thread CPU, activity split, top fns by self time with their hottest line, inclusive fns; view=tree: the call tree with the JIT's inline levels as frames and each frame's tier (focus= re-roots at a fn, view=callers fn= inverts); save=1 / view=flame writes folded stacks; ev= samples a hardware event (Linux)"),
     ("pf", "<summary|frames|frame F<n>|top cpu|jit|gpu|hitches|timeline F<n>|lanes|why-slow|diff> [s=3] [save=x.mkpf] [base=y.mkpf]", "the profiler for agents: the client records the app's live `prof` stream (lanes, phases, waits, compile jobs, JIT installs with tiers, GPU passes) for s seconds and answers as compact text: finding first, tables, drill-down ids; file=<x.mkpf> pf ... answers on a recording"),
     ("rec", "status | save [last=60s|5m|all] [path=<file>] | mark <text> | on | off | replay (file=<x.mkpf>: client side)", "the flight recorder (always on, bounded memory): the last minutes of frames, every thread's spans and waits, the owner's requests with requester and call site, JIT installs, events (app marks, logs, panics, script errors, hitches, zone swaps), input; save = a .mkpf recording for `pf` queries and Scope; automatic recordings on a hitch over 1 s, a panic, a fatal fault"),
@@ -217,7 +217,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("events", "[follow=1] [since=<seq>] [on=...]", "the recent events, ending at the newest (follow=1: stream one JSON line per new event)"),
     ("panics", "", "panics parked now, waiting for a decision"),
     ("resume", "<panic id> panic|retry|restart|return <v>[,<v>]", "decide a parked panic: unwind, retry, restart the hosted app domain (otherwise its restartable fn), or return the values"),
-    ("memory", "[compiler=1] [n=24]", "where the memory is and why: RSS by mapping kind, malloc in use vs held free, makepad run's own parts, findings, growth since the last `memory`"),
+    ("memory", "[compiler=1] [n=24]", "where the memory is and why: RSS by mapping kind, malloc in use vs held free, Relax's own parts, findings, growth since the last `memory`"),
     ("diff", "<snap a> <snap b|now>", "memory growth between two snapshots, largest first"),
     ("mem", "snap <name> | timeline [from_ms= to_ms=] | trim", "keep a named memory snapshot; resident size over time with phase markers and the peak's phase; trim: return the allocators' free pages now (RSS before/after)"),
     ("heap", "start [rate=65536] [ttl_s=600] | top [by=live|alloc|freed|peak] [zone=burst|compiler|slots|other] | frame [s=2] [n=12] | snap <name> | diff <a> <b|now> | path H<id> | stop | status", "program heap by allocation stack (JIT-patched allocator hooks, byte-sampled): live, allocated, freed; growth and leaks between snapshots"),
@@ -247,7 +247,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("rm", "<G<n>|all>", "removes probe groups: the code they replaced comes back (no recompile)"),
     ("continue", "[K<n>|all]", "lets parked breakpoint hits go"),
     ("stale", "[n=8]", "stale accesses (into memory the JIT retired for good: unloaded modules, invalidated code), answer first: who touched what, where in it, when and why it was retired, the report; then the retired ranges. A stale access parks its thread and pauses the app until `resume P<n> restart | stop`"),
-    ("pause", "", "stops the program's threads (makepad run's and inspect's keep running); stacks work while paused"),
+    ("pause", "", "stops the program's threads (Relax's and inspect's keep running); stacks work while paused"),
     ("resume", "", "after pause: the program runs again (`resume P<n> panic` releases a parked panic)"),
     ("gpu", "[top [by=bytes|owner|site|churn] [n=15]|idle [frames=1800] [n=15]|snap <name>|diff <a> <b|now>|path <session>:<kind>:<index>:<generation>]", "HAL GPU memory: totals per session, kind and owner against the device (native apps: MAKEPAD_INSPECT=1 or MAKEPAD_REMOTE=1)"),
     ("hal", "pump|pace", "HAL pump loop per session: turns and wake causes, totals and per second since the last call (an idle app shows none); pace: the WM-hosted shell's frame pacing"),
@@ -445,7 +445,7 @@ fn dispatch_command(req: &Req, out: &mut Out) {
                 Err(e) => out.err(&e),
             }
         }
-        "pf" => out.err("pf is answered by the client: makepad inspect <app> pf <query> (it attaches to the app's prof stream)"),
+        "pf" => out.err(&format!("pf is answered by the client: {tool} inspect <app> pf <query> (it attaches to the app's prof stream)", tool = crate::tool_name())),
         "ping" => out.line(&format!("{{\"pid\":{},\"app\":{},\"ms\":{}}}", std::process::id(), json_str(&APP.lock().unwrap()), now_ms())),
         "threads" => cmd_threads(out),
         "jit" => cmd_jit(req, out),
@@ -610,7 +610,8 @@ fn with_by(req: &Req) -> Req {
 
 fn help(req: &Req, out: &mut Out) {
     if req.pos.first().map(String::as_str) == Some("schema") {
-        out.line(&schema());
+        // one line longer than a reply's byte limit (`line` would drop it whole): always written
+        out.always(&schema());
         return;
     }
     out.measured("commands", "static", &[]);
@@ -637,7 +638,7 @@ pub fn schema() -> String {
     let cmds: Vec<String> = COMMANDS.iter().chain(makepad_gpu_trace::query::COMMANDS).chain(host.iter()).map(|(n, a, w)| format!("{} {} -- {}", n, a, w)).collect();
     format!(
         "{{\"name\":\"relax_inspect\",\"description\":{},\"input_schema\":{{\"type\":\"object\",\"properties\":{{\"target\":{{\"type\":\"string\",\"description\":\"pid (an app name or all only for an app of your own lease)\"}},\"command\":{{\"type\":\"string\",\"description\":\"one request line, e.g. `why-hung` or `stacks thread=main`\"}}}},\"required\":[\"target\",\"command\"]}}}}",
-        json_str(&format!("Ask a running makepad app about itself. Run as `makepad inspect <target> <command>`. Commands:\n{}", cmds.join("\n")))
+        json_str(&format!("Ask a running program about itself. Run as `{tool} inspect <target> <command>`. Commands:\n{}", cmds.join("\n"), tool = crate::tool_name()))
     )
 }
 
@@ -659,7 +660,7 @@ fn role(name: &str, os_id: u64, handle: u64) -> &'static str {
     match name {
         n if n.starts_with("run-inspect") || n.starts_with("makepad-remote") => "inspect",
         n if n.starts_with("run-jit-") || n.starts_with("gandalf") || n.starts_with("run-check") => "compiler",
-        n if n.starts_with("run-") => "makepad run",
+        n if n.starts_with("run-") => "Relax",
         // an unnamed thread: the OS's dispatch workers, or a program thread spawned without a name
         "" => "unnamed",
         _ => "program",
@@ -2075,7 +2076,7 @@ mod tests {
         let home = std::env::temp_dir().join(format!("relax-view-restart-{}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("MAKEPAD_HOME", &home);
-        std::env::set_var("MAKEPAD_RUN_LIVE_LOG", home.join("live.jsonl"));
+        std::env::set_var("RELAX_LIVE_LOG", home.join("live.jsonl"));
         super::run_view::publish("\"over_app\":false,\"patch_failed\":false,\"patch_notice\":null".into());
         let view = || String::from_utf8(makepad_remote::cmd::answer(super::dispatch_command, "session view").0).unwrap();
         assert!(view().contains("\"restart_waiting\":[]"), "{}", view());

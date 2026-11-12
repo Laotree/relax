@@ -259,7 +259,7 @@ pub mod memreport;
 pub mod registry_net;
 
 /// The system allocator (Relax's own malloc zone once a program swaps the default zone:
-/// zone_alloc.rs), with per-subsystem accounting when MAKEPAD_RUN_MEM_REPORT is set (memstat.rs).
+/// zone_alloc.rs), with per-subsystem accounting when RELAX_MEM_REPORT is set (memstat.rs).
 #[global_allocator]
 static GLOBAL_ALLOC: memstat::Counting = memstat::Counting;
 
@@ -272,7 +272,7 @@ pub use jit::PROVENANCE;
 
 /// The same, as a marker other binaries find in this one's bytes (provenance_of).
 #[used]
-static PROVENANCE_MARK: &str = concat!("<<RELAX-PROVENANCE:", env!("MAKEPAD_RUN_PROVENANCE"), ">>");
+static PROVENANCE_MARK: &str = concat!("<<RELAX-PROVENANCE:", env!("RELAX_PROVENANCE"), ">>");
 
 /// The compiler stamp a binary file carries (its PROVENANCE_MARK), if any.
 pub fn provenance_of(path: &std::path::Path) -> Option<String> {
@@ -287,14 +287,14 @@ pub fn provenance_of(path: &std::path::Path) -> Option<String> {
 /// script's RUSTC is Relax itself; asked `--version`, it answers this (relax_as_rustc).
 pub const RUSTC_VERSION: &str = "1.98.0";
 
-/// MAKEPAD_RUN_AS_RUSTC=1: a build script's RUSTC is Relax itself. `--version` / `-vV` / `-V` answer
+/// RELAX_AS_RUSTC=1: a build script's RUSTC is Relax itself. `--version` / `-vV` / `-V` answer
 /// as a rustc of RUSTC_VERSION would (build scripts such as libc's read the minor version);
 /// `--print` requests about the target (cargo's target-info probe, which `cargo metadata
 /// --filter-platform` runs) answer from Relax's own target model (print_as_rustc). Returns whether
 /// it answered.
 pub fn relax_as_rustc() -> bool {
     let args: Vec<String> = os::proc::args_bytes().iter().skip(1).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
-    if std::env::var_os("MAKEPAD_RUN_AS_RUSTC").is_none() && !native::is_target_rustc_probe(&args) {
+    if std::env::var_os("RELAX_AS_RUSTC").is_none() && !native::is_target_rustc_probe(&args) {
         return false;
     }
     // the script's own run (and a nested script's) is a Relax command, not a RUSTC question
@@ -303,9 +303,9 @@ pub fn relax_as_rustc() -> bool {
     }
     let sess = &session_from_env(&args);
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-        ["--version"] | ["-V"] => println!("rustc {} (makepad run {})", RUSTC_VERSION, PROVENANCE),
+        ["--version"] | ["-V"] => println!("rustc {} (Relax {})", RUSTC_VERSION, PROVENANCE),
         ["-vV"] | ["--version", "--verbose"] | ["--verbose", "--version"] | ["-V", "--verbose"] | ["--verbose", "-V"] => {
-            println!("rustc {} (makepad run {})", RUSTC_VERSION, PROVENANCE);
+            println!("rustc {} (Relax {})", RUSTC_VERSION, PROVENANCE);
             println!("binary: rustc");
             println!("commit-hash: unknown");
             println!("commit-date: unknown");
@@ -330,7 +330,7 @@ pub fn relax_as_rustc() -> bool {
                     // anything else asked of RUSTC (a compile probe: autocfg, rustc_version's
                     // `--emit`): Relax is not rustc. Fail the probe as a missing rustc would (the
                     // script decides); never run the script's program again.
-                    eprintln!("makepad: not rustc: a build script asked RUSTC {:?}: {}", args, e);
+                    eprintln!("relax: not rustc: a build script asked RUSTC {:?}: {}", args, e);
                     std::process::exit(1);
                 }
             }
@@ -489,11 +489,11 @@ pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
         match a.as_str() {
             "--no-asm" => {
                 options.no_asm = true;
-                std::env::set_var("MAKEPAD_RUN_NO_ASM", "1");
+                std::env::set_var("RELAX_NO_ASM", "1");
             }
             "--allow-c" => {
                 options.allow_c = true;
-                std::env::set_var("MAKEPAD_RUN_ALLOW_C", "1");
+                std::env::set_var("RELAX_ALLOW_C", "1");
             }
             _ => {}
         }
@@ -521,7 +521,7 @@ pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
     if std::env::var_os("CARGO").is_none() {
         std::env::set_var("CARGO", "cargo");
     }
-    if std::env::var_os("MAKEPAD_RUN_CODE_SIG").is_some() {
+    if std::env::var_os("RELAX_CODE_SIG").is_some() {
         relax_backend::regalloc::SIG_ON.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     // a program's own arguments after `--` may be any bytes (`makepad run p -- $'\xff'`): Relax
@@ -535,11 +535,11 @@ pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
         !(k <= end && (a == "--no-asm" || a == "--allow-c"))
     });
     if args.get(1).map(String::as_str) == Some("--version") {
-        println!("makepad run {}", PROVENANCE);
+        println!("Relax {}", PROVENANCE);
         std::process::exit(0);
     }
     if args.len() < 3 && !matches!(args.get(1).map(String::as_str), Some("serve" | "clean")) {
-        eprintln!("makepad: {} needs an argument; run `makepad help {}`", args.get(1).map_or("this command", String::as_str), args.get(1).map_or("", String::as_str));
+        eprintln!("relax: {} needs an argument; run `{tool} help {}`", args.get(1).map_or("this command", String::as_str), args.get(1).map_or("", String::as_str), tool = crate::tool_name());
         std::process::exit(2);
     }
     match args[1].as_str() {
@@ -877,12 +877,12 @@ fn census_report(crates: &[crates::CrateUnit], per: &[census::Census], total: &c
 
 pub mod std_source;
 
-/// std sources: $MAKEPAD_RUN_STD, else <repo>/libs/relax/compiler/std next to the binary's
+/// std sources: $RELAX_STD, else <repo>/libs/relax/compiler/std next to the binary's
 /// target dir (<worktree>/<target>/release/makepad; a pool node's layout keeps the sources under
 /// <dir>/src), else the source tree this binary was built from (a CARGO_TARGET_DIR outside the
-/// checkout). None found: the build tree's path, and a hint to set MAKEPAD_RUN_STD, said once.
+/// checkout). None found: the build tree's path, and a hint to set RELAX_STD, said once.
 pub fn std_dir() -> String {
-    if let Ok(d) = std::env::var("MAKEPAD_RUN_STD") {
+    if let Ok(d) = std::env::var("RELAX_STD") {
         return d;
     }
     let candidates = std_candidates(None);
@@ -890,7 +890,7 @@ pub fn std_dir() -> String {
         return c.clone();
     }
     static HINT: std::sync::Once = std::sync::Once::new();
-    HINT.call_once(|| eprintln!("makepad-run: no std sources found (looked in {}): set MAKEPAD_RUN_STD=<makepad checkout>/libs/relax/compiler/std", candidates.join(", ")));
+    HINT.call_once(|| eprintln!("relax: no std sources found (looked in {}): set RELAX_STD=<checkout>/libs/relax/compiler/std", candidates.join(", ")));
     concat!(env!("CARGO_MANIFEST_DIR"), "/std").to_string()
 }
 
@@ -1271,7 +1271,7 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
             rules.push_str(&format!("{} {}  ", n, u.stats.inline_rules[i]));
         }
         println!("inlined call sites by rule: {}", rules);
-        if std::env::var("MAKEPAD_RUN_PASS_TIMES").is_ok() {
+        if std::env::var("RELAX_PASS_TIMES").is_ok() {
             let mut passes = String::new();
             for i in 0..relax_backend::stats::PASS_NAMES.len() {
                 passes.push_str(&format!("{} {:.2}  ", relax_backend::stats::PASS_NAMES[i], relax_backend::stats::PASS_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6));
@@ -1432,7 +1432,7 @@ mod check_reuse_tests;
 fn round18_rpit_diagnostic() {
     // `makepad test` is process-global (it installs the runtime and exits): run it in a child of
     // this test binary, as lazy_reload_tests does, instead of naming a built makepad binary.
-    const CHILD: &str = "MAKEPAD_RUN_ROUND18_RPIT_CHILD";
+    const CHILD: &str = "RELAX_ROUND18_RPIT_CHILD";
     let dir = env!("CARGO_MANIFEST_DIR");
     if std::env::var_os(CHILD).is_some() {
         let sess = session_from_env(&[]);
@@ -1440,7 +1440,7 @@ fn round18_rpit_diagnostic() {
     }
     let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "round18_rpit_diagnostic", "--nocapture", "--test-threads=1"])
-        .env(CHILD, "1").env("MAKEPAD_RUN_STD", format!("{dir}/std")).env("MAKEPAD_RUN_CACHE", "off")
+        .env(CHILD, "1").env("RELAX_STD", format!("{dir}/std")).env("RELAX_CACHE", "off")
         .env("MAKEPAD_HIDE_WINDOWS", "1").env("SANDBOX_MUTE", "1"));
     let all = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     eprintln!("{all}");

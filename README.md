@@ -34,7 +34,7 @@ builds and its tests pass on Linux x86-64 and macOS arm64. Windows isn't tested.
   a few workloads: see [where LLVM still wins](#where-llvm-still-wins).
 - **More memory.** The compiler, its caches and every code version it publishes share your program's
   process, and JIT code is append-only. `relax inspect <pid> memory` shows the split, `code` the growth.
-  The code cache in a package's `target/makepad-run` takes 120 to 190 MB for `hello`.
+  The code cache in a package's `target/relax` takes 120 to 190 MB for `hello`.
 - **`relax check` isn't faster than `cargo check` yet.** On a large package a cold check takes longer
   and uses more memory than `cargo check`, and an edit can re-check more than it needs to. We're
   working on it.
@@ -85,14 +85,14 @@ from the checkout it was built in, so keep the `relax` folder where it is.
 
 Measured from a fresh clone: building `relax` took 53 s on a 16-core x86-64 Linux box and 78 s on a
 10-core arm64 Mac with cargo held to 4 jobs. The first `relax run` of `hello` took 0.24 s and 0.97 s,
-the next ones 0.01 to 0.07 s. Relax keeps what it compiles in the package's `target/makepad-run`
+the next ones 0.01 to 0.07 s. Relax keeps what it compiles in the package's `target/relax`
 (`relax clean` removes it), so each new package starts cold.
 
 **Network.** A package with no dependencies, like `hello`, needs none. For a crates.io dependency Relax
 takes the package from `~/.cargo`'s registry when it is there, and otherwise downloads it from
-crates.io itself, checked against the index's SHA-256. With `MAKEPAD_RUN_OFFLINE=1` or cargo's
+crates.io itself, checked against the index's SHA-256. With `RELAX_OFFLINE=1` or cargo's
 `CARGO_NET_OFFLINE` it never downloads. `relax fetch <git-url>` (`tools/run/runner/src/fetch.rs`)
-stores a git repository as one file under `~/.makepad-run`.
+stores a git repository as one file under `~/.relax`.
 
 ---
 

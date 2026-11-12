@@ -4,7 +4,7 @@
 //! installs relax-light-http), with local reads from Cargo's git cache and Relax's stores. Nothing is
 //! checked out: the store's path table of a commit is what its files are read from (vfs.rs).
 //!
-//! Cargo offline settings and MAKEPAD_RUN_OFFLINE=1 forbid every request.
+//! Cargo offline settings and RELAX_OFFLINE=1 forbid every request.
 use super::{build_info_refs_request, build_upload_pack_request, extract_pack_from_response, Advertisement, ObjectId, ObjectKind, Request, Response};
 use crate::gitstore::{self as store, Oid};
 use std::path::Path;
@@ -83,11 +83,11 @@ impl Repo {
 }
 
 /// How long asking a remote which commit a ref names may take before the stores answer instead
-/// (MAKEPAD_RUN_FETCH_TIMEOUT_S overrides it).
+/// (RELAX_FETCH_TIMEOUT_S overrides it).
 const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn head_timeout() -> Duration {
-    std::env::var("MAKEPAD_RUN_FETCH_TIMEOUT_S").ok().and_then(|v| v.parse().ok()).map(Duration::from_secs).unwrap_or(HEAD_TIMEOUT)
+    std::env::var("RELAX_FETCH_TIMEOUT_S").ok().and_then(|v| v.parse().ok()).map(Duration::from_secs).unwrap_or(HEAD_TIMEOUT)
 }
 
 /// The remote's ref advertisement.
@@ -234,7 +234,7 @@ fn fetch_commit(path: &Path, existing: Option<&store::Store>, url: &str, adv: &A
         }
     }
     let req = build_upload_pack_request(url, &[ObjectId(commit)], caps, &haves, &shallow, can_deepen.then_some(1)).map_err(|e| e.to_string())?;
-    eprintln!("makepad: fetching {} ({})", url, &store::hex(&commit)[..12]);
+    eprintln!("relax: fetching {} ({})", url, &store::hex(&commit)[..12]);
     let t0 = std::time::Instant::now();
     let pack = http(&req, Duration::from_secs(600)).and_then(|r| extract_pack_from_response(&r).map_err(|e| e.to_string())?.ok_or_else(|| "the server sent no pack".to_string()));
     let pack = match pack {
@@ -249,7 +249,7 @@ fn fetch_commit(path: &Path, existing: Option<&store::Store>, url: &str, adv: &A
             if tips.is_empty() || tips.iter().any(|t| t.0 == commit) {
                 return Err(format!("{url}: {first}"));
             }
-            eprintln!("makepad: {url}: {} is no branch or tag tip ({first}): fetching the history", &store::hex(&commit)[..12]);
+            eprintln!("relax: {url}: {} is no branch or tag tip ({first}): fetching the history", &store::hex(&commit)[..12]);
             // no haves: the store holds shallow commits, whose parents the service would take as had
             let req = build_upload_pack_request(url, &tips, caps, &[], &[], None).map_err(|e| e.to_string())?;
             let r = http(&req, Duration::from_secs(1800))?;
@@ -258,8 +258,8 @@ fn fetch_commit(path: &Path, existing: Option<&store::Store>, url: &str, adv: &A
     };
     let t_dl = t0.elapsed();
     let (n, t_unpack, t_store) = append_pack(path, existing, &pack, store::Ref { key: key.to_string(), commit, time: now() }, url)?;
-    if std::env::var_os("MAKEPAD_RUN_FETCH_TIMES").is_some() {
-        eprintln!("makepad: {}: download {:.2} s, unpack {:.2} s ({} objects), store {:.2} s", url, t_dl.as_secs_f64(), t_unpack, n, t_store);
+    if std::env::var_os("RELAX_FETCH_TIMES").is_some() {
+        eprintln!("relax: {}: download {:.2} s, unpack {:.2} s ({} objects), store {:.2} s", url, t_dl.as_secs_f64(), t_unpack, n, t_store);
     }
     Ok(())
 }
@@ -453,7 +453,7 @@ fn fetch_short_rev(path: &Path, existing: Option<&store::Store>, url: &str, adv:
     if heads.is_empty() {
         return Err(format!("{url}: no branches or tags to look for rev `{rev}` in"));
     }
-    eprintln!("makepad: fetching {url} (the history, for rev {rev})");
+    eprintln!("relax: fetching {url} (the history, for rev {rev})");
     let req = build_upload_pack_request(url, &heads, &adv.capabilities, &[], &[], None).map_err(|e| e.to_string())?;
     let r = http(&req, Duration::from_secs(1800))?;
     let pack = extract_pack_from_response(&r).map_err(|e| format!("{url}: {e}"))?.ok_or_else(|| format!("{url}: the server sent no pack"))?;

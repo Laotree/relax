@@ -19,7 +19,7 @@ pub(crate) fn symbols(u: &Unit) -> &HashMap<String, u64> {
     u.global_asm.get_or_init(|| match place_all(u) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("makepad run: global_asm!: {}", e);
+            eprintln!("relax run: global_asm!: {}", e);
             HashMap::new()
         }
     })

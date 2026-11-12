@@ -341,7 +341,7 @@ impl Body {
             args, expr_ty, expr_typed, pat_ty, pat_typed, field_uses, struct_updates, awaits, dependencies, locals, param_pats, closures, errors);
     }
 
-    /// Memory report (MAKEPAD_RUN_MEM_REPORT): per table (entries, heap bytes incl. nested vectors),
+    /// Memory report (RELAX_MEM_REPORT): per table (entries, heap bytes incl. nested vectors),
     /// accumulated into `acc` by name.
     /// Memory report: the bytes these contents took in the previous layout, counted as that
     /// layout's report counted them: a 1304 B struct; HashMap side tables grown by insertion
@@ -610,9 +610,9 @@ pub(crate) fn try_instantiate_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, 
     // Diagnostic only: sample one in N calls, including queries outside JIT scopes.
     // Keep this off for timing runs; symbolizing a backtrace is deliberately expensive.
     static SAMPLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let sample = *SAMPLE.get_or_init(|| std::env::var("MAKEPAD_RUN_TYPECK_BACKTRACE").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
+    let sample = *SAMPLE.get_or_init(|| std::env::var("RELAX_TYPECK_BACKTRACE").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
     if sample != 0 && CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % sample == 0 {
-        let trace = format!("makepad-run typeck-backtrace: {} def={} args={:?} origin={} time={}\n{}\nmakepad-run typeck-backtrace-end\n",
+        let trace = format!("relax typeck-backtrace: {} def={} args={:?} origin={} time={}\n{}\nrelax typeck-backtrace-end\n",
             prog.def_path(def), def.0, args, crate::clock::TYS_ORIGIN.with(|o| o.get()),
             relax_codegen::fncost::mono(), std::backtrace::Backtrace::force_capture());
         // The app may write directly to fd 2 without Rust's stderr lock. Format
@@ -649,7 +649,7 @@ pub(crate) fn check_fn(prog: &Program, tcx: &Tcx, def: DefId) -> Body {
     let state = crate::tcx::EvalState::new();
     let cx = crate::tcx::EvalCx::new(prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
     static ST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let st = *ST.get_or_init(|| std::env::var("MAKEPAD_RUN_TYSTATS").is_ok());
+    let st = *ST.get_or_init(|| std::env::var("RELAX_TYSTATS").is_ok());
     let t0 = if st { relax_session::clock::cpu_ns() } else { 0 };
     thread_local! { static NEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
     let child0 = if st { NEST.with(|c| c.get()) } else { 0 };
@@ -668,7 +668,7 @@ pub(crate) fn check_fn(prog: &Program, tcx: &Tcx, def: DefId) -> Body {
     b
 }
 
-/// MAKEPAD_RUN_LAZY_STATS: the fn defs whose bodies were type-checked (what a lazy parse would parse)
+/// RELAX_LAZY_STATS: the fn defs whose bodies were type-checked (what a lazy parse would parse)
 pub static CHECKED_DEFS: relax_session::sync::Mutex<Option<std::collections::HashSet<u32>>> = relax_session::sync::Mutex::new(None);
 
 fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Body {
@@ -678,7 +678,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         crate::why::enter(cause)
     });
     static LAZY_STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *LAZY_STATS.get_or_init(|| std::env::var_os("MAKEPAD_RUN_LAZY_STATS").is_some()) {
+    if *LAZY_STATS.get_or_init(|| std::env::var_os("RELAX_LAZY_STATS").is_some()) {
         CHECKED_DEFS.lock().unwrap().get_or_insert_with(Default::default).insert(def.0);
     }
     let d = prog.def(def);

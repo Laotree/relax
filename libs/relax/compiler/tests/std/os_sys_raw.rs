@@ -273,7 +273,7 @@ fn a06_futex_backends() {
         let wake: WakeFn = core::mem::transmute(k);
         let r = wait(addr, 3, 4, 0, 32, 1_000_000);
         println!("| os_sync via ptr {} {} {}", r, errno(), wake(addr, 4, 0));
-        // the __ulock fallback (MAKEPAD_RUN_FORCE_ULOCK=1 path)
+        // the __ulock fallback (RELAX_FORCE_ULOCK=1 path)
         let r1 = __ulock_wait(1, addr, 4, 1000);
         let r2 = __ulock_wait(1, addr, 3, 2000);
         let e2 = errno();

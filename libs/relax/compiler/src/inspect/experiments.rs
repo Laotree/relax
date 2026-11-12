@@ -4,7 +4,7 @@
 //! and the answer is noise-aware: per-variant medians, the spread of the rounds, a permutation
 //! test over the rounds, a verdict. Variants:
 //! - `base`: an O3 build as the JIT makes it (inspect builds are never cached)
-//! - `opt:<tok>,<tok>`: an O3 build with these MAKEPAD_RUN_OPT tokens (`-sroa`, `-latedce`, ...:
+//! - `opt:<tok>,<tok>`: an O3 build with these RELAX_OPT tokens (`-sroa`, `-latedce`, ...:
 //!   the passes' own off switches), for this slot only
 //! - `inline:<callee>` / `noinline:<callee>`: an O3 build that inlines every site of the callee /
 //!   none (tokens `+inl@<slot>` / `-inl@<slot>`, read by the inliner)
@@ -113,7 +113,7 @@ fn install(up: *mut crate::jit::Unit, id: u32, v: &Variant, round: u32) -> Resul
             if ok {
                 Ok(())
             } else {
-                Err("the O3 build was not installed (O3 off, not verified, or failed: MAKEPAD_RUN_TIER1_TRACE=1 says why)".into())
+                Err("the O3 build was not installed (O3 off, not verified, or failed: RELAX_TIER1_TRACE=1 says why)".into())
             }
         }
     }

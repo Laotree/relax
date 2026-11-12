@@ -9,7 +9,7 @@
 //!   panel shows like a parked panic), pauses the program's threads so the state stays inspectable,
 //!   and waits for a decision: `restart` (the process starts again) or `stop` (the process ends by
 //!   the fault's signal). With nobody who could decide (no Run panel, no inspect
-//!   watcher or agent; MAKEPAD_RUN_STALE_PARK=1 forces the park) the report is followed by `stop`.
+//!   watcher or agent; RELAX_STALE_PARK=1 forces the park) the report is followed by `stop`.
 //!   A quit (a signal, the app's own quit) ends the wait as its domain's stop does: the program
 //!   goes on so its quit runs to the end (inspect::events::quit_releases).
 //!
@@ -222,7 +222,7 @@ fn leave_when(ending: impl Fn() -> bool) {
     STUCK.fetch_sub(1, Ordering::AcqRel);
 }
 
-/// "makepad-run: stale access ..." on stderr from the handler (a stack buffer, write(2)).
+/// "relax: stale access ..." on stderr from the handler (a stack buffer, write(2)).
 fn first_line(f: &crate::os::fault::Fault, r: &Range) {
     let mut buf = [0u8; 384];
     let mut n = 0;
@@ -241,7 +241,7 @@ fn first_line(f: &crate::os::fault::Fault, r: &Range) {
         }
         h
     };
-    put(b"makepad-run: stale access into the ");
+    put(b"relax: stale access into the ");
     put(r.kind.as_bytes());
     put(b" `");
     put(r.name.as_bytes());
@@ -284,7 +284,7 @@ fn start_watcher() {
             }
         });
         if let Err(e) = spawned {
-            eprintln!("makepad: the stale-access watcher did not start ({}): a stale access ends the process without a report", e);
+            eprintln!("relax: the stale-access watcher did not start ({}): a stale access ends the process without a report", e);
         }
     });
 }
@@ -304,7 +304,7 @@ fn wait() {
 
 /// Somebody can answer a parked stale access: the Run panel, an inspect watcher or agent.
 fn decidable() -> bool {
-    std::env::var_os("MAKEPAD_RUN_STALE_PARK").is_some_and(|v| v != "0") || crate::inspect::events::can_decide()
+    std::env::var_os("RELAX_STALE_PARK").is_some_and(|v| v != "0") || crate::inspect::events::can_decide()
 }
 
 /// A thread held for good without a fault (`park_held`), waiting for the watcher's report.
@@ -359,7 +359,7 @@ fn handle_held(h: Held) {
         thread, h.os_id, frame, h.what, h.reason
     );
     let report = crate::jit::stale_report(&message, &frames, frames.get(h.at.min(frames.len().saturating_sub(1))).copied().unwrap_or(0));
-    eprintln!("makepad: {}\n  report: {}", message, report);
+    eprintln!("relax: {}\n  report: {}", message, report);
     crate::inspect::flightrec::fault_dump(&format!("stale.held tid {} {}", h.os_id, h.what));
     let verdict = format!(
         "stale access on a stack: thread `{}` (tid {}) {} at a layout-changing patch: its {} is in {} ({}). HOW: frame in first-version code at a layout patch (this code shares pages with other code, so it is not made inaccessible: the pause found the frame in the captured stacks and holds the thread before it returns there). {}",
@@ -371,10 +371,10 @@ fn handle_held(h: Held) {
         h.reason,
         if h.held { "The app runs on without it; the restart is offered" } else { "The process ends" }
     );
-    eprintln!("makepad: {}", verdict);
+    eprintln!("relax: {}", verdict);
     crate::zone_alloc::kept_with(|| ANSWERS.lock().unwrap_or_else(|e| e.into_inner()).push((verdict.clone(), report.clone())));
     if !h.held {
-        eprintln!("makepad: the thread could not be held: the process ends (it must not run that code)");
+        eprintln!("relax: the thread could not be held: the process ends (it must not run that code)");
         crate::os::fault::die_by(11);
     }
     crate::domain::held_for_good(h.os_id);
@@ -417,7 +417,7 @@ fn handle(rec: &Rec) {
         None => format!("stale access into the {} `{}` at {:#x}: its memory is never reused (a stale pointer); the thread is parked, nothing unwound", r.kind, r.name, addr),
     };
     let report = crate::jit::stale_report(&message, &frames, addr);
-    eprintln!("makepad: {}\n  report: {}", message, report);
+    eprintln!("relax: {}\n  report: {}", message, report);
     crate::inspect::flightrec::fault_dump(&format!("stale.access {} {} at {:#x} pc {:#x}", r.kind, r.name, addr, pc));
     let domain = crate::domain::id_of_base(rec.domain_base.load(Ordering::Relaxed));
     let os_id = rec.os_id.load(Ordering::Relaxed);
@@ -437,17 +437,17 @@ fn handle(rec: &Rec) {
         ),
     };
     if let Some(h) = &how {
-        eprintln!("makepad: stale access: {}", h);
+        eprintln!("relax: stale access: {}", h);
     }
     crate::zone_alloc::kept_with(|| ANSWERS.lock().unwrap_or_else(|e| e.into_inner()).push((verdict.clone(), report.clone())));
     if !decidable() {
-        eprintln!("makepad: nobody can decide on the stale access (no Run panel, inspect watcher or agent; MAKEPAD_RUN_STALE_PARK=1 parks): the process ends");
+        eprintln!("relax: nobody can decide on the stale access (no Run panel, inspect watcher or agent; RELAX_STALE_PARK=1 parks): the process ends");
         crate::os::fault::die_by(sig);
     }
     // (a paused process must answer: `makepad test` and hosted runs may not have started inspect)
     crate::inspect::start("stale-access");
     let paused = crate::inspect::instrument::pause_program();
-    eprintln!("makepad: the app is paused ({} threads held) -- decide: makepad inspect {} resume <id> restart | stop (the Run panel offers both)", paused, std::process::id());
+    eprintln!("relax: the app is paused ({} threads held) -- decide: {tool} inspect {} resume <id> restart | stop (the Run panel offers both)", paused, std::process::id(), tool = crate::tool_name());
     let decision = crate::inspect::events::park_stale(rec.os_id.load(Ordering::Relaxed), domain, &message, &frames);
     decided(decision, sig, "stale access");
 }
@@ -489,7 +489,7 @@ fn decided(decision: crate::inspect::events::StaleDecision, sig: i32, what: &str
     use crate::inspect::events::StaleDecision;
     match decision {
         StaleDecision::Stop => {
-            eprintln!("makepad: {what}: stopped");
+            eprintln!("relax: {what}: stopped");
             crate::os::fault::die_by(sig);
         }
         StaleDecision::Restart => restart_run(),
@@ -507,7 +507,7 @@ fn restart_run() {
     std::thread::sleep(std::time::Duration::from_millis(200));
     crate::inspect::instrument::resume_program();
     if let Err(e) = crate::reload::restart_run("stale access") {
-        eprintln!("makepad: stale access: {e}");
+        eprintln!("relax: stale access: {e}");
         crate::os::fault::die_by(11);
     }
 }
@@ -604,7 +604,7 @@ mod tests {
     #[test]
     fn a_thread_held_at_a_layout_patch_stops_nothing_else() {
         isolated_test!(a_thread_held_at_a_layout_patch_stops_nothing_else);
-        std::env::set_var("MAKEPAD_RUN_STALE_PARK", "1");
+        std::env::set_var("RELAX_STALE_PARK", "1");
         let what = "slot #7 `work::step` first-version code [0x1000, 0x1100) (+0x10)".to_string();
         let reason = "layout-changing patch gen 2 (fields or variants of Mode) replaced it: code built for the old layout never runs again".to_string();
         super::park_held(42, vec![0x1010, 0x2000], 0, what, reason, true);

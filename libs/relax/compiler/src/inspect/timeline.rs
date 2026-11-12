@@ -28,7 +28,7 @@ use relax_session::sync::Mutex;
 /// through the loader symbols `relax_recording` / `__relax_recording`): on while the timeline
 /// records or a watcher wants frame spikes.
 #[no_mangle]
-pub static MAKEPAD_RUN_RECORDING: AtomicBool = AtomicBool::new(false);
+pub static RELAX_RECORDING: AtomicBool = AtomicBool::new(false);
 /// the timeline's rings record
 static RINGS_ON: AtomicBool = AtomicBool::new(false);
 /// frame spikes are watched (`watch`, `events follow=1`, `--agent`)
@@ -39,21 +39,21 @@ static FRAME_WATCH: AtomicBool = AtomicBool::new(false);
 /// and other rates.
 pub static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-/// frames slower than this are `hitch` events (ns; 0: off): always on, MAKEPAD_RUN_HITCH_MS
+/// frames slower than this are `hitch` events (ns; 0: off): always on, RELAX_HITCH_MS
 /// (default 50) or `hitch ms=<n>|off`
 static HITCH_NS: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn flag_update() {
     let rec = RINGS_ON.load(Relaxed) || super::pstream::on();
-    MAKEPAD_RUN_RECORDING.store(rec || FRAME_WATCH.load(Relaxed) || HITCH_NS.load(Relaxed) > 0, Release);
+    RELAX_RECORDING.store(rec || FRAME_WATCH.load(Relaxed) || HITCH_NS.load(Relaxed) > 0, Release);
     // the wait hook: the timeline's rings, the prof stream and the UI thread's frame log want waits
     let f: fn(bool, &'static str, &'static str, u64) = wait_trace;
     crate::waits::TRACE.store(if rec || HITCH_NS.load(Relaxed) > 0 { f as usize } else { 0 }, Release);
 }
 
-/// Hitch detection on at inspect's start (MAKEPAD_RUN_HITCH_MS, default 50; 0: off).
+/// Hitch detection on at inspect's start (RELAX_HITCH_MS, default 50; 0: off).
 pub fn hitch_init() {
-    let ms = std::env::var("MAKEPAD_RUN_HITCH_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(50);
+    let ms = std::env::var("RELAX_HITCH_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(50);
     HITCH_NS.store(ms * 1_000_000, Relaxed);
     flag_update();
 }
@@ -1357,7 +1357,7 @@ fn frames_cmd(req: &Req, out: &mut Out) {
     let stop = stopped_or_now();
     let ths = build(collect(), stop);
     let Some(ui) = ui_thread(&ths) else {
-        out.err("no records: `timeline start`, use the app, `timeline stop` (makepad's UI phases need the platform's makepad run hook)");
+        out.err("no records: `timeline start`, use the app, `timeline stop` (makepad's UI phases need the platform's Relax hook)");
         return;
     };
     let fr = frames_of(&ths[ui]);
@@ -1686,9 +1686,9 @@ fn save_cmd(out: &mut Out) {
         ps::record(&mut body, ps::kind::SPANS, &ps::spans_payload(0xFFFF, &gpu_recs));
     }
     file.extend_from_slice(&body);
-    let path = std::env::temp_dir().join(format!("makepad-run-inspect-{}-timeline-{}.mkpf", std::process::id(), now_ms()));
+    let path = std::env::temp_dir().join(format!("relax-inspect-{}-timeline-{}.mkpf", std::process::id(), now_ms()));
     match std::fs::write(&path, &file) {
-        Ok(()) => out.line(&format!("{{\"saved\":{},\"records\":{},\"lanes\":{},\"bytes\":{},\"more\":[\"makepad inspect file={} pf summary\"]}}", json_str(&path.display().to_string()), n_recs, lanes.len(), file.len(), path.display())),
+        Ok(()) => out.line(&format!("{{\"saved\":{},\"records\":{},\"lanes\":{},\"bytes\":{},\"more\":[\"{tool} inspect file={} pf summary\"]}}", json_str(&path.display().to_string()), n_recs, lanes.len(), file.len(), path.display(), tool = crate::tool_name())),
         Err(e) => out.err(&format!("cannot write {}: {}", path.display(), e)),
     }
 }

@@ -1032,12 +1032,12 @@ mod tests {
         }
     }
 
-    /// Runs this test binary again with MAKEPAD_RUN_HEAP_CHECK set, as child `mode` of
+    /// Runs this test binary again with RELAX_HEAP_CHECK set, as child `mode` of
     /// `heap_check_child` (the check is read once per process).
     fn heap_check_run(mode: &str) -> std::process::Output {
         std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "zone_alloc::domain::tests::heap_check_child", "--nocapture", "--test-threads=1"])
-            .env("MAKEPAD_RUN_HEAP_CHECK", "1")
+            .env("RELAX_HEAP_CHECK", "1")
             .env("RELAX_HEAP_CHECK_CHILD", mode)
             .output()
             .unwrap()
@@ -1111,7 +1111,7 @@ mod tests {
             let out = heap_check_run(mode);
             let err = String::from_utf8_lossy(&out.stderr);
             assert!(!out.status.success(), "{mode}: the child ended normally: {err}");
-            assert!(err.contains("makepad-run heap check: free of a block that is not live"), "{mode}: {err}");
+            assert!(err.contains("relax heap check: free of a block that is not live"), "{mode}: {err}");
         }
     }
 }

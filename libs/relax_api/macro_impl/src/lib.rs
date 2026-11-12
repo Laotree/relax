@@ -1,4 +1,4 @@
-//! Expansion of `#[relax_api]` (see makepad-relax-api for what the marks mean). The item is
+//! Expansion of `#[relax_api]` (see relax-api for what the marks mean). The item is
 //! passed through unchanged; under the using crate's `host-shims` feature the expansion adds,
 //! next to it, the extern "C" wrappers and the `relax_api` link-section entries.
 
@@ -413,8 +413,8 @@ const SECTION: &str = "#[used] #[cfg_attr(target_vendor = \"apple\", link_sectio
 /// outlives a program or keep nothing of one, and free what a program held at their own end.
 fn op_phase() -> &'static str {
     match std::env::var("CARGO_CRATE_NAME").as_deref() {
-        Ok("makepad_script" | "makepad_script_std" | "makepad_tween_script" | "relax_provided_fixture") => "let _phase = ::makepad_relax_api::run_op();",
-        _ => "let _phase = ::makepad_relax_api::host_op();",
+        Ok("makepad_script" | "makepad_script_std" | "makepad_tween_script" | "relax_provided_fixture") => "let _phase = ::relax_api::run_op();",
+        _ => "let _phase = ::relax_api::host_op();",
     }
 }
 
@@ -428,9 +428,9 @@ fn op_code(o: &Owner, s: &Sig) -> String {
     let args: Vec<String> = (0..params.len()).map(|k| format!("::core::ptr::read(*a.add({k}) as *const _)")).collect();
     let call = format!("{}({})", path, args.join(", "));
     let body = if s.never {
-        format!("match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| -> () {{ unsafe {{ {call} }} }})) {{ Ok(()) => 0, Err(p) => ::makepad_relax_api::caught(p) }}")
+        format!("match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| -> () {{ unsafe {{ {call} }} }})) {{ Ok(()) => 0, Err(p) => ::relax_api::caught(p) }}")
     } else {
-        format!("match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| unsafe {{ {call} }})) {{ Ok(v) => {{ ::core::ptr::write(r as *mut _, v); 0 }} Err(p) => ::makepad_relax_api::caught(p) }}")
+        format!("match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| unsafe {{ {call} }})) {{ Ok(v) => {{ ::core::ptr::write(r as *mut _, v); 0 }} Err(p) => ::relax_api::caught(p) }}")
     };
     let slot = |t: &[TokenTree]| -> String {
         let ty = text(t, Some("'static"));
@@ -477,8 +477,8 @@ fn op_code(o: &Owner, s: &Sig) -> String {
     let phase = op_phase();
     format!(
         "{CFG} #[doc(hidden)] #[allow(non_snake_case, unused_unsafe, clippy::all)] unsafe extern \"C\" fn {w}(a: *const *mut u8, r: *mut u8) -> u32 {{ let _ = r; {phase} {body} }}
-{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static {w}_E: ::makepad_relax_api::Entry = ::makepad_relax_api::Entry {{
-  kind: ::makepad_relax_api::OP, module: module_path!(),
+{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static {w}_E: ::relax_api::Entry = ::relax_api::Entry {{
+  kind: ::relax_api::OP, module: module_path!(),
   key: {key},
   sig: {{ fn s() -> &'static str {{ ::core::any::type_name::<{fnptr}>() }} s }},
   shim: Some({w}), slots: &[{slots}], size: 0, align: 0, offsets: &[], drop: None }};",
@@ -659,8 +659,8 @@ fn expand_static(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, St
     let key = format!("{{ fn k() -> &'static str {{ concat!(module_path!(), \"::{name}\") }} k }}");
     let none = "{ fn s() -> &'static str { \"\" } s }";
     let extra = format!(
-        "{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_s{id:016x}: ::makepad_relax_api::Entry = ::makepad_relax_api::Entry {{
-  kind: ::makepad_relax_api::PER_SIDE, module: module_path!(), key: {key}, sig: {none},
+        "{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_s{id:016x}: ::relax_api::Entry = ::relax_api::Entry {{
+  kind: ::relax_api::PER_SIDE, module: module_path!(), key: {key}, sig: {none},
   shim: None, slots: &[], size: 0, align: 0, offsets: &[], drop: None }};"
     );
     Ok((toks.iter().cloned().collect(), extra))
@@ -726,8 +726,8 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
     }
     if plain {
         extra.push_str(&format!(
-            "{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_t{id:016x}: ::makepad_relax_api::Entry = ::makepad_relax_api::Entry {{
-  kind: ::makepad_relax_api::PLAIN, module: module_path!(), key: {key}, sig: {none},
+            "{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_t{id:016x}: ::relax_api::Entry = ::relax_api::Entry {{
+  kind: ::relax_api::PLAIN, module: module_path!(), key: {key}, sig: {none},
   shim: None, slots: &[], size: ::core::mem::size_of::<{ty}>() as u64, align: ::core::mem::align_of::<{ty}>() as u64,
   offsets: &[{}], drop: None }};",
             offsets.join(", ")
@@ -735,8 +735,8 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
     } else {
         extra.push_str(&format!(
             "{CFG} #[doc(hidden)] #[allow(non_snake_case)] unsafe extern \"C\" fn __relax_api_d{id:016x}(p: *mut u8) {{ let _ = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| unsafe {{ ::core::ptr::drop_in_place(p as *mut {ty}) }})); }}
-{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_t{id:016x}: ::makepad_relax_api::Entry = ::makepad_relax_api::Entry {{
-  kind: ::makepad_relax_api::HANDLE, module: module_path!(), key: {key}, sig: {none},
+{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_t{id:016x}: ::relax_api::Entry = ::relax_api::Entry {{
+  kind: ::relax_api::HANDLE, module: module_path!(), key: {key}, sig: {none},
   shim: None, slots: &[], size: ::core::mem::size_of::<{ty}>() as u64, align: ::core::mem::align_of::<{ty}>() as u64,
   offsets: &[{}], drop: if ::core::mem::needs_drop::<{ty}>() {{ Some(__relax_api_d{id:016x}) }} else {{ None }} }};",
             offsets.join(", ")
@@ -746,9 +746,9 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
             let h = fnv(&format!("{name} default"));
             let phase = op_phase();
             extra.push_str(&format!(
-                "\n{CFG} #[doc(hidden)] #[allow(non_snake_case, unused_unsafe)] unsafe extern \"C\" fn __relax_api_h{h:016x}(a: *const *mut u8, r: *mut u8) -> u32 {{ let _ = a; {phase} match ::std::panic::catch_unwind(<{ty} as ::core::default::Default>::default) {{ Ok(v) => {{ ::core::ptr::write(r as *mut {ty}, v); 0 }} Err(p) => ::makepad_relax_api::caught(p) }} }}
-{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_h{h:016x}_E: ::makepad_relax_api::Entry = ::makepad_relax_api::Entry {{
-  kind: ::makepad_relax_api::OP, module: module_path!(),
+                "\n{CFG} #[doc(hidden)] #[allow(non_snake_case, unused_unsafe)] unsafe extern \"C\" fn __relax_api_h{h:016x}(a: *const *mut u8, r: *mut u8) -> u32 {{ let _ = a; {phase} match ::std::panic::catch_unwind(<{ty} as ::core::default::Default>::default) {{ Ok(v) => {{ ::core::ptr::write(r as *mut {ty}, v); 0 }} Err(p) => ::relax_api::caught(p) }} }}
+{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_h{h:016x}_E: ::relax_api::Entry = ::relax_api::Entry {{
+  kind: ::relax_api::OP, module: module_path!(),
   key: {{ fn k() -> &'static str {{ ::core::any::type_name_of_val(&<{ty} as ::core::default::Default>::default) }} k }},
   sig: {{ fn s() -> &'static str {{ ::core::any::type_name::<fn() -> {ty}>() }} s }},
   shim: Some(__relax_api_h{h:016x}), slots: &[[::core::mem::size_of::<{ty}>() as u64, ::core::mem::align_of::<{ty}>() as u64, 0, 0]], size: 0, align: 0, offsets: &[], drop: None }};"
@@ -759,9 +759,9 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
             let h = fnv(&format!("{name} {tag}"));
             let phase = op_phase();
             extra.push_str(&format!(
-                "\n{CFG} #[doc(hidden)] #[allow(non_snake_case, unused_unsafe)] unsafe extern \"C\" fn __relax_api_h{h:016x}(a: *const *mut u8, r: *mut u8) -> u32 {{ {phase} match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| unsafe {{ {call} }})) {{ Ok(v) => {{ ::core::ptr::write(r as *mut _, v); 0 }} Err(p) => ::makepad_relax_api::caught(p) }} }}
-{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_h{h:016x}_E: ::makepad_relax_api::Entry = ::makepad_relax_api::Entry {{
-  kind: ::makepad_relax_api::OP, module: module_path!(),
+                "\n{CFG} #[doc(hidden)] #[allow(non_snake_case, unused_unsafe)] unsafe extern \"C\" fn __relax_api_h{h:016x}(a: *const *mut u8, r: *mut u8) -> u32 {{ {phase} match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| unsafe {{ {call} }})) {{ Ok(v) => {{ ::core::ptr::write(r as *mut _, v); 0 }} Err(p) => ::relax_api::caught(p) }} }}
+{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_h{h:016x}_E: ::relax_api::Entry = ::relax_api::Entry {{
+  kind: ::relax_api::OP, module: module_path!(),
   key: {{ fn k() -> &'static str {{ concat!(\"<\", module_path!(), \"::{name} as {trait_key}\") }} k }}, sig: {none},
   shim: Some(__relax_api_h{h:016x}), slots: &[], size: 0, align: 0, offsets: &[], drop: None }};"
             ));
@@ -773,7 +773,7 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
             helper("eq", "PartialEq>::eq", format!("<{ty} as ::core::cmp::PartialEq>::eq(::core::ptr::read(*a.add(0) as *const _), ::core::ptr::read(*a.add(1) as *const _))"));
         }
         if args.iter().any(|a| a == "hash") {
-            helper("hash", "Hash>::hash_into", format!("{{ let x: &{ty} = ::core::ptr::read(*a.add(0) as *const &{ty}); let st: *mut u8 = ::core::ptr::read(*a.add(1) as *const *mut u8); let w: unsafe extern \"C-unwind\" fn(*mut u8, *const u8, usize) = ::core::ptr::read(*a.add(2) as *const _); ::core::hash::Hash::hash(x, &mut ::makepad_relax_api::RelaxHasher(st, w)) }}"));
+            helper("hash", "Hash>::hash_into", format!("{{ let x: &{ty} = ::core::ptr::read(*a.add(0) as *const &{ty}); let st: *mut u8 = ::core::ptr::read(*a.add(1) as *const *mut u8); let w: unsafe extern \"C-unwind\" fn(*mut u8, *const u8, usize) = ::core::ptr::read(*a.add(2) as *const _); ::core::hash::Hash::hash(x, &mut ::relax_api::RelaxHasher(st, w)) }}"));
         }
         let debug = args.iter().any(|a| a == "debug");
         let display = args.iter().any(|a| a == "display");

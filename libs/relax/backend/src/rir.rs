@@ -1946,7 +1946,7 @@ impl Func {
 
     /// Structural verifier: every use has a class-correct vreg, every target exists.
     /// Hard verification after a rewrite that runs past the last `verify` (JITSAFE 19): always in
-    /// debug builds; in release with MAKEPAD_RUN_VERIFY_PASSES (the gates' diff_fast legs set it).
+    /// debug builds; in release with RELAX_VERIFY_PASSES (the gates' diff_fast legs set it).
     /// A broken function is an error naming the pass -- never compiled.
     pub fn verify_after(&self, pass: &str) -> Result<(), String> {
         if !verify_passes_on() {
@@ -2438,12 +2438,12 @@ pub fn split_unwind_info(code: &[u8]) -> (usize, Option<UnwindInfo>) {
     }
 }
 
-/// MAKEPAD_RUN_UNWIND_STATS: bytes of cleanup pads, landing stubs, unwind trailers; invoke count.
+/// RELAX_UNWIND_STATS: bytes of cleanup pads, landing stubs, unwind trailers; invoke count.
 pub static UNWIND_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 pub fn unwind_stats_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_UNWIND_STATS").is_ok())
+    *ON.get_or_init(|| std::env::var("RELAX_UNWIND_STATS").is_ok())
 }
 
 /// Per stack slot: whether any SlotAddr names it (the only way to reach a slot).
@@ -2522,11 +2522,11 @@ mod unwind_trailer_tests {
     }
 }
 
-/// MAKEPAD_RUN_VERIFY_PASSES (any value), `force_verify_passes`, or a debug build:
+/// RELAX_VERIFY_PASSES (any value), `force_verify_passes`, or a debug build:
 /// `Func::verify_after` checks.
 pub fn verify_passes_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    cfg!(debug_assertions) || FORCE_VERIFY.load(std::sync::atomic::Ordering::Relaxed) || *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_VERIFY_PASSES").is_some())
+    cfg!(debug_assertions) || FORCE_VERIFY.load(std::sync::atomic::Ordering::Relaxed) || *ON.get_or_init(|| std::env::var_os("RELAX_VERIFY_PASSES").is_some())
 }
 
 static FORCE_VERIFY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

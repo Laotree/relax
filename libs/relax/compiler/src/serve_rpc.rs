@@ -163,7 +163,7 @@ fn owner_package(path: &str, root: &Path) -> Result<String, String> {
 use crate::vfs::canonical;
 
 pub fn cmd_serve(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
-    match run(sess, args) { Ok(()) => 0, Err(e) => { eprintln!("makepad serve: {e}"); 2 } }
+    match run(sess, args) { Ok(()) => 0, Err(e) => { eprintln!("relax serve: {e}"); 2 } }
 }
 fn run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> Result<(), String> {
     let mut cwd = std::env::current_dir().map_err(|e|e.to_string())?;
@@ -352,7 +352,7 @@ fn connect(start: bool) -> Result<PathBuf, String> {
         if theirs == crate::jit::PROVENANCE { return Ok(dir); }
         if let Ok((_, _, pid)) = endpoint(&dir) {
             serve_os::stop(pid);
-            eprintln!("makepad: the check server (pid {pid}) runs another compiler ({}): stopped it{}", if theirs.is_empty() { "unnamed" } else { theirs }, if start { "" } else { "; checking in-process" });
+            eprintln!("relax: the check server (pid {pid}) runs another compiler ({}): stopped it{}", if theirs.is_empty() { "unnamed" } else { theirs }, if start { "" } else { "; checking in-process" });
             if !start { return Err("the check server ran another compiler".into()); }
             let stopping = Instant::now();
             while serve_os::alive(pid) {
@@ -362,7 +362,7 @@ fn connect(start: bool) -> Result<PathBuf, String> {
         }
     }
     if !start { return Err("no check server".into()); }
-    eprintln!("makepad: starting the check server...");
+    eprintln!("relax: starting the check server...");
     let log_path = dir.join("serve.log");
     let log = if log_path.exists() { std::fs::OpenOptions::new().append(true).open(&log_path) } else { crate::os::proc::create_private(&log_path) }.map_err(|e|e.to_string())?;
     let mut cmd = std::process::Command::new(std::env::current_exe().map_err(|e|e.to_string())?);
@@ -390,7 +390,7 @@ fn check_packages(args: &[String]) -> Result<Vec<String>, i32> {
         match args[i].as_str() {
             "-p" | "--package" => {
                 let Some(p) = args.get(i + 1).filter(|p| !p.starts_with('-')) else {
-                    eprintln!("makepad check: {} needs a package", args[i]);
+                    eprintln!("relax check: {} needs a package", args[i]);
                     return Err(2);
                 };
                 packages.push(p.clone());
@@ -407,7 +407,7 @@ fn check_packages(args: &[String]) -> Result<Vec<String>, i32> {
         return Ok(out);
     }
     let exe = std::env::current_exe().map_err(|e| {
-        eprintln!("makepad check: the loader's own path: {e}");
+        eprintln!("relax check: the loader's own path: {e}");
         2
     })?;
     let mut worst = 0;
@@ -415,7 +415,7 @@ fn check_packages(args: &[String]) -> Result<Vec<String>, i32> {
         let status = std::process::Command::new(&exe).arg("check").args(&out).arg(&p).status();
         let code = status.ok().and_then(|s| s.code()).unwrap_or(2);
         if code != 0 {
-            eprintln!("makepad check: {p}: exit {code}");
+            eprintln!("relax check: {p}: exit {code}");
         }
         worst = worst.max(code);
     }
@@ -432,7 +432,7 @@ pub fn check(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     let never = args.iter().any(|a|a=="--no-serve");
     let json = args.iter().any(|a|a=="--json");
     let rest: Vec<_> = args.iter().filter(|a| !matches!(a.as_str(),"--serve"|"--no-serve"|"--json")).collect();
-    if start && never { eprintln!("makepad: --serve and --no-serve conflict"); return 2; }
+    if start && never { eprintln!("relax: --serve and --no-serve conflict"); return 2; }
     if !never && rest.len() == 1 && !rest[0].starts_with('-') {
         let response = connect(start).and_then(|dir|request(&dir,"check",&format!("{{\"pkg\":{}}}",quote(rest[0]))));
         match response {
@@ -445,13 +445,13 @@ pub fn check(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
                 let errors = summary.get("errors").map_or(0.0,Json::num) as usize;
                 let ms = summary.get("ms").map_or(0.0,Json::num) as u64;
                 if json { println!("{{\"type\":\"summary\",\"errors\":{errors},\"warnings\":{},\"ms\":{ms}}}",summary.get("warnings").map_or(0.0,Json::num)); }
-                else { eprintln!("makepad check: {errors} errors, {ms} ms"); }
+                else { eprintln!("relax check: {errors} errors, {ms} ms"); }
                 return if errors == 0 { 0 } else { 1 };
             }
-            Err(e) if start => { eprintln!("makepad: {e}"); return 2; }
+            Err(e) if start => { eprintln!("relax: {e}"); return 2; }
             Err(_) => {},
         }
-    } else if start { eprintln!("makepad: --serve supports check [--json] <package>; use --no-serve for other check options"); return 2; }
+    } else if start { eprintln!("relax: --serve supports check [--json] <package>; use --no-serve for other check options"); return 2; }
     let mut a = vec!["--check".into()]; a.extend(args.iter().filter(|a| !matches!(a.as_str(),"--serve"|"--no-serve")).cloned());
     crate::run::cmd_run(sess, &a)
 }
@@ -460,7 +460,7 @@ pub fn query(sess: &std::sync::Arc<crate::Session>, method: &str, args: &[String
     let params = match (method, values.as_slice()) {
         ("schema", [pkg,path]) => format!("{{\"pkg\":{},\"path\":{}}}",quote(pkg),quote(path)),
         ("hover"|"definition", [pkg,path,line,col]) if line.parse::<u32>().is_ok() && col.parse::<u32>().is_ok() => format!("{{\"pkg\":{},\"path\":{},\"line\":{},\"col\":{}}}",quote(pkg),quote(&canonical(path)),line,col),
-        _ => { eprintln!("usage: makepad schema [--serve] <pkg> <item> | makepad hover|definition [--serve] <pkg> <file> <line> <col>"); return 2; }
+        _ => { eprintln!("usage: {tool} schema [--serve] <pkg> <item> | {tool} hover|definition [--serve] <pkg> <file> <line> <col>", tool = crate::tool_name()); return 2; }
     };
     let start = args.iter().any(|a|a=="--serve");
     let response = match connect(start) {
@@ -475,6 +475,6 @@ pub fn query(sess: &std::sync::Arc<crate::Session>, method: &str, args: &[String
         Err(e) => Err(e),
     };
     match response {
-        Ok(v) => { println!("{v}"); 0 }, Err(e) => { eprintln!("makepad: {e}"); 2 }
+        Ok(v) => { println!("{v}"); 0 }, Err(e) => { eprintln!("relax: {e}"); 2 }
     }
 }

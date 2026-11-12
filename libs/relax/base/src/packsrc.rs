@@ -4,7 +4,7 @@
 //! (vfs.rs) as the workspace root.
 //!
 //! The file set is what the front end READS, recorded rather than guessed: the packer runs
-//! `makepad check` of every package in a child process with a cold cache and MAKEPAD_RUN_READ_LOG set (vfs.rs
+//! `makepad check` of every package in a child process with a cold cache and RELAX_READ_LOG set (vfs.rs
 //! notes every read, probe and folder listing of the child and of the build scripts it starts), for
 //! the crate graph and cfg of `--target`. To that it adds
 //!   - the `resources/` folder of every crate it read Rust sources of (what apps load at run time),
@@ -211,13 +211,13 @@ pub fn run(opts: Options) -> Result<(), String> {
         // the device. About 12-17 s per package on the Mac with the shared cache.
         cmd.arg("--workspace");
         cmd.arg(pkg).args(flags).current_dir(&root);
-        cmd.env("MAKEPAD_RUN_CACHE_DIR", work.join("cache"));
-        cmd.env("MAKEPAD_RUN_READ_LOG", &log);
+        cmd.env("RELAX_CACHE_DIR", work.join("cache"));
+        cmd.env("RELAX_READ_LOG", &log);
         crate::progenv::scrub_run_facts(&mut cmd);
-        cmd.env_remove("MAKEPAD_RUN_CHECK_TARGET");
-        cmd.env("MAKEPAD_RUN_OFFLINE", "1").env("MAKEPAD_CEF_OFFLINE", "1");
+        cmd.env_remove("RELAX_CHECK_TARGET");
+        cmd.env("RELAX_OFFLINE", "1").env("MAKEPAD_CEF_OFFLINE", "1");
         if let Some(t) = &opts.target {
-            cmd.env("MAKEPAD_RUN_CHECK_TARGET", t);
+            cmd.env("RELAX_CHECK_TARGET", t);
         }
         let f = std::fs::File::create(&out_log).map_err(|e| e.to_string())?;
         cmd.stdout(f.try_clone().map_err(|e| e.to_string())?).stderr(f);
@@ -232,7 +232,7 @@ pub fn run(opts: Options) -> Result<(), String> {
             return Err(format!("check of {pkg} found {diag} error line(s); log {}:\n{}", out_log.display(), errs.join("\n")));
         }
         // a check that failed to run to the end read fewer files than a run needs
-        if st.code().is_none() || !text.contains("makepad check:") {
+        if st.code().is_none() || !text.contains("relax check:") {
             let tail: Vec<&str> = text.lines().rev().take(8).collect();
             return Err(format!("check of {pkg} did not finish ({}); log {}:\n{}", st, out_log.display(), tail.into_iter().rev().collect::<Vec<_>>().join("\n")));
         }
@@ -408,7 +408,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         let c = s.stored_size(oid).map_err(|e| e.to_string())?.unwrap_or(0);
         let c = *stored.entry(*oid).or_insert(c);
         let key = if path.starts_with(&format!("{STD_DIR}/")) {
-            "(makepad run std)".to_string()
+            "(Relax std)".to_string()
         } else {
             match package_of(path, &pkgs) {
                 Some("") | None => "(workspace root)".to_string(),

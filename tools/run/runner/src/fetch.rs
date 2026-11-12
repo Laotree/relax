@@ -11,7 +11,7 @@
 //! Offline, the newest kept commits run. `--cached` runs the newest kept commits at once and
 //! fetches the spec in a detached `makepad fetch` for the next start.
 //!
-//! `<home>` is $MAKEPAD_RUN_HOME, else `~/.makepad-run` (`%USERPROFILE%\.makepad-run`). Requests carry a plain
+//! `<home>` is $RELAX_HOME, else `~/.relax` (`%USERPROFILE%\.relax`). Requests carry a plain
 //! User-Agent and nothing that identifies the person.
 pub use relax_compiler::git::fetch::Repo;
 use relax_compiler::git::fetch::fetch_repo;
@@ -40,7 +40,7 @@ impl Spec {
         Ok((dir.to_string(), Repo::parse(url)?))
     }
     /// The words that name this spec on a command line (`makepad fetch` takes them back; the
-    /// loader exports them as MAKEPAD_RUN_SPEC for the programs it runs).
+    /// loader exports them as RELAX_SPEC for the programs it runs).
     pub fn args(&self) -> Vec<String> {
         let w = |r: &Repo| {
             let base = r.reference.as_ref().map_or(r.url.clone(), |x| format!("{}#{x}", r.url));
@@ -178,7 +178,7 @@ fn export_path(out: &Path, rel: &str) -> Result<Option<PathBuf>, String> {
 }
 
 /// `makepad export`: writes the snapshot's files into `out` as one working tree (the mounted
-/// repositories at their folders), then the edits folder's files over them (MAKEPAD_RUN_EDITS: what
+/// repositories at their folders), then the edits folder's files over them (RELAX_EDITS: what
 /// the app's runs read instead of the store's), so a native build (cargo) sees what the app runs.
 /// Files whose bytes are already there are left alone (their times too: cargo rebuilds only what
 /// changed); files an earlier export wrote that this one does not are removed
@@ -263,7 +263,7 @@ pub fn export(snap: &Snapshot, edits: Option<&Path>, out: &Path) -> Result<(usiz
     Ok((files.len(), wrote))
 }
 
-/// The repositories a run has mounted (`MAKEPAD_RUN_VFS`) as a snapshot, each at its folder in the
+/// The repositories a run has mounted (`RELAX_VFS`) as a snapshot, each at its folder in the
 /// virtual workspace: what `makepad export --mounted` writes out for a native build of a run that
 /// stands nowhere on disk.
 pub fn mounted(table: &str, workspace: &str) -> Result<Snapshot, String> {
@@ -271,7 +271,7 @@ pub fn mounted(table: &str, workspace: &str) -> Result<Snapshot, String> {
     let workspace = normalize_path(workspace);
     let mut parts = Vec::new();
     for line in table.lines().filter(|l| !l.is_empty()) {
-        let bad = || format!("MAKEPAD_RUN_VFS: cannot export {line}");
+        let bad = || format!("RELAX_VFS: cannot export {line}");
         let mut it = line.split('\t');
         // a fourth field is a store inside a bigger file, an embedded app's and never a workspace's
         let (Some(root), Some(path), Some(commit), None) = (it.next(), it.next(), it.next(), it.next()) else { return Err(bad()) };
@@ -280,7 +280,7 @@ pub fn mounted(table: &str, workspace: &str) -> Result<Snapshot, String> {
         let commit = relax_compiler::gitstore::from_hex(commit).ok_or_else(bad)?;
         parts.push((dir.trim_start_matches('/').to_string(), PathBuf::from(path), commit));
     }
-    if parts.is_empty() { return Err("MAKEPAD_RUN_VFS: nothing is mounted".to_string()); }
+    if parts.is_empty() { return Err("RELAX_VFS: nothing is mounted".to_string()); }
     Ok(Snapshot { label: String::new(), parts })
 }
 
@@ -353,7 +353,7 @@ pub fn split_args(args: &[String]) -> Option<Result<(Vec<String>, Spec, bool, Ve
     Some(Ok((opts, Spec { root, mounts }, cached, rest)))
 }
 
-/// Whether a mount this process inherited (`table`: MAKEPAD_RUN_VFS, a parent run's virtual
+/// Whether a mount this process inherited (`table`: RELAX_VFS, a parent run's virtual
 /// workspace) serves this run, whose command line is `words` (after the executable): not when the
 /// run's workspace comes from elsewhere -- a launch record (`app <id>`, or no arguments), a git URL,
 /// or a --workspace-dir outside every root of the table. `export --mounted` exports it.
@@ -557,14 +557,14 @@ mod tests {
     /// The fixtures need HTTP, while offline mode deliberately forbids every request.
     /// Give each scenario its own environment without changing parallel tests' settings.
     fn run_online_child(test: &str) -> bool {
-        if std::env::var("MAKEPAD_RUN_FETCH_TEST").as_deref() == Ok(test) {
+        if std::env::var("RELAX_FETCH_TEST").as_deref() == Ok(test) {
             return false;
         }
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test, "--nocapture"])
-            .env("MAKEPAD_RUN_FETCH_TEST", test)
+            .env("RELAX_FETCH_TEST", test)
             .env("CARGO_NET_OFFLINE", "false")
-            .env("MAKEPAD_RUN_OFFLINE", "0")
+            .env("RELAX_OFFLINE", "0")
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);

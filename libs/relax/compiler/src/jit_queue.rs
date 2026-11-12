@@ -520,7 +520,7 @@ pub(super) fn start() {
     };
     match DRAINS.start(want, init, || crate::pool::drain(&SOURCE)) {
         Ok(Started::Already | Started::All) => {}
-        Ok(Started::Short(have, e)) => eprintln!("makepad-run: the JIT compiles on {have} of its {want} workers: the OS refused another thread ({e})"),
+        Ok(Started::Short(have, e)) => eprintln!("relax: the JIT compiles on {have} of its {want} workers: the OS refused another thread ({e})"),
         Err(e) => panic!("failed to start JIT pool worker: {e}"),
     }
 }
@@ -553,7 +553,7 @@ pub(super) fn stop_workers(report: std::time::Duration) {
                     None => TIER_LABELS[r.tier].to_string(),
                 }).collect()
             };
-            eprintln!("makepad-run: a run's end waits {:.0} s for its compile workers, {} still in a job: {}", said.as_secs_f64(), DRAINS.count.load(Ordering::SeqCst) - DRAINS_BACK.load(Ordering::SeqCst), jobs.join(", "));
+            eprintln!("relax: a run's end waits {:.0} s for its compile workers, {} still in a job: {}", said.as_secs_f64(), DRAINS.count.load(Ordering::SeqCst) - DRAINS_BACK.load(Ordering::SeqCst), jobs.join(", "));
         }
         wake_all();
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -945,7 +945,7 @@ fn worker_loop(index: usize) {
                     drop(active);
                     if let Err(payload) = result {
                         let (message, bail) = panic_payload(&*payload);
-                        if !bail { eprintln!("makepad: JIT job panicked: {message}"); }
+                        if !bail { eprintln!("relax: JIT job panicked: {message}"); }
                     }
                     held = Some(permit);
                     finished = Some((serial, tier));

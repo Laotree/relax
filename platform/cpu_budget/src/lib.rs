@@ -10,7 +10,7 @@
 //! tokens, Visible none above the JIT's floor. A build has no checkpoint for seconds at a time, in
 //! its optimiser: until its next one the machine runs over its cores, with the build below the
 //! person's work by the OS's priorities.
-use makepad_relax_api::relax_api;
+use relax_api::relax_api;
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write;

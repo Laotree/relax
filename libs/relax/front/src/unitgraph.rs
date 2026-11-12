@@ -326,10 +326,10 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
                 for bin_name in &g.bins {
                     let wrapper = bin_dir.join(if cfg!(windows) { format!("{bin_name}.cmd") } else { bin_name.clone() });
                     let script = if cfg!(windows) {
-                        format!("@echo off\r\nset MAKEPAD_RUN_SELF_EXEC=\r\nset MAKEPAD_RUN_SELF_EXEC_SILENT_ADDED=\r\n\"{}\" run --quiet --silent --no-live --run-dir \"{}\" --workspace-dir \"{}\" \"{}\" --bin \"{}\" -- %*\r\n",
+                        format!("@echo off\r\nset RELAX_SELF_EXEC=\r\nset RELAX_SELF_EXEC_SILENT_ADDED=\r\n\"{}\" run --quiet --silent --no-live --run-dir \"{}\" --workspace-dir \"{}\" \"{}\" --bin \"{}\" -- %*\r\n",
                             exe_str, td_str, pkg_dir, pkg_name, bin_name)
                     } else {
-                        format!("#!/bin/sh\nunset MAKEPAD_RUN_SELF_EXEC MAKEPAD_RUN_SELF_EXEC_SILENT_ADDED\nexec {} run --quiet --silent --no-live --run-dir {} --workspace-dir {} {} --bin {} -- \"$@\"\n",
+                        format!("#!/bin/sh\nunset RELAX_SELF_EXEC RELAX_SELF_EXEC_SILENT_ADDED\nexec {} run --quiet --silent --no-live --run-dir {} --workspace-dir {} {} --bin {} -- \"$@\"\n",
                             sh_quote(&exe_str), sh_quote(&td_str), sh_quote(pkg_dir), sh_quote(pkg_name), sh_quote(bin_name))
                     };
                     if std::fs::read(&wrapper).ok().as_deref() != Some(script.as_bytes()) {
@@ -397,7 +397,7 @@ fn fnv(data: &[u8], mut h: u64) -> u64 {
     h
 }
 
-/// The triple the checked crate graph is read for (MAKEPAD_RUN_CHECK_TARGET, else the machine).
+/// The triple the checked crate graph is read for (RELAX_CHECK_TARGET, else the machine).
 fn target_triple(sess: &std::sync::Arc<crate::Session>) -> &'static str {
     crate::cfg::CfgSet::host(sess, &[]).triple()
 }
@@ -512,7 +512,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
         let why = reason.describe(pname);
         if builds || cached.is_some() {
             if builds && sess.runtime.profile {
-                eprintln!("makepad-run build-script: {} is native ({})", pname, why);
+                eprintln!("relax build-script: {} is native ({})", pname, why);
             }
             native_seeds.push(i);
             continue;
@@ -520,7 +520,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
         // a script that runs a C compiler cannot work without one; `links =` / DEP_ metadata
         // alone run under Relax as before
         if reason.compiles_c() && check_only {
-            eprintln!("makepad check: `{}`'s build script compiles C ({}): not run without `--allow-c` (its cfgs and OUT_DIR are missing; a `--allow-c` run fills the cache this check reads)", pname, why);
+            eprintln!("relax check: `{}`'s build script compiles C ({}): not run without `--allow-c` (its cfgs and OUT_DIR are missing; a `--allow-c` run fills the cache this check reads)", pname, why);
             check_skipped.push(bs.krate);
             continue;
         }
@@ -738,7 +738,7 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
         let name = &g.crates[bs.krate].name;
         let role = if noop::script(bs, &g.raw) {
             if sess.runtime.profile {
-                eprintln!("makepad-run build-script: {} skipped (no effect under MAKEPAD_RUN_BUILD_SCRIPT)", pname);
+                eprintln!("relax build-script: {} skipped (no effect under RELAX_BUILD_SCRIPT)", pname);
             }
             ScriptRole::Answered(Vec::new())
         } else { script_role(pname, &bs.features) };
@@ -883,7 +883,7 @@ fn apply_script_results(g: &mut Graph, results: Vec<(Vec<usize>, Result<String, 
             // a check without `--allow-c`: a script that needed a skipped C package (aws-lc-rs reads
             // aws-lc-sys's DEP_ metadata) leaves its crate unconfigured, said once, not fatal
             Err(e) if check_only => {
-                eprintln!("makepad check: {} (its crate is checked without the script's cfgs)", e.lines().next().unwrap_or(""));
+                eprintln!("relax check: {} (its crate is checked without the script's cfgs)", e.lines().next().unwrap_or(""));
                 String::new()
             }
             Err(e) => return Err(e),
@@ -1066,7 +1066,7 @@ fn self_exe() -> std::io::Result<std::path::PathBuf> {
 /// (stdout of the script, OUT_DIR). The script runs as a Relax program: this executable started
 /// again on the script's units (script_units) -- no rustc, no script binary; Relax re-running
 /// itself is the only process it starts. A script of a git run reads its package through the
-/// VFS (MAKEPAD_RUN_VFS / MAKEPAD_RUN_WORKSPACE for the child), and writes only OUT_DIR (on disk).
+/// VFS (RELAX_VFS / RELAX_WORKSPACE for the child), and writes only OUT_DIR (on disk).
 #[allow(clippy::too_many_arguments)]
 fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUnit], cenv: &[(String, String)], dir: &str, pname: &str, ver: &str, name: &str, target_dir: &str, receipt: Option<&str>) -> (Result<String, String>, String) {
     if let Err(e) = crate::vfs::read(&bs.src_path) {
@@ -1076,7 +1076,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     if sess.runtime.profile {
         if let Some(rewrite) = &rewrite {
             for (dep, function) in &rewrite.calls {
-                eprintln!("makepad-run build-script: {} runs without {}::{}() (inert)", pname, dep, function);
+                eprintln!("relax build-script: {} runs without {}::{}() (inert)", pname, dep, function);
             }
         }
     }
@@ -1111,11 +1111,11 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     };
     // nesting: a build-dependency's own script runs inside a script's run, and its
     // build-dependencies' scripts inside that, as deep as the graph goes (cargo refuses a cyclic
-    // one). MAKEPAD_RUN_SCRIPT_DEPTH marks a script's run; MAKEPAD_RUN_SCRIPT_CHAIN names the
+    // one). RELAX_SCRIPT_DEPTH marks a script's run; RELAX_SCRIPT_CHAIN names the
     // packages whose scripts are running, each as name@version (two versions of one package may
     // both sit in a chain). A package already in the chain is a script that runs itself again.
-    let depth: u32 = std::env::var("MAKEPAD_RUN_SCRIPT_DEPTH").ok().and_then(|d| d.parse().ok()).unwrap_or(0) + 1;
-    let chain = std::env::var("MAKEPAD_RUN_SCRIPT_CHAIN").unwrap_or_default();
+    let depth: u32 = std::env::var("RELAX_SCRIPT_DEPTH").ok().and_then(|d| d.parse().ok()).unwrap_or(0) + 1;
+    let chain = std::env::var("RELAX_SCRIPT_CHAIN").unwrap_or_default();
     let me = format!("{pname}@{ver}");
     if chain.split('>').any(|p| p == me) {
         return (Err(format!("{}: the build script of `{}` runs again inside its own run (build-dependency cycle: {} -> {}); refused", bs.src_path, me, chain.replace('>', " -> "), me)), out_dir);
@@ -1127,7 +1127,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     cmd.args(["run", "--quiet", "--silent", "--run-dir", target_dir, "--units", &units_path, "build-script-build"]);
     cmd.env("OUT_DIR", &out_dir)
         // Build scripts may test this to skip work only rustc needs.
-        .env("MAKEPAD_RUN_BUILD_SCRIPT", "1")
+        .env("RELAX_BUILD_SCRIPT", "1")
         .env("TARGET", target_triple(sess))
         .env("HOST", host_triple(sess))
         .env("PROFILE", "release")
@@ -1141,12 +1141,12 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         .env("RUSTC", &exe)
         .env("CARGO", &exe)
         .env("RUSTDOC", "rustdoc")
-        .env("MAKEPAD_RUN_AS_RUSTC", "build-script")
-        .env("MAKEPAD_RUN_SCRIPT_DEPTH", depth.to_string())
-        .env("MAKEPAD_RUN_SCRIPT_CHAIN", &chain)
+        .env("RELAX_AS_RUSTC", "build-script")
+        .env("RELAX_SCRIPT_DEPTH", depth.to_string())
+        .env("RELAX_SCRIPT_CHAIN", &chain)
         // the script is compiled and run for the machine (cargo: build scripts are host
         // artifacts); the target it builds for reaches it only as TARGET / CARGO_CFG_TARGET_*
-        .env_remove("MAKEPAD_RUN_CHECK_TARGET");
+        .env_remove("RELAX_CHECK_TARGET");
     for (k, v) in crate::cfg::CfgSet::host(sess, &[]).build_script_env() {
         cmd.env(k, v);
     }
@@ -1170,14 +1170,14 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     // the package folder is the script's current folder (cargo runs scripts there); a virtual one
     // is handed over as the child's virtual workspace with the mount table
     if crate::vfs::is_virtual(dir) {
-        cmd.env("MAKEPAD_RUN_WORKSPACE", dir).env("MAKEPAD_RUN_VFS", crate::vfs::mounts_text());
-        if let Some(e) = std::env::var_os("MAKEPAD_RUN_EDITS") {
-            cmd.env("MAKEPAD_RUN_EDITS", e);
+        cmd.env("RELAX_WORKSPACE", dir).env("RELAX_VFS", crate::vfs::mounts_text());
+        if let Some(e) = std::env::var_os("RELAX_EDITS") {
+            cmd.env("RELAX_EDITS", e);
         }
     } else {
         // a package on disk (a registry crate of a store run): its folder is the current folder,
         // and no virtual workspace crosses (Relax's std resolves relative paths against
-        // MAKEPAD_RUN_WORKSPACE first: rustix's build.rs probed `src/backend/linux_raw/arch/x86_64.rs`
+        // RELAX_WORKSPACE first: rustix's build.rs probed `src/backend/linux_raw/arch/x86_64.rs`
         // there, found nothing and chose its libc backend)
         cmd.current_dir(dir);
     }
@@ -1200,8 +1200,8 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     }
     let build_dir = dir_of_path(&out_dir);
     let output_path = format!("{}/output", build_dir);
-    let key_path = format!("{}/makepad-run-rerun", build_dir);
-    let env_path = format!("{}/makepad-run-rerun-env", build_dir);
+    let key_path = format!("{}/relax-rerun", build_dir);
+    let env_path = format!("{}/relax-rerun-env", build_dir);
     // Ok: the previous output, which stands; Err: why the script runs again
     let previous = || match (std::fs::read_to_string(&output_path), std::fs::read_to_string(&key_path)) {
         (Ok(old), Ok(key)) => {
@@ -1212,37 +1212,37 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     };
     let mut why = match previous() {
         Ok(old) => {
-            if sess.runtime.profile { eprintln!("makepad-run build-script: {} cached", pname); }
+            if sess.runtime.profile { eprintln!("relax build-script: {} cached", pname); }
             return (Ok(old), out_dir);
         }
         Err(why) => why,
     };
     // One run at a time makes a script's output (its OUT_DIR is one folder for every run of this
-    // run dir): the run holds `makepad-run-claim` beside it locked while its script runs. A run
+    // run dir): the run holds `relax-claim` beside it locked while its script runs. A run
     // that finds it held waits and takes the output the other made, where two runs started
     // together each compiled and ran every script. The OS drops the lock with a run that dies.
     // The script slot (this process's) comes first: a run holding the claim and waiting for a slot
     // could wait on a slot whose script's nested run waits for this claim (a package that is
     // both a dependency here and a build-dependency of another script).
     let _slot = script_slot();
-    let claim = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(format!("{}/makepad-run-claim", build_dir)).ok();
+    let claim = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(format!("{}/relax-claim", build_dir)).ok();
     if let Some(claim) = claim.as_ref().filter(|claim| claim.try_lock().is_err()) {
         let _ = claim.lock();
         match previous() {
             Ok(old) => {
-                if sess.runtime.profile { eprintln!("makepad-run build-script: {} made by another run", pname); }
+                if sess.runtime.profile { eprintln!("relax build-script: {} made by another run", pname); }
                 return (Ok(old), out_dir);
             }
             Err(now) => why = now,
         }
     }
-    // why this script runs again, kept beside its output (relax-rerun-why: the last 20) and shown with MAKEPAD_RUN_PROFILE
-    if sess.runtime.profile { eprintln!("makepad-run build-script: {} runs: {}", pname, why); }
+    // why this script runs again, kept beside its output (relax-rerun-why: the last 20) and shown with RELAX_PROFILE
+    if sess.runtime.profile { eprintln!("relax build-script: {} runs: {}", pname, why); }
     note_rerun(&build_dir, &why);
     let started = std::time::Instant::now();
     let output = cmd.output();
     if sess.runtime.profile {
-        eprintln!("makepad-run build-script: {} executed {:.3} ms", pname, started.elapsed().as_secs_f64() * 1000.0);
+        eprintln!("relax build-script: {} executed {:.3} ms", pname, started.elapsed().as_secs_f64() * 1000.0);
     }
     match output {
         Ok(o) if o.status.success() => {
@@ -1351,12 +1351,12 @@ fn rerun_reason(stored: &str, now: &str, stored_env: &str, env_key: &str) -> Str
 /// package reached at the top and inside another script's run (a dependency here and a
 /// build-dependency there) keeps one output (relax issue 69). No cargo script can read them.
 /// The variable that hands a build script's child run its parent's native receipt.
-pub const NATIVE_RECEIPT: &str = "MAKEPAD_RUN_NATIVE_RECEIPT";
+pub const NATIVE_RECEIPT: &str = "RELAX_NATIVE_RECEIPT";
 
-const SCRIPT_RUN_SHAPE_VARS: [&str; 4] = ["MAKEPAD_RUN_VFS", "MAKEPAD_RUN_EDITS", "MAKEPAD_RUN_SCRIPT_DEPTH", "MAKEPAD_RUN_SCRIPT_CHAIN"];
+const SCRIPT_RUN_SHAPE_VARS: [&str; 4] = ["RELAX_VFS", "RELAX_EDITS", "RELAX_SCRIPT_DEPTH", "RELAX_SCRIPT_CHAIN"];
 
 fn note_rerun(build_dir: &str, why: &str) {
-    let path = format!("{}/makepad-run-rerun-why", build_dir);
+    let path = format!("{}/relax-rerun-why", build_dir);
     let mut lines: Vec<String> = std::fs::read_to_string(&path).unwrap_or_default().lines().map(str::to_string).collect();
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     lines.push(format!("{} pid {} {}", t, std::process::id(), why));
@@ -1565,7 +1565,7 @@ mod script_error_tests {
     /// The cause a failing build script names, by what its stderr holds (relax PR 59).
     #[test]
     fn a_failing_scripts_cause_is_what_it_printed_first() {
-        let summary = "error: could not compile `build_script_build` due to 1 previous error: not started (`makepad run` checks the app's own crates whole before they run, as cargo builds them)";
+        let summary = "error: could not compile `build_script_build` due to 1 previous error: not started (`relax run` checks the app's own crates whole before they run, as cargo builds them)";
         let relax = format!("/app/build.rs:2:9: warning: unused variable: `unused` [unused_variables]\n/app/build.rs:3:21: E0308: mismatched types: expected `u8`, found `&str`\n{summary}\n");
         assert_eq!(super::script_error_cause(&relax), "/app/build.rs:3:21: E0308: mismatched types: expected `u8`, found `&str`", "a compile failure names its error, not a warning or the summary");
         let rustc = "error[E0308]: mismatched types\n --> build.rs:3:21\n  |\nerror: could not compile `app` (build script) due to 1 previous error\n";

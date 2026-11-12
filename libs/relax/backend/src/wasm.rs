@@ -263,7 +263,7 @@ pub struct Stats {
     pub n_folded: usize,
     /// (slot id, function name, body bytes) of every chosen function
     pub fn_sizes: Vec<(u32, String, usize)>,
-    /// MAKEPAD_RUN_WASM_EXPORT_FNLIST: (slot id, [(inline context, code bytes)]) of every chosen body
+    /// RELAX_WASM_EXPORT_FNLIST: (slot id, [(inline context, code bytes)]) of every chosen body
     pub fn_ctx_bytes: Vec<(u32, Vec<(u64, i64)>)>,
     /// (slot id, absolute module offset, encoded body length), including final
     /// relocation encodings. Folded aliases own no bytes: (slot, 0, 0).
@@ -1575,7 +1575,7 @@ struct Fx<'a> {
     me: usize,
     /// per vreg: every definition is below 32 (a 5-bit mask or such a constant): a shift count
     small5: Vec<bool>,
-    /// MAKEPAD_RUN_WASM_EXPORT_FNLIST: code bytes per inline context (rir::pos_ctx of the
+    /// RELAX_WASM_EXPORT_FNLIST: code bytes per inline context (rir::pos_ctx of the
     /// statement's position; a block's terminator counts with its last statement)
     ctx_bytes: Option<HashMap<u64, i64>>,
     /// bytes attributed so far (a terminator emits its nested blocks: they claim their own)
@@ -1585,7 +1585,7 @@ struct Fx<'a> {
 /// Whether bodies attribute their bytes to inline contexts (size analysis only).
 fn ctx_bytes_on() -> bool {
     static T: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    relax_session::phase::env_once(&T, "MAKEPAD_RUN_WASM_EXPORT_FNLIST").is_some()
+    relax_session::phase::env_once(&T, "RELAX_WASM_EXPORT_FNLIST").is_some()
 }
 
 /// Whether a call's arguments are pushed for the call itself (a direct call of a module

@@ -3,7 +3,7 @@
 //! again (as cargo check keeps an unchanged crate's metadata).
 //!
 //! A crate's key (`Reuse::open_in`) is what its check's output rests on: the Relax build and its
-//! options, every `MAKEPAD_RUN_*` variable (the command line's lint flags among them), the checked
+//! options, every `RELAX_*` variable (the command line's lint flags among them), the checked
 //! crates and the root, the crate as rustc is invoked on it (name, root, edition, cfg with the
 //! features, binary or not, test harness, its dependencies by alias) and the text of every file of
 //! it; and of each crate of its dependency closure, the text when that crate is not checked (std,
@@ -212,8 +212,8 @@ pub(crate) struct Reuse {
 }
 
 /// What a check's crates' keys rest on beyond the crates: the Relax build and options, the
-/// variables that steer the check (every `MAKEPAD_RUN_*` one but run.rs RUN_STATE_VARS and
-/// RUN_LOCATING_VARS, and the store's mode MAKEPAD_RUN_CACHE: how the verdicts are used, not what
+/// variables that steer the check (every `RELAX_*` one but run.rs RUN_STATE_VARS and
+/// RUN_LOCATING_VARS, and the store's mode RELAX_CACHE: how the verdicts are used, not what
 /// they rest on, so a Verify or read-only check finds what an ordinary one stored). Payload keys
 /// add the anchor locations separately.
 fn env_key(prog: &Program) -> u128 {
@@ -224,7 +224,7 @@ fn env_key(prog: &Program) -> u128 {
     h.u128(prog.session.options.fingerprint());
     let mut vars: Vec<(String, String)> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.to_string_lossy().into_owned())))
-        .filter(|(k, _)| k.starts_with("MAKEPAD_RUN_") && k != "MAKEPAD_RUN_CACHE" && !crate::run::RUN_STATE_VARS.contains(&k.as_str()) && !crate::run::RUN_LOCATING_VARS.contains(&k.as_str()))
+        .filter(|(k, _)| k.starts_with("RELAX_") && k != "RELAX_CACHE" && !crate::run::RUN_STATE_VARS.contains(&k.as_str()) && !crate::run::RUN_LOCATING_VARS.contains(&k.as_str()))
         .collect();
     vars.sort();
     h.u32(vars.len() as u32);
@@ -377,7 +377,7 @@ impl Reuse {
     /// Computes a persisted verdict key and traces its worktree-free counterpart once per crate.
     fn verdict_key(&mut self, prog: &Program, j: usize, late: &[(String, u8, String, u128)]) -> u128 {
         let (key, anchored) = verdict_keys(self.keys[j], late);
-        if !self.traced[j] && std::env::var_os("MAKEPAD_RUN_CHECK_REUSE_TRACE").is_some() {
+        if !self.traced[j] && std::env::var_os("RELAX_CHECK_REUSE_TRACE").is_some() {
             eprintln!("check-reuse-trace: {}: anchored key {:032x}", prog.syms.str(prog.crates[self.checked[j] as usize].name), anchored);
             self.traced[j] = true;
         }
@@ -385,7 +385,7 @@ impl Reuse {
     }
 
     /// The reuse of a one-shot check of `checked` rooted at `root`, in the cache's folder, in the
-    /// store's mode (MAKEPAD_RUN_CACHE). None: the cache is off.
+    /// store's mode (RELAX_CACHE). None: the cache is off.
     pub(crate) fn open(prog: &Program, root: u32, checked: &[u32]) -> Option<Reuse> {
         let mode = crate::cache::mode_from_env(&prog.session.options)?;
         Some(Self::open_in(prog, root, checked, &crate::dirs::relax_dir().join("cache"), mode))
@@ -464,7 +464,7 @@ impl Reuse {
             h.finish128()
         };
         let path = dir.join(format!("check-{:016x}.rcs", set as u64));
-        let trace = std::env::var_os("MAKEPAD_RUN_CHECK_REUSE_TRACE").is_some();
+        let trace = std::env::var_os("RELAX_CHECK_REUSE_TRACE").is_some();
         let mut r = Reuse {
             path, write, hit: vec![false; checked.len()], raw: vec![None; checked.len()], traced: vec![false; checked.len()],
             vkeys: vec![0; checked.len()], late_names: vec![None; checked.len()], keys, checked, closures, iface_of,
@@ -475,7 +475,7 @@ impl Reuse {
             verify, env, set, bodies_new: Vec::new(), bodies_keep: Vec::new(),
         };
         r.restore = vec![false; r.checked.len()];
-        // MAKEPAD_RUN_CHECK_REUSE_TRACE: each crate's key parts (two checks' traces diff to what changed)
+        // RELAX_CHECK_REUSE_TRACE: each crate's key parts (two checks' traces diff to what changed)
         if trace {
             for c in 0..n {
                 let j = r.checked.binary_search(&(c as u32)).ok();
@@ -485,7 +485,7 @@ impl Reuse {
             }
             for s in &skipped { eprintln!("check-reuse-trace: skipped {} {}", prog.syms.str(prog.crates[s.0 as usize].name), s.1); }
             // (=<path part>[,<path part>..]: the interface text of the files whose path holds one)
-            if let Some(parts) = std::env::var("MAKEPAD_RUN_CHECK_REUSE_TRACE").ok().filter(|v| v.len() > 1) {
+            if let Some(parts) = std::env::var("RELAX_CHECK_REUSE_TRACE").ok().filter(|v| v.len() > 1) {
                 for (f, p) in prog.file_paths.iter().enumerate().filter(|(_, p)| parts.split(',').any(|q| !q.is_empty() && p.contains(q))) {
                     let pf = &prog.files[f];
                     let lazy = pf.ast.items.iter().filter(|it| matches!(&it.kind, crate::ast::ItemKind::Fn(sig, body, _) if body.is_none() && pf.ast.fn_sig(*sig).lazy_body.is_some())).count();
@@ -644,7 +644,7 @@ impl Reuse {
         if !self.write { return; }
         let verbose = prog.session.options.verbose;
         if relax_types::borrowck::relaxed_pending() || crate::relaxed::pending() {
-            if verbose { eprintln!("makepad check: verdicts not stored: sites accepted only in relaxed Rust"); }
+            if verbose { eprintln!("relax check: verdicts not stored: sites accepted only in relaxed Rust"); }
             return;
         }
         let mut by_path: HashMap<&str, u32> = HashMap::new();
@@ -658,7 +658,7 @@ impl Reuse {
             let producer = if e.stage.group != NO_DEF && (e.stage.group.0 as usize) < prog.defs.len() { Some(prog.def(e.stage.group).krate) }
                 else { crate::check_order::path_of(text).and_then(|p| by_path.get(p).copied()) };
             let Some(j) = producer.and_then(|k| self.checked.binary_search(&k).ok()) else {
-                if verbose { eprintln!("makepad check: verdicts not stored: a diagnostic of no checked crate: {}", text.lines().next().unwrap_or("")); }
+                if verbose { eprintln!("relax check: verdicts not stored: a diagnostic of no checked crate: {}", text.lines().next().unwrap_or("")); }
                 return;
             };
             // (a hit's own diagnostics are in its stored verdict already)
@@ -743,7 +743,7 @@ impl Reuse {
         let r = dir.parent().map_or(Ok(()), crate::pack::ensure_private_dir).and_then(|_| crate::pack::ensure_private_dir(dir))
             .and_then(|_| crate::store::append(&self.path, new, drop_all).map_err(|e| e.to_string()));
         self.complete = r.is_ok() && self.sig_clean;
-        if verbose { eprintln!("makepad check: verdicts stored ({:?})", r.err()); }
+        if verbose { eprintln!("relax check: verdicts stored ({:?})", r.err()); }
     }
 
     /// `record` stored every verdict and the run record (`complete`).
@@ -853,7 +853,7 @@ impl Reuse {
         let dir = self.path.parent().unwrap_or(Path::new("."));
         let r = dir.parent().map_or(Ok(()), crate::pack::ensure_private_dir).and_then(|_| crate::pack::ensure_private_dir(dir))
             .and_then(|_| crate::store::append(&self.path, new, false).map_err(|e| e.to_string()));
-        if verbose { eprintln!("makepad check: body verdicts stored ({:?})", r.err()); }
+        if verbose { eprintln!("relax check: body verdicts stored ({:?})", r.err()); }
     }
 }
 
@@ -985,7 +985,7 @@ impl Dirty {
         if trace || prog.session.options.verbose {
             let nodes: usize = now.iter().flatten().map(Vec::len).sum();
             let coarse: Vec<&str> = (0..n).filter(|&c| d.coarse[c]).map(|c| prog.syms.str(prog.crates[c].name)).collect();
-            eprintln!("makepad check: changed interfaces: {} ({} unknown), {} changed nodes, {} seed names, {} dirty names after {} passes over {} nodes, coarse {:?}, {:.1} ms",
+            eprintln!("relax check: changed interfaces: {} ({} unknown), {} changed nodes, {} seed names, {} dirty names after {} passes over {} nodes, coarse {:?}, {:.1} ms",
                 pairs.len(), d.unknown.len(), changed_n, seeds, d.names.len(), passes, nodes, coarse, t0.elapsed().as_secs_f64() * 1e3);
         }
         d
@@ -998,8 +998,8 @@ impl Dirty {
 pub(crate) fn print_reused_texts(texts: &[String], crates: usize) -> i32 {
     let entries: Vec<Entry> = texts.iter().map(|t| Entry { stage: Stage::new(Phase::Resolve, 0), seq: 0, out: Out::Warning(t.clone()), group_at: None }).collect();
     crate::check_order::print(&entries, true, true, crate::diag::enabled());
-    eprintln!("makepad check: {} crates unchanged since a passing check: their verdicts reused", crates);
-    eprintln!("makepad check: 0 body owners of the checked crates, 0 compiled in all, 0 errors");
+    eprintln!("relax check: {} crates unchanged since a passing check: their verdicts reused", crates);
+    eprintln!("relax check: 0 body owners of the checked crates, 0 compiled in all, 0 errors");
     0
 }
 
@@ -1039,7 +1039,7 @@ pub(crate) fn graph_key(g: &crate::unitgraph::Graph) -> u128 {
 
 /// A one-shot check's early record (run.rs): a check whose every crate hit and that printed its
 /// stored diagnostics (`print_reused_texts`) stores what it printed, under a key known before the load:
-/// the Relax build and options and the `MAKEPAD_RUN_*` variables (`env_key`), the command line,
+/// the Relax build and options and the `RELAX_*` variables (`env_key`), the command line,
 /// the unit graph (`graph_key`), the load's recipe and the inputs and module probes of its front
 /// graph certificate. The certificate is current only while every input has its recorded text
 /// (cache.rs begin_load: a recorded stat stands for the text, else the file is hashed). A later
@@ -1092,14 +1092,14 @@ impl Early {
     /// The stored output printed when the record is current (its late inputs unchanged): the
     /// check's exit code. None: no current record.
     pub(crate) fn replay(&self) -> Option<i32> {
-        let times = std::env::var_os("MAKEPAD_RUN_CHECK_TIMES").is_some();
+        let times = std::env::var_os("RELAX_CHECK_TIMES").is_some();
         let found = crate::store::Store::open(&self.path).and_then(|store| match store.get_checked(self.key) {
             Some((KIND_EARLY, p)) => decode_early(p),
             _ => None,
         });
         let current = found.filter(|r| r.late.iter().all(|(c, k, name, h)| late_current(c, *k, name, *h)));
         if times {
-            eprintln!("makepad check: early record ({} inputs, {} probes): {}", self.inputs.len(), self.n_probes, if current.is_some() { "current" } else { "none" });
+            eprintln!("relax check: early record ({} inputs, {} probes): {}", self.inputs.len(), self.n_probes, if current.is_some() { "current" } else { "none" });
         }
         let r = current?;
         for s in &r.stores { crate::store::stamp_used(Path::new(s)); }
@@ -1112,7 +1112,7 @@ impl Early {
     pub(crate) fn record(&self, reuse: &Reuse, texts: &[String], verbose: bool) {
         if !self.write { return; }
         if let Some((p, _)) = reuse.files.iter().find(|(p, x)| self.inputs.get(p) != Some(x)) {
-            if verbose { eprintln!("makepad check: early record not stored: {} is not the certificate's", p); }
+            if verbose { eprintln!("relax check: early record not stored: {} is not the certificate's", p); }
             return;
         }
         let mut late = reuse.late.clone();
@@ -1134,7 +1134,7 @@ impl Early {
         // (one record per recipe: the last check's)
         let r = self.path.parent().map_or(Ok(()), crate::pack::ensure_private_dir)
             .and_then(|_| crate::store::append(&self.path, vec![entry], true).map_err(|e| e.to_string()));
-        if verbose { eprintln!("makepad check: early record stored ({:?})", r.err()); }
+        if verbose { eprintln!("relax check: early record stored ({:?})", r.err()); }
     }
 }
 

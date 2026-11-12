@@ -1290,7 +1290,7 @@ impl<'a> Dead<'a> {
     }
 }
 
-/// MAKEPAD_RUN_CHECK_TIMES: a pass's parts of 50 ms or more, summed over the crates
+/// RELAX_CHECK_TIMES: a pass's parts of 50 ms or more, summed over the crates
 pub(crate) struct PartTimes {
     pass: &'static str,
     on: bool,
@@ -1299,7 +1299,7 @@ pub(crate) struct PartTimes {
 }
 impl PartTimes {
     pub(crate) fn new(pass: &'static str) -> Self {
-        PartTimes { pass, on: std::env::var_os("MAKEPAD_RUN_CHECK_TIMES").is_some(), t: std::time::Instant::now(), parts: Vec::new() }
+        PartTimes { pass, on: std::env::var_os("RELAX_CHECK_TIMES").is_some(), t: std::time::Instant::now(), parts: Vec::new() }
     }
     pub(crate) fn mark(&mut self, part: &'static str) {
         if !self.on { return; }
@@ -1321,7 +1321,7 @@ impl PartTimes {
     }
     pub(crate) fn report(&self, crates: usize) {
         for &(part, dt) in &self.parts {
-            if dt.as_millis() >= 50 { eprintln!("makepad check: {} {} {:.2} s ({} crates)", self.pass, part, dt.as_secs_f64(), crates); }
+            if dt.as_millis() >= 50 { eprintln!("relax check: {} {} {:.2} s ({} crates)", self.pass, part, dt.as_secs_f64(), crates); }
         }
     }
 }
