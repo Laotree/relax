@@ -14820,6 +14820,30 @@ pub fn start_completion(up: *mut Unit) {
     }
 }
 
+/// The skipped files of `mods` a live edit names (reload.rs apply_update), loaded: how many of
+/// them were still skipped and are loaded now.
+pub unsafe fn load_skipped(up: *mut Unit, mods: &[u32]) -> usize {
+    owner::call(owner::Class::Program, || {
+        let skipped = || mods.iter().filter(|m| (*up).prog.skipped_files.contains_key(m)).count();
+        let before = skipped();
+        load_modules(up, mods, "edit");
+        before.saturating_sub(skipped())
+    })
+}
+
+/// The saves among a live edit's `sources` (files no loaded version has) that are files of
+/// modules the file selection deferred: their crates read the saved texts from now on, so an
+/// outline lookup and the first load (an edit's or a build's) see them. Returns those paths.
+pub unsafe fn save_skipped_sources(up: *mut Unit, sources: &[(&str, &[u8])]) -> Vec<String> {
+    owner::call(owner::Class::Program, || {
+        if !sources.iter().any(|(p, _)| (*up).prog.skipped_module_of(p).is_some()) {
+            return Vec::new();
+        }
+        let _fw = front_write();
+        sources.iter().filter(|(p, s)| (*up).prog.save_skipped_source(p, std::sync::Arc::from(*s))).map(|(p, _)| p.to_string()).collect()
+    })
+}
+
 /// `makepad check` checks every body: the skipped files are loaded first (unit lock).
 pub unsafe fn load_all_skipped(up: *mut Unit) {
     owner::call(owner::Class::Program, || {
@@ -25631,6 +25655,13 @@ pub fn front_write_unless(ms: u64, give_way: &dyn Fn() -> bool) -> Option<std::s
 }
 
 pub fn front_write() -> std::sync::RwLockWriteGuard<'static, ()> {
+    front_write_noted(None)
+}
+
+/// `front_write` whose wait says itself on the owner (a live edit's, which waits there for the
+/// front's readers): `said` hears None once the wait passes `after`, then Some(the whole wait)
+/// when the lock is taken. A wait that ends sooner says nothing.
+pub fn front_write_noted(mut said: Option<(std::time::Duration, &mut dyn FnMut(Option<std::time::Duration>))>) -> std::sync::RwLockWriteGuard<'static, ()> {
     owner::forbid_in_publish("a front write", u32::MAX);
     // background checks that opted in (Gandalf's type checks) stop at their next preemption
     // point instead of finishing first (relax_types::preempt)
@@ -25642,11 +25673,26 @@ pub fn front_write() -> std::sync::RwLockWriteGuard<'static, ()> {
     // so it serves them while it waits; a request served nested inside another's wait gives
     // way instead (that request's own readers may be what holds the front)
     owner::busy_if_nested();
+    let t0 = std::time::Instant::now();
+    let mut told = false;
     loop {
         match front_try_write() {
-            Some(g) => return g,
-            // (the wait names the longest-held read: makepad inspect `waits`)
-            None => owner::pump_wait_for(front_holders::oldest(), &|| FRONT_RW.try_write().is_ok()),
+            Some(g) => {
+                if let Some((_, say)) = said.as_mut().filter(|_| told) { say(Some(t0.elapsed())); }
+                return g;
+            }
+            None => {
+                if let Some((after, say)) = said.as_mut().filter(|_| !told) {
+                    if t0.elapsed() >= *after {
+                        told = true;
+                        say(None);
+                    }
+                }
+                // (a wait still to be said ends at its time to say it)
+                let due = said.as_ref().filter(|_| !told).map(|(after, _)| *after);
+                // (the wait names the longest-held read: makepad inspect `waits`)
+                owner::pump_wait_for(front_holders::oldest(), &|| FRONT_RW.try_write().is_ok() || due.is_some_and(|d| t0.elapsed() >= d));
+            }
         }
     }
 }
