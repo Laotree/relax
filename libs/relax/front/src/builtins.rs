@@ -462,6 +462,12 @@ pub fn macro_def_for(krate: &str, name: &str) -> Option<crate::macros::MacroRef>
     Some(def_for_id(name, id))
 }
 
+/// The macro definition standing for the hosted function-like proc macro with entry point `entry`.
+pub fn hosted_macro_def(entry: &crate::macro_reg::Entry) -> Option<crate::macros::MacroRef> {
+    let i = crate::macro_reg::bang_index_of(entry)?;
+    (i < (u16::MAX - HOSTED) as usize).then(|| def_for_id(&entry.fname, HOSTED + i as u16))
+}
+
 /// The macro definition standing for built-in `name` (no arms; `builtin` set), if any.
 pub fn macro_def(name: &str) -> Option<crate::macros::MacroRef> {
     macro_def_for("", name)

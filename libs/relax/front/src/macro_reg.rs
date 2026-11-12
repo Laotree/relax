@@ -387,6 +387,14 @@ pub fn bang_index(name: &str) -> Option<usize> {
     REG.with(|r| r.borrow().as_ref().and_then(|r| r.macros.iter().position(|(n, e)| n == name && e.kind == Kind::Bang)))
 }
 
+/// Index of the function-like proc macro whose entry point is `entry`.
+pub fn bang_index_of(entry: &Entry) -> Option<usize> {
+    if in_world() {
+        return None;
+    }
+    REG.with(|r| r.borrow().as_ref().and_then(|r| r.macros.iter().position(|(_, e)| e.kind == Kind::Bang && e.unit == entry.unit && e.fname == entry.fname)))
+}
+
 /// Index of function-like proc macro `name` as crate `krate` sees it (`resolve_entry`).
 pub fn bang_index_for(krate: &str, name: &str) -> Option<usize> {
     if in_world() {
