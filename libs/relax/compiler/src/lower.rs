@@ -8315,6 +8315,36 @@ impl<'a> Lcx<'a> {
             pl = if self.unsized_ty(inner) { Place::Regs(p) } else { Place::Mem(p[0], 0) };
             pt = inner;
         }
+        let it = self.body_ty(i);
+        let item = match self.kind(it) {
+            TyKind::Adt(d, _, _) => self.u.tcx.lang_items.by_def.get(&d).copied(),
+            _ => None,
+        };
+        // What the inline bounds check below does not cover goes through the std `Index` impl
+        // typeck recorded, as every range index does in rustc: a `str` range's ends must be char
+        // boundaries, and an inclusive range panics at an end of usize::MAX and slices from its end
+        // once exhausted (core's into_slice_range). A plain range of an array or slice stays inline.
+        let via_std = match item {
+            Some(LangItem::RangeInclusiveStruct | LangItem::RangeToInclusive) => true,
+            Some(LangItem::Range | LangItem::RangeFrom | LangItem::RangeTo) => matches!(self.kind(pt), TyKind::Str),
+            _ => false,
+        };
+        if via_std {
+            if let Some((m, args)) = self.b.std_index.get(&e.0).cloned() {
+                let args = self.mono_list(args);
+                let (lo, hi) = (self.ast().expr(e).lo, self.ast().expr(e).hi);
+                // the call's location is the brackets, as an overloaded index's
+                let (alo, ilo) = (self.ast().expr(a).hi, self.ast().expr(i).lo);
+                let src = &self.u.prog.files[self.b.file as usize].src;
+                if let Some(k) = (alo..ilo).find(|&k| src.get(k as usize) == Some(&b'[')) {
+                    self.pos = k;
+                }
+                return match self.overloaded_index(m, args, pl, pt, i, t, (lo, hi)) {
+                    (Place::Regs(r), _) => Val::L(r),
+                    _ => self.unit(),
+                };
+            }
+        }
         let (elem_size, base, len) = match self.kind(pt) {
             TyKind::Array(el, n) => {
                 let n = n.try_to_target_usize(&self.u.tcx.tys).expect("normalized array length");
@@ -8335,13 +8365,8 @@ impl<'a> Lcx<'a> {
             },
             _ => return self.unit(),
         };
-        let it = self.body_ty(i);
         let rv = self.lower_expr(i);
         let rv = self.to_leaves(rv, it);
-        let item = match self.kind(it) {
-            TyKind::Adt(d, _, _) => self.u.tcx.lang_items.by_def.get(&d).copied(),
-            _ => None,
-        };
         let (lo, hi) = match item {
             Some(LangItem::Range) => (rv[0], rv[1]),
             Some(LangItem::RangeFrom) => (rv[0], len),
