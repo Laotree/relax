@@ -14311,36 +14311,66 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
             skill[bi * wd..(bi + 1) * wd].copy_from_slice(&k);
         }
     }
+    // Least fixpoint of live_in[b] = gen[b] | (union(live_in[succ]) & !kill[b]), the same one a
+    // reverse sweep reaches. A full sweep per change did not finish on a function of ~1e5 blocks.
     let exposed_from = |seen: &[bool], known: &[Option<bool>]| -> Vec<u64> {
+        let mut succs_of: Vec<Vec<u32>> = vec![Vec::new(); nb];
+        let mut preds: Vec<Vec<u32>> = vec![Vec::new(); nb];
+        for bi in 0..nb {
+            if !seen[bi] {
+                continue;
+            }
+            let mut s: Vec<u32> = match (known[bi], &f.blocks[bi].term) {
+                (Some(t), Term::Branch(_, y, n)) => vec![if t { *y } else { *n }],
+                (_, t) => t.succs().into_iter().collect(),
+            };
+            s.extend_from_slice(&susp_to[bi]);
+            for &t in &s {
+                preds[t as usize].push(bi as u32);
+            }
+            succs_of[bi] = s;
+        }
         let mut live_in = vec![0u64; nb * wd];
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for bi in (0..nb).rev() {
-                if !seen[bi] {
+        let mut in_work = vec![false; nb];
+        let mut work: Vec<u32> = Vec::new();
+        for bi in 0..nb {
+            if !seen[bi] {
+                continue;
+            }
+            if sgen[bi * wd..(bi + 1) * wd].iter().any(|w| *w != 0) {
+                in_work[bi] = true;
+                work.push(bi as u32);
+            }
+        }
+        while let Some(bi_u) = work.pop() {
+            let bi = bi_u as usize;
+            in_work[bi] = false;
+            if !seen[bi] {
+                continue;
+            }
+            let mut out = vec![0u64; wd];
+            for &t in &succs_of[bi] {
+                if !seen[t as usize] {
                     continue;
                 }
-                let mut out = vec![0u64; wd];
-                let mut succs: Vec<u32> = match (known[bi], &f.blocks[bi].term) {
-                    (Some(t), Term::Branch(_, y, n)) => vec![if t { *y } else { *n }],
-                    (_, t) => t.succs().into_iter().collect(),
-                };
-                for &(pend, resume, cancel) in &c.suspends {
-                    if pend as usize == bi {
-                        succs.push(resume);
-                        succs.push(cancel);
-                    }
-                }
-                for t in succs {
-                    for w in 0..wd {
-                        out[w] |= live_in[t as usize * wd + w];
-                    }
-                }
                 for w in 0..wd {
-                    let v = sgen[bi * wd + w] | (out[w] & !skill[bi * wd + w]);
-                    if v != live_in[bi * wd + w] {
-                        live_in[bi * wd + w] = v;
-                        changed = true;
+                    out[w] |= live_in[t as usize * wd + w];
+                }
+            }
+            let mut grew = false;
+            for w in 0..wd {
+                let v = sgen[bi * wd + w] | (out[w] & !skill[bi * wd + w]);
+                if v != live_in[bi * wd + w] {
+                    live_in[bi * wd + w] = v;
+                    grew = true;
+                }
+            }
+            if grew {
+                for &p in &preds[bi] {
+                    let p = p as usize;
+                    if seen[p] && !in_work[p] {
+                        in_work[p] = true;
+                        work.push(p as u32);
                     }
                 }
             }
@@ -15217,17 +15247,23 @@ impl CoroFlags {
         let mut seen = vec![false; nb];
         let mut known: Vec<Option<bool>> = vec![None; nb];
         let mut work = Vec::new();
+        // `work.contains` walked the whole stack. A function of ~1e5 blocks never finished it.
+        let mut in_work = vec![false; nb];
         for (b, st) in starts {
             let b = *b as usize;
             seen[b] = true;
             for k in 0..nt {
                 inn[b * nt + k] = st.map_or(CF_ANY, |s| s[k]);
             }
-            work.push(b as u32);
+            if !in_work[b] {
+                in_work[b] = true;
+                work.push(b as u32);
+            }
         }
         let meet = |a: i64, b: i64| if a == CF_UNSEEN { b } else if b == CF_UNSEEN || a == b { a } else { CF_ANY };
         while let Some(bi) = work.pop() {
             let bi = bi as usize;
+            in_work[bi] = false;
             let mut st = inn[bi * nt..(bi + 1) * nt].to_vec();
             for i in &f.blocks[bi].insts {
                 if let Inst::Iconst(d, x) = i {
@@ -15264,7 +15300,8 @@ impl CoroFlags {
                         ch = true;
                     }
                 }
-                if ch && !work.contains(&(sb as u32)) {
+                if ch && !in_work[sb] {
+                    in_work[sb] = true;
                     work.push(sb as u32);
                 }
             }
