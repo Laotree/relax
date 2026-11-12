@@ -45,6 +45,11 @@ button{font:inherit;color:inherit}
 :focus-visible{outline:2px solid var(--relax);outline-offset:3px;border-radius:6px}
 .skip{position:absolute;left:-999px;top:8px;background:var(--relax);color:#04130d;padding:10px 14px;border-radius:8px;z-index:100;font-weight:700}
 .skip:focus{left:12px}
+/* the experimental notice: a full-width bar above the sticky nav, in both the JS and the plain view */
+.xp{background:color-mix(in srgb,var(--warn) 13%,var(--bg));border-bottom:1px solid color-mix(in srgb,var(--warn) 55%,transparent);box-shadow:inset 0 3px 0 var(--warn);color:var(--text);font-size:.92rem;line-height:1.45}
+.xp .wrap{padding-top:12px;padding-bottom:10px}
+.xp b{color:var(--warn)}
+.xp code{background:rgba(255,255,255,.1)}
 .wrap{width:100%;max-width:var(--maxw);margin:0 auto;padding:0 16px}
 @media (min-width:600px){.wrap{padding:0 28px}}
 .off *,.off *::before,.off *::after{animation-play-state:paused!important}
@@ -593,11 +598,11 @@ code.nw{white-space:nowrap}
    so "Rust，告别" has no hole after the comma (the build wraps it in .pc) */
 .pc{letter-spacing:-.42em}
 </style>
-<style>#speed{display:none!important}</style>
 </head>
 <body>
 <a class="skip" href="#main">跳到正文</a>
 <div id="prog" aria-hidden="true"></div>
+<div class="xp" role="note"><div class="wrap"><b>实验性</b> · Relax 用于开发迭代。任何发布版本请使用 Rust 本身构建（<code>cargo build --release</code>）。</div></div>
 <div id="plain">
 <p>本页的文字由 JavaScript 填充。以下是同一内容的纯 HTML 版，供不运行 JavaScript 的读者使用；英文原文见 <a href="https://github.com/makepad/relax#readme">README</a> 和 <a href="../retro/">纯 HTML 版</a>。</p>
 <h1>Rust，告别等待。</h1>
@@ -617,12 +622,12 @@ code.nw{white-space:nowrap}
 <tr valign="top"><td>保存文件 → 92 个测试重跑</td><td>得先重新构建测试二进制</td><td><b>2.2 s</b> 从保存那一刻算起</td></tr>
 <tr valign="top"><td>改动运行中程序里的一个函数</td><td>重新构建、重新链接、重启：状态全丢</td><td>热补丁进正在运行的进程</td></tr>
 <tr valign="top"><td>类型检查与借用检查</td><td><code>cargo check</code>；构建时先检查全部代码</td><td><b><code>relax check</code></b>；运行时每个函数先做类型检查再运行，借用检查在后台进行</td></tr>
-<tr valign="top"><td>优化后的代码</td><td>基准 1.00×（<code>--release</code>，本机 CPU）</td><td>耗时为其 <b>1.14–1.26 倍</b>，密集数值循环上为 2.3 倍（<a href="#plain-tradeoffs">取舍</a>）</td></tr>
+<tr valign="top"><td>优化后的代码</td><td>基准 1.00×（<code>--release</code>）</td><td><b>更慢：x64 上耗时为 1.12 倍，arm64 上为 1.24 倍</b>（21 个负载的几何平均）（<a href="#plain-tradeoffs">取舍</a>）</td></tr>
 <tr valign="top"><td>需要什么</td><td>rustc、LLVM、链接器</td><td><b>一个 Rust 库</b>：438k 行，0 个 crates.io 依赖</td></tr>
 </table>
 <h2><a name="plain-tradeoffs">JIT 的代价。</a></h2>
 <ul>
-<li><b>优化后的代码更慢</b>：耗时是针对本机 CPU 的 <code>--release</code> 的 1.14–1.26 倍，密集数值循环上是 2.3 倍（还不做向量化）。<a href="#plain-gaps">详情</a>
+<li><b>优化后的代码更慢</b>：总体上比 rustc 的 <code>--release</code> 更慢：21 个负载的几何平均，x64 上耗时为 1.12 倍，arm64 上为 1.24 倍；只有少数负载更快。<a href="#plain-gaps">详情</a>
 <li><b>占用更多内存</b>：编译器、它的缓存和所有已发布的代码都与你的程序同处一个进程；JIT 代码只增不减。见 <code>relax inspect &lt;pid&gt; memory</code>。
 <li><b>检查还不比 cargo 快</b>：在大型包上，冷启动的 <code>relax check</code> 比 <code>cargo check</code> 更慢、占用更多内存，一次编辑也可能重新检查超出需要的部分。我们正在改进。
 <li><b>有些改动需要重启</b>：函数体的改动实时打补丁。结构体布局、导入、trait 或 impl 头、宏的改动要等 <code>relax inspect &lt;pid&gt; session relaunch</code>。
@@ -699,19 +704,36 @@ cd hello
 <li><b>数十个</b> 改动每天合入，每一个都先在 Relax 下检查，再合并
 </ul>
 <h2><a name="plain-gaps">LLVM 仍然领先的地方。</a></h2>
-<p>在稳定状态下，LLVM 生成的代码仍然更快。<b>热 JIT 对比同一份源码、同样输入的原生构建</b>，取实际耗时之比（越低越好，1.00× = LLVM）。</p>
+<p>总体而言，Relax 运行的代码比 rustc 构建的更慢。稳定状态下，Relax 与 rustc 的耗时之比（越低越好，1.00× = rustc）。</p>
 <table border="1" cellpadding="4" cellspacing="0">
-<tr valign="top"><td>3D 打印切片器：零件首次切片，4 线程</td><td>x86-64 (Zen 4)</td><td><b>1.14×</b>（周期数 1.15 倍，指令数 1.26 倍）</td><td>测于 2026-11-11</td></tr>
-<tr valign="top"><td>同上，8 线程</td><td>x86-64 (Zen 4)</td><td><b>1.17×</b></td><td>测于 2026-11-11</td></tr>
-<tr valign="top"><td>同上，4 线程</td><td>AArch64 (Apple M4)</td><td><b>1.24×</b>（测于本周的 x86 优化移植过来之前）</td><td>测于 2026-11-09</td></tr>
-<tr valign="top"><td>CAD B-rep 建模一轮</td><td>x86-64 (Zen 4)</td><td><b>1.26×</b></td><td>测于 2026-11-10</td></tr>
-<tr valign="top"><td>脚本虚拟机的解释器循环</td><td>x86-64 (Zen 4)</td><td><b>1.19×</b></td><td>测于 2026-11-11</td></tr>
-<tr valign="top"><td>密集数值内核（Cholesky 分解）</td><td>x86-64 (Zen 4)</td><td><b>2.29×</b>（LLVM 用 AVX-512 把它向量化了，Relax 目前还不做循环向量化）</td><td>测于 2026-11-10</td></tr>
-<tr valign="top"><td>任意负载对比普通 <code>--release</code>（可移植 CPU 基线）</td><td></td><td>尚未测量</td><td></td></tr>
-</table>
-<p>以上是我们最常剖析的负载。本周一次覆盖 18 个负载的更广泛测试结果更慢；我们正在查明原因。</p>
-<p><b>哪个 <code>--release</code>？</b> 对比的是带 <code>-C target-cpu=native</code> 的 <code>--release</code>。大多数 Rust 程序用面向可移植 CPU 的普通 <code>--release</code> 发布，而 Relax 针对它所运行的 CPU 编译，所以那时差距会缩小。<b>尚未测量。</b></p>
-<p>切片器的差距在三天里从 1.26 倍缩小到 1.14 倍。其余差距从哪来：见 <a href="https://github.com/makepad/relax#where-llvm-still-wins">README</a>。</p>
+<tr><th>负载</th><th>x64 对比默认</th><th>x64 对比本机 CPU</th><th>arm64 对比默认</th><th>arm64 对比本机 CPU</th></tr>
+<tr valign="top"><td>文本整形与字形光栅化</td><td align="right">1.36×</td><td align="right">1.38×</td><td align="right">1.33×</td><td align="right">1.31×</td></tr>
+<tr valign="top"><td>有符号距离场字形生成</td><td align="right">1.31×</td><td align="right">1.45×</td><td align="right">1.26×</td><td align="right">1.26×</td></tr>
+<tr valign="top"><td>DEFLATE 解码</td><td align="right">1.20×</td><td align="right">1.19×</td><td align="right">1.26×</td><td align="right">1.25×</td></tr>
+<tr valign="top"><td>ZIP 归档读取</td><td align="right">1.22×</td><td align="right">1.26×</td><td align="right">1.11×</td><td align="right">1.10×</td></tr>
+<tr valign="top"><td>PNG 解码</td><td align="right">1.21×</td><td align="right">1.25×</td><td align="right">1.32×</td><td align="right">1.32×</td></tr>
+<tr valign="top"><td>Brotli 解码</td><td align="right">1.29×</td><td align="right">1.26×</td><td align="right">1.27×</td><td align="right">1.28×</td></tr>
+<tr valign="top"><td>矢量地图瓦片解码</td><td align="right">1.06×</td><td align="right">1.06×</td><td align="right">1.01×</td><td align="right">0.99×</td></tr>
+<tr valign="top"><td>控件树布局</td><td align="right">1.54×</td><td align="right">1.49×</td><td align="right">1.75×</td><td align="right">1.74×</td></tr>
+<tr valign="top"><td>LLM 解码宿主端路径</td><td align="right">1.12×</td><td align="right">0.91×</td><td align="right">0.87×</td><td align="right">1.05×</td></tr>
+<tr valign="top"><td>Rust 源码词法分析</td><td align="right">1.06×</td><td align="right">1.06×</td><td align="right">1.20×</td><td align="right">1.21×</td></tr>
+<tr valign="top"><td>Markdown 解析</td><td align="right">1.39×</td><td align="right">1.31×</td><td align="right">1.54×</td><td align="right">1.56×</td></tr>
+<tr valign="top"><td>HTML 解析</td><td align="right">1.06×</td><td align="right">0.89×</td><td align="right">1.04×</td><td align="right">1.11×</td></tr>
+<tr valign="top"><td>钢琴物理模型音频</td><td align="right">1.22×</td><td align="right">1.25×</td><td align="right">1.44×</td><td align="right">1.44×</td></tr>
+<tr valign="top"><td>Ogg Vorbis 音频解码</td><td align="right">1.20×</td><td align="right">1.20×</td><td align="right">1.24×</td><td align="right">1.27×</td></tr>
+<tr valign="top"><td>游戏音频混音</td><td align="right">1.03×</td><td align="right">1.16×</td><td align="right">1.17×</td><td align="right">1.18×</td></tr>
+<tr valign="top"><td>脚本虚拟机求值</td><td align="right">1.11×</td><td align="right">1.09×</td><td align="right">1.12×</td><td align="right">1.13×</td></tr>
+<tr valign="top"><td>实体几何（CSG）布尔运算</td><td align="right">1.20×</td><td align="right">1.25×</td><td align="right">1.11×</td><td align="right">1.12×</td></tr>
+<tr valign="top"><td>刚体物理</td><td align="right">0.43×</td><td align="right">1.38×</td><td align="right">1.30×</td><td align="right">1.32×</td></tr>
+<tr valign="top"><td>游戏模拟步进</td><td align="right">0.60×</td><td align="right">1.26×</td><td align="right">1.25×</td><td align="right">1.25×</td></tr>
+<tr valign="top"><td>关卡漫游（导航网格与行走路线）</td><td align="right">0.87×</td><td align="right">0.87×</td><td align="right">0.91×</td><td align="right">0.91×</td></tr>
+<tr valign="top"><td>3D 模型构建</td><td align="right">2.00×</td><td align="right">2.04×</td><td align="right">1.91×</td><td align="right">1.92×</td></tr>
+<tr valign="top"><td><b>几何平均（21）</b></td><td align="right"><b>1.12×</b></td><td align="right"><b>1.22×</b></td><td align="right"><b>1.24×</b></td><td align="right"><b>1.25×</b></td></tr></table>
+<p>总体而言，Relax 运行的代码比 rustc 构建的更慢：21 个负载的几何平均，x64 上耗时是默认 <code>--release</code> 的 1.12 倍，arm64 上是 1.24 倍；对比本机 CPU 构建分别是 1.22 倍和 1.25 倍。只有少数负载 Relax 更快：对比默认构建，x64 上是刚体物理（0.43×）、游戏模拟步进（0.60×）和关卡漫游（0.87×），arm64 上是 LLM 解码宿主端路径（0.87×）和关卡漫游（0.91×）。x64 上最大的两项优势在本机 CPU 构建面前消失（刚体物理 1.38×，游戏模拟步进 1.26×），这两项优势只是相对通用 CPU 基线。最慢的是 3D 模型构建，耗时约为 rustc 的两倍。</p>
+<p>核内微基准（30 个）稳定状态几何平均：x64 对比默认 1.14×、对比本机 CPU 1.24×，arm64 约 1.23×。这些数字暂定，待“热缓存下不升级到 O3”的缺陷修复后更新：JIT 缓存已预热时，部分热函数不会升级到 O3，所以微基准数字可能偏慢，应视为上界。上面的 21 个负载不受影响。</p>
+<p>x64：8 核台式机 CPU，Linux；arm64：Apple M4 笔记本，macOS。rustc 1.99.1，LLVM 23.1.1。每个数字都是 3 轮的中位数，测于 2026-11-12。“默认”指通用 CPU 的 <code>cargo build --release</code>；“本机 CPU”指带 <code>-C target-cpu=native</code> 的 <code>--release</code>。Relax 取默认模式、升级到高优化层之后的稳定状态。x64 上，默认与本机两列来自同一台机器、同样二进制的两次独立运行。arm64 上通用 CPU 本就是 M 系列基线，两列仅差噪声。</p>
+<p><b>哪个 <code>--release</code>？</b> 两种都测了：默认（<code>cargo build --release</code>，通用 CPU）和本机 CPU（<code>-C target-cpu=native</code>）。Relax 总是针对它所运行的 CPU 编译，所以“本机 CPU”一列才是同条件对比。</p>
+<p>Relax 用于开发迭代；发布构建请用 rustc。</p>
 <h2><a name="plain-life">一个函数的一生。</a></h2>
 <ul>
 <li><b>解释器</b>：代码从这里起步。
@@ -904,6 +926,7 @@ cd hello
     <div class="bctl reveal" id="benchCtl"></div>
     <div class="bcall" id="benchCall"></div>
     <div class="card bchart reveal grid" id="benchChart"></div>
+    <p class="note reveal" data-rich="benchText.footnote"></p>
     <details class="nums reveal" id="benchNums"><summary>查看具体数字</summary><div class="scrollx"><table class="nt" id="benchTable"></table></div></details>
   </div>
 </section>
@@ -920,7 +943,6 @@ cd hello
       <p class="note" data-rich="gaps.tableNote"></p>
     </div>
     <div class="card which reveal grid" id="gapWhich"></div>
-    <div class="card trend reveal grid" id="gapTrend"></div>
   </div>
 </section>
 
@@ -953,26 +975,6 @@ cd hello
 
 <script>
 "use strict";
-/* Layout-only stand-in for DATA.bench. Every value it makes is fake and the
-   page shows a "placeholder data" badge while DATA.bench.placeholder is set.
-   Replace DATA.bench with the measured JSON (same shape, no placeholder flag). */
-function placeholderBench() {
-  const W = ["PNG decode", "Brotli decode", "Inflate decode", "Zip read", "Text shaping and raster", "SDF glyphs", "Map tile decode", "Widget layout", "Rust tokenizer", "Markdown parse", "HTML parse", "LLM host path", "Physical piano model", "Ogg decode", "Audio mix", "Script VM", "CSG booleans", "Rigid-body physics"];
-  const f = (v, d) => +v.toFixed(d == null ? 2 : d);
-  function plat(id, cpu, os, k) {
-    const rows = W.map((w, i) => {
-      const rn = f(0.74 + ((i * 37 + k * 11) % 17) / 17 * 0.66), rs = f(rn * 0.94), ms = 40 + i * 9;
-      return { workload: w, what: "占位", rustc_ms: ms, rustc_native_ms: f(ms * 0.94, 1), relax_ms: f(ms * rs, 1), ratio_stock: rs, ratio_native: rn,
-        spread_stock: [f(rs * 0.95), f(rs * 1.06)], spread_native: [f(rn * 0.95), f(rn * 1.06)], tts_ms: 100 + i * 7, checksum_ok: i !== 13 };
-    });
-    const ok = rows.filter(r => r.checksum_ok), gm = key => f(Math.exp(ok.reduce((a, r) => a + Math.log(r[key]), 0) / ok.length));
-    return { id: id, cpu: cpu, os: os, rustc: "占位", llvm: "占位", rows: rows,
-      geomean_stock: gm("ratio_stock"), geomean_native: gm("ratio_native"),
-      faster_than_stock: ok.filter(r => r.ratio_stock < 1).length, faster_than_native: ok.filter(r => r.ratio_native < 1).length, n: ok.length };
-  }
-  return { placeholder: true, date: "占位", sha: "占位", platforms: [plat("x64", "占位 x86-64 CPU", "Linux", 0), plat("arm64", "占位 Apple M4", "macOS", 1)] };
-}
-
 /* ------------------------------------------------------------------
    zh-CN: the Chinese text of the English page's DATA. Keys, order and the
    DATA.bench shape are identical to the English page; paste the same bench
@@ -1004,14 +1006,14 @@ const DATA = {
     ],
     rest: [
       ["类型检查与借用检查", "`cargo check`；构建时先检查全部代码", "**`relax check`**；运行时每个函数先做类型检查再运行，借用检查在后台进行"],
-      ["优化后的代码", "基准 1.00×（`--release`，本机 CPU）", "耗时为其 **1.14–1.26 倍**，密集数值循环上为 2.3 倍（[取舍](#tradeoffs)）"],
+      ["优化后的代码", "基准 1.00×（`--release`）", "**更慢：x64 上耗时为 1.12 倍，arm64 上为 1.24 倍**（21 个负载的几何平均）（[取舍](#tradeoffs)）"],
       ["需要什么", "rustc、LLVM、链接器", "**一个 Rust 库**：438k 行，0 个 crates.io 依赖"]
     ]
   },
 
   tradeoffs: {
     items: [
-      { title: "优化后的代码更慢", body: "耗时是针对本机 CPU 的 `--release` 的 1.14–1.26 倍，密集数值循环上是 2.3 倍（还不做向量化）。[详情](#gaps)" },
+      { title: "优化后的代码更慢", body: "总体上比 rustc 的 `--release` 更慢：21 个负载的几何平均，x64 上耗时为 1.12 倍，arm64 上为 1.24 倍；只有少数负载更快。[详情](#gaps)" },
       { title: "占用更多内存", body: "编译器、它的缓存和所有已发布的代码都与你的程序同处一个进程；JIT 代码只增不减。见 `relax inspect <pid> memory`。" },
       { title: "检查还不比 cargo 快", body: "在大型包上，冷启动的 `relax check` 比 `cargo check` 更慢、占用更多内存，一次编辑也可能重新检查超出需要的部分。我们正在改进。" },
       { title: "有些改动需要重启", body: "函数体的改动实时打补丁。结构体布局、导入、trait 或 impl 头、宏的改动要等 `relax inspect <pid> session relaunch`。" },
@@ -1133,11 +1135,63 @@ const DATA = {
     ]
   },
 
-  /* measured speed: main pastes the benchmark JSON here */
-  bench: placeholderBench(),
+  /* measured speed: 2026-11-12, median of 3 rounds */
+  bench: {
+    date: "2026-11-12", sha: "dd009c0122",
+    platforms: [
+      { id: "x64", cpu: "8-core desktop CPU", os: "Linux", rustc: "1.99.1", llvm: "23.1.1", geomean_stock: 1.118, geomean_native: 1.217, faster_than_stock: 3, faster_than_native: 3, n: 21,
+        rows: [
+          {"workload": "Text shaping and glyph rasterisation", "what": "", "rustc_ms": 9.071, "rustc_native_ms": 9.198, "relax_ms": 12.503, "ratio_stock": 1.36, "ratio_native": 1.38, "spread_stock": [1.36, 1.36], "spread_native": [1.33, 1.38], "tts_ms": 6286, "checksum_ok": true},
+          {"workload": "Signed-distance-field glyph generation", "what": "", "rustc_ms": 9.394, "rustc_native_ms": 8.666, "relax_ms": 12.42, "ratio_stock": 1.31, "ratio_native": 1.45, "spread_stock": [1.3, 1.32], "spread_native": [1.45, 1.45], "tts_ms": 4838, "checksum_ok": true},
+          {"workload": "DEFLATE decode", "what": "", "rustc_ms": 0.824, "rustc_native_ms": 0.826, "relax_ms": 0.986, "ratio_stock": 1.2, "ratio_native": 1.19, "spread_stock": [1.18, 1.23], "spread_native": [1.17, 1.22], "tts_ms": 4693, "checksum_ok": true},
+          {"workload": "ZIP archive read", "what": "", "rustc_ms": 1.843, "rustc_native_ms": 1.804, "relax_ms": 2.266, "ratio_stock": 1.22, "ratio_native": 1.26, "spread_stock": [1.2, 1.23], "spread_native": [1.26, 1.26], "tts_ms": 4818, "checksum_ok": true},
+          {"workload": "PNG decode", "what": "", "rustc_ms": 8.679, "rustc_native_ms": 8.396, "relax_ms": 10.562, "ratio_stock": 1.21, "ratio_native": 1.25, "spread_stock": [1.2, 1.22], "spread_native": [1.19, 1.49], "tts_ms": 4585, "checksum_ok": true},
+          {"workload": "Brotli decode", "what": "", "rustc_ms": 1.69, "rustc_native_ms": 1.695, "relax_ms": 2.17, "ratio_stock": 1.29, "ratio_native": 1.26, "spread_stock": [1.28, 1.3], "spread_native": [1.26, 1.28], "tts_ms": 4842, "checksum_ok": true},
+          {"workload": "Vector map tile decode", "what": "", "rustc_ms": 14.637, "rustc_native_ms": 14.561, "relax_ms": 15.503, "ratio_stock": 1.06, "ratio_native": 1.06, "spread_stock": [1.04, 1.06], "spread_native": [1.06, 1.07], "tts_ms": 5989, "checksum_ok": true},
+          {"workload": "Widget tree layout", "what": "", "rustc_ms": 19.54, "rustc_native_ms": 19.674, "relax_ms": 29.52, "ratio_stock": 1.54, "ratio_native": 1.49, "spread_stock": [1.49, 1.54], "spread_native": [1.48, 1.51], "tts_ms": 11297, "checksum_ok": true},
+          {"workload": "LLM decode host path", "what": "", "rustc_ms": 150.215, "rustc_native_ms": 169.695, "relax_ms": 161.344, "ratio_stock": 1.12, "ratio_native": 0.91, "spread_stock": [1.03, 1.12], "spread_native": [0.906, 0.919], "tts_ms": 5535, "checksum_ok": true},
+          {"workload": "Rust source tokenizer", "what": "", "rustc_ms": 0.548, "rustc_native_ms": 0.548, "relax_ms": 0.585, "ratio_stock": 1.06, "ratio_native": 1.06, "spread_stock": [1.02, 1.1], "spread_native": [1.05, 1.06], "tts_ms": 5009, "checksum_ok": true},
+          {"workload": "Markdown parse", "what": "", "rustc_ms": 1.354, "rustc_native_ms": 1.445, "relax_ms": 1.887, "ratio_stock": 1.39, "ratio_native": 1.31, "spread_stock": [1.32, 1.43], "spread_native": [1.28, 1.32], "tts_ms": 6327, "checksum_ok": true},
+          {"workload": "HTML parse", "what": "", "rustc_ms": 1.264, "rustc_native_ms": 1.397, "relax_ms": 1.308, "ratio_stock": 1.06, "ratio_native": 0.89, "spread_stock": [1.03, 1.08], "spread_native": [0.881, 0.918], "tts_ms": 9498, "checksum_ok": true},
+          {"workload": "Physical piano model audio", "what": "", "rustc_ms": 53.796, "rustc_native_ms": 52.212, "relax_ms": 65.376, "ratio_stock": 1.22, "ratio_native": 1.25, "spread_stock": [1.22, 1.22], "spread_native": [1.24, 1.27], "tts_ms": 6655, "checksum_ok": true},
+          {"workload": "Ogg Vorbis audio decode", "what": "", "rustc_ms": 3.94, "rustc_native_ms": 3.953, "relax_ms": 4.755, "ratio_stock": 1.2, "ratio_native": 1.2, "spread_stock": [1.19, 1.22], "spread_native": [1.2, 1.25], "tts_ms": 5001, "checksum_ok": true},
+          {"workload": "Game audio mixer", "what": "", "rustc_ms": 12.076, "rustc_native_ms": 10.705, "relax_ms": 12.384, "ratio_stock": 1.03, "ratio_native": 1.16, "spread_stock": [1.02, 1.04], "spread_native": [1.15, 1.16], "tts_ms": 4626, "checksum_ok": true},
+          {"workload": "Script VM evaluation", "what": "", "rustc_ms": 2.462, "rustc_native_ms": 2.483, "relax_ms": 2.721, "ratio_stock": 1.11, "ratio_native": 1.09, "spread_stock": [1.1, 1.11], "spread_native": [1.08, 1.12], "tts_ms": 2167, "checksum_ok": true},
+          {"workload": "Solid geometry (CSG) booleans", "what": "", "rustc_ms": 9.307, "rustc_native_ms": 9.157, "relax_ms": 11.345, "ratio_stock": 1.2, "ratio_native": 1.25, "spread_stock": [1.2, 1.25], "spread_native": [1.25, 1.26], "tts_ms": 6948, "checksum_ok": true},
+          {"workload": "Rigid-body physics", "what": "", "rustc_ms": 48.968, "rustc_native_ms": 15.092, "relax_ms": 20.927, "ratio_stock": 0.43, "ratio_native": 1.38, "spread_stock": [0.424, 0.432], "spread_native": [1.37, 1.38], "tts_ms": 6112, "checksum_ok": true},
+          {"workload": "Game simulation tick", "what": "", "rustc_ms": 28.854, "rustc_native_ms": 13.772, "relax_ms": 17.325, "ratio_stock": 0.6, "ratio_native": 1.26, "spread_stock": [0.6, 0.607], "spread_native": [1.26, 1.26], "tts_ms": 6820, "checksum_ok": true},
+          {"workload": "Level walk (navigation grid and walker tours)", "what": "", "rustc_ms": 8.006, "rustc_native_ms": 8.085, "relax_ms": 6.992, "ratio_stock": 0.87, "ratio_native": 0.87, "spread_stock": [0.867, 0.876], "spread_native": [0.858, 0.872], "tts_ms": 4620, "checksum_ok": true},
+          {"workload": "3D model build", "what": "", "rustc_ms": 338.605, "rustc_native_ms": 334.563, "relax_ms": 680.548, "ratio_stock": 2.0, "ratio_native": 2.04, "spread_stock": [1.97, 2.01], "spread_native": [2.01, 2.06], "tts_ms": 18210, "checksum_ok": true}
+        ] },
+      { id: "arm64", cpu: "Apple M4 laptop", os: "macOS", rustc: "1.99.1", llvm: "23.1.1", geomean_stock: 1.236, geomean_native: 1.253, faster_than_stock: 2, faster_than_native: 2, n: 21,
+        rows: [
+          {"workload": "Text shaping and glyph rasterisation", "what": "", "rustc_ms": 7.015, "rustc_native_ms": 7.036, "relax_ms": 9.274, "ratio_stock": 1.33, "ratio_native": 1.31, "spread_stock": [1.32, 1.33], "spread_native": [1.31, 1.32], "tts_ms": 5923, "checksum_ok": true},
+          {"workload": "Signed-distance-field glyph generation", "what": "", "rustc_ms": 9.445, "rustc_native_ms": 9.445, "relax_ms": 11.922, "ratio_stock": 1.26, "ratio_native": 1.26, "spread_stock": [1.26, 1.27], "spread_native": [1.25, 1.27], "tts_ms": 4616, "checksum_ok": true},
+          {"workload": "DEFLATE decode", "what": "", "rustc_ms": 0.631, "rustc_native_ms": 0.635, "relax_ms": 0.793, "ratio_stock": 1.26, "ratio_native": 1.25, "spread_stock": [1.23, 1.26], "spread_native": [1.24, 1.27], "tts_ms": 5617, "checksum_ok": true},
+          {"workload": "ZIP archive read", "what": "", "rustc_ms": 1.699, "rustc_native_ms": 1.702, "relax_ms": 1.876, "ratio_stock": 1.11, "ratio_native": 1.1, "spread_stock": [1.1, 1.11], "spread_native": [1.09, 1.13], "tts_ms": 5711, "checksum_ok": true},
+          {"workload": "PNG decode", "what": "", "rustc_ms": 7.452, "rustc_native_ms": 7.438, "relax_ms": 9.805, "ratio_stock": 1.32, "ratio_native": 1.32, "spread_stock": [1.31, 1.33], "spread_native": [1.31, 1.32], "tts_ms": 4536, "checksum_ok": true},
+          {"workload": "Brotli decode", "what": "", "rustc_ms": 1.436, "rustc_native_ms": 1.414, "relax_ms": 1.817, "ratio_stock": 1.27, "ratio_native": 1.28, "spread_stock": [1.23, 1.32], "spread_native": [1.24, 1.29], "tts_ms": 4653, "checksum_ok": true},
+          {"workload": "Vector map tile decode", "what": "", "rustc_ms": 13.228, "rustc_native_ms": 13.395, "relax_ms": 13.311, "ratio_stock": 1.01, "ratio_native": 0.99, "spread_stock": [1.0, 1.01], "spread_native": [0.993, 1.01], "tts_ms": 5903, "checksum_ok": true},
+          {"workload": "Widget tree layout", "what": "", "rustc_ms": 12.288, "rustc_native_ms": 12.357, "relax_ms": 21.523, "ratio_stock": 1.75, "ratio_native": 1.74, "spread_stock": [1.74, 1.76], "spread_native": [1.69, 1.76], "tts_ms": 10324, "checksum_ok": true},
+          {"workload": "LLM decode host path", "what": "", "rustc_ms": 191.08, "rustc_native_ms": 159.248, "relax_ms": 167.38, "ratio_stock": 0.87, "ratio_native": 1.05, "spread_stock": [0.856, 0.876], "spread_native": [1.05, 1.05], "tts_ms": 5850, "checksum_ok": true},
+          {"workload": "Rust source tokenizer", "what": "", "rustc_ms": 0.383, "rustc_native_ms": 0.381, "relax_ms": 0.461, "ratio_stock": 1.2, "ratio_native": 1.21, "spread_stock": [1.2, 1.21], "spread_native": [1.21, 1.21], "tts_ms": 4612, "checksum_ok": true},
+          {"workload": "Markdown parse", "what": "", "rustc_ms": 1.008, "rustc_native_ms": 1.008, "relax_ms": 1.563, "ratio_stock": 1.54, "ratio_native": 1.56, "spread_stock": [1.53, 1.56], "spread_native": [1.55, 1.56], "tts_ms": 8602, "checksum_ok": true},
+          {"workload": "HTML parse", "what": "", "rustc_ms": 1.072, "rustc_native_ms": 1.072, "relax_ms": 1.152, "ratio_stock": 1.04, "ratio_native": 1.11, "spread_stock": [1.02, 1.09], "spread_native": [1.07, 1.12], "tts_ms": 9676, "checksum_ok": true},
+          {"workload": "Physical piano model audio", "what": "", "rustc_ms": 44.67, "rustc_native_ms": 44.737, "relax_ms": 64.441, "ratio_stock": 1.44, "ratio_native": 1.44, "spread_stock": [1.43, 1.46], "spread_native": [1.42, 1.45], "tts_ms": 5613, "checksum_ok": true},
+          {"workload": "Ogg Vorbis audio decode", "what": "", "rustc_ms": 2.642, "rustc_native_ms": 2.595, "relax_ms": 3.284, "ratio_stock": 1.24, "ratio_native": 1.27, "spread_stock": [1.21, 1.28], "spread_native": [1.26, 1.27], "tts_ms": 4561, "checksum_ok": true},
+          {"workload": "Game audio mixer", "what": "", "rustc_ms": 6.12, "rustc_native_ms": 6.123, "relax_ms": 7.189, "ratio_stock": 1.17, "ratio_native": 1.18, "spread_stock": [1.17, 1.19], "spread_native": [1.17, 1.18], "tts_ms": 4285, "checksum_ok": true},
+          {"workload": "Script VM evaluation", "what": "", "rustc_ms": 1.773, "rustc_native_ms": 1.722, "relax_ms": 1.961, "ratio_stock": 1.12, "ratio_native": 1.13, "spread_stock": [1.08, 1.13], "spread_native": [1.13, 1.15], "tts_ms": 1837, "checksum_ok": true},
+          {"workload": "Solid geometry (CSG) booleans", "what": "", "rustc_ms": 8.446, "rustc_native_ms": 8.436, "relax_ms": 9.38, "ratio_stock": 1.11, "ratio_native": 1.12, "spread_stock": [1.11, 1.11], "spread_native": [1.1, 1.12], "tts_ms": 6801, "checksum_ok": true},
+          {"workload": "Rigid-body physics", "what": "", "rustc_ms": 11.496, "rustc_native_ms": 11.423, "relax_ms": 14.97, "ratio_stock": 1.3, "ratio_native": 1.32, "spread_stock": [1.28, 1.31], "spread_native": [1.29, 1.32], "tts_ms": 8853, "checksum_ok": true},
+          {"workload": "Game simulation tick", "what": "", "rustc_ms": 11.508, "rustc_native_ms": 11.481, "relax_ms": 14.335, "ratio_stock": 1.25, "ratio_native": 1.25, "spread_stock": [1.24, 1.26], "spread_native": [1.24, 1.25], "tts_ms": 6695, "checksum_ok": true},
+          {"workload": "Level walk (navigation grid and walker tours)", "what": "", "rustc_ms": 5.944, "rustc_native_ms": 5.936, "relax_ms": 5.396, "ratio_stock": 0.91, "ratio_native": 0.91, "spread_stock": [0.905, 0.908], "spread_native": [0.903, 0.921], "tts_ms": 4179, "checksum_ok": true},
+          {"workload": "3D model build", "what": "", "rustc_ms": 265.054, "rustc_native_ms": 265.276, "relax_ms": 509.552, "ratio_stock": 1.91, "ratio_native": 1.92, "spread_stock": [1.91, 1.93], "spread_native": [1.92, 1.93], "tts_ms": 13904, "checksum_ok": true}
+        ] }
+    ]
+  },
   benchText: {
-    intro: "{n} 个真实负载，每个都用三种方式构建：rustc `cargo build --release`（默认配置，通用 CPU）、带 `-C target-cpu=native` 的 rustc `--release`，以及 Relax。**比值 = Relax 耗时 / rustc 耗时，低于 1.00× 表示 Relax 更快。**",
-    placeholder: "占位数据",
+    intro: "{n} 个真实负载，每个都用三种方式构建：rustc `cargo build --release`（默认配置，通用 CPU）、带 `-C target-cpu=native` 的 rustc `--release`，以及 Relax。**比值 = Relax 耗时 / rustc 耗时，低于 1.00× 表示 Relax 更快。** 总体而言 Relax 更慢：它用于开发迭代，发布构建请用 rustc。",
+    footnote: "x64：8 核台式机 CPU，Linux；arm64：Apple M4 笔记本，macOS。rustc 1.99.1，LLVM 23.1.1。每个数字都是 3 轮的中位数，测于 2026-11-12。“默认”指通用 CPU 的 `cargo build --release`；“本机 CPU”指带 `-C target-cpu=native` 的 `--release`。Relax 取默认模式、升级到高优化层之后的稳定状态。x64 上，默认与本机两列来自同一台机器、同样二进制的两次独立运行。arm64 上通用 CPU 本就是 M 系列基线，两列仅差噪声。",
     platforms: { x64: "x86-64", arm64: "Apple M4" },
     baselines: { stock: "--release", native: "--release + 本机 CPU" },
     baselineLong: { stock: "rustc `cargo build --release`（默认配置，通用 CPU）", native: "带 `-C target-cpu=native` 的 rustc `--release`" },
@@ -1156,38 +1210,49 @@ const DATA = {
     ok: "一致", bad: "不一致",
     /* display names for the workload keys in DATA.bench; a name not listed shows as it is */
     workloads: {
-      "PNG decode": "PNG 解码", "Brotli decode": "Brotli 解码", "Inflate decode": "Inflate 解压", "Zip read": "Zip 读取",
-      "Text shaping and raster": "文本整形与光栅化", "SDF glyphs": "SDF 字形", "Map tile decode": "地图瓦片解码", "Widget layout": "控件布局",
-      "Rust tokenizer": "Rust 词法分析", "Markdown parse": "Markdown 解析", "HTML parse": "HTML 解析", "LLM host path": "LLM 宿主端路径",
-      "Physical piano model": "钢琴物理模型", "Ogg decode": "Ogg 解码", "Audio mix": "音频混音", "Script VM": "脚本虚拟机",
-      "CSG booleans": "CSG 布尔运算", "Rigid-body physics": "刚体物理"
+      "Text shaping and glyph rasterisation": "文本整形与字形光栅化",
+      "Signed-distance-field glyph generation": "有符号距离场字形生成",
+      "DEFLATE decode": "DEFLATE 解码",
+      "ZIP archive read": "ZIP 归档读取",
+      "PNG decode": "PNG 解码",
+      "Brotli decode": "Brotli 解码",
+      "Vector map tile decode": "矢量地图瓦片解码",
+      "Widget tree layout": "控件树布局",
+      "LLM decode host path": "LLM 解码宿主端路径",
+      "Rust source tokenizer": "Rust 源码词法分析",
+      "Markdown parse": "Markdown 解析",
+      "HTML parse": "HTML 解析",
+      "Physical piano model audio": "钢琴物理模型音频",
+      "Ogg Vorbis audio decode": "Ogg Vorbis 音频解码",
+      "Game audio mixer": "游戏音频混音",
+      "Script VM evaluation": "脚本虚拟机求值",
+      "Solid geometry (CSG) booleans": "实体几何（CSG）布尔运算",
+      "Rigid-body physics": "刚体物理",
+      "Game simulation tick": "游戏模拟步进",
+      "Level walk (navigation grid and walker tours)": "关卡漫游（导航网格与行走路线）",
+      "3D model build": "3D 模型构建"
     }
   },
 
   gaps: {
-    intro: "在稳定状态下，LLVM 生成的代码仍然更快。**热 JIT 对比同一份源码、同样输入的原生构建**，取实际耗时之比（越低越好，1.00× = LLVM）。",
-    chartTitle: "Relax 对比 `--release`（本机 CPU）",
-    baseline: { value: 1.00, label: "1.00× = LLVM，针对本机 CPU 的 --release" },
-    overLabel: "Relax 比 LLVM 多用的时间",
+    intro: "总体而言，Relax 运行的代码比 rustc 构建的更慢。**升级到高优化层之后的稳定状态，21 个负载的几何平均**，Relax 耗时 / rustc 耗时（越低越好，1.00× = rustc）。",
+    chartTitle: "Relax 耗时 / rustc 耗时，几何平均",
+    baseline: { value: 1.00, label: "1.00× = rustc" },
+    overLabel: "Relax 比 rustc 多用的时间",
     measuredLabel: "测于",
-    tableNote: "以上是我们最常剖析的负载。本周一次覆盖 18 个负载的更广泛测试结果更慢；我们正在查明原因。",
+    tableNote: "只有少数负载 Relax 更快（见上面的数字）。核内微基准（30 个）暂定，待热缓存升级缺陷修复后更新。Relax 用于开发迭代；发布构建请用 rustc。",
     rows: [
-      { workload: "3D 打印切片器：零件首次切片，4 线程", cpu: "x86-64 (Zen 4)", ratio: { value: 1.14, decimals: 2, suffix: "×" }, detail: "周期数 1.15 倍，指令数 1.26 倍", measured: "2026-11-11" },
-      { workload: "同上，8 线程", cpu: "x86-64 (Zen 4)", ratio: { value: 1.17, decimals: 2, suffix: "×" }, measured: "2026-11-11" },
-      { workload: "同上，4 线程", cpu: "AArch64 (Apple M4)", ratio: { value: 1.24, decimals: 2, suffix: "×" }, detail: "测于本周的 x86 优化移植过来之前", measured: "2026-11-09" },
-      { workload: "CAD B-rep 建模一轮", cpu: "x86-64 (Zen 4)", ratio: { value: 1.26, decimals: 2, suffix: "×" }, measured: "2026-11-10" },
-      { workload: "脚本虚拟机的解释器循环", cpu: "x86-64 (Zen 4)", ratio: { value: 1.19, decimals: 2, suffix: "×" }, measured: "2026-11-11" },
-      { workload: "密集数值内核（Cholesky 分解）", cpu: "x86-64 (Zen 4)", ratio: { value: 2.29, decimals: 2, suffix: "×" }, detail: "LLVM 用 AVX-512 把它向量化了，Relax 目前还不做循环向量化", measured: "2026-11-10" },
-      { workload: "任意负载对比普通 `--release`（可移植 CPU 基线）", cpu: "", ratio: null, detail: "尚未测量" }
+      { workload: "21 个负载，对比默认 `--release`", cpu: "x64", ratio: { value: 1.12, decimals: 2, suffix: "×" }, measured: "2026-11-12" },
+      { workload: "21 个负载，对比本机 CPU", cpu: "x64", ratio: { value: 1.22, decimals: 2, suffix: "×" }, measured: "2026-11-12" },
+      { workload: "21 个负载，对比默认 `--release`", cpu: "arm64", ratio: { value: 1.24, decimals: 2, suffix: "×" }, measured: "2026-11-12" },
+      { workload: "21 个负载，对比本机 CPU", cpu: "arm64", ratio: { value: 1.25, decimals: 2, suffix: "×" }, measured: "2026-11-12" },
+      { workload: "核内微基准（30 个），对比默认", cpu: "x64", ratio: { value: 1.14, decimals: 2, suffix: "×" }, detail: "暂定，待热缓存升级缺陷修复；应视为上界", measured: "2026-11-12" },
+      { workload: "核内微基准（30 个），对比本机 CPU", cpu: "x64", ratio: { value: 1.24, decimals: 2, suffix: "×" }, detail: "暂定，待热缓存升级缺陷修复；应视为上界", measured: "2026-11-12" },
+      { workload: "核内微基准（30 个）", cpu: "arm64", ratio: { value: 1.23, decimals: 2, suffix: "×" }, detail: "约 1.23；暂定，待热缓存升级缺陷修复；应视为上界", measured: "2026-11-12" }
     ],
     which: {
       title: "哪个 `--release`？",
-      body: "对比的是带 `-C target-cpu=native` 的 `--release`。大多数 Rust 程序用面向可移植 CPU 的普通 `--release` 发布，而 Relax 针对它所运行的 CPU 编译，所以那时差距会缩小。**尚未测量。**"
-    },
-    trend: {
-      from: "1.26×",
-      to: { from: 1.26, value: 1.14, decimals: 2, suffix: "×" },
-      text: "切片器的差距在三天里从 1.26 倍缩小到 1.14 倍。其余差距从哪来：见 [README](https://github.com/makepad/relax#where-llvm-still-wins)。"
+      body: "两种都测了：默认（`cargo build --release`，通用 CPU）和本机 CPU（`-C target-cpu=native`）。Relax 总是针对它所运行的 CPU 编译，所以“本机 CPU”一列才是同条件对比。arm64 上两者只差噪声。"
     }
   },
 
@@ -1531,7 +1596,7 @@ DATA.agents.practice.forEach((p, i) => bigcard($("#practice"), p, i));
   const LG = Math.log(mx), pos = v => Math.max(-1, Math.min(1, Math.log(v) / LG));
   const x = v => v.toFixed(2) + "×", sub = (s, o) => s.replace(/\{(\w+)\}/g, (m, k) => o[k]);
 
-  $("#benchIntro").innerHTML = rich(sub(T.intro, { n: B.platforms[0].rows.length })) + (B.placeholder ? " <span class=\"badge\">" + esc(T.placeholder) + "</span>" : "");
+  $("#benchIntro").innerHTML = rich(sub(T.intro, { n: B.platforms[0].rows.length }));
   function seg(label, opts, on) {
     const g = add(ctl, "div", "seg"); g.setAttribute("role", "group"); g.setAttribute("aria-label", label);
     const bs = opts.map((o, i) => {
@@ -1547,7 +1612,6 @@ DATA.agents.practice.forEach((p, i) => bigcard($("#practice"), p, i));
   const cFast = add(call, "div", "card bigcard reveal"), fNum = add(cFast, "strong"), fLab = add(cFast, "span"), fEx = add(cFast, "small");
   const spec = add(add(call, "div", "card bigcard spec reveal"), "dl");
   cFast.style.setProperty("--d", 1);
-  if (B.placeholder) add(spec.parentNode, "em", "badge", esc(T.placeholder)).style.cssText = "margin-top:14px;font-style:normal";
 
   const ax = add(chart, "div", "brow ax"); ax.setAttribute("aria-hidden", "true");
   add(ax, "div", "btrack", T.axis.map(a => "<span>" + esc(a) + "</span>").join(""));
@@ -1639,10 +1703,6 @@ DATA.agents.practice.forEach((p, i) => bigcard($("#practice"), p, i));
   const W = $("#gapWhich");
   add(W, "h3", "", rich(G.which.title)); add(W, "p", "", rich(G.which.body));
 
-  const T = $("#gapTrend"), nums = add(T, "div", "nums");
-  add(nums, "s", "", esc(G.trend.from)); add(nums, "span", "", "&rarr;").setAttribute("aria-hidden", "true");
-  nums.appendChild(counter(el("b", "grad"), G.trend.to));
-  add(T, "p", "", rich(G.trend.text));
 })();
 
 /* ------------------------------ a function's life ------------------------------ */

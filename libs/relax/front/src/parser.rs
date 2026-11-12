@@ -1755,7 +1755,17 @@ impl<'a> Parser<'a> {
                 .filter(|&q| !matches!(q, "crate" | "self" | "super" | "std" | "core" | "alloc"))
                 .and_then(|q| m.table.crates.get(&self.krate).and_then(|c| c.externs.get(q)).map(|s| s.as_str()).or(Some(q)))
                 .unwrap_or(&self.krate);
-            crate::builtins::macro_def_for(scope_krate, &name)
+            // A path names a proc macro through the imports it crosses, a rename among them
+            // (rustc resolves a macro path as any other): `time::serde::format_description!` is
+            // `pub use time_macros::serde_format_description as format_description;`, not the
+            // `format_description` time_macros also has ("unexpected token: ,"). A path the
+            // imports do not lead through keeps the macro of that name the crate can see. (Only
+            // for a call no macro_rules! answered: the walk is per call.)
+            let renamed = (r.is_none() && qual.is_some() && crate::builtins::builtin_macro_def(&name).is_none())
+                .then(|| m.proc_macro_path(&self.krate, &module, &full_path, crate::macro_reg::Kind::Bang, &mut Default::default())).flatten()
+                .filter(|entry| entry.fname != name)
+                .and_then(|entry| crate::builtins::hosted_macro_def(&entry));
+            renamed.or_else(|| crate::builtins::macro_def_for(scope_krate, &name))
         };
         // MAKEPAD_RUN_TRACE=macmiss: a qualified macro path that resolves to nothing (the call stays
         // unexpanded and its body's check reports it as not supported)
@@ -4849,6 +4859,7 @@ impl<'a> Parser<'a> {
             T::OpenBrace | T::KwIf | T::KwMatch | T::KwLoop | T::KwWhile | T::KwFor => true,
             T::KwUnsafe => self.nth(1) == T::OpenBrace,
             T::KwConst => self.nth(1) == T::OpenBrace,
+            T::KwTry => self.nth(1) == T::OpenBrace,
             T::KwAsync => self.nth(1) == T::OpenBrace || (self.nth(1) == T::KwMove && self.nth(2) == T::OpenBrace),
             T::Lifetime => self.nth(1) == T::Colon,
             _ => false,
@@ -5290,6 +5301,22 @@ impl<'a> Parser<'a> {
         e
     }
 
+    /// An element of a built-in `vec!`: None when a `#[cfg(..)]` on it is false. The `$x:expr`
+    /// fragment takes the attributes along into `box_new([$($x),+])` / `from_elem($elem, $n)`,
+    /// where the element is configured away as any list element is (`list_elem`; rustc_expand
+    /// expand.rs filter_map_expr).
+    fn vec_elem(&mut self) -> PResult<Option<ExprId>> {
+        let pend0 = self.pending_shape.len();
+        let attrs = if self.kind() == T::Pound && self.nth(1) == T::OpenBracket { self.outer_attrs()? } else { Vec::new() };
+        if !attrs.is_empty() && !self.cfg_present(&attrs) {
+            self.parse_stripped(|p| p.expr())?;
+            self.pending_shape.truncate(pend0);
+            return Ok(None);
+        }
+        self.closure_attrs(&attrs)?;
+        self.mac_list_elem().map(Some)
+    }
+
     /// rustc_parse parse_expr_block: a labeled or unsafe block, or a closure body after its return
     /// type, is written out, not a `$b:block` fragment.
     fn no_block_frag(&self) -> PResult<()> {
@@ -5396,10 +5423,12 @@ impl<'a> Parser<'a> {
                 let b = self.block()?;
                 Ok(self.mk_expr(ExprKind::ConstBlock(b), lo))
             }
-            T::KwTry if self.nth(1) == T::OpenBrace && self.cfg_out > 0 => {
+            // (`try` is a keyword from 2018 on; feature_gate.rs gates the block)
+            T::KwTry if self.nth(1) == T::OpenBrace => {
                 self.pos += 1;
+                self.no_block_frag()?;
                 let b = self.block()?;
-                Ok(self.mk_expr(ExprKind::Block(b, OptIdent::NONE), lo))
+                Ok(self.mk_expr(ExprKind::TryBlock(b), lo))
             }
             T::Lifetime => {
                 let label = self.label()?;

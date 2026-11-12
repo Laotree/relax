@@ -1220,39 +1220,28 @@ pub fn build_of(p: &Path) -> Option<u64> {
 /// The flights this process leads: (crate set, its lock file, the open lock).
 static FLIGHTS: std::sync::Mutex<Vec<(u128, PathBuf, std::fs::File)>> = std::sync::Mutex::new(Vec::new());
 
-/// How long a run waits for another's first load of its crate set: MAKEPAD_RUN_FLIGHT_WAIT
-/// seconds (0: it never waits), else two minutes.
-fn flight_wait() -> std::time::Duration {
-    std::time::Duration::from_secs(std::env::var("MAKEPAD_RUN_FLIGHT_WAIT").ok().and_then(|v| v.parse().ok()).unwrap_or(120))
-}
-
 /// A first load of crate set `identity` with the stores of `dir` (none of its graphs is
 /// stored): one run at a time makes it. The run that finds `<dir>/flight/<32 hex>` free leads:
 /// it holds the file locked until it has recorded the set ([`flight_landed`]) or exits (the OS
-/// drops the lock with the process, also on a crash). A run that finds it held waits for that
-/// (at most [`flight_wait`]) and returns true: the leader's stores are there to restore from,
-/// where two runs started together each parsed and recorded the same crates. false: this run
-/// leads, or loads on its own (no lock file can be made, the wait ran out).
+/// drops the lock with the process, also on a crash). A run that finds it held waits for that,
+/// as long as the leader takes, and returns true: the leader's stores are there to restore from,
+/// where two runs started together each parsed and recorded the same crates (a leader that ended
+/// without recording leaves nothing to restore: the follower then loads on its own). false: this
+/// run leads (or no lock file can be made: it loads on its own).
 pub fn flight(dir: &Path, identity: u128) -> bool {
-    let wait = flight_wait();
-    if wait.is_zero() { return false; }
+    // a set this process leads already: no wait on itself
+    if FLIGHTS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(id, ..)| *id == identity) { return false; }
     let folder = dir.join("flight");
     if std::fs::create_dir_all(&folder).is_err() { return false; }
     let path = folder.join(format!("{identity:032x}"));
     let Ok(f) = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path) else { return false };
     if f.try_lock().is_ok() {
+        // the file went between the open and the lock: its leader landed
+        if !still_at(&f, &path) { return true; }
         FLIGHTS.lock().unwrap_or_else(|e| e.into_inner()).push((identity, path, f));
         return false;
     }
-    let started = std::time::Instant::now();
-    while started.elapsed() < wait {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        if f.try_lock().is_ok() {
-            let _ = f.unlock();
-            return true;
-        }
-    }
-    false
+    f.lock().is_ok()
 }
 
 /// This process recorded what its flights were for (or will not): their followers go on.
@@ -1435,22 +1424,23 @@ mod tests {
         d
     }
 
-    /// A first load is led by one run: another that starts meanwhile waits until the leader has
-    /// recorded it, and one that starts after that leads its own.
+    /// A first load is led by one run: its flight file stays locked until the leader has recorded
+    /// the set (what another run's lock waits for), the leader does not wait on itself, and a
+    /// landing leaves no file, so the next run leads.
     #[test]
-    fn a_flight_is_led_by_one_run_and_followed_by_the_others() {
+    fn a_flight_is_held_by_its_leader_until_it_lands() {
         let d = tmpdir("flight");
         let identity = 0x00f1_1957_u128 << 64 | std::process::id() as u128;
+        let file = d.join("flight").join(format!("{identity:032x}"));
         assert!(!flight(&d, identity), "the first run leads");
-        let follower = { let d = d.clone(); std::thread::spawn(move || (flight(&d, identity), std::time::Instant::now())) };
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        let landed = std::time::Instant::now();
+        let other = std::fs::OpenOptions::new().read(true).write(true).open(&file).unwrap();
+        assert!(other.try_lock().is_err(), "another run finds it held, and waits");
+        assert!(!flight(&d, identity), "the leader does not wait on itself");
         flight_landed();
-        let (followed, at) = follower.join().unwrap();
-        assert!(followed && at >= landed, "the second waited for the first to land");
+        assert!(other.try_lock().is_ok(), "landed: the waiting run goes on");
+        assert!(!file.exists(), "a landed flight leaves no file");
         assert!(!flight(&d, identity), "a run after the landing leads again");
         flight_landed();
-        assert!(!d.join("flight").join(format!("{identity:032x}")).exists(), "a landed flight leaves no file");
         std::fs::remove_dir_all(d).unwrap();
     }
 
