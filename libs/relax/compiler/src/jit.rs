@@ -21083,9 +21083,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let owner_ns = std::cell::Cell::new(0u64);
     // candidate RIR built off the owner is stored only if no patch landed meanwhile
     let epoch0 = PATCH_EPOCH.load(Ordering::SeqCst);
-    // what the owner's drain had made when this build began: a candidate it leaves out waits for more
+    // what this build's fronts ask the owner's drain for: a candidate it leaves out waits on those
     // (o3_left_out), and the build is stored as incomplete
-    let drained0 = DRAIN_MADE.load(Ordering::SeqCst);
+    let _wants = BuildWants::on();
     let mut waiting: std::collections::HashSet<u32> = Default::default();
     let mut rounds = 0u32;
     let mut needs: Vec<u32> = Vec::new();
@@ -21487,7 +21487,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             // (the root's own O1 build is no inline candidate: its own front failing drops the build
             // at the next take, counted in the own-slot fronts)
             if *n == SPLIT_TRIES && !wanted.is_empty() && c != id {
-                if o3_left_out(up, id, c, &wanted, &unmade, drained0) {
+                if o3_left_out(up, id, c, &wanted, &unmade, &BuildWants::noted()) {
                     waiting.insert(c);
                 }
             }
@@ -21861,12 +21861,12 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                             keep_user(u, c);
                             notes.push((c, if came { "RIR came meanwhile: again once it is hot" } else { "RIR building: again once it is hot" }));
                         } else if waiting.contains(&c) {
-                            // (o3_left_out: queued again after the owner's next drain; stored as
+                            // (o3_left_out: queued again once what it waits for comes; stored as
                             // incomplete, so a launch that links it builds it again too)
                             incomplete = true;
                             kept_calls.push(c);
                             keep_user(u, c);
-                            notes.push((c, "left out: again after the owner's next drain"));
+                            notes.push((c, "left out: again once what it waits for comes"));
                         } else {
                             notes.push((c, "compiled, no RIR, not building: NOT built again"));
                         }
@@ -23570,61 +23570,213 @@ const SPLIT_TRIES: u8 = 2;
 /// under a trace, unless it has RIR by now. Those fronts were made and it still needs them, or
 /// they cannot be made off the owner (`unmade`, by why): the build keeps a call there, which is a
 /// bug, not a policy (a warm launch kept quicksort's stable_partition a call this way: sort_by_key
-/// 2.8x slower than with the disk cache off). The build is queued again once the owner's drain has
-/// made something since it began (`drained0`; LEFT_OUT_WAIT): its fronts' constants, statics and
-/// entries come from there. Left out for the rest of the run, a candidate's caller ran without it
-/// for good once a front needed more tries than one build gives it. False: `c` has RIR by now (the
-/// build's install keeps it for a rebuild once it turns hot).
-fn o3_left_out(up: *mut Unit, id: u32, c: u32, wanted: &[u32], unmade: &HashMap<u32, u8>, drained0: u64) -> bool {
+/// 2.8x slower than with the disk cache off). The build waits for what it is missing (left_out_wait):
+/// the items its fronts asked the owner's drain for that the drain has not made yet (`noted`,
+/// wanted_key), and is queued again once, when the drain makes the first of them. A build that
+/// waits on no such item (its fronts need the owner itself, or what they asked for is made and
+/// they still failed) has the slots it needed built on the owner, each slot once in the run, and
+/// is queued again once after that. Neither repeats for the same item or slot: a build queued
+/// again after every drain that made anything was built hundreds of times in a run, leaving the
+/// same candidate out each time (a large app: one decoder's O3 build 480 times, while its
+/// allocator calls' fronts needed a static the drain was never asked for).
+/// False: `c` has RIR by now (the build's install keeps it for a rebuild once it turns hot), or
+/// nothing is left to wait for (it stays a call for this run).
+fn o3_left_out(up: *mut Unit, id: u32, c: u32, wanted: &[u32], unmade: &HashMap<u32, u8>, noted: &[u64]) -> bool {
     owner::publish(|| {
         let u = unsafe { &*up };
         if u.fns[c as usize].rir.is_some() {
             return false;
         }
-        crate::zone_alloc::kept_with(|| {
-            let mut w = LEFT_OUT_WAIT.lock().unwrap_or_else(|e| e.into_inner());
-            match w.iter_mut().find(|x| x.0 == id) {
-                Some(x) => x.1 = x.1.min(drained0),
-                None => w.push((id, drained0)),
-            }
-        });
+        let wait = left_out_wait(id, wanted, noted);
         let name = |s: u32| format!("#{} {}", s, short_name(&u.fns[s as usize].name));
         let why = wanted.iter().map(|&s| match unmade.get(&s) {
             Some(&af) => format!("{} (its front is not made off the owner: {})", name(s), PREFRONT_FAIL_NAMES[af as usize]),
             None => format!("{} (made, and needed again)", name(s)),
         }).collect::<Vec<_>>().join(", ");
-        eprintln!("relax: the O3 build of {} leaves inline candidate {} out until the owner's next drain: it needs {} -- Relax bug, report it", name(id), name(c), why);
-        true
+        let until = match wait {
+            LeftOutWait::Item => "until the owner's drain makes what its fronts asked for",
+            LeftOutWait::Owner => "until the owner builds what it needs",
+            LeftOutWait::Never => "for this run (the owner built what it needs already)",
+        };
+        eprintln!("relax: the O3 build of {} leaves inline candidate {} out {}: it needs {} -- Relax bug, report it", name(id), name(c), until, why);
+        wait != LeftOutWait::Never
     })
 }
 
-/// O3 builds that left an inline candidate out (o3_left_out): (root slot, DRAIN_MADE when that
-/// build began). Each is queued again once the drain has made more (left_out_drain), never dropped.
-static LEFT_OUT_WAIT: relax_session::sync::Mutex<Vec<(u32, u64)>> = relax_session::sync::Mutex::new(Vec::new());
+/// What a left-out O3 build waits for (left_out_wait)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeftOutWait {
+    /// an item its fronts asked the owner's drain for
+    Item,
+    /// the slots it needed, built on the owner (left_out_drain)
+    Owner,
+    /// nothing: the owner built those slots for an earlier left-out already
+    Never,
+}
 
-/// What the owner's drain made in this run (const_drain: an evaluated constant or static, a placed
-/// thread-local, an entry, a vtable, a body's value): the progress a left-out candidate waits for
-static DRAIN_MADE: AtomicU64 = AtomicU64::new(0);
+/// An O3 build that left a candidate out, waiting (LeftOuts::waits)
+struct LeftOut {
+    root: u32,
+    /// the drain items it waits on (wanted_key): the first one made queues it again
+    items: Vec<u64>,
+    /// slots to build on the owner first (no item to wait on)
+    owner: Vec<u32>,
+}
 
-/// Owner, between requests (after const_drain): the O3 builds that left a candidate out
-/// (LEFT_OUT_WAIT) and began before the drain's last progress are queued again (a retier: the
-/// build replaces the code that calls the candidate). Returns the slots queued.
+/// The left-out O3 builds and what the owner's drain made (LEFT_OUTS)
+struct LeftOuts {
+    waits: Vec<LeftOut>,
+    /// builds an item they waited on came for (root, its owner slots): queued by left_out_drain
+    due: Vec<(u32, Vec<u32>)>,
+    /// items the drain made, and those it could not make (wanted_key)
+    made: Option<crate::fxhash::HashSet<u64>>,
+    failed: Option<crate::fxhash::HashSet<u64>>,
+    /// slots a left-out build had built on the owner: never asked for again
+    owner_built: Option<crate::fxhash::HashSet<u32>>,
+}
+
+static LEFT_OUTS: relax_session::sync::Mutex<LeftOuts> = relax_session::sync::Mutex::new(LeftOuts { waits: Vec::new(), due: Vec::new(), made: None, failed: None, owner_built: None });
+
+/// Root `root`'s build left a candidate out needing the fronts of `wanted`, its fronts having asked
+/// the drain for `noted`: it waits on those of them the drain has not made (or failed), else on
+/// the slots of `wanted` no left-out had built on the owner yet.
+fn left_out_wait(root: u32, wanted: &[u32], noted: &[u64]) -> LeftOutWait {
+    crate::zone_alloc::kept_with(|| {
+        let mut st = LEFT_OUTS.lock().unwrap_or_else(|e| e.into_inner());
+        let st = &mut *st;
+        let made = st.made.get_or_insert_with(Default::default);
+        let failed = st.failed.get_or_insert_with(Default::default);
+        let mut items: Vec<u64> = noted.iter().copied().filter(|k| !made.contains(k) && !failed.contains(k)).collect();
+        items.sort_unstable();
+        items.dedup();
+        let (items, owner, wait) = if !items.is_empty() {
+            (items, Vec::new(), LeftOutWait::Item)
+        } else {
+            let built = st.owner_built.get_or_insert_with(Default::default);
+            let slots: Vec<u32> = wanted.iter().copied().filter(|s| built.insert(*s)).collect();
+            if slots.is_empty() {
+                return LeftOutWait::Never;
+            }
+            (Vec::new(), slots, LeftOutWait::Owner)
+        };
+        match st.waits.iter_mut().find(|w| w.root == root) {
+            Some(w) => {
+                w.items.extend(items);
+                w.items.sort_unstable();
+                w.items.dedup();
+                w.owner.extend(owner);
+            }
+            None => st.waits.push(LeftOut { root, items, owner }),
+        }
+        wait
+    })
+}
+
+/// Item `key` (wanted_key) of the owner's drain is made (`ok`) or cannot be: the left-out builds
+/// that wait on a made one are due (one queue each, left_out_drain); a failed one is waited on no
+/// more (a build that waited on nothing else stays as built: the owner's lowering reports it).
+fn left_out_drained(key: u64, ok: bool) {
+    crate::zone_alloc::kept_with(|| {
+        let mut st = LEFT_OUTS.lock().unwrap_or_else(|e| e.into_inner());
+        let st = &mut *st;
+        if ok {
+            st.made.get_or_insert_with(Default::default).insert(key);
+        } else {
+            st.failed.get_or_insert_with(Default::default).insert(key);
+        }
+        let mut i = 0;
+        while i < st.waits.len() {
+            let w = &mut st.waits[i];
+            if w.items.contains(&key) {
+                if ok {
+                    let w = st.waits.swap_remove(i);
+                    st.due.push((w.root, w.owner));
+                    continue;
+                }
+                w.items.retain(|k| *k != key);
+                if w.items.is_empty() && w.owner.is_empty() {
+                    st.waits.swap_remove(i);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    })
+}
+
+/// Owner, between requests (after const_drain): the left-out O3 builds that are due (an item they
+/// waited on was made) or wait on the owner alone (no item): the slots they needed are built here,
+/// on the owner, each once in the run, and each build is queued again (a retier: the build
+/// replaces the code that calls the candidate). Returns the slots queued.
 pub(crate) fn left_out_drain() -> Vec<u32> {
-    let made = DRAIN_MADE.load(Ordering::SeqCst);
-    let due: Vec<u32> = {
-        let mut w = LEFT_OUT_WAIT.lock().unwrap_or_else(|e| e.into_inner());
-        if w.is_empty() {
+    // (O3 stopped, the run ending: no O3 build is made again, and the owner builds nothing for one)
+    if TIER_STOP.load(Ordering::SeqCst) {
+        return Vec::new();
+    }
+    let due: Vec<(u32, Vec<u32>)> = {
+        let mut st = LEFT_OUTS.lock().unwrap_or_else(|e| e.into_inner());
+        if st.due.is_empty() && !st.waits.iter().any(|w| w.items.is_empty()) {
             return Vec::new();
         }
-        let due = w.iter().filter(|x| x.1 < made).map(|x| x.0).collect();
-        w.retain(|x| x.1 >= made);
-        due
+        let st = &mut *st;
+        crate::zone_alloc::kept_with(|| {
+            let mut due = std::mem::take(&mut st.due);
+            st.waits.retain_mut(|w| {
+                if !w.items.is_empty() {
+                    return true;
+                }
+                due.push((w.root, std::mem::take(&mut w.owner)));
+                false
+            });
+            due
+        })
     };
-    for &id in &due {
+    // (the unit const_drain made the items in: the one the left-out builds' fronts read)
+    let up = cur_unit();
+    let mut queued: Vec<u32> = Vec::with_capacity(due.len());
+    for (root, slots) in due {
+        if up.is_null() {
+            break;
+        }
+        for s in slots {
+            let f = unsafe { &(&*up).fns[s as usize] };
+            if !f.building && f.build_err.is_none() && lowering_wanted(f) {
+                let _ = unsafe { build_rir_mode(up, s, RirMode::Normal) };
+            }
+        }
+        if !queued.contains(&root) {
+            queued.push(root);
+        }
+    }
+    for &id in &queued {
         crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::RETIER, 0, 0, 0);
         tier_push(id, Q_RETIER, 0);
     }
-    due
+    queued
+}
+
+thread_local! {
+    /// (an O3 build, run_o3) the items its fronts asked the owner's drain for (wanted_key): what a
+    /// candidate it leaves out waits on (o3_left_out)
+    static BUILD_WANTS: std::cell::RefCell<Option<Vec<u64>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// run_o3's scope of BUILD_WANTS (the scope it replaced comes back after it)
+struct BuildWants(Option<Vec<u64>>);
+impl BuildWants {
+    fn on() -> BuildWants {
+        BuildWants(BUILD_WANTS.with(|b| b.replace(Some(Vec::new()))))
+    }
+    /// what this build's fronts asked for so far
+    fn noted() -> Vec<u64> {
+        BUILD_WANTS.try_with(|b| b.borrow().clone().unwrap_or_default()).unwrap_or_default()
+    }
+}
+impl Drop for BuildWants {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        let _ = BUILD_WANTS.try_with(|b| b.replace(prev));
+    }
 }
 
 /// O1 builds of `ids` off the owner (their fronts made ahead): prepared in a take (a publish), optimised on
@@ -30150,8 +30302,9 @@ fn want_missing_body_consts(u: &Unit, body: &Body) -> bool {
     }
     missing
 }
-/// Notes `w` for the owner's const_drain.
+/// Notes `w` for the owner's const_drain (and for the O3 build that asked: BUILD_WANTS).
 fn want(w: Wanted, epoch: u64) {
+    let _ = BUILD_WANTS.try_with(|b| if let Some(v) = b.borrow_mut().as_mut() { v.push(wanted_key(&w, epoch)) });
     crate::zone_alloc::kept_with(|| CONSTS_WANTED.lock().unwrap_or_else(|e| e.into_inner()).push((w, epoch)));
     let _ = WANT_NOTES.try_with(|n| n.set(n.get().wrapping_add(1)));
 }
@@ -30176,6 +30329,12 @@ impl Drop for WantConsts {
 /// The same holds for a `#[thread_local]` static nobody placed in this run (Unit::thread_local_place
 /// allocates its TLS: csg_boolean's CURRENT_CANCEL getter ran baseline).
 static CONSTS_WANTED: relax_session::sync::Mutex<Vec<(Wanted, u64)>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// Item `w` of epoch `epoch` as a left-out build waits on it (LeftOut::items): one of another
+/// epoch is another item.
+fn wanted_key(w: &Wanted, epoch: u64) -> u64 {
+    std::hash::BuildHasher::hash_one(&crate::fxhash::FxBuild::default(), (w, epoch))
+}
 
 /// What a background build's front found missing (CONSTS_WANTED)
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -30270,7 +30429,14 @@ pub(crate) fn const_drain() {
     let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
     let mut seen: crate::fxhash::HashSet<Wanted> = Default::default();
     for (w, e) in want {
-        if e != epoch || !seen.insert(w.clone()) {
+        // (what it makes, or finds made, ends the waits of the left-out builds that asked for it;
+        // an item of an earlier epoch is made by no drain)
+        let item = wanted_key(&w, e);
+        if e != epoch {
+            left_out_drained(item, false);
+            continue;
+        }
+        if !seen.insert(w.clone()) {
             continue;
         }
         // each item's builds a caught panic left open are closed after it: the next item's
@@ -30280,7 +30446,7 @@ pub(crate) fn const_drain() {
             Wanted::Entry(key) => {
                 let id = u.fn_id(key);
                 let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.entry(id))).is_ok();
-                if ok { DRAIN_MADE.fetch_add(1, Ordering::SeqCst); }
+                left_out_drained(item, ok);
                 if ahead_trace() {
                     eprintln!("const-drain: entry of {} {}", u.fns[id as usize].name, if ok { "taken" } else { "failed" });
                 }
@@ -30288,7 +30454,7 @@ pub(crate) fn const_drain() {
             }
             Wanted::Vtable(src, dy) => {
                 let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.vtable(src, dy).is_ok())).unwrap_or(false);
-                if ok { DRAIN_MADE.fetch_add(1, Ordering::SeqCst); }
+                left_out_drained(item, ok);
                 if ahead_trace() {
                     eprintln!("const-drain: a vtable {}", if ok { "made" } else { "failed" });
                 }
@@ -30296,6 +30462,7 @@ pub(crate) fn const_drain() {
             }
             Wanted::Body(slot, what, body) => {
                 if u.front.body_consts.get(&what.key(u, slot)).is_some() {
+                    left_out_drained(item, true);
                     continue;
                 }
                 // as the slot's own lowering: its reader of the constants this evaluation reads
@@ -30309,7 +30476,7 @@ pub(crate) fn const_drain() {
                 DEFERRED_ABORT.with(|a| a.set(deferred));
                 unsafe { close_builds_above(up, depth + 1) };
                 BUILD_STACK.with(|s| s.borrow_mut().truncate(depth));
-                if ok { DRAIN_MADE.fetch_add(1, Ordering::SeqCst); }
+                left_out_drained(item, ok);
                 if ahead_trace() {
                     eprintln!("const-drain: a value of the body of {} {}", u.fns[slot as usize].name, if ok { "evaluated" } else { "failed" });
                 }
@@ -30317,12 +30484,14 @@ pub(crate) fn const_drain() {
             }
             Wanted::Const(d, args) => {
                 if u.front.consts.get(&(d, args.clone())).is_some() {
+                    left_out_drained(item, true);
                     continue;
                 }
                 (d, matches!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.const_addr(d, args))), Ok(Some(_))))
             }
             Wanted::Tls(d) => {
                 if u.front.tls.get(&d).is_some() {
+                    left_out_drained(item, true);
                     continue;
                 }
                 (d, matches!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.thread_local_place(d))), Ok(Some(_))))
@@ -30330,12 +30499,13 @@ pub(crate) fn const_drain() {
             // (Unit::static_addr publishes an initialized static into FrontShared::consts)
             Wanted::Static(d) => {
                 if u.front.consts.get(&(d, Vec::new())).is_some() {
+                    left_out_drained(item, true);
                     continue;
                 }
                 (d, std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.static_addr(d))).is_ok_and(|a| a != 0))
             }
         };
-        if ok { DRAIN_MADE.fetch_add(1, Ordering::SeqCst); }
+        left_out_drained(item, ok);
         if ahead_trace() {
             eprintln!("const-drain: {} {}", u.prog.def_path(d), if ok { "evaluated" } else { "failed" });
         }

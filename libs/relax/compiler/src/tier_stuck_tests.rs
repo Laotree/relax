@@ -513,21 +513,30 @@ fn a_bailed_take_gives_back_a_full_bodys_normal_lowering() {
 }
 
 const LEFT_SOURCE: &str = r#"
-const K: u32 = 40 + 2;
-pub fn leaf(x: u32) -> u32 { x ^ 7 }
-pub fn root(x: u32) -> u32 { leaf(x).wrapping_add(K) }
+const K1: u32 = 40 + 2;
+const K2: u32 = 6 * 7;
+extern "C" {
+    fn relax_left_out_fixture_absent(x: u32) -> u32;
+}
+pub fn leaf(x: u32) -> u32 { if x == 0 { unsafe { relax_left_out_fixture_absent(x) } } else { x ^ 7 } }
+pub fn mid(x: u32) -> u32 { leaf(x).wrapping_add(K2) }
+pub fn root(x: u32) -> u32 { mid(x).wrapping_add(K1) }
 fn main() {
     let _ = root(1);
 }
 "#;
 
-/// An O3 build that leaves an inline candidate out (the fronts it needed were not had within the
-/// build's tries) is queued again once the owner's drain has made something since the build began,
-/// and only then: the candidate is never left a call for the rest of the run, as it was ("a call
-/// for this run"), and a build whose fronts wait on nothing new is not built over and over.
+/// An O3 build that leaves an inline candidate out is built again once per thing it waited on, and
+/// never in a loop. One that waits on an item its fronts asked the owner's drain for is queued
+/// again when the drain makes that item, not when a drain makes anything else (a large app's
+/// decoder build was queued after every drain that made anything: 480 builds in a run, each leaving
+/// the same allocator calls out). One whose front cannot be made off the owner and asked for
+/// nothing (a call of a C function no loaded image defines: only the owner loads the program's
+/// libraries) has that slot built on the owner once and is queued once; a later left-out needing
+/// the same slot waits for nothing.
 #[test]
-fn a_left_out_candidates_build_is_queued_again_after_the_drain() {
-    isolated_test!(a_left_out_candidates_build_is_queued_again_after_the_drain);
+fn a_left_out_build_is_built_again_once_per_thing_it_waited_on() {
+    isolated_test!(a_left_out_build_is_built_again_once_per_thing_it_waited_on);
     crate::borrowck::lazy::disable_gandalf();
     if std::env::var_os("RELAX_STD").is_none() {
         std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
@@ -541,30 +550,58 @@ fn a_left_out_candidates_build_is_queued_again_after_the_drain() {
         let id = DefId(i as u32);
         (d.krate == krate && d.kind == kind && prog.name(id) == n).then_some(id)
     }).unwrap();
-    let (root_d, leaf_d, k_d) = (def(&prog, "root", DefKind::Fn), def(&prog, "leaf", DefKind::Fn), def(&prog, "K", DefKind::Const));
+    let (root_d, mid_d, leaf_d) = (def(&prog, "root", DefKind::Fn), def(&prog, "mid", DefKind::Fn), def(&prog, "leaf", DefKind::Fn));
+    let (k1, k2) = (def(&prog, "K1", DefKind::Const), def(&prog, "K2", DefKind::Const));
     let mut tcx = Tcx::new();
     tcx.collect(&prog);
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
     let mut u = Unit::new(prog, tcx, core);
     let up = &mut *u as *mut Unit;
     unsafe { UNIT = up };
-    let (root, leaf) = crate::owner::call(crate::owner::Class::Program, || (u.fn_id(FnKey::Inst(root_d, Vec::new())), u.fn_id(FnKey::Inst(leaf_d, Vec::new()))));
-    // root's O3 build began, then left leaf out: leaf's own front was not had in its tries
+    let (root, mid, leaf) = crate::owner::call(crate::owner::Class::Program, || (u.fn_id(FnKey::Inst(root_d, Vec::new())), u.fn_id(FnKey::Inst(mid_d, Vec::new())), u.fn_id(FnKey::Inst(leaf_d, Vec::new()))));
     crate::inspect::tierlog::init();
-    let drained0 = DRAIN_MADE.load(Ordering::SeqCst);
-    assert!(o3_left_out(up, root, leaf, &[leaf], &HashMap::new(), drained0), "leaf has no RIR: its build waits");
     // (the owner runs the drain steps between its requests: each call below ends with them; a
-    // worker may take the queued build at once, so the decision is read from the tier log)
-    let retiers = || crate::inspect::tierlog::history(root).0.map_or(0, |h| h.n[crate::inspect::tierlog::ev::RETIER as usize]);
+    // worker may take a queued build at once, so the decision is read from the tier log)
+    let retiers = |id: u32| crate::inspect::tierlog::history(id).0.map_or(0, |h| h.n[crate::inspect::tierlog::ev::RETIER as usize]);
+    let drain = |w: Wanted| {
+        let epoch = crate::owner::call(crate::owner::Class::Program, || u.tcx.collect_epoch.load(Ordering::SeqCst));
+        want(w, epoch);
+        crate::owner::call(crate::owner::Class::Job, const_drain);
+        crate::owner::call(crate::owner::Class::Program, || ());
+    };
     let epoch = crate::owner::call(crate::owner::Class::Program, || u.tcx.collect_epoch.load(Ordering::SeqCst));
-    assert_eq!(retiers(), 0, "built again before the drain made anything its fronts could wait for");
-    // a front asks for a constant, and the owner's drain evaluates it
-    want(Wanted::Const(k_d, Vec::new()), epoch);
-    crate::owner::call(crate::owner::Class::Job, const_drain);
+
+    // root's build left mid out, its fronts having asked the drain for K1
+    assert!(o3_left_out(up, root, mid, &[mid], &HashMap::new(), &[wanted_key(&Wanted::Const(k1, Vec::new()), epoch)]), "mid has no RIR: its build waits on K1");
     crate::owner::call(crate::owner::Class::Program, || ());
-    assert_eq!(retiers(), 1, "the build that left leaf out is not queued again after the drain made something");
+    assert_eq!(retiers(root), 0, "built again before the item it waits on was made");
+    drain(Wanted::Const(k2, Vec::new()));
+    assert_eq!(retiers(root), 0, "built again after a drain that made something it did not wait on (K2)");
+    drain(Wanted::Const(k1, Vec::new()));
+    assert_eq!(retiers(root), 1, "not built again once the drain made K1, the item it waited on");
+    drain(Wanted::Const(k1, Vec::new()));
+    drain(Wanted::Const(k2, Vec::new()));
+    assert_eq!(retiers(root), 1, "built again by later drains: one item it waited on builds it once");
+
+    // leaf's front cannot be made off the owner, and it asks the drain for nothing
+    let front = crate::owner::call(crate::owner::Class::Program, || u.front.clone());
+    let notes = want_notes();
+    let _ = PREFRONT_WHY.try_with(|w| w.set(AF_OK));
+    assert!(!prefront_slot(&front, leaf), "the fixture's front was made off the owner: it must need the unit");
+    let why = PREFRONT_WHY.try_with(|w| w.get()).unwrap_or(AF_OK);
+    assert_eq!(want_notes(), notes, "the fixture's front asked the drain for something: it must need the owner itself");
+    // mid's build leaves leaf out: leaf is built on the owner, then the build is queued, once
+    let unmade: HashMap<u32, u8> = [(leaf, why)].into_iter().collect();
+    assert!(o3_left_out(up, mid, leaf, &[leaf], &unmade, &[]), "leaf has no RIR: its build waits on the owner");
     crate::owner::call(crate::owner::Class::Program, || ());
-    assert_eq!(retiers(), 1, "queued again at a later drain too: one left-out queues its build once");
+    assert_eq!(retiers(mid), 1, "the build that waits on the owner is not queued again after the owner's drain");
+    assert!(inline_body(&u.fns[leaf as usize]).is_some(), "the owner did not build the slot the left-out build needed");
+    drain(Wanted::Const(k2, Vec::new()));
+    assert_eq!(retiers(mid), 1, "built again by a later drain: the owner's build of its slot queues it once");
+    // another build needing the same slot again (made, and needed again) waits for nothing more
+    assert!(!o3_left_out(up, root, mid, &[leaf], &unmade, &[]), "a left-out needing a slot the owner built already waits again");
+    crate::owner::call(crate::owner::Class::Program, || ());
+    assert_eq!(retiers(root), 1, "queued again for a slot the owner built already: a loop");
     // (process exit owns the runtime's teardown)
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
