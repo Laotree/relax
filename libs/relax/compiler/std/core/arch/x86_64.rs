@@ -104,6 +104,12 @@ pub struct __m512(pub [f32; 16]);
 #[derive(Copy, Clone)]
 #[repr(C, align(64))]
 pub struct __m512d(pub [f64; 8]);
+
+// The AVX-512 mask registers, one bit per lane (stdarch's avx512f.rs aliases).
+pub type __mmask8 = u8;
+pub type __mmask16 = u16;
+pub type __mmask32 = u32;
+pub type __mmask64 = u64;
 #[derive(Copy, Clone)]
 #[repr(C, align(16))]
 pub struct __m128bh(pub [u16; 8]);
@@ -5123,6 +5129,16 @@ pub fn _mm256_unpacklo_ps(a: __m256, b: __m256) -> __m256 {
 pub fn _mm256_unpackhi_ps(a: __m256, b: __m256) -> __m256 {
     unsafe {
         ps_join(_mm_unpackhi_ps(ps_lo(&a), ps_lo(&b)), _mm_unpackhi_ps(ps_hi(&a), ps_hi(&b)))
+    }
+}
+
+/// `_mm_shuffle_ps` on each 128-bit half, with the same `MASK`.
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+pub fn _mm256_shuffle_ps<const MASK: i32>(a: __m256, b: __m256) -> __m256 {
+    unsafe {
+        ps_join(_mm_shuffle_ps::<MASK>(ps_lo(&a), ps_lo(&b)), _mm_shuffle_ps::<MASK>(ps_hi(&a), ps_hi(&b)))
     }
 }
 
