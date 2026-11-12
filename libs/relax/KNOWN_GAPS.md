@@ -97,23 +97,3 @@ in arm64.rs, folded in passes.rs, run by codegen/src/interp.rs, refused by wasm.
 bit 12 of the CRC32* encoding; x64 has them as SSE4.2 `crc32`), then the std wrappers in
 compiler/std/core/arch/aarch64.rs and x86_64.rs, and a check in
 compiler/tests/crc32_clmul_intrinsics.rs.
-
-## 7. NEON intrinsics are `unsafe fn`; rustc's are safe
-
-```rust
-#[cfg(target_arch = "aarch64")]
-fn main() {
-    use core::arch::aarch64::*;
-    let a = unsafe { vdup_n_u8(3) };
-    println!("{:?}", vadd_u8(a, a));
-}
-```
-
-- rustc (1.87 and later): compiles; the NEON intrinsics without pointer arguments are safe
-  `#[target_feature(enable = "neon")]` functions, and NEON is on for every aarch64 target.
-- Relax: E0133, call to unsafe function `vadd_u8`.
-
-compiler/std/core/arch/aarch64.rs declares every intrinsic `pub unsafe fn`. The ones stdarch
-declares safe (all but the loads, stores and those that need a feature beyond NEON, such as crc
-and aes) should be `pub fn` with their bodies in `unsafe` blocks; the families at the end of the
-file change in their macros.
