@@ -1239,6 +1239,16 @@ impl<'a> Fcx<'a> {
 
     /// rustc_hir_typeck/src/coercion.rs:1134-1164: a failed coercion returns
     /// failure without reporting. Only the demanding caller emits a diagnostic.
+    /// rustc check_expr_index: the index operand of an overloaded index is coerced to the selected
+    /// impl's index type (demand_coerce), so a reference index is reborrowed with a fresh region:
+    /// `files[name]` with `name: &String` passes `&*name`, and a closure captures `*name`, not the
+    /// local `name` (relax issue 77: an inner closure borrowed the outer closure's parameter).
+    fn reborrow_index_operand(&mut self, ti: TyId, i: ExprId) {
+        if let TyKind::Ref(m, inner, _) = self.tcx.tys.kind(self.shallow(ti)).clone() {
+            let want = self.tcx.tys.intern(TyKind::Ref(m, inner, self.fresh_region()));
+            self.try_coerce(ti, want, Some(i));
+        }
+    }
     fn try_coerce(&mut self, a: TyId, x: TyId, e: Option<ExprId>) -> bool {
         self.try_coerce_inner(a, x, e, self.last_lo, false).is_some()
     }
@@ -5876,6 +5886,7 @@ impl<'a> Fcx<'a> {
                                     for st in [cur, slice] {
                                         let ds = self.infcx.deeply_resolve_ignoring_regions(st);
                                         if !matches!(self.select_trait(td, ds, &[ti2]), Err(_)) {
+                                            self.reborrow_index_operand(ti, *i);
                                             let m = self.trait_fn(td, "index").unwrap();
                                             self.b.ov_index.insert(e.0, (m, self.tcx.tys.mk_list(&[ds, ti2])));
                                             let out = self.tcx.trait_assoc(self.prog, td, self.prog.syms.get("Output").unwrap()).unwrap();
@@ -5939,6 +5950,9 @@ impl<'a> Fcx<'a> {
                                     }
                                 }
                                 if !matches!(found, Err(_)) {
+                                    if coerced_idx.is_none() {
+                                        self.reborrow_index_operand(ti, *i);
+                                    }
                                     self.set_operand_derefs(e.0, derefs);
                                     let m = self.trait_fn(td, "index").unwrap();
                                     let index = coerced_idx.unwrap_or(ti2);
