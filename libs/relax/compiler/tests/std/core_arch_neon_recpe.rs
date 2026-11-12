@@ -20,6 +20,9 @@ fn recpe(x: u32) -> u32 {
 #[test]
 fn a01_add_across_widening() {
     unsafe {
+        assert_eq!(vaddlv_u8(vdup_n_u8(0)), 0);
+        assert_eq!(vaddlvq_u8(vdupq_n_u8(0)), 0);
+        assert_eq!(vaddlv_u8(vdup_n_u8(1)), 8);
         assert_eq!(vaddlvq_u8(vdupq_n_u8(1)), 16);
         assert_eq!(vaddlvq_u8(vdupq_n_u8(255)), 4080);
         assert_eq!(vaddlv_u8(vdup_n_u8(255)), 2040);

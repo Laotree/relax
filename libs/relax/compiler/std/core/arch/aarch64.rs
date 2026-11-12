@@ -1670,6 +1670,9 @@ pub fn vaddq_u8(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
     }
 }
 
+// Widening add across the vector (stdarch vaddlv_u8 / vaddlvq_u8). The sum of the lanes is at
+// most 8 * 255 = 2040, or 16 * 255 = 4080 for the 128-bit form, so the u16 accumulator cannot
+// overflow.
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vaddlv_u8(a: uint8x8_t) -> u16 {
     let mut r = 0u16;
