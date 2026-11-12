@@ -99,8 +99,9 @@ impl<'a> Mode<'a> {
 
 /// Which of the C symbols `names` the loader process binds once the libraries `dylibs` and the
 /// frameworks `frameworks` are loaded: what the dynamic loader can bind a native library's
-/// import to (the C runtime and system libraries; the program's code is in none of them).
-pub type Resolvable = fn(names: &[String], dylibs: &[String], frameworks: &[String]) -> Vec<bool>;
+/// import to (the C runtime and system libraries; the program's code is in none of them). A
+/// library is the file the link took, from the build scripts' search folders `search` first.
+pub type Resolvable = fn(names: &[String], dylibs: &[String], frameworks: &[String], search: &[String]) -> Vec<bool>;
 
 /// What cargo's build script of one native package produced.
 #[derive(Clone)]
@@ -321,10 +322,16 @@ fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
         h = fnv(b"\0", h);
     }
     h = fnv(&resolved_packages_key(g.raw.iter().filter(|u| script_pkgs.binary_search(&u.pkg.1).is_ok())).to_le_bytes(), h);
+    // and the program's rustc flags, wherever cargo takes them from: the native library is linked
+    // with the program's link arguments (`link_args`)
     let mut native_env: Vec<_> = std::env::vars().filter(|(k, _)| {
-        ["CC", "CXX", "AR", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS", "PKG_CONFIG"]
+        ["CC", "CXX", "AR", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS", "PKG_CONFIG", "RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"]
             .iter().any(|prefix| k == prefix || k.starts_with(&format!("{prefix}_")))
+            || (k.starts_with("CARGO_TARGET_") && (k.ends_with("_RUSTFLAGS") || k.ends_with("_LINKER")))
     }).collect();
+    for (_, file) in crate::resolve::cargo_config_files(req.workspace) {
+        native_env.push((file.clone(), std::fs::read_to_string(&file).unwrap_or_default()));
+    }
     native_env.sort();
     for (k, v) in native_env {
         h = fnv(k.as_bytes(), h);
@@ -387,7 +394,7 @@ pub fn build(g: &Graph, seeds: &[usize], req: &Request) -> Result<Built, String>
         return Ok(Built { scripts: out.scripts, lib: None });
     }
     if !std::path::Path::new(&plan.lib_path).is_file() {
-        link(&plan.lib_path, &out.archives, &out.search, &out.fw_search, &out.dylibs, &out.frameworks, req.triple, req.resolvable)?;
+        link(&plan.lib_path, &out, req.triple, req.resolvable)?;
     }
     if std::path::Path::new(&plan.fast_mark).is_file() {
         optimize_later(g, req, exe, &flags, plan.script_pkgs, plan.lib_pkgs, seeds, &out, plan.lib_path.clone(), plan.fast_mark);
@@ -547,6 +554,9 @@ struct Outputs {
     fw_search: Vec<String>,
     dylibs: Vec<String>,
     frameworks: Vec<String>,
+    /// the program's link arguments (`-C link-arg`s of its binary's rustc command: RUSTFLAGS, the
+    /// cargo config's rustflags, its build scripts' `rustc-link-arg`s), as cargo gave them
+    link_args: Vec<String>,
 }
 
 /// (crate, features) of each build script of the graph: what the native steps read of it
@@ -594,8 +604,13 @@ fn outputs_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<Stri
     let mut dylibs: Vec<String> = Vec::new();
     let mut frameworks: Vec<String> = Vec::new();
     let mut runs: Vec<(String, String)> = Vec::new();
+    let mut link_args: Vec<String> = Vec::new();
     for line in messages.lines() {
         let j = crate::json::parse(line.as_bytes()).map_err(|e| format!("cargo message: {e}"))?;
+        if let Some(a) = j.get("relax_link_args") {
+            link_args = a.arr().iter().map(|x| x.str().to_string()).collect();
+            continue;
+        }
         let (n, v) = id_name_version(j.get("package_id").map(|p| p.str()).unwrap_or(""));
         let Some(&s) = seeds.iter().find(|&&s| {
             let p = &pkg[scripts_of[s].0];
@@ -653,7 +668,7 @@ fn outputs_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<Stri
             None => return Err(format!("--allow-c: a native build script links static library `{}`, but {} is in none of its search paths ({})", name, file, search.join(", "))),
         }
     }
-    Ok(Outputs { scripts, runs, statics, archives, search, fw_search, dylibs, frameworks })
+    Ok(Outputs { scripts, runs, statics, archives, search, fw_search, dylibs, frameworks, link_args })
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -706,7 +721,7 @@ fn optimize_later(g: &Graph, req: &Request, exe: std::path::PathBuf, flags: &[&S
             return;
         }
         let tmp = format!("{}.opt{}", lib_path, std::process::id());
-        if link(&tmp, &o.archives, &o.search, &o.fw_search, &o.dylibs, &o.frameworks, &triple, resolvable).is_ok() && std::fs::rename(&tmp, &lib_path).is_ok() {
+        if link(&tmp, &o, &triple, resolvable).is_ok() && std::fs::rename(&tmp, &lib_path).is_ok() {
             let _ = std::fs::remove_file(&fast_mark);
             
         } else {
@@ -748,6 +763,14 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
     if tier == Tier::Fast {
         eprintln!("makepad run: --allow-c: building native dependencies with cargo (opt-level 0 now, optimized in the background; cached afterwards): {}", script_pkgs.iter().take(8).cloned().collect::<Vec<_>>().join(", "));
     }
+    // the program's link arguments: the wrapper writes them here, a file per binary or test
+    // harness. A folder of its own per cargo run: the program's stubs depend on its name
+    // (wrapper), so cargo runs them again, and they say the link arguments, even when nothing else
+    // changed
+    let run_id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let link_dir = build.join(format!("relax-link-args.{}.{run_id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&link_dir);
+    std::fs::create_dir_all(&link_dir).map_err(|e| format!("{}: {e}", link_dir.display()))?;
     let mut cmd = Command::new("cargo");
     // cargo runs in the real workspace: nothing of this run crosses
     crate::progenv::scrub_run_facts(&mut cmd);
@@ -774,12 +797,16 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
         .env("MAKEPAD_RUN_NATIVE_RUSTC", "rustc")
         .env("MAKEPAD_RUN_NATIVE_TARGET", triple)
         .env("MAKEPAD_RUN_NATIVE_BUILD_DIR", &build)
+        .env("MAKEPAD_RUN_NATIVE_LINK_ARGS", &link_dir)
         .env_remove("MAKEPAD_RUN_AS_RUSTC")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let out = cmd.output().map_err(|e| format!("--allow-c needs cargo on PATH to build the native dependencies ({}): {e}", package))?;
+    let out = cmd.output();
+    let link_args = program_link_args(&link_dir, package, flags);
+    let _ = std::fs::remove_dir_all(&link_dir);
+    let out = out.map_err(|e| format!("--allow-c needs cargo on PATH to build the native dependencies ({}): {e}", package))?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     if !out.status.success() {
         // cargo's own messages; a native script's failure is in `compiler-message`s and stderr
@@ -856,7 +883,46 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
             return Err(format!("--allow-c: cargo and Relax resolve `{} {}` with different features (cargo {:?}, relax {:?})", p.1, p.2, built, ours));
         }
     }
+    keep.push_str(&format!("{{\"relax_link_args\":[{}]}}\n", link_args.iter().map(|a| json_string(a)).collect::<Vec<_>>().join(",")));
     Ok(keep)
+}
+
+/// The link arguments the wrapper saw on the rustc command of the program (`wrapper`, a file per
+/// crate of the package's binaries and test harnesses): the binary `--bin` names, else the crate
+/// named after the package, else what they all say alike.
+fn program_link_args(dir: &std::path::Path, package: &str, flags: &[&String]) -> Vec<String> {
+    let units: Vec<(String, String)> = std::fs::read_dir(dir).into_iter().flatten().flatten()
+        .filter_map(|e| Some((e.file_name().to_str()?.to_string(), std::fs::read_to_string(e.path()).ok()?))).collect();
+    let named = flags.iter().position(|f| f.as_str() == "--bin").and_then(|i| flags.get(i + 1)).map(|b| b.as_str())
+        .or_else(|| flags.iter().find_map(|f| f.strip_prefix("--bin=")))
+        .unwrap_or(package).replace('-', "_");
+    let alike = units.first().filter(|(_, t)| units.iter().all(|(_, u)| u == t));
+    let text = units.iter().find(|(n, _)| *n == named).or(alike).map_or("", |(_, t)| t.as_str());
+    text.lines().filter(|l| !l.is_empty()).map(str::to_string).collect()
+}
+
+/// The `-C link-arg=` / `-C link-args=` values of a rustc command line, in order.
+fn link_args_of(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let value = if a == "-C" || a == "--codegen" {
+            i += 1;
+            args.get(i).map(String::as_str)
+        } else {
+            a.strip_prefix("-C").or_else(|| a.strip_prefix("--codegen="))
+        };
+        if let Some(v) = value {
+            if let Some(x) = v.strip_prefix("link-arg=") {
+                out.push(x.to_string());
+            } else if let Some(x) = v.strip_prefix("link-args=") {
+                out.extend(x.split_whitespace().map(str::to_string));
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 /// `s` as a JSON string literal.
@@ -875,7 +941,7 @@ fn json_string(s: &str) -> String {
 }
 
 fn selection_key(scripts: &[String], libs: &[String]) -> u64 {
-    let mut h = fnv(b"target-compiler-probes-v4-build-dir", 0xcbf29ce484222325);
+    let mut h = fnv(b"target-compiler-probes-v5-link-args", 0xcbf29ce484222325);
     for list in [scripts, libs] {
         h = fnv(b"\xff", h);
         for name in list { h = fnv(name.as_bytes(), h); h = fnv(b"\0", h); }
@@ -1035,7 +1101,8 @@ fn library_imports(lib: &str) -> Result<Vec<String>, String> {
     Ok(imports.into_iter().collect())
 }
 
-fn link(lib_path: &str, archives: &[String], search: &[String], fw_search: &[String], dylibs: &[String], frameworks: &[String], triple: &str, resolvable: Resolvable) -> Result<(), String> {
+fn link(lib_path: &str, out: &Outputs, triple: &str, resolvable: Resolvable) -> Result<(), String> {
+    let (archives, search, fw_search, dylibs, frameworks) = (&out.archives, &out.search, &out.fw_search, &out.dylibs, &out.frameworks);
     if let Some(d) = std::path::Path::new(lib_path).parent() {
         let _ = std::fs::create_dir_all(d);
     }
@@ -1121,6 +1188,9 @@ fn link(lib_path: &str, archives: &[String], search: &[String], fw_search: &[Str
     for f in frameworks {
         cmd.args(["-framework", f]);
     }
+    // the program's own link arguments, as rustc gives them to the linker for its binary (an rpath
+    // that finds a library of the scripts' search folders at load time)
+    cmd.args(&out.link_args);
     let run = |cmd: &mut Command| -> Result<(), String> {
         let out = cmd.output().map_err(|e| format!("--allow-c: cannot run the C compiler to link the native library: {e}"))?;
         if out.status.success() {
@@ -1135,7 +1205,7 @@ fn link(lib_path: &str, archives: &[String], search: &[String], fw_search: &[Str
     if linked.is_ok() {
         let stubs_path = format!("{}.callbacks.o", tmp);
         linked = library_imports(&tmp).and_then(|imports| {
-            let resolved = resolvable(&imports, dylibs, frameworks);
+            let resolved = resolvable(&imports, dylibs, frameworks, search);
             let callbacks: Vec<String> = imports.into_iter().zip(resolved).filter(|(_, r)| !r).map(|(n, _)| n).collect();
             if callbacks.is_empty() {
                 return Ok(());
@@ -1322,6 +1392,15 @@ pub fn wrapper() -> Option<i32> {
         i += 1;
     }
     let types: Vec<String> = rest.iter().enumerate().filter_map(|(i, a)| if a == "--crate-type" { rest.get(i + 1).cloned() } else { a.strip_prefix("--crate-type=").map(str::to_string) }).collect();
+    // the program's binaries and test harnesses: their link arguments, which the native library is
+    // linked with (program_link_args). The stub's dep-info names the run's folder, so the next
+    // cargo run, with a folder of its own, does not take this one as fresh.
+    let capture = std::env::var("MAKEPAD_RUN_NATIVE_LINK_ARGS").ok().filter(|_| {
+        std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some() && (types.iter().any(|t| t == "bin") || rest.iter().any(|a| a == "--test"))
+    });
+    if let Some(dir) = &capture {
+        let _ = std::fs::write(std::path::Path::new(dir).join(&name), link_args_of(rest).join("\n"));
+    }
     let emit = value("--emit").unwrap_or_default();
     let json = value("--json").unwrap_or_default().contains("artifacts");
     let dylib_ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
@@ -1358,7 +1437,12 @@ pub fn wrapper() -> Option<i32> {
             }
         } else if *kind == "dep-info" {
             let src = rest.iter().find(|a| a.ends_with(".rs")).cloned().unwrap_or_default();
-            let _ = std::fs::write(path, format!("{}: {}\n", path, src));
+            let mut d = format!("{}: {}\n", path, src);
+            if let Some(dir) = &capture {
+                // rustc's form of an `env!` the crate read (cargo's dep-info parser unescapes it)
+                d.push_str(&format!("\n# env-dep:MAKEPAD_RUN_NATIVE_LINK_ARGS={}\n", dir.replace('\\', "\\\\").replace('\n', "\\n")));
+            }
+            let _ = std::fs::write(path, d);
         } else {
             let _ = std::fs::write(path, b"");
         }
@@ -1490,7 +1574,7 @@ fn the_native_prune_keeps_what_the_roots_name() {
     root("00000000000000a1", &workspace, "aaaaaaaaaaaaaaaa", "1111111111111111");
     let relax_dir = dir.to_str().unwrap();
     let flags = vec!["--tests".to_string()];
-    let req = Request { workspace: workspace.to_str().unwrap(), package: "app", cargo_flags: &flags, relax_dir, triple: "x86_64-unknown-linux-gnu", resolvable: |names, _, _| vec![false; names.len()] };
+    let req = Request { workspace: workspace.to_str().unwrap(), package: "app", cargo_flags: &flags, relax_dir, triple: "x86_64-unknown-linux-gnu", resolvable: |names, _, _, _| vec![false; names.len()] };
     let plan = Plan { script_pkgs: Vec::new(), lib_pkgs: Vec::new(), flags: flags.clone(), names: Vec::new(), key: 0xabababababababab, selection: 0x1111111111111111,
         dir: String::new(), messages_path: String::new(), lib_path: String::new(), fast_mark: String::new() };
     write_root(&req, &plan).unwrap();

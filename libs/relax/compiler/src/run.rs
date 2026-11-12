@@ -2679,10 +2679,15 @@ pub(crate) fn exported_fns(prog: &crate::program::Program, prefixes: &[String]) 
 
 /// native::Resolvable for this process: the libraries loaded, which of the symbols the
 /// dynamic loader binds (what a native library's import resolves to without the program),
-/// searched as the program's own foreign calls are (proc::find_any).
-fn native_resolvable(names: &[String], dylibs: &[String], frameworks: &[String]) -> Vec<bool> {
+/// searched as the program's own foreign calls are (proc::find_any). A library is the one the
+/// linker took: `lib<name>.so` (`.dylib`) of the first of the scripts' search folders that holds
+/// one, else the one the loader finds by its name.
+fn native_resolvable(names: &[String], dylibs: &[String], frameworks: &[String], search: &[String]) -> Vec<bool> {
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
     for l in dylibs {
-        let _ = crate::os::proc::load_library(l, false) || crate::os::proc::load_library_versioned(l);
+        let linked = search.iter().map(|d| format!("{d}/lib{l}.{ext}")).find(|p| std::path::Path::new(p).is_file());
+        let _ = linked.is_some_and(|p| crate::os::proc::load_path(&p).is_ok())
+            || crate::os::proc::load_library(l, false) || crate::os::proc::load_library_versioned(l);
     }
     for f in frameworks {
         let _ = crate::os::proc::load_library(f, true);
@@ -2699,7 +2704,7 @@ mod native_tests {
     #[test]
     fn native_resolvable_finds_process_symbols() {
         let names = ["strlen", "malloc", "relax_native_no_such_symbol"].map(String::from);
-        assert_eq!(super::native_resolvable(&names, &[], &[]), [true, true, false]);
+        assert_eq!(super::native_resolvable(&names, &[], &[], &[]), [true, true, false]);
     }
 
     /// Domain 2 of an edited package (its `#[no_mangle]` fn another DefId) does not take the
@@ -2845,11 +2850,13 @@ pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(Strin
     // `--allow-c`: the native dependencies' library (front native.rs), its symbols global
     let mut callbacks = NativeCallbacks::default();
     if let Some(n) = native {
-        let handle = crate::os::proc::load_path(&n.path).map_err(|error| {
+        let loaded = crate::os::proc::load_path(&n.path).map_err(|error| {
             format!("cannot load {} (--allow-c native library of {}): {}", n.path, n.crates.join(", "), error)
-        })?;
-        callbacks = native_callbacks(prog, n, handle, crates)?;
-        note_native_bundle(handle, &n.path);
+        }).and_then(|handle| native_callbacks(prog, n, handle, crates).inspect(|_| note_native_bundle(handle, &n.path)));
+        // a library that does not load is not kept: what its link found (the libraries, which of
+        // its imports are the program's callbacks) can be what changed since, and the next run
+        // links it again
+        callbacks = loaded.inspect_err(|_| { let _ = std::fs::remove_file(&n.path); })?;
     }
     let provided_static = |name: &str| native.is_some_and(|n| n.statics.iter().any(|s| s == name));
     for (name, fw) in link_libs {

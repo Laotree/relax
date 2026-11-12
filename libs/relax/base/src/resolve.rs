@@ -1382,7 +1382,7 @@ pub fn find_root(dir: &str) -> Result<String, String> {
 /// `.cargo/config` (else `.cargo/config.toml`) of `dir` and of every folder above it, then
 /// $CARGO_HOME's when none of those is it. Each with the folder its relative paths resolve
 /// against: the one holding that `.cargo` (the folder above CARGO_HOME for its config).
-fn cargo_config_files(dir: &str) -> Vec<(String, String)> {
+pub fn cargo_config_files(dir: &str) -> Vec<(String, String)> {
     let in_dir = |d: &str| ["config", "config.toml"].iter().map(|f| format!("{}/{}", d, f)).find(|p| crate::vfs::is_file(p));
     let mut files: Vec<(String, String)> = Vec::new();
     let mut cur = Some(normalize(dir));
