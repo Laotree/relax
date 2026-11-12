@@ -7069,6 +7069,9 @@ impl<'a> Lcx<'a> {
                 self.want_mut = false;
                 let cur = self.read_place(&pl, pt);
                 let cur = self.to_leaves(cur, pt);
+                if !self.scalar_operands(*op, pt, pt, bt, *a) {
+                    return self.unit();
+                }
                 let r = self.arith(*op, pt, cur[0], rv[0], bt);
                 self.write_place(&pl, pt, Val::L(vec![r]));
                 self.watch_write(*a, &pl, pt);
@@ -8618,12 +8621,15 @@ impl<'a> Lcx<'a> {
                 let at = self.body_ty(a);
                 let bt = self.body_ty(b);
                 let av = self.lower_expr(a);
-                let (av, _) = self.prim_leaves(av, at);
+                let (av, lt) = self.prim_leaves(av, at);
                 let bv = self.lower_expr(b);
                 let (bv, bt) = self.prim_leaves(bv, bt);
                 if av.is_empty() || bv.is_empty() {
                     let (x, y) = (crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, at), crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, bt));
                     self.err(self.pos, format!("internal: arithmetic on `{}` and `{}` without values -- Relax bug, report it", x, y));
+                    return self.dummy_val(t);
+                }
+                if !self.scalar_operands(op, t, lt, bt, a) {
                     return self.dummy_val(t);
                 }
                 let r = self.arith(op, t, av[0], bv[0], bt);
@@ -8992,6 +8998,10 @@ impl<'a> Lcx<'a> {
             }
             ExprKind::Binary(op, a, b) => {
                 let (at, bt) = (self.body_ty(*a), self.body_ty(*b));
+                let (lt, rt) = (self.prim_peeled(at), self.prim_peeled(bt));
+                if !self.scalar_operands(*op, t, lt, rt, *a) {
+                    return self.dummy_val(t);
+                }
                 let av = self.lower_expr(*a);
                 let x = self.wide_parts(av, at);
                 let bv = self.lower_expr(*b);
@@ -9017,6 +9027,9 @@ impl<'a> Lcx<'a> {
                 let (pl, pt) = self.lower_place(*a);
                 self.want_mut = false;
                 let cur = self.read_place(&pl, pt);
+                if !self.scalar_operands(*op, pt, pt, self.prim_peeled(bt), *a) {
+                    return self.unit();
+                }
                 let x = self.wide_parts(cur, pt);
                 if !self.is_wide(pt) && matches!(op, BinOp::Shl | BinOp::Shr) {
                     if self.overflow_checks { self.shift_check(*op, self.int_ty(pt).bits as u32, (y.0, Some(y.1))); }
@@ -9216,6 +9229,35 @@ impl<'a> Lcx<'a> {
             t = inner;
         }
         (r, t)
+    }
+
+    /// `t` with its references to primitives peeled: prim_leaves' type, without the loads.
+    fn prim_peeled(&self, mut t: TyId) -> TyId {
+        while let TyKind::Ref(_, inner, _) = self.kind(t) {
+            if !matches!(self.kind_ref(inner), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Ref(..) | TyKind::FnPtr(..)) {
+                break;
+            }
+            t = inner;
+        }
+        t
+    }
+
+    /// Built-in arithmetic takes primitive scalars of the operator's type `t` (a shift's amount:
+    /// any integer). Anything else reaching IBin/FBin is a typeck gap that computes on an
+    /// address or a mismatched value (`256u32 >> &big` once shifted by the reference's address):
+    /// an internal error at the expression, never a silent result.
+    fn scalar_operands(&mut self, op: BinOp, t: TyId, lt: TyId, rt: TyId, at: ExprId) -> bool {
+        let (kt, kl, kr) = (self.kind(t), self.kind(lt), self.kind(rt));
+        let scalar = matches!(kt, TyKind::Int(_) | TyKind::Float(_)) || (matches!(kt, TyKind::Bool) && matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor));
+        let shift = matches!(op, BinOp::Shl | BinOp::Shr);
+        if scalar && kl == kt && if shift { matches!(kt, TyKind::Int(_)) && matches!(kr, TyKind::Int(_)) } else { kr == kt } {
+            return true;
+        }
+        let s = |l: &Self, x| crate::typeck::ty_to_string(false, &l.u.prog, &l.u.tcx, x);
+        let (x, y, z) = (s(self, lt), s(self, rt), s(self, t));
+        let lo = self.ast().expr(at).lo;
+        self.err(lo, format!("internal: built-in `{:?}` on `{}` and `{}` (operator type `{}`): an operand is not a primitive of the operator's type, a type check gap -- makepad run bug, report it", op, x, y, z));
+        false
     }
 
     /// Arithmetic on primitive operands of type `t` (rhs type `bt` matters for shifts).

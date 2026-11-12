@@ -93,4 +93,45 @@ fn operators_take_a_reference_on_the_right() {
     assert_eq!(10u32 % &b, 2);
     assert_eq!(1u32 << &b, 16);
     assert_eq!(256u32 >> &b, 16);
+    // a shift by an odd amount: a shift built in by the reference's (aligned) address never gives it
+    let odd = Big(9);
+    assert_eq!(1u32 << &odd, 512);
+    assert_eq!((1u32 << 20) >> &odd, 2048);
+    assert_eq!(shifted(1 << 20, &odd), 2048);
+}
+
+/// The reference is a parameter, not a borrow at the operator.
+fn shifted(x: u32, by: &Big) -> u32 {
+    x >> by
+}
+
+/// rustc 1.99's core forward-ref operator impls: a primitive with a reference to a primitive on
+/// either side, every arithmetic and bit operator, and through a closure parameter (`|t| x - t`,
+/// t: &f64, from `Option<&f64>::is_some_and`).
+#[test]
+fn primitives_take_a_reference_to_a_primitive() {
+    let (a, b) = (7.5f64, 2.0f64);
+    assert_eq!([a + &b, a - &b, a * &b, a / &b, a % &b], [9.5, 5.5, 15.0, 3.75, 1.5]);
+    assert_eq!([&a + b, &a - b, &a * &b, &a / &b, &a % b], [9.5, 5.5, 15.0, 3.75, 1.5]);
+    let (c, d) = (7.5f32, 2.0f32);
+    assert_eq!([c - &d, &c * d, &c / &d], [5.5, 15.0, 3.75]);
+    let (i, j) = (-17i32, 5i32);
+    assert_eq!([i + &j, i - &j, &i * j, &i / &j, i % &j], [-12, -22, -85, -3, -2]);
+    let (u, v) = (200u8, 7u8);
+    assert_eq!([u + &v, u - &v, &u / v, &u % &v], [207, 193, 28, 4]);
+    let (m, n) = (0b1100u32, 0b1010u32);
+    assert_eq!([m & &n, &m | n, &m ^ &n, m << &2u32, &m >> &2u8], [8, 14, 6, 48, 3]);
+    assert_eq!([true & &false, &true | false, &true ^ &true], [false, true, false]);
+    let mut f = 10.0f64;
+    f -= &2.5;
+    f *= &3.0;
+    let mut k = 10u16;
+    k -= &3;
+    k <<= &2u32;
+    assert_eq!((f, k), (22.5, 28));
+    let last: std::collections::HashMap<u32, f64> = [(1, 1.0)].into_iter().collect();
+    let t0 = 1.0f64;
+    assert!(last.get(&1).is_some_and(|t| t0 - t <= 1e-7));
+    let scaled: Vec<f64> = [1.0, 2.0].iter().map(|t| 0.5 + t).collect();
+    assert_eq!(scaled, [1.5, 2.5]);
 }

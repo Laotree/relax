@@ -6639,7 +6639,18 @@ impl<'a> Fcx<'a> {
                     self.cur_binop = e.0;
                     return self.check_op_trait(op, sa, b, lo, false);
                 }
-                self.check_expr(b, None);
+                // a non-primitive right operand, or a reference to one, is an operator trait call
+                // too (`256u32 >> &big` with `impl Shr<&Big> for u32`; rustc is_builtin_binop needs
+                // both operands integral): built in, the shift took the reference's address
+                let tb0 = self.check_expr(b, None);
+                let sb0 = self.shallow(tb0);
+                if self.non_prim_operand(sb0) {
+                    if let Some(r) = self.prim_lhs_op(op, e, sa, sb0, lo, false) {
+                        return r;
+                    }
+                    let (x, y) = (self.ty_str(sa), self.ty_str(sb0));
+                    self.err(lo, format!("E0277: {}", binop_unimplemented(op, &x, &y)));
+                }
                 ta
             }
             _ => {
