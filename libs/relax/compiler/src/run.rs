@@ -1697,6 +1697,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
     }
     if load_errors > 0 && !watch {
+        // the run ends here, before `main`: say so, or the exit reads as the program's own
+        eprintln!(
+            "makepad-run: {load_errors} crate(s) did not load (the load errors above), so the run stops before `main`; `--watch` runs it anyway"
+        );
         // a test target's program: its other targets (test_pkg.rs) would end the same way
         return if harness || plain_test { makepad_remote::hot::LOAD_ERROR_EXIT } else { 1 };
     }
