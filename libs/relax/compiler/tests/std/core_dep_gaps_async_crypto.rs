@@ -70,3 +70,31 @@ fn a04_wrapping_by_reference() {
     d %= Wrapping(5);
     println!("| div rem assign {:?}", d);
 }
+
+// ring names every C symbol through prefixed_extern!: `#[link_name = concat!(prefix, stringify!(name))]`,
+// directly or passed through a rules macro as an `expr` fragment. The prefix here is libc's `l`.
+macro_rules! symbol_prefix {
+    () => {
+        "l"
+    };
+}
+macro_rules! prefixed_item {
+    { $attr:ident $name:ident { $($item:tt)+ } } => {
+        prefixed_item! { $attr { concat!(symbol_prefix!(), stringify!($name)) } { $($item)+ } }
+    };
+    { $attr:ident { $prefixed_name:expr } { $($item:tt)+ } } => {
+        #[$attr = $prefixed_name]
+        $($item)+
+    };
+}
+extern "C" {
+    #[link_name = concat!(symbol_prefix!(), stringify!(abs))]
+    fn direct_labs(x: std::ffi::c_long) -> std::ffi::c_long;
+    prefixed_item! { link_name abs { fn passed_labs(x: std::ffi::c_long) -> std::ffi::c_long; } }
+}
+
+#[test]
+fn a05_link_name_from_a_macro() {
+    let (d, p) = unsafe { (direct_labs(-41), passed_labs(-42)) };
+    println!("| direct {} passed {}", d, p);
+}
