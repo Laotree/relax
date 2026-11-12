@@ -1140,11 +1140,11 @@ impl<'a> Res<'a> {
 
     /// `type_in` through glob sources (each module once per query); `partial`: the crate whose
     /// scope is being computed and its tables so far.
-    fn type_in_seen<'b>(&self, k: &'b str, m: &'b str, n: &str, seen: &mut Seen<'b>, partial: Option<(&str, &'b CrateScope)>) -> Option<(&'b str, &'b str)>
+    fn type_in_seen<'b>(&self, from: &str, k: &'b str, m: &'b str, n: &str, seen: &mut Seen<'b>, partial: Option<(&str, &'b CrateScope)>) -> Option<(&'b str, &'b str)>
     where
         'a: 'b,
     {
-        self.glob_find(k, k, m, n, seen, partial).map(|(_, _, t)| (t.0.as_str(), t.1.as_str()))
+        self.glob_find(from, k, m, n, seen, partial).map(|(_, _, t)| (t.0.as_str(), t.1.as_str()))
     }
 
     /// `type_in_seen`, with the (crate, module) whose non-glob bindings had the name. `from`: the
@@ -1383,7 +1383,10 @@ impl CrateScope {
     /// The module a name denotes in module `mm` of crate `kk`: this crate's partial tables, a
     /// dependency's finished ones.
     fn lookup_type<'b>(&'b self, r: &Res<'b>, k: &str, kk: &'b str, mm: &'b str, n: &str) -> Option<(&'b str, &'b str)> {
-        r.type_in_seen(kk, mm, n, &mut Seen::new(), Some((k, self)))
+        // Retain the importing crate across qualified paths. A private module
+        // beside a public macro (zerovec::zerovec) must not be imported into the
+        // type namespace and shadow the extern crate used by attribute macros.
+        r.type_in_seen(k, kk, mm, n, &mut Seen::new(), Some((k, self)))
     }
 
     fn lookup_macro(&self, r: &Res, k: &str, kk: &str, mm: &str, n: &str) -> Option<MacroRef> {
