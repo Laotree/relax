@@ -11,7 +11,7 @@
 <center>
 <h1>Relax</h1>
 <h3><i>Rust without the wait.</i></h3>
-<p>[ <a href="#relax-vs-cargo-and-rustc">Relax vs cargo and rustc</a> | <a href="#the-tradeoffs">The tradeoffs</a> | <a href="#what-you-get-from-a-jit">What you get from a JIT</a> | <a href="#try-it">Try it</a> | <a href="#what-it-took-a-new-rust-toolchain">What it took</a> | <a href="#built-for-ai-agents">Built for AI agents</a> | <a href="#where-llvm-still-wins">Where LLVM still wins</a> | <a href="#architecture">Architecture</a> | <a href="#repository-layout">Repository layout</a> | <a href="#license">License</a> | <a href="https://github.com/makepad/relax">GitHub</a> ]</p>
+<p>[ <a href="#relax-vs-cargo-and-rustc">Relax vs cargo and rustc</a> | <a href="#the-tradeoffs">The tradeoffs</a> | <a href="#what-you-get-from-a-jit">What you get from a JIT</a> | <a href="#try-it">Try it</a> | <a href="#what-it-took-a-new-rust-toolchain">What it took</a> | <a href="#how-makepad-uses-relax">How Makepad uses Relax</a> | <a href="#built-for-ai-agents">Built for AI agents</a> | <a href="#where-llvm-still-wins">Where LLVM still wins</a> | <a href="#architecture">Architecture</a> | <a href="#repository-layout">Repository layout</a> | <a href="#license">License</a> | <a href="https://github.com/makepad/relax">GitHub</a> ]</p>
 <p><small>Also on this site: <a href="../">the full page</a> | <a href="../zh/">中文</a></small></p>
 </center>
 <hr>
@@ -87,11 +87,25 @@ cd hello
 <tr valign="top"><td><b>Procedural macros</b></td><td>Built as native dylibs, then loaded.</td><td><b>Run natively when they match a linked build, otherwise on the JIT.</b></td></tr>
 <tr valign="top"><td><b>Native code</b></td><td>Everything is native.</td><td><b>Crates that must stay native (OS layers, GPU, audio) export an interface with <code>#[relax_api]</code></b>, which JIT code calls through the C ABI.</td></tr>
 </table>
+<h2><a name="how-makepad-uses-relax">How Makepad uses Relax</a></h2>
+<p><b>Relax comes from the <a href="https://github.com/makepad/makepad">Makepad</a> project. <code>makepad run</code> and its tooling live in Makepad's repository, not in this one; this section describes how Makepad uses Relax.</b></p>
+<p><code>makepad</code> is Relax's runner plus a Makepad host. A UI app started with <code>makepad run &lt;package&gt;</code> gets:</p>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th></th><th>What the app gets</th><th>Command</th></tr>
+<tr valign="top"><td><b>No native build</b></td><td>Its window opens at once with the build's progress; the app's first window takes it over.</td><td><code>makepad run &lt;package&gt;</code></td></tr>
+<tr valign="top"><td><b>Save to patch</b></td><td>Edits patch into the running app; its state and windows stay.</td><td>on by default</td></tr>
+<tr valign="top"><td><b>Restart in place</b></td><td>An edit that can't patch (a type's layout, an import, a trait or impl header, a macro) shows "Update ready" on the caption's JIT ring. A click restarts the app in the same process and window, with its state (<code>AppMain::restart_state</code>) and window frames; unsaved work can hold it back (<code>AppMain::can_restart</code>).</td><td><code>session relaunch</code></td></tr>
+<tr valign="top"><td><b>Errors in the window</b></td><td>Compile errors and edits the borrow checker refuses show over the app, with file and line. After a crash the window stays and offers Restart once the sources change.</td><td><code>session view open</code></td></tr>
+<tr valign="top"><td><b>Fix a panic, then retry</b></td><td>A panic pauses the app and the ring says "Paused on a panic"; a click shows the message and where. On the UI thread, fix the code, save, and <code>retry</code> reruns the event with the new code.</td><td><code>panics</code>, <code>locals panic=P1</code>, <code>resume P1 retry</code></td></tr>
+<tr valign="top"><td><b>See the code</b></td><td>Each function's code versions, O3 remarks, machine code beside rustc's, and the flight recorder.</td><td><code>versions &lt;fn&gt;</code>, <code>remarks &lt;fn&gt;</code>, <code>asm &lt;fn&gt; vs=rustc</code>, <code>rec save</code></td></tr>
+<tr valign="top"><td><b>Drive the UI</b></td><td>The app's remote control shares Relax's inspect socket (same user, nothing on the network).</td><td><code>ui find q=&lt;text&gt;</code>, <code>ui act node=&lt;id&gt; press</code>, <code>grab</code></td></tr>
+</table>
+<p>Commands other than <code>makepad run</code> go to <code>makepad inspect &lt;app&gt;</code>. Across a day of Makepad's agent lanes, an edit was patched 3.6 s (median) after it reached the machine, 86 s at p90 on a cold JIT or cache.</p>
 <h2><a name="built-for-ai-agents">Built for AI agents</a></h2>
 <p>An AI agent can't feel a slow build, but it pays for every one in tokens, wall-clock and lost context. <a href="https://github.com/makepad/makepad">Makepad</a> builds its apps with many AI agents working in parallel, and its dev hub, <b>devhub</b>, keeps each agent's app or test run alive under Relax on a warm machine.</p>
 <table border="1" cellpadding="4" cellspacing="0">
 <tr><th>An agent's iteration</th><th>With cargo + rustc</th><th><b>With Relax + devhub</b></th></tr>
-<tr valign="top"><td><b>Edit reaches the program</b></td><td>rebuild and relink: minutes on a large app</td><td><b>synced and patched in milliseconds</b> (~50–200 ms to the box)</td></tr>
+<tr valign="top"><td><b>Edit reaches the program</b></td><td>rebuild and relink: minutes on a large app</td><td><b>shipped in 0.1 s, patched in 3.6 s</b> (medians)</td></tr>
 <tr valign="top"><td><b>Test verdict</b></td><td>rebuild the test binary, then run</td><td><b>92 tests back 2.2 s after the save</b></td></tr>
 <tr valign="top"><td><b>See the UI</b></td><td>rebuild, relaunch, navigate back</td><td><b>a frame of the live app, grabbed as a PNG</b></td></tr>
 <tr valign="top"><td><b>New worker</b></td><td>cold build</td><td><b>starts warm</b>: every machine keeps a warm cache at the tip</td></tr>

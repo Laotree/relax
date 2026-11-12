@@ -116,6 +116,26 @@ the linker in between, with one Rust library.
 | **Procedural macros** | Built as native dylibs, then loaded. | **Run natively when they match a linked build, otherwise on the JIT.** |
 | **Native code** | Everything is native. | **Crates that must stay native (OS layers, GPU, audio) export an interface with `#[relax_api]`**, which JIT code calls through the C ABI. |
 
+## How Makepad uses Relax
+
+**Relax comes from the [Makepad](https://github.com/makepad/makepad) project. `makepad run` and its
+tooling live in Makepad's repository, not in this one; this section describes how Makepad uses Relax.**
+
+`makepad` is Relax's runner plus a Makepad host. A UI app started with `makepad run <package>` gets:
+
+| | What the app gets | Command |
+| --- | --- | --- |
+| **No native build** | Its window opens at once with the build's progress; the app's first window takes it over. | `makepad run <package>` |
+| **Save to patch** | Edits patch into the running app; its state and windows stay. | on by default |
+| **Restart in place** | An edit that can't patch (a type's layout, an import, a trait or impl header, a macro) shows "Update ready" on the caption's JIT ring. A click restarts the app in the same process and window, with its state (`AppMain::restart_state`) and window frames; unsaved work can hold it back (`AppMain::can_restart`). | `session relaunch` |
+| **Errors in the window** | Compile errors and edits the borrow checker refuses show over the app, with file and line. After a crash the window stays and offers Restart once the sources change. | `session view open` |
+| **Fix a panic, then retry** | A panic pauses the app and the ring says "Paused on a panic"; a click shows the message and where. On the UI thread, fix the code, save, and `retry` reruns the event with the new code. | `panics`, `locals panic=P1`, `resume P1 retry` |
+| **See the code** | Each function's code versions, O3 remarks, machine code beside rustc's, and the flight recorder. | `versions <fn>`, `remarks <fn>`, `asm <fn> vs=rustc`, `rec save` |
+| **Drive the UI** | The app's remote control shares Relax's inspect socket (same user, nothing on the network). | `ui find q=<text>`, `ui act node=<id> press`, `grab` |
+
+Commands other than `makepad run` go to `makepad inspect <app>`. Across a day of Makepad's agent lanes,
+an edit was patched 3.6 s (median) after it reached the machine, 86 s at p90 on a cold JIT or cache.
+
 ## Built for AI agents
 
 An AI agent can't feel a slow build, but it pays for every one in tokens, wall-clock and lost context.
@@ -124,7 +144,7 @@ and its dev hub, **devhub**, keeps each agent's app or test run alive under Rela
 
 | An agent's iteration | With cargo + rustc | **With Relax + devhub** |
 | --- | --- | --- |
-| **Edit reaches the program** | rebuild and relink: minutes on a large app | **synced and patched in milliseconds** (~50–200 ms to the box) |
+| **Edit reaches the program** | rebuild and relink: minutes on a large app | **shipped in 0.1 s, patched in 3.6 s** (medians) |
 | **Test verdict** | rebuild the test binary, then run | **92 tests back 2.2 s after the save** |
 | **See the UI** | rebuild, relaunch, navigate back | **a frame of the live app, grabbed as a PNG** |
 | **New worker** | cold build | **starts warm**: every machine keeps a warm cache at the tip |

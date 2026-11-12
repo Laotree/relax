@@ -608,11 +608,25 @@ cd hello
 <tr valign="top"><td><b>Procedural macros</b></td><td>Built as native dylibs, then loaded.</td><td><b>Run natively when they match a linked build, otherwise on the JIT.</b></td></tr>
 <tr valign="top"><td><b>Native code</b></td><td>Everything is native.</td><td><b>Crates that must stay native (OS layers, GPU, audio) export an interface with <code>#[relax_api]</code></b>, which JIT code calls through the C ABI.</td></tr>
 </table>
+<h2><a name="plain-how-makepad-uses-relax">How Makepad uses Relax</a></h2>
+<p><b>Relax comes from the <a href="https://github.com/makepad/makepad">Makepad</a> project. <code>makepad run</code> and its tooling live in Makepad's repository, not in this one; this section describes how Makepad uses Relax.</b></p>
+<p><code>makepad</code> is Relax's runner plus a Makepad host. A UI app started with <code>makepad run &lt;package&gt;</code> gets:</p>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th></th><th>What the app gets</th><th>Command</th></tr>
+<tr valign="top"><td><b>No native build</b></td><td>Its window opens at once with the build's progress; the app's first window takes it over.</td><td><code>makepad run &lt;package&gt;</code></td></tr>
+<tr valign="top"><td><b>Save to patch</b></td><td>Edits patch into the running app; its state and windows stay.</td><td>on by default</td></tr>
+<tr valign="top"><td><b>Restart in place</b></td><td>An edit that can't patch (a type's layout, an import, a trait or impl header, a macro) shows "Update ready" on the caption's JIT ring. A click restarts the app in the same process and window, with its state (<code>AppMain::restart_state</code>) and window frames; unsaved work can hold it back (<code>AppMain::can_restart</code>).</td><td><code>session relaunch</code></td></tr>
+<tr valign="top"><td><b>Errors in the window</b></td><td>Compile errors and edits the borrow checker refuses show over the app, with file and line. After a crash the window stays and offers Restart once the sources change.</td><td><code>session view open</code></td></tr>
+<tr valign="top"><td><b>Fix a panic, then retry</b></td><td>A panic pauses the app and the ring says "Paused on a panic"; a click shows the message and where. On the UI thread, fix the code, save, and <code>retry</code> reruns the event with the new code.</td><td><code>panics</code>, <code>locals panic=P1</code>, <code>resume P1 retry</code></td></tr>
+<tr valign="top"><td><b>See the code</b></td><td>Each function's code versions, O3 remarks, machine code beside rustc's, and the flight recorder.</td><td><code>versions &lt;fn&gt;</code>, <code>remarks &lt;fn&gt;</code>, <code>asm &lt;fn&gt; vs=rustc</code>, <code>rec save</code></td></tr>
+<tr valign="top"><td><b>Drive the UI</b></td><td>The app's remote control shares Relax's inspect socket (same user, nothing on the network).</td><td><code>ui find q=&lt;text&gt;</code>, <code>ui act node=&lt;id&gt; press</code>, <code>grab</code></td></tr>
+</table>
+<p>Commands other than <code>makepad run</code> go to <code>makepad inspect &lt;app&gt;</code>. Across a day of Makepad's agent lanes, an edit was patched 3.6 s (median) after it reached the machine, 86 s at p90 on a cold JIT or cache.</p>
 <h2><a name="plain-built-for-ai-agents">Built for AI agents</a></h2>
 <p>An AI agent can't feel a slow build, but it pays for every one in tokens, wall-clock and lost context. <a href="https://github.com/makepad/makepad">Makepad</a> builds its apps with many AI agents working in parallel, and its dev hub, <b>devhub</b>, keeps each agent's app or test run alive under Relax on a warm machine.</p>
 <table border="1" cellpadding="4" cellspacing="0">
 <tr><th>An agent's iteration</th><th>With cargo + rustc</th><th><b>With Relax + devhub</b></th></tr>
-<tr valign="top"><td><b>Edit reaches the program</b></td><td>rebuild and relink: minutes on a large app</td><td><b>synced and patched in milliseconds</b> (~50–200 ms to the box)</td></tr>
+<tr valign="top"><td><b>Edit reaches the program</b></td><td>rebuild and relink: minutes on a large app</td><td><b>shipped in 0.1 s, patched in 3.6 s</b> (medians)</td></tr>
 <tr valign="top"><td><b>Test verdict</b></td><td>rebuild the test binary, then run</td><td><b>92 tests back 2.2 s after the save</b></td></tr>
 <tr valign="top"><td><b>See the UI</b></td><td>rebuild, relaunch, navigate back</td><td><b>a frame of the live app, grabbed as a PNG</b></td></tr>
 <tr valign="top"><td><b>New worker</b></td><td>cold build</td><td><b>starts warm</b>: every machine keeps a warm cache at the tip</td></tr>
@@ -692,6 +706,7 @@ libs/ platform/ tools/ widgets/         the small support crates Relax links: to
       <a href="#benefits">Benefits</a>
       <a href="#try">Try it</a>
       <a href="#toolchain">What it took</a>
+      <a href="#makepad">In Makepad</a>
       <a href="#gaps">Where LLVM wins</a>
     </nav>
     <a class="lang" href="zh/" hreflang="zh-CN" lang="zh-CN"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.4"/><path d="M1.6 8h12.8M8 1.6c1.9 1.8 2.8 4 2.8 6.4S9.9 12.6 8 14.4M8 1.6C6.1 3.4 5.2 5.6 5.2 8s.9 4.6 2.8 6.4"/></svg>中文</a>
@@ -829,7 +844,18 @@ libs/ platform/ tools/ widgets/         the small support crates Relax links: to
   </div>
 </section>
 
-<section id="agents" class="alt" aria-labelledby="h-agents">
+<section id="makepad" class="alt" aria-labelledby="h-mp">
+  <div class="wrap">
+    <p class="kicker reveal">How Makepad uses Relax</p>
+    <h2 class="title reveal" id="h-mp">Relax inside <em>makepad run.</em></h2>
+    <p class="intro reveal" data-rich="makepad.note"></p>
+    <p class="intro reveal" data-rich="makepad.intro"></p>
+    <div class="grid g2 mt48" id="mpList"></div>
+    <p class="intro reveal mt48" data-rich="makepad.speed"></p>
+  </div>
+</section>
+
+<section id="agents" aria-labelledby="h-agents">
   <div class="wrap">
     <p class="kicker reveal">Built for AI agents</p>
     <h2 class="title reveal" id="h-agents">The loop <em>that stays hot.</em></h2>
@@ -853,7 +879,7 @@ libs/ platform/ tools/ widgets/         the small support crates Relax links: to
   </div>
 </section>
 
-<section id="gaps" aria-labelledby="h-gaps">
+<section id="gaps" class="alt" aria-labelledby="h-gaps">
   <div class="wrap">
     <p class="kicker o reveal">Honest numbers</p>
     <h2 class="title reveal" id="h-gaps">Where LLVM <em>still wins.</em></h2>
@@ -869,7 +895,7 @@ libs/ platform/ tools/ widgets/         the small support crates Relax links: to
   </div>
 </section>
 
-<section id="life" class="alt" aria-labelledby="h-life">
+<section id="life" aria-labelledby="h-life">
   <div class="wrap">
     <p class="kicker reveal">Tiering and live patching</p>
     <h2 class="title reveal" id="h-life">A function's <em>life.</em></h2>
@@ -1046,11 +1072,26 @@ const DATA = {
     ]
   },
 
+  makepad: {
+    note: "**Relax comes from the [Makepad](https://github.com/makepad/makepad) project.** `makepad run` and its tooling live in Makepad's repository, not in this one; this section describes how Makepad uses Relax.",
+    intro: "`makepad` is Relax's runner plus a Makepad host. Commands other than `makepad run` go to `makepad inspect <app>`.",
+    items: [
+      { title: "No native build", body: "Its window opens at once with the build's progress; the app's first window takes it over.", cmd: ["makepad run <package>"] },
+      { title: "Save to patch", body: "Edits patch into the running app; its state and windows stay.", cmd: [] },
+      { title: "Restart in place", body: "An edit that can't patch (a type's layout, an import, a trait or impl header, a macro) shows “Update ready” on the caption's JIT ring. A click restarts the app in the same process and window, with its state (`AppMain::restart_state`) and window frames; unsaved work can hold it back (`AppMain::can_restart`).", cmd: ["session relaunch"] },
+      { title: "Errors in the window", body: "Compile errors and edits the borrow checker refuses show over the app, with file and line. After a crash the window stays and offers Restart once the sources change.", cmd: ["session view open"] },
+      { title: "Fix a panic, then retry", body: "A panic pauses the app and the ring says “Paused on a panic”; a click shows the message and where. On the UI thread, fix the code, save, and `retry` reruns the event with the new code.", cmd: ["panics", "locals panic=P1", "resume P1 retry"] },
+      { title: "See the code", body: "Each function's code versions, O3 remarks, machine code beside rustc's, and the flight recorder.", cmd: ["versions <fn>", "remarks <fn>", "asm <fn> vs=rustc", "rec save"] },
+      { title: "Drive the UI", body: "The app's remote control shares Relax's inspect socket (same user, nothing on the network).", cmd: ["ui find q=<text>", "ui act node=<id> press", "grab"] }
+    ],
+    speed: "Across a day of Makepad's agent lanes, an edit was patched **3.6 s** (median) after it reached the machine, 86 s at p90 on a cold JIT or cache."
+  },
+
   agents: {
     intro: "An AI agent pays for every slow build in **tokens, wall-clock and lost context.**",
     heads: ["With rustc + Cargo", "With Relax + devhub"],
     table: [
-      ["Edit reaches the program", "rebuild and relink: minutes", "**patched in milliseconds** (~50–200 ms to the box)"],
+      ["Edit reaches the program", "rebuild and relink: minutes", "**shipped in 0.1 s, patched in 3.6 s** (medians)"],
       ["Test verdict", "rebuild the test binary, then run", "**92 tests, 2.2 s after the save**"],
       ["See the UI", "rebuild, relaunch, navigate back", "**a frame of the live app, as a PNG**"],
       ["New worker", "cold build", "**starts warm**"]
@@ -1601,11 +1642,15 @@ DATA.agents.practice.forEach((p, i) => bigcard($("#practice"), p, i));
 
 /* ------------------------------ tradeoffs, benefits ------------------------------ */
 cards($("#tradeList"), DATA.tradeoffs.items);
-DATA.benefits.items.forEach((b, i) => {
-  const c = add($("#benefitList"), "article", "card fact reveal"); c.style.setProperty("--d", i % 2);
-  add(c, "h3", "", esc(b.title)); add(c, "p", "", rich(b.body));
-  add(c, "p", "use", b.cmd.map(x => "<code>" + esc(x) + "</code>").join(" "));
-});
+function facts(host, list) {
+  list.forEach((b, i) => {
+    const c = add(host, "article", "card fact reveal"); c.style.setProperty("--d", i % 2);
+    add(c, "h3", "", esc(b.title)); add(c, "p", "", rich(b.body));
+    if (b.cmd.length) add(c, "p", "use", b.cmd.map(x => "<code>" + esc(x) + "</code>").join(" "));
+  });
+}
+facts($("#benefitList"), DATA.benefits.items);
+facts($("#mpList"), DATA.makepad.items);
 
 /* ------------------------------ reveals, counters, off-screen pause, progress ------------------------------ */
 (function () {

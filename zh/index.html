@@ -670,11 +670,24 @@ cd hello
 <li><b>0</b> 个 crates.io 依赖
 <li><b>134k</b> 行 <code>core</code>、<code>alloc</code> 与 <code>std</code>，由 Relax 编译
 </ul>
+<h2><a name="plain-makepad">makepad run 里的 Relax。</a></h2>
+<p><b>Relax 出自 <a href="https://github.com/makepad/makepad">Makepad</a> 项目。</b><code>makepad run</code> 及其工具在 Makepad 的仓库里，不在本仓库；本节介绍 Makepad 如何使用 Relax。</p>
+<p><code>makepad</code> 就是 Relax 的运行器加上 Makepad 的宿主。除 <code>makepad run</code> 外，下列命令都发给 <code>makepad inspect &lt;app&gt;</code>。</p>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr valign="top"><td>无需原生构建</td><td>窗口立即打开并显示构建进度；应用的第一个窗口随后接管它。</td><td><code>makepad run &lt;package&gt;</code></td></tr>
+<tr valign="top"><td>保存即补丁</td><td>修改被热补丁进正在运行的应用，状态和窗口都保留。</td><td></td></tr>
+<tr valign="top"><td>原地重启</td><td>无法热补丁的修改（类型布局、导入、trait 或 impl 头、宏）会在标题栏的 JIT 环上显示“Update ready”。点一下，应用就在同一进程、同一窗口里重启，带着它的状态（<code>AppMain::restart_state</code>）和窗口位置；有未保存的工作时可以推迟（<code>AppMain::can_restart</code>）。</td><td><code>session relaunch</code></td></tr>
+<tr valign="top"><td>错误显示在窗口里</td><td>编译错误和被借用检查器拒绝的修改显示在应用上方，带文件和行号。应用崩溃后窗口仍在，源码一改就提供 Restart。</td><td><code>session view open</code></td></tr>
+<tr valign="top"><td>修好 panic 再重试</td><td>panic 会暂停应用，JIT 环显示“Paused on a panic”；点一下就看到消息和位置。在 UI 线程上，改好代码、保存，<code>retry</code> 就用新代码重新运行那个事件。</td><td><code>panics</code>、<code>locals panic=P1</code>、<code>resume P1 retry</code></td></tr>
+<tr valign="top"><td>看清代码</td><td>每个函数的各个代码版本、O3 优化说明、与 rustc 并排的机器码，以及飞行记录器。</td><td><code>versions &lt;fn&gt;</code>、<code>remarks &lt;fn&gt;</code>、<code>asm &lt;fn&gt; vs=rustc</code>、<code>rec save</code></td></tr>
+<tr valign="top"><td>驱动 UI</td><td>应用的远程控制与 Relax 共用 inspect 套接字（仅限本用户，不经网络）。</td><td><code>ui find q=&lt;text&gt;</code>、<code>ui act node=&lt;id&gt; press</code>、<code>grab</code></td></tr>
+</table>
+<p>在 Makepad 智能体通道一天的数据里，修改到达机器后 <b>3.6 s</b>（中位数）就被热补丁进去；JIT 或缓存还冷时 p90 为 86 s。</p>
 <h2><a name="plain-agents">迭代循环，始终是热的。</a></h2>
 <p>AI 智能体每一次慢构建都在付账：<b>token、时间，还有丢掉的上下文。</b></p>
 <table border="1" cellpadding="4" cellspacing="0">
 <tr><th></th><th>用 rustc + Cargo</th><th>用 Relax + devhub</th></tr>
-<tr valign="top"><td>改动生效</td><td>重新构建、重新链接：几分钟</td><td><b>毫秒级打上补丁</b>（送到机器约 50–200 ms）</td></tr>
+<tr valign="top"><td>改动生效</td><td>重新构建、重新链接：几分钟</td><td><b>0.1 s 送达，3.6 s 打上补丁</b>（中位数）</td></tr>
 <tr valign="top"><td>测试结果</td><td>先重新构建测试二进制，再运行</td><td><b>92 个测试，保存后 2.2 s</b></td></tr>
 <tr valign="top"><td>查看界面</td><td>重新构建、重新启动、再点回原来的页面</td><td><b>运行中应用的一帧，存成 PNG</b></td></tr>
 <tr valign="top"><td>新 worker</td><td>冷构建</td><td><b>一上来就是热的</b></td></tr>
@@ -722,6 +735,7 @@ cd hello
       <a href="#benefits">好处</a>
       <a href="#try">试一试</a>
       <a href="#toolchain">工具链</a>
+      <a href="#makepad">在 Makepad 中</a>
       <a href="#gaps">LLVM 领先处</a>
     </nav>
     <a class="lang" href="../" hreflang="en" lang="en"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.4"/><path d="M1.6 8h12.8M8 1.6c1.9 1.8 2.8 4 2.8 6.4S9.9 12.6 8 14.4M8 1.6C6.1 3.4 5.2 5.6 5.2 8s.9 4.6 2.8 6.4"/></svg>English</a>
@@ -859,7 +873,18 @@ cd hello
   </div>
 </section>
 
-<section id="agents" class="alt" aria-labelledby="h-agents">
+<section id="makepad" class="alt" aria-labelledby="h-mp">
+  <div class="wrap">
+    <p class="kicker reveal">Makepad 如何使用 Relax</p>
+    <h2 class="title reveal" id="h-mp">makepad run 里的 <em>Relax。</em></h2>
+    <p class="intro reveal" data-rich="makepad.note"></p>
+    <p class="intro reveal" data-rich="makepad.intro"></p>
+    <div class="grid g2 mt48" id="mpList"></div>
+    <p class="intro reveal mt48" data-rich="makepad.speed"></p>
+  </div>
+</section>
+
+<section id="agents" aria-labelledby="h-agents">
   <div class="wrap">
     <p class="kicker reveal">为 AI 智能体而生</p>
     <h2 class="title reveal" id="h-agents">迭代循环<span class="pc">，</span><wbr><em>始终是热的。</em></h2>
@@ -883,7 +908,7 @@ cd hello
   </div>
 </section>
 
-<section id="gaps" aria-labelledby="h-gaps">
+<section id="gaps" class="alt" aria-labelledby="h-gaps">
   <div class="wrap">
     <p class="kicker o reveal">实话实说</p>
     <h2 class="title reveal" id="h-gaps">LLVM <em>仍然领先的地方。</em></h2>
@@ -899,7 +924,7 @@ cd hello
   </div>
 </section>
 
-<section id="life" class="alt" aria-labelledby="h-life">
+<section id="life" aria-labelledby="h-life">
   <div class="wrap">
     <p class="kicker reveal">分层编译与实时补丁</p>
     <h2 class="title reveal" id="h-life">一个函数的<em>一生。</em></h2>
@@ -1076,11 +1101,26 @@ const DATA = {
     ]
   },
 
+  makepad: {
+    note: "**Relax 出自 [Makepad](https://github.com/makepad/makepad) 项目。**`makepad run` 及其工具在 Makepad 的仓库里，不在本仓库；本节介绍 Makepad 如何使用 Relax。",
+    intro: "`makepad` 就是 Relax 的运行器加上 Makepad 的宿主。除 `makepad run` 外，下列命令都发给 `makepad inspect <app>`。",
+    items: [
+      { title: "无需原生构建", body: "窗口立即打开并显示构建进度；应用的第一个窗口随后接管它。", cmd: ["makepad run <package>"] },
+      { title: "保存即补丁", body: "修改被热补丁进正在运行的应用，状态和窗口都保留。", cmd: [] },
+      { title: "原地重启", body: "无法热补丁的修改（类型布局、导入、trait 或 impl 头、宏）会在标题栏的 JIT 环上显示“Update ready”。点一下，应用就在同一进程、同一窗口里重启，带着它的状态（`AppMain::restart_state`）和窗口位置；有未保存的工作时可以推迟（`AppMain::can_restart`）。", cmd: ["session relaunch"] },
+      { title: "错误显示在窗口里", body: "编译错误和被借用检查器拒绝的修改显示在应用上方，带文件和行号。应用崩溃后窗口仍在，源码一改就提供 Restart。", cmd: ["session view open"] },
+      { title: "修好 panic 再重试", body: "panic 会暂停应用，JIT 环显示“Paused on a panic”；点一下就看到消息和位置。在 UI 线程上，改好代码、保存，`retry` 就用新代码重新运行那个事件。", cmd: ["panics", "locals panic=P1", "resume P1 retry"] },
+      { title: "看清代码", body: "每个函数的各个代码版本、O3 优化说明、与 rustc 并排的机器码，以及飞行记录器。", cmd: ["versions <fn>", "remarks <fn>", "asm <fn> vs=rustc", "rec save"] },
+      { title: "驱动 UI", body: "应用的远程控制与 Relax 共用 inspect 套接字（仅限本用户，不经网络）。", cmd: ["ui find q=<text>", "ui act node=<id> press", "grab"] }
+    ],
+    speed: "在 Makepad 智能体通道一天的数据里，修改到达机器后 **3.6 s**（中位数）就被热补丁进去；JIT 或缓存还冷时 p90 为 86 s。"
+  },
+
   agents: {
     intro: "AI 智能体每一次慢构建都在付账：**token、时间，还有丢掉的上下文。**",
     heads: ["用 rustc + Cargo", "用 Relax + devhub"],
     table: [
-      ["改动生效", "重新构建、重新链接：几分钟", "**毫秒级打上补丁**（送到机器约 50–200 ms）"],
+      ["改动生效", "重新构建、重新链接：几分钟", "**0.1 s 送达，3.6 s 打上补丁**（中位数）"],
       ["测试结果", "先重新构建测试二进制，再运行", "**92 个测试，保存后 2.2 s**"],
       ["查看界面", "重新构建、重新启动、再点回原来的页面", "**运行中应用的一帧，存成 PNG**"],
       ["新 worker", "冷构建", "**一上来就是热的**"]
@@ -1639,11 +1679,15 @@ DATA.agents.practice.forEach((p, i) => bigcard($("#practice"), p, i));
 
 /* ------------------------------ tradeoffs, benefits ------------------------------ */
 cards($("#tradeList"), DATA.tradeoffs.items);
-DATA.benefits.items.forEach((b, i) => {
-  const c = add($("#benefitList"), "article", "card fact reveal"); c.style.setProperty("--d", i % 2);
-  add(c, "h3", "", esc(b.title)); add(c, "p", "", rich(b.body));
-  add(c, "p", "use", b.cmd.map(x => "<code>" + esc(x) + "</code>").join(" "));
-});
+function facts(host, list) {
+  list.forEach((b, i) => {
+    const c = add(host, "article", "card fact reveal"); c.style.setProperty("--d", i % 2);
+    add(c, "h3", "", esc(b.title)); add(c, "p", "", rich(b.body));
+    if (b.cmd.length) add(c, "p", "use", b.cmd.map(x => "<code>" + esc(x) + "</code>").join(" "));
+  });
+}
+facts($("#benefitList"), DATA.benefits.items);
+facts($("#mpList"), DATA.makepad.items);
 
 /* ------------------------------ reveals, counters, off-screen pause, progress ------------------------------ */
 (function () {
