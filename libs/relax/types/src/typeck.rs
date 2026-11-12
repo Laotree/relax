@@ -3946,15 +3946,18 @@ impl<'a> Fcx<'a> {
                 }
             }
         }
-        // `T::item` with T a generic param (or `Self` in a trait body): resolved through the
-        // param's bounds only, as rustc does on the generic body; an inherent item of the type
-        // a given instance substitutes is never seen (`U::from(x)` with U: From<T> calls
-        // From::from even when the instance's U has an inherent `from`).
+        // `T::item` with T a generic param (or `Self` in a trait body, or in an impl whose self
+        // type is a param: `impl<T: Build<P>> Build<W<P>> for T`): resolved through the param's
+        // bounds first, as rustc's probe takes a param's where clauses as inherent candidates
+        // (assemble_inherent_candidates_from_param) ahead of the traits in scope; an inherent
+        // item of the type a given instance substitutes is never seen (`U::from(x)` with
+        // U: From<T> calls From::from even when the instance's U has an inherent `from`), and
+        // `Self::from` with T: Build<P> is Build's, not the prelude From's (relax issue 49).
         // rustc_hir_analysis hir_ty_lowering lower_assoc_path / probe_single_bound_for_assoc_item
         let prefix_is_param = n == 2
             && path.no_qself()
             && match self.ast().segs(path.segs)[0].kind() {
-                SegKind::SelfType => self.env.trait_def.is_some(),
+                SegKind::SelfType => self.env.trait_def.is_some() || matches!(self.tcx.tys.kind(self_ty), TyKind::Param(_)),
                 _ => {
                     let s0 = self.sym(self.ast().segs(path.segs)[0].name);
                     self.env.names.iter().take(self.b.args.len()).any(|nm| *nm == s0)
