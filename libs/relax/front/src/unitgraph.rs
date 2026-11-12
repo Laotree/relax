@@ -956,17 +956,36 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     let output_path = format!("{}/output", build_dir);
     let key_path = format!("{}/makepad-run-rerun", build_dir);
     let env_path = format!("{}/makepad-run-rerun-env", build_dir);
-    let why = match (std::fs::read_to_string(&output_path), std::fs::read_to_string(&key_path)) {
+    // Ok: the previous output, which stands; Err: why the script runs again
+    let previous = || match (std::fs::read_to_string(&output_path), std::fs::read_to_string(&key_path)) {
         (Ok(old), Ok(key)) => {
             let now = rerun_key(&old, dir, &env_key).unwrap_or_default();
-            if now == key {
-                if sess.runtime.profile { eprintln!("makepad-run build-script: {} cached", pname); }
+            if now == key { Ok(old) } else { Err(rerun_reason(&key, &now, &std::fs::read_to_string(&env_path).unwrap_or_default(), &env_key)) }
+        }
+        _ => Err("no previous output".to_string()),
+    };
+    let mut why = match previous() {
+        Ok(old) => {
+            if sess.runtime.profile { eprintln!("makepad-run build-script: {} cached", pname); }
+            return (Ok(old), out_dir);
+        }
+        Err(why) => why,
+    };
+    // One run at a time makes a script's output (its OUT_DIR is one folder for every run of this
+    // run dir): the run holds `makepad-run-claim` beside it locked while its script runs. A run
+    // that finds it held waits and takes the output the other made, where two runs started
+    // together each compiled and ran every script. The OS drops the lock with a run that dies.
+    let claim = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(format!("{}/makepad-run-claim", build_dir)).ok();
+    if let Some(claim) = claim.as_ref().filter(|claim| claim.try_lock().is_err()) {
+        let _ = claim.lock();
+        match previous() {
+            Ok(old) => {
+                if sess.runtime.profile { eprintln!("makepad-run build-script: {} made by another run", pname); }
                 return (Ok(old), out_dir);
             }
-            rerun_reason(&key, &now, &std::fs::read_to_string(&env_path).unwrap_or_default(), &env_key)
+            Err(now) => why = now,
         }
-        _ => "no previous output".to_string(),
-    };
+    }
     // why this script runs again, kept beside its output (relax-rerun-why: the last 20) and shown with MAKEPAD_RUN_PROFILE
     if sess.runtime.profile { eprintln!("makepad-run build-script: {} runs: {}", pname, why); }
     note_rerun(&build_dir, &why);
