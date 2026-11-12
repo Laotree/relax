@@ -6864,9 +6864,10 @@ impl<'a> Lcx<'a> {
     fn lower_expr_inner(&mut self, e: ExprId, t: TyId) -> Val {
         let ast = self.ast();
         let ex = ast.expr(e);
-        // Two-word integer operations need both halves of every operand.
+        // Two-word integer operations need both halves of every operand, an operand that is a
+        // reference to one too (`&a + &b` on i128: built in, with both operands loaded)
         let wide = match &ex.kind {
-            ExprKind::Binary(_, a, b) | ExprKind::AssignOp(_, a, b) => self.is_wide(self.body_ty(*a)) || self.is_wide(self.body_ty(*b)),
+            ExprKind::Binary(_, a, b) | ExprKind::AssignOp(_, a, b) => self.is_wide(self.prim_peeled(self.body_ty(*a))) || self.is_wide(self.prim_peeled(self.body_ty(*b))),
             ExprKind::Unary(UnOp::Neg | UnOp::Not, x) | ExprKind::Cast(x, _) => self.is_wide(self.body_ty(*x)) || self.is_wide(t),
             _ => false,
         };
@@ -7069,7 +7070,7 @@ impl<'a> Lcx<'a> {
                 self.want_mut = false;
                 let cur = self.read_place(&pl, pt);
                 let cur = self.to_leaves(cur, pt);
-                if !self.scalar_operands(*op, pt, pt, bt, *a) {
+                if !self.scalar_operands(*op, pt, pt, bt, *a, false) {
                     return self.unit();
                 }
                 let r = self.arith(*op, pt, cur[0], rv[0], bt);
@@ -8629,7 +8630,7 @@ impl<'a> Lcx<'a> {
                     self.err(self.pos, format!("internal: arithmetic on `{}` and `{}` without values -- Relax bug, report it", x, y));
                     return self.dummy_val(t);
                 }
-                if !self.scalar_operands(op, t, lt, bt, a) {
+                if !self.scalar_operands(op, t, lt, bt, a, false) {
                     return self.dummy_val(t);
                 }
                 let r = self.arith(op, t, av[0], bv[0], bt);
@@ -8988,7 +8989,9 @@ impl<'a> Lcx<'a> {
         match &ex.kind {
             ExprKind::Binary(op, a, b) if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) => {
                 let at = self.body_ty(*a);
-                let signed = self.wide_signed(at) || (!self.is_wide(at) && self.int_ty(at).signed);
+                // `&a < &b`: the referenced integers' sign (the loads go through the references)
+                let pt = self.prim_peeled(at);
+                let signed = self.wide_signed(pt) || (!self.is_wide(pt) && self.int_ty(pt).signed);
                 let av = self.lower_expr(*a);
                 let x = self.wide_parts(av, at);
                 let bt = self.body_ty(*b);
@@ -8999,7 +9002,7 @@ impl<'a> Lcx<'a> {
             ExprKind::Binary(op, a, b) => {
                 let (at, bt) = (self.body_ty(*a), self.body_ty(*b));
                 let (lt, rt) = (self.prim_peeled(at), self.prim_peeled(bt));
-                if !self.scalar_operands(*op, t, lt, rt, *a) {
+                if !self.scalar_operands(*op, t, lt, rt, *a, true) {
                     return self.dummy_val(t);
                 }
                 let av = self.lower_expr(*a);
@@ -9027,7 +9030,7 @@ impl<'a> Lcx<'a> {
                 let (pl, pt) = self.lower_place(*a);
                 self.want_mut = false;
                 let cur = self.read_place(&pl, pt);
-                if !self.scalar_operands(*op, pt, pt, self.prim_peeled(bt), *a) {
+                if !self.scalar_operands(*op, pt, pt, self.prim_peeled(bt), *a, true) {
                     return self.unit();
                 }
                 let x = self.wide_parts(cur, pt);
@@ -9245,18 +9248,22 @@ impl<'a> Lcx<'a> {
     /// Built-in arithmetic takes primitive scalars of the operator's type `t` (a shift's amount:
     /// any integer). Anything else reaching IBin/FBin is a typeck gap that computes on an
     /// address or a mismatched value (`256u32 >> &big` once shifted by the reference's address):
-    /// an internal error at the expression, never a silent result.
-    fn scalar_operands(&mut self, op: BinOp, t: TyId, lt: TyId, rt: TyId, at: ExprId) -> bool {
+    /// an internal error at the expression, never a silent result. `two_words`: the caller is
+    /// lower_wide; a one-word caller given a 128-bit operand would compute its low half alone
+    /// (`&a + &b` on i128 once left the high half of the result unwritten).
+    fn scalar_operands(&mut self, op: BinOp, t: TyId, lt: TyId, rt: TyId, at: ExprId, two_words: bool) -> bool {
         let (kt, kl, kr) = (self.kind(t), self.kind(lt), self.kind(rt));
         let scalar = matches!(kt, TyKind::Int(_) | TyKind::Float(_)) || (matches!(kt, TyKind::Bool) && matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor));
         let shift = matches!(op, BinOp::Shl | BinOp::Shr);
-        if scalar && kl == kt && if shift { matches!(kt, TyKind::Int(_)) && matches!(kr, TyKind::Int(_)) } else { kr == kt } {
+        let words = two_words || !(self.is_wide(t) || self.is_wide(lt) || self.is_wide(rt));
+        if scalar && words && kl == kt && if shift { matches!(kt, TyKind::Int(_)) && matches!(kr, TyKind::Int(_)) } else { kr == kt } {
             return true;
         }
         let s = |l: &Self, x| crate::typeck::ty_to_string(false, &l.u.prog, &l.u.tcx, x);
         let (x, y, z) = (s(self, lt), s(self, rt), s(self, t));
         let lo = self.ast().expr(at).lo;
-        self.err(lo, format!("internal: built-in `{:?}` on `{}` and `{}` (operator type `{}`): an operand is not a primitive of the operator's type, a type check gap -- makepad run bug, report it", op, x, y, z));
+        let why = if words { "an operand is not a primitive of the operator's type, a type check gap" } else { "a 128-bit operation on the one-word path, a lowering gap" };
+        self.err(lo, format!("internal: built-in `{:?}` on `{}` and `{}` (operator type `{}`): {} -- Relax bug, report it", op, x, y, z, why));
         false
     }
 

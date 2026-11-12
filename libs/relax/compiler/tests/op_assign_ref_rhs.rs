@@ -119,6 +119,13 @@ fn primitives_take_a_reference_to_a_primitive() {
     assert_eq!([i + &j, i - &j, &i * j, &i / &j, i % &j], [-12, -22, -85, -3, -2]);
     let (u, v) = (200u8, 7u8);
     assert_eq!([u + &v, u - &v, &u / v, &u % &v], [207, 193, 28, 4]);
+    // 128-bit: both words of the result, with both operands references too
+    let (w, x) = (-(1i128 << 100), 7i128);
+    assert_eq!([w + &x, &w - x, &w + &x, &w - &x], [-(1i128 << 100) + 7, -(1i128 << 100) - 7, -(1i128 << 100) + 7, -(1i128 << 100) - 7]);
+    assert_eq!([&w * &x, &w / &x, &w % &x], [-(1i128 << 100) * 7, -(1i128 << 100) / 7, -(1i128 << 100) % 7]);
+    let (p, q) = (1u128 << 70, 3u128);
+    assert_eq!([&p - &q, &p >> &q, &p & &q, p << &q], [(1u128 << 70) - 3, 1u128 << 67, 0, 1u128 << 73]);
+    assert!(&w < &x && &x > &w && &w <= &w && &p > &q && &w != &x);
     let (m, n) = (0b1100u32, 0b1010u32);
     assert_eq!([m & &n, &m | n, &m ^ &n, m << &2u32, &m >> &2u8], [8, 14, 6, 48, 3]);
     assert_eq!([true & &false, &true | false, &true ^ &true], [false, true, false]);
