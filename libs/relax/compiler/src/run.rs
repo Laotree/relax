@@ -808,7 +808,10 @@ pub(crate) fn resolve_package(
                 Some(Box::new(alone))
             };
             let hook: Option<&unitgraph::ScriptsDone<'_>> = (boot && !check_only).then_some(&early_world);
-            let scripts = unitgraph::run_build_scripts(sess, &mut g, target_dir, native_mode, check_only, hook);
+            // a build script's own child run gets the native outputs its parent built: the
+            // child compiles the same packages and cannot compute the parent's cache key
+            let native_receipt = std::env::var("MAKEPAD_RUN_NATIVE_RECEIPT").ok();
+            let scripts = unitgraph::run_build_scripts(sess, &mut g, target_dir, native_mode, check_only, native_receipt.as_deref(), hook);
             let scripts_ms = t_scripts.elapsed().as_secs_f64() * 1e3;
             let t_wait = Instant::now();
             (sources.map(|h| h.join().expect("provided source check")), scripts, scripts_ms, t_wait.elapsed().as_secs_f64() * 1e3)

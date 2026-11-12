@@ -32,8 +32,15 @@
 //!
 //! A check without the flag starts no cargo either, but it reads a receipt the flag left behind:
 //! the same key, so the cfgs, rustc-env and OUT_DIR of that build are what its compile uses
-//! (`cached_scripts`). A tree whose C was built once type-checks whole from then on; only an
+//! (`cached_outputs`). A tree whose C was built once type-checks whole from then on; only an
 //! absent receipt (or one that does not cover every native package) leaves a check without them.
+//!
+//! A build script runs as a `relax run --units` child of its own. That child resolves the same
+//! native packages but not the parent's key (its unit graph is a subset), so the parent writes
+//! what they produced — cfgs, env, OUT_DIR and the linked library — to a receipt beside the run
+//! dir and names it in `MAKEPAD_RUN_NATIVE_RECEIPT`. The child matches entries by the scripts'
+//! own paths (`write_receipt` / `read_receipt`), so a build script that calls into a native crate
+//! compiles and runs without cargo and without needing the flag itself.
 //!
 //! Cargo brings the lock up to date as `cargo run` does, and fetches only what is missing (the
 //! run's --offline / --frozen and cargo's offline settings still hold). Cargo.lock is not
@@ -95,6 +102,7 @@ impl<'a> Mode<'a> {
 pub type Resolvable = fn(names: &[String], dylibs: &[String], frameworks: &[String]) -> Vec<bool>;
 
 /// What cargo's build script of one native package produced.
+#[derive(Clone)]
 pub struct ScriptOut {
     pub krate: usize,
     /// A separate host feature set of a package also built for the target.
@@ -107,6 +115,7 @@ pub struct ScriptOut {
 }
 
 /// The shared library the native archives were linked into.
+#[derive(Clone)]
 pub struct NativeLib {
     pub path: String,
     /// the names of the static libraries inside it (`#[link(name = .., kind = "static")]`)
@@ -354,12 +363,13 @@ pub fn build(g: &Graph, seeds: &[usize], req: &Request) -> Result<Built, String>
     Ok(Built { scripts: out.scripts, lib: Some(NativeLib { path: plan.lib_path, statics: out.statics, crates: plan.names }) })
 }
 
-/// The script outputs of the native build already cached under `req`'s key (no cargo, no link):
-/// the cfgs, env and OUT_DIR a check compiles the native packages with. `None` when nothing is
+/// The outputs of the native build already cached under `req`'s key (no cargo, no link): the
+/// cfgs, env and OUT_DIR a check compiles the native packages with, and the library when the
+/// build linked one (a build script's own child run calls into it). `None` when nothing is
 /// cached, when the receipt does not cover every seed (a partial build is not a build), or when
 /// the directories it names are gone. `cached` rejects the receipt of a build that did not link
 /// or whose library the target no longer holds, so only a whole build is read back as one.
-pub fn cached_scripts(g: &Graph, seeds: &[usize], req: &Request) -> Option<Vec<ScriptOut>> {
+pub fn cached_outputs(g: &Graph, seeds: &[usize], req: &Request) -> Option<(Vec<ScriptOut>, Option<NativeLib>)> {
     let plan = plan(g, seeds, req);
     let messages = std::fs::read_to_string(&plan.messages_path).ok()?;
     let out = cached(&g.pkg, &script_table(g), seeds, &messages, &plan.lib_path)?;
@@ -369,7 +379,176 @@ pub fn cached_scripts(g: &Graph, seeds: &[usize], req: &Request) -> Option<Vec<S
             return None;
         }
     }
-    Some(out.scripts)
+    let links = !(out.archives.is_empty() && out.dylibs.is_empty() && out.frameworks.is_empty());
+    let lib = links.then(|| NativeLib { path: plan.lib_path.clone(), statics: out.statics.clone(), crates: plan.names.clone() });
+    Some((out.scripts, lib))
+}
+
+/// `cached_outputs`' script half (a check reads no library).
+pub fn cached_scripts(g: &Graph, seeds: &[usize], req: &Request) -> Option<Vec<ScriptOut>> {
+    cached_outputs(g, seeds, req).map(|(scripts, _)| scripts)
+}
+
+/// What a native build left for a build script's own child run (`write_receipt`).
+pub struct Receipt {
+    pub scripts: Vec<ReceiptScript>,
+    pub lib: Option<NativeLib>,
+}
+
+/// One native script's outputs as a build-script child reads them (`write_receipt`): keyed by the
+/// script's `src_path`, which a child can match without the parent's key (its unit graph is a
+/// subset, so it cannot recompute that key).
+pub struct ReceiptScript {
+    pub path: String,
+    pub host: bool,
+    pub out_dir: String,
+    pub cfgs: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub system: Vec<(String, bool)>,
+}
+
+/// Write what the native scripts produced for the run's own build-script children. A child
+/// compiles the same native packages (they are in its build-dependency closure), but it runs as
+/// `relax run --units … build-script-build` with no `--allow-c` and no way to reach the parent's
+/// key; without this it would refuse their scripts (or run them) instead of compiling with their
+/// OUT_DIR, cfgs and env. One line of JSON, replaced atomically.
+pub fn write_receipt(g: &Graph, seeds: &[usize], scripts: &[ScriptOut], lib: Option<&NativeLib>, path: &str) -> Result<(), String> {
+    let mut out = String::from("{\"scripts\":[");
+    let mut first = true;
+    for &s in seeds {
+        let bs = &g.build_scripts[s];
+        for o in scripts.iter().filter(|o| o.krate == bs.krate) {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            out.push_str("{\"path\":");
+            json_str(&mut out, &bs.src_path);
+            out.push_str(",\"host\":");
+            out.push_str(if o.host { "true" } else { "false" });
+            out.push_str(",\"out_dir\":");
+            json_str(&mut out, &o.out_dir);
+            out.push_str(",\"cfgs\":[");
+            for (i, c) in o.cfgs.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                json_str(&mut out, c);
+            }
+            out.push_str("],\"env\":[");
+            for (i, (k, v)) in o.env.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push('[');
+                json_str(&mut out, k);
+                out.push(',');
+                json_str(&mut out, v);
+                out.push(']');
+            }
+            out.push_str("],\"system\":[");
+            for (i, (k, framework)) in o.system.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push('[');
+                json_str(&mut out, k);
+                out.push(',');
+                out.push_str(if *framework { "true" } else { "false" });
+                out.push(']');
+            }
+            out.push_str("]}");
+        }
+    }
+    out.push_str("]");
+    if let Some(lib) = lib {
+        out.push_str(",\"lib\":{\"path\":");
+        json_str(&mut out, &lib.path);
+        out.push_str(",\"statics\":[");
+        for (i, name) in lib.statics.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            json_str(&mut out, name);
+        }
+        out.push_str("],\"crates\":[");
+        for (i, name) in lib.crates.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            json_str(&mut out, name);
+        }
+        out.push_str("]}");
+    }
+    out.push('}');
+    let tmp = format!("{}.tmp{}", path, std::process::id());
+    std::fs::write(&tmp, &out).map_err(|e| format!("{}: {}", tmp, e))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {}", path, e))
+}
+
+/// The scripts a child run's receipt names (`write_receipt`), or `None` when there is no usable
+/// receipt. Every entry's OUT_DIR must still exist: a receipt outlives the directory it names.
+pub fn read_receipt(path: &str) -> Option<Receipt> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let j = crate::json::parse(text.as_bytes()).ok()?;
+    let mut out = Vec::new();
+    for s in j.get("scripts")?.arr() {
+        let path = s.get("path")?.str().to_string();
+        let out_dir = s.get("out_dir").map(|v| v.str().to_string()).unwrap_or_default();
+        if !out_dir.is_empty() && !std::path::Path::new(&out_dir).is_dir() {
+            return None;
+        }
+        let strs = |k: &str| -> Vec<String> { s.get(k).map(|a| a.arr().iter().map(|x| x.str().to_string()).collect()).unwrap_or_default() };
+        let mut env = Vec::new();
+        if let Some(e) = s.get("env") {
+            for kv in e.arr() {
+                if let [k, v] = kv.arr() {
+                    env.push((k.str().to_string(), v.str().to_string()));
+                }
+            }
+        }
+        let mut system = Vec::new();
+        if let Some(e) = s.get("system") {
+            for kv in e.arr() {
+                if let [k, v] = kv.arr() {
+                    system.push((k.str().to_string(), matches!(v, crate::json::Json::Bool(true))));
+                }
+            }
+        }
+        out.push(ReceiptScript {
+            path,
+            host: matches!(s.get("host"), Some(crate::json::Json::Bool(true))),
+            out_dir,
+            cfgs: strs("cfgs"),
+            env,
+            system,
+        });
+    }
+    let lib = j.get("lib").and_then(|l| {
+        let path = l.get("path")?.str().to_string();
+        if !std::path::Path::new(&path).is_file() {
+            return None;
+        }
+        let list = |k: &str| -> Vec<String> { l.get(k).map(|a| a.arr().iter().map(|x| x.str().to_string()).collect()).unwrap_or_default() };
+        Some(NativeLib { path, statics: list("statics"), crates: list("crates") })
+    });
+    Some(Receipt { scripts: out, lib })
+}
+
+fn json_str(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 /// The wrapper selects real builds by package name. Selecting one unit therefore
