@@ -8,9 +8,12 @@ pub const fn black_box<T>(dummy: T) -> T {
     unsafe { crate::intrinsics_mem::black_box(dummy) }
 }
 
-/// Marks the path that reaches it as unlikely (stable since Rust 1.95). Relax: no layout hint yet,
-/// so it does nothing.
-pub const fn cold_path() {}
+/// Marks the path that reaches it as unlikely (stable since Rust 1.95). As rustc's core: an
+/// always-inlined call of the intrinsic, which Relax lays out no differently yet.
+#[inline(always)]
+pub const fn cold_path() {
+    crate::intrinsics::cold_path()
+}
 
 pub fn spin_loop() {
     unsafe { crate::intrinsics_atomic::spin_loop_hint() }

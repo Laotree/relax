@@ -38,6 +38,10 @@ pub mod intrinsics {
     pub use super::intrinsics_simd as simd;
     /// rustc's `intrinsics::assume` (UB when false): hint::assert_unchecked
     pub use crate::hint::assert_unchecked as assume;
+    /// rustc's `intrinsics::cold_path`, safe and const: `#[cold]`, with the empty body rustc's
+    /// fallback (its spec). hint::cold_path calls it.
+    #[cold]
+    pub const fn cold_path() {}
 }
 
 /// rustc's generic SIMD intrinsics (`core::intrinsics::simd`) on `#[repr(simd)]` types, lane-wise
