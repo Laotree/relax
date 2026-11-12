@@ -442,6 +442,43 @@ impl<T: Read, U: Read> Read for Chain<T, U> {
     }
 }
 
+/// As real std: the first reader's buffer until it comes back empty, then the second's for good.
+/// read_until stays in the first reader while its result ends in `byte`; read_line keeps the
+/// default, since a UTF-8 sequence can span the two readers.
+impl<T: BufRead, U: BufRead> BufRead for Chain<T, U> {
+    fn fill_buf(&mut self) -> Result<&[u8]> {
+        if !self.done_first {
+            match self.first.fill_buf()? {
+                buf if buf.is_empty() => self.done_first = true,
+                buf => return Ok(buf),
+            }
+        }
+        self.second.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        if !self.done_first {
+            self.first.consume(amt)
+        } else {
+            self.second.consume(amt)
+        }
+    }
+
+    fn read_until(&mut self, byte: u8, buf: &mut Vec<u8>) -> Result<usize> {
+        let mut read = 0;
+        if !self.done_first {
+            let n = self.first.read_until(byte, buf)?;
+            read += n;
+            match buf.last() {
+                Some(b) if *b == byte && n != 0 => return Ok(read),
+                _ => self.done_first = true,
+            }
+        }
+        read += self.second.read_until(byte, buf)?;
+        Ok(read)
+    }
+}
+
 #[derive(Debug)]
 pub struct Split<B> {
     buf: B,
@@ -452,7 +489,7 @@ impl<B: BufRead> Iterator for Split<B> {
     type Item = Result<Vec<u8>>;
     fn next(&mut self) -> Option<Result<Vec<u8>>> {
         let mut buf = Vec::new();
-        match read_until(&mut self.buf, self.delim, &mut buf) {
+        match self.buf.read_until(self.delim, &mut buf) {
             Ok(0) => None,
             Ok(_n) => {
                 if buf[buf.len() - 1] == self.delim {

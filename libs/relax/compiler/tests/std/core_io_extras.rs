@@ -1,7 +1,7 @@
 // io::repeat / Repeat, Empty as a writer and seeker, &Sink, IoSlice / IoSliceMut (new, deref,
 // advance, advance_slices), the default read_vectored / write_vectored, the adapters' derived
-// Debug (Take, Chain, Bytes, Lines, Split) and Seek for Take (real std).
-use std::io::{self, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write};
+// Debug (Take, Chain, Bytes, Lines, Split), Seek for Take and BufRead for Chain (real std).
+use std::io::{self, BufRead, Cursor, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write};
 
 #[test]
 fn a01_repeat_empty_sink() {
@@ -111,4 +111,109 @@ fn a04_take_seek() {
     println!("| rewound {:?} {:?}", t.stream_position(), t);
     t.set_limit(2);
     println!("| set {} {} {:?}", show(t.seek(SeekFrom::End(0))), show(t.seek(SeekFrom::Start(3))), t);
+}
+
+// A BufRead that logs its calls: its read_until is its own; `empty_once` makes the first
+// fill_buf come back empty although data follows.
+struct Logged {
+    data: Vec<u8>,
+    pos: usize,
+    empty_once: bool,
+}
+
+impl Read for Logged {
+    fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+        let n = {
+            let a = self.fill_buf()?;
+            let n = a.len().min(b.len());
+            b[..n].copy_from_slice(&a[..n]);
+            n
+        };
+        self.consume(n);
+        Ok(n)
+    }
+}
+
+impl BufRead for Logged {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.empty_once {
+            self.empty_once = false;
+            println!("| first fill_buf empty");
+            return Ok(&[]);
+        }
+        Ok(&self.data[self.pos..])
+    }
+    fn consume(&mut self, n: usize) {
+        println!("| first consume {n}");
+        self.pos += n;
+    }
+    fn read_until(&mut self, byte: u8, buf: &mut Vec<u8>) -> io::Result<usize> {
+        println!("| first read_until");
+        let start = self.pos;
+        while self.pos < self.data.len() {
+            let c = self.data[self.pos];
+            self.pos += 1;
+            buf.push(c);
+            if c == byte {
+                break;
+            }
+        }
+        Ok(self.pos - start)
+    }
+}
+
+fn logged(data: &[u8], empty_once: bool) -> Logged {
+    Logged { data: data.to_vec(), pos: 0, empty_once }
+}
+
+fn count_lines<R: BufRead>(r: R) -> usize {
+    r.lines().count()
+}
+
+#[test]
+fn a05_chain_bufread() {
+    let chained = Cursor::new("a\nb".to_string()).chain(Cursor::new("\nc".to_string()));
+    let lines: Vec<String> = chained.lines().map(Result::unwrap).collect();
+    println!("| {lines:?}");
+    println!("| {}", count_lines(Cursor::new("x\ny\n").chain(&b"z"[..])));
+    // fill_buf and consume across the boundary: the first's rest, then the second's
+    let mut c = (&b"abc"[..]).chain(&b"de"[..]);
+    println!("| {:?}", c.fill_buf().map(|b| b.to_vec()));
+    c.consume(2);
+    println!("| {:?}", c.fill_buf().map(|b| b.to_vec()));
+    c.consume(1);
+    println!("| {:?}", c.fill_buf().map(|b| b.to_vec()));
+    c.consume(1);
+    println!("| {:?}", c.fill_buf().map(|b| b.to_vec()));
+    c.consume(1);
+    println!("| {:?}", c.fill_buf().map(|b| b.to_vec()));
+    let mut e = (&b""[..]).chain(&b"q"[..]);
+    println!("| {:?}", e.fill_buf().map(|b| b.to_vec()));
+    // read_until: the first reader's own, and on into the second when it ends without the byte
+    let mut c = logged(b"ab\ncd", false).chain(Cursor::new(b"ef\ngh".to_vec()));
+    let mut v = Vec::new();
+    println!("| {:?} {:?}", c.read_until(b'\n', &mut v), String::from_utf8_lossy(&v));
+    v.clear();
+    println!("| {:?} {:?}", c.read_until(b'\n', &mut v), String::from_utf8_lossy(&v));
+    let mut l = String::new();
+    println!("| {:?} {:?}", c.read_line(&mut l), l);
+    // an empty fill_buf ends the first reader for good
+    let lines: Vec<String> = logged(b"x\ny", true).chain(Cursor::new(b"z".to_vec())).lines().map(Result::unwrap).collect();
+    println!("| {lines:?}");
+    // split goes through Chain's read_until; skip_until through fill_buf and consume
+    let parts: Vec<Vec<u8>> = logged(b"1;2", false).chain(Cursor::new(b";3".to_vec())).split(b';').map(Result::unwrap).collect();
+    println!("| {parts:?}");
+    let mut s = logged(b"pq", false).chain(Cursor::new(b"rs".to_vec()));
+    println!("| {:?}", s.skip_until(b'r'));
+    let mut rest = String::new();
+    s.read_to_string(&mut rest).unwrap();
+    println!("| {rest:?}");
+    // a UTF-8 sequence split between the two readers, and a chain of chains
+    let bytes = "x\u{e9}y\n".as_bytes();
+    let mut u = (&bytes[..2]).chain(&bytes[2..]);
+    let mut l = String::new();
+    println!("| {:?} {:?}", u.read_line(&mut l), l);
+    let nested = (&b"1\n"[..]).chain(&b"2"[..]).chain((&b"\n3"[..]).chain(&b"\n"[..]));
+    let lines: Vec<String> = nested.lines().map(Result::unwrap).collect();
+    println!("| {lines:?}");
 }
