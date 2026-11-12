@@ -8969,13 +8969,25 @@ impl SettleWait {
         SettleWait { since: Instant::now(), save: std::time::SystemTime::now(), file, said: false }
     }
 
-    /// `what` moved (or holds the tree): said once the wait is a second long
-    fn moved(&mut self, what: &str) {
+    /// `what` moved (or holds the tree): said once the wait is a second long, naming the saved
+    /// files as they are then (`file`, None: as at the start)
+    fn moved(&mut self, what: &str, file: impl FnOnce() -> Option<String>) {
         if !self.said && self.since.elapsed() >= std::time::Duration::from_secs(1) {
             self.said = true;
+            if let Some(file) = file() { self.file = file; }
             eprintln!("makepad live: {}: waits for the tree to settle ({what})", self.file);
         }
     }
+}
+
+/// What a settle wait's lines name: the program's files among `changed`, else what changed. A
+/// source folder's stamp moves with its files, and before them when a writer first makes a
+/// temporary file there, so a wait that began with the folder names the file once it is saved.
+fn wait_name(changed: &[usize], files: &[(String, u32, Option<(std::time::SystemTime, u64)>)]) -> Option<String> {
+    let loaded: Vec<usize> = changed.iter().copied().filter(|&k| files[k].1 != u32::MAX).collect();
+    let named: &[usize] = if loaded.is_empty() { changed } else { &loaded };
+    let first = files.get(*named.first()?)?.0.as_str();
+    Some(if named.len() > 1 { format!("{first} (and {} more)", named.len() - 1) } else { first.to_string() })
 }
 
 impl Drop for SettleWait {
@@ -9448,11 +9460,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             Some(w) if std::mem::take(&mut again_wait) => w,
             _ => {
                 again_wait = false;
-                // named by the program's files it changed (a source folder's stamp moves with them)
-                let loaded: Vec<usize> = changed.iter().copied().filter(|&k| files[k].1 != u32::MAX).collect();
-                let named = if loaded.is_empty() { &changed } else { &loaded };
-                let first = files[named[0]].0.as_str();
-                SettleWait::new(if named.len() > 1 { format!("{first} (and {} more)", named.len() - 1) } else { first.to_string() })
+                SettleWait::new(wait_name(&changed, &files).unwrap_or_default())
             }
         };
         if live_trace() { eprintln!("makepad live: a change seen at t={:.0} ms ({} file(s))", crate::clock::ms_since_start(), changed.len()); }
@@ -9525,7 +9533,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             last = now;
             git_state = next_git;
             if let Some(what) = moved {
-                wait.moved(&what);
+                wait.moved(&what, || wait_name(&changed, &files));
                 quiet_retry = false;
                 still_since = Instant::now();
             } else if committed || still_since.elapsed() >= LIVE_QUIET {
@@ -9821,7 +9829,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let now: Vec<_> = files.iter().enumerate().map(|(k, f)| look.stamp(&virt, k, &f.0)).collect();
         let next_git = repositories.snapshot();
         if let Some(what) = moved_file(&files, &now, &settled_stamps).or_else(|| next_git.moved_from(&git_state).map(|p| format!("{} moved", p.display()))) {
-            wait.moved(&what);
+            wait.moved(&what, || wait_name(&changed, &files));
             settle_wait = Some(wait);
             again = true;
             again_wait = true;
