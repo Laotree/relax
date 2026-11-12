@@ -955,6 +955,11 @@ pub fn parse_range(s: &str) -> Option<(u64, u64)> {
 /// The edits folder is a shared workspace's checkout (SHARE): a plain folder.
 static SHARED: AtomicBool = AtomicBool::new(false);
 
+/// Whether this run's workspace is a shared one (SHARE).
+pub fn shared() -> bool {
+    SHARED.load(Ordering::Relaxed)
+}
+
 /// A shared workspace's mount root and its checkout's folder (both normalized).
 static SHARE_ROOTS: OnceLock<(String, String)> = OnceLock::new();
 

@@ -198,6 +198,10 @@ fn env_key(prog: &Program) -> u128 {
     let mut vars: Vec<(String, String)> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.to_string_lossy().into_owned())))
         .filter(|(k, _)| k.starts_with("MAKEPAD_RUN_") && !crate::run::RUN_STATE_VARS.contains(&k.as_str()))
+        // a shared workspace's checkout (vfs.rs SHARE): where its files are read from, which
+        // steers no check (their text is in the keys). With it in the key, a second checkout
+        // of the same text checked every crate again.
+        .filter(|(k, _)| !(k == "MAKEPAD_RUN_EDITS" && crate::vfs::shared()))
         .collect();
     vars.sort();
     h.u32(vars.len() as u32);
