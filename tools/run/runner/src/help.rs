@@ -141,6 +141,7 @@ fn relax_main_page(st: &Style) -> String {
     p.row("export <git-url> <folder>", "Write a repository's files into a folder");
     p.row("inspect <pid> <question>", "Ask a running program about itself (hangs, stacks, events)");
     p.row("clean [-p <package>]", "Remove the workspace's target/relax cache");
+    host_rows(&mut p);
     p.row("serve", "Run the warm check server");
     p.row("help [command]", "Show this help, or a command's page");
     p.section("Options:");
@@ -185,6 +186,7 @@ fn main_page(st: &Style) -> String {
     p.row("live <file.rs> <edit.rs>...", "Run tests, then apply edits as live patches");
     p.row("fix --to-strict <package>", "Rewrite relaxed code to plain rustc Rust");
     p.row("clean [-p <package>]", "Remove the workspace's target/relax cache");
+    host_rows(&mut p);
     p.row("serve", "Run the warm check server");
     p.row("schema|hover|definition", "Editor queries to the check server");
     p.row("help [command]", "Show this help, or a command's page");
@@ -446,6 +448,29 @@ fn observe_page(st: &Style) -> String {
     p.out
 }
 
+/// The main page's rows of the commands the host adds.
+fn host_rows(p: &mut Page) {
+    for c in crate::host().commands {
+        p.row(c.row.0, c.row.1);
+    }
+}
+
+/// `help <name>` of a command the host adds.
+fn host_page(st: &Style, c: &crate::HostCommand) -> String {
+    let mut p = Page::new(st, 40);
+    title(&mut p, c.title);
+    for line in c.page {
+        match *line {
+            crate::HelpLine::Blank => p.blank(),
+            crate::HelpLine::Usage(s) => p.usage(s),
+            crate::HelpLine::Text(s) => p.text(s),
+            crate::HelpLine::Section(s) => p.section(s),
+            crate::HelpLine::Row(name, desc) => p.row(name, desc),
+        }
+    }
+    p.out
+}
+
 fn ci_page(st: &Style) -> String {
     let mut p = Page::new(st, 40);
     title(&mut p, "committed CI proofs for this checkout");
@@ -478,8 +503,11 @@ fn page(st: &Style, cmd: Option<&str>) -> Option<String> {
         Some("fix") => fix_page(st),
         Some("serve" | "schema" | "hover" | "definition") => serve_page(st),
         Some("clean") => clean_page(st),
-        Some(c) if COMMANDS.contains(&c) => main_page(st),
-        Some(_) => return None,
+        Some(c) => match crate::host().commands.iter().find(|h| h.name == c) {
+            Some(h) => host_page(st, h),
+            None if COMMANDS.contains(&c) => main_page(st),
+            None => return None,
+        },
     })
 }
 

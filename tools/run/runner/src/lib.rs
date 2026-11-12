@@ -73,11 +73,36 @@ pub struct Host {
     /// into it (reload::host)
     pub package: &'static str,
     pub manifest: &'static str,
+    /// the commands this binary adds to the runner's: listed in its help, run before anything of
+    /// the runner's own
+    pub commands: &'static [HostCommand],
+}
+
+/// A command a host adds to its binary: its word, its row on the main help page, its own help
+/// page and its entry (the arguments after the word; the exit code).
+pub struct HostCommand {
+    pub name: &'static str,
+    /// the main page's row: the usage and the line beside it
+    pub row: (&'static str, &'static str),
+    /// `help <name>`: what the page's title says the command does, then its lines
+    pub title: &'static str,
+    pub page: &'static [HelpLine],
+    pub main: fn(&[String]) -> i32,
+}
+
+/// A line of a host command's help page, styled as the runner's own pages are.
+pub enum HelpLine {
+    Blank,
+    Usage(&'static str),
+    Text(&'static str),
+    Section(&'static str),
+    /// a name and its description (`\n` continues the description on the next line)
+    Row(&'static str, &'static str),
 }
 
 /// The bare runner (bin `relax`): provides nothing; tests, checks and agents' boots compile only
 /// what runs.
-pub const BARE: Host = Host { provenance: None, init: || {}, provide: || {}, run_host: || {}, ahead: relax_compiler::options::AheadLevel::Minimal, proc_macros: relax_compiler::pmhost::Policy::Open, default_launch: None, package: env!("CARGO_PKG_NAME"), manifest: concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml") };
+pub const BARE: Host = Host { provenance: None, init: || {}, provide: || {}, run_host: || {}, ahead: relax_compiler::options::AheadLevel::Minimal, proc_macros: relax_compiler::pmhost::Policy::Open, default_launch: None, package: env!("CARGO_PKG_NAME"), manifest: concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"), commands: &[] };
 
 static HOST: std::sync::OnceLock<&'static Host> = std::sync::OnceLock::new();
 
@@ -300,6 +325,10 @@ fn run(raw_args: Vec<Vec<u8>>) {
     #[cfg(target_os = "linux")]
     nvidia_shader_cache();
     macros::register();
+    // a command the host adds: its own, no compiler started here
+    if let Some(c) = args.get(1).and_then(|w| host().commands.iter().find(|c| c.name == w)) {
+        std::process::exit((c.main)(&args[2..]));
+    }
     match args.get(1).map(String::as_str) {
         None => {
             help::print_main(help::Stream::Err);
