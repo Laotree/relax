@@ -10427,14 +10427,14 @@ impl<'a> Lcx<'a> {
                 }
             }
         }
+        // Only the pointer this call gets is its own memory. The place the result is read from
+        // (call_result_slot's other vreg) is an ordinary slot once the call returns: a later call
+        // it is passed to may keep its address, as `f(&make()).await` does in the future `f`
+        // returns, so the slot is saved across the await (relax issue 81: it stayed in the
+        // poll's frame and the next poll read it after the stack was reused).
         if let (Some(a), Some(c)) = (sret, self.coro.as_mut()) {
             c.call_private.insert(a);
             c.call_sret.insert(a);
-            // the place stays the call's own memory for the points-to analysis (as when it was
-            // the same vreg), but a call it is passed to later does not write it whole
-            if let Some(p) = sret_place {
-                c.call_private.insert(p);
-            }
         }
         if let (Some(_), Callee::Fn(id)) = (sret, &callee) {
             if !self.f.sret_callees.contains(id) {
