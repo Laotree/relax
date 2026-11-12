@@ -8,6 +8,10 @@ pub const fn black_box<T>(dummy: T) -> T {
     unsafe { crate::intrinsics_mem::black_box(dummy) }
 }
 
+/// Marks the path that reaches it as unlikely (stable since Rust 1.95). Relax: no layout hint yet,
+/// so it does nothing.
+pub const fn cold_path() {}
+
 pub fn spin_loop() {
     unsafe { crate::intrinsics_atomic::spin_loop_hint() }
 }
