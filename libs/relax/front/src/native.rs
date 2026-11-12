@@ -35,6 +35,14 @@
 //! (`cached_scripts`). A tree whose C was built once type-checks whole from then on; only an
 //! absent receipt (or one that does not cover every native package) leaves a check without them.
 //!
+//! A build script runs as a `run --units` child of its own, which resolves the native packages its
+//! build-dependencies reach but not the run's key (its unit graph is a part of the run's). So the
+//! run writes what the native scripts produced (cfgs, env, OUT_DIR) and the library they were
+//! linked into to a script receipt, named by its content, and hands it to its script children in
+//! `MAKEPAD_RUN_NATIVE_RECEIPT` (`write_receipt` / `read_receipt`). A child matches the entries by
+//! the scripts' own paths, so a build script that calls into a native crate compiles and runs
+//! with that crate's outputs and library, without cargo and without the flag itself.
+//!
 //! Cargo brings the lock up to date as `cargo run` does, and fetches only what is missing (the
 //! run's --offline / --frozen and cargo's offline settings still hold). Cargo.lock is not
 //! tracked, so each tree keeps its own, and with `--locked` every native build failed on a tree
@@ -95,6 +103,7 @@ impl<'a> Mode<'a> {
 pub type Resolvable = fn(names: &[String], dylibs: &[String], frameworks: &[String]) -> Vec<bool>;
 
 /// What cargo's build script of one native package produced.
+#[derive(Clone)]
 pub struct ScriptOut {
     pub krate: usize,
     /// A separate host feature set of a package also built for the target.
@@ -107,6 +116,7 @@ pub struct ScriptOut {
 }
 
 /// The shared library the native archives were linked into.
+#[derive(Clone)]
 pub struct NativeLib {
     pub path: String,
     /// the names of the static libraries inside it (`#[link(name = .., kind = "static")]`)
@@ -391,6 +401,12 @@ pub fn build(g: &Graph, seeds: &[usize], req: &Request) -> Result<Built, String>
 /// the directories it names are gone. `cached` rejects the receipt of a build that did not link
 /// or whose library the target no longer holds, so only a whole build is read back as one.
 pub fn cached_scripts(g: &Graph, seeds: &[usize], req: &Request) -> Option<Vec<ScriptOut>> {
+    cached_outputs(g, seeds, req).map(|(scripts, _)| scripts)
+}
+
+/// `cached_scripts` and the library the cached build linked (None when it linked nothing): what a
+/// build script's own child run calls into.
+pub fn cached_outputs(g: &Graph, seeds: &[usize], req: &Request) -> Option<(Vec<ScriptOut>, Option<NativeLib>)> {
     let plan = plan(g, seeds, req);
     let messages = std::fs::read_to_string(&plan.messages_path).ok()?;
     let out = cached(&g.pkg, &script_table(g), seeds, &messages, &plan.lib_path)?;
@@ -400,7 +416,105 @@ pub fn cached_scripts(g: &Graph, seeds: &[usize], req: &Request) -> Option<Vec<S
             return None;
         }
     }
-    Some(out.scripts)
+    let links = !(out.archives.is_empty() && out.dylibs.is_empty() && out.frameworks.is_empty());
+    let lib = links.then(|| NativeLib { path: plan.lib_path.clone(), statics: out.statics.clone(), crates: plan.names.clone() });
+    Some((out.scripts, lib))
+}
+
+/// A script receipt (`write_receipt`): the native scripts' outputs by script path, and the library.
+pub struct Receipt {
+    pub scripts: Vec<ReceiptScript>,
+    pub lib: Option<NativeLib>,
+}
+
+/// One native script's outputs in a script receipt, by the script's `src_path`: the key a build
+/// script's own child run can match (its unit graph is a part of the run's, so it cannot
+/// compute the run's key).
+pub struct ReceiptScript {
+    pub path: String,
+    pub host: bool,
+    pub out_dir: String,
+    pub cfgs: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub system: Vec<(String, bool)>,
+}
+
+/// Writes the native scripts' outputs (those of `seeds`) and the library for the run's own
+/// build-script children: `<dir>/native-scripts-<hash of the content>.json`, so equal outputs
+/// are one file whose name says nothing about the run that wrote it (a script's rerun key holds
+/// the name, and a name per run would run every script again on every run). Its path.
+pub fn write_receipt(g: &Graph, seeds: &[usize], scripts: &[ScriptOut], lib: Option<&NativeLib>, dir: &str) -> Result<String, String> {
+    let list = |items: &mut dyn Iterator<Item = String>| format!("[{}]", items.collect::<Vec<_>>().join(","));
+    let mut entries = Vec::new();
+    for &s in seeds {
+        let bs = &g.build_scripts[s];
+        let (_, name, version) = &g.pkg[bs.krate];
+        for o in scripts.iter().filter(|o| o.krate == bs.krate || (g.pkg[o.krate].1 == *name && g.pkg[o.krate].2 == *version)) {
+            entries.push(format!(
+                "{{\"path\":{},\"host\":{},\"out_dir\":{},\"cfgs\":{},\"env\":{},\"system\":{}}}",
+                json_string(&bs.src_path),
+                o.host,
+                json_string(&o.out_dir),
+                list(&mut o.cfgs.iter().map(|c| json_string(c))),
+                list(&mut o.env.iter().map(|(k, v)| format!("[{},{}]", json_string(k), json_string(v)))),
+                list(&mut o.system.iter().map(|(k, framework)| format!("[{},{}]", json_string(k), framework))),
+            ));
+        }
+    }
+    let mut out = format!("{{\"scripts\":[{}]", entries.join(","));
+    if let Some(lib) = lib {
+        out.push_str(&format!(
+            ",\"lib\":{{\"path\":{},\"statics\":{},\"crates\":{}}}",
+            json_string(&lib.path),
+            list(&mut lib.statics.iter().map(|n| json_string(n))),
+            list(&mut lib.crates.iter().map(|n| json_string(n))),
+        ));
+    }
+    out.push('}');
+    let path = format!("{}/native-scripts-{:016x}.json", dir, fnv(out.as_bytes(), 0xcbf29ce484222325));
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(out.as_str()) {
+        let tmp = format!("{}.tmp{}", path, std::process::id());
+        std::fs::write(&tmp, &out).map_err(|e| format!("{}: {}", tmp, e))?;
+        std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {}", path, e))?;
+    }
+    Ok(path)
+}
+
+/// A script receipt (`write_receipt`), or None when there is none to use: unreadable, or naming an
+/// OUT_DIR or a library that is gone.
+pub fn read_receipt(path: &str) -> Option<Receipt> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let j = crate::json::parse(text.as_bytes()).ok()?;
+    let strs = |v: Option<&crate::json::Json>| -> Vec<String> { v.map(|a| a.arr().iter().map(|x| x.str().to_string()).collect()).unwrap_or_default() };
+    let mut scripts = Vec::new();
+    for s in j.get("scripts")?.arr() {
+        let out_dir = s.get("out_dir").map(|v| v.str().to_string()).unwrap_or_default();
+        if !out_dir.is_empty() && !std::path::Path::new(&out_dir).is_dir() {
+            return None;
+        }
+        let pairs = |k: &str| -> Vec<(&crate::json::Json, &crate::json::Json)> {
+            s.get(k).map(|a| a.arr().iter().filter_map(|kv| match kv.arr() { [k, v] => Some((k, v)), _ => None }).collect()).unwrap_or_default()
+        };
+        scripts.push(ReceiptScript {
+            path: s.get("path")?.str().to_string(),
+            host: matches!(s.get("host"), Some(crate::json::Json::Bool(true))),
+            out_dir,
+            cfgs: strs(s.get("cfgs")),
+            env: pairs("env").into_iter().map(|(k, v)| (k.str().to_string(), v.str().to_string())).collect(),
+            system: pairs("system").into_iter().map(|(k, v)| (k.str().to_string(), matches!(v, crate::json::Json::Bool(true)))).collect(),
+        });
+    }
+    let lib = match j.get("lib") {
+        Some(l) => {
+            let path = l.get("path")?.str().to_string();
+            if !std::path::Path::new(&path).is_file() {
+                return None;
+            }
+            Some(NativeLib { path, statics: strs(l.get("statics")), crates: strs(l.get("crates")) })
+        }
+        None => None,
+    };
+    Some(Receipt { scripts, lib })
 }
 
 /// The wrapper selects real builds by package name. Selecting one unit therefore
@@ -743,6 +857,21 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
         }
     }
     Ok(keep)
+}
+
+/// `s` as a JSON string literal.
+fn json_string(s: &str) -> String {
+    let mut o = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
 }
 
 fn selection_key(scripts: &[String], libs: &[String]) -> u64 {

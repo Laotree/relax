@@ -459,8 +459,12 @@ pub type ScriptsDone<'a> = dyn Fn(&Graph, &[usize], &[Vec<String>], &[Vec<(Strin
 /// the native packages (a cold `--allow-c` start: the C compile takes tens of seconds), with the
 /// crates' cfgs and env so far (the native packages' outputs missing). The boot starts the
 /// proc-macro world from it, beside the C compile. What it returns is kept until cargo is done.
+///
+/// `native_receipt`: in a build script's own child run, the receipt its parent wrote of the native
+/// build's outputs (`native::write_receipt`): the native packages its build-dependencies reach
+/// compile with those outputs and call into that library.
 pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, target_dir: &str, native: Option<crate::native::Mode<'_>>, check_only: bool,
-    scripts_done: Option<&ScriptsDone<'_>>) -> Result<(), String> {
+    native_receipt: Option<&str>, scripts_done: Option<&ScriptsDone<'_>>) -> Result<(), String> {
     // the packages whose scripts compile or link C (native.rs): built by cargo with `--allow-c`,
     // an error naming the flag without it; Relax runs the other scripts. A check without the flag
     // reads the cfgs, env and OUT_DIR a native build already in the cache produced, so it needs
@@ -477,11 +481,19 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
         }
         crate::native::native_reason(g, bs).map(|reason| (i, reason))
     }).collect();
-    let cached = match native {
-        Some(m) if !m.builds() && !native_scripts.is_empty() => {
-            let seeds: Vec<usize> = native_scripts.iter().map(|(i, _)| *i).collect();
-            crate::native::cached_scripts(g, &seeds, m.request())
-        }
+    let seeds: Vec<usize> = native_scripts.iter().map(|(i, _)| *i).collect();
+    // the native build's outputs: cached under this run's key, or (a build script's own child
+    // run, which builds nothing) the receipt its parent wrote, matched by the scripts' paths
+    let pre = match native {
+        Some(m) if !m.builds() && !seeds.is_empty() => crate::native::cached_outputs(g, &seeds, m.request()),
+        Some(_) => None,
+        None => native_receipt.and_then(crate::native::read_receipt).and_then(|r| Some((inherited_scripts(g, &seeds, &r.scripts)?, r.lib))),
+    };
+    // what this run compiles the native packages with: a check's cached build links nothing and
+    // loads no library; a child run calls into its parent's
+    let cached = match (native, &pre) {
+        (Some(m), Some((scripts, _))) if !m.builds() => Some((scripts.clone(), None)),
+        (None, Some(p)) => Some(p.clone()),
         _ => None,
     };
     let mut native_seeds: Vec<usize> = Vec::new();
@@ -509,6 +521,33 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
         }
     }
     let native_krates: Vec<usize> = native_seeds.iter().map(|&i| g.build_scripts[i].krate).collect();
+    // The scripts Relax runs whose build-dependencies reach a native package: their child runs
+    // compile it, so they read the native outputs from a receipt (native.rs `write_receipt`).
+    // Only they wait for a cold native build and only their rerun keys hold the receipt's name.
+    let reach: Vec<bool> = g.build_scripts.iter().map(|bs| {
+        !native_krates.is_empty() && !native_krates.contains(&bs.krate) && !check_skipped.contains(&bs.krate) && reaches_native(g, bs, &native_krates)
+    }).collect();
+    let mut receipt: Option<String> = None;
+    let mut prebuilt = false;
+    if reach.contains(&true) {
+        let outputs = match native {
+            Some(crate::native::Mode::Build(req)) => match crate::native::cached_outputs(g, &seeds, req) {
+                Some(cached) => Some(cached),
+                None => {
+                    // a cold build: its outputs are those scripts' inputs, so it finishes first
+                    let built = crate::native::build(g, &native_seeds, req)?;
+                    let outputs = (built.scripts.clone(), built.lib.clone());
+                    apply_built(g, &native_krates, built)?;
+                    prebuilt = true;
+                    Some(outputs)
+                }
+            },
+            _ => pre,
+        };
+        if let Some((scripts, lib)) = outputs {
+            receipt = Some(crate::native::write_receipt(g, &seeds, &scripts, lib.as_ref(), target_dir)?);
+        }
+    }
     // makepad-platform's script is answered by makepad run itself (`platform_answer`, no process);
     // in no-codegen mode (the platforms that run no generated code, iOS) no other script runs: any
     // other crate with a build script is an error.
@@ -525,7 +564,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
     let gr: &Graph = g;
     let (native_built, results) = std::thread::scope(|scope| {
         let native_job = match (native, native_seeds.is_empty()) {
-            (Some(crate::native::Mode::Build(req)), false) => Some(scope.spawn(|| {
+            (Some(crate::native::Mode::Build(req)), false) if !prebuilt => Some(scope.spawn(|| {
                 let _z = crate::zone_alloc::compiler_thread();
                 crate::native::build(gr, &native_seeds, req)
             })),
@@ -540,7 +579,8 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
             }
             _ => Vec::new(),
         };
-        let mut results = relax_scripts(sess, gr, target_dir, &native_krates, &check_skipped, &|k| world.is_empty() || world[k]);
+        let receipts: Vec<Option<&str>> = reach.iter().map(|&r| if r { receipt.as_deref() } else { None }).collect();
+        let mut results = relax_scripts(sess, gr, target_dir, &native_krates, &check_skipped, &receipts, &|k| world.is_empty() || world[k]);
         let mut _kept = None;
         if let (Some(job), Some(done)) = (&native_job, scripts_done) {
             if !job.is_finished() {
@@ -556,27 +596,67 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
             }
         }
         if !world.is_empty() {
-            results.extend(relax_scripts(sess, gr, target_dir, &native_krates, &check_skipped, &|k| !world[k]));
+            results.extend(relax_scripts(sess, gr, target_dir, &native_krates, &check_skipped, &receipts, &|k| !world[k]));
         }
         (native_job.map(|j| j.join().unwrap_or_else(|_| Err("--allow-c: the native build panicked".to_string()))), results)
     });
     if let Some(built) = native_built {
-        let built = built?;
-        // every native package's script ran under cargo (cargo sets OUT_DIR for each package
-        // with a build script): one cargo did not build would compile without its outputs
-        for &k in &native_krates {
-            let (_, n, v) = &g.pkg[k];
-            if !built.scripts.iter().any(|o| o.krate == k || (g.pkg[o.krate].1 == *n && g.pkg[o.krate].2 == *v)) {
-                return Err(format!("--allow-c: cargo did not run the build script of `{n} {v}` (no build-script-executed message): its OUT_DIR and cfgs are unknown"));
-            }
-        }
-        g.native = built.lib;
-        apply_native_scripts(g, built.scripts);
-    } else if let Some(scripts) = cached {
-        // a check's cached build: the same outputs cargo would have produced, no cargo and no lib
+        apply_built(g, &native_krates, built?)?;
+    } else if let Some((scripts, lib)) = cached {
+        // a check's cached build (no lib), or a child run's receipt: the same outputs cargo
+        // would have produced, no cargo
+        g.native = lib;
         apply_native_scripts(g, scripts);
     }
     apply_script_results(g, results, check_only)
+}
+
+/// A `--allow-c` build into the graph: every native package's script ran under cargo (cargo sets
+/// OUT_DIR for each package with a build script); one cargo did not build would compile without
+/// its outputs.
+fn apply_built(g: &mut Graph, native_krates: &[usize], built: crate::native::Built) -> Result<(), String> {
+    for &k in native_krates {
+        let (_, n, v) = &g.pkg[k];
+        if !built.scripts.iter().any(|o| o.krate == k || (g.pkg[o.krate].1 == *n && g.pkg[o.krate].2 == *v)) {
+            return Err(format!("--allow-c: cargo did not run the build script of `{n} {v}` (no build-script-executed message): its OUT_DIR and cfgs are unknown"));
+        }
+    }
+    g.native = built.lib;
+    apply_native_scripts(g, built.scripts);
+    Ok(())
+}
+
+/// Whether `bs`'s build-dependencies reach one of the native packages (`native_krates`): its
+/// child run compiles that package (a build-dependency is the same package built for the host).
+fn reaches_native(g: &Graph, bs: &BuildScript, native_krates: &[usize]) -> bool {
+    let native: Vec<(&str, &str)> = native_krates.iter().map(|&k| (g.pkg[k].1.as_str(), g.pkg[k].2.as_str())).collect();
+    let mut seen = vec![false; g.raw.len()];
+    let mut stack: Vec<usize> = bs.build_deps.iter().map(|d| d.0).collect();
+    while let Some(i) = stack.pop() {
+        if i >= g.raw.len() || std::mem::replace(&mut seen[i], true) {
+            continue;
+        }
+        let u = &g.raw[i];
+        if native.contains(&(u.pkg.1.as_str(), u.pkg.2.as_str())) {
+            return true;
+        }
+        stack.extend(u.deps.iter().map(|d| d.0));
+    }
+    false
+}
+
+/// The native outputs a child run's receipt names, onto this graph's native scripts by their
+/// paths (`native::write_receipt`). None unless every one is covered: a partial receipt is none.
+/// A package the parent built with a separate host feature set has two entries; the child's
+/// copy is a build-dependency's, the host one.
+fn inherited_scripts(g: &Graph, seeds: &[usize], records: &[crate::native::ReceiptScript]) -> Option<Vec<crate::native::ScriptOut>> {
+    let mut out = Vec::new();
+    for &s in seeds {
+        let bs = &g.build_scripts[s];
+        let r = records.iter().filter(|r| r.path == bs.src_path).max_by_key(|r| r.host)?;
+        out.push(crate::native::ScriptOut { krate: bs.krate, host: false, cfgs: r.cfgs.clone(), env: r.env.clone(), out_dir: r.out_dir.clone(), system: r.system.clone() });
+    }
+    Some(out)
 }
 
 /// A native build's script outputs into the graph (cfgs, link libraries, env, OUT_DIR): what
@@ -611,10 +691,11 @@ fn apply_native_scripts(g: &mut Graph, scripts: Vec<crate::native::ScriptOut>) {
 
 /// The scripts Relax runs itself (every one but the native packages' and a check's skipped
 /// ones), on the pool: (crates, stdout or error, OUT_DIR) per script.
-fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &str, native_krates: &[usize], check_skipped: &[usize], only: &(dyn Fn(usize) -> bool + Sync)) -> Vec<(Vec<usize>, Result<String, String>, String)> {
+fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &str, native_krates: &[usize], check_skipped: &[usize],
+    receipts: &[Option<&str>], only: &(dyn Fn(usize) -> bool + Sync)) -> Vec<(Vec<usize>, Result<String, String>, String)> {
     let results: Mutex<Vec<(Vec<usize>, Result<String, String>, String)>> = Mutex::new(Vec::new());
     crate::pool::scope(|s| {
-        for bs in &g.build_scripts {
+        for (si, bs) in g.build_scripts.iter().enumerate() {
             if native_krates.contains(&bs.krate) || !only(bs.krate) {
                 continue;
             }
@@ -663,8 +744,9 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
                 }
                 ScriptRole::Artefact => {}
             }
+            let receipt = receipts[si];
             s.spawn(move || {
-                let r = run_one(sess, bs, raw, &cenv, &dir, &pname, &ver, &name, target_dir);
+                let r = run_one(sess, bs, raw, &cenv, &dir, &pname, &ver, &name, target_dir, receipt);
                 results.lock().unwrap().push((bs.krates(), r.0, r.1));
             });
         }
@@ -863,7 +945,7 @@ fn self_exe() -> std::io::Result<std::path::PathBuf> {
 /// itself is the only process it starts. A script of a git run reads its package through the
 /// VFS (MAKEPAD_RUN_VFS / MAKEPAD_RUN_WORKSPACE for the child), and writes only OUT_DIR (on disk).
 #[allow(clippy::too_many_arguments)]
-fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUnit], cenv: &[(String, String)], dir: &str, pname: &str, ver: &str, name: &str, target_dir: &str) -> (Result<String, String>, String) {
+fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUnit], cenv: &[(String, String)], dir: &str, pname: &str, ver: &str, name: &str, target_dir: &str, receipt: Option<&str>) -> (Result<String, String>, String) {
     if let Err(e) = crate::vfs::read(&bs.src_path) {
         return (Err(format!("{}: {}", bs.src_path, e)), String::new());
     }
@@ -949,6 +1031,12 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         Some(l) => cmd.env("CARGO_MANIFEST_LINKS", l),
         None => cmd.env_remove("CARGO_MANIFEST_LINKS"),
     };
+    // the native build's outputs for the native packages this script's build-dependencies reach
+    // (run_build_scripts): named by its content, so the rerun key below changes exactly when they do
+    match receipt {
+        Some(r) => cmd.env(NATIVE_RECEIPT, r),
+        None => cmd.env_remove(NATIVE_RECEIPT),
+    };
     for (k, v) in cenv {
         cmd.env(k, v);
     }
@@ -981,7 +1069,8 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     // script that names none: no file of its package changed)
     let mut env_key = format!("{:016x}", h);
     for (k, v) in cmd.get_envs() {
-        if SCRIPT_RUN_SHAPE_VARS.iter().any(|s| k == *s) {
+        // no receipt is no part of the key (it held none before there were receipts)
+        if SCRIPT_RUN_SHAPE_VARS.iter().any(|s| k == *s) || (k == NATIVE_RECEIPT && v.is_none()) {
             continue;
         }
         env_key.push_str(&format!("\n{}={}", k.to_string_lossy(), v.map(|v| v.to_string_lossy().into_owned()).unwrap_or_default()));
@@ -1138,6 +1227,9 @@ fn rerun_reason(stored: &str, now: &str, stored_env: &str, env_key: &str) -> Str
 /// what they are; the nesting depth and chain say which script's run this one sits in, so a
 /// package reached at the top and inside another script's run (a dependency here and a
 /// build-dependency there) keeps one output (relax issue 69). No cargo script can read them.
+/// The variable that hands a build script's child run its parent's native receipt.
+pub const NATIVE_RECEIPT: &str = "MAKEPAD_RUN_NATIVE_RECEIPT";
+
 const SCRIPT_RUN_SHAPE_VARS: [&str; 4] = ["MAKEPAD_RUN_VFS", "MAKEPAD_RUN_EDITS", "MAKEPAD_RUN_SCRIPT_DEPTH", "MAKEPAD_RUN_SCRIPT_CHAIN"];
 
 fn note_rerun(build_dir: &str, why: &str) {
