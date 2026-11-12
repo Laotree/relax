@@ -1707,8 +1707,16 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
     }
     if load_errors > 0 && !watch {
-        // a test target's program: its other targets (test_pkg.rs) would end the same way
-        return if harness || plain_test { makepad_remote::hot::LOAD_ERROR_EXIT } else { 1 };
+        // the load errors end the run before `main` (a test program's before its tests): say so,
+        // or the exit reads as the program's own
+        let crates = if load_errors == 1 { "1 crate".to_string() } else { format!("{load_errors} crates") };
+        if harness || plain_test {
+            eprintln!("makepad-run: {crates} did not load (the load errors above), so the tests do not run");
+            // its other targets (test_pkg.rs) would end the same way
+            return makepad_remote::hot::LOAD_ERROR_EXIT;
+        }
+        eprintln!("makepad-run: {crates} did not load (the load errors above), so the run stops before `main`; `--watch` runs it anyway");
+        return 1;
     }
     {
         // what the unit holds, by identity: a domain started later shares these crates (domain.rs)
