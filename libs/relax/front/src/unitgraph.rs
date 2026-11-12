@@ -466,7 +466,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
     // reads the cfgs, env and OUT_DIR a native build already in the cache produced, so it needs
     // no cargo and no link of its own.
     let builds = native.is_some_and(|m| m.builds());
-    let native_scripts: Vec<(usize, String)> = g.build_scripts.iter().enumerate().filter_map(|(i, bs)| {
+    let native_scripts: Vec<(usize, crate::native::NativeReason)> = g.build_scripts.iter().enumerate().filter_map(|(i, bs)| {
         let (_, pname, _) = &g.pkg[bs.krate];
         // A kept GPU-kernel script (`Artefact`) that links native code (makepad-ai-cuda's nvcc
         // archives, `links =`) is cargo's too with `--allow-c`: its archives join the run's
@@ -475,7 +475,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
         if noop::script(bs, &g.raw) || !(kept_native || matches!(script_role(pname, &bs.features), ScriptRole::ToRemove)) {
             return None;
         }
-        crate::native::native_reason(g, bs).map(|why| (i, why))
+        crate::native::native_reason(g, bs).map(|reason| (i, reason))
     }).collect();
     let cached = match native {
         Some(m) if !m.builds() && !native_scripts.is_empty() => {
@@ -486,9 +486,10 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
     };
     let mut native_seeds: Vec<usize> = Vec::new();
     let mut check_skipped: Vec<usize> = Vec::new();
-    for (i, why) in native_scripts {
+    for (i, reason) in native_scripts {
         let bs = &g.build_scripts[i];
         let (_, pname, _) = &g.pkg[bs.krate];
+        let why = reason.describe(pname);
         if builds || cached.is_some() {
             if builds && sess.runtime.profile {
                 eprintln!("makepad-run build-script: {} is native ({})", pname, why);
@@ -498,12 +499,12 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
         }
         // a script that runs a C compiler cannot work without one; `links =` / DEP_ metadata
         // alone run under Relax as before
-        if why.contains("build-dependency") && check_only {
+        if reason.compiles_c() && check_only {
             eprintln!("makepad check: `{}`'s build script compiles C ({}): not run without `--allow-c` (its cfgs and OUT_DIR are missing; a `--allow-c` run fills the cache this check reads)", pname, why);
             check_skipped.push(bs.krate);
             continue;
         }
-        if why.contains("build-dependency") {
+        if reason.compiles_c() {
             return Err(format!("`{}` compiles C ({}): it {}", pname, why, relax_session::options::C_GATE));
         }
     }

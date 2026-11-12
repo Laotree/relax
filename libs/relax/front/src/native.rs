@@ -137,26 +137,57 @@ pub fn address_name(name: &[u8]) -> String {
 /// script that hashes its assets) need no `--allow-c` and run under Relax like any other.
 const C_FREE_WITH_FEATURE: [(&str, &str); 1] = [("blake3", "pure")];
 
-/// Why a package's build script is native, if it is.
-pub fn native_reason(g: &Graph, bs: &BuildScript) -> Option<String> {
+/// Why a package's build script is native. One script can have several reasons; the strongest
+/// one is the classification: a build-dependency that compiles C (`cc`, `cmake`, ..) needs
+/// `--allow-c` whether or not the package also declares `links =`, which alone only passes
+/// metadata to its dependents and runs under Relax.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeReason {
+    /// a build-dependency on one of [`BUILD_DEPS`] (its extern name)
+    CompilesC(String),
+    /// `links =` in the manifest
+    Links,
+    /// the script reads another package's `DEP_*` metadata
+    DepMetadata,
+}
+
+impl NativeReason {
+    /// The script runs a C compiler (or a native build tool): it cannot run without one, so
+    /// without `--allow-c` a run refuses it and a check skips it.
+    pub fn compiles_c(&self) -> bool {
+        matches!(self, NativeReason::CompilesC(_))
+    }
+
+    /// `<package>: <reason>`, as the C gate's messages print it.
+    pub fn describe(&self, pkg: &str) -> String {
+        match self {
+            NativeReason::CompilesC(dep) => format!("{}: build-dependency {}", pkg, dep),
+            NativeReason::Links => format!("{}: links =", pkg),
+            NativeReason::DepMetadata => format!("{}: reads DEP_ metadata", pkg),
+        }
+    }
+}
+
+/// Why a package's build script is native, if it is (the strongest reason: [`NativeReason`]).
+pub fn native_reason(g: &Graph, bs: &BuildScript) -> Option<NativeReason> {
     let (dir, name, _) = &g.pkg[bs.krate];
+    let c_free = C_FREE_WITH_FEATURE.iter().any(|(p, f)| p == name && bs.features.iter().any(|x| x == f));
+    for (_, ext) in &bs.build_deps {
+        if BUILD_DEPS.contains(&ext.as_str()) && !c_free {
+            return Some(NativeReason::CompilesC(ext.clone()));
+        }
+    }
     let manifest = crate::vfs::read_to_string(format!("{}/Cargo.toml", dir)).unwrap_or_default();
     let links = manifest.lines().any(|l| {
         let l = l.trim();
         l.strip_prefix("links").is_some_and(|r| r.trim_start().starts_with('='))
     });
     if links {
-        return Some(format!("{}: links =", name));
-    }
-    let c_free = C_FREE_WITH_FEATURE.iter().any(|(p, f)| p == name && bs.features.iter().any(|x| x == f));
-    for (_, ext) in &bs.build_deps {
-        if BUILD_DEPS.contains(&ext.as_str()) && !c_free {
-            return Some(format!("{}: build-dependency {}", name, ext));
-        }
+        return Some(NativeReason::Links);
     }
     let src = crate::vfs::read_to_string(&bs.src_path).unwrap_or_default();
     if src.contains("DEP_") {
-        return Some(format!("{}: reads DEP_ metadata", name));
+        return Some(NativeReason::DepMetadata);
     }
     None
 }
