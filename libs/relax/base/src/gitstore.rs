@@ -547,7 +547,7 @@ pub fn append(path: &Path, add: Append, keep: &dyn Fn(&[Ref]) -> Vec<Ref>) -> Re
         file.seek(SeekFrom::Start(0)).map_err(err)?;
         file.read_exact(&mut head).map_err(err)?;
         if &head[..8] != MAGIC {
-            return Err(format!("{}: not a makepad run git store", path.display()));
+            return Err(format!("{}: not a Relax git store", path.display()));
         }
         match Store::last_trailer(&file, 0, len, &|_| true).map_err(err)? {
             Some((e, i, _)) => (e, i),
@@ -689,14 +689,14 @@ pub fn compact(store: &Store) -> Result<(), String> {
 }
 
 /// The store file of a repository URL in `cache`: `git-<name>-<hash8>.store`.
-/// makepad run's own folder: $MAKEPAD_RUN_HOME, else ~/.makepad-run (%USERPROFILE%\.makepad-run);
+/// makepad run's own folder: $RELAX_HOME, else ~/.relax (%USERPROFILE%\.relax);
 /// its stores are in `cache/` there.
 pub fn relax_home() -> PathBuf {
-    if let Some(h) = std::env::var_os("MAKEPAD_RUN_HOME").filter(|h| !h.is_empty()) {
+    if let Some(h) = std::env::var_os("RELAX_HOME").filter(|h| !h.is_empty()) {
         return PathBuf::from(h);
     }
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).unwrap_or_else(|| ".".into());
-    home.join(".makepad-run")
+    home.join(".relax")
 }
 
 /// One file of `url`'s repository at `commit`, from its store (None: no store, the commit is

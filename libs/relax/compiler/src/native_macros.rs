@@ -19,7 +19,7 @@ pub struct Mismatch {
 }
 impl std::fmt::Display for Mismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the proc macros in this tree differ from those built into makepad: {} [{}: {}: {}]", crate::srchash::rebuild_hint(), self.package, self.file, self.reason)
+        write!(f, "the proc macros in this tree differ from those built into {tool}: {} [{}: {}: {}]", crate::srchash::rebuild_hint(crate::tool_name()), self.package, self.file, self.reason, tool = crate::tool_name())
     }
 }
 impl std::error::Error for Mismatch {}
@@ -32,7 +32,7 @@ fn validate_package(reg: &Reg, unit: usize, overlays: &std::collections::HashMap
     let u = &reg.units[unit];
     let error = |file: String, reason: String| Mismatch { package: u.name.clone(), file, reason };
     let Some((_, files)) = relax_native_macros::PACKAGES.iter().find(|(name, _)| *name == u.name) else {
-        return Err(error(u.src_path.clone(), "dependency is not built into makepad".into()));
+        return Err(error(u.src_path.clone(), format!("dependency is not built into {tool}", tool = crate::tool_name())));
     };
     if u.proc_macro != relax_native_macros::ENTRIES.iter().any(|n| n.krate == u.name) {
         return Err(error(u.src_path.clone(), "proc-macro crate kind differs".into()));
@@ -45,7 +45,7 @@ fn validate_package(reg: &Reg, unit: usize, overlays: &std::collections::HashMap
         "makepad_micro_proc_macro" => &["relax-tokens"],
         // the loader's copy is built with it (the loader links makepad-hal, which enables it): a
         // graph that links makepad-hal (its own tests) asks for that build
-        "makepad_relax_api" => &["host-shims"],
+        "relax_api" => &["host-shims"],
         _ => &[],
     };
     if u.edition != 2021 || !u.features.iter().all(|f| features.contains(&f.as_str())) {
@@ -107,7 +107,7 @@ fn validate_package(reg: &Reg, unit: usize, overlays: &std::collections::HashMap
             return Err(error(root.join("Cargo.toml").display().to_string(), format!("dependency {name} resolves to {}", reg.units[*dep].name)));
         }
         if !required(&reg.units[*dep].name) {
-            return Err(error(root.join("Cargo.toml").display().to_string(), format!("dependency {name} is not built into makepad")));
+            return Err(error(root.join("Cargo.toml").display().to_string(), format!("dependency {name} is not built into {tool}", tool = crate::tool_name())));
         }
     }
 
@@ -162,7 +162,7 @@ impl Graph {
     }
     fn missing(&self, entry: &Entry) -> String {
         let u = &self.reg.units[entry.unit];
-        Mismatch { package: u.name.clone(), file: u.src_path.clone(), reason: format!("entry {} is not built into makepad", entry.fname) }.to_string()
+        Mismatch { package: u.name.clone(), file: u.src_path.clone(), reason: format!("entry {} is not built into {tool}", entry.fname, tool = crate::tool_name()) }.to_string()
     }
     fn verdict(&self) -> Result<(), String> { self.verdicts.iter().find(|v| v.is_err()).cloned().unwrap_or(Ok(())) }
     fn find(&self, entry: &Entry) -> Result<Option<&'static Native>, String> {
@@ -302,7 +302,7 @@ mod tests {
         let entry = Entry { unit: 2, fname: native.fname.into(), kind: crate::macro_reg::Kind::Derive };
         assert!(graph.find(&entry).unwrap().is_some());
         let missing = Entry { fname: "missing_native_entry".into(), ..entry.clone() };
-        assert!(graph.find(&missing).err().unwrap().contains("entry missing_native_entry is not built into makepad"));
+        assert!(graph.find(&missing).err().unwrap().contains("entry missing_native_entry is not built into relax"));
         let helper = root.join("makepad_micro_proc_macro/src/macro_lib.rs");
         let original = std::fs::read(&helper).unwrap();
         std::fs::write(&helper, b"// changed helper").unwrap();
@@ -319,7 +319,7 @@ mod tests {
         let before = SOURCE_READS.load(std::sync::atomic::Ordering::Relaxed);
         assert!(graph.find(&entry).err().unwrap().contains("source bytes differ"));
         assert_eq!(SOURCE_READS.load(std::sync::atomic::Ordering::Relaxed), before);
-        assert!(mismatch.to_string().contains("the proc macros in this tree differ from those built into makepad: rebuild makepad by starting it through cargo: cargo run --release -p makepad-run --bin makepad --"));
+        assert!(mismatch.to_string().contains("the proc macros in this tree differ from those built into relax: rebuild relax by starting it through cargo: cargo run --release -p makepad-run --bin makepad --"));
         std::fs::write(&helper, &original).unwrap();
         let before = SOURCE_READS.load(std::sync::atomic::Ordering::Relaxed);
         graph.reload(&[(helper.to_str().unwrap(), None), (helper.to_str().unwrap(), None)]);

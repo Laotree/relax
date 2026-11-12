@@ -120,7 +120,7 @@ fn thread_pools_fold_into_one_row() {
     l.push_str("{\"id\":\"T9\",\"name\":\"run-owner\",\"role\":\"owner\",\"state\":\"waiting\",\"cpu_ms\":5}\n");
     let r = render("threads", &lines(&l));
     assert!(r.contains("| T2..T5 | makepad-pool* (4 threads) | program | 0 running | 0.04 |"), "{}", r);
-    assert!(r.starts_with("6 threads: 5 of the program, 1 of makepad run."), "{}", r);
+    assert!(r.starts_with("6 threads: 5 of the program, 1 of Relax."), "{}", r);
 }
 
 #[test]
@@ -174,7 +174,7 @@ fn why_slow_says_the_ui_wakes_apart_from_its_frames() {
 #[test]
 fn a_hosted_apps_heap_is_its_domain_arena_by_resident_pages() {
     // a hosted app: the domain arena's committed bytes (whole chunks made writable) are 4x its
-    // resident pages; malloc holds makepad run's own blocks
+    // resident pages; malloc holds Relax's own blocks
     let r = render(
         "memory",
         &lines(r#"{"freed_by_domain_teardown_bytes":0}
@@ -188,6 +188,6 @@ fn a_hosted_apps_heap_is_its_domain_arena_by_resident_pages() {
     assert!(r.contains("Program heap (domain 1 arena) 289 MB resident, 291 MB in use"), "{}", r);
     assert!(r.contains("| app domain 1 arena (makepad-calc) | 289 |"), "{}", r);
     assert!(r.contains("resident; 291 MB in use, 1.16 GB committed address space, 19 threads"), "{}", r);
-    assert!(r.contains("| malloc (makepad run, provided crates), in use | 372 |"), "{}", r);
+    assert!(r.contains("| malloc (Relax, provided crates), in use | 372 |"), "{}", r);
     assert!(!r.contains("program heap (malloc"), "{}", r);
 }

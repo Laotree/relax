@@ -41,7 +41,7 @@ struct ReloadTrace {
     cpu_last: u64,
     cpu: std::collections::BTreeMap<&'static str, f64>,
     stages: std::collections::BTreeMap<&'static str, f64>,
-    // sub-stage wall times inside a stage (MAKEPAD_RUN_RELOAD_TRACE: printed as sub.<name>_ms)
+    // sub-stage wall times inside a stage (RELAX_RELOAD_TRACE: printed as sub.<name>_ms)
     sub_last: Option<Instant>,
     subs: std::collections::BTreeMap<&'static str, f64>,
     counts: std::collections::BTreeMap<&'static str, usize>,
@@ -63,17 +63,17 @@ thread_local! {
 
 pub(crate) fn reload_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_RELOAD_TRACE").is_some())
+    *ON.get_or_init(|| std::env::var_os("RELAX_RELOAD_TRACE").is_some())
 }
 
 fn stream_timing() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_STREAM_TIMING").is_some())
+    *ON.get_or_init(|| std::env::var_os("RELAX_STREAM_TIMING").is_some())
 }
 
 fn live_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some())
+    *ON.get_or_init(|| std::env::var_os("RELAX_LIVE_TRACE").is_some())
 }
 
 /// The watcher's part of an edit: `watch_ms` from the save to the read, `look_ms` of it from the
@@ -107,7 +107,7 @@ pub(crate) fn trace_sub(name: &'static str) {
         }
     });
 }
-/// A unit call for the reload transaction; MAKEPAD_RUN_RELOAD_TRACE reports a wait over 5 ms with
+/// A unit call for the reload transaction; RELAX_RELOAD_TRACE reports a wait over 5 ms with
 /// the holder seen when the wait began (whose hold delayed the edit).
 fn call_traced<R>(at: &'static str, f: impl FnOnce() -> R) -> R {
     let traced = TRACE.with(|s| s.started.is_some());
@@ -1449,7 +1449,7 @@ fn compose_partial(prog: &Program, old_file: u32, new_src: &[u8]) -> Option<(Vec
     }
     prog.parse_version(old_file, path, text.clone()).ok()?;
     if stream_timing() {
-        eprintln!("makepad-run stream: compose_partial {} bytes {:.3} ms", new_src.len(), ms(started));
+        eprintln!("relax stream: compose_partial {} bytes {:.3} ms", new_src.len(), ms(started));
     }
     Some((text, kept))
 }
@@ -2511,7 +2511,7 @@ unsafe fn settle_edited_crates(up: *mut Unit) {
     if live_trace() {
         let prog = &(*up).prog;
         let names = |cs: &[u32]| cs.iter().map(|&c| prog.syms.str(prog.crates[c as usize].name).to_string()).collect::<Vec<String>>().join(", ");
-        eprintln!("makepad live: not edited (the text the run booted from): {}; edited: [{}]", names(&clean), names(&edited_crates()));
+        eprintln!("relax live: not edited (the text the run booted from): {}; edited: [{}]", names(&clean), names(&edited_crates()));
     }
 }
 
@@ -4091,7 +4091,7 @@ unsafe fn compile_guarded(up: *mut Unit, id: u32) -> Result<Code, String> {
             }
             let u = &mut *up;
             u.fns[id as usize].building = false;
-            Err(format!("internal compiler error in {}: {} -- makepad run bug, report it", u.fns[id as usize].name, msg))
+            Err(format!("internal compiler error in {}: {} -- Relax bug, report it", u.fns[id as usize].name, msg))
         }
     }
 }
@@ -4402,7 +4402,7 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, sources: &[Edit], partial:
             // the message and where the compiler panicked: the report names the spot
             let msg = crate::lifeline::panic_line(&*p);
             mark_unit_suspect(&format!("internal compiler error applying an edit: {msg}"));
-            Outcome { failure: Some(makepad_remote::hot::Outcome::Panic), kept: 0, pending: false, rung: Rung::Restart, files, lines: vec![format!("internal compiler error applying the edit: {} -- makepad run bug, report it; the app runs on with its code, and a restart applies the edit", msg)], names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), group: 0, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() }
+            Outcome { failure: Some(makepad_remote::hot::Outcome::Panic), kept: 0, pending: false, rung: Rung::Restart, files, lines: vec![format!("internal compiler error applying the edit: {} -- Relax bug, report it; the app runs on with its code, and a restart applies the edit", msg)], names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), group: 0, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() }
         }
     };
     if r.rung != Rung::Patch { crate::sip::restore_late_files(&late); }
@@ -4454,9 +4454,9 @@ fn front_wait_said(paths: &[String], waited: Option<std::time::Duration>) {
             let held = jit::front_holders::snapshot().into_iter().min_by_key(|r| r.2).map(|(tid, site, since)| {
                 format!(" (the longest read: {site} on thread {tid}, {:.1} s)", crate::clock::wall_ns().saturating_sub(since) as f64 / 1e9)
             });
-            eprintln!("makepad live: {what}: waits for the front end's readers to finish{}", held.unwrap_or_default());
+            eprintln!("relax live: {what}: waits for the front end's readers to finish{}", held.unwrap_or_default());
         }
-        Some(w) => eprintln!("makepad live: {what}: the front end's wait ended after {:.1} s; the edit goes on", w.as_secs_f64()),
+        Some(w) => eprintln!("relax live: {what}: the front end's wait ended after {:.1} s; the edit goes on", w.as_secs_f64()),
     }
 }
 
@@ -5471,7 +5471,6 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let mut removed_errs: Vec<String> = Vec::new();
     // fns declared again: a type their unchanged signature names moved (decls_naming_removed)
     let mut redeclared: Vec<DefId> = Vec::new();
-    let errors0 = u.prog.errors.len();
     trace_stage("gate_prepare");
     {
         // parsing may have served requests: more startup installs may have been made since the
@@ -5484,6 +5483,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             eprintln!("reload-front-wait: {:.1} ms (t={:.0}..{:.0} ms)", (now - wait_from) as f64 / 1e6, wait_from as f64 / 1e6, now as f64 / 1e6);
         }
         trace_stage("front_write_wait");
+        // the edit's own errors are those recorded from here: the wait above serves the owner's
+        // requests, and a module load among them records its file's errors in the program's (a
+        // count taken before the wait read them as this edit's and refused it, relax#33)
+        let errors0 = u.prog.errors.len();
         // (the tables are not the boot's from here on, kept or refused: PROGRAM_EDITS)
         if !versions.is_empty() { PROGRAM_EDITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
         let from = u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst);
@@ -6225,7 +6228,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     checked_bodies.push(b);
                 }
                 // (not the text's error: where a restart is needed, the restart builds it anew)
-                Err(p) => errs.push(format!("internal compiler error type-checking {} ({}) -- makepad run bug, report it", u.prog.def_path(d), crate::lifeline::panic_line(&*p))),
+                Err(p) => errs.push(format!("internal compiler error type-checking {} ({}) -- Relax bug, report it", u.prog.def_path(d), crate::lifeline::panic_line(&*p))),
             }
         }
     }
@@ -6898,7 +6901,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         crate::invalid::invalidate(u, |g| matches!(g, crate::invalid::Group::Patch { slot, gen: g0 } if g0 < gen && rebuilt.contains(&slot)), gen, "invalidated code", None, &why);
         let held = crate::invalid::hold_old_frames(u, gen, &breaking_names.join(", "), paused);
         if held > 0 {
-            out.lines.push(format!("held: {} thread(s) with a frame in the first-version code of a rebuilt fn: the app runs on without them, the restart is offered (makepad inspect {} stale)", held, std::process::id()));
+            out.lines.push(format!("held: {} thread(s) with a frame in the first-version code of a rebuilt fn: the app runs on without them, the restart is offered ({tool} inspect {} stale)", held, std::process::id(), tool = crate::tool_name()));
         }
     }
     let u = &mut *up;
@@ -7029,7 +7032,7 @@ pub(crate) fn hold_landing(files: &[(String, Option<[u8; 20]>)]) -> Result<usize
         let take = held.get(&path).is_some_and(|h| h.2);
         held.insert(path, (*oid, false, take));
     }
-    eprintln!("makepad live: a landing is held back: {} file(s) wait while they say what it wrote; other saves apply", held.len());
+    eprintln!("relax live: a landing is held back: {} file(s) wait while they say what it wrote; other saves apply", held.len());
     Ok(held.len())
 }
 
@@ -7070,7 +7073,7 @@ pub(crate) fn take_landing(dir: &str, files: &[(String, Option<[u8; 20]>)]) -> R
     }
     let n = held.len();
     drop(held);
-    eprintln!("makepad live: the held landing takes {} file(s) at a proven tip; {n} still held", taken.len());
+    eprintln!("relax live: the held landing takes {} file(s) at a proven tip; {n} still held", taken.len());
     let t = taken.len();
     if t > 0 {
         LANDING_FORCED.lock().unwrap_or_else(|e| e.into_inner()).extend(taken);
@@ -7085,7 +7088,7 @@ pub(crate) fn release_landing() -> usize {
     crate::vfs::release_read(None);
     let n = held.len();
     if n > 0 {
-        eprintln!("makepad live: the held landing goes in ({n} file(s))");
+        eprintln!("relax live: the held landing goes in ({n} file(s))");
         LANDING_FORCED.lock().unwrap_or_else(|e| e.into_inner()).extend(held.into_keys());
         CATCH_UP.store(true, std::sync::atomic::Ordering::Release);
         watch_events::kick();
@@ -7112,7 +7115,7 @@ fn held_back(path: &str, settled: bool) -> bool {
         if settled {
             LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
             crate::vfs::release_read(Some(&key));
-            eprintln!("makepad live: {path}: the person's save of a held landing's file applies; it is held no more");
+            eprintln!("relax live: {path}: the person's save of a held landing's file applies; it is held no more");
         }
         return false;
     }
@@ -7121,13 +7124,13 @@ fn held_back(path: &str, settled: bool) -> bool {
     let mut held = LANDING_HOLD.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, said, _)) = held.get_mut(&key).filter(|h| !h.1) {
         *said = true;
-        eprintln!("makepad live: {path} waits: it says what the held landing wrote (`inspect hold off` lets it in)");
+        eprintln!("relax live: {path} waits: it says what the held landing wrote (`inspect hold off` lets it in)");
     }
     true
 }
 static RESTART_REASON: relax_session::sync::Mutex<String> = relax_session::sync::Mutex::new(String::new());
 /// When the edit that asked for the restart was saved (unix ms): the restarted run's report
-/// measures save -> back on screen from it (MAKEPAD_RUN_RESTART_T0).
+/// measures save -> back on screen from it (RELAX_RESTART_T0).
 static RESTART_SAVED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DOMAIN_RESTORED: relax_session::sync::Mutex<Option<String>> = relax_session::sync::Mutex::new(None);
 static DOMAIN_LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -7181,7 +7184,7 @@ pub fn domain_stopping(id: u32) {
 }
 
 // the first domain of a restarted run gets the state the previous run left
-// (MAKEPAD_RUN_RESTORE, read once: run_end::run_input)
+// (RELAX_RESTORE, read once: run_end::run_input)
 static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 pub(crate) fn domain_loaded(inputs: Option<Inputs>) {
@@ -7190,7 +7193,7 @@ pub(crate) fn domain_loaded(inputs: Option<Inputs>) {
     clear_restart_pending();
     let mut restored = None;
     if FIRST.swap(false, std::sync::atomic::Ordering::AcqRel) {
-        if let Some(path) = crate::run_end::run_input("MAKEPAD_RUN_RESTORE") {
+        if let Some(path) = crate::run_end::run_input("RELAX_RESTORE") {
             let _k = crate::zone_alloc::kept();
             restored = std::fs::read_to_string(&path).ok();
             let _ = std::fs::remove_file(&path);
@@ -7227,7 +7230,7 @@ pub extern "C" fn __relax_live_edit_enabled() -> bool {
 }
 
 /// A WM dock app's watcher gate. A dock app runs from a machine's synced checkout of landed work
-/// (`MAKEPAD_RUN_DOCK_REVISION` names its `FLEET-REVISION.txt`, which only devhub's sync writes,
+/// (`RELAX_DOCK_REVISION` names its `FLEET-REVISION.txt`, which only devhub's sync writes,
 /// after it moved the files): a change of its sources is applied (patched, or the app restarts
 /// with its state) only in the watch round that follows a new revision. Anything else that
 /// writes into that tree -- a lane's build or checkout there, a hand edit -- never reaches the
@@ -7240,7 +7243,7 @@ pub(crate) struct DockGate {
 
 impl DockGate {
     pub(crate) fn from_env() -> Option<DockGate> {
-        Some(DockGate::new(std::path::PathBuf::from(std::env::var_os("MAKEPAD_RUN_DOCK_REVISION").filter(|p| !p.is_empty())?)))
+        Some(DockGate::new(std::path::PathBuf::from(std::env::var_os("RELAX_DOCK_REVISION").filter(|p| !p.is_empty())?)))
     }
 
     /// The gate of a checkout whose revision file is `revision`, open for what it says now.
@@ -7279,7 +7282,7 @@ impl DockGate {
         self.warned = true;
         let paths: Vec<&str> = paths.take(3).collect();
         let message = format!("dock app: {} changed outside a devhub sync of landed work; not applied: the app keeps running the synced code", paths.join(", "));
-        eprintln!("makepad live: {message}");
+        eprintln!("relax live: {message}");
         live_log(&format!("{{\"event\":\"dock_held\",\"message\":{}}}", json_str(&message)));
         false
     }
@@ -7431,7 +7434,7 @@ pub extern "C" fn __relax_restart_reason(buf: *mut u8, cap: usize) -> usize {
     })
 }
 
-/// The state the previous run left for this one (MAKEPAD_RUN_RESTORE), read once.
+/// The state the previous run left for this one (RELAX_RESTORE), read once.
 pub extern "C" fn __relax_restored_state(buf: *mut u8, cap: usize) -> usize {
     crate::jit::host_boundary("__relax_restored_state", move || {
         if crate::domain::current_app_domain().is_some() && crate::domain::current_app_domain() == crate::run::app_domain() {
@@ -7456,10 +7459,10 @@ pub extern "C" fn __relax_restored_state(buf: *mut u8, cap: usize) -> usize {
 }
 
 /// When the edit whose restart started this run was saved (unix ms; 0 for a run no restart started):
-/// MAKEPAD_RUN_RESTART_T0 as this run has it (run_end::run_input), for save -> back on screen.
+/// RELAX_RESTART_T0 as this run has it (run_end::run_input), for save -> back on screen.
 pub extern "C" fn __relax_restart_saved_ms() -> f64 {
     crate::jit::host_boundary("__relax_restart_saved_ms", || {
-        crate::run_end::run_input("MAKEPAD_RUN_RESTART_T0").and_then(|v| v.into_string().ok()).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0)
+        crate::run_end::run_input("RELAX_RESTART_T0").and_then(|v| v.into_string().ok()).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0)
     })
 }
 
@@ -7469,12 +7472,12 @@ pub extern "C" fn __relax_restart_saved_ms() -> f64 {
 pub extern "C" fn __relax_hot_load_failed(why: *const u8, len: usize) {
     crate::jit::host_boundary("__relax_hot_load_failed", move || {
         let why = unsafe { if why.is_null() { String::new() } else { String::from_utf8_lossy(std::slice::from_raw_parts(why, len)).into_owned() } };
-        eprintln!("makepad live:   {why}");
+        eprintln!("relax live:   {why}");
         recover_hot_failure(makepad_remote::hot::Outcome::StaleFrame, &[why], None);
     })
 }
 
-/// The app's restart with its state: the next run starts with it (MAKEPAD_RUN_RESTORE). Returns only
+/// The app's restart with its state: the next run starts with it (RELAX_RESTORE). Returns only
 /// when the restart could not start.
 pub extern "C" fn __relax_restart_now(state: *const u8, len: usize) {
     crate::jit::host_boundary("__relax_restart_now", move || {
@@ -7487,7 +7490,7 @@ pub extern "C" fn __relax_restart_now(state: *const u8, len: usize) {
             Ok(()) => crate::run_end::leave(),
             Err(e) => {
                 crate::hot_failure::restart_failed(&e);
-                eprintln!("makepad live: {e}");
+                eprintln!("relax live: {e}");
             }
         }
     })
@@ -7513,7 +7516,7 @@ pub(crate) struct PendingPatch {
     pub(crate) event_seq: u64,
 }
 
-/// MAKEPAD_RUN_SPECV_TRACE: the slots a patch group's verdict waits on, printed when they change
+/// RELAX_SPECV_TRACE: the slots a patch group's verdict waits on, printed when they change
 /// (the queue position aside: it moves on every poll).
 fn trace_patch_wait(group: u32, waits: &[String]) {
     static LAST: relax_session::sync::Mutex<Vec<(u32, String)>> = relax_session::sync::Mutex::new(Vec::new());
@@ -7573,7 +7576,7 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
             Some(None) => {
                 let p = pending.remove(i);
                 for why in &unchecked {
-                    eprintln!("makepad live: {}: the borrow checker did not check {} (it stays unverified baseline code)", p.what, why);
+                    eprintln!("relax live: {}: the borrow checker did not check {} (it stays unverified baseline code)", p.what, why);
                 }
                 UNVERIFIED_PATCHES.fetch_sub(1, Ordering::AcqRel);
                 let seqs = crate::inspect::events::unverified_seqs_since(p.event_seq);
@@ -7615,7 +7618,7 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
                 }
                 let e = &events[0].error;
                 eprintln!(
-                    "makepad live: {}: REVERTED -- the borrow checker rejected it after it ran: {} at {}:{}:{}: {}; {} fn(s) run their previous code again{}",
+                    "relax live: {}: REVERTED -- the borrow checker rejected it after it ran: {} at {}:{}:{}: {}; {} fn(s) run their previous code again{}",
                     what, e.fn_path, e.file, e.line, e.col, e.message, names.len(),
                     if ok { "" } else { " (its undo record was already dropped: not reverted)" }
                 );
@@ -7680,7 +7683,7 @@ fn running_old_code(u: &Unit, gen: u32) -> Option<String> {
         Ok(caps) => caps,
         Err(e) => {
             if layout {
-                eprintln!("makepad live: the landing check after a field's change could not read the stacks ({e}): a frame still running code from before the edit reads the old layout -- restart the app if it misbehaves");
+                eprintln!("relax live: the landing check after a field's change could not read the stacks ({e}): a frame still running code from before the edit reads the old layout -- restart the app if it misbehaves");
             }
             return None;
         }
@@ -7752,7 +7755,7 @@ fn restart_in_place(why: String) -> Result<&'static str, String> {
             wake_program();
             return Ok("restart with the program's state");
         };
-        eprintln!("makepad live: the restart does not wait for the app's state: {blocked}; the next run starts without it");
+        eprintln!("relax live: the restart does not wait for the app's state: {blocked}; the next run starts without it");
         return next_run(&why, None).map(|_| "restart without the program's state");
     }
     match start_state() {
@@ -7780,7 +7783,7 @@ fn start_state() -> Option<String> {
 /// hands its state over, and the run's end lets that thread go.)
 fn handover_blocked() -> Option<String> {
     let stuck = crate::stale::stuck_threads();
-    (stuck > 0).then(|| format!("{stuck} thread(s) of it are parked at a stale access and the app is paused for the report (`makepad inspect {} stale`)", std::process::id()))
+    (stuck > 0).then(|| format!("{stuck} thread(s) of it are parked at a stale access and the app is paused for the report (`{tool} inspect {} stale`)", std::process::id(), tool = crate::tool_name()))
 }
 
 /// The next run starts now, without the app's state (the app is not asked: a test run of `makepad
@@ -7915,7 +7918,7 @@ pub(crate) fn next_run_env(state: Option<&[u8]>) -> Result<Vec<(&'static str, Op
         None => None,
     };
     let saved = RESTART_SAVED_MS.load(std::sync::atomic::Ordering::Relaxed).to_string();
-    Ok(vec![("MAKEPAD_JIT_RECOVERY", recovery), ("MAKEPAD_RUN_RESTORE", restore), ("MAKEPAD_RUN_RESTART_T0", Some(saved.into()))])
+    Ok(vec![("MAKEPAD_JIT_RECOVERY", recovery), ("RELAX_RESTORE", restore), ("RELAX_RESTART_T0", Some(saved.into()))])
 }
 
 /// A restart that waited out the run's boot (run_end::restart) and hands no state of its own: the
@@ -7923,18 +7926,18 @@ pub(crate) fn next_run_env(state: Option<&[u8]>) -> Result<Vec<(&'static str, Op
 /// relaunch 3 s after a restart with the app's state dropped it). Read already by the domain's
 /// load ([`domain_loaded`]), it goes in a file of its own again; else its file is still there.
 pub(crate) fn carry_restore(next: &mut [(&'static str, Option<std::ffi::OsString>)]) {
-    let Some(slot) = next.iter_mut().find(|(k, v)| *k == "MAKEPAD_RUN_RESTORE" && v.is_none()) else { return };
+    let Some(slot) = next.iter_mut().find(|(k, v)| *k == "RELAX_RESTORE" && v.is_none()) else { return };
     let loaded = DOMAIN_RESTORED.lock().unwrap_or_else(|e| e.into_inner()).clone();
     slot.1 = match loaded {
-        Some(text) => restart_state_file(text.as_bytes()).map_err(|e| eprintln!("makepad live: the state this run was started with is lost: {e}")).ok().map(|p| p.into_os_string()),
-        None => crate::run_end::run_input("MAKEPAD_RUN_RESTORE").filter(|p| std::path::Path::new(p).exists()),
+        Some(text) => restart_state_file(text.as_bytes()).map_err(|e| eprintln!("relax live: the state this run was started with is lost: {e}")).ok().map(|p| p.into_os_string()),
+        None => crate::run_end::run_input("RELAX_RESTORE").filter(|p| std::path::Path::new(p).exists()),
     };
     if slot.1.is_some() {
-        eprintln!("makepad live: the state this run was started with goes to the next run");
+        eprintln!("relax live: the state this run was started with goes to the next run");
     }
 }
 
-/// The app's state for the next run (MAKEPAD_RUN_RESTORE), in a file of its own, which that run
+/// The app's state for the next run (RELAX_RESTORE), in a file of its own, which that run
 /// removes when it reads it: made new in this user's own directory (makepad_remote's socket dir),
 /// so no other user can read it, put it there first or point it elsewhere.
 pub(crate) fn restart_state_file(st: &[u8]) -> Result<std::path::PathBuf, String> {
@@ -7999,14 +8002,14 @@ fn a_restarts_state_file_is_made_new_never_through_a_link() {
 fn a_run_ended_in_its_boot_hands_on_the_state_it_was_started_with() {
     isolated_test!(a_run_ended_in_its_boot_hands_on_the_state_it_was_started_with);
     *DOMAIN_RESTORED.lock().unwrap_or_else(|e| e.into_inner()) = Some("tick 41".into());
-    let mut next = vec![("MAKEPAD_JIT_RECOVERY", None), ("MAKEPAD_RUN_RESTORE", None)];
+    let mut next = vec![("MAKEPAD_JIT_RECOVERY", None), ("RELAX_RESTORE", None)];
     carry_restore(&mut next);
     let carried = next[1].1.clone().expect("the state the run was started with goes on");
     assert_eq!(std::fs::read_to_string(&carried).unwrap(), "tick 41");
     assert_eq!(next[0].1, None, "only the state is handed on");
     std::fs::remove_file(&carried).unwrap();
     let own = std::ffi::OsString::from("its own state");
-    let mut next = vec![("MAKEPAD_RUN_RESTORE", Some(own.clone()))];
+    let mut next = vec![("RELAX_RESTORE", Some(own.clone()))];
     carry_restore(&mut next);
     assert_eq!(next[0].1, Some(own), "a restart with a state of its own hands that on");
 }
@@ -8017,7 +8020,7 @@ fn a_run_ended_in_its_boot_hands_on_the_state_it_was_started_with() {
 fn exec_restart(state: Option<&[u8]>) -> Result<(), String> {
     #[cfg(any(unix, windows))]
     {
-        let exe = host::loader().ok_or("the makepad binary's path is unknown")?;
+        let exe = host::loader().ok_or_else(|| format!("the {tool} binary's path is unknown", tool = crate::tool_name()))?;
         let mut cmd = std::process::Command::new(exe);
         cmd.args(crate::harness::live::restart_args(std::env::args_os().skip(1).collect()));
         // the process as this run was started: what it set for its program (its target's cargo
@@ -8042,7 +8045,7 @@ fn exec_restart(state: Option<&[u8]>) -> Result<(), String> {
         // a restart is a clean end of this process (its transcript is not kept)
         crate::tui::exit_code(0);
         crate::tui::finish(false);
-        eprintln!("makepad live: restarting ({})", RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()));
+        eprintln!("relax live: restarting ({})", RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()));
         #[cfg(unix)]
         let e = std::os::unix::process::CommandExt::exec(&mut cmd);
         #[cfg(windows)]
@@ -8060,7 +8063,7 @@ fn exec_restart(state: Option<&[u8]>) -> Result<(), String> {
 /// on it asks for it), and in the live log for the WM's toast (devhub follows it).
 pub(crate) fn offer_restart(why: &str) {
     note_restart_pending(why);
-    eprintln!("makepad live: {why}: a restart applies it; offered (Update ready on the JIT ring, the WM's toast, or `makepad inspect <app> session relaunch`); the app keeps running meanwhile");
+    eprintln!("relax live: {why}: a restart applies it; offered (Update ready on the JIT ring, the WM's toast, or `{tool} inspect <app> session relaunch`); the app keeps running meanwhile", tool = crate::tool_name());
     live_log(&format!("{{\"event\":\"restart_offered\",\"pid\":{},\"why\":{}}}", std::process::id(), json_str(why)));
 }
 
@@ -8075,7 +8078,7 @@ pub fn offer_restart_after_crash() {
     let why = CRASHED_SOURCES_CHANGED;
     if RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p.0 == why) { return; }
     note_restart_pending(why);
-    eprintln!("makepad live: {why}: Restart runs them; offered (the run window's Restart, the WM's toast, or `makepad inspect <app> session relaunch`)");
+    eprintln!("relax live: {why}: Restart runs them; offered (the run window's Restart, the WM's toast, or `{tool} inspect <app> session relaunch`)", tool = crate::tool_name());
     live_log(&format!("{{\"event\":\"restart_offered\",\"pid\":{},\"why\":{}}}", std::process::id(), json_str(why)));
 }
 
@@ -8098,12 +8101,12 @@ fn note_restart_pending(why: &str) {
 /// `who` asked, said in the log with every request: a click in the run window, or the inspect
 /// client's process ([`inspect_asker`]). A restart nobody could name read as the person's own
 /// click (Scope, Fab and Story restarted for a landing, 11-06).
-pub fn relaunch_pending(who: &str) -> Result<&'static str, String> {
+pub fn relaunch_pending(who: &str) -> Result<String, String> {
     RELAUNCH_ASKED.store(true, Ordering::SeqCst);
     let why = restart_pending().join("; ");
     eprintln!("{}", relaunch_line(who, &why, host::restart_asked()));
     if let Some(result) = host::relaunch() { return result; }
-    restart_in_place(if why.is_empty() { "session relaunch".into() } else { why })
+    restart_in_place(if why.is_empty() { "session relaunch".into() } else { why }).map(str::to_string)
 }
 
 /// The log's line of a `session relaunch` that `who` asked for, `why` the edits it applies (a
@@ -8111,9 +8114,9 @@ pub fn relaunch_pending(who: &str) -> Result<&'static str, String> {
 fn relaunch_line(who: &str, why: &str, again: bool) -> String {
     let what = if why.is_empty() { "nothing waits" } else { why };
     if again {
-        format!("makepad live: session relaunch, asked by {who} again: the restart is on its way ({what})")
+        format!("relax live: session relaunch, asked by {who} again: the restart is on its way ({what})")
     } else {
-        format!("makepad live: session relaunch, asked by {who}: {what}")
+        format!("relax live: session relaunch, asked by {who}: {what}")
     }
 }
 
@@ -8257,7 +8260,7 @@ fn provided_lacks(prog: &Program, errs: &[String]) -> Option<Vec<String>> {
                 lacked.iter().find(|(n, _)| *n == name)?.1.clone()
             }
         };
-        Some(format!("{e} -- `{krate}` is built into makepad, and this one lacks it: needs the rebuilt makepad: restart to apply"))
+        Some(format!("{e} -- `{krate}` is built into {tool}, and this one lacks it: needs the rebuilt {tool}: restart to apply", tool = crate::tool_name()))
     }).collect()
 }
 
@@ -8288,16 +8291,16 @@ fn refusal_lines(first: Vec<String>, retry: Vec<String>) -> Vec<String> {
 
 /// The session log: one JSON line per edit (rung, reasons, phase latencies) and per restart
 /// outcome (the program's kept/lost report, through std::relax::live_log), appended across the
-/// restarts of one session (the path travels in MAKEPAD_RUN_LIVE_LOG; default: the temp dir).
+/// restarts of one session (the path travels in RELAX_LIVE_LOG; default: the temp dir).
 fn live_log_path() -> String {
-    if let Ok(p) = std::env::var("MAKEPAD_RUN_LIVE_LOG") {
+    if let Ok(p) = std::env::var("RELAX_LIVE_LOG") {
         if !p.is_empty() {
             return p;
         }
     }
-    let p = std::env::temp_dir().join(format!("makepad-run-live-{}.jsonl", std::process::id())).to_string_lossy().into_owned();
+    let p = std::env::temp_dir().join(format!("relax-live-{}.jsonl", std::process::id())).to_string_lossy().into_owned();
     // exec'd restarts inherit it: one session, one log
-    std::env::set_var("MAKEPAD_RUN_LIVE_LOG", &p);
+    std::env::set_var("RELAX_LIVE_LOG", &p);
     p
 }
 
@@ -8408,7 +8411,7 @@ pub(crate) fn session_summary() -> Option<String> {
         inplace[((inplace.len() as f64 - 1.0) * p).round() as usize]
     };
     Some(format!(
-        "makepad live: session: {} edit(s): {} in place ({:.0}%), {} restart, {} refused; in-place save->applied p50 {:.0} ms, p95 {:.0} ms; log {}",
+        "relax live: session: {} edit(s): {} in place ({:.0}%), {} restart, {} refused; in-place save->applied p50 {:.0} ms, p95 {:.0} ms; log {}",
         n,
         count("patch") + count("unchanged") + count("partial"),
         100.0 * (count("patch") + count("unchanged") + count("partial")) as f64 / n as f64,
@@ -8597,13 +8600,13 @@ unsafe fn drain_streams(up: *mut Unit) {
                     let mut o = idle_outcome(Some(file), &error);
                     o.rung = Rung::Refuse;
                     log_edit(&path, &o, None, seen);
-                    eprintln!("makepad live: {}", error);
+                    eprintln!("relax live: {}", error);
                 } else if let Some(src) = composed {
                     let o = apply_mode(up, vec![Edit { file, path: path.clone(), src }], &[], 0, matches!(target, StreamTarget::Module(_)));
                     record_stream(up, target, &o);
                     if o.rung != Rung::Patch {
                         log_edit(&path, &o, None, seen);
-                        for line in &o.lines { eprintln!("makepad live: {}: {}", path, line); }
+                        for line in &o.lines { eprintln!("relax live: {}: {}", path, line); }
                     }
                 }
             }
@@ -8635,7 +8638,7 @@ pub extern "C" fn __relax_live_stream(p: *const u8, n: usize, t: *const u8, len:
 /// std's, not registry/git dependencies) and applies each settled save as one transaction.
 /// Body-class patches are type-safe to install while the program runs (hotreload.md §9.2), so
 /// they apply at once; other edits print their rung and reason. Every outcome is one line on
-/// stderr ("makepad live: ...").
+/// stderr ("relax live: ...").
 #[path = "reload_inputs.rs"]
 mod inputs;
 #[path = "reload_git.rs"]
@@ -8661,7 +8664,7 @@ pub fn start_watcher(up: *mut Unit, inputs: Inputs) {
                 if let Err(e) = r {
                     let why = e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_default();
                     let why = format!("the live watcher panicked: {why}{}", jit::take_ice_location());
-                    eprintln!("makepad live: {why}");
+                    eprintln!("relax live: {why}");
                     recover_hot_failure(makepad_remote::hot::Outcome::Panic, &[why], None);
                     if !await_recovery() || crate::hot_failure::has_error() { break; }
                 } else {
@@ -8732,7 +8735,7 @@ pub(crate) fn input_paths(keep: &dyn Fn(&str) -> bool) -> Result<Vec<String>, St
     drop(g);
     // (and what its code included: the watcher patches those files' includers, so a save of one
     // is an edit the process reads)
-    let std_dir = std::env::var("MAKEPAD_RUN_STD").unwrap_or_default();
+    let std_dir = std::env::var("RELAX_STD").unwrap_or_default();
     let included = included_files(&std_dir).into_iter().filter(|p| keep(p));
     Ok(inputs.source_paths(loaded.iter().filter(|p| keep(p)).cloned().chain(included), keep))
 }
@@ -8741,15 +8744,61 @@ pub(crate) fn input_paths(keep: &dyn Fn(&str) -> bool) -> Result<Vec<String>, St
 pub(crate) fn outside_packages<'a>(asked: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
     let g = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(v) = g.as_ref() else { return Vec::new() };
-    let std_dir = std::env::var("MAKEPAD_RUN_STD").unwrap_or_default();
+    let std_dir = std::env::var("RELAX_STD").unwrap_or_default();
     asked.filter(|p| v.inputs.outside_packages(p, &std_dir)).collect()
+}
+
+/// What a live session's program looked at (std's fs_vfs `note`), on the disk or in a virtual
+/// folder, absolute and normalized: the files it opened for reading or probed, and the folders it
+/// listed.
+#[derive(Default)]
+struct ProgramReads {
+    paths: std::collections::HashSet<String>,
+    dirs: std::collections::HashSet<String>,
+}
+
+static PROGRAM_READS: relax_session::sync::Mutex<Option<ProgramReads>> = relax_session::sync::Mutex::new(None);
+
+/// std's fs_vfs `note`: `kind` b'f' a file opened for reading, b'p' a path probed, b'd' a folder
+/// listed; the path as the program gave it (a relative one is its current folder's). Only a live
+/// session keeps it, once per path: a data file its tests read is part of their verdict wherever it
+/// lies (`read_by_program`). One relaxed load otherwise.
+pub(crate) extern "C" fn relax_vfs_note(p: *const u8, n: usize, kind: u32) {
+    if !crate::layout::LIVE_SESSION.load(Ordering::Relaxed) || p.is_null() {
+        return;
+    }
+    // process state: built in the kept heap
+    let _k = crate::zone_alloc::kept();
+    let given = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, n) });
+    let abs = if std::path::Path::new(&*given).is_absolute() {
+        given.into_owned()
+    } else {
+        let Ok(cwd) = std::env::current_dir() else { return };
+        cwd.join(&*given).to_string_lossy().into_owned()
+    };
+    let path = crate::vfs::normalize_path(&abs);
+    let mut g = PROGRAM_READS.lock().unwrap();
+    let r = g.get_or_insert_with(ProgramReads::default);
+    if kind == b'd' as u32 { r.dirs.insert(path); } else { r.paths.insert(path); }
+}
+
+/// Of `asked` (workspace-relative paths), those the program opened or probed, or whose folder it
+/// listed (a fixture added to a folder it reads): `at(absolute, relative)` says whether the one is
+/// the other. A file in no package of the graph that is one of them still changes what its tests see.
+pub(crate) fn read_by_program<'a>(asked: impl Iterator<Item = &'a str>, at: &dyn Fn(&str, &str) -> bool) -> Vec<&'a str> {
+    let g = PROGRAM_READS.lock().unwrap();
+    let Some(r) = g.as_ref() else { return Vec::new() };
+    asked.filter(|a| {
+        let rel = a.trim_start_matches("../");
+        r.paths.iter().any(|p| at(p, rel)) || rel.rsplit_once('/').is_some_and(|(dir, _)| r.dirs.iter().any(|p| at(p, dir)))
+    }).collect()
 }
 
 static STD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// A source file a live session watches and patches (`own_source`).
 pub(crate) fn own_source_file(prog: &crate::program::Program, file: u32) -> bool {
-    let std_dir = STD.get_or_init(|| std::env::var("MAKEPAD_RUN_STD").unwrap_or_default());
+    let std_dir = STD.get_or_init(|| std::env::var("RELAX_STD").unwrap_or_default());
     prog.file_paths.get(file as usize).is_some_and(|p| own_source(p, std_dir))
 }
 
@@ -8792,7 +8841,7 @@ impl WatchCost {
         if self.since.elapsed() >= std::time::Duration::from_secs(60) {
             if self.wakes > 1 {
                 let why: Vec<String> = self.why.iter().zip(Self::WHY).filter(|(n, _)| **n > 0).map(|(n, w)| format!("{w} {n}")).collect();
-                eprintln!("makepad live: watch cost: {} wakeup(s), {} round(s) looked at {} file(s) in {:.0} s ({})", self.wakes, self.rounds, self.stats, self.since.elapsed().as_secs_f64(), why.join(", "));
+                eprintln!("relax live: watch cost: {} wakeup(s), {} round(s) looked at {} file(s) in {:.0} s ({})", self.wakes, self.rounds, self.stats, self.since.elapsed().as_secs_f64(), why.join(", "));
             }
             *self = WatchCost::new();
         }
@@ -8867,7 +8916,7 @@ fn committed_by_ledger<'a>(mut paths: impl Iterator<Item = &'a str>) -> bool {
 fn gate_note(g: u8) {
     static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
     if LAST.swap(g, Ordering::Relaxed) != g && live_trace() {
-        eprintln!("makepad live: watcher gate {} at t={:.0} ms", ["open", "domain loading", "no first present", "restart required"][g as usize], crate::clock::ms_since_start());
+        eprintln!("relax live: watcher gate {} at t={:.0} ms", ["open", "domain loading", "no first present", "restart required"][g as usize], crate::clock::ms_since_start());
     }
 }
 
@@ -8947,6 +8996,59 @@ impl Ledger {
 /// Stillness, not an overall deadline: a busy checkout can take as long as it needs. Also the
 /// stat poll of a watch without native file events.
 const LIVE_QUIET: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// A save's wait for the tree to settle (its quiet window, and the rounds an `again` adds): said
+/// once it is a second long, naming what moved then, and again when it ends. It has no end of
+/// its own (a slow writer is waited for); silent, a save held back by a lock or by a watched
+/// folder something keeps writing in looked like one the session ignored (relax#33).
+struct SettleWait {
+    since: Instant,
+    /// the first change seen: a lock made since can be this save's writer's (git::Snapshot::holding)
+    save: std::time::SystemTime,
+    /// the saved file(s), for the lines
+    file: String,
+    said: bool,
+}
+
+impl SettleWait {
+    fn new(file: String) -> SettleWait {
+        SettleWait { since: Instant::now(), save: std::time::SystemTime::now(), file, said: false }
+    }
+
+    /// `what` moved (or holds the tree): said once the wait is a second long, naming the saved
+    /// files as they are then (`file`, None: as at the start)
+    fn moved(&mut self, what: &str, file: impl FnOnce() -> Option<String>) {
+        if !self.said && self.since.elapsed() >= std::time::Duration::from_secs(1) {
+            self.said = true;
+            if let Some(file) = file() { self.file = file; }
+            eprintln!("relax live: {}: waits for the tree to settle ({what})", self.file);
+        }
+    }
+}
+
+/// What a settle wait's lines name: the program's files among `changed`, else what changed. A
+/// source folder's stamp moves with its files, and before them when a writer first makes a
+/// temporary file there, so a wait that began with the folder names the file once it is saved.
+fn wait_name(changed: &[usize], files: &[(String, u32, Option<(std::time::SystemTime, u64)>)]) -> Option<String> {
+    let loaded: Vec<usize> = changed.iter().copied().filter(|&k| files[k].1 != u32::MAX).collect();
+    let named: &[usize] = if loaded.is_empty() { changed } else { &loaded };
+    let first = files.get(*named.first()?)?.0.as_str();
+    Some(if named.len() > 1 { format!("{first} (and {} more)", named.len() - 1) } else { first.to_string() })
+}
+
+impl Drop for SettleWait {
+    fn drop(&mut self) {
+        if self.said { eprintln!("relax live: {}: the tree settled after {:.1} s", self.file, self.since.elapsed().as_secs_f64()); }
+    }
+}
+
+/// The first watched file whose stamp differs between two looks ("<path> moved"); one the watch
+/// added since names the last file
+fn moved_file(files: &[(String, u32, Option<(std::time::SystemTime, u64)>)], now: &[Option<(std::time::SystemTime, u64)>], before: &[Option<(std::time::SystemTime, u64)>]) -> Option<String> {
+    if now == before { return None; }
+    let k = now.iter().zip(before).position(|(a, b)| a != b).unwrap_or(now.len().saturating_sub(1));
+    files.get(k).map(|f| format!("{} moved", f.0))
+}
 /// How often a watcher whose startup scan waits for the first frames to pass looks again.
 const STARTUP_SCAN_LOOK: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -8955,7 +9057,7 @@ unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &
     use crate::harness::live;
     let what = paths.join(", ");
     let mut edit = live::Edit { paths, group: o.group, compile_ms: Some(o.ms[2]), restarted: false, changed: o.test_changes.clone(), patch: Some((o.changed, o.names.len())) };
-    for line in &o.lines { eprintln!("makepad live:   {line}"); }
+    for line in &o.lines { eprintln!("relax live:   {line}"); }
     if o.rung != Rung::Patch {
         patch_refused_event(&what, o.rung == Rung::Refuse, &o.lines);
         if o.rung == Rung::Restart {
@@ -8964,13 +9066,13 @@ unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &
         }
         return Vec::new();
     }
-    eprintln!("makepad live: {what}: patched ({} item(s) changed, {} fn(s) installed) in {:.1} ms", o.changed, o.names.len(), o.ms.iter().sum::<f64>());
+    eprintln!("relax live: {what}: patched ({} item(s) changed, {} fn(s) installed) in {:.1} ms", o.changed, o.names.len(), o.ms.iter().sum::<f64>());
     // the warnings of the bodies it changed or added, as the test check reports them (those that
     // rest on every body -- dead code, unused imports -- wait for the next test check)
     let mut bodies = o.bodies.clone();
     if let Some(u) = &o.undo { bodies.extend(u.added.iter().copied()); }
     for l in crate::owner::call(crate::owner::Class::Program, || crate::check::live_lints(&(*up).prog, &(*up).tcx, &bodies)) {
-        eprintln!("makepad live:   {l}");
+        eprintln!("relax live:   {l}");
     }
     patch_landed(edit.paths.iter().cloned(), changed_items(up, o));
     let mut pending = Vec::new();
@@ -9003,7 +9105,7 @@ unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &
         crate::inspect::events::emit("patchreverted", &verdict_key(&what), &format!(
             "\"edit\":[{}],\"reverted\":true,\"groups\":{:?},\"fns\":[{}],\"error\":\"a fault in live test code\"",
             edit.paths.iter().map(|p| json_str(p)).collect::<Vec<_>>().join(","), groups, names.iter().map(|n| json_str(n)).collect::<Vec<_>>().join(",")));
-        eprintln!("makepad live: {what}: reverted patch groups {groups:?}; rerunning tests");
+        eprintln!("relax live: {what}: reverted patch groups {groups:?}; rerunning tests");
         edit.compile_ms = None;
         edit.changed = None;
     }
@@ -9015,7 +9117,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     crate::sip::on_late_new(watch_events::kick);
     inputs.add_runner();
     *LOADED_HEADS.lock().unwrap_or_else(|e| e.into_inner()) = inputs.heads.clone();
-    let std_dir = std::env::var("MAKEPAD_RUN_STD").unwrap_or_default();
+    let std_dir = std::env::var("RELAX_STD").unwrap_or_default();
     // (path, running file index, last stamp)
     // the program's own source files (not std, registry or git dependencies), loaded so far
     let own_files = |u: &Unit| -> Vec<(String, u32)> {
@@ -9056,16 +9158,22 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     let mut events = LiveWatch::new(files.iter().map(|f| f.0.as_str()));
     let mut repositories = git::Repositories::default();
     repositories.include(files.iter().map(|f| f.0.as_str()));
-    if crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) { eprintln!("makepad live: watching {} source files; session log {}", files.len(), live_log_path()); }
-    // the readiness signal for tools and tests, whatever the log verbosity: MAKEPAD_RUN_LIVE_READY=<file>
+    // the git identities as the tree last settled: a lock older than a save holds it only while
+    // its repository moved since (git::Snapshot::holding)
+    let mut settled_git = repositories.snapshot();
+    // a save's wait for the tree that an `again` re-queued: the next round goes on with it
+    let mut settle_wait: Option<SettleWait> = None;
+    let mut again_wait = false;
+    if crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) { eprintln!("relax live: watching {} source files; session log {}", files.len(), live_log_path()); }
+    // the readiness signal for tools and tests, whatever the log verbosity: RELAX_LIVE_READY=<file>
     // gets the watched file count once the watcher runs (edits saved from now on are seen)
-    if let Some(ready) = std::env::var_os("MAKEPAD_RUN_LIVE_READY") { let _ = std::fs::write(ready, format!("{}\n", files.len())); }
+    if let Some(ready) = std::env::var_os("RELAX_LIVE_READY") { let _ = std::fs::write(ready, format!("{}\n", files.len())); }
     let mut undos: Vec<Undo> = Vec::new();
     // SPEC-V: patches that ran before their verdict
     let mut pending: Vec<PendingPatch> = Vec::new();
     // with native file events a round runs only on an event or a kick: a watcher at rest makes no
     // system call. Without them a save is seen within 100 ms; one round is a stat per watched file
-    // (MAKEPAD_RUN_LIVE_TRACE=1 prints its cost once)
+    // (RELAX_LIVE_TRACE=1 prints its cost once)
     let mut traced = !live_trace();
     // the hot set (no native events): the program's own package (its root crate's directory) and
     // every file saved this session, polled every 5 ms (a few stats); every file every 100 ms
@@ -9139,7 +9247,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                     let now = look.stamp(&virt, k, &files[k].0);
                     if now != files[k].2 && held_saves.get(&k) != Some(&now) {
                         held_saves.insert(k, now);
-                        eprintln!("makepad live: {}: held: a failed edit's recovery (its restart) is under way; this edit applies once it ends", short(&files[k].0));
+                        eprintln!("relax live: {}: held: a failed edit's recovery (its restart) is under way; this edit applies once it ends", short(&files[k].0));
                     }
                 }
             }
@@ -9193,6 +9301,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             events = LiveWatch::new(files.iter().map(|f| f.0.as_str()));
             repositories = git::Repositories::default();
             repositories.include(files.iter().map(|f| f.0.as_str()));
+            settled_git = repositories.snapshot();
             hot.clear();
             stalled.clear();
             again = false;
@@ -9247,7 +9356,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 let message = format!("{}{}: restart pending ({restart_message}); this edit applies with it", names.join(", "), if changed.len() > 3 { ", ..." } else { "" });
                 // said where the session's output is read too: the event alone left a save without a
                 // line (relax#33)
-                eprintln!("makepad live: {message}");
+                eprintln!("relax live: {message}");
                 // (a live test session's restart would not apply it either: refused there)
                 patch_refused_event(&message, crate::harness::live::enabled(), std::slice::from_ref(&message));
                 for (k, current) in changed { files[k].2 = current; }
@@ -9277,7 +9386,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             late_seen = late;
             let t_own = Instant::now();
             let loaded = crate::owner::call(crate::owner::Class::Program, || own_files(&*up));
-            if live_trace() { eprintln!("makepad live: rewatch (loads {loads}, startup scan {rewatched}): own files in {:.1} ms at t={:.0} ms", t_own.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start()); }
+            if live_trace() { eprintln!("relax live: rewatch (loads {loads}, startup scan {rewatched}): own files in {:.1} ms at t={:.0} ms", t_own.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start()); }
             let known: std::collections::HashMap<_, _> = files.iter().enumerate().map(|(i, f)| (f.0.clone(), i)).collect();
             let mut added = Vec::new();
             for (path, file) in loaded {
@@ -9286,7 +9395,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             }
             let loaded_more = !added.is_empty();
             if loaded_more {
-                if jit::deferred_trace() { eprintln!("makepad live: watching {} more file(s) the post-boot loader loaded", added.len()); }
+                if jit::deferred_trace() { eprintln!("relax live: watching {} more file(s) the post-boot loader loaded", added.len()); }
                 for (p, i) in added { let st = stamp(&p); files.push((p, i, st)); }
             }
             set_watch_loaded(&files);
@@ -9298,7 +9407,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         }
         let t_dr = Instant::now();
         drain_streams(up);
-        if live_trace() && t_dr.elapsed().as_millis() > 20 { eprintln!("makepad live: drain_streams took {:.1} ms at t={:.0} ms", t_dr.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start()); }
+        if live_trace() && t_dr.elapsed().as_millis() > 20 { eprintln!("relax live: drain_streams took {:.1} ms at t={:.0} ms", t_dr.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start()); }
         if crate::hot_failure::recovering() { continue; }
         // The landing check: a patch whose old code is still running a while after the install
         // has not reached that call (a loop that never returns): the edit restarts the app.
@@ -9313,13 +9422,13 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 if live_trace() {
                     // a long wait names what the owner served meanwhile
                     let behind = if old.1.as_millis() >= 20 { format!("; behind {}", crate::owner::served_during(w0, w0 + old.1.as_nanos() as u64)) } else { String::new() };
-                    eprintln!("makepad live: landing check of patch group {gen} at t={:.0} ms: {:.1} ms ({:.1} ms waiting for the owner{behind})", crate::clock::ms_since_start(), t_land.elapsed().as_secs_f64() * 1e3, old.1.as_secs_f64() * 1e3);
+                    eprintln!("relax live: landing check of patch group {gen} at t={:.0} ms: {:.1} ms ({:.1} ms waiting for the owner{behind})", crate::clock::ms_since_start(), t_land.elapsed().as_secs_f64() * 1e3, old.1.as_secs_f64() * 1e3);
                 }
                 if let Some(name) = old.0 {
                     let lines = vec![format!("`{name}` still runs the code from before the edit: a call made before the patch has not returned (a loop) -- restart the app")];
                     log_edit(&what, &Outcome { failure: None, kept: 0, pending: false, rung: Rung::Restart, files: Vec::new(), lines: lines.clone(), names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), group: gen, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() }, None, Instant::now());
                     restart_for_edit(&what, &lines);
-                    for l in &lines { eprintln!("makepad live:   {}", l); }
+                    for l in &lines { eprintln!("relax live:   {}", l); }
                     patch_refused_event(&what, false, &lines);
                     landing.clear();
                     break;
@@ -9328,7 +9437,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         }
         let t_ev = Instant::now();
         let notifications = events.as_mut().and_then(|w| w.changed());
-        if t_ev.elapsed().as_millis() > 20 && live_trace() { eprintln!("makepad live: events drain took {:.1} ms", t_ev.elapsed().as_secs_f64() * 1e3); }
+        if t_ev.elapsed().as_millis() > 20 && live_trace() { eprintln!("relax live: events drain took {:.1} ms", t_ev.elapsed().as_secs_f64() * 1e3); }
         let lost = events.is_some() && notifications.is_none();
         let t_rewatch = Instant::now();
         if lost { events = LiveWatch::new(files.iter().map(|f| f.0.as_str())); }
@@ -9367,13 +9476,13 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // a round that looked at something: when it woke, what woke it and what it found (the
         // 5 ms polls while a verdict is pending look at nothing and print nothing)
         if live_trace() && scanned > 0 {
-            eprintln!("makepad live: watch round at t={:.0} ms: woke after {:.1} ms, round {:.1} ms after the wake; {}named {:?}, ledger {}, looked {scanned}, changed {}",
+            eprintln!("relax live: watch round at t={:.0} ms: woke after {:.1} ms, round {:.1} ms after the wake; {}named {:?}, ledger {}, looked {scanned}, changed {}",
                 crate::clock::ms_since_start(), woke.duration_since(t_wait).as_secs_f64() * 1e3, woke.elapsed().as_secs_f64() * 1e3,
                 if lost { format!("events lost (rewatched in {rewatch_ms:.1} ms), ") } else { String::new() }, named, if ledger.0 != ledger_was { "moved" } else { "still" }, changed.len());
         }
         if !traced && all {
             traced = true;
-            eprintln!("makepad live: one watch round: {} files in {:.2} ms; hot set {} files", files.len(), t_round.elapsed().as_secs_f64() * 1e3, hot.len());
+            eprintln!("relax live: one watch round: {} files in {:.2} ms; hot set {} files", files.len(), t_round.elapsed().as_secs_f64() * 1e3, hot.len());
         }
         // a held landing's files wait (`hold_landing`); the person's saves go on
         changed.retain(|&k| !held_back(&files[k].0, false));
@@ -9393,7 +9502,14 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             continue;
         }
         let seen = std::time::Instant::now();
-        if live_trace() { eprintln!("makepad live: a change seen at t={:.0} ms ({} file(s))", crate::clock::ms_since_start(), changed.len()); }
+        let mut wait = match settle_wait.take() {
+            Some(w) if std::mem::take(&mut again_wait) => w,
+            _ => {
+                again_wait = false;
+                SettleWait::new(wait_name(&changed, &files).unwrap_or_default())
+            }
+        };
+        if live_trace() { eprintln!("relax live: a change seen at t={:.0} ms ({} file(s))", crate::clock::ms_since_start(), changed.len()); }
         // from the save on, the post-boot loader keeps off the unit (the read below
         // compares with the running text on it)
         for &k in &changed {
@@ -9457,10 +9573,13 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             changed.sort_unstable();
             changed.dedup();
             let next_git = repositories.snapshot();
-            let moving = now != last || next_git != git_state || next_git.busy;
+            let moved = moved_file(&files, &now, &last)
+                .or_else(|| next_git.moved_from(&git_state).map(|p| format!("{} moved", p.display())))
+                .or_else(|| next_git.holding(wait.save, &settled_git).map(|p| format!("{} is there", p.display())));
             last = now;
             git_state = next_git;
-            if moving {
+            if let Some(what) = moved {
+                wait.moved(&what, || wait_name(&changed, &files));
                 quiet_retry = false;
                 still_since = Instant::now();
             } else if committed || still_since.elapsed() >= LIVE_QUIET {
@@ -9468,6 +9587,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             }
             committed = false;
         }
+        settled_git = git_state.clone();
         // a wait above may have taken a wakeup meant for the loop's own (a streamed edit, a
         // retry, a domain's inputs): one more round sees what it was for
         if waited { watch_events::kick(); }
@@ -9481,7 +9601,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // its own resolved graph moved; else there is nothing to rebuild or restart.
         let manifests: Vec<usize> = changed.iter().copied().filter(|&k| inputs.is_manifest(&files[k].0)).collect();
         if !manifests.is_empty() && !inputs.graph_moved(&(*up).prog.session) {
-            eprintln!("makepad live: {} manifest(s) changed, this app's Cargo graph did not", manifests.len());
+            eprintln!("relax live: {} manifest(s) changed, this app's Cargo graph did not", manifests.len());
             for &k in &manifests { files[k].2 = settled_stamps[k]; }
             changed.retain(|k| !manifests.contains(k));
             if changed.is_empty() {
@@ -9506,11 +9626,11 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             if !host_side.is_empty() {
                 let short = |p: &str| -> String { let v: Vec<&str> = p.rsplit('/').take(2).collect(); v.into_iter().rev().collect::<Vec<_>>().join("/") };
                 let names: Vec<String> = host_side.iter().take(3).map(|&k| short(&files[k].0)).collect();
-                let why = format!("{} makepad input(s) changed ({}{}): {}", host_side.len(), names.join(", "), if host_side.len() > 3 { ", ..." } else { "" },
-                    inputs.restart_reason(host_side.iter().map(|&k| files[k].0.as_str())).unwrap_or("its sources changed"));
+                let why = format!("{} {tool} input(s) changed ({}{}): {}", host_side.len(), names.join(", "), if host_side.len() > 3 { ", ..." } else { "" },
+                    inputs.restart_reason(host_side.iter().map(|&k| files[k].0.as_str())).unwrap_or("its sources changed"), tool = crate::tool_name());
                 if let Err(e) = host::request(why.clone(), inputs.process_paths(&|_| true)) {
-                    let message = format!("{why}; cannot rebuild makepad here ({e}); the app goes on with the makepad it runs");
-                    eprintln!("makepad live: {message}");
+                    let message = format!("{why}; cannot rebuild {tool} here ({e}); the app goes on with the {tool} it runs", tool = crate::tool_name());
+                    eprintln!("relax live: {message}");
                     live_log(&format!("{{\"event\":\"host_rebuild\",\"ok\":false,\"message\":{}}}", json_str(&message)));
                 }
                 for &k in &host_side { files[k].2 = settled_stamps[k]; }
@@ -9583,24 +9703,24 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                     for &k in &host_side { files[k].2 = settled_stamps[k]; }
                     true
                 }
-                Err(e) => { eprintln!("makepad live: cannot rebuild and restart makepad here: {e}"); false }
+                Err(e) => { eprintln!("relax live: cannot rebuild and restart {tool} here: {e}", tool = crate::tool_name()); false }
             };
             if offered {
                 if rest.is_empty() { continue; }
                 changed = rest;
             } else {
-                let package = std::env::var("MAKEPAD_RUN_PACKAGE").unwrap_or_else(|_| "<pkg>".into());
+                let package = std::env::var("RELAX_PACKAGE").unwrap_or_else(|_| "<pkg>".into());
                 let what = if changed.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };
                 // provided crates and std are built into this binary: cargo rebuilds it on the way
                 let restart = if inputs.host_restart_required(changed.iter().map(|&k| files[k].0.as_str())) {
                     host::note_cannot_build();
-                    format!("needs a JIT rebuild: restart it through cargo (which rebuilds makepad): {}", crate::srchash::rebuild_command(&std::env::args().skip(1).collect::<Vec<_>>()))
+                    format!("needs a JIT rebuild: restart it through cargo (which rebuilds {tool}): {}", crate::srchash::rebuild_command(&std::env::args().skip(1).collect::<Vec<_>>()), tool = crate::tool_name())
                 } else {
-                    format!("restart `makepad run {package}`")
+                    format!("restart `{tool} run {package}`", tool = crate::tool_name())
                 };
-                let message = format!("{} {what} changed: {reason}; {restart} (or `makepad inspect <app> session relaunch`) to pick them up; keeping the running code", changed.len());
+                let message = format!("{} {what} changed: {reason}; {restart} (or `{tool} inspect <app> session relaunch`) to pick them up; keeping the running code", changed.len(), tool = crate::tool_name());
                 note_restart_pending(&message);
-                eprintln!("makepad live: {message}");
+                eprintln!("relax live: {message}");
                 live_log(&format!("{{\"restart_required\":true,\"message\":{}}}", json_str(&message)));
                 // The edit's one verdict, at once. A live test session cannot restart into it (the
                 // restarted tests would run this binary again): there it is refused.
@@ -9614,7 +9734,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let _reloading = jit::Reloading::begin();
         let macro_changes: Vec<_> = changed.iter().map(|&k| (files[k].0.as_str(), None)).collect();
         if let Err(error) = crate::native_macros::reload(&macro_changes, (&(*up).prog.session).runtime.profile) {
-            eprintln!("makepad live: {error}");
+            eprintln!("relax live: {error}");
             live_log(&error);
             if !synced && !crate::harness::live::enabled() {
                 patch_refused_event(&error, true, std::slice::from_ref(&error));
@@ -9705,8 +9825,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             let what = what.join(", ");
             let o = Outcome { failure: None, kept: 0, pending: false, rung: Rung::Refuse, files: Vec::new(), lines: undeclared.clone(), names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), group: 0, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() };
             log_edit(&what, &o, saved, seen);
-            eprintln!("makepad live: {}: NOT applied (errors below); the app runs the previous code", what);
-            for l in &undeclared { eprintln!("makepad live:   {}", l); }
+            eprintln!("relax live: {}: NOT applied (errors below); the app runs the previous code", what);
+            for l in &undeclared { eprintln!("relax live:   {}", l); }
             patch_refused_event(&what, true, &undeclared);
             continue;
         }
@@ -9743,7 +9863,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 for (old, new) in back { for f in &mut files { if f.1 == new { f.1 = old; } } }
                 continue;
             }
-            eprintln!("makepad live: {}: patched (0 item(s) changed, 0 fn(s) installed) in 0.0 ms", what.join(", "));
+            eprintln!("relax live: {}: patched (0 item(s) changed, 0 fn(s) installed) in 0.0 ms", what.join(", "));
             patch_verified_event(&what.join(", "), 0, &[]);
             continue;
         }
@@ -9752,10 +9872,16 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // A writer may have resumed while we read. Keep these texts pending and
         // collect its next batch before compiling or requesting a recovery.
         let look = Look::new();
-        if files.iter().enumerate().map(|(k, f)| look.stamp(&virt, k, &f.0)).ne(settled_stamps.iter().copied()) || repositories.snapshot() != git_state {
+        let now: Vec<_> = files.iter().enumerate().map(|(k, f)| look.stamp(&virt, k, &f.0)).collect();
+        let next_git = repositories.snapshot();
+        if let Some(what) = moved_file(&files, &now, &settled_stamps).or_else(|| next_git.moved_from(&git_state).map(|p| format!("{} moved", p.display()))) {
+            wait.moved(&what, || wait_name(&changed, &files));
+            settle_wait = Some(wait);
             again = true;
+            again_wait = true;
             continue;
         }
+        drop(wait);
         trace_input(watch_ms, (read_started - seen).as_secs_f64() * 1000., ms(read_started), scanned);
         let mut o = apply_update(up, edits);
         let only_previous_errors = !o.lines.is_empty() && o.lines.iter().all(|l| l.ends_with("type checking failed due to previous errors"));
@@ -9780,8 +9906,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 failure = Some(makepad_remote::hot::Outcome::Refused);
             }
             log_edit(&what, &o, saved, seen);
-            eprintln!("makepad live: {}: NOT applied (errors below); the app runs the previous code", what);
-            for l in &o.lines { eprintln!("makepad live:   {}", l); }
+            eprintln!("relax live: {}: NOT applied (errors below); the app runs the previous code", what);
+            for l in &o.lines { eprintln!("relax live:   {}", l); }
             patch_refused_event(&what, true, &o.lines);
             // An unchanged tree compiles the same verdict again: a failure of makepad itself
             // recovers now, the edit's own errors wait for the tree's next change. A tree that
@@ -9841,13 +9967,13 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         }
         match o.rung {
             Rung::Patch => eprintln!(
-                "makepad live: {}: patched ({} item(s) changed, {} fn(s) installed) in {:.1} ms",
+                "relax live: {}: patched ({} item(s) changed, {} fn(s) installed) in {:.1} ms",
                 what,
                 o.changed,
                 o.names.len(),
                 o.ms.iter().sum::<f64>()
             ),
-            Rung::Refuse => eprintln!("makepad live: {}: NOT applied (errors below); the app runs the previous code", what),
+            Rung::Refuse => eprintln!("relax live: {}: NOT applied (errors below); the app runs the previous code", what),
             // an edit the patcher cannot absorb: makepad restarts for real (the app is asked at its
             // next safe point and keeps its state); it runs the previous code until then
             Rung::Restart => restart_for_edit(&what, &o.lines),
@@ -9858,7 +9984,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             restart_for_edit(&what, &held);
         }
         for l in &o.lines {
-            eprintln!("makepad live:   {}", l);
+            eprintln!("relax live:   {}", l);
         }
         if o.rung != Rung::Patch {
             patch_refused_event(&what, o.rung == Rung::Refuse, &o.lines);
@@ -9900,17 +10026,17 @@ mod round32_tests {
 
     #[test]
     fn enum_reload_snapshots() {
-        const CHILD: &str = "MAKEPAD_RUN_ENUM_RELOAD_CASE";
+        const CHILD: &str = "RELAX_ENUM_RELOAD_CASE";
         let Ok(case) = std::env::var(CHILD) else {
             for case in ["same", "changed", "order", "removed", "reordered", "added", "larger", "named", "executable", "callee", "named_code", "unrelated"] {
                 let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "reload::round32_tests::enum_reload_snapshots", "--nocapture", "--test-threads=1"])
-                    .env(CHILD, case).env("MAKEPAD_RUN_CTFE", "0").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0"));
+                    .env(CHILD, case).env("RELAX_CTFE", "0").env("RELAX_CACHE", "off").env("RELAX_GANDALF", "0"));
                 assert!(output.status.success(), "{case}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
             }
             return;
         };
-        std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
         crate::borrowck::lazy::disable_gandalf();
         let (old, new, accept) = match case.as_str() {
             "same" => ("enum E { A = 1, B }", "enum E { A = 1 + 0, B }", true),
@@ -9982,17 +10108,17 @@ mod use_edit_tests {
     /// takes its old bindings out: no E0252 against its own earlier binding, and the edit patches.
     #[test]
     fn editing_a_use_of_a_same_module_item_patches() {
-        const CHILD: &str = "MAKEPAD_RUN_USE_EDIT_CASE";
+        const CHILD: &str = "RELAX_USE_EDIT_CASE";
         let Ok(case) = std::env::var(CHILD) else {
             for case in ["enum_variants", "fn_rename", "use_in_closure", "closure_added"] {
                 let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "reload::use_edit_tests::editing_a_use_of_a_same_module_item_patches", "--nocapture", "--test-threads=1"])
-                    .env(CHILD, case).env("MAKEPAD_RUN_CTFE", "0").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0"));
+                    .env(CHILD, case).env("RELAX_CTFE", "0").env("RELAX_CACHE", "off").env("RELAX_GANDALF", "0"));
                 assert!(output.status.success(), "{case}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
             }
             return;
         };
-        std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
         crate::borrowck::lazy::disable_gandalf();
         let (old, new) = match case.as_str() {
             "enum_variants" => (
@@ -10053,7 +10179,7 @@ mod moved_type_tests {
     /// decoder moved to a crate of its own, 11-08): `read`, the fn's signature was asked before
     /// the edit; `built`, code for the fn exists. The edit's outcome and lines.
     fn move_type(name: &str, read: bool, built: bool) -> (Rung, Vec<String>) {
-        std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
         crate::borrowck::lazy::disable_gandalf();
         let old = "pub struct Pic { pub w: u32 }\npub fn width<'a>(p: &'a Pic) -> &'a u32 { &p.w }\nfn main() { let p = Pic { w: 1 }; let _ = *width(&p); }\n";
         let new = "mod decode { pub struct Pic { pub w: u32 } }\nuse decode::Pic;\npub fn width<'a>(p: &'a Pic) -> &'a u32 { &p.w }\nfn main() { let p = Pic { w: 2 }; let _ = *width(&p); }\n";
@@ -10181,9 +10307,9 @@ mod watch_wait_tests {
         let home = std::env::temp_dir().join(format!("relax-failed-edit-{}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("MAKEPAD_HOME", &home);
-        std::env::set_var("MAKEPAD_RUN_LIVE_LOG", home.join("live.jsonl"));
+        std::env::set_var("RELAX_LIVE_LOG", home.join("live.jsonl"));
         crate::hot_failure::enable();
-        let why = "internal compiler error applying the edit: test -- makepad run bug, report it".to_string();
+        let why = "internal compiler error applying the edit: test -- Relax bug, report it".to_string();
         recover_hot_failure(makepad_remote::hot::Outcome::Panic, std::slice::from_ref(&why), None);
         assert!(restart_pending().contains(&why), "the restart is offered: {:?}", restart_pending());
         assert!(!RESTART_CONFIRMED.load(Ordering::SeqCst), "nobody took the offer: no restart is under way");
@@ -10200,8 +10326,8 @@ mod watch_wait_tests {
     #[test]
     fn a_relaunch_says_who_asked() {
         let why = "the Splash VM changed";
-        assert_eq!(relaunch_line("a click on the ring's dot (Update ready)", why, false), "makepad live: session relaunch, asked by a click on the ring's dot (Update ready): the Splash VM changed");
-        assert_eq!(relaunch_line("the R key in the run window", "", true), "makepad live: session relaunch, asked by the R key in the run window again: the restart is on its way (nothing waits)");
+        assert_eq!(relaunch_line("a click on the ring's dot (Update ready)", why, false), "relax live: session relaunch, asked by a click on the ring's dot (Update ready): the Splash VM changed");
+        assert_eq!(relaunch_line("the R key in the run window", "", true), "relax live: session relaunch, asked by the R key in the run window again: the restart is on its way (nothing waits)");
         // no command is answered on this thread: its asker is not known
         assert_eq!(inspect_asker(), "an inspect client whose process its connection does not name");
     }
@@ -10219,7 +10345,7 @@ mod removed_module_tests {
     #[test]
     fn a_removed_module_file_its_parent_still_declares_is_refused() {
         isolated_test!(a_removed_module_file_its_parent_still_declares_is_refused);
-        std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
         let dir = std::env::temp_dir().join(format!("relax-removed-module-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("zz")).unwrap();
         std::fs::write(dir.join("main.rs"), "mod zz;\nmod leaf;\nfn main() { let _ = zz::f() + leaf::g(); }\n").unwrap();
@@ -10820,6 +10946,56 @@ mod ledger_tests {
         assert_eq!(ledger.round(at(2), false, None, &hot, &virt), [0], "no native events: the hot set's disk files");
         assert_eq!(ledger.round(at(3), false, None, &hot, &virt), [0, 1, 3], "no native events, the ledger moved: and every virtual file");
         assert_eq!(ledger.round(at(3), false, Some(vec![3]), &hot, &virt), [3], "a virtual file the watch named (an in-app edit leaves the ledger)");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod program_reads_tests {
+    use crate::reload_async_tests::{in_child, live_app};
+    use crate::value_tests::vfs_store;
+
+    const LOOK: &str = r#"pub fn look(out: &mut u64) {
+    let read = std::fs::read_to_string("../data/game.splash").map_or(0, |s| s.len() as u64);
+    let missing = std::fs::File::open("../data/missing.splash").is_err() as u64;
+    let listed = std::fs::read_dir("../levels").map_or(0, |d| d.count() as u64);
+    let probed = std::path::Path::new("../data/probe.txt").exists() as u64;
+    let virt = std::fs::read_to_string("/relax-program-reads/m/res/race.splash").map_or(0, |s| s.len() as u64);
+    let virt_listed = std::fs::read_dir("/relax-program-reads/m/res/levels").map_or(0, |d| d.count() as u64);
+    *out = virt_listed * 100_000 + virt * 10_000 + read * 1000 + missing * 100 + listed * 10 + probed;
+}
+"#;
+
+    /// What a live session's program reads is what its tests' verdict is about, wherever it lies
+    /// and whether the disk or a virtual folder (an overlay run's sources) serves it: a session's
+    /// `inputs` names the files it opened (found or not) or probed, and those in the folders it
+    /// listed, by paths relative to its current folder too. A data file in no package kept a stale
+    /// verdict when only sources counted (RACECARS game.splash, 11-12).
+    #[test]
+    fn a_live_programs_reads_are_what_its_verdict_covers() {
+        in_child("reload::program_reads_tests::a_live_programs_reads_are_what_its_verdict_covers", &["only"], |_| {
+            let dir = std::env::temp_dir().join(format!("relax-reload-{}-{}", "program-reads", std::process::id()));
+            let fixture = vfs_store::Fixture::new(&[("res/race.splash", b"12"), ("res/levels/one.splash", b"1")]);
+            crate::vfs::mount("/relax-program-reads/m", fixture.store.clone(), &fixture.commit).unwrap();
+            live_app("program-reads", &[("lib.rs", LOOK)], &["look"], |call, _| {
+                std::fs::create_dir_all(dir.join("data")).unwrap();
+                std::fs::create_dir_all(dir.join("levels")).unwrap();
+                std::fs::write(dir.join("data/game.splash"), "12345").unwrap();
+                std::fs::write(dir.join("data/other.splash"), "1").unwrap();
+                std::fs::write(dir.join("levels/one.splash"), "1").unwrap();
+                std::env::set_current_dir(dir.join("app")).unwrap();
+                assert_eq!(call("look"), 125_110, "the program read 2 virtual bytes and listed one virtual level, read 5 bytes, missed one file, listed one level and probed nothing there");
+                let asked = ["data/game.splash", "data/missing.splash", "levels/two.splash", "data/probe.txt", "data/other.splash", "app/src/lib.rs", "res/race.splash", "res/levels/two.splash"];
+                let read = super::read_by_program(asked.into_iter(), &crate::inspect::ends_with_rel);
+                assert!(read.contains(&"data/game.splash"), "a file read by a path relative to the program's folder: {read:?}");
+                assert!(read.contains(&"data/missing.splash"), "a file the program opened and did not find: {read:?}");
+                assert!(read.contains(&"levels/two.splash"), "a file new in a folder the program listed: {read:?}");
+                assert!(read.contains(&"data/probe.txt"), "a path the program probed: {read:?}");
+                assert!(!read.contains(&"data/other.splash"), "a file the program never looked at: {read:?}");
+                assert!(!read.contains(&"app/src/lib.rs"), "the compiler's reads of the sources are not the program's: {read:?}");
+                assert!(read.contains(&"res/race.splash"), "a file a virtual folder served: {read:?}");
+                assert!(read.contains(&"res/levels/two.splash"), "a file new in a virtual folder the program listed: {read:?}");
+            });
+        });
     }
 }
 

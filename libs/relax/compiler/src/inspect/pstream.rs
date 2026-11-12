@@ -259,7 +259,7 @@ pub fn push(kind: u8, label: &'static str, a: u64, b: u64) {
     }
 }
 
-/// MAKEPAD_RUN_FLIGHTREC_ELIDE_US: the short-span threshold (0: keep every span).
+/// RELAX_FLIGHTREC_ELIDE_US: the short-span threshold (0: keep every span).
 pub(super) fn set_elide_us(us: u64) {
     ELIDE_NS.store(us * 1000, Relaxed);
 }

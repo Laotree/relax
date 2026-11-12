@@ -1,5 +1,5 @@
-//! The macOS futex backend choice: os_sync when the OS has it, ulock with MAKEPAD_RUN_FORCE_ULOCK=1.
-//! Run twice (os_diff.sh does): plain, and with MAKEPAD_RUN_FORCE_ULOCK=1 FUTEX_EXPECT=ulock.
+//! The macOS futex backend choice: os_sync when the OS has it, ulock with RELAX_FORCE_ULOCK=1.
+//! Run twice (os_diff.sh does): plain, and with RELAX_FORCE_ULOCK=1 FUTEX_EXPECT=ulock.
 #![cfg(target_os = "macos")]
 extern crate relax_std_os_check as hrs;
 

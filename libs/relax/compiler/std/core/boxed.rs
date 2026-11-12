@@ -129,6 +129,20 @@ impl<T, const N: usize> crate::convert::TryFrom<Box<[T]>> for Box<[T; N]> {
     }
 }
 
+/// `Vec<T>` of exactly N elements as `Box<[T; N]>` (its boxed slice: in place when its capacity is
+/// N, moved into one of N otherwise), else the Vec back as it was (alloc/src/boxed.rs).
+impl<T, const N: usize> crate::convert::TryFrom<Vec<T>> for Box<[T; N]> {
+    type Error = Vec<T>;
+    fn try_from(vec: Vec<T>) -> Result<Box<[T; N]>, Vec<T>> {
+        if vec.len() == N {
+            let b = vec.into_boxed_slice();
+            Ok(unsafe { Box::from_raw(Box::into_raw(b) as *mut T as *mut [T; N]) })
+        } else {
+            Err(vec)
+        }
+    }
+}
+
 unsafe impl<#[may_dangle] T: ?Sized> Drop for Box<T> {
     fn drop(&mut self) {
         unsafe {

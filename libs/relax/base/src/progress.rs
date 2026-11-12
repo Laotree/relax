@@ -69,8 +69,8 @@ pub fn progress(label: &str, done: u64, total: Option<u64>) {
         report("progress", &format!("{done} {} {label}", total_text(total)));
     } else {
         match total {
-            Some(t) if t > 0 => eprintln!("makepad: {label}: {} %", done.min(t) * 100 / t),
-            _ => eprintln!("makepad: {label}: {} MB", done >> 20),
+            Some(t) if t > 0 => eprintln!("relax: {label}: {} %", done.min(t) * 100 / t),
+            _ => eprintln!("relax: {label}: {} MB", done >> 20),
         }
     }
 }
@@ -79,7 +79,7 @@ pub fn progress(label: &str, done: u64, total: Option<u64>) {
 /// remote could not be reached): the launcher's report as `note`, and a stderr line.
 pub fn note(text: &str) {
     let text: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
-    eprintln!("makepad: {text}");
+    eprintln!("relax: {text}");
     if let Some(report) = REPORT.get().copied() {
         report("note", &text);
     }

@@ -238,7 +238,7 @@ impl Cache {
             if stop() { return Err(()); }
         }
         if self.verbose {
-            eprintln!("makepad-run cache: startup image of {} slots ({} keys, {} symbols, {} crates, {} KB code); ms: slots to {:.1}, data to {:.1}, key crates to {:.1}, encoded {:.1}", n, tab.keys.list.len(), tab.syms.list.len(), tab.crates.len(), blob.len() / 1024, ph[0], ph[1], ph[2], ph[3]);
+            eprintln!("relax cache: startup image of {} slots ({} keys, {} symbols, {} crates, {} KB code); ms: slots to {:.1}, data to {:.1}, key crates to {:.1}, encoded {:.1}", n, tab.keys.list.len(), tab.syms.list.len(), tab.crates.len(), blob.len() / 1024, ph[0], ph[1], ph[2], ph[3]);
         }
         Ok(Some((e.0, n)))
     }
@@ -400,7 +400,7 @@ impl Cache {
             }
         }
         if self.verbose && added > 0 {
-            eprintln!("makepad-run cache: startup image: {} slots its code calls added", added);
+            eprintln!("relax cache: startup image: {} slots its code calls added", added);
         }
         Ok(())
     }
@@ -994,7 +994,10 @@ pub(crate) fn skip_fnkey(d: &mut D, depth: u32, v: &mut dyn FnMut(Atom)) -> Opti
             skip_fnkey(d, depth + 1, v)
         }
         KeyKind::Glue => {
-            d.u8()?;
+            // a kind below 0xFF is one byte; 0xFF escapes to a u32 (cache.rs enc_fnkey)
+            if d.u8()? == 0xFF {
+                d.u32()?;
+            }
             skip_ty(d, 0, v)
         }
         KeyKind::Shim => {
@@ -1745,7 +1748,7 @@ impl Linker {
         }
         // the hot code together (GAPX6: x64 front-end stalls): the O3 slots first, in image order
         // (the order they first ran in), then the rest. The slots stay in image order in `out`
-        // (install order feeds the next manifest's start order). MAKEPAD_RUN_OPT=-hotimage: image order.
+        // (install order feeds the next manifest's start order). RELAX_OPT=-hotimage: image order.
         let hot_first = !relax_backend::stats::opt_env_off("-hotimage");
         for pass in [true, false] {
             for e in layout.iter_mut() {
@@ -1917,7 +1920,7 @@ impl Linker {
         if self.cache().verbose {
             let s = &self.cache().stats;
             let unchanged = (0..nk).filter(|&k| need[k] && im.slot[k] == NO_SLOT && im.key_ok[k]).count();
-            eprintln!("makepad-run cache: startup identities decoded: {} ({} duplicate, {} did not decode, {} of those naming only unchanged crates) in {:.1} ms",
+            eprintln!("relax cache: startup identities decoded: {} ({} duplicate, {} did not decode, {} of those naming only unchanged crates) in {:.1} ms",
                 s.ids_decoded, s.ids_dup, s.ids_failed, unchanged, s.ids_ns as f64 / 1e6);
         }
         let t_check = crate::jit::wall_ns();
@@ -1989,9 +1992,9 @@ impl Linker {
         super::warm_count::add(super::warm_count::IMG_FAILED, im.failed);
         super::warm_count::add(super::warm_count::IMG_HAD_CODE, im.had_code);
         c.stats.prelink_ns += crate::jit::wall_ns() - t0;
-        if im.timed && std::env::var_os("MAKEPAD_RUN_BOOT_TRACE").is_some() {
+        if im.timed && std::env::var_os("RELAX_BOOT_TRACE").is_some() {
             let tags: Vec<String> = im.t_tag.iter().enumerate().filter(|(_, e)| e.1 != 0).map(|(k, e)| format!("tag{}={}/{:.1}ms", k, e.1, e.0 as f64 / 1e6)).collect();
-            eprintln!("makepad-run cache: prelink symbols: place_data {:.1} ms (incl. its symbols), {} symbols in the image; resolved by tag: {}; thunks decoded (not image keys) {} in {:.1} ms",
+            eprintln!("relax cache: prelink symbols: place_data {:.1} ms (incl. its symbols), {} symbols in the image; resolved by tag: {}; thunks decoded (not image keys) {} in {:.1} ms",
                 im.t_place as f64 / 1e6, im.syms.len(), tags.join(" "), super::THUNK_DECODED.load(std::sync::atomic::Ordering::Relaxed), super::THUNK_DECODE_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6);
         }
         // what decides whether the next manifest carries a fresh image (record_manifest)

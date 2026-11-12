@@ -936,8 +936,8 @@ fn x64_int_clobbers(options: &relax_session::Options, i: &Inst) -> u64 {
     }
 }
 
-/// BMI2 (shlx / shrx / sarx) on this CPU, unless MAKEPAD_RUN_NO_BMI2: the JIT uses what the machine has.
-/// MAKEPAD_RUN_CHECK_WINDOWS=1: every read of a spill window's register checks it against the value's
+/// BMI2 (shlx / shrx / sarx) on this CPU, unless RELAX_NO_BMI2: the JIT uses what the machine has.
+/// RELAX_CHECK_WINDOWS=1: every read of a spill window's register checks it against the value's
 /// slot and traps (ud2) when they differ -- finds a window whose register something clobbered.
 fn check_windows(options: &relax_session::Options) -> bool {
     options.check_windows
@@ -2772,7 +2772,7 @@ impl<'a> Gen<'a> {
     /// never mid-call: an unwind never walks through it, and without a loop the hang watchdog never
     /// stops it, so the frame chain only misses it as the faulting frame of undefined behaviour
     /// (Unreachable). Saves push rbp / mov rbp, rsp / pop rbp per call of small helpers.
-    /// MAKEPAD_RUN_OPT=-frameless: always a frame.
+    /// RELAX_OPT=-frameless: always a frame.
     fn frameless_leaf(&self, options: &relax_session::Options, reach: &[bool]) -> bool {
         if crate::stats::opt_off(options, "-frameless") || !self.al.used_callee_int.is_empty() || self.cplan.is_some() || self.f.cabi.is_some() || !self.dom_read.is_empty() {
             return false;
@@ -5916,7 +5916,7 @@ impl<'a> Gen<'a> {
             // a target whose bounds the source type holds exactly (f32: up to 16 bits, f64: up to 32;
             // i32 from f64 keeps its cvttsd2si fast path): clamp in the source precision, convert
             // once -- branchless, no f64 detour (sdf's f32 -> u8 was cvtss2sd + three compares)
-            // MAKEPAD_RUN_OPT=-f2iclamp: the f64 compare path for these too
+            // RELAX_OPT=-f2iclamp: the f64 compare path for these too
             Conv::FToInt(from64, it) if it.bits <= if from64 { 32 } else { 16 } && !(it.signed && it.bits == 32) && !crate::stats::opt_off(options, "-f2iclamp") => {
                 // a spilled source loads into XS2, the working register (XS holds the bounds)
                 let xs = self.use_f(s, XS2);
@@ -6592,7 +6592,7 @@ pub fn vx_native(options: &relax_session::Options, op: VX) -> bool {
     }
 }
 
-/// Does this CPU (and the environment: MAKEPAD_RUN_NO_AVX) allow VEX-encoded AVX instructions?
+/// Does this CPU (and the environment: RELAX_NO_AVX) allow VEX-encoded AVX instructions?
 pub fn host_avx(options: &relax_session::Options) -> bool {
     options.cpu.avx
 }
@@ -6662,7 +6662,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     };
     // vector ops without an instruction sequence here: per-lane scalar code
     let legal;
-    // (MAKEPAD_RUN_OPT=-vxnative: every expandable op, the legaliser's reference meaning)
+    // (RELAX_OPT=-vxnative: every expandable op, the legaliser's reference meaning)
     let all = crate::stats::opt_off(options, "-vxnative");
     let native = |op| !all && vx_native(options, op);
     let f = if crate::legal::needed(f, &native, !all) {
@@ -6712,7 +6712,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     let mut cfg = reg_config(options);
     cfg.sym_class = env.sym_class;
     // rax: allocatable over the instructions that keep it (keeps_rax), last of the caller-saved
-    // registers; not in C ABI bodies (their prologue / epilogue use it). MAKEPAD_RUN_OPT=-rax: off
+    // registers; not in C ABI bodies (their prologue / epilogue use it). RELAX_OPT=-rax: off
     if f.cabi.is_none() && !crate::stats::opt_off(options, "-rax") {
         cfg.int_caller.push(RAX);
     }
@@ -6728,7 +6728,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     drop(_cost_ra);
     let alloc_sig = regalloc::alloc_sig(&al);
     regalloc::trace_alloc(f, &al);
-    // the allocation checker (MAKEPAD_RUN_OPT=+checkra; gates, fuzzer): a finding fails the compile
+    // the allocation checker (RELAX_OPT=+checkra; gates, fuzzer): a finding fails the compile
     if regalloc::check_on(options) {
         regalloc::check_or_fail(options, f, &cfg, &al, env.opt_regs || f.full)?;
     }
@@ -6853,7 +6853,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     }
     // optimised code is emitted twice (GAPX6: x64 front end): the first pass places the blocks,
     // the second emits each forward jump whose first-pass distance fits in rel8 as a 2-byte jump
-    // (jcc rel32 is 6 bytes, jmp 5) -- denser hot code. MAKEPAD_RUN_OPT=-shortjmp: one pass
+    // (jcc rel32 is 6 bytes, jmp 5) -- denser hot code. RELAX_OPT=-shortjmp: one pass
     let two_pass = env.opt_regs && !crate::stats::opt_off(options, "-shortjmp");
     let first = two_pass.then(|| g.clone());
     g.gen(options);

@@ -176,7 +176,7 @@ impl LTable {
         use std::sync::atomic::{AtomicU32, Ordering};
         let i = t.0 as usize;
         let ci = i >> LCHUNK_BITS;
-        assert!(ci < LMAX_CHUNKS, "makepad: layout table full");
+        assert!(ci < LMAX_CHUNKS, "relax: layout table full");
         let mut c = self.chunks[ci].load(Ordering::Acquire);
         if c.is_null() {
             let fresh: Box<[AtomicU32]> = (0..LCHUNK).map(|_| AtomicU32::new(0)).collect();
@@ -476,7 +476,7 @@ impl Layouts {
         self.struct_layout(lcx, tcx, &storage.fields, Repr { pack: 0, align: 0, reorder: true }, kind)
     }
 
-    /// Memory report (MAKEPAD_RUN_MEM_REPORT): exact bytes of the slot tables (live and retired) and of
+    /// Memory report (RELAX_MEM_REPORT): exact bytes of the slot tables (live and retired) and of
     /// the shared layout entries with their vectors.
     pub fn mem_lines(&self) -> Vec<(String, u64)> {
         use std::sync::atomic::Ordering;
@@ -528,7 +528,7 @@ impl Layouts {
             at = Some(pool.next[i as usize]).filter(|n| *n != u32::MAX);
         }
         let i = self.ents.push(e) as u32;
-        assert!(i < SLOT_IDX, "makepad: layout entries full");
+        assert!(i < SLOT_IDX, "relax: layout entries full");
         let first = pool.head.insert(h, i);
         pool.next.push(first.unwrap_or(u32::MAX));
         i + 1
@@ -927,7 +927,7 @@ impl Layouts {
                     // its sized instances may be reordered differently, so say so loudly
                     if kind == Kind::AlwaysSized && repr.reorder && fts.len() > 1 && self.is_unsized(lcx, tcx, fts[fts.len() - 1]) {
                         let name = lcx.prog.def_path(d);
-                        eprintln!("makepad: layout of `{}` with an unsized last field, but its definition requires that field sized (rustc: E0277); declare the parameter `?Sized`", name);
+                        eprintln!("relax: layout of `{}` with an unsized last field, but its definition requires that field sized (rustc: E0277); declare the parameter `?Sized`", name);
                     }
                     let mut l = self.struct_layout(lcx, tcx, &fts, repr, kind);
                     if adt.is_simd() {

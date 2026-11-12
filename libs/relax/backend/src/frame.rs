@@ -179,9 +179,9 @@ pub fn slot_colors_used(f: &Func, min: u32, addressed: &[bool]) -> Option<Vec<u3
     } else {
         slot_live_intervals(f, &cand, &der, &acc, &ent, &ext)
     };
-    // MAKEPAD_RUN_COLOR_TRACE=<name substring>: each slot of the matching fns, escaping or not
+    // RELAX_COLOR_TRACE=<name substring>: each slot of the matching fns, escaping or not
     static TRACE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    if let Some(w) = relax_session::phase::env_once(&TRACE, "MAKEPAD_RUN_COLOR_TRACE") {
+    if let Some(w) = relax_session::phase::env_once(&TRACE, "RELAX_COLOR_TRACE") {
         if f.name.contains(w) {
             for s in 0..ns {
                 if f.slots[s].size >= min && addressed[s] {
@@ -455,7 +455,7 @@ pub fn slot_addr_positions(f: &Func, at: &[i64]) -> Vec<i64> {
 /// `Copy(dst, src, n)` with both addresses at known frame positions (`slot_addr_positions`) whose
 /// byte ranges overlap but are not the same bytes: `dst - src` in bytes, else 0. Copy is memcpy
 /// (no pass may make such a copy: rir `overlapping_copy`), but the frame layout shares storage
-/// too, so the backends check the final layout: under MAKEPAD_RUN_VERIFY_PASSES such a copy fails
+/// too, so the backends check the final layout: under RELAX_VERIFY_PASSES such a copy fails
 /// the build, elsewhere it is emitted in memmove order -- a correct copy, never a wrong one.
 pub fn copy_overlap(pos: &[i64], dst: VReg, src: VReg, n: u32) -> i64 {
     let (Some(&pd), Some(&ps)) = (pos.get(dst.0 as usize), pos.get(src.0 as usize)) else { return 0 };
@@ -711,7 +711,7 @@ pub fn born_liveness(f: &Func, cand: &[usize], der: &[Vec<u32>], live: &mut [Vec
 /// below the frame's base); each slot something addresses gets the end of its storage
 /// (offset of its lowest byte below the base, its alignment respected), slots sharing storage
 /// (`slot_colors`) the same; unaddressed slots take no space. Returns the offsets and the new
-/// end of the area. `share` false (MAKEPAD_RUN_OPT=-slotcolor): every slot keeps its own storage.
+/// end of the area. `share` false (RELAX_OPT=-slotcolor): every slot keeps its own storage.
 pub fn slot_layout(f: &Func, off: i64, share: bool) -> (Vec<i64>, i64) {
     slot_layout_aligned(f, off, share, |_| 1)
 }

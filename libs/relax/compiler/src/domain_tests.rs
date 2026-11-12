@@ -53,7 +53,7 @@ fn fixture_of(source: &str, entry_name: &str) -> (Box<Unit>, u64, std::path::Pat
     let path = root.join("fixture.rs");
     std::fs::write(&path, source).unwrap();
     // the std sources of this checkout (as lazy_reload_tests.rs does: a test binary is not next to them)
-    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     let sess = std::sync::Arc::new(crate::Session::default());
     let (prog, core, _) = crate::load_with_std(&sess, path.to_str().unwrap(), "teardown_fixture", false).unwrap();
     let mut tcx = crate::tcx::Tcx::new();
@@ -230,7 +230,7 @@ fn teardown_fixture_cycles_and_retiring_thread() {
 // external tools or copied implementation of the pool is involved.
 fn static_pool_fixture() -> String {
     let budget = include_str!("../../../../platform/cpu_budget/src/lib.rs")
-        .replace("use makepad_relax_api::relax_api;\n", "")
+        .replace("use relax_api::relax_api;\n", "")
         .replace("#[relax_api]\n", "");
     let source = include_str!("../../../../platform/src/thread.rs");
     let network = source.split_once("pub use makepad_network::{").unwrap().1

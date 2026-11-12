@@ -163,6 +163,20 @@ impl<T> [T] {
         let end = unsafe { im::ptr_add(start, self.len()) };
         start..end
     }
+    /// Real core's `element_offset` (slice/mod.rs): the index of `element` if it is one of this
+    /// slice's elements by address (not by value); panics for a zero-sized `T`.
+    pub fn element_offset(&self, element: &T) -> Option<usize> {
+        let size = crate::mem::size_of::<T>();
+        if size == 0 {
+            panic!("elements are zero-sized");
+        }
+        let byte_offset = (element as *const T as usize).wrapping_sub(self.as_ptr() as usize);
+        if byte_offset % size != 0 {
+            return None;
+        }
+        let offset = byte_offset / size;
+        if offset < self.len() { Some(offset) } else { None }
+    }
     #[track_caller]
     pub fn swap(&mut self, a: usize, b: usize) {
         super::swap(self, a, b)
@@ -384,6 +398,14 @@ impl<T> [T] {
     pub fn select_nth_unstable_by<F: FnMut(&T, &T) -> Ordering>(&mut self, index: usize, compare: F) -> (&mut [T], &mut T, &mut [T]) {
         let mut compare = compare;
         sort::select_nth(self, index, &mut |a: &T, b: &T| compare(a, b) == Ordering::Less);
+        let (left, rest) = super::split_at_mut(self, index);
+        let (mid, right) = super::split_at_mut(rest, 1);
+        (left, &mut mid[0], right)
+    }
+    #[track_caller]
+    pub fn select_nth_unstable_by_key<K: Ord, F: FnMut(&T) -> K>(&mut self, index: usize, f: F) -> (&mut [T], &mut T, &mut [T]) {
+        let mut f = f;
+        sort::select_nth(self, index, &mut |a: &T, b: &T| f(a).lt(&f(b)));
         let (left, rest) = super::split_at_mut(self, index);
         let (mid, right) = super::split_at_mut(rest, 1);
         (left, &mut mid[0], right)

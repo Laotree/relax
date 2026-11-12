@@ -64,12 +64,12 @@ const X8: u8 = 8;
 
 /// Whether the CPU running the JIT'd code has ARMv8.1 LSE atomics (`cas`, `ldadd`, ...). Every
 /// Apple arm64 CPU does; Android and Linux ask the kernel (HWCAP_ATOMICS: Cortex-A53/A73 class
-/// cores have none). `MAKEPAD_RUN_NO_LSE=1` forces the ARMv8.0 exclusive-load/store loops (to test
+/// cores have none). `RELAX_NO_LSE=1` forces the ARMv8.0 exclusive-load/store loops (to test
 /// them on an LSE machine; stored code is keyed by this class, relax-compiler codegen_id::target_tag).
 pub fn lse_atomics() -> bool {
     static LSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LSE.get_or_init(|| {
-        if std::env::var_os("MAKEPAD_RUN_NO_LSE").is_some_and(|v| !v.is_empty()) {
+        if std::env::var_os("RELAX_NO_LSE").is_some_and(|v| !v.is_empty()) {
             return false;
         }
         #[cfg(all(target_arch = "aarch64", any(target_os = "linux", target_os = "android")))]
@@ -89,7 +89,7 @@ pub fn lse_atomics() -> bool {
 const INT_ARGS: usize = 8;
 const FLT_ARGS: usize = 8;
 
-/// arm64 isel switches for measurements: `MAKEPAD_RUN_A64=none` or `-fuse,-fconst`.
+/// arm64 isel switches for measurements: `RELAX_A64=none` or `-fuse,-fconst`.
 const A64_FUSE: u8 = 1;
 const A64_FCONST: u8 = 2;
 /// struct copies of >= 32 bytes through 16-byte vector pairs (off: 8-byte pieces; measurement switch)
@@ -3871,7 +3871,7 @@ impl<'a> Gen<'a> {
         // inlined callees, are worse than the lowering's then-first order: +0.7% instructions on
         // rust_tokenize); static code takes the back edge, and of two targets laid out before
         // the nearer one (the innermost loop's header; an exit placed before the loop is further
-        // back). (MAKEPAD_RUN_OPT=-a64backedge: off, A/B)
+        // back). (RELAX_OPT=-a64backedge: off, A/B)
         let on = !crate::stats::opt_env_off("-a64backedge");
         let back = |b: u32| b as usize <= bi;
         let (ct, cf) = (self.f.blocks[tt as usize].count, self.f.blocks[ff as usize].count);
@@ -5558,7 +5558,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     };
     // vector ops without an instruction sequence here: per-lane scalar code
     let legal;
-    // (MAKEPAD_RUN_OPT=-vxnative: every expandable op, the legaliser's reference meaning)
+    // (RELAX_OPT=-vxnative: every expandable op, the legaliser's reference meaning)
     let all = crate::stats::opt_off(options, "-vxnative");
     let native = |op| !all && vx_native(op);
     let f = if crate::legal::needed(f, &native, !all) {
@@ -5639,7 +5639,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     drop(_cost_ra);
     let alloc_sig = regalloc::alloc_sig(&al0);
     regalloc::trace_alloc(f, &al0);
-    // the allocation checker (MAKEPAD_RUN_OPT=+checkra; gates, fuzzer): a finding fails the compile
+    // the allocation checker (RELAX_OPT=+checkra; gates, fuzzer): a finding fails the compile
     if regalloc::check_on(options) {
         regalloc::check_or_fail(options, f, &cfg, &al0, env.opt_regs || f.full)?;
     }

@@ -427,6 +427,9 @@ pub(crate) const WRAP_PAREN: u32 = 1 << 25;
 /// a `vis` fragment that matched nothing, forwarded here (rustc's empty invisible group): no tokens,
 /// only the token it stands before (`Parser::empty_vis`)
 pub(crate) const EMPTY_VIS: u32 = 1 << 24;
+/// A `$s:stmt` fragment (rustc's `MetaVarKind::Stmt`): the statement it begins ends with it, no `;`
+/// looked for after it. Both meta bits, as no fragment is an expression and a literal at once.
+pub(crate) const STMT_FRAG: u32 = EXPR_FRAG | LIT_FRAG;
 pub(crate) const FRAG_FLAGS: u32 = TY_FRAG | EXPR_FRAG | LIT_FRAG | META_ONLY | BLOCK_FRAG | PATH_FRAG | WRAP_PAREN | EMPTY_VIS;
 
 const GLOB_ID: Name = Name(0);
@@ -676,6 +679,19 @@ impl MacroTable {
     /// The import `use path::{orig as alias}` of crate `krate` binding `alias`.
     pub fn alias(&self, krate: &str, alias: &str) -> Option<&(String, String)> {
         self.aliases.get(krate)?.get(alias)
+    }
+
+    /// Whether an import that module `module` of crate `cur` sees binds `name` in the module
+    /// `path` names from there (empty: `module` itself). The aliases map is the crate's, from
+    /// every module's imports; an import is in scope only in its module, in the modules inside
+    /// it that glob-import it, and through `pub` re-exports (rustc_resolve ident.rs
+    /// `visit_scopes`: a plain name's module scope is the current module, not its parents).
+    /// Returns the module it asked when the path resolves.
+    pub(crate) fn import_binds(&self, cur: &str, module: &str, path: &[String], name: &str) -> (bool, Option<(String, String)>) {
+        let r = Res { table: self };
+        let Some((k, m)) = (if path.is_empty() { Some((cur, module)) } else { r.resolve_mod(cur, module, path) }) else { return (false, None) };
+        let mut seen = Seen::new();
+        (r.import_binds(cur, k, m, module, name, &mut seen), Some((k.to_string(), m.to_string())))
     }
 
     /// Records an import alias of crate `krate` (copies that crate's map only if a snapshot
@@ -1215,6 +1231,32 @@ impl<'a> Res<'a> {
     fn macro_in(&self, k: &str, m: &str, n: &str) -> Option<MacroRef> {
         let sc = self.scope(k)?;
         sc.mnon.get(m).and_then(|t| t.get(n)).or_else(|| sc.mglob.get(m).and_then(|t| t.get(n))).cloned()
+    }
+
+    /// Whether a `use` binds `name` (by that name) in module `m` of crate `k` as module `asker`
+    /// of crate `from` sees it: the module's own imports, then those its glob imports bring. A
+    /// private import is seen from its module and the modules inside it; through another
+    /// crate's module, or through a module `asker` is not inside, only `pub` imports and `pub`
+    /// globs count (rustc: a glob imports what is visible to the importing module).
+    fn import_binds<'b>(&self, from: &str, k: &'b str, m: &'b str, asker: &str, name: &str, seen: &mut Seen<'b>) -> bool
+    where
+        'a: 'b,
+    {
+        if !seen.insert(k, m) {
+            return false;
+        }
+        let Some(cm) = self.table.crates.get(k) else { return false };
+        let inside = from == k && (asker == m || asker.strip_prefix(m).is_some_and(|rest| rest.starts_with("::")));
+        if cm.uses.get(m).is_some_and(|v| v.iter().any(|u| u.bind.as_deref() == Some(name) && (inside || u.is_pub))) {
+            return true;
+        }
+        let Some(sc) = self.scope(k) else { return false };
+        for (k2, m2, is_pub) in sc.tglobs.get(m).map_or(&[][..], |v| &v[..]) {
+            if (inside || *is_pub) && self.import_binds(from, k2, m2, asker, name, seen) {
+                return true;
+            }
+        }
+        false
     }
 
     /// The module path `path` names from module `m` of crate `k` (type namespace), with
@@ -1766,6 +1808,27 @@ impl MacroScope {
             let mut inputs = LookupInputs::new(&self.table);
             self.lookup_via_local_use(names.id(name), names.id(cur), &[], names.id(module), &mut memo, &mut inputs)
         })
+    }
+
+    /// `MacroTable::import_binds`, with the imports macro expansions wrote: this parse's and the
+    /// crate's earlier ones (a binding of the name in that module, or any glob of theirs there:
+    /// expansion-made globs are not followed, so one is taken to bind it).
+    pub(crate) fn import_binds(&self, cur: &str, module: &str, path: &[String], name: &str) -> bool {
+        let (bound, at) = self.table.import_binds(cur, module, path, name);
+        if bound {
+            return true;
+        }
+        let Some((k, m)) = at else { return false };
+        if k != cur {
+            return false;
+        }
+        let names = &*self.table.names;
+        let mid = names.id(&m);
+        let local = self.local_uses.borrow();
+        if local.bindings.contains_key(&(mid, names.id(name))) || local.bindings.contains_key(&(mid, GLOB_ID)) {
+            return true;
+        }
+        self.table.exp_uses.get(cur).is_some_and(|t| t.contains_key(&(m.clone(), name.to_string())) || t.contains_key(&(m, GLOB.to_string())))
     }
 
     /// An explicit binding, or an attribute exported through a glob. The outer Option keeps
@@ -3714,8 +3777,10 @@ impl<'a> Parser<'a> {
                         // rustc_expand mbe/transcribe.rs: transcribe_pnr wraps even a
                         // one-token path in MetaVarKind::Path invisible delimiters.
                         let path_frag = *f == Frag::Path;
-                        let kind_flag = match f { Frag::Expr if !wrap => EXPR_FRAG, Frag::Literal => LIT_FRAG, Frag::Block if !wrap => BLOCK_FRAG, Frag::Path => PATH_FRAG, _ => 0 };
-                        let group = opaque && out.s.len() > group_start && (hi - lo + usize::from(taken.is_some()) > 1 || ty_frag || path_frag);
+                        let kind_flag = match f { Frag::Expr if !wrap => EXPR_FRAG, Frag::Literal => LIT_FRAG, Frag::Block if !wrap => BLOCK_FRAG, Frag::Path => PATH_FRAG, Frag::Stmt => STMT_FRAG, _ => 0 };
+                        // (a `$s:stmt` of one token too: `break` is a statement of its own before the next)
+                        let stmt_frag = *f == Frag::Stmt;
+                        let group = opaque && out.s.len() > group_start && (hi - lo + usize::from(taken.is_some()) > 1 || ty_frag || path_frag || stmt_frag);
                         if group || (kind_flag != 0 && out.s.len() > group_start) {
                             out.groups.push((group_start as u32, out.s.len() as u32 | if ty_frag { TY_FRAG } else { 0 } | kind_flag | if group { 0 } else { META_ONLY }));
                         }
@@ -3966,6 +4031,28 @@ pub fn mtoks(p: &Parser, toks: &[Tok]) -> Vec<MTok> {
     definition_tokens(toks, |lo, hi| p.bytes(lo, hi))
 }
 
+/// A definition's tokens with each `$crate` named as crate `krate`, the way a transcription
+/// names it (`__relax_crate_<krate>`): for a `macro_rules!` whose `$crate` is not the crate that
+/// holds it (Parser::dollar_crate_of). `$$crate` stays: it writes a `$crate` for a later macro.
+pub(crate) fn name_dollar_crate(toks: Vec<MTok>, krate: &str) -> Vec<MTok> {
+    let mut out: Vec<MTok> = Vec::with_capacity(toks.len());
+    let mut escaped = false;
+    let mut i = 0;
+    while i < toks.len() {
+        let t = &toks[i];
+        if t.kind == T::Dollar && !escaped && toks.get(i + 1).is_some_and(|n| n.kind == T::KwCrate) {
+            out.push(MTok { kind: T::Ident, text: format!("__relax_crate_{krate}"), pos: t.pos });
+            i += 2;
+            continue;
+        }
+        // (`$$` is one escape: the `$` after it is the escaped one)
+        escaped = t.kind == T::Dollar && !escaped;
+        out.push(t.clone());
+        i += 1;
+    }
+    out
+}
+
 /// rustc_expand mbe/quoted.rs: parse_tree retains DocComment tokens in definitions.
 /// Recover the lexer trivia for both the prescan and the parser's definitions.
 pub(crate) fn definition_tokens<'a>(toks: &[Tok], bytes: impl Fn(u32, u32) -> &'a [u8]) -> Vec<MTok> {
@@ -4174,7 +4261,7 @@ mod spacing_tests {
         let session = std::sync::Arc::new(crate::Session::default());
         let mut p = Parser::new(&session, src.as_bytes(), toks.clone(), 2021);
         let (s, etoks, ..) = p.expand_rules(&def, call + 3, close(call + 2)).unwrap();
-        // the transcription's text lexes back to its tokens (MAKEPAD_RUN_VERIFY_TOKENS)
+        // the transcription's text lexes back to its tokens (RELAX_VERIFY_TOKENS)
         let mut lexed = Vec::new();
         crate::lexer::lex(s.as_bytes(), 2021, &mut lexed).unwrap_or_else(|e| panic!("{}", e.msg));
         lexed.retain(|t| t.kind != T::Eof);

@@ -1176,7 +1176,7 @@ pub fn paused() -> bool {
 /// inspection goes on, so its quit runs to the end. A patch's pause ends with its install.
 pub(crate) fn quit_resumes() {
     if paused() {
-        eprintln!("makepad: a quit: the paused program goes on so that it can quit");
+        eprintln!("relax: a quit: the paused program goes on so that it can quit");
         resume_program();
     }
 }

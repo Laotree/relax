@@ -196,7 +196,7 @@ fn output_dir_entry(dir: &Path, name: &str) -> bool {
 
 fn directory_hash(path: &str, entries: &[(String, bool)]) -> u128 {
     let mut hash = crate::sip::Sip128::new();
-    hash.str(path);
+    hash.str(&crate::dirs::anchored(path));
     for (name, dir) in entries {
         hash.str(name);
         hash.u32(*dir as u32);
@@ -235,7 +235,7 @@ pub fn input_stamp(path: &str, hash: u128, now_ns: u64) -> Option<crate::vfs::Fi
 }
 pub fn cmd_lex(args: &[String]) -> i32 {
     let Some(path) = args.first() else {
-        eprintln!("usage: makepad lex <file>");
+        eprintln!("usage: {tool} lex <file>", tool = crate::tool_name());
         return 2;
     };
     let src = match crate::vfs::read(path) {

@@ -397,7 +397,7 @@ fn sandbox_check(root: &str, edition: u16) -> Result<(), String> {
             };
             if let Some(what) = bad {
                 let (l, c) = crate::lexer::line_col(&src, toks[i].lo);
-                return Err(format!("{}:{}:{}: proc macro uses {} -- not allowed in compile-time code of a third-party crate under `makepad run` (bare `relax` runs it)", path, l, c, what));
+                return Err(format!("{}:{}:{}: proc macro uses {} -- not allowed in compile-time code of a third-party crate under `{tool} run` (bare `relax` runs it)", path, l, c, what, tool = crate::tool_name()));
             }
         }
     }
@@ -531,7 +531,7 @@ fn build_world_inner(sess: &std::sync::Arc<crate::Session>, units: &[crate::macr
     prog.std_from_shared = true;
     // macros run on this machine: its pointer width, whatever the program's target
     prog.ptr_bytes = 8;
-    // macros run here: the machine's cfg, never MAKEPAD_RUN_CHECK_TARGET's
+    // macros run here: the machine's cfg, never RELAX_CHECK_TARGET's
     let host = |f: &[String]| crate::cfg::CfgSet::machine(sess, f);
     let core = prog.load_crate_deferred("core", &format!("{}/core/lib.rs", std_dir), 2021, host(&[]), Vec::new())?;
     let mut std_deps = vec![(prog.syms.intern("core"), core)];
@@ -632,7 +632,7 @@ fn build_world_inner(sess: &std::sync::Arc<crate::Session>, units: &[crate::macr
     let bridge = u.entry(id);
     if crate::preload::trace() {
         eprintln!("boot-trace: macro world: std {:.1} ms, + macro crates {:.1}, + resolve {:.1}, + collect {:.1}, + unit and cache {:.1} ms", t_std, t_crates, t_res, t_col, t0.elapsed().as_secs_f64() * 1e3);
-        eprintln!("boot-trace: macro world heap (MAKEPAD_RUN_MEM_REPORT): std {} MB, + macro crates {}, + collect {}, + unit {} MB", m_std, m_crates, m_col, crate::memstat::live_of(crate::memstat::Tag::PmHost) >> 20);
+        eprintln!("boot-trace: macro world heap (RELAX_MEM_REPORT): std {} MB, + macro crates {}, + collect {}, + unit {} MB", m_std, m_crates, m_col, crate::memstat::live_of(crate::memstat::Tag::PmHost) >> 20);
     }
     let ns = t0.elapsed().as_nanos() as u64;
     STATS.with(|s| {

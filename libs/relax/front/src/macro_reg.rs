@@ -781,11 +781,11 @@ pub fn outline_identity() -> u128 {
     )).unwrap_or_default());
     let mut hash = crate::sip::Sip128::new();
     for (name, entry, source) in entries {
-        hash.str(&name); hash.str(&source); hash.str(&entry.fname); hash.u8(entry.kind as u8);
+        hash.str(&name); hash.str(&crate::dirs::anchored(&source)); hash.str(&entry.fname); hash.u8(entry.kind as u8);
         hash.u8(RUNNER.get().is_some_and(|r| r.native(&entry)) as u8);
     }
     for (source, name, attributes) in helpers {
-        hash.str(&source); hash.str(&name); hash.u32(attributes.len() as u32);
+        hash.str(&crate::dirs::anchored(&source)); hash.str(&name); hash.u32(attributes.len() as u32);
         for attribute in attributes { hash.str(&attribute); }
     }
     hash.finish128()

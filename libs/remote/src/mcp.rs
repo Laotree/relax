@@ -233,7 +233,7 @@ fn connect(target: &str) -> Result<Client, String> {
     if target.contains(':') && !target.contains('/') {
         #[cfg(unix)]
         {
-            let relax = std::env::var_os("MAKEPAD_RUN_BIN").map(std::path::PathBuf::from);
+            let relax = std::env::var_os("RELAX_BIN").map(std::path::PathBuf::from);
             let hub = crate::hub::connect(relax.as_deref())?;
             return Ok(Client::routed(&hub, target));
         }

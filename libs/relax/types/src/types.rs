@@ -713,7 +713,7 @@ impl Types {
         }
         let i = self.len.load(Relaxed) as usize;
         let ci = i >> CHUNK_BITS;
-        assert!(i + 1 < 1 << ID_BITS, "makepad: type interner full");
+        assert!(i + 1 < 1 << ID_BITS, "relax: type interner full");
         let mut c = self.chunks[ci].load(Relaxed);
         if c.is_null() {
             let layout = std::alloc::Layout::array::<Entry>(CHUNK).unwrap();

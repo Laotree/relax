@@ -35,6 +35,14 @@
 //! (`cached_scripts`). A tree whose C was built once type-checks whole from then on; only an
 //! absent receipt (or one that does not cover every native package) leaves a check without them.
 //!
+//! A build script runs as a `run --units` child of its own, which resolves the native packages its
+//! build-dependencies reach but not the run's key (its unit graph is a part of the run's). So the
+//! run writes what the native scripts produced (cfgs, env, OUT_DIR) and the library they were
+//! linked into to a script receipt, named by its content, and hands it to its script children in
+//! `RELAX_NATIVE_RECEIPT` (`write_receipt` / `read_receipt`). A child matches the entries by
+//! the scripts' own paths, so a build script that calls into a native crate compiles and runs
+//! with that crate's outputs and library, without cargo and without the flag itself.
+//!
 //! Cargo brings the lock up to date as `cargo run` does, and fetches only what is missing (the
 //! run's --offline / --frozen and cargo's offline settings still hold). Cargo.lock is not
 //! tracked, so each tree keeps its own, and with `--locked` every native build failed on a tree
@@ -91,10 +99,12 @@ impl<'a> Mode<'a> {
 
 /// Which of the C symbols `names` the loader process binds once the libraries `dylibs` and the
 /// frameworks `frameworks` are loaded: what the dynamic loader can bind a native library's
-/// import to (the C runtime and system libraries; the program's code is in none of them).
-pub type Resolvable = fn(names: &[String], dylibs: &[String], frameworks: &[String]) -> Vec<bool>;
+/// import to (the C runtime and system libraries; the program's code is in none of them). A
+/// library is the file the link took, from the build scripts' search folders `search` first.
+pub type Resolvable = fn(names: &[String], dylibs: &[String], frameworks: &[String], search: &[String]) -> Vec<bool>;
 
 /// What cargo's build script of one native package produced.
+#[derive(Clone)]
 pub struct ScriptOut {
     pub krate: usize,
     /// A separate host feature set of a package also built for the target.
@@ -107,6 +117,7 @@ pub struct ScriptOut {
 }
 
 /// The shared library the native archives were linked into.
+#[derive(Clone)]
 pub struct NativeLib {
     pub path: String,
     /// the names of the static libraries inside it (`#[link(name = .., kind = "static")]`)
@@ -137,28 +148,63 @@ pub fn address_name(name: &[u8]) -> String {
 /// script that hashes its assets) need no `--allow-c` and run under Relax like any other.
 const C_FREE_WITH_FEATURE: [(&str, &str); 1] = [("blake3", "pure")];
 
-/// Why a package's build script is native, if it is.
-pub fn native_reason(g: &Graph, bs: &BuildScript) -> Option<String> {
+/// Why a package's build script is native. One script can have several reasons; the strongest
+/// one is the classification: a build-dependency that compiles C (`cc`, `cmake`, ..) needs
+/// `--allow-c` whether or not the package also declares `links =`, which alone only passes
+/// metadata to its dependents and runs under Relax.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeReason {
+    /// a build-dependency on one of [`BUILD_DEPS`] (its extern name)
+    CompilesC(String),
+    /// `links =` in the manifest
+    Links,
+    /// the script reads another package's `DEP_*` metadata
+    DepMetadata,
+}
+
+impl NativeReason {
+    /// The script runs a C compiler (or a native build tool): it cannot run without one, so
+    /// without `--allow-c` a run refuses it and a check skips it.
+    pub fn compiles_c(&self) -> bool {
+        matches!(self, NativeReason::CompilesC(_))
+    }
+
+    /// `<package>: <reason>`, as the C gate's messages print it.
+    pub fn describe(&self, pkg: &str) -> String {
+        match self {
+            NativeReason::CompilesC(dep) => format!("{}: build-dependency {}", pkg, dep),
+            NativeReason::Links => format!("{}: links =", pkg),
+            NativeReason::DepMetadata => format!("{}: reads DEP_ metadata", pkg),
+        }
+    }
+}
+
+/// Why a package's build script is native, if it is (the strongest reason: [`NativeReason`]).
+pub fn native_reason(g: &Graph, bs: &BuildScript) -> Option<NativeReason> {
     let (dir, name, _) = &g.pkg[bs.krate];
+    let c_free = C_FREE_WITH_FEATURE.iter().any(|(p, f)| p == name && bs.features.iter().any(|x| x == f));
+    for (_, ext) in &bs.build_deps {
+        if BUILD_DEPS.contains(&ext.as_str()) && !c_free {
+            return Some(NativeReason::CompilesC(ext.clone()));
+        }
+    }
     let manifest = crate::vfs::read_to_string(format!("{}/Cargo.toml", dir)).unwrap_or_default();
     let links = manifest.lines().any(|l| {
         let l = l.trim();
         l.strip_prefix("links").is_some_and(|r| r.trim_start().starts_with('='))
     });
     if links {
-        return Some(format!("{}: links =", name));
+        return Some(NativeReason::Links);
     }
-    let c_free = C_FREE_WITH_FEATURE.iter().any(|(p, f)| p == name && bs.features.iter().any(|x| x == f));
-    for (_, ext) in &bs.build_deps {
-        if BUILD_DEPS.contains(&ext.as_str()) && !c_free {
-            return Some(format!("{}: build-dependency {}", name, ext));
-        }
-    }
-    let src = crate::vfs::read_to_string(&bs.src_path).unwrap_or_default();
-    if src.contains("DEP_") {
-        return Some(format!("{}: reads DEP_ metadata", name));
+    if reads_dep_metadata(bs) {
+        return Some(NativeReason::DepMetadata);
     }
     None
+}
+
+/// Whether a build script reads `DEP_*` metadata (its source names such a variable).
+pub fn reads_dep_metadata(bs: &BuildScript) -> bool {
+    crate::vfs::read_to_string(&bs.src_path).unwrap_or_default().contains("DEP_")
 }
 
 fn fnv(data: &[u8], mut h: u64) -> u64 {
@@ -202,7 +248,7 @@ fn resolved_packages_key<'a>(raw: impl IntoIterator<Item = &'a crate::unitgraph:
         let mut features = unit.features.clone();
         features.sort();
         features.dedup();
-        (unit.pkg.clone(), features)
+        ((crate::dirs::anchored(&unit.pkg.0).into_owned(), unit.pkg.1.clone(), unit.pkg.2.clone()), features)
     }).collect();
     packages.sort();
     packages.dedup();
@@ -273,6 +319,8 @@ fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
     // cargo builds for real): two packages whose closure resolves alike share the build.
     let selection = selection_key(&script_pkgs, &lib_pkgs);
     let mut h = fnv(b"native-link-v15", 0xcbf29ce484222325);
+    // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
+    h = fnv(&crate::dirs::anchors_key().to_le_bytes(), h);
     h = fnv(req.triple.as_bytes(), h);
     h = fnv(&selection.to_le_bytes(), h);
     for f in &flags {
@@ -280,10 +328,16 @@ fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
         h = fnv(b"\0", h);
     }
     h = fnv(&resolved_packages_key(g.raw.iter().filter(|u| script_pkgs.binary_search(&u.pkg.1).is_ok())).to_le_bytes(), h);
+    // and the program's rustc flags, wherever cargo takes them from: the native library is linked
+    // with the program's link arguments (`link_args`)
     let mut native_env: Vec<_> = std::env::vars().filter(|(k, _)| {
-        ["CC", "CXX", "AR", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS", "PKG_CONFIG"]
+        ["CC", "CXX", "AR", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS", "PKG_CONFIG", "RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"]
             .iter().any(|prefix| k == prefix || k.starts_with(&format!("{prefix}_")))
+            || (k.starts_with("CARGO_TARGET_") && (k.ends_with("_RUSTFLAGS") || k.ends_with("_LINKER")))
     }).collect();
+    for (_, file) in crate::resolve::cargo_config_files(req.workspace) {
+        native_env.push((file.clone(), std::fs::read_to_string(&file).unwrap_or_default()));
+    }
     native_env.sort();
     for (k, v) in native_env {
         h = fnv(k.as_bytes(), h);
@@ -346,7 +400,7 @@ pub fn build(g: &Graph, seeds: &[usize], req: &Request) -> Result<Built, String>
         return Ok(Built { scripts: out.scripts, lib: None });
     }
     if !std::path::Path::new(&plan.lib_path).is_file() {
-        link(&plan.lib_path, &out.archives, &out.search, &out.fw_search, &out.dylibs, &out.frameworks, req.triple, req.resolvable)?;
+        link(&plan.lib_path, &out, req.triple, req.resolvable)?;
     }
     if std::path::Path::new(&plan.fast_mark).is_file() {
         optimize_later(g, req, exe, &flags, plan.script_pkgs, plan.lib_pkgs, seeds, &out, plan.lib_path.clone(), plan.fast_mark);
@@ -360,6 +414,12 @@ pub fn build(g: &Graph, seeds: &[usize], req: &Request) -> Result<Built, String>
 /// the directories it names are gone. `cached` rejects the receipt of a build that did not link
 /// or whose library the target no longer holds, so only a whole build is read back as one.
 pub fn cached_scripts(g: &Graph, seeds: &[usize], req: &Request) -> Option<Vec<ScriptOut>> {
+    cached_outputs(g, seeds, req).map(|(scripts, _)| scripts)
+}
+
+/// `cached_scripts` and the library the cached build linked (None when it linked nothing): what a
+/// build script's own child run calls into.
+pub fn cached_outputs(g: &Graph, seeds: &[usize], req: &Request) -> Option<(Vec<ScriptOut>, Option<NativeLib>)> {
     let plan = plan(g, seeds, req);
     let messages = std::fs::read_to_string(&plan.messages_path).ok()?;
     let out = cached(&g.pkg, &script_table(g), seeds, &messages, &plan.lib_path)?;
@@ -369,7 +429,105 @@ pub fn cached_scripts(g: &Graph, seeds: &[usize], req: &Request) -> Option<Vec<S
             return None;
         }
     }
-    Some(out.scripts)
+    let links = !(out.archives.is_empty() && out.dylibs.is_empty() && out.frameworks.is_empty());
+    let lib = links.then(|| NativeLib { path: plan.lib_path.clone(), statics: out.statics.clone(), crates: plan.names.clone() });
+    Some((out.scripts, lib))
+}
+
+/// A script receipt (`write_receipt`): the native scripts' outputs by script path, and the library.
+pub struct Receipt {
+    pub scripts: Vec<ReceiptScript>,
+    pub lib: Option<NativeLib>,
+}
+
+/// One native script's outputs in a script receipt, by the script's `src_path`: the key a build
+/// script's own child run can match (its unit graph is a part of the run's, so it cannot
+/// compute the run's key).
+pub struct ReceiptScript {
+    pub path: String,
+    pub host: bool,
+    pub out_dir: String,
+    pub cfgs: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub system: Vec<(String, bool)>,
+}
+
+/// Writes the native scripts' outputs (those of `seeds`) and the library for the run's own
+/// build-script children: `<dir>/native-scripts-<hash of the content>.json`, so equal outputs
+/// are one file whose name says nothing about the run that wrote it (a script's rerun key holds
+/// the name, and a name per run would run every script again on every run). Its path.
+pub fn write_receipt(g: &Graph, seeds: &[usize], scripts: &[ScriptOut], lib: Option<&NativeLib>, dir: &str) -> Result<String, String> {
+    let list = |items: &mut dyn Iterator<Item = String>| format!("[{}]", items.collect::<Vec<_>>().join(","));
+    let mut entries = Vec::new();
+    for &s in seeds {
+        let bs = &g.build_scripts[s];
+        let (_, name, version) = &g.pkg[bs.krate];
+        for o in scripts.iter().filter(|o| o.krate == bs.krate || (g.pkg[o.krate].1 == *name && g.pkg[o.krate].2 == *version)) {
+            entries.push(format!(
+                "{{\"path\":{},\"host\":{},\"out_dir\":{},\"cfgs\":{},\"env\":{},\"system\":{}}}",
+                json_string(&bs.src_path),
+                o.host,
+                json_string(&o.out_dir),
+                list(&mut o.cfgs.iter().map(|c| json_string(c))),
+                list(&mut o.env.iter().map(|(k, v)| format!("[{},{}]", json_string(k), json_string(v)))),
+                list(&mut o.system.iter().map(|(k, framework)| format!("[{},{}]", json_string(k), framework))),
+            ));
+        }
+    }
+    let mut out = format!("{{\"scripts\":[{}]", entries.join(","));
+    if let Some(lib) = lib {
+        out.push_str(&format!(
+            ",\"lib\":{{\"path\":{},\"statics\":{},\"crates\":{}}}",
+            json_string(&lib.path),
+            list(&mut lib.statics.iter().map(|n| json_string(n))),
+            list(&mut lib.crates.iter().map(|n| json_string(n))),
+        ));
+    }
+    out.push('}');
+    let path = format!("{}/native-scripts-{:016x}.json", dir, fnv(out.as_bytes(), 0xcbf29ce484222325));
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(out.as_str()) {
+        let tmp = format!("{}.tmp{}", path, std::process::id());
+        std::fs::write(&tmp, &out).map_err(|e| format!("{}: {}", tmp, e))?;
+        std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {}", path, e))?;
+    }
+    Ok(path)
+}
+
+/// A script receipt (`write_receipt`), or None when there is none to use: unreadable, or naming an
+/// OUT_DIR or a library that is gone.
+pub fn read_receipt(path: &str) -> Option<Receipt> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let j = crate::json::parse(text.as_bytes()).ok()?;
+    let strs = |v: Option<&crate::json::Json>| -> Vec<String> { v.map(|a| a.arr().iter().map(|x| x.str().to_string()).collect()).unwrap_or_default() };
+    let mut scripts = Vec::new();
+    for s in j.get("scripts")?.arr() {
+        let out_dir = s.get("out_dir").map(|v| v.str().to_string()).unwrap_or_default();
+        if !out_dir.is_empty() && !std::path::Path::new(&out_dir).is_dir() {
+            return None;
+        }
+        let pairs = |k: &str| -> Vec<(&crate::json::Json, &crate::json::Json)> {
+            s.get(k).map(|a| a.arr().iter().filter_map(|kv| match kv.arr() { [k, v] => Some((k, v)), _ => None }).collect()).unwrap_or_default()
+        };
+        scripts.push(ReceiptScript {
+            path: s.get("path")?.str().to_string(),
+            host: matches!(s.get("host"), Some(crate::json::Json::Bool(true))),
+            out_dir,
+            cfgs: strs(s.get("cfgs")),
+            env: pairs("env").into_iter().map(|(k, v)| (k.str().to_string(), v.str().to_string())).collect(),
+            system: pairs("system").into_iter().map(|(k, v)| (k.str().to_string(), matches!(v, crate::json::Json::Bool(true)))).collect(),
+        });
+    }
+    let lib = match j.get("lib") {
+        Some(l) => {
+            let path = l.get("path")?.str().to_string();
+            if !std::path::Path::new(&path).is_file() {
+                return None;
+            }
+            Some(NativeLib { path, statics: strs(l.get("statics")), crates: strs(l.get("crates")) })
+        }
+        None => None,
+    };
+    Some(Receipt { scripts, lib })
 }
 
 /// The wrapper selects real builds by package name. Selecting one unit therefore
@@ -402,6 +560,9 @@ struct Outputs {
     fw_search: Vec<String>,
     dylibs: Vec<String>,
     frameworks: Vec<String>,
+    /// the program's link arguments (`-C link-arg`s of its binary's rustc command: RUSTFLAGS, the
+    /// cargo config's rustflags, its build scripts' `rustc-link-arg`s), as cargo gave them
+    link_args: Vec<String>,
 }
 
 /// (crate, features) of each build script of the graph: what the native steps read of it
@@ -449,8 +610,13 @@ fn outputs_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<Stri
     let mut dylibs: Vec<String> = Vec::new();
     let mut frameworks: Vec<String> = Vec::new();
     let mut runs: Vec<(String, String)> = Vec::new();
+    let mut link_args: Vec<String> = Vec::new();
     for line in messages.lines() {
         let j = crate::json::parse(line.as_bytes()).map_err(|e| format!("cargo message: {e}"))?;
+        if let Some(a) = j.get("relax_link_args") {
+            link_args = a.arr().iter().map(|x| x.str().to_string()).collect();
+            continue;
+        }
         let (n, v) = id_name_version(j.get("package_id").map(|p| p.str()).unwrap_or(""));
         let Some(&s) = seeds.iter().find(|&&s| {
             let p = &pkg[scripts_of[s].0];
@@ -508,7 +674,7 @@ fn outputs_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<Stri
             None => return Err(format!("--allow-c: a native build script links static library `{}`, but {} is in none of its search paths ({})", name, file, search.join(", "))),
         }
     }
-    Ok(Outputs { scripts, runs, statics, archives, search, fw_search, dylibs, frameworks })
+    Ok(Outputs { scripts, runs, statics, archives, search, fw_search, dylibs, frameworks, link_args })
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -548,20 +714,20 @@ fn optimize_later(g: &Graph, req: &Request, exe: std::path::PathBuf, flags: &[&S
         let m = match run_cargo_with(&pkg, &scripts, &workspace, &package, &relax_dir, &triple, &exe, &flag_refs, &script_pkgs, &lib_pkgs, &seeds, Tier::Optimized) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("makepad-run: --allow-c: the optimized native build failed (the opt-level 0 library stays): {}", e.lines().next().unwrap_or(""));
+                eprintln!("relax: --allow-c: the optimized native build failed (the opt-level 0 library stays): {}", e.lines().next().unwrap_or(""));
                 return;
             }
         };
         let o = match outputs_with(&pkg, &scripts, &seeds, &m) {
             Ok(o) => o,
-            Err(e) => { eprintln!("makepad-run: --allow-c: the optimized native build: {}", e); return; }
+            Err(e) => { eprintln!("relax: --allow-c: the optimized native build: {}", e); return; }
         };
         if said(&o) != want {
-            eprintln!("makepad-run: --allow-c: the optimized native build's scripts said other cfgs or env than the first build's: its library is not taken");
+            eprintln!("relax: --allow-c: the optimized native build's scripts said other cfgs or env than the first build's: its library is not taken");
             return;
         }
         let tmp = format!("{}.opt{}", lib_path, std::process::id());
-        if link(&tmp, &o.archives, &o.search, &o.fw_search, &o.dylibs, &o.frameworks, &triple, resolvable).is_ok() && std::fs::rename(&tmp, &lib_path).is_ok() {
+        if link(&tmp, &o, &triple, resolvable).is_ok() && std::fs::rename(&tmp, &lib_path).is_ok() {
             let _ = std::fs::remove_file(&fast_mark);
             
         } else {
@@ -601,8 +767,16 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
         .map(|p| p.join("makepad-native").join(match tier { Tier::Fast => "fast", Tier::Optimized => "optimized" }).join(format!("{selection:016x}")))
         .unwrap_or_else(|| target.clone());
     if tier == Tier::Fast {
-        eprintln!("makepad run: --allow-c: building native dependencies with cargo (opt-level 0 now, optimized in the background; cached afterwards): {}", script_pkgs.iter().take(8).cloned().collect::<Vec<_>>().join(", "));
+        eprintln!("relax run: --allow-c: building native dependencies with cargo (opt-level 0 now, optimized in the background; cached afterwards): {}", script_pkgs.iter().take(8).cloned().collect::<Vec<_>>().join(", "));
     }
+    // the program's link arguments: the wrapper writes them here, a file per binary or test
+    // harness. A folder of its own per cargo run: the program's stubs depend on its name
+    // (wrapper), so cargo runs them again, and they say the link arguments, even when nothing else
+    // changed
+    let run_id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let link_dir = build.join(format!("relax-link-args.{}.{run_id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&link_dir);
+    std::fs::create_dir_all(&link_dir).map_err(|e| format!("{}: {e}", link_dir.display()))?;
     let mut cmd = Command::new("cargo");
     // cargo runs in the real workspace: nothing of this run crosses
     crate::progenv::scrub_run_facts(&mut cmd);
@@ -624,18 +798,22 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
         .env("CARGO_BUILD_BUILD_DIR", &build)
         .env("CARGO_INCREMENTAL", "0")
         .env("RUSTC_WRAPPER", exe)
-        .env("MAKEPAD_RUN_NATIVE_SCRIPTS", script_pkgs.join(","))
-        .env("MAKEPAD_RUN_NATIVE_LIBS", lib_pkgs.join(","))
+        .env("RELAX_NATIVE_SCRIPTS", script_pkgs.join(","))
+        .env("RELAX_NATIVE_LIBS", lib_pkgs.join(","))
         .env("RUSTC", exe)
-        .env("MAKEPAD_RUN_NATIVE_RUSTC", "rustc")
-        .env("MAKEPAD_RUN_NATIVE_TARGET", triple)
-        .env("MAKEPAD_RUN_NATIVE_BUILD_DIR", &build)
-        .env_remove("MAKEPAD_RUN_AS_RUSTC")
+        .env("RELAX_NATIVE_RUSTC", "rustc")
+        .env("RELAX_NATIVE_TARGET", triple)
+        .env("RELAX_NATIVE_BUILD_DIR", &build)
+        .env("RELAX_NATIVE_LINK_ARGS", &link_dir)
+        .env_remove("RELAX_AS_RUSTC")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let out = cmd.output().map_err(|e| format!("--allow-c needs cargo on PATH to build the native dependencies ({}): {e}", package))?;
+    let out = cmd.output();
+    let link_args = program_link_args(&link_dir, package, flags);
+    let _ = std::fs::remove_dir_all(&link_dir);
+    let out = out.map_err(|e| format!("--allow-c needs cargo on PATH to build the native dependencies ({}): {e}", package))?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     if !out.status.success() {
         // cargo's own messages; a native script's failure is in `compiler-message`s and stderr
@@ -712,11 +890,65 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
             return Err(format!("--allow-c: cargo and Relax resolve `{} {}` with different features (cargo {:?}, relax {:?})", p.1, p.2, built, ours));
         }
     }
+    keep.push_str(&format!("{{\"relax_link_args\":[{}]}}\n", link_args.iter().map(|a| json_string(a)).collect::<Vec<_>>().join(",")));
     Ok(keep)
 }
 
+/// The link arguments the wrapper saw on the rustc command of the program (`wrapper`, a file per
+/// crate of the package's binaries and test harnesses): the binary `--bin` names, else the crate
+/// named after the package, else what they all say alike.
+fn program_link_args(dir: &std::path::Path, package: &str, flags: &[&String]) -> Vec<String> {
+    let units: Vec<(String, String)> = std::fs::read_dir(dir).into_iter().flatten().flatten()
+        .filter_map(|e| Some((e.file_name().to_str()?.to_string(), std::fs::read_to_string(e.path()).ok()?))).collect();
+    let named = flags.iter().position(|f| f.as_str() == "--bin").and_then(|i| flags.get(i + 1)).map(|b| b.as_str())
+        .or_else(|| flags.iter().find_map(|f| f.strip_prefix("--bin=")))
+        .unwrap_or(package).replace('-', "_");
+    let alike = units.first().filter(|(_, t)| units.iter().all(|(_, u)| u == t));
+    let text = units.iter().find(|(n, _)| *n == named).or(alike).map_or("", |(_, t)| t.as_str());
+    text.lines().filter(|l| !l.is_empty()).map(str::to_string).collect()
+}
+
+/// The `-C link-arg=` / `-C link-args=` values of a rustc command line, in order.
+fn link_args_of(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let value = if a == "-C" || a == "--codegen" {
+            i += 1;
+            args.get(i).map(String::as_str)
+        } else {
+            a.strip_prefix("-C").or_else(|| a.strip_prefix("--codegen="))
+        };
+        if let Some(v) = value {
+            if let Some(x) = v.strip_prefix("link-arg=") {
+                out.push(x.to_string());
+            } else if let Some(x) = v.strip_prefix("link-args=") {
+                out.extend(x.split_whitespace().map(str::to_string));
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `s` as a JSON string literal.
+fn json_string(s: &str) -> String {
+    let mut o = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
 fn selection_key(scripts: &[String], libs: &[String]) -> u64 {
-    let mut h = fnv(b"target-compiler-probes-v4-build-dir", 0xcbf29ce484222325);
+    let mut h = fnv(b"target-compiler-probes-v5-link-args", 0xcbf29ce484222325);
     for list in [scripts, libs] {
         h = fnv(b"\xff", h);
         for name in list { h = fnv(name.as_bytes(), h); h = fnv(b"\0", h); }
@@ -876,7 +1108,8 @@ fn library_imports(lib: &str) -> Result<Vec<String>, String> {
     Ok(imports.into_iter().collect())
 }
 
-fn link(lib_path: &str, archives: &[String], search: &[String], fw_search: &[String], dylibs: &[String], frameworks: &[String], triple: &str, resolvable: Resolvable) -> Result<(), String> {
+fn link(lib_path: &str, out: &Outputs, triple: &str, resolvable: Resolvable) -> Result<(), String> {
+    let (archives, search, fw_search, dylibs, frameworks) = (&out.archives, &out.search, &out.fw_search, &out.dylibs, &out.frameworks);
     if let Some(d) = std::path::Path::new(lib_path).parent() {
         let _ = std::fs::create_dir_all(d);
     }
@@ -962,6 +1195,9 @@ fn link(lib_path: &str, archives: &[String], search: &[String], fw_search: &[Str
     for f in frameworks {
         cmd.args(["-framework", f]);
     }
+    // the program's own link arguments, as rustc gives them to the linker for its binary (an rpath
+    // that finds a library of the scripts' search folders at load time)
+    cmd.args(&out.link_args);
     let run = |cmd: &mut Command| -> Result<(), String> {
         let out = cmd.output().map_err(|e| format!("--allow-c: cannot run the C compiler to link the native library: {e}"))?;
         if out.status.success() {
@@ -976,7 +1212,7 @@ fn link(lib_path: &str, archives: &[String], search: &[String], fw_search: &[Str
     if linked.is_ok() {
         let stubs_path = format!("{}.callbacks.o", tmp);
         linked = library_imports(&tmp).and_then(|imports| {
-            let resolved = resolvable(&imports, dylibs, frameworks);
+            let resolved = resolvable(&imports, dylibs, frameworks, search);
             let callbacks: Vec<String> = imports.into_iter().zip(resolved).filter(|(_, r)| !r).map(|(n, _)| n).collect();
             if callbacks.is_empty() {
                 return Ok(());
@@ -1079,21 +1315,21 @@ fn is_target_out_dir(out_dir: &str, cargo_target: &std::path::Path, triple: &str
 /// An explicit target keeps Cargo's host and target script directories separate,
 /// including packages used on both sides with identical features.
 pub fn is_target_rustc_probe(args: &[String]) -> bool {
-    if std::env::var_os("MAKEPAD_RUN_NATIVE_RUSTC").is_none() {
+    if std::env::var_os("RELAX_NATIVE_RUSTC").is_none() {
         return false;
     }
     let Some(first) = args.first() else { return false };
     if std::env::var("RUSTC").is_ok_and(|rustc| first == &rustc) {
         return false;
     }
-    let (Ok(out), Some(target), Ok(triple)) = (std::env::var("OUT_DIR"), std::env::var_os("MAKEPAD_RUN_NATIVE_BUILD_DIR"), std::env::var("MAKEPAD_RUN_NATIVE_TARGET")) else { return false };
+    let (Ok(out), Some(target), Ok(triple)) = (std::env::var("OUT_DIR"), std::env::var_os("RELAX_NATIVE_BUILD_DIR"), std::env::var("RELAX_NATIVE_TARGET")) else { return false };
     is_target_out_dir(&out, std::path::Path::new(&target), &triple)
 }
 
-/// This executable as cargo's `RUSTC_WRAPPER` (`MAKEPAD_RUN_NATIVE_SCRIPTS` set) or as a stubbed
+/// This executable as cargo's `RUSTC_WRAPPER` (`RELAX_NATIVE_SCRIPTS` set) or as a stubbed
 /// build script. Returns the exit code when it acted, None when this is an ordinary start.
 pub fn wrapper() -> Option<i32> {
-    let scripts = std::env::var("MAKEPAD_RUN_NATIVE_SCRIPTS").ok()?;
+    let scripts = std::env::var("RELAX_NATIVE_SCRIPTS").ok()?;
     let args: Vec<String> = std::env::args().collect();
     // a build script stub (cargo runs what the wrapper left as the script): nothing to do
     let stem = std::path::Path::new(&args[0]).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1104,14 +1340,14 @@ pub fn wrapper() -> Option<i32> {
     if args.len() < 2 || std::env::var_os("RUSTC_WRAPPER").is_none() && std::env::var_os("CARGO_PKG_NAME").is_none() {
         return None;
     }
-    let native_rustc = std::env::var("MAKEPAD_RUN_NATIVE_RUSTC").ok();
+    let native_rustc = std::env::var("RELAX_NATIVE_RUSTC").ok();
     let direct = native_rustc.is_some() && std::env::var("RUSTC").is_ok_and(|rustc| args[1] != rustc);
     let rustc = native_rustc.as_ref().unwrap_or(&args[1]);
     let rest = if direct { &args[1..] } else { &args[2..] };
     if direct {
         return Some(match Command::new(rustc).args(rest).status() {
             Ok(s) => s.code().unwrap_or(1),
-            Err(e) => { eprintln!("makepad run: native compiler probe: {}: {}", rustc, e); 1 }
+            Err(e) => { eprintln!("relax run: native compiler probe: {}: {}", rustc, e); 1 }
         });
     }
     let value = |flag: &str| -> Option<String> {
@@ -1135,14 +1371,14 @@ pub fn wrapper() -> Option<i32> {
         Some(n) => {
             let pkg = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
             let list = |v: &str| std::env::var(v).unwrap_or_default().split(',').any(|x| x == pkg);
-            if n.starts_with("build_script_") { scripts.split(',').any(|x| x == pkg) } else { list("MAKEPAD_RUN_NATIVE_LIBS") }
+            if n.starts_with("build_script_") { scripts.split(',').any(|x| x == pkg) } else { list("RELAX_NATIVE_LIBS") }
         }
     };
     if real {
         return Some(match Command::new(rustc).args(rest).status() {
             Ok(s) => s.code().unwrap_or(1),
             Err(e) => {
-                eprintln!("makepad run: native wrapper: cannot run {}: {}", rustc, e);
+                eprintln!("relax run: native wrapper: cannot run {}: {}", rustc, e);
                 1
             }
         });
@@ -1163,6 +1399,15 @@ pub fn wrapper() -> Option<i32> {
         i += 1;
     }
     let types: Vec<String> = rest.iter().enumerate().filter_map(|(i, a)| if a == "--crate-type" { rest.get(i + 1).cloned() } else { a.strip_prefix("--crate-type=").map(str::to_string) }).collect();
+    // the program's binaries and test harnesses: their link arguments, which the native library is
+    // linked with (program_link_args). The stub's dep-info names the run's folder, so the next
+    // cargo run, with a folder of its own, does not take this one as fresh.
+    let capture = std::env::var("RELAX_NATIVE_LINK_ARGS").ok().filter(|_| {
+        std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some() && (types.iter().any(|t| t == "bin") || rest.iter().any(|a| a == "--test"))
+    });
+    if let Some(dir) = &capture {
+        let _ = std::fs::write(std::path::Path::new(dir).join(&name), link_args_of(rest).join("\n"));
+    }
     let emit = value("--emit").unwrap_or_default();
     let json = value("--json").unwrap_or_default().contains("artifacts");
     let dylib_ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
@@ -1199,7 +1444,12 @@ pub fn wrapper() -> Option<i32> {
             }
         } else if *kind == "dep-info" {
             let src = rest.iter().find(|a| a.ends_with(".rs")).cloned().unwrap_or_default();
-            let _ = std::fs::write(path, format!("{}: {}\n", path, src));
+            let mut d = format!("{}: {}\n", path, src);
+            if let Some(dir) = &capture {
+                // rustc's form of an `env!` the crate read (cargo's dep-info parser unescapes it)
+                d.push_str(&format!("\n# env-dep:RELAX_NATIVE_LINK_ARGS={}\n", dir.replace('\\', "\\\\").replace('\n', "\\n")));
+            }
+            let _ = std::fs::write(path, d);
         } else {
             let _ = std::fs::write(path, b"");
         }
@@ -1331,7 +1581,7 @@ fn the_native_prune_keeps_what_the_roots_name() {
     root("00000000000000a1", &workspace, "aaaaaaaaaaaaaaaa", "1111111111111111");
     let relax_dir = dir.to_str().unwrap();
     let flags = vec!["--tests".to_string()];
-    let req = Request { workspace: workspace.to_str().unwrap(), package: "app", cargo_flags: &flags, relax_dir, triple: "x86_64-unknown-linux-gnu", resolvable: |names, _, _| vec![false; names.len()] };
+    let req = Request { workspace: workspace.to_str().unwrap(), package: "app", cargo_flags: &flags, relax_dir, triple: "x86_64-unknown-linux-gnu", resolvable: |names, _, _, _| vec![false; names.len()] };
     let plan = Plan { script_pkgs: Vec::new(), lib_pkgs: Vec::new(), flags: flags.clone(), names: Vec::new(), key: 0xabababababababab, selection: 0x1111111111111111,
         dir: String::new(), messages_path: String::new(), lib_path: String::new(), fast_mark: String::new() };
     write_root(&req, &plan).unwrap();

@@ -29,16 +29,16 @@
 //!    opened as a warm start opens it and inherits what the old one learned, and the Unit's
 //!    compile fields are replaced; the old ones are returned;
 //! 4. the old values are dropped on the monitor's thread, then the heap is trimmed.
-//! `MAKEPAD_RUN_SETTLE_REBUILD=0` turns it off.
+//! `RELAX_SETTLE_REBUILD=0` turns it off.
 
 use super::*;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
-/// On unless MAKEPAD_RUN_SETTLE_REBUILD=0.
+/// On unless RELAX_SETTLE_REBUILD=0.
 pub(crate) fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_SETTLE_REBUILD").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| std::env::var("RELAX_SETTLE_REBUILD").map_or(true, |v| v != "0"))
 }
 
 /// The crate list of this launch (kept: the rebuild restores against it, and the crates added
@@ -215,9 +215,9 @@ fn with_added(prog: &Program, boot: &[crate::preload::PreCrate]) -> Vec<crate::p
 
 fn trace(what: &str) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_SETTLE_TRACE").is_some()) {
+    if *ON.get_or_init(|| std::env::var_os("RELAX_SETTLE_TRACE").is_some()) {
         let (rss, peak, extra) = crate::memstat::process_rss();
-        eprintln!("makepad-run settle rebuild: {what} (t={:.0} ms; rss {} MB, peak {} MB, {})", crate::clock::ms_since_start(), rss >> 20, peak >> 20, extra.split(';').next().unwrap_or(""));
+        eprintln!("relax settle rebuild: {what} (t={:.0} ms; rss {} MB, peak {} MB, {})", crate::clock::ms_since_start(), rss >> 20, peak >> 20, extra.split(';').next().unwrap_or(""));
     }
 }
 
@@ -469,7 +469,7 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
     let rss1 = crate::memstat::resident();
     trace("the old state dropped");
     REBUILDS.fetch_add(1, Ordering::Relaxed);
-    if crate::run::VERBOSE.load(Ordering::Relaxed) || crate::memstat::enabled() { eprintln!("makepad-run settle rebuild at t={:.0} ms: {}, restore {:.1} ms, spill {:.1} ms, replace on the owner {:.1} ms, old state dropped in {:.1} ms; total {:.1} ms; rss {:.0} -> {:.0} MB",
+    if crate::run::VERBOSE.load(Ordering::Relaxed) || crate::memstat::enabled() { eprintln!("relax settle rebuild at t={:.0} ms: {}, restore {:.1} ms, spill {:.1} ms, replace on the owner {:.1} ms, old state dropped in {:.1} ms; total {:.1} ms; rss {:.0} -> {:.0} MB",
         crate::clock::ms_since_start(), encode, restore_ms, spill_ms, replace_ms, drop_ms, ms(t_all), rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0); }
     Outcome::Done
 }
@@ -627,7 +627,7 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
         crate::inspect::flightrec::event("settle.replace", &format!("the replace held the owner {:.1} ms (ms to): {steps}", ms(t_r)), t_r.elapsed().as_micros() as u64, 0);
         if verbose {
             trace(&format!("replace steps (ms to): {steps}"));
-            eprintln!("makepad-run settle rebuild replace (ms to): {steps}");
+            eprintln!("relax settle rebuild replace (ms to): {steps}");
         }
     }
     Ok(old)

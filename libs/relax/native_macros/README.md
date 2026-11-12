@@ -1,6 +1,9 @@
 # Source-matched native proc macros
 
-This package depends on the enclosing Makepad checkout's expansion libraries by path.
+This package depends by path on the expansion libraries of the proc macros it runs natively,
+which this repository carries beside the compiler: Relax's `#[relax_api]` (libs/relax_api) and the
+Makepad project's live_id, micro_serde, script and widget macros (libs/live_id, libs/micro_serde,
+platform/script/derive_impl, widgets/derive_widget_impl).
 The `relax-tokens` feature of `makepad-micro-proc-macro` selects the Relax Rust token model
 for these normal dependencies. Cargo's resolver 2 keeps rustc's host proc-macro builds
 on the standard `proc_macro` API.
@@ -8,7 +11,7 @@ on the standard `proc_macro` API.
 `build.rs` embeds the actual packages' manifests and source files for runtime identity
 checks and generates bindings from those same wrapper sources. It removes only
 proc-macro entry annotations and redirects their token imports. There is no snapshot
-or manual sync step; changing the checkout's sources rebuilds the identity and bindings.
+or manual sync step; changing those sources rebuilds the identity and bindings.
 
 The compiler validates every source and manifest in a macro's dependency closure, its
 edition, feature policy, and dependency aliases before dispatching to this library.
@@ -21,7 +24,7 @@ Expansion implementations have no features; the program's proc-macro helper must
 `relax-tokens` disabled. The live-id library is an unused dependency
 of the widget wrapper, retained for complete graph validation; it is not linked here.
 
-`MAKEPAD_RUN_PARSE_VERIFY=1` compares worker results with fresh
+`RELAX_PARSE_VERIFY=1` compares worker results with fresh
 collection-scope parses, including AST arrays, tokens, source/hygiene maps, macro
 publications, and file preparation. Use it for verification, not timing.
 

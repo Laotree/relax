@@ -76,3 +76,9 @@ fn main() { make_wo(); }
 - Relax: the same warning at 2:31.
 
 Start in types/src/lint_liveness.rs (the span of the binding it reports).
+
+## 6. A constant the trait solver evaluates keeps the solver's typing mode (no repro known)
+
+rustc's `try_evaluate_const` (traits/mod.rs) evaluates in the post-analysis environment whatever
+the solver's mode; Relax's `evaluate_const` (types/src/next_solver/goals.rs) passes the solver's
+own mode (Coherence in the overlap check) for every constant but a repeat count.

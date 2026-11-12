@@ -696,7 +696,7 @@ impl<'a> Lcx<'a> {
                 return;
             }
             let key = crate::provided::key(&self.u.prog, &self.u.tcx, d);
-            self.provided_err(krate, format!("`{}` calls `{}` in JIT-compiled code, but `{}` lives in a provided crate: it works an object rustc allocated with makepad run's std, whose layout differs: mark it #[relax_api] (an op), or make it generic over the type JIT code allocates (an instance of a generic fn is compiled for its caller's type)", key, path, key));
+            self.provided_err(krate, format!("`{}` calls `{}` in JIT-compiled code, but `{}` lives in a provided crate: it works an object rustc allocated with Relax's std, whose layout differs: mark it #[relax_api] (an op), or make it generic over the type JIT code allocates (an instance of a generic fn is compiled for its caller's type)", key, path, key));
         }
     }
 
@@ -1095,7 +1095,7 @@ impl<'a> Lcx<'a> {
             if u.size_overflows(t) {
                 self.err(self.pos, format!("{}values of the type `{}` are too big for the target architecture", relax_front::diagnostics::UNCODED_PREFIX, ts));
             } else {
-                self.err(self.pos, format!("type `{}` is 4 GiB or larger, which makepad run does not lay out yet", ts));
+                self.err(self.pos, format!("type `{}` is 4 GiB or larger, which Relax does not lay out yet", ts));
             }
         }
         l
@@ -1383,7 +1383,7 @@ impl<'a> Lcx<'a> {
                 // unreachable code after a diverging expression legitimately has no value
                 if self.errors.is_empty() && !self.cur_unreachable() {
                     let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
-                    self.err(self.pos, format!("internal: value of `{}` has {} parts, expected {} -- makepad run bug, report it", ts, r.len(), leaves.len()));
+                    self.err(self.pos, format!("internal: value of `{}` has {} parts, expected {} -- Relax bug, report it", ts, r.len(), leaves.len()));
                 }
                 for lf in &leaves[r.len()..] {
                     let d = self.f.vreg(lf.cls);
@@ -1484,7 +1484,7 @@ impl<'a> Lcx<'a> {
         }
     }
 
-    /// MAKEPAD_RUN_FIELD_PROF: one field-access site of the body being lowered (jit.rs field_note).
+    /// RELAX_FIELD_PROF: one field-access site of the body being lowered (jit.rs field_note).
     #[allow(clippy::too_many_arguments)]
     fn field_note(&mut self, t: TyId, adt: &crate::tcx::AdtT, fi: u32, off: u32, fsz: u32, ssz: u32, salign: u32) {
         let prog = &self.u.prog;
@@ -1566,7 +1566,7 @@ impl<'a> Lcx<'a> {
                 } else {
                     l.fields.get(fi as usize).copied()
                 };
-                // MAKEPAD_RUN_FIELD_PROF: a struct field reached through memory, for the hot-field
+                // RELAX_FIELD_PROF: a struct field reached through memory, for the hot-field
                 // layout measurement (jit.rs field_note)
                 if !adt.is_enum && !adt.is_union && matches!(p, Place::Mem(..)) && crate::jit::field_prof_on() {
                     if let (Some(o), Some(ft)) = (off, ft) {
@@ -1578,14 +1578,14 @@ impl<'a> Lcx<'a> {
                     (Some(off), Some(ft)) => (ft, off, var.fields.len()),
                     _ => {
                         let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
-                        self.err(self.pos, format!("internal: no field {} in the layout of `{}` -- makepad run bug, report it", fi, ts));
+                        self.err(self.pos, format!("internal: no field {} in the layout of `{}` -- Relax bug, report it", fi, ts));
                         (self.u.tcx.tys.error, 0, var.fields.len())
                     }
                 }
             }
             _ => {
                 let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
-                self.err(self.pos, format!("internal: field {} of non-aggregate `{}` -- makepad run bug, report it", fi, ts));
+                self.err(self.pos, format!("internal: field {} of non-aggregate `{}` -- Relax bug, report it", fi, ts));
                 return (Place::Regs(Vec::new()), self.u.tcx.tys.error);
             }
         };
@@ -5505,7 +5505,7 @@ impl<'a> Lcx<'a> {
                     let cv = if matches!(k, TyKind::Ptr(..) | TyKind::FnPtr(..)) {
                         match self.const_ptr_val(cs, lf.off) {
                             Some(v) => v,
-                            None => return self.err(self.pos, "a pointer in a constant pattern whose target makepad run cannot name".to_string()),
+                            None => return self.err(self.pos, "a pointer in a constant pattern whose target Relax cannot name".to_string()),
                         }
                     } else {
                         let raw = unsafe { read_raw(c + lf.off as u64, lf.mem) };
@@ -5533,7 +5533,7 @@ impl<'a> Lcx<'a> {
                         let v = self.read_place(place, t);
                         let a = match self.const_ptr_val(cs, 0) {
                             Some(a) => a,
-                            None => return self.err(self.pos, "a string constant pattern whose bytes makepad run cannot name".to_string()),
+                            None => return self.err(self.pos, "a string constant pattern whose bytes Relax cannot name".to_string()),
                         };
                         let l = self.iconst(cl as i64);
                         let r = self.eq_vals(v, Val::L(vec![a, l]), t);
@@ -6756,7 +6756,7 @@ impl<'a> Lcx<'a> {
                 let st = self.body_ty(e);
                 let p = self.to_leaves(v, st);
                 if p.len() != 2 {
-                    self.err(self.pos, "internal: trait object upcast of a value without a vtable -- makepad run bug, report it".to_string());
+                    self.err(self.pos, "internal: trait object upcast of a value without a vtable -- Relax bug, report it".to_string());
                     return self.unit();
                 }
                 let vt = self.f.vreg(Cls::I);
@@ -7069,6 +7069,9 @@ impl<'a> Lcx<'a> {
                 self.want_mut = false;
                 let cur = self.read_place(&pl, pt);
                 let cur = self.to_leaves(cur, pt);
+                if !self.scalar_operands(*op, pt, pt, bt, *a) {
+                    return self.unit();
+                }
                 let r = self.arith(*op, pt, cur[0], rv[0], bt);
                 self.write_place(&pl, pt, Val::L(vec![r]));
                 self.watch_write(*a, &pl, pt);
@@ -8315,6 +8318,36 @@ impl<'a> Lcx<'a> {
             pl = if self.unsized_ty(inner) { Place::Regs(p) } else { Place::Mem(p[0], 0) };
             pt = inner;
         }
+        let it = self.body_ty(i);
+        let item = match self.kind(it) {
+            TyKind::Adt(d, _, _) => self.u.tcx.lang_items.by_def.get(&d).copied(),
+            _ => None,
+        };
+        // What the inline bounds check below does not cover goes through the std `Index` impl
+        // typeck recorded, as every range index does in rustc: a `str` range's ends must be char
+        // boundaries, and an inclusive range panics at an end of usize::MAX and slices from its end
+        // once exhausted (core's into_slice_range). A plain range of an array or slice stays inline.
+        let via_std = match item {
+            Some(LangItem::RangeInclusiveStruct | LangItem::RangeToInclusive) => true,
+            Some(LangItem::Range | LangItem::RangeFrom | LangItem::RangeTo) => matches!(self.kind(pt), TyKind::Str),
+            _ => false,
+        };
+        if via_std {
+            if let Some((m, args)) = self.b.std_index.get(&e.0).cloned() {
+                let args = self.mono_list(args);
+                let (lo, hi) = (self.ast().expr(e).lo, self.ast().expr(e).hi);
+                // the call's location is the brackets, as an overloaded index's
+                let (alo, ilo) = (self.ast().expr(a).hi, self.ast().expr(i).lo);
+                let src = &self.u.prog.files[self.b.file as usize].src;
+                if let Some(k) = (alo..ilo).find(|&k| src.get(k as usize) == Some(&b'[')) {
+                    self.pos = k;
+                }
+                return match self.overloaded_index(m, args, pl, pt, i, t, (lo, hi)) {
+                    (Place::Regs(r), _) => Val::L(r),
+                    _ => self.unit(),
+                };
+            }
+        }
         let (elem_size, base, len) = match self.kind(pt) {
             TyKind::Array(el, n) => {
                 let n = n.try_to_target_usize(&self.u.tcx.tys).expect("normalized array length");
@@ -8335,13 +8368,8 @@ impl<'a> Lcx<'a> {
             },
             _ => return self.unit(),
         };
-        let it = self.body_ty(i);
         let rv = self.lower_expr(i);
         let rv = self.to_leaves(rv, it);
-        let item = match self.kind(it) {
-            TyKind::Adt(d, _, _) => self.u.tcx.lang_items.by_def.get(&d).copied(),
-            _ => None,
-        };
         let (lo, hi) = match item {
             Some(LangItem::Range) => (rv[0], rv[1]),
             Some(LangItem::RangeFrom) => (rv[0], len),
@@ -8410,7 +8438,21 @@ impl<'a> Lcx<'a> {
         let bt = self.body_ty(b);
         let (pa, ta) = self.lower_place(a);
         let ra = self.ref_to_place(&pa, ta);
-        let (pb, tb) = self.lower_place(b);
+        // a right operand coerced to the impl's Rhs is borrowed as the coerced value: `&usize <
+        // &&usize` is `PartialOrd::lt(&a, &(*b as &usize))` (the one `PartialOrd<&B> for &A` impl
+        // fixes Rhs before the operand is coerced, rustc op.rs). Borrowing the operand's own place
+        // handed the impl a `&&&usize` as a `&&usize`, and it compared a pointer with the value
+        // (relax issue 87).
+        let (pb, tb, bt) = match args.get(1) {
+            Some(&rhs) if rhs != bt && self.b.coerce(b.0).is_some() => {
+                let v = self.lower_expr_coerced(b, rhs);
+                (self.val_to_place(v), rhs, rhs)
+            }
+            _ => {
+                let (pb, tb) = self.lower_place(b);
+                (pb, tb, bt)
+            }
+        };
         let rb = self.ref_to_place(&pb, tb);
         let instance = self.resolve_instance(method, args);
         let rta = self.u.tcx.tys.intern(TyKind::Ref(false, at, crate::types::RegionId::ERASED));
@@ -8579,12 +8621,15 @@ impl<'a> Lcx<'a> {
                 let at = self.body_ty(a);
                 let bt = self.body_ty(b);
                 let av = self.lower_expr(a);
-                let (av, _) = self.prim_leaves(av, at);
+                let (av, lt) = self.prim_leaves(av, at);
                 let bv = self.lower_expr(b);
                 let (bv, bt) = self.prim_leaves(bv, bt);
                 if av.is_empty() || bv.is_empty() {
                     let (x, y) = (crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, at), crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, bt));
-                    self.err(self.pos, format!("internal: arithmetic on `{}` and `{}` without values -- makepad run bug, report it", x, y));
+                    self.err(self.pos, format!("internal: arithmetic on `{}` and `{}` without values -- Relax bug, report it", x, y));
+                    return self.dummy_val(t);
+                }
+                if !self.scalar_operands(op, t, lt, bt, a) {
                     return self.dummy_val(t);
                 }
                 let r = self.arith(op, t, av[0], bv[0], bt);
@@ -8953,6 +8998,10 @@ impl<'a> Lcx<'a> {
             }
             ExprKind::Binary(op, a, b) => {
                 let (at, bt) = (self.body_ty(*a), self.body_ty(*b));
+                let (lt, rt) = (self.prim_peeled(at), self.prim_peeled(bt));
+                if !self.scalar_operands(*op, t, lt, rt, *a) {
+                    return self.dummy_val(t);
+                }
                 let av = self.lower_expr(*a);
                 let x = self.wide_parts(av, at);
                 let bv = self.lower_expr(*b);
@@ -8978,6 +9027,9 @@ impl<'a> Lcx<'a> {
                 let (pl, pt) = self.lower_place(*a);
                 self.want_mut = false;
                 let cur = self.read_place(&pl, pt);
+                if !self.scalar_operands(*op, pt, pt, self.prim_peeled(bt), *a) {
+                    return self.unit();
+                }
                 let x = self.wide_parts(cur, pt);
                 if !self.is_wide(pt) && matches!(op, BinOp::Shl | BinOp::Shr) {
                     if self.overflow_checks { self.shift_check(*op, self.int_ty(pt).bits as u32, (y.0, Some(y.1))); }
@@ -9177,6 +9229,35 @@ impl<'a> Lcx<'a> {
             t = inner;
         }
         (r, t)
+    }
+
+    /// `t` with its references to primitives peeled: prim_leaves' type, without the loads.
+    fn prim_peeled(&self, mut t: TyId) -> TyId {
+        while let TyKind::Ref(_, inner, _) = self.kind(t) {
+            if !matches!(self.kind_ref(inner), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Ref(..) | TyKind::FnPtr(..)) {
+                break;
+            }
+            t = inner;
+        }
+        t
+    }
+
+    /// Built-in arithmetic takes primitive scalars of the operator's type `t` (a shift's amount:
+    /// any integer). Anything else reaching IBin/FBin is a typeck gap that computes on an
+    /// address or a mismatched value (`256u32 >> &big` once shifted by the reference's address):
+    /// an internal error at the expression, never a silent result.
+    fn scalar_operands(&mut self, op: BinOp, t: TyId, lt: TyId, rt: TyId, at: ExprId) -> bool {
+        let (kt, kl, kr) = (self.kind(t), self.kind(lt), self.kind(rt));
+        let scalar = matches!(kt, TyKind::Int(_) | TyKind::Float(_)) || (matches!(kt, TyKind::Bool) && matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor));
+        let shift = matches!(op, BinOp::Shl | BinOp::Shr);
+        if scalar && kl == kt && if shift { matches!(kt, TyKind::Int(_)) && matches!(kr, TyKind::Int(_)) } else { kr == kt } {
+            return true;
+        }
+        let s = |l: &Self, x| crate::typeck::ty_to_string(false, &l.u.prog, &l.u.tcx, x);
+        let (x, y, z) = (s(self, lt), s(self, rt), s(self, t));
+        let lo = self.ast().expr(at).lo;
+        self.err(lo, format!("internal: built-in `{:?}` on `{}` and `{}` (operator type `{}`): an operand is not a primitive of the operator's type, a type check gap -- makepad run bug, report it", op, x, y, z));
+        false
     }
 
     /// Arithmetic on primitive operands of type `t` (rhs type `bt` matters for shifts).
@@ -10427,14 +10508,14 @@ impl<'a> Lcx<'a> {
                 }
             }
         }
+        // Only the pointer this call gets is its own memory. The place the result is read from
+        // (call_result_slot's other vreg) is an ordinary slot once the call returns: a later call
+        // it is passed to may keep its address, as `f(&make()).await` does in the future `f`
+        // returns, so the slot is saved across the await (relax issue 81: it stayed in the
+        // poll's frame and the next poll read it after the stack was reused).
         if let (Some(a), Some(c)) = (sret, self.coro.as_mut()) {
             c.call_private.insert(a);
             c.call_sret.insert(a);
-            // the place stays the call's own memory for the points-to analysis (as when it was
-            // the same vreg), but a call it is passed to later does not write it whole
-            if let Some(p) = sret_place {
-                c.call_private.insert(p);
-            }
         }
         if let (Some(_), Callee::Fn(id)) = (sret, &callee) {
             if !self.f.sret_callees.contains(id) {
@@ -12798,7 +12879,7 @@ pub fn takes_caller_loc(u: &Unit, id: u32) -> bool {
 /// array, the shim moves them out and writes the result to the result slot (or the caller's
 /// result address). A shim that caught a panic returns 1: its text is read through the crate's
 /// `__host_last_panic` and raised here as a Relax panic. One that caught this thread's own panic
-/// on its way through the op's frames (makepad_relax_api::CallerPanic) returns 2: it goes on.
+/// on its way through the op's frames (relax_api::CallerPanic) returns 2: it goes on.
 pub fn bridge_func(u: &Unit, d: DefId, name: String, shim: relax_backend::rir::Sym, last_panic: relax_backend::rir::Sym) -> Option<Func> {
     let s = u.tcx.fn_sig(&u.prog, d).cloned()?;
     let ps: Vec<TyId> = s.params.iter().map(|p| u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), *p)).collect();
@@ -12943,9 +13024,9 @@ pub fn forward_func(u: &Unit, ps: &[TyId], ret: TyId, name: String, callee: u32)
     f
 }
 
-pub fn glue_func(u: &mut Unit, kind: u8, t: TyId) -> Func {
+pub fn glue_func(u: &mut Unit, kind: u32, t: TyId) -> Func {
     if kind >= crate::jit::GLUE_CTOR {
-        return ctor_fn(u, (kind - crate::jit::GLUE_CTOR) as u32, t);
+        return ctor_fn(u, kind - crate::jit::GLUE_CTOR, t);
     }
     if kind == crate::jit::GLUE_DROP
         && u.lay.is_unsized(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, t)
@@ -13007,7 +13088,7 @@ pub fn glue_func(u: &mut Unit, kind: u8, t: TyId) -> Func {
 
 /// `fn(fields..) -> Adt` building variant `vi` (tuple structs: 0) of the fn type's return ADT.
 fn ctor_fn(u: &mut Unit, vi: u32, t: TyId) -> Func {
-    let name = fn_name(u, &FnKey::Glue(crate::jit::GLUE_CTOR + vi as u8, t));
+    let name = fn_name(u, &FnKey::Glue(crate::jit::GLUE_CTOR + vi, t));
     let mut f = Func::new(name, 0);
     let b = f.block();
     let (ps, ret) = match u.tcx.tys.kind(t).clone() {
@@ -13694,11 +13775,11 @@ fn rt_divrem128(mode: u64, alo: u64, ahi: u64, blo: u64, bhi: u64) -> WideRet {
 /// State word (rustc's discriminant): 0 unresumed, 1 returned, 2 poisoned (running: a panic
 /// leaves it), 3 + k suspended at point k. A poll with a null context (the coroutine dropped)
 /// runs the drops of its suspension point.
-/// MAKEPAD_RUN_CORO_VERIFY=1: every suspension point's live vregs (the per-vreg walks of
+/// RELAX_CORO_VERIFY=1: every suspension point's live vregs (the per-vreg walks of
 /// coroutine_transform) are checked against the dense block x vreg dataflow they replace.
 fn coro_verify() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("MAKEPAD_RUN_CORO_VERIFY").is_ok_and(|v| v == "1"))
+    *V.get_or_init(|| std::env::var("RELAX_CORO_VERIFY").is_ok_and(|v| v == "1"))
 }
 
 /// The dense backward liveness from one suspension point (its view `seen` / `known`): panics
@@ -13763,17 +13844,17 @@ fn dense_live_check(f: &Func, c: &Coro, nv: usize, seen: &[bool], known: &[Optio
 
 fn coro_transform_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_TRACE").is_ok_and(|v| v.split(',').any(|x| x == "coro")))
+    *ON.get_or_init(|| std::env::var("RELAX_TRACE").is_ok_and(|v| v.split(',').any(|x| x == "coro")))
 }
 
 fn coro_trace_level() -> u8 {
     static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("MAKEPAD_RUN_CORO_TRACE").as_deref() { Ok("2") => 2, Ok("3") => 3, _ => 0 })
+    *ON.get_or_init(|| match std::env::var("RELAX_CORO_TRACE").as_deref() { Ok("2") => 2, Ok("3") => 3, _ => 0 })
 }
 
 fn coro_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_CORO_TRACE").is_some())
+    *ON.get_or_init(|| std::env::var_os("RELAX_CORO_TRACE").is_some())
 }
 
 /// Single definitions of a body's address vregs: a slot's address and slot + constant, by vreg
@@ -13812,7 +13893,7 @@ fn slot_addrs(f: &Func) -> std::collections::HashMap<u32, (u32, i32)> {
 /// `tys`: the types of the body's locals by slot and by register (coro_local_tys), for the state's shape.
 fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::collections::HashMap<u32, Vec<TyId>>, std::collections::HashMap<u32, TyId>)) -> Result<(u32, u32, u64), String> {
     use relax_backend::regalloc::{term_uses, uses_defs};
-    // MAKEPAD_RUN_TRACE=coro: the transform's sizes and phase times (coro-transform line)
+    // RELAX_TRACE=coro: the transform's sizes and phase times (coro-transform line)
     let tr = coro_transform_trace();
     let t_start = std::time::Instant::now();
     let mut t_ph: Vec<(&str, f64)> = Vec::new();
@@ -13820,8 +13901,8 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
     // drop flags whose value is known where they are tested (a value moved out before a
     // suspension point: rustc's maybe-initialized analysis) -- the dead drop would keep the
     // value's slot saved across it
-    let cp = CoroFlags::new(f);
-    let (seen_g, known_g, inn_g) = cp.run(f, c, &[(0, None)]);
+    let cp = CoroFlags::new(f, c);
+    let (seen_g, known_g, inn_g) = cp.run(f, &[(0, None)]);
     for bi in 0..f.blocks.len() {
         if let (true, Some(t), Term::Branch(_, y, n)) = (seen_g[bi], known_g[bi], f.blocks[bi].term.clone()) {
             f.blocks[bi].term = Term::Jump(if t { y } else { n });
@@ -14311,36 +14392,51 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
             skill[bi * wd..(bi + 1) * wd].copy_from_slice(&k);
         }
     }
+    // the least fixpoint of live_in[b] = gen[b] | (union of its successors' live_in & !kill[b]) over
+    // the blocks `seen`, on a worklist: a block is queued at most once at a time, only blocks with
+    // something of their own start queued (the others stay empty until a successor's live-in
+    // grows), and a block whose live-in grows queues its predecessors again (lpreds: every edge, a
+    // superset under `known`). A reverse sweep of every block per change did not finish on a
+    // coroutine of ~180k blocks (relax PR #96)
     let exposed_from = |seen: &[bool], known: &[Option<bool>]| -> Vec<u64> {
         let mut live_in = vec![0u64; nb * wd];
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for bi in (0..nb).rev() {
-                if !seen[bi] {
-                    continue;
-                }
-                let mut out = vec![0u64; wd];
-                let mut succs: Vec<u32> = match (known[bi], &f.blocks[bi].term) {
-                    (Some(t), Term::Branch(_, y, n)) => vec![if t { *y } else { *n }],
-                    (_, t) => t.succs().into_iter().collect(),
-                };
-                for &(pend, resume, cancel) in &c.suspends {
-                    if pend as usize == bi {
-                        succs.push(resume);
-                        succs.push(cancel);
-                    }
-                }
-                for t in succs {
-                    for w in 0..wd {
-                        out[w] |= live_in[t as usize * wd + w];
-                    }
-                }
+        let mut in_work = vec![false; nb];
+        let mut work: Vec<u32> = Vec::new();
+        for bi in 0..nb {
+            if seen[bi] && sgen[bi * wd..(bi + 1) * wd].iter().any(|w| *w != 0) {
+                in_work[bi] = true;
+                work.push(bi as u32);
+            }
+        }
+        let mut out = vec![0u64; wd];
+        while let Some(b) = work.pop() {
+            let bi = b as usize;
+            in_work[bi] = false;
+            out.fill(0);
+            let mut gather = |t: u32| {
                 for w in 0..wd {
-                    let v = sgen[bi * wd + w] | (out[w] & !skill[bi * wd + w]);
-                    if v != live_in[bi * wd + w] {
-                        live_in[bi * wd + w] = v;
-                        changed = true;
+                    out[w] |= live_in[t as usize * wd + w];
+                }
+            };
+            match (known[bi], &f.blocks[bi].term) {
+                (Some(t), Term::Branch(_, y, n)) => gather(if t { *y } else { *n }),
+                (_, t) => t.succs().for_each(&mut gather),
+            }
+            susp_to[bi].iter().for_each(|&t| gather(t));
+            let mut grew = false;
+            for w in 0..wd {
+                let v = sgen[bi * wd + w] | (out[w] & !skill[bi * wd + w]);
+                if v != live_in[bi * wd + w] {
+                    live_in[bi * wd + w] = v;
+                    grew = true;
+                }
+            }
+            if grew {
+                for &p in &lpreds[bi] {
+                    let p = p as usize;
+                    if seen[p] && !in_work[p] {
+                        in_work[p] = true;
+                        work.push(p as u32);
                     }
                 }
             }
@@ -14369,14 +14465,14 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
         seen
     };
     mark("gen/kill");
-    // MAKEPAD_RUN_CORO_TRACE=2: why each slot is saved at each point (3: slots of 1 MB and more)
+    // RELAX_CORO_TRACE=2: why each slot is saved at each point (3: slots of 1 MB and more)
     let coro_why = coro_trace_level();
     for (k, &(pend, resume, cancel)) in c.suspends.iter().enumerate() {
         let mut vs = Vec::new();
         let mut sv = vec![0u64; wd];
         let mut own_addr = vec![false; ns];
         let st: Option<Vec<i64>> = if seen_g[pend as usize] && cp.nt > 0 { Some(inn_g[pend as usize * cp.nt..(pend as usize + 1) * cp.nt].to_vec()) } else { None };
-        let (seen_k, known_k, _) = cp.run(f, c, &[(resume, st.as_deref()), (cancel, st.as_deref())]);
+        let (seen_k, known_k, _) = cp.run(f, &[(resume, st.as_deref()), (cancel, st.as_deref())]);
         // the vregs live at its resume or cancel block in this point's view
         let mut live_rc = vec![0u64; (nv + 63) / 64];
         for &v in &cands[k] {
@@ -14677,7 +14773,7 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
         end = end.max(o);
     }
     let size = end;
-    // MAKEPAD_RUN_CORO_TRACE: the saved slots and values of each coroutine
+    // RELAX_CORO_TRACE: the saved slots and values of each coroutine
     if coro_trace() {
         for s in 0..ns {
             if !saved_at[s].is_empty() {
@@ -15166,14 +15262,21 @@ fn elaborate_drop_flags(f: &mut Func, flags: &[VReg]) {
 struct CoroFlags {
     idx: Vec<usize>,
     nt: usize,
+    /// per block, the resume and cancel blocks of the suspension points it is the Pending block of
+    susp_to: Vec<Vec<u32>>,
 }
 
 const CF_UNSEEN: i64 = i64::MIN;
 const CF_ANY: i64 = i64::MIN + 1;
 
 impl CoroFlags {
-    fn new(f: &Func) -> CoroFlags {
+    fn new(f: &Func, c: &Coro) -> CoroFlags {
         let nv = f.vregs.len();
+        let mut susp_to: Vec<Vec<u32>> = vec![Vec::new(); f.blocks.len()];
+        for &(pend, resume, cancel) in &c.suspends {
+            susp_to[pend as usize].push(resume);
+            susp_to[pend as usize].push(cancel);
+        }
         let mut flaglike = vec![true; nv];
         let (mut us, mut ds) = (Vec::new(), Vec::new());
         for b in &f.blocks {
@@ -15202,14 +15305,14 @@ impl CoroFlags {
         }
         if nt * f.blocks.len().max(1) > 1 << 24 {
             // too big to track: nothing is known
-            return CoroFlags { idx: vec![usize::MAX; nv], nt: 0 };
+            return CoroFlags { idx: vec![usize::MAX; nv], nt: 0, susp_to };
         }
-        CoroFlags { idx, nt }
+        CoroFlags { idx, nt, susp_to }
     }
 
     /// From `starts` (block, its state: a block's in-state from an earlier run, or all
     /// unknown): (blocks reached, decided branches, in-states).
-    fn run(&self, f: &Func, c: &Coro, starts: &[(u32, Option<&[i64]>)]) -> (Vec<bool>, Vec<Option<bool>>, Vec<i64>) {
+    fn run(&self, f: &Func, starts: &[(u32, Option<&[i64]>)]) -> (Vec<bool>, Vec<Option<bool>>, Vec<i64>) {
         let nb = f.blocks.len();
         let nt = self.nt;
         let idx = &self.idx;
@@ -15217,17 +15320,24 @@ impl CoroFlags {
         let mut seen = vec![false; nb];
         let mut known: Vec<Option<bool>> = vec![None; nb];
         let mut work = Vec::new();
+        // a block is on the work stack at most once (a bit per block: a scan of the stack never
+        // finished on a coroutine of ~180k blocks, relax PR #96)
+        let mut in_work = vec![false; nb];
         for (b, st) in starts {
             let b = *b as usize;
             seen[b] = true;
             for k in 0..nt {
                 inn[b * nt + k] = st.map_or(CF_ANY, |s| s[k]);
             }
-            work.push(b as u32);
+            if !in_work[b] {
+                in_work[b] = true;
+                work.push(b as u32);
+            }
         }
         let meet = |a: i64, b: i64| if a == CF_UNSEEN { b } else if b == CF_UNSEEN || a == b { a } else { CF_ANY };
         while let Some(bi) = work.pop() {
             let bi = bi as usize;
+            in_work[bi] = false;
             let mut st = inn[bi * nt..(bi + 1) * nt].to_vec();
             for i in &f.blocks[bi].insts {
                 if let Inst::Iconst(d, x) = i {
@@ -15247,12 +15357,7 @@ impl CoroFlags {
                     t.succs().into_iter().collect()
                 }
             };
-            for &(pend, resume, cancel) in &c.suspends {
-                if pend as usize == bi {
-                    succs.push(resume);
-                    succs.push(cancel);
-                }
-            }
+            succs.extend_from_slice(&self.susp_to[bi]);
             for sb in succs {
                 let sb = sb as usize;
                 let mut ch = !seen[sb];
@@ -15264,7 +15369,8 @@ impl CoroFlags {
                         ch = true;
                     }
                 }
-                if ch && !work.contains(&(sb as u32)) {
+                if ch && !in_work[sb] {
+                    in_work[sb] = true;
                     work.push(sb as u32);
                 }
             }
@@ -15350,7 +15456,7 @@ pub fn valid_moves(out: &mut usize) {
     fn moves_rustc_rejects_are_refused_at_lowering() {
         isolated_test!(moves_rustc_rejects_are_refused_at_lowering);
         crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
-        std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
         let dir = std::env::temp_dir().join(format!("relax-illegal-moves-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("lib.rs");

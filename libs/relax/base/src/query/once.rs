@@ -68,7 +68,7 @@ pub fn init_once<'a, T>(cell: &'a std::sync::OnceLock<T>, compute: impl FnOnce()
                     return v;
                 }
             }
-            panic!("makepad: a declaration asks for itself while this thread computes it (a cycle)");
+            panic!("relax: a declaration asks for itself while this thread computes it (a cycle)");
         }
     };
     let mut value = compute();

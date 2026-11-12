@@ -1,6 +1,6 @@
 # Contributing to Relax
 
-Relax is makepad's Rust JIT: it parses, type-checks and compiles Rust from source at run time.
+Relax is a Rust JIT from the Makepad project: it parses, type-checks and compiles Rust from source at run time.
 The crates are in libs/relax (front end, types, codegen, backend, compiler) and the command-line
 runner, `relax`, is in tools/run/runner. Open gaps with repros: KNOWN_GAPS.md.
 
@@ -63,21 +63,21 @@ The runner reads std from a checkout at run time, not from the binary. When you 
 builds, point each one at its own commit's std:
 
 ```sh
-MAKEPAD_RUN_STD=/path/to/that/checkout/libs/relax/compiler/std /path/to/that/target/release/relax run ...
+RELAX_STD=/path/to/that/checkout/libs/relax/compiler/std /path/to/that/target/release/relax run ...
 ```
 
-Compiled code is kept in the workspace's run dir, `target/makepad-run` (in `CARGO_TARGET_DIR` when
-that is set); `MAKEPAD_RUN_HOME` holds only fetched git repositories. Give each side its own run dir
-with `MAKEPAD_RUN_CACHE_DIR=<dir>` so neither reuses the other's compiled code.
+Compiled code is kept in the workspace's run dir, `target/relax` (in `CARGO_TARGET_DIR` when
+that is set); `RELAX_HOME` holds only fetched git repositories. Give each side its own run dir
+with `RELAX_CACHE_DIR=<dir>` so neither reuses the other's compiled code.
 
 ## Traces
 
-- `MAKEPAD_RUN_TRACE=pmhost`: proc-macro registry and macro world (which crate serves which
+- `RELAX_TRACE=pmhost`: proc-macro registry and macro world (which crate serves which
   derive, sandbox refusals).
-- `MAKEPAD_RUN_TRACE=expand:<macro>`: each expansion of that macro, with its call site.
-- `MAKEPAD_RUN_TRACE=typeck:<fn substring>,lower:<fn substring>`: phase starts for matching fns.
-- `MAKEPAD_RUN_TRACE=bt`: backtraces of internal errors.
-- `--verbose` (or `MAKEPAD_RUN_VERBOSE=1`): phase timings.
+- `RELAX_TRACE=expand:<macro>`: each expansion of that macro, with its call site.
+- `RELAX_TRACE=typeck:<fn substring>,lower:<fn substring>`: phase starts for matching fns.
+- `RELAX_TRACE=bt`: backtraces of internal errors.
+- `--verbose` (or `RELAX_VERBOSE=1`): phase timings.
 - A running program: `relax inspect <pid> help` (panics, why-hung, probes).
 
 ## Shrinking a bug

@@ -8,7 +8,7 @@
 //! Panic parking: a panic in JIT code on a program thread parks with its stack intact for up to
 //! 600 s when someone can decide it: an inspect watcher, `--agent`, devhub, the visible Run panel
 //! in a live session, or an interactive terminal. Otherwise it parks briefly
-//! (MAKEPAD_RUN_PANIC_PARK seconds, default 2), once per site. Someone attaching extends a short
+//! (RELAX_PANIC_PARK seconds, default 2), once per site. Someone attaching extends a short
 //! park to 600 s from its start; a long park never shortens. Resuming or timing out unwinds as
 //! usual. `--unattended` never parks. Every park always prints one line, even under --quiet or
 //! --silent, naming who can decide, the limit, how to inspect it and how --unattended avoids it;
@@ -98,7 +98,7 @@ fn emit_record(kind: &'static str, key: &str, fields: &str) -> (u64, std::sync::
         fields
     );
     if super::AGENT.load(Relaxed) {
-        eprintln!("makepad-run event: {}", json);
+        eprintln!("relax event: {}", json);
     }
     if let Some(w) = super::WATCH.get() {
         crate::zone_alloc::kept_with(|| w.emit(&json));
@@ -155,7 +155,7 @@ pub fn observer_closed() {
 
 /// Retry boundaries are worth setting while someone may resume a panic with `retry`.
 fn retry_update() {
-    MAKEPAD_RUN_RETRY_ON.store(watched() || OBSERVERS.load(Relaxed) > 0 || RUN_STATE_AVAILABLE.load(Relaxed), Relaxed);
+    RELAX_RETRY_ON.store(watched() || OBSERVERS.load(Relaxed) > 0 || RUN_STATE_AVAILABLE.load(Relaxed), Relaxed);
 }
 
 fn wanted(on: &Option<Vec<String>>, kind: &str) -> bool {
@@ -173,7 +173,7 @@ pub fn cmd_watch(req: &Req, out: &mut Out) {
     // A run that does not watch its sources never emits a patch event: say so now, not after
     // the caller's timeout.
     if on.as_ref().is_some_and(|v| v.iter().any(|k| k.starts_with("patch"))) && !crate::layout::LIVE_SESSION.load(Relaxed) {
-        out.line("{\"err\":\"not a live session: this run does not watch its sources, so no edit patches in (a run from a store is live with MAKEPAD_RUN_STORE_LIVE=1 and an edits folder)\"}");
+        out.line("{\"err\":\"not a live session: this run does not watch its sources, so no edit patches in (a run from a store is live with RELAX_STORE_LIVE=1 and an edits folder)\"}");
         return;
     }
     let parked_since = PARKED.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|p| p.seq).min().map_or(u64::MAX, |s| s - 1);
@@ -322,7 +322,7 @@ pub fn parked_frames(id: Option<u64>) -> Option<(u64, Option<crate::domain::Doma
 
 /// boundaries may be set (makepad checks it through `relax_retry_on`): on while watched
 #[no_mangle]
-pub static MAKEPAD_RUN_RETRY_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static RELAX_RETRY_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
     /// retry boundaries open on this thread (their unit names, innermost last)
@@ -366,7 +366,7 @@ pub fn unattended() {
 }
 
 fn park_secs_unwatched() -> u64 {
-    std::env::var("MAKEPAD_RUN_PANIC_PARK").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
+    std::env::var("RELAX_PANIC_PARK").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
 }
 
 /// Who can decide a panic now, including a person reading an interactive terminal.
@@ -523,9 +523,9 @@ pub fn on_panic(info: &crate::jit::PanicInfo, regs: *const u64) {
     let thread_line = thread.replace(['\n', '\r'], " ");
     let message = super::short(&info.message, 120).replace(['\n', '\r'], " ");
     if let Some(who) = deciding {
-        eprintln!("{tool}: panic parked on thread {thread_line} ({message}) for {wait_s} s ({who} can decide): {tool} inspect {pid} panics, then resume P{id} panic; rerun with --unattended to never park");
+        eprintln!("relax: panic parked on thread {thread_line} ({message}) for {wait_s} s ({who} can decide): {tool} inspect {pid} panics, then resume P{id} panic; rerun with --unattended to never park");
     } else {
-        eprintln!("{tool}: panic parked on thread {thread_line} ({message}) for {wait_s} s (nothing attached): {tool} inspect {pid} panics within that time, or rerun with --unattended");
+        eprintln!("relax: panic parked on thread {thread_line} ({message}) for {wait_s} s (nothing attached): {tool} inspect {pid} panics within that time, or rerun with --unattended");
     }
     let t0 = std::time::Instant::now();
     loop {
@@ -535,7 +535,7 @@ pub fn on_panic(info: &crate::jit::PanicInfo, regs: *const u64) {
             if let Some(who) = decider(domain) {
                 watched = true;
                 wait_s = 600;
-                eprintln!("{tool}: panic P{id} on thread {thread_line}: {who} attached; park extended to {wait_s} s from its start");
+                eprintln!("relax: panic P{id} on thread {thread_line}: {who} attached; park extended to {wait_s} s from its start");
             }
         }
         if p.decision.load(SeqCst) != 0 || t0.elapsed().as_secs() >= wait_s || crate::run_threads::run_ending() {
@@ -586,7 +586,7 @@ pub enum StaleDecision {
 /// timeout.
 pub fn park_stale(os_id: u64, domain: Option<crate::domain::DomainId>, message: &str, frames: &[u64]) -> StaleDecision {
     let (id, decision) = park_for_restart(ParkKind::Stale, "stale access", os_id, domain, message, frames,
-        |id| format!("makepad: stale access parked as P{} -- makepad inspect {} panics; resume P{} restart | stop", id, std::process::id(), id));
+        |id| format!("relax: stale access parked as P{} -- {tool} inspect {} panics; resume P{} restart | stop", id, std::process::id(), id, tool = crate::tool_name()));
     let d = match decision { 3 => StaleDecision::Restart, 5 => StaleDecision::Stop, _ => StaleDecision::Ending };
     super::flightrec::panic_decided(id, match d { StaleDecision::Stop => "stale: stop", StaleDecision::Restart => "stale: restart", StaleDecision::Ending => "stale: the run ended" });
     d
@@ -610,7 +610,7 @@ pub enum UpdateParked {
 /// is never restarted by itself.
 pub fn park_update_failed(message: &str, frames: &[u64]) -> UpdateParked {
     let (id, decision) = park_for_restart(ParkKind::UpdateFailed, "update failed", super::threads::self_os_id(), crate::domain::current_app_domain(), message, frames,
-        |id| format!("makepad: {} -- parked as P{} (the app holds still, its state kept): makepad inspect {} panics; resume P{} restart | stop", super::short(message, 200), id, std::process::id(), id));
+        |id| format!("relax: {} -- parked as P{} (the app holds still, its state kept): {tool} inspect {} panics; resume P{} restart | stop", super::short(message, 200), id, std::process::id(), id, tool = crate::tool_name()));
     let d = match decision { 3 => UpdateParked::Restart, 5 => UpdateParked::Stop, _ => UpdateParked::Ending };
     super::flightrec::panic_decided(id, match d { UpdateParked::Restart => "update failed: restart", UpdateParked::Stop => "update failed: stop", UpdateParked::Ending => "update failed: the run ended" });
     d
@@ -701,7 +701,7 @@ pub fn park_compile_error(message: &str, location: &str, frames: &[u64], mut reb
     // Unconditional, like a panic's park line: a run nobody attends (a script, CI) learns here why it
     // waits and that --unattended ends it at the error instead.
     let tool = crate::tool_name();
-    eprintln!("{tool}: compile error parked on thread {} at its call of code that did not compile: edit the code (a live edit that makes it compile resumes the call), or stop: {tool} inspect {} panics (resume P{} stop); rerun with --unattended to end the run at a compile error instead", thread, std::process::id(), id);
+    eprintln!("relax: compile error parked on thread {} at its call of code that did not compile: edit the code (a live edit that makes it compile resumes the call), or stop: {tool} inspect {} panics (resume P{} stop); rerun with --unattended to end the run at a compile error instead", thread, std::process::id(), id);
     let mut epoch = crate::jit::patch_epoch();
     let end = loop {
         match p.decision.load(SeqCst) {
@@ -812,7 +812,7 @@ pub fn cmd_resume(req: &Req, out: &mut Out) {
                     std::thread::sleep(std::time::Duration::from_millis(200));
                     if let Err(e) = crate::reload::restart_run(&why) {
                         crate::hot_failure::restart_failed(&e);
-                        eprintln!("makepad: {why}: {e}");
+                        eprintln!("relax: {why}: {e}");
                     }
                 });
                 match spawned {
@@ -847,7 +847,7 @@ pub fn start() {
     { let _k = crate::zone_alloc::kept();
     let _ = crate::run_threads::spawn("run-inspect-watch", || {
         super::heap::exclude_this_thread();
-        let hang_ms: u64 = std::env::var("MAKEPAD_RUN_INSPECT_HANG_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
+        let hang_ms: u64 = std::env::var("RELAX_INSPECT_HANG_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
         let mut last_cycle: Vec<u64> = Vec::new();
         let mut last_rows: Vec<(u64, u64, u64)> = Vec::new();
         let mut base_rss = 0u64;
@@ -952,7 +952,7 @@ mod tests {
         let home = std::env::temp_dir().join(format!("relax-update-failed-{}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("MAKEPAD_HOME", &home);
-        std::env::set_var("MAKEPAD_RUN_LIVE_LOG", home.join("live.jsonl"));
+        std::env::set_var("RELAX_LIVE_LOG", home.join("live.jsonl"));
         crate::hot_failure::enable();
         crate::hot_failure::edit_ran_for_test();
         let ice = "internal compiler error compiling `f` (slot 7) on its first call: test".to_string();

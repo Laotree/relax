@@ -145,7 +145,7 @@ pub(crate) const DECLARATIONS: QueryId = QueryId { kind: 0, key: ALL_CRATES };
 const ALL_CRATES: u32 = u32::MAX;
 const FILE_BODIES: u16 = 21;
 
-/// Memory report (MAKEPAD_RUN_MEM_REPORT): per typeck owner (first read ms, last read ms, reads,
+/// Memory report (RELAX_MEM_REPORT): per typeck owner (first read ms, last read ms, reads,
 /// reads more than 2 s after the first) -- who still reads a Body after its owner is lowered.
 static TYPECK_READS: relax_session::sync::Mutex<Option<crate::fxhash::HashMap<u32, (u64, u64, u32, u32)>>> = relax_session::sync::Mutex::new(None);
 static TYPECK_READS_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -160,7 +160,7 @@ fn note_typeck_read(def: DefId) {
 }
 
 impl QueryCx {
-    /// memory report (MAKEPAD_RUN_MEM_REPORT): the solver cache and the bound-vars tables
+    /// memory report (RELAX_MEM_REPORT): the solver cache and the bound-vars tables
     pub fn mem_lines(&self, tys: &crate::types::Types) -> Vec<(String, u64)> {
         let mut out = Vec::new();
         let mut p = |name: &str, (n, b): (usize, usize)| out.push((format!("qt {} ({})", name, n), b as u64));
@@ -255,11 +255,11 @@ impl QueryCx {
         if keep_solver {
             let before = solver.cached_len();
             solver.remove_misses();
-            if std::env::var_os("MAKEPAD_RUN_INVALIDATION_TRACE").is_some() { eprintln!("invalidation-trace: solver dropped={} kept={}", before - solver.cached_len(), solver.cached_len()); }
+            if std::env::var_os("RELAX_INVALIDATION_TRACE").is_some() { eprintln!("invalidation-trace: solver dropped={} kept={}", before - solver.cached_len(), solver.cached_len()); }
             return;
         }
         let retired = std::mem::take(solver);
-        if std::env::var_os("MAKEPAD_RUN_INVALIDATION_TRACE").is_some() { eprintln!("invalidation-trace: solver dropped={} kept=0", retired.cached_len()); }
+        if std::env::var_os("RELAX_INVALIDATION_TRACE").is_some() { eprintln!("invalidation-trace: solver dropped={} kept=0", retired.cached_len()); }
         // Freeing a session's worth of solver entries took ~0.4 s of every declaration edit
         // (lead decision 52 R1); nothing reads the retired cache, so it is freed off the
         // edit's critical path. (rustc starts each incremental session with an empty cache.)
@@ -609,8 +609,19 @@ impl Providers<'_> {
         // errors `makepad check` reports are the body's errors too, for the crates the borrow
         // checker covers -- safe code may not dereference raw pointers or forge Send/Sync.
         // (Errors, not a stub body: closures' layouts still read its tables.)
+        // A body that compile-time evaluation runs (a constant, a static, an anonymous constant, a
+        // const fn) never starts the crate's impl checks: they evaluate the impls' constants (an
+        // array length in an impl header of a trait with supertraits), and that evaluation may
+        // need this very body's check, then in progress: a false E0391, and an impl whose header
+        // is an error, which instance selection then finds ambiguous. rustc's body checks never
+        // depend on its impl checks. (The next other body starts them; the app check checks the
+        // impls on its own.)
+        let evaluable = match self.prog.def(def).kind {
+            crate::program::DefKind::Fn | crate::program::DefKind::AssocFn => self.tcx.fn_sig(self.prog, def).is_some_and(|s| s.is_const),
+            _ => true,
+        };
         if body.errors.is_empty() && !crate::lint::enabled() && crate::borrowck::event::admit(self.prog, self.prog.def(def).krate) {
-            let mut errors: Vec<String> = crate::unsafety::run_crate_impl_errors(self.prog, self.tcx, self.prog.def(def).krate).to_vec();
+            let mut errors: Vec<String> = if evaluable { Vec::new() } else { crate::unsafety::run_crate_impl_errors(self.prog, self.tcx, self.prog.def(def).krate).to_vec() };
             errors.extend(crate::unsafety::run_body_errors(self.prog, self.tcx, &body));
             for e in errors { body.errors.push(e); }
         }
@@ -759,7 +770,7 @@ impl Tcx {
         // have done (feed_anon_const_from_holder): done before the query, which a holder's body
         // evaluating the constant enters
         self.feed_anon_const_from_holder(prog, def);
-        match (Providers { tcx: self, prog }).typeck(def) {
+        match crate::body_facts::with_owner(prog, def, || (Providers { tcx: self, prog }).typeck(def)) {
             Ok(body) => body,
             // rustc_query_system cycle_error: E0391, the query's error value
             Err(QueryError::Cycle(_)) => {
@@ -912,18 +923,18 @@ impl Tcx {
 
 }
 
-/// MAKEPAD_RUN_TEST_TYPECK_PANIC=<fn name>[:gandalf]: `typeck`'s provider panics for that body, on
+/// RELAX_TEST_TYPECK_PANIC=<fn name>[:gandalf]: `typeck`'s provider panics for that body, on
 /// the background checker's thread with `:gandalf`, else on every thread (compiler
 /// lazy_reload_tests: a panic in a background check stays in that check).
 fn test_typeck_panic(prog: &Program, def: DefId) {
     static WANT: std::sync::OnceLock<Option<(String, bool)>> = std::sync::OnceLock::new();
-    let want = WANT.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_TEST_TYPECK_PANIC").ok().filter(|w| !w.is_empty()).map(|w| match w.strip_suffix(":gandalf") {
+    let want = WANT.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("RELAX_TEST_TYPECK_PANIC").ok().filter(|w| !w.is_empty()).map(|w| match w.strip_suffix(":gandalf") {
         Some(name) => (name.to_string(), true),
         None => (w, false),
     })));
     if let Some((name, only_gandalf)) = want {
         if prog.name(def) == name.as_str() && (!*only_gandalf || std::thread::current().name() == Some("gandalf")) {
-            panic!("MAKEPAD_RUN_TEST_TYPECK_PANIC: forced panic type-checking `{name}`");
+            panic!("RELAX_TEST_TYPECK_PANIC: forced panic type-checking `{name}`");
         }
     }
 }

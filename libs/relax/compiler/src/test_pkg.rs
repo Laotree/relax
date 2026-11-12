@@ -13,6 +13,7 @@
 //! `--live` keeps one harness target (default: the lib, else the package's only harness target) running across source edits.
 
 pub fn cmd_test_package(args: &[String]) -> i32 {
+    stop::install();
     // Loader options go before each run's package; feature flags go after it.
     let mut i = 0;
     let mut pre: Vec<String> = Vec::new();
@@ -32,7 +33,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
             i += 1;
             if takes_value {
                 let Some(v) = args.get(i) else {
-                    eprintln!("makepad test: {} needs a value", args[i - 1]);
+                    eprintln!("relax test: {} needs a value", args[i - 1]);
                     return 2;
                 };
                 feature_flags.push(v.clone());
@@ -52,7 +53,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         i += 1;
     }
     let Some(package) = args.get(i).cloned() else {
-        eprintln!("usage: makepad test <package> [--lib] [--bins] [--bin <name>] [--tests] [--test <name>] [cargo flags] [-- <test args>]");
+        eprintln!("usage: {tool} test <package> [--lib] [--bins] [--bin <name>] [--tests] [--test <name>] [cargo flags] [-- <test args>]", tool = crate::tool_name());
         return 2;
     };
     let mut lib = false;
@@ -77,7 +78,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
             "--bin" => match words.next() {
                 Some(b) => { bins.get_or_insert_with(Vec::new).push(b.clone()); selections += 1; }
                 None => {
-                    eprintln!("makepad test: --bin needs a target name");
+                    eprintln!("relax test: --bin needs a target name");
                     return 2;
                 }
             },
@@ -88,7 +89,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
             "--test" => match words.next() {
                 Some(t) => { tests.get_or_insert_with(Vec::new).push(t.clone()); selections += 1; }
                 None => {
-                    eprintln!("makepad test: --test needs a target name");
+                    eprintln!("relax test: --test needs a target name");
                     return 2;
                 }
             },
@@ -97,7 +98,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
             "--release" => {}
             "--features" | "-F" => {
                 let Some(v) = words.next() else {
-                    eprintln!("makepad test: {w} needs a value");
+                    eprintln!("relax test: {w} needs a value");
                     return 2;
                 };
                 feature_flags.extend([w.clone(), v.clone()]);
@@ -142,7 +143,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         &feature_flags, bins.as_deref().unwrap_or_default(), tests.as_deref().unwrap_or_default()) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("makepad test: {e}");
+            eprintln!("relax test: {e}");
             return 101;
         }
     };
@@ -154,7 +155,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
                 .chain(targets.iter().filter(|t| t.2).map(|t| ("--test", &t.0))).collect();
             if harness.len() != 1 {
                 let names = harness.iter().map(|(flag, name)| format!("{flag} {name}")).collect::<Vec<_>>().join(", ");
-                eprintln!("makepad test --live: package `{package}` has no lib and {} harness targets ({names}): select one", harness.len());
+                eprintln!("relax test --live: package `{package}` has no lib and {} harness targets ({names}): select one", harness.len());
                 return 2;
             }
             let (flag, name) = harness[0];
@@ -191,7 +192,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         match chosen(all, names) {
             Ok(r) => runs.extend(r.into_iter().map(Some)),
             Err(e) => {
-                eprintln!("makepad test: {e}");
+                eprintln!("relax test: {e}");
                 return 101;
             }
         }
@@ -212,7 +213,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("makepad test: the loader's own path: {e}");
+            eprintln!("relax test: the loader's own path: {e}");
             return 101;
         }
     };
@@ -240,14 +241,26 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         }
         a.push("--".to_string());
         a.extend(prog.iter().cloned());
-        let status = std::process::Command::new(&exe).args(&a).env(makepad_remote::hot::TEST_PACKAGE_ENV, "1").status();
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(&a).env(makepad_remote::hot::TEST_PACKAGE_ENV, "1");
+        // the run leads a process group of its own, which a signal to this command ends (`stop`)
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let status = cmd.spawn().and_then(|mut child| {
+            stop::started(child.id());
+            let status = child.wait();
+            stop::ended();
+            status
+        });
         let c = match status {
             Ok(s) => s.code().unwrap_or(101),
             Err(e) => {
-                eprintln!("makepad test: starting {}: {e}", exe.display());
+                eprintln!("relax test: starting {}: {e}", exe.display());
                 101
             }
         };
+        // ended by a signal: the run it started has ended with it, and so does the command
+        if let Some(sig) = stop::signalled() { return 128 + sig; }
         if c == makepad_remote::hot::NO_TESTS_EXIT {
             unmatched = true;
             continue;
@@ -274,15 +287,66 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         if let Some(lib_target) = has_lib.as_ref().filter(|l| l.doctest) {
             let n = count_doctests(&lib_target.path);
             if n > 0 {
-                eprintln!("makepad test: {n} doc test{} not run (makepad test runs no doc tests; `cargo test --doc` does)", if n == 1 { "" } else { "s" });
+                eprintln!("relax test: {n} doc test{} not run ({tool} test runs no doc tests; `cargo test --doc` does)", if n == 1 { "" } else { "s" }, tool = crate::tool_name());
             }
         }
     }
     code
 }
 
+/// A signal that ends `makepad test` (a driver's terminate: SIGTERM; SIGINT, SIGHUP) ends the
+/// run it started, and everything that run started, before the command exits as the signal asks
+/// (128 + the signal). The run leads a process group of its own and the handler ends that group,
+/// as the build host ends the cargo it started (reload_host.rs end_group). Before, the command
+/// alone ended: a `--live` session's run kept watching the sources and testing every save, about
+/// 1 GB each (relax issue 88).
+mod stop {
+    use std::sync::atomic::{AtomicI32, AtomicU32, Ordering::SeqCst};
+
+    /// the running child's pid (0: none)
+    static CHILD: AtomicU32 = AtomicU32::new(0);
+    /// the signal that ended the command (0: none)
+    static SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+    #[cfg(unix)]
+    extern "C" fn on_signal(sig: i32) {
+        // async-signal-safe: atomics and kill(2)
+        SIGNAL.store(sig, SeqCst);
+        let pid = CHILD.load(SeqCst);
+        if pid != 0 { crate::reload::host::end_group(pid); }
+    }
+
+    pub(super) fn install() {
+        #[cfg(unix)]
+        {
+            extern "C" { fn signal(sig: i32, handler: usize) -> usize; }
+            // SIGHUP, SIGINT, SIGTERM: the same numbers on Linux and macOS
+            for sig in [1, 2, 15] {
+                // SAFETY: the handler does only async-signal-safe work
+                unsafe { signal(sig, on_signal as extern "C" fn(i32) as usize) };
+            }
+        }
+    }
+
+    /// The run `pid` started: a signal from now on ends its group, and one that came before
+    /// it was recorded ends it now.
+    pub(super) fn started(pid: u32) {
+        CHILD.store(pid, SeqCst);
+        if SIGNAL.load(SeqCst) != 0 { crate::reload::host::end_group(pid); }
+    }
+
+    /// The run was waited for: its pid is no longer this command's to signal.
+    pub(super) fn ended() {
+        CHILD.store(0, SeqCst);
+    }
+
+    pub(super) fn signalled() -> Option<i32> {
+        Some(SIGNAL.load(SeqCst)).filter(|&s| s != 0)
+    }
+}
+
 fn live_usage() -> i32 {
-    eprintln!("usage: makepad test --live <package> [--lib | --bin <name> | --test <name>] [-- <test args>] (exactly one harness target; default: the lib, else the package's only one)");
+    eprintln!("usage: {tool} test --live <package> [--lib | --bin <name> | --test <name>] [-- <test args>] (exactly one harness target; default: the lib, else the package's only one)", tool = crate::tool_name());
     2
 }
 

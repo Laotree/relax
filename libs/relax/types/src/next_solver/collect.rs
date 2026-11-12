@@ -59,15 +59,15 @@ static DECLARATION_ENVS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 static LOWER_BOUNDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn count_query(counter: &std::sync::atomic::AtomicU64) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ENABLED.get_or_init(|| std::env::var_os("MAKEPAD_RUN_DECL_COUNTERS").is_some()) {
+    if *ENABLED.get_or_init(|| std::env::var_os("RELAX_DECL_COUNTERS").is_some()) {
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
 impl Tcx {
     pub fn report_declaration_counters() {
-        if std::env::var_os("MAKEPAD_RUN_DECL_COUNTERS").is_some() {
-            eprintln!("makepad-run declarations at first present: declaration_env={} lower_bounds={}",
+        if std::env::var_os("RELAX_DECL_COUNTERS").is_some() {
+            eprintln!("relax declarations at first present: declaration_env={} lower_bounds={}",
                 DECLARATION_ENVS.load(std::sync::atomic::Ordering::Relaxed),
                 LOWER_BOUNDS.load(std::sync::atomic::Ordering::Relaxed));
         }

@@ -150,7 +150,7 @@ pub(crate) fn restart(mut edit: Edit, why: &str) {
     edit.restarted = true;
     LIVE.get().unwrap().0.lock().unwrap().edit = edit;
     if let Err(e) = crate::reload::restart_run(why) {
-        eprintln!("makepad test: {e}");
+        eprintln!("relax test: {e}");
         crate::hot_failure::restart_failed(&e);
         crate::hot_failure::pump();
         if crate::hot_failure::has_error() { std::process::exit(crate::hot_failure::verdict(101).code()); }

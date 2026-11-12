@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// This process is a forked child on its way to exec (set in the child only).
 static EXEC_CHILD: AtomicBool = AtomicBool::new(false);
-/// MAKEPAD_RUN_VERBOSE: a child that reached unbuilt code says which on its stderr
+/// RELAX_VERBOSE: a child that reached unbuilt code says which on its stderr
 static VERBOSE: AtomicBool = AtomicBool::new(false);
 
 pub fn exec_child() -> bool {
@@ -69,7 +69,7 @@ thread_local! {
 /// or code memory is touched: the module's header), and the child is marked and recorded.
 pub(crate) extern "C" fn relax_fork_exec() -> i32 {
     static ENV: std::sync::Once = std::sync::Once::new();
-    ENV.call_once(|| VERBOSE.store(std::env::var_os("MAKEPAD_RUN_VERBOSE").is_some_and(|v| v != "0"), Ordering::Relaxed));
+    ENV.call_once(|| VERBOSE.store(std::env::var_os("RELAX_VERBOSE").is_some_and(|v| v != "0"), Ordering::Relaxed));
     let t = table();
     let k = t.and_then(|t| t.iter().position(|e| e[0].compare_exchange(0, CLAIMED, Ordering::SeqCst, Ordering::SeqCst).is_ok()));
     if let (Some(t), Some(k)) = (t, k) {
@@ -116,7 +116,7 @@ pub(crate) extern "C" fn relax_fork_exec_done(pid: i32) -> u32 {
     }
     match unbuilt {
         Some(slot) => {
-            crate::jit::with_slot_name(slot, &mut |n| eprintln!("makepad run: a forked child ended at `{}`, not built before its fork: built now, forking again", String::from_utf8_lossy(n)));
+            crate::jit::with_slot_name(slot, &mut |n| eprintln!("relax run: a forked child ended at `{}`, not built before its fork: built now, forking again", String::from_utf8_lossy(n)));
             crate::jit::precompile_from(slot);
             1
         }
@@ -128,7 +128,7 @@ pub(crate) extern "C" fn relax_fork_exec_done(pid: i32) -> u32 {
 /// built before the fork. Compiling here could wait for good on a lock another thread held at
 /// the fork, so the child ends at once (exit 127), with the function's name in its entry: the
 /// parent builds it and std forks again (`relax_fork_exec_done`). Async-signal-safe: atomics,
-/// _exit; the name goes to stderr only with MAKEPAD_RUN_VERBOSE (read before the fork).
+/// _exit; the name goes to stderr only with RELAX_VERBOSE (read before the fork).
 pub(crate) fn child_reached_unbuilt(slot: u32) -> ! {
     let k = ENTRY.try_with(|e| e.get()).unwrap_or(usize::MAX);
     if let Some(t) = table().filter(|_| k < ENTRIES) {
@@ -143,7 +143,7 @@ pub(crate) fn child_reached_unbuilt(slot: u32) -> ! {
     if !VERBOSE.load(Ordering::Relaxed) {
         crate::os::thread::exit_now(127)
     }
-    put(b"makepad run: a forked child reached `");
+    put(b"relax run: a forked child reached `");
     crate::jit::with_slot_name(slot, &mut |n| put(&n[..n.len().min(300)]));
     put(b"` before its exec, and it was not built before the fork: the child of a spawn never compiles (it has only the forking thread; locks other threads held stay held) -- it ends (exit 127), and the spawn builds it and forks again\n");
     crate::os::thread::exit_now(127)

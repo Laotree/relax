@@ -1,7 +1,7 @@
 //! Provided crates (local/plans/loader-core.md section 8): a crate rustc built into the binary
 //! that runs Relax (the `makepad` loader builds makepad-script into itself). Relax still loads
 //! its source (types, signatures, generic and inline bodies) but binds the fns the crate marks
-//! `#[relax_api]` (makepad-relax-api) to the compiled code: each gets a bridge body
+//! `#[relax_api]` (relax-api) to the compiled code: each gets a bridge body
 //! (lower::bridge_func) with Relax's own ABI that packs its arguments into one uniform C call,
 //! `extern "C" fn(args: *const *mut u8, ret: *mut u8) -> u32`, of the wrapper the attribute
 //! generated into the crate. Callers, fn pointers and vtables need nothing else: the slot is an
@@ -30,7 +30,7 @@ use relax_session::sync::Mutex;
 
 /// A generated shim: arguments moved out of `args[i]`, the result written to `ret`; 0 = returned,
 /// 1 = panicked (the message is then read with the crate's LastPanicFn), 2 = the calling thread's
-/// own panic unwound through it (makepad_relax_api::CallerPanic: the caller goes on with it).
+/// own panic unwound through it (relax_api::CallerPanic: the caller goes on with it).
 pub type ShimFn = unsafe extern "C" fn(*const *mut u8, *mut u8) -> u32;
 /// Writes the text of the last panic a shim caught on this thread: (ptr, len), valid until the
 /// thread's next shim call.
@@ -89,7 +89,7 @@ pub(crate) fn registered(name: &str) -> bool {
 }
 
 /// Registers a provided crate (before `cli_main`): its `#[relax_api]` entries as the loader read
-/// them from its own binary (makepad_relax_api::entries), and the panic-text accessor.
+/// them from its own binary (relax_api::entries), and the panic-text accessor.
 pub fn register(
     name: &str,
     shims: HashMap<String, Shim>,
@@ -580,7 +580,7 @@ pub fn layout_deps(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, out: &mut Vec
     }
 }
 
-/// The key an op is registered under, as `#[relax_api]` records it (makepad-relax-api's
+/// The key an op is registered under, as `#[relax_api]` records it (relax-api's
 /// key_code): a trait impl's method `<T as Trait>::m`, an inherent method `<T>::m` (T as
 /// `type_name` prints it), a free fn its path -- [`norm`]ed.
 pub fn key(prog: &Program, tcx: &Tcx, d: DefId) -> String {

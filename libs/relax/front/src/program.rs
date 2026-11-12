@@ -592,8 +592,9 @@ pub struct Program {
     parse_reuse: HashMap<u32, std::sync::Arc<crate::parse_work::Reuse>>,
     /// files read and lexed by the macro prescan, consumed by load_file
     pub prelexed: HashMap<String, (Vec<u8>, Vec<crate::lexer::Tok>)>,
-    /// glob lookups after import resolution: (module, name, type ns) -> result
-    pub glob_cache: crate::conc::MemoMap<(u32, Sym, bool), Option<(DefId, BindVis)>>,
+    /// glob lookups after import resolution: (module, name, type ns) -> result, with the import
+    /// uses the lookup went through (`MemoUses`)
+    pub glob_cache: crate::conc::MemoMap<(u32, Sym, bool), (Option<(DefId, BindVis)>, MemoUses)>,
     /// `glob_ambiguity` answers once imports are resolved: (module, name, namespace, used from, skip_direct)
     pub glob_amb_cache: crate::conc::MemoMap<(u32, Sym, bool, bool), u8>,
     /// precise lookups of a name in a glob's module (what `glob_ambiguity` compares) once imports are resolved
@@ -608,8 +609,9 @@ pub struct Program {
     /// the import replay's macro namespace of the checked modules (rsim.rs `macro_table`)
     pub sim_macros: Option<HashMap<(u32, Sym), rsim::MacBinding>>,
     /// lexical lookups (`lookup_in_scope`) once imports are resolved: (module, name, ns_type);
-    /// cleared whenever a binding is defined or imports are resolved again
-    scope_cache: crate::conc::MemoMap<(u32, Sym, bool), Option<DefId>>,
+    /// cleared whenever a binding is defined or imports are resolved again; with the import uses
+    /// the lookup went through (`MemoUses`)
+    pub scope_cache: crate::conc::MemoMap<(u32, Sym, bool), (Option<DefId>, MemoUses)>,
     /// the import bindings (module, bound name, type namespace) and the glob imports (module,
     /// glob target) a name resolution went through (rustc_resolve `record_use`); recorded only
     /// while `record_import_uses` is on (`makepad check`)
@@ -630,7 +632,7 @@ pub struct Program {
     pub imports_done: bool,
     /// Rust file selection: imports left unresolved because their lookup stops in
     /// a skipped module (or one that depends on such an import), with the name
-    /// each would bind (None: a glob). Used only by MAKEPAD_RUN_LAZY_VERIFY.
+    /// each would bind (None: a glob). Used only by RELAX_LAZY_VERIFY.
     pub deferred_imports: Vec<(u32, Option<Sym>)>,
     /// Rust file selection: modules whose file was skipped -> (file, its children's directory,
     /// is a mod.rs). load_deferred_module loads one after boot.
@@ -1536,9 +1538,9 @@ impl Program {
                         .map(|(token, (a, b))| format!(" at token {}: lazy {a:?}, eager {b:?}", token + 1)).unwrap_or_default();
                     format!("\nfirst differing source: {}{difference}", complete.file_paths[i])
                 }).unwrap_or_default();
-            return Err(format!("MAKEPAD_RUN_LAZY_VERIFY: complete program items, IDs, resolutions, or diagnostics differ from eager{detail}{source}"));
+            return Err(format!("RELAX_LAZY_VERIFY: complete program items, IDs, resolutions, or diagnostics differ from eager{detail}{source}"));
         }
-        if complete.file_paths != eager.file_paths { return Err("MAKEPAD_RUN_LAZY_VERIFY: file order differs from eager".into()); }
+        if complete.file_paths != eager.file_paths { return Err("RELAX_LAZY_VERIFY: file order differs from eager".into()); }
         for (left, right) in complete.files.iter().zip(&eager.files) { verify_file(left, right); }
         // Compare the actual lazy result as well. Completing the graph must not
         // mask a changed macro expansion, a missing import, or a different binding.
@@ -1548,7 +1550,7 @@ impl Program {
             let krate = self.file_crate[file_index];
             let occurrence = occurrences.entry((krate, path)).or_insert(0);
             let Some((i, _)) = eager.file_paths.iter().enumerate().filter(|(i, p)| *p == path && eager.file_crate[*i] == krate).nth(*occurrence) else {
-                return Err(format!("MAKEPAD_RUN_LAZY_VERIFY: lazy-only file {path}"));
+                return Err(format!("RELAX_LAZY_VERIFY: lazy-only file {path}"));
             };
             *occurrence += 1;
             verify_file(file, &eager.files[i]);
@@ -1559,14 +1561,14 @@ impl Program {
         if actual != expected {
             let first = actual.iter().find(|(key, values)| expected.get(*key) != Some(*values));
             let detail = first.map(|(key, values)| format!("\n{key}\nlazy: {values:?}\neager: {:?}", expected.get(key))).unwrap_or_default();
-            return Err(format!("MAKEPAD_RUN_LAZY_VERIFY: a reached module resolves differently from eager{detail}"));
+            return Err(format!("RELAX_LAZY_VERIFY: a reached module resolves differently from eager{detail}"));
         }
         let errors: Vec<_> = eager.errors.iter().filter(|error| reached.iter().any(|path| error.starts_with(path))).collect();
         if self.errors.iter().collect::<Vec<_>>() != errors {
-            return Err("MAKEPAD_RUN_LAZY_VERIFY: reached-file diagnostics differ from eager".into());
+            return Err("RELAX_LAZY_VERIFY: reached-file diagnostics differ from eager".into());
         }
         if self.session.options.rs_lazy && self.language_snapshot() != eager.language_snapshot() {
-            return Err("MAKEPAD_RUN_LAZY_VERIFY: global language items or their diagnostics differ from eager".into());
+            return Err("RELAX_LAZY_VERIFY: global language items or their diagnostics differ from eager".into());
         }
         let (reached, total) = plan.counts();
         eprintln!("rust-lazy-verify: passed; reached={reached} total={total}; items, IDs, ASTs, resolutions, diagnostics and available indexes match");
@@ -2147,8 +2149,9 @@ impl Program {
     pub fn memo_mem_lines(&self) -> Vec<(String, u64)> {
         let mut out = Vec::new();
         let mut push = |name: &str, (n, b): (usize, usize)| out.push((format!("program {} ({})", name, n), b as u64));
-        push("scope_cache", self.scope_cache.mem_stats(|_, _| 0));
-        push("glob_cache", self.glob_cache.mem_stats(|_, _| 0));
+        let uses = |v: &MemoUses| v.as_ref().map_or(0, |u| u.len() * std::mem::size_of::<MemoUse>());
+        push("scope_cache", self.scope_cache.mem_stats(|_, v| uses(&v.1)));
+        push("glob_cache", self.glob_cache.mem_stats(|_, v| uses(&v.1)));
         push("trait_bind_cache", self.trait_bind_cache.mem_stats(|_, v| 40 + v.capacity() * std::mem::size_of::<(DefId, BindVis)>()));
         push("trait_scope", self.trait_scope.mem_stats(|_, v| 64 + v.capacity() * 5));
         out
@@ -2345,7 +2348,7 @@ impl Program {
         self.declaration_versions.insert(new, declarations);
         let t_collect = std::time::Instant::now();
         let collected = self.collect_version_definitions(new, !same_scopes, true, visible);
-        if std::env::var_os("MAKEPAD_RUN_COMMIT_TRACE").is_some() {
+        if std::env::var_os("RELAX_COMMIT_TRACE").is_some() {
             eprintln!("commit-trace: save {:.2} ms, collect definitions {:.2} ms, rest {:.2} ms", save_ms, t_collect.elapsed().as_secs_f64() * 1e3, t_save.elapsed().as_secs_f64() * 1e3 - save_ms - t_collect.elapsed().as_secs_f64() * 1e3);
         }
         if let Err(error) = collected {
@@ -3869,12 +3872,12 @@ impl Program {
     /// the missed name.
     pub fn misses_to_load(&self, misses: &[(u32, String)]) -> Vec<u32> {
         let mut mods = Vec::new();
-        let trace = std::env::var_os("MAKEPAD_RUN_DEFERRED_TRACE").is_some();
+        let trace = std::env::var_os("RELAX_DEFERRED_TRACE").is_some();
         for (m, name) in misses {
             let skipped = self.skipped_files.contains_key(m);
             let declares = skipped && self.skipped_declares(*m, name);
             if trace {
-                eprintln!("makepad-run deferred: miss `{}` in {} ({})", name, self.def_path(self.mods[*m as usize].def),
+                eprintln!("relax deferred: miss `{}` in {} ({})", name, self.def_path(self.mods[*m as usize].def),
                     if !skipped { "not skipped" } else if declares { "load" } else { "outline does not bind it" });
             }
             if !mods.contains(m) && declares { mods.push(*m); }
@@ -4143,16 +4146,16 @@ impl Program {
         // Scope/trait-scope also read the implicit prelude. A changed prelude
         // therefore invalidates those scopes even without an explicit glob edge.
         let prelude_changed = self.prelude_modules().iter().any(|m| invalid.contains(m));
-        let scope = retain_load_memos(&mut self.scope_cache, |(m, _, _), v| !prelude_changed && !invalid.contains(m) && v.is_some());
-        let glob = retain_load_memos(&mut self.glob_cache, |(m, _, _), v| !invalid.contains(m) && v.is_some());
+        let scope = retain_load_memos(&mut self.scope_cache, |(m, _, _), v| !prelude_changed && !invalid.contains(m) && v.0.is_some());
+        let glob = retain_load_memos(&mut self.glob_cache, |(m, _, _), v| !invalid.contains(m) && v.0.is_some());
         let trait_bind = retain_load_memos(&mut self.trait_bind_cache, |m, v| !invalid.contains(m) && !v.is_empty());
         let trait_scope = retain_load_memos(&mut self.trait_scope, |m, v| !prelude_changed && !invalid.contains(m) && !v.is_empty());
         self.imports_done = true;
         self.load_graph = Some(graph);
-        if std::env::var_os("MAKEPAD_RUN_DEFERRED_TRACE").is_some() {
+        if std::env::var_os("RELAX_DEFERRED_TRACE").is_some() {
             let kept = scope.0 + glob.0 + trait_bind.0 + trait_scope.0;
             let dropped = scope.1 + glob.1 + trait_bind.1 + trait_scope.1;
-            eprintln!("makepad-run deferred: front-load {} imports_retried={} imports_done={} settle_retries={} wait_modules={} modules_invalidated={} cache_kept={} cache_dropped={} prelude_changed={} scope={:?} glob={:?} trait_bind={:?} trait_scope={:?} index_built={}",
+            eprintln!("relax deferred: front-load {} imports_retried={} imports_done={} settle_retries={} wait_modules={} modules_invalidated={} cache_kept={} cache_dropped={} prelude_changed={} scope={:?} glob={:?} trait_bind={:?} trait_scope={:?} index_built={}",
                 self.def_path(self.mods[m as usize].def), retried, completed, settled, affected.len(),
                 if prelude_changed { self.mods.len() } else { invalid.len() }, kept, dropped, prelude_changed,
                 scope, glob, trait_bind, trait_scope, indexed);
@@ -4318,7 +4321,9 @@ impl Program {
                 tdef = self.lookup_in_scope(module, last, true);
                 vdef = if self.imports[i].bound & BOUND_SELF_ONLY != 0 { None } else { self.lookup_in_scope(module, last, false) };
             }
-        } else if segs.len() == 1 && last_kind != SegKind::Ident {
+        } else if last_kind != SegKind::Ident {
+            // a path that ends in a keyword names a module: `use super as p;`, `use crate as c;`,
+            // `use super::super as a;`, `use self::super::{self as b};`
             let m = match self.resolve_mod_path(module, global, &segs, edition < 2018, true) {
                 Some(m) => m,
                 None => return false,
@@ -4605,6 +4610,13 @@ impl Program {
         RECORD_IMPORT_USES.load(std::sync::atomic::Ordering::Relaxed) && self.uses_stretch == Some(RECORD_STRETCH.load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    /// Merges a body's captured resolutions into the sets read by the unused-import passes.
+    pub fn add_import_uses(&self, u: &ImportUses) {
+        if !u.import.is_empty() { self.import_used.lock().unwrap_or_else(|e| e.into_inner()).extend(u.import.iter().copied()); }
+        if !u.glob.is_empty() { self.glob_used.lock().unwrap_or_else(|e| e.into_inner()).extend(u.glob.iter().copied()); }
+        if !u.ext.is_empty() { self.extern_used.lock().unwrap_or_else(|e| e.into_inner()).extend(u.ext.iter().copied()); }
+    }
+
     /// Whether a resolution went through the import binding `name` of module `m`.
     pub fn import_binding_used(&self, m: u32, name: Sym) -> bool {
         let u = self.import_used.lock().unwrap_or_else(|e| e.into_inner());
@@ -4810,7 +4822,7 @@ impl Program {
         let krate = self.mods[module as usize].krate;
         for (n, c) in &self.crates[krate as usize].deps {
             if *n == name {
-                if record_import_uses() { self.extern_used.lock().unwrap_or_else(|e| e.into_inner()).insert((krate, name)); }
+                if record_import_uses() && !record_import_use(|u| u.ext.push((krate, name))) { self.extern_used.lock().unwrap_or_else(|e| e.into_inner()).insert((krate, name)); }
                 return Some(*c);
             }
         }
@@ -4893,11 +4905,16 @@ impl Program {
     pub fn resolve_mod_path(&self, module: u32, global: bool, segs: &[(SegKind, Sym)], from_root: bool, in_use: bool) -> Option<DefId> {
         let krate = self.mods[module as usize].krate;
         let mut cur: Option<DefId> = None;
+        // rustc_resolve ident.rs resolve_path_with_ribs: `super` follows only `self` and other
+        // `super`s (`::super`, `crate::super` and `a::super` fail)
+        let mut allow_super = !global;
         for (i, (kind, name)) in segs.iter().enumerate() {
+            allow_super &= matches!(kind, SegKind::SelfValue | SegKind::Super);
             let next = if i == 0 {
                 match kind {
                     SegKind::Crate => Some(self.mods[self.crates[krate as usize].root_mod as usize].def),
                     SegKind::SelfValue => Some(self.mods[self.mods[module as usize].normal as usize].def),
+                    SegKind::Super if !allow_super => return None,
                     SegKind::Super => {
                         let n = self.mods[module as usize].normal;
                         let p = self.mods[n as usize].parent_mod?;
@@ -4938,7 +4955,7 @@ impl Program {
                 match kind {
                     SegKind::Super => {
                         let d = self.def(c);
-                        if d.kind != DefKind::Mod {
+                        if !allow_super || d.kind != DefKind::Mod {
                             return None;
                         }
                         let p = self.mods[d.sub as usize].parent_mod?;
@@ -5014,36 +5031,39 @@ impl Program {
         let cacheable = self.imports_done && !q.precise && !self.mods[m as usize].globs.is_empty()
             && !self.mods[m as usize].values.contains_key(&name) && !self.mods[m as usize].types.contains_key(&name);
         if cacheable {
-            if let Some(r) = self.glob_cache.get(&(m, name, ns_type)) {
+            if let Some(r) = self.glob_cache.with(&(m, name, ns_type), memo_hit).flatten() {
                 return r;
             }
         }
         // first found wins between globs, so an answer can change once more after it is
         // found; the passes are bounded by the cycle (each pass settles at least one more
         // module of it) -- the bound only guards against a non-converging glob graph
-        for pass in 0.. {
-            q.memo.clear();
-            q.hits.clear();
-            q.tainted.clear();
-            let r = self.lookup_in_module_pass(m, name, ns_type, q);
-            let stale = q.hits.iter().any(|(x, given)| q.memo.get(x).map_or(false, |fin| fin != given));
-            if !stale || pass > q.prev.len() + 1 {
-                if cacheable && !quiet_lookups() {
-                    // (a final answer of the pass is there already)
-                    self.glob_cache.insert_first((m, name, ns_type), r);
+        let (r, uses) = self.memo_lookup(|| {
+            for pass in 0.. {
+                q.memo.clear();
+                q.hits.clear();
+                q.tainted.clear();
+                let r = self.lookup_in_module_pass(m, name, ns_type, q);
+                let stale = q.hits.iter().any(|(x, given)| q.memo.get(x).map_or(false, |fin| fin != given));
+                if !stale || pass > q.prev.len() + 1 {
+                    return r;
                 }
-                return r;
+                q.prev = std::mem::take(&mut q.memo);
             }
-            q.prev = std::mem::take(&mut q.memo);
+            unreachable!()
+        });
+        if cacheable && !quiet_lookups() {
+            // (a final answer of the pass is there already)
+            memo_put(&self.glob_cache, (m, name, ns_type), (r, uses));
         }
-        unreachable!()
+        r
     }
 
     fn lookup_in_module_pass(&self, m: u32, name: Sym, ns_type: bool, q: &mut GlobQuery) -> Option<(DefId, BindVis)> {
         let md = &self.mods[m as usize];
         let direct = if ns_type { md.types.get(&name) } else { md.values.get(&name) };
         if let Some(&d) = direct {
-            if record_import_uses() && md.import_pub.contains_key(&(name, ns_type)) { self.import_used.lock().unwrap_or_else(|e| e.into_inner()).insert((m, name, ns_type)); }
+            if record_import_uses() && md.import_pub.contains_key(&(name, ns_type)) && !record_import_use(|u| u.import.push((m, name, ns_type))) { self.import_used.lock().unwrap_or_else(|e| e.into_inner()).insert((m, name, ns_type)); }
             return Some((d, if q.precise { self.precise_vis(m, name, ns_type, d) } else { self.binding_vis(m, name, ns_type, d) }));
         }
         if md.globs.is_empty() {
@@ -5061,13 +5081,13 @@ impl Program {
         // through globs: converged answers of earlier queries (glob graphs are wide and deep)
         let cacheable = self.imports_done && !q.precise;
         if cacheable {
-            if let Some(r) = self.glob_cache.get(&(m, name, ns_type)) {
+            if let Some(r) = self.glob_cache.with(&(m, name, ns_type), memo_hit).flatten() {
                 return r;
             }
         }
         let (hits, taints) = (q.hits.len(), q.taints);
         q.open.push(m);
-        let r = self.lookup_in_module_globs(m, name, ns_type, q);
+        let (r, uses) = self.memo_lookup(|| self.lookup_in_module_globs(m, name, ns_type, q));
         q.open.pop();
         q.memo.insert(m, r);
         // an answer that read no module still being looked through (directly or through an
@@ -5076,7 +5096,7 @@ impl Program {
         if q.hits.len() != hits || q.taints != taints {
             q.tainted.insert(m);
         } else if cacheable && !quiet_lookups() {
-            self.glob_cache.insert_first((m, name, ns_type), r);
+            memo_put(&self.glob_cache, (m, name, ns_type), (r, uses));
         }
         r
     }
@@ -5113,7 +5133,7 @@ impl Program {
                 }
                 let gv = if gpub { None } else { Some(md.normal) };
                 let v = self.vis_min(gv, v);
-                if record_import_uses() { self.glob_used.lock().unwrap_or_else(|e| e.into_inner()).insert((m, g)); }
+                if record_import_uses() && !record_import_use(|u| u.glob.push((m, g))) { self.glob_used.lock().unwrap_or_else(|e| e.into_inner()).insert((m, g)); }
                 match best {
                     None => best = Some((d, v)),
                     Some((bd, bv)) => {
@@ -5262,13 +5282,37 @@ impl Program {
         if !self.imports_done || !self.body_memos.load(std::sync::atomic::Ordering::Relaxed) {
             return self.lookup_in_scope_uncached(module, name, ns_type);
         }
-        if let Some(r) = self.scope_cache.get(&(module, name, ns_type)) {
+        if let Some(r) = self.scope_cache.with(&(module, name, ns_type), memo_hit).flatten() {
             if r.is_none() { self.note_scope_miss(module, name); }
             return r;
         }
-        let r = self.lookup_in_scope_uncached(module, name, ns_type);
-        if !quiet_lookups() { self.scope_cache.insert((module, name, ns_type), r); }
+        let (r, uses) = self.memo_lookup(|| self.lookup_in_scope_uncached(module, name, ns_type));
+        if !quiet_lookups() { memo_put(&self.scope_cache, (module, name, ns_type), (r, uses)); }
         r
+    }
+
+    /// Lookup `f` for a memo: with the import uses it goes through when uses are recorded. They
+    /// go where its own records would have gone and come back for the memo entry: in this
+    /// thread's capture they are what `f` added to it (nested lookups add theirs there too);
+    /// without one, a capture of `f`'s own passes them on to the program's sets.
+    fn memo_lookup<R>(&self, f: impl FnOnce() -> R) -> (R, MemoUses) {
+        if !record_import_uses() { return (f(), None); }
+        let marks = IMPORT_USE_SINK.with(|s| s.borrow().as_ref().map(|u| (u.import.len(), u.glob.len(), u.ext.len())));
+        let Some((i, g, e)) = marks else {
+            let (r, got) = capture_import_uses(f);
+            let uses = memo_uses(&got.import, &got.glob, &got.ext);
+            self.add_import_uses(&got);
+            return (r, Some(uses));
+        };
+        let r = f();
+        // `f` leaves the capture it found in place (capture_import_uses restores it) and
+        // only appends to it
+        let uses = IMPORT_USE_SINK.with(|s| {
+            let s = s.borrow();
+            let u = s.as_ref().expect("a lookup's capture outlives the lookup");
+            memo_uses(&u.import[i..], &u.glob[g..], &u.ext[e..])
+        });
+        (r, Some(uses))
     }
 
     /// A name a lookup did not find in module `m` may be in a module the Rust selection
@@ -5849,6 +5893,124 @@ static RECORD_IMPORT_USES: std::sync::atomic::AtomicBool = std::sync::atomic::At
 static RECORD_STRETCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub fn record_import_uses() -> bool { RECORD_IMPORT_USES.load(std::sync::atomic::Ordering::Relaxed) && !quiet_lookups() }
 
+/// Import resolutions captured by one body scope, without depending on the type layer's facts.
+#[derive(Clone, Default, PartialEq, Debug)]
+pub struct ImportUses {
+    /// Module, imported name and namespace, for the used-binding set.
+    pub import: Vec<(u32, Sym, bool)>,
+    /// Module and glob target, for the used-glob set.
+    pub glob: Vec<(u32, DefId)>,
+    /// Crate and extern-prelude name, for the used-extern set.
+    pub ext: Vec<(u32, Sym)>,
+}
+
+/// One import use a memoized name lookup went through (an `ImportUses` entry).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum MemoUse {
+    Import(u32, Sym, bool),
+    Glob(u32, DefId),
+    Ext(u32, Sym),
+}
+
+/// The import uses a memoized name lookup went through, kept with its answer: every lookup that
+/// takes the answer records them, so a body's captured uses name each import its lookups go
+/// through, whichever body looked the name up first (check_bodies.rs stores them per body).
+/// None: the answer was found while uses were not recorded (the import replay's pause, a run);
+/// a lookup while they are recorded does it again.
+pub type MemoUses = Option<Box<[MemoUse]>>;
+
+/// A memo hit: its answer, its import uses recorded for this thread's capture. None: the answer
+/// holds no uses and they are recorded now (look it up again). Without a capture the program's
+/// sets have them already: the lookup that found the answer put them there or in a body's
+/// capture, which the check merges into them.
+fn memo_hit<T: Copy>(v: &(T, MemoUses)) -> Option<T> {
+    if !record_import_uses() { return Some(v.0); }
+    let uses = v.1.as_deref()?;
+    if !uses.is_empty() {
+        IMPORT_USE_SINK.with(|s| if let Some(u) = s.borrow_mut().as_mut() {
+            let _k = crate::zone_alloc::kept();
+            for x in uses {
+                match *x {
+                    MemoUse::Import(m, n, t) => u.import.push((m, n, t)),
+                    MemoUse::Glob(m, g) => u.glob.push((m, g)),
+                    MemoUse::Ext(c, n) => u.ext.push((c, n)),
+                }
+            }
+        });
+    }
+    Some(v.0)
+}
+
+/// Puts a lookup's answer in its memo: the first answer stands (racing lookups of one name find
+/// the same), except one that holds no uses, which an answer with its uses replaces.
+fn memo_put<T: Clone>(map: &crate::conc::MemoMap<(u32, Sym, bool), (T, MemoUses)>, key: (u32, Sym, bool), v: (T, MemoUses)) {
+    let unrecorded = v.1.is_none();
+    map.put_unless(key, v, |old| unrecorded || old.1.is_some());
+}
+
+/// A lookup's import uses in their memo form: each once.
+fn memo_uses(import: &[(u32, Sym, bool)], glob: &[(u32, DefId)], ext: &[(u32, Sym)]) -> Box<[MemoUse]> {
+    let mut v: Vec<MemoUse> = import.iter().map(|&(m, n, t)| MemoUse::Import(m, n, t))
+        .chain(glob.iter().map(|&(m, g)| MemoUse::Glob(m, g)))
+        .chain(ext.iter().map(|&(c, n)| MemoUse::Ext(c, n)))
+        .collect();
+    if v.len() > 1 {
+        v.sort_unstable();
+        v.dedup();
+    }
+    v.into_boxed_slice()
+}
+
+/// Captures of the same owner combine without losing resolutions made in an earlier scope.
+impl ImportUses {
+    /// Appends all three kinds of use in their recording order.
+    pub fn append(&mut self, mut other: ImportUses) {
+        self.import.append(&mut other.import);
+        self.glob.append(&mut other.glob);
+        self.ext.append(&mut other.ext);
+    }
+
+    /// Sorts each kind and keeps each use once: every reader takes them as sets (the program's
+    /// used sets, a stored verdict's canonical form), and a body's memo hits repeat them.
+    pub fn sort_dedup(&mut self) {
+        self.import.sort_unstable();
+        self.import.dedup();
+        self.glob.sort_unstable();
+        self.glob.dedup();
+        self.ext.sort_unstable();
+        self.ext.dedup();
+    }
+}
+
+thread_local! {
+    /// The current scope's import uses; none leaves resolution writing the program's sets.
+    static IMPORT_USE_SINK: std::cell::RefCell<Option<ImportUses>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Captures a resolution on this thread, or lets the caller insert into its program as before.
+fn record_import_use(f: impl FnOnce(&mut ImportUses)) -> bool {
+    IMPORT_USE_SINK.with(|s| match s.borrow_mut().as_mut() {
+        Some(u) => { let _k = crate::zone_alloc::kept(); f(u); true }
+        None => false,
+    })
+}
+
+/// Runs `f` with a fresh import-use buffer and restores the previous capture, including on unwind.
+pub fn capture_import_uses<R>(f: impl FnOnce() -> R) -> (R, ImportUses) {
+    /// The suspended capture, retained so an unwinding body cannot leak its sink to the next one.
+    struct Restore(Option<Option<ImportUses>>);
+    /// Scope cleanup restores the outer capture if normal return has not already taken it.
+    impl Drop for Restore {
+        /// Restores the saved capture without masking a panic from the body.
+        fn drop(&mut self) { if let Some(prev) = self.0.take() { IMPORT_USE_SINK.with(|s| *s.borrow_mut() = prev); } }
+    }
+    let mut restore = Restore(Some(IMPORT_USE_SINK.with(|s| s.replace(Some(ImportUses::default())))));
+    let r = f();
+    let prev = restore.0.take().unwrap_or_default();
+    let got = IMPORT_USE_SINK.with(|s| s.replace(prev)).unwrap_or_default();
+    (r, got)
+}
+
 thread_local! {
     static QUIET_LOOKUPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
@@ -5953,7 +6115,7 @@ fn shared_std_wait(path: &str) -> Option<std::sync::Arc<SharedParse>> {
         g = ng;
         if to.timed_out() && g.as_ref().map_or(true, |m| !m.contains_key(path)) {
             // never silent: a stall here is a wait cycle between the world and the load
-            eprintln!("makepad: the proc-macro world waited 10 s for the program's parse of {}; parsing it itself", path);
+            eprintln!("relax: the proc-macro world waited 10 s for the program's parse of {}; parsing it itself", path);
             return None;
         }
     }
@@ -5997,7 +6159,7 @@ impl ParseSnapshot {
             let _timing = crate::parse_work::time(1);
             old.part(&self.cfg);
         }
-        let verify = std::env::var("MAKEPAD_RUN_PARSE_VERIFY").as_deref() == Ok("1");
+        let verify = std::env::var("RELAX_PARSE_VERIFY").as_deref() == Ok("1");
         let full_src = verify.then(|| src.clone());
         let session = crate::parse_work::Session::new(self.reuse.clone());
         let mut v = self.parse_full(src)?;
@@ -6569,7 +6731,7 @@ mod deferred_load_tests {
     #[test]
     fn incremental_load_matches_full_resolution() {
         const SKIP: &str = "load_late.rs,load_other.rs,load_unrelated.rs,load_nested.rs,load_empty.rs";
-        if std::env::var("MAKEPAD_RUN_LAZY_DEFER").as_deref() != Ok(SKIP) {
+        if std::env::var("RELAX_LAZY_DEFER").as_deref() != Ok(SKIP) {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -6577,7 +6739,7 @@ mod deferred_load_tests {
                     "--nocapture",
                     "--test-threads=1",
                 ])
-                .env("MAKEPAD_RUN_LAZY_DEFER", SKIP)
+                .env("RELAX_LAZY_DEFER", SKIP)
                 .output()
                 .unwrap();
             assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));

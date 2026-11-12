@@ -113,7 +113,7 @@ pub(crate) fn run(u: &mut Unit, up: *mut Unit, groups: &[(String, u32)]) -> i32 
         let c = match run_crate(u, up, *krate) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("makepad test: {e}");
+                eprintln!("relax test: {e}");
                 101
             }
         };
@@ -188,7 +188,7 @@ fn prepare(u: &mut Unit, krate: u32) -> Result<(Vec<Found>, Vec<Test>, u64), Str
         })
         .collect();
     if u.session.options.verbose {
-        eprintln!("makepad test timing: prepare_ms={:.3} tests={} reused=false", started.elapsed().as_secs_f64() * 1000.0, table.len());
+        eprintln!("relax test timing: prepare_ms={:.3} tests={} reused=false", started.elapsed().as_secs_f64() * 1000.0, table.len());
     }
     Ok((found, table, main_entry))
 }
@@ -276,7 +276,7 @@ extern "C" fn next_run(t: *mut Tests, ms: f64) -> u32 {
                         t.len = run.table.len();
                         t.revision += 1;
                     }
-                    Err(e) => { eprintln!("makepad test: {e}"); t.code = 101; return 0; }
+                    Err(e) => { eprintln!("relax test: {e}"); t.code = 101; return 0; }
                 }
             }
             for (i, test) in run.table.iter().enumerate() {
@@ -285,7 +285,7 @@ extern "C" fn next_run(t: *mut Tests, ms: f64) -> u32 {
             run.overhead_ms = started.elapsed().as_secs_f64() * 1000.0;
             if t.verbose != 0 {
                 let changed: Vec<_> = edit.changed.iter().flatten().map(|d| u.prog.def_path(*d)).collect();
-                eprintln!("makepad test selection: changed={changed:?} select_ms={:.3} why={:?}", run.overhead_ms, run.why);
+                eprintln!("relax test selection: changed={changed:?} select_ms={:.3} why={:?}", run.overhead_ms, run.why);
             }
             1
         })

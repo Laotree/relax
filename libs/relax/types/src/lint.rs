@@ -314,7 +314,12 @@ pub fn fulfilled_expectations() -> Vec<AttrKey> {
     std::mem::take(&mut *FULFILLED.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// Whether the command line sets any lint level (MAKEPAD_RUN_LINT_FLAGS).
+/// Restores a body's fulfilled expectations before the crate-wide expectation check.
+pub(crate) fn merge_fulfilled(fulfilled: Vec<AttrKey>) {
+    if !fulfilled.is_empty() { FULFILLED.lock().unwrap_or_else(|e| e.into_inner()).extend(fulfilled); }
+}
+
+/// Whether the command line sets any lint level (RELAX_LINT_FLAGS).
 pub fn cmdline_set() -> bool {
     !cmdline_levels().is_empty()
 }
@@ -323,7 +328,7 @@ fn cmdline_levels() -> &'static [(Level, String)] {
     &cmdline().levels
 }
 
-/// The lint flags of the command line, from `MAKEPAD_RUN_LINT_FLAGS`: rustc's `-A/-W/-D/-F`
+/// The lint flags of the command line, from `RELAX_LINT_FLAGS`: rustc's `-A/-W/-D/-F`
 /// flags in order (e.g. `-A unused -D warnings`; the UI test harness passes `-A unused`, as
 /// rustc's compiletest does) and `--cap-lints <level>`.
 struct CmdLine {
@@ -333,7 +338,7 @@ struct CmdLine {
 
 fn cmdline() -> &'static CmdLine {
     static FLAGS: std::sync::OnceLock<CmdLine> = std::sync::OnceLock::new();
-    FLAGS.get_or_init(|| parse_cmdline(&std::env::var("MAKEPAD_RUN_LINT_FLAGS").unwrap_or_default()))
+    FLAGS.get_or_init(|| parse_cmdline(&std::env::var("RELAX_LINT_FLAGS").unwrap_or_default()))
 }
 
 fn parse_cmdline(v: &str) -> CmdLine {
@@ -394,13 +399,18 @@ thread_local! {
     static CAPTURED: std::cell::RefCell<Option<Vec<Reported>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// A report to the sink, or to this thread's `capture`.
+/// A report to this thread's `capture`, its body owner, or the global sink, in that order.
 fn sink(r: Reported) {
-    let r = CAPTURED.with(|c| match c.borrow_mut().as_mut() {
+    let mut r = CAPTURED.with(|c| match c.borrow_mut().as_mut() {
         Some(v) => { v.push(r); None }
         None => Some(r),
     });
-    if let Some(r) = r { SINK.lock().unwrap_or_else(|e| e.into_inner()).push(r); }
+    if r.is_some() && !crate::body_facts::record(|f| f.reported.push(r.take().unwrap())) { SINK.lock().unwrap_or_else(|e| e.into_inner()).push(r.unwrap()); }
+}
+
+/// Publishes a body's reports directly, preserving their sequence numbers and bypassing capture.
+pub(crate) fn merge_reported(reported: Vec<Reported>) {
+    if !reported.is_empty() { SINK.lock().unwrap_or_else(|e| e.into_inner()).extend(reported); }
 }
 
 /// `f`, and what it reported on this thread, kept out of the sink: a live save's lints of the
@@ -442,10 +452,9 @@ pub fn hard_error(prog: &Program, file: u32, pos: u32, msg: &str) {
     sink(Reported { level: Level::Deny, lint: "", def: NO_DEF, seq, line });
 }
 
-/// `emit` under the attributes `inner` of a node inside `def`'s body; none given: those around
-/// `pos` in it (attrs_at).
-pub fn emit_in(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint, file: u32, pos: u32, msg: &str) {
-    if !enabled() { return; }
+/// The level `emit_in` reports `lint` at, at `pos` of `file` in `def`'s scope: under the
+/// attributes `inner`, or (none given) those around `pos`.
+pub fn level_at(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint, file: u32, pos: u32) -> Resolved {
     let around;
     let inner = if inner.is_empty() && def != NO_DEF {
         around = attrs_at(prog, def, file, pos, pos);
@@ -453,10 +462,19 @@ pub fn emit_in(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint, file: u3
     } else {
         inner
     };
-    let spec = resolve_in(prog, def, file, inner, lint, None);
+    resolve_in(prog, def, file, inner, lint, None)
+}
+
+/// `emit` under the attributes `inner` of a node inside `def`'s body; none given: those around
+/// `pos` in it (attrs_at).
+pub fn emit_in(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint, file: u32, pos: u32, msg: &str) {
+    if !enabled() { return; }
+    let spec = level_at(prog, def, inner, lint, file, pos);
     let level = spec.level;
     if level == Level::Allow {
-        if let Some(k) = spec.expect { FULFILLED.lock().unwrap_or_else(|e| e.into_inner()).push(k); }
+        if let Some(k) = spec.expect {
+            if !crate::body_facts::record(|f| f.fulfilled.push(k)) { FULFILLED.lock().unwrap_or_else(|e| e.into_inner()).push(k); }
+        }
         return;
     }
     let (l, c) = prog.files[file as usize].line_col(pos);
@@ -467,7 +485,7 @@ pub fn emit_in(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint, file: u3
     sink(Reported { level, lint: lint.name, def, seq, line });
 }
 
-/// `f` on each of `items` on the pool's workers (MAKEPAD_RUN_JOBS), the next free worker taking
+/// `f` on each of `items` on the pool's workers (RELAX_JOBS), the next free worker taking
 /// the next item (the biggest first balance them), results in item order. A lint pass may run
 /// its crates or items so: the sink takes reports from any thread, and the check's sort orders
 /// them (check_order.rs), never the order they came in.

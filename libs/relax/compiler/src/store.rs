@@ -884,10 +884,10 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool, orde
     Ok(())
 }
 
-/// MAKEPAD_RUN_PROFILE is set: the load timeline's spans for the image writes.
+/// RELAX_PROFILE is set: the load timeline's spans for the image writes.
 pub fn profiling() -> bool {
     static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *P.get_or_init(|| std::env::var_os("MAKEPAD_RUN_PROFILE").is_some())
+    *P.get_or_init(|| std::env::var_os("RELAX_PROFILE").is_some())
 }
 
 /// Makes the bytes written to `f` so far reach the disk before anything written after: an

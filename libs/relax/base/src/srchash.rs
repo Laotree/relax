@@ -378,7 +378,7 @@ pub fn diff_entries<'a>(built: &'a Manifest, current: &'a Manifest) -> impl Iter
 }
 
 /// Bound diagnostic output, not the work or the identity: every input still counts.
-pub fn diff_message(name: &str, built: &Manifest, current: &Manifest) -> String {
+pub fn diff_message(name: &str, built: &Manifest, current: &Manifest, tool: &str) -> String {
     let mut files = Vec::new();
     let mut metadata = Vec::new();
     for key @ (package, path) in diff_entries(built, current) {
@@ -390,18 +390,18 @@ pub fn diff_message(name: &str, built: &Manifest, current: &Manifest) -> String 
             files.push(format!("  {kind} {package}: {path}"));
         }
     }
-    let mut message = format!("provided crate {name} differs from the library built into makepad:\n");
+    let mut message = format!("provided crate {name} differs from the library built into {tool}:\n");
     for line in files.iter().take(20).chain(metadata.iter()) { message.push_str(line); message.push('\n'); }
     if files.len() > 20 { message.push_str(&format!("  {} more files\n", files.len() - 20)); }
-    message.push_str(&rebuild_hint());
+    message.push_str(&rebuild_hint(tool));
     message
 }
 
 /// How to fix a `makepad` binary older than the checkout's provided crates: run it through cargo,
 /// which rebuilds it first, with this process's own arguments.
-pub fn rebuild_hint() -> String {
+pub fn rebuild_hint(tool: &str) -> String {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    format!("rebuild makepad by starting it through cargo: {}", rebuild_command(&args))
+    format!("rebuild {tool} by starting it through cargo: {}", rebuild_command(&args))
 }
 
 /// `cargo run --release -p makepad-run --bin makepad -- <args>` (arguments with spaces or quotes
@@ -511,16 +511,16 @@ mod tests {
         std::fs::remove_file(dir.0.join("src/removed.rs")).unwrap();
         pkgs[0].features.push("extra".into());
         let current = closure_manifest(&pkgs, 0);
-        let message = diff_message("fixture", &built, &current);
+        let message = diff_message("fixture", &built, &current, crate::tool_name());
         assert!(message.contains("provided crate fixture"));
         for line in ["changed fixture@1.0: src/lib.rs", "added fixture@1.0: src/added.rs", "removed fixture@1.0: src/removed.rs", "fixture@1.0 features:  -> extra"] { assert!(message.contains(line), "{message}"); }
-        assert!(message.contains("rebuild makepad by starting it through cargo: cargo run --release -p makepad-run --bin makepad --"), "{message}");
+        assert!(message.contains("rebuild relax by starting it through cargo: cargo run --release -p makepad-run --bin makepad --"), "{message}");
         pkgs[0].version = "2.0".into();
-        let message = diff_message("fixture", &built, &closure_manifest(&pkgs, 0));
+        let message = diff_message("fixture", &built, &closure_manifest(&pkgs, 0), crate::tool_name());
         assert!(message.contains("version: 1.0 -> <absent>"));
         assert!(message.contains("version: <absent> -> 2.0"));
         for i in 0..25 { dir.write(&format!("src/new{i}.rs"), "new"); }
-        let message = diff_message("fixture", &Manifest::new(), &closure_manifest(&pkgs, 0));
+        let message = diff_message("fixture", &Manifest::new(), &closure_manifest(&pkgs, 0), crate::tool_name());
         assert_eq!(message.lines().filter(|l| l.starts_with("  added ")).count(), 20);
         assert!(message.contains("8 more files"), "{message}");
     }
@@ -539,7 +539,7 @@ mod tests {
         pkgs[0].features.push("host-shims".into());
         assert_eq!(built, closure_manifest(&pkgs, 0));
         pkgs[1].features.push("enabled".into());
-        assert!(diff_message("fixture", &built, &closure_manifest(&pkgs, 0)).contains("dep@1 features:  -> enabled"));
+        assert!(diff_message("fixture", &built, &closure_manifest(&pkgs, 0), crate::tool_name()).contains("dep@1 features:  -> enabled"));
         pkgs[1].proc_macro = true;
         let host = closure_manifest(&pkgs, 0);
         pkgs[1].features.clear();

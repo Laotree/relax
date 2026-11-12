@@ -60,7 +60,7 @@ pub fn object(triple: &str, names: &[String]) -> Result<Vec<u8>, String> {
 
 /// What a slot's trap writes when C code calls it before the loader bound it.
 fn unbound_message(name: &str) -> String {
-    format!("makepad-run: cannot load the --allow-c native library: its C code calls `{name}` while the library loads (a C constructor), before the program's fns are bound to it\n")
+    format!("relax: cannot load the --allow-c native library: its C code calls `{name}` while the library loads (a C constructor), before the program's fns are bound to it\n")
 }
 
 /// The object's code: the stubs, one unbound trap per stub, and the traps' shared exit.

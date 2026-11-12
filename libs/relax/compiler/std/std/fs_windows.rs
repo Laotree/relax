@@ -483,6 +483,7 @@ impl OpenOptions {
                 let disk = vfs::edit_target(&*abs, how).unwrap_or_else(|| Err(vfs::read_only()))?;
                 return self.open_native(&maybe_verbatim(&disk)?);
             }
+            vfs::note(&abs, b'f');
             return match k {
                 vfs::Kind::File(stat) => {
                     let data = vfs::read(&*abs)?;
@@ -495,6 +496,9 @@ impl OpenOptions {
                 vfs::Kind::Dir => Err(os_error(ERROR_ACCESS_DENIED)),
                 vfs::Kind::Missing => Err(io::Error::from(io::ErrorKind::NotFound)),
             };
+        }
+        if self.read {
+            vfs::note(path.as_ref(), b'f');
         }
         let path = maybe_verbatim(path.as_ref())?;
         self.open_native(&path)
@@ -1428,6 +1432,7 @@ impl Default for DirBuilder {
 
 pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
     if let Some((abs, vfs::Kind::File(_))) = vfs::kind(path.as_ref()) {
+        vfs::note(&abs, b'f');
         return vfs::read(&*abs);
     }
     let mut file = File::open(path.as_ref())?;
@@ -1438,6 +1443,7 @@ pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
 
 pub fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
     if let Some((abs, vfs::Kind::File(_))) = vfs::kind(path.as_ref()) {
+        vfs::note(&abs, b'f');
         return String::from_utf8(vfs::read(&*abs)?).map_err(|_| io::Error::INVALID_UTF8);
     }
     let mut file = File::open(path.as_ref())?;
@@ -1487,12 +1493,14 @@ fn stat_native(path: &[u16], reparse_flag: u32) -> io::Result<Metadata> {
 }
 
 pub fn metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
-    if let Some((_, k)) = vfs::kind(path.as_ref()) {
+    if let Some((abs, k)) = vfs::kind(path.as_ref()) {
+        vfs::note(&abs, b'p');
         return match k {
             vfs::Kind::Missing => Err(io::Error::from(io::ErrorKind::NotFound)),
             k => Ok(Metadata::virtual_entry(&k)),
         };
     }
+    vfs::note(path.as_ref(), b'p');
     let p = maybe_verbatim(path.as_ref())?;
     match stat_native(&p, 0) {
         Err(e) => {
@@ -1514,14 +1522,17 @@ pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
     if vfs::kind(path.as_ref()).is_some() {
         return metadata(path);
     }
+    vfs::note(path.as_ref(), b'p');
     let p = maybe_verbatim(path.as_ref())?;
     stat_native(&p, FILE_FLAG_OPEN_REPARSE_POINT)
 }
 
 pub fn exists<P: AsRef<Path>>(path: P) -> io::Result<bool> {
-    if let Some((_, k)) = vfs::kind(path.as_ref()) {
+    if let Some((abs, k)) = vfs::kind(path.as_ref()) {
+        vfs::note(&abs, b'p');
         return Ok(!matches!(k, vfs::Kind::Missing));
     }
+    vfs::note(path.as_ref(), b'p');
     let p = maybe_verbatim(path.as_ref())?;
     match open_for_meta(&p, 0) {
         Ok(_) => Ok(true),
@@ -1715,6 +1726,7 @@ fn remove_dir_all_recursive(path: &Path) -> io::Result<()> {
 pub fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
     let p = path.as_ref();
     if let Some((abs, k)) = vfs::kind(p) {
+        vfs::note(&abs, b'd');
         return match k {
             vfs::Kind::Dir => {
                 let mut virt = Vec::new();
@@ -1750,6 +1762,7 @@ pub fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
     if p.as_os_str().is_empty() {
         return Err(os_error(ERROR_PATH_NOT_FOUND));
     }
+    vfs::note(p, b'd');
     let root = p.to_path_buf();
     let star = p.join("*");
     let w = maybe_verbatim(&star)?;

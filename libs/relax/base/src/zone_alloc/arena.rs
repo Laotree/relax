@@ -425,7 +425,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// scopes included), so what it builds -- typically a clone of something the job made -- lives in
 /// the heap of the thread's phase (the compiler arena on a compiler thread) and outlives the job.
 /// A result that skips this stays in the job arena: it is still freed by its owner's Drop, it only
-/// pins a job-arena chunk (counted as a job survivor, MAKEPAD_RUN_JOB_CHECK).
+/// pins a job-arena chunk (counted as a job survivor, RELAX_JOB_CHECK).
 pub fn copy_out<R>(f: impl FnOnce() -> R) -> R {
     struct Restore(usize);
     impl Drop for Restore {
@@ -922,7 +922,7 @@ pub struct Arena {
     headers: [Chunk; N],
     pool: Mutex<Pool>,
     partial: Mutex<Partial>,
-    /// MAKEPAD_RUN_HEAP_CHECK (program heaps): one bit per 16 bytes of the reservation, set while
+    /// RELAX_HEAP_CHECK (program heaps): one bit per 16 bytes of the reservation, set while
     /// a block starts there (0: off). See `heap_check_on`.
     live_bits: AtomicUsize,
     /// Program heaps: advanced once a second by the monitor (`densify`). A thread's current chunk
@@ -1029,7 +1029,7 @@ impl Arena {
     /// thread's native allocations come from its own heap (memstat `run_alloc`), the full one.
     unsafe fn add_region(&self, single: usize) -> Option<&Arena> {
         let first = self.first();
-        let at = os::reserve(REGION_TABLES, PAGE, c"makepad-run-domain tables");
+        let at = os::reserve(REGION_TABLES, PAGE, c"relax-domain tables");
         if at == 0 {
             return None;
         }
@@ -1196,7 +1196,7 @@ impl Arena {
         // locked paths, which keep the live bits
         self.cache_fast() && (self.dynamic || !EXITED.with(|e| e.get())) && self.live_bits.load(Ordering::Relaxed) == 0
     }
-    /// MAKEPAD_RUN_HEAP_CHECK: sets (`live`) or clears the live bit of the block at `p`; returns
+    /// RELAX_HEAP_CHECK: sets (`live`) or clears the live bit of the block at `p`; returns
     /// whether it was set before. No-op (true for a clear, false for a set) when the check is off.
     #[inline]
     fn mark(&self, p: usize, live: bool) -> bool {
@@ -1210,7 +1210,7 @@ impl Arena {
         let old = if live { w.fetch_or(m, Ordering::Relaxed) } else { w.fetch_and(!m, Ordering::Relaxed) };
         old & m != 0
     }
-    /// MAKEPAD_RUN_HEAP_CHECK: a block marked in `committed` bytes of chunk `index` (one being
+    /// RELAX_HEAP_CHECK: a block marked in `committed` bytes of chunk `index` (one being
     /// released), or None.
     fn live_in(&self, index: usize, committed: usize) -> Option<usize> {
         let bits = self.live_bits.load(Ordering::Relaxed);
@@ -1520,7 +1520,7 @@ impl Arena {
                     if WEB_AT != 0 {
                         os::reserve_at(WEB_AT, RESERVE, LABEL)
                     } else {
-                        os::reserve(self.reach(), CHUNK, if self.dynamic { c"makepad-run-domain" } else { LABEL })
+                        os::reserve(self.reach(), CHUNK, if self.dynamic { c"relax-domain" } else { LABEL })
                     }
                 };
                 // every arena. A domain heap (the program's heap, as its malloc would be) gets
@@ -2157,7 +2157,7 @@ impl Arena {
             }
         };
         let mut t = [0u8; 20];
-        put(b"makepad-run alloc: program arena ");
+        put(b"relax alloc: program arena ");
         let i = num(self.id, &mut t);
         put(&t[i..]);
         put(b" refused ");
@@ -2816,10 +2816,10 @@ impl Drop for Arena {
     }
 }
 
-/// 0 = not read, 1 = off, 2 = MAKEPAD_RUN_HEAP_CHECK is set.
+/// 0 = not read, 1 = off, 2 = RELAX_HEAP_CHECK is set.
 static HEAP_CHECK: AtomicU8 = AtomicU8::new(0);
 
-/// MAKEPAD_RUN_HEAP_CHECK=1: every program heap (domain arena) made from then on keeps a live bit
+/// RELAX_HEAP_CHECK=1: every program heap (domain arena) made from then on keeps a live bit
 /// per block and runs without thread chunk caches; a free of a block that is not live (double
 /// free, a pointer into a block), a live block handed out again, or a chunk released while a block
 /// in it is live aborts at once with one line naming the address (and the JIT's abort report
@@ -2834,14 +2834,14 @@ pub fn heap_check_on() -> bool {
                 extern "C" {
                     fn getenv(name: *const core::ffi::c_char) -> *mut core::ffi::c_char;
                 }
-                !getenv(c"MAKEPAD_RUN_HEAP_CHECK".as_ptr().cast()).is_null()
+                !getenv(c"RELAX_HEAP_CHECK".as_ptr().cast()).is_null()
             };
             #[cfg(windows)]
             let on = unsafe {
                 use relax_session::win32::{GetEnvironmentVariableW, GetLastError, SetLastError};
                 // Presence enables the check, including an empty value, just like getenv.
                 // Stay allocation-free: this is called while creating an allocator.
-                let name = b"MAKEPAD_RUN_HEAP_CHECK\0".map(u16::from);
+                let name = b"RELAX_HEAP_CHECK\0".map(u16::from);
                 let mut value = 0u16;
                 SetLastError(0);
                 GetEnvironmentVariableW(name.as_ptr(), &mut value, 1) != 0 || GetLastError() == 0
@@ -2859,7 +2859,7 @@ pub fn heap_check_on() -> bool {
 fn os_bits_map() -> usize {
     #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
     unsafe {
-        let b = os::reserve(RESERVE / 128, GRANULE, c"makepad-run heap check");
+        let b = os::reserve(RESERVE / 128, GRANULE, c"relax heap check");
         if b != 0 && !os::commit(b as *mut u8, RESERVE / 128) {
             os::unreserve(b, RESERVE / 128);
             return 0;
@@ -2870,7 +2870,7 @@ fn os_bits_map() -> usize {
     0
 }
 
-/// A MAKEPAD_RUN_HEAP_CHECK failure: one line on stderr (no allocation: this runs inside
+/// A RELAX_HEAP_CHECK failure: one line on stderr (no allocation: this runs inside
 /// the allocator, under its locks), then abort.
 #[cold]
 #[inline(never)]
@@ -2899,7 +2899,7 @@ fn heap_check_fail(what: &[u8], p: usize, index: usize, stride: usize) -> ! {
         k
     };
     let mut d = [0u8; 20];
-    put(b"makepad-run heap check: ");
+    put(b"relax heap check: ");
     put(what);
     put(b" 0x");
     let k = num(p, true, &mut d);

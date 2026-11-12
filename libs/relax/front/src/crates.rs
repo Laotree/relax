@@ -113,7 +113,7 @@ pub fn apply_substitutes(sess: &std::sync::Arc<crate::Session>, units: &mut [Cra
     };
     for line in apply_substitute_table(units, std_dir, &table) {
         if sess.options.verbose {
-            eprintln!("makepad run: {line}");
+            eprintln!("relax run: {line}");
         }
     }
     // proc-macro crates run in the JIT proc-macro host; the app graph sees them empty

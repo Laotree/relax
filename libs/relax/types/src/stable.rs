@@ -25,7 +25,7 @@ fn crate_ident(prog: &Program, krate: u32, h: &mut Sip128) {
     h.str(relax_front::crates::base_crate_name(prog.syms.str(c.name)));
     let root_file = prog.mods.get(c.root_mod as usize).map(|m| m.file);
     match root_file.and_then(|f| prog.file_paths.get(f as usize)) {
-        Some(p) => h.str(p),
+        Some(p) => h.str(&crate::dirs::anchored(p)),
         None => h.str(""),
     }
 }
@@ -62,7 +62,7 @@ pub fn def_ident(prog: &Program, d: DefId, h: &mut Sip128) {
         return;
     }
     match prog.file_paths.get(def.file as usize) {
-        Some(p) => h.str(p),
+        Some(p) => h.str(&crate::dirs::anchored(p)),
         None => h.str(""),
     }
     let (owner, ord) = block_place(prog, d);
@@ -263,7 +263,7 @@ fn type_into(prog: &Program, tcx: &Tcx, t: TyId, h: &mut Sip128, depth: u32) {
         TyKind::Closure(file, expr, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: state }) => {
             h.u8(17);
             match prog.file_paths.get(*file as usize) {
-                Some(p) => h.str(p),
+                Some(p) => h.str(&crate::dirs::anchored(p)),
                 None => h.str(""),
             }
             h.u32(*expr);
@@ -493,7 +493,7 @@ mod tests {
     }
 }
 
-/// MAKEPAD_RUN_CACHE_FP=1: prints the codegen identity (`codegen_id`, relax-compiler's
+/// RELAX_CACHE_FP=1: prints the codegen identity (`codegen_id`, relax-compiler's
 /// codegen_id.rs), every crate's fingerprint and the cost (C0 check: identical across runs of the
 /// same sources; must stay a few ms).
 pub fn report_fingerprints(prog: &Program, codegen_id: u128) {
@@ -503,20 +503,20 @@ pub fn report_fingerprints(prog: &Program, codegen_id: u128) {
     let tf = t.elapsed();
     let bytes: usize = prog.files.iter().map(|f| f.src.len()).sum();
     eprintln!(
-        "makepad-run cache: codegen id {:032x}; {} crates, {} files, {:.1} MB hashed in {:.2} ms",
+        "relax cache: codegen id {:032x}; {} crates, {} files, {:.1} MB hashed in {:.2} ms",
         codegen_id,
         fps.len(),
         prog.files.len(),
         bytes as f64 / 1e6,
         tf.as_secs_f64() * 1e3
     );
-    let mode = std::env::var("MAKEPAD_RUN_CACHE_FP").unwrap_or_default();
-    if let Ok(want) = std::env::var("MAKEPAD_RUN_CACHE_FP_CRATE") {
+    let mode = std::env::var("RELAX_CACHE_FP").unwrap_or_default();
+    if let Ok(want) = std::env::var("RELAX_CACHE_FP_CRATE") {
         // diagnostics: per-file hashes of one crate (why does a fingerprint differ?)
         for (i, f) in prog.files.iter().enumerate() {
             let c = prog.file_crate.get(i).copied().unwrap_or(u32::MAX) as usize;
             if prog.crates.get(c).map_or(false, |ci| prog.syms.str(ci.name) == want) {
-                eprintln!("makepad-run cache: file {} {:032x} src_len {} len {} {}", i, hash_bytes(&f.src), f.src_len, f.src.len(), prog.file_paths.get(i).map_or("", |p| p.as_str()));
+                eprintln!("relax cache: file {} {:032x} src_len {} len {} {}", i, hash_bytes(&f.src), f.src_len, f.src.len(), prog.file_paths.get(i).map_or("", |p| p.as_str()));
             }
         }
     }
@@ -527,9 +527,9 @@ pub fn report_fingerprints(prog: &Program, codegen_id: u128) {
                 let mut f: Vec<&str> = ci.cfg.set.iter().map(|x| x.as_str()).collect();
                 f.sort();
                 let deps: Vec<String> = ci.deps.iter().map(|(n, d)| format!("{}={}", prog.syms.str(*n), prog.syms.str(prog.crates[*d as usize].name))).collect();
-                eprintln!("makepad-run cache: crate {:032x} {} [{}] deps [{}]", fp, prog.syms.str(ci.name), f.join(" "), deps.join(" "));
+                eprintln!("relax cache: crate {:032x} {} [{}] deps [{}]", fp, prog.syms.str(ci.name), f.join(" "), deps.join(" "));
             } else {
-                eprintln!("makepad-run cache: crate {:032x} {}", fp, prog.syms.str(ci.name));
+                eprintln!("relax cache: crate {:032x} {}", fp, prog.syms.str(ci.name));
             }
         }
     }

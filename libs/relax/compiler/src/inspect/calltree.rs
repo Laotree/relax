@@ -219,7 +219,7 @@ pub(crate) fn report(run: &super::prof::Run, req: &Req, out: &mut Out) {
             parts.extend(st.iter().map(|f| format!("{} [{}]", f.name.replace(';', ":"), f.tier)));
             *folded.entry(parts.join(";")).or_default() += w;
         }
-        let path = std::env::temp_dir().join(format!("makepad-run-inspect-{}-prof-{}.folded", std::process::id(), now_ms()));
+        let path = std::env::temp_dir().join(format!("relax-inspect-{}-prof-{}.folded", std::process::id(), now_ms()));
         let text: String = folded.iter().map(|(k, v)| format!("{} {}\n", k, v)).collect();
         match std::fs::write(&path, text) {
             Ok(()) => out.always(&format!("folded stacks (inline levels expanded, [tier] per frame): {} ({} distinct stacks)", path.display(), folded.len())),
@@ -289,7 +289,7 @@ pub(crate) fn report(run: &super::prof::Run, req: &Req, out: &mut Out) {
     for l in legend.iter().take(12) {
         out.line(l);
     }
-    out.always("tiers: O3/O2/O1/baseline = JIT code of that tier, inl = a level the JIT inlined (its own frame here), native = compiled-in code (makepad run, provided crates, system)");
+    out.always("tiers: O3/O2/O1/baseline = JIT code of that tier, inl = a level the JIT inlined (its own frame here), native = compiled-in code (Relax, provided crates, system)");
     for p in &partial {
         out.always(&format!("note: {}", p));
     }

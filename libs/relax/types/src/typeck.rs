@@ -341,7 +341,7 @@ impl Body {
             args, expr_ty, expr_typed, pat_ty, pat_typed, field_uses, struct_updates, awaits, dependencies, locals, param_pats, closures, errors);
     }
 
-    /// Memory report (MAKEPAD_RUN_MEM_REPORT): per table (entries, heap bytes incl. nested vectors),
+    /// Memory report (RELAX_MEM_REPORT): per table (entries, heap bytes incl. nested vectors),
     /// accumulated into `acc` by name.
     /// Memory report: the bytes these contents took in the previous layout, counted as that
     /// layout's report counted them: a 1304 B struct; HashMap side tables grown by insertion
@@ -610,9 +610,9 @@ pub(crate) fn try_instantiate_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, 
     // Diagnostic only: sample one in N calls, including queries outside JIT scopes.
     // Keep this off for timing runs; symbolizing a backtrace is deliberately expensive.
     static SAMPLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let sample = *SAMPLE.get_or_init(|| std::env::var("MAKEPAD_RUN_TYPECK_BACKTRACE").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
+    let sample = *SAMPLE.get_or_init(|| std::env::var("RELAX_TYPECK_BACKTRACE").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
     if sample != 0 && CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % sample == 0 {
-        let trace = format!("makepad-run typeck-backtrace: {} def={} args={:?} origin={} time={}\n{}\nmakepad-run typeck-backtrace-end\n",
+        let trace = format!("relax typeck-backtrace: {} def={} args={:?} origin={} time={}\n{}\nrelax typeck-backtrace-end\n",
             prog.def_path(def), def.0, args, crate::clock::TYS_ORIGIN.with(|o| o.get()),
             relax_codegen::fncost::mono(), std::backtrace::Backtrace::force_capture());
         // The app may write directly to fd 2 without Rust's stderr lock. Format
@@ -649,7 +649,7 @@ pub(crate) fn check_fn(prog: &Program, tcx: &Tcx, def: DefId) -> Body {
     let state = crate::tcx::EvalState::new();
     let cx = crate::tcx::EvalCx::new(prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
     static ST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let st = *ST.get_or_init(|| std::env::var("MAKEPAD_RUN_TYSTATS").is_ok());
+    let st = *ST.get_or_init(|| std::env::var("RELAX_TYSTATS").is_ok());
     let t0 = if st { relax_session::clock::cpu_ns() } else { 0 };
     thread_local! { static NEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
     let child0 = if st { NEST.with(|c| c.get()) } else { 0 };
@@ -668,7 +668,7 @@ pub(crate) fn check_fn(prog: &Program, tcx: &Tcx, def: DefId) -> Body {
     b
 }
 
-/// MAKEPAD_RUN_LAZY_STATS: the fn defs whose bodies were type-checked (what a lazy parse would parse)
+/// RELAX_LAZY_STATS: the fn defs whose bodies were type-checked (what a lazy parse would parse)
 pub static CHECKED_DEFS: relax_session::sync::Mutex<Option<std::collections::HashSet<u32>>> = relax_session::sync::Mutex::new(None);
 
 fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Body {
@@ -678,7 +678,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         crate::why::enter(cause)
     });
     static LAZY_STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *LAZY_STATS.get_or_init(|| std::env::var_os("MAKEPAD_RUN_LAZY_STATS").is_some()) {
+    if *LAZY_STATS.get_or_init(|| std::env::var_os("RELAX_LAZY_STATS").is_some()) {
         CHECKED_DEFS.lock().unwrap().get_or_insert_with(Default::default).insert(def.0);
     }
     let d = prog.def(def);
@@ -1239,6 +1239,16 @@ impl<'a> Fcx<'a> {
 
     /// rustc_hir_typeck/src/coercion.rs:1134-1164: a failed coercion returns
     /// failure without reporting. Only the demanding caller emits a diagnostic.
+    /// rustc check_expr_index: the index operand of an overloaded index is coerced to the selected
+    /// impl's index type (demand_coerce), so a reference index is reborrowed with a fresh region:
+    /// `files[name]` with `name: &String` passes `&*name`, and a closure captures `*name`, not the
+    /// local `name` (relax issue 77: an inner closure borrowed the outer closure's parameter).
+    fn reborrow_index_operand(&mut self, ti: TyId, i: ExprId) {
+        if let TyKind::Ref(m, inner, _) = self.tcx.tys.kind(self.shallow(ti)).clone() {
+            let want = self.tcx.tys.intern(TyKind::Ref(m, inner, self.fresh_region()));
+            self.try_coerce(ti, want, Some(i));
+        }
+    }
     fn try_coerce(&mut self, a: TyId, x: TyId, e: Option<ExprId>) -> bool {
         self.try_coerce_inner(a, x, e, self.last_lo, false).is_some()
     }
@@ -5175,10 +5185,11 @@ impl<'a> Fcx<'a> {
                 }
                 let is_shift = matches!(op, BinOp::Shl | BinOp::Shr);
                 let tb = self.check_expr(*b, if is_shift { None } else { Some(ta) });
-                // a primitive place with a non-primitive right operand is an `<Op>Assign` call
-                // (`n /= NonZero<u32>`; rustc is_builtin_binop needs both sides primitive)
+                // a primitive place with a non-primitive right operand, or a reference to one, is an
+                // `<Op>Assign` call (`n /= NonZero<u32>`, `x %= &big`; rustc is_builtin_binop needs
+                // both sides primitive)
                 let sb0 = self.shallow(tb);
-                if matches!(self.tcx.tys.kind(sb0), TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(..)) {
+                if self.non_prim_operand(sb0) || self.ref_to_var(sb0) {
                     self.cur_binop = e.0;
                     if self.prim_lhs_op(*op, e, sa, sb0, lo, true).is_some() {
                         return unit;
@@ -5875,6 +5886,7 @@ impl<'a> Fcx<'a> {
                                     for st in [cur, slice] {
                                         let ds = self.infcx.deeply_resolve_ignoring_regions(st);
                                         if !matches!(self.select_trait(td, ds, &[ti2]), Err(_)) {
+                                            self.reborrow_index_operand(ti, *i);
                                             let m = self.trait_fn(td, "index").unwrap();
                                             self.b.ov_index.insert(e.0, (m, self.tcx.tys.mk_list(&[ds, ti2])));
                                             let out = self.tcx.trait_assoc(self.prog, td, self.prog.syms.get("Output").unwrap()).unwrap();
@@ -5938,6 +5950,9 @@ impl<'a> Fcx<'a> {
                                     }
                                 }
                                 if !matches!(found, Err(_)) {
+                                    if coerced_idx.is_none() {
+                                        self.reborrow_index_operand(ti, *i);
+                                    }
                                     self.set_operand_derefs(e.0, derefs);
                                     let m = self.trait_fn(td, "index").unwrap();
                                     let index = coerced_idx.unwrap_or(ti2);
@@ -6624,7 +6639,21 @@ impl<'a> Fcx<'a> {
                     self.cur_binop = e.0;
                     return self.check_op_trait(op, sa, b, lo, false);
                 }
-                self.check_expr(b, None);
+                // a non-primitive right operand, or a reference to one, is an operator trait call
+                // too (`256u32 >> &big` with `impl Shr<&Big> for u32`; rustc is_builtin_binop needs
+                // both operands integral): built in, the shift took the reference's address
+                let tb0 = self.check_expr(b, None);
+                let sb0 = self.shallow(tb0);
+                let non_prim = self.non_prim_operand(sb0);
+                if non_prim || self.ref_to_var(sb0) {
+                    if let Some(r) = self.prim_lhs_op(op, e, sa, sb0, lo, false) {
+                        return r;
+                    }
+                    if non_prim {
+                        let (x, y) = (self.ty_str(sa), self.ty_str(sb0));
+                        self.err(lo, format!("E0277: {}", binop_unimplemented(op, &x, &y)));
+                    }
+                }
                 ta
             }
             _ => {
@@ -6663,7 +6692,7 @@ impl<'a> Fcx<'a> {
                 // a primitive left operand with a non-primitive right one is an operator trait
                 // call too (`3u32 * duration`: `impl Mul<Duration> for u32`; rustc is_builtin_binop
                 // needs both sides primitive)
-                if matches!(self.tcx.tys.kind(sb0), TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(..) | TyKind::Infer(_)) {
+                if self.non_prim_operand(sb0) || self.ref_to_var(sb0) || matches!(self.tcx.tys.kind(sb0), TyKind::Infer(_)) {
                     let sa = self.shallow(ta);
                     if let Some(r) = self.prim_lhs_op(op, e, sa, sb0, lo, false) {
                         return r;
@@ -7435,18 +7464,19 @@ impl<'a> Fcx<'a> {
         // Some(10)`, one impl); several impls (`&A: PartialEq<&B>` / `<&mut B>`, String's) leave
         // it open, as rustc's fresh variable does -- `x == &Unicode(y.as_ref())` with x:
         // &Unicode<CowStr> is `Unicode<&str>`, not `Unicode<CowStr>` (op.rs check_overloaded_binop)
-        let hint = if self.tcx.has_param(da) {
-            None
+        // `open`: the impls leave `L: Cmp<?R>` open, so rustc's ?R takes the right operand's own type
+        let (hint, open) = if self.tcx.has_param(da) {
+            (None, false)
         } else {
             let rhs = self.fresh(0);
             let mark = self.start_snapshot();
             let hint = match self.select_trait(td, da, &[rhs]) {
                 Ok(Some(_)) => {
                     let h = self.infcx.deeply_resolve_ignoring_regions(rhs);
-                    if self.tcx.tys.has_infer(h) { None } else { Some(h) }
+                    if self.tcx.tys.has_infer(h) { (None, true) } else { (Some(h), false) }
                 }
-                Ok(None) => None,
-                Err(_) => Some(ta),
+                Ok(None) => (None, true),
+                Err(_) => (Some(ta), false),
             };
             self.rollback_to(mark);
             hint
@@ -7460,6 +7490,19 @@ impl<'a> Fcx<'a> {
         let selection = self.select_trait(td, da, &[db]);
         let rhs = if selection.is_ok() {
             db
+        } else if checked_b.is_some() && open {
+            // a right operand checked as written is not coerced: rustc coerces it to ?R, which
+            // the impls left open (`&A: PartialEq<&B>` and `<&mut B>`), so ?R is its own type and
+            // `L: Cmp<R>` is unmet (op.rs check_overloaded_binop; relax issue 87: `&usize ==
+            // &&usize` compiled). The error names the innermost pair the impls for references
+            // reach: can't compare `usize` with `&usize`.
+            let (mut x, mut y) = (da, db);
+            while let (TyKind::Ref(_, i, _), TyKind::Ref(_, j, _)) = (self.tcx.tys.kind(x).clone(), self.tcx.tys.kind(y).clone()) {
+                (x, y) = (i, j);
+            }
+            let (x, y) = (self.ty_str(x), self.ty_str(y));
+            self.err(lo, format!("E0277: {}", binop_unimplemented(op, &x, &y)));
+            return Some(self.tcx.tys.bool_);
         } else if !matches!(self.select_trait(td, da, &[da]), Err(_)) {
             self.coerce_or_unify(tb, ta, Some(b), lo);
             da
@@ -7561,6 +7604,32 @@ impl<'a> Fcx<'a> {
         self.norm(r)
     }
 
+    /// A right operand no primitive operator takes: a non-primitive type, or a reference to one
+    /// (`x %= &big` with `impl RemAssign<&BigUint> for u32`). rustc is_builtin_binop needs both
+    /// operands primitive; core's forward-ref operator impls take references to primitives only.
+    fn non_prim_operand(&mut self, sb: TyId) -> bool {
+        let non_prim = |k: &TyKind| matches!(k, TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(..));
+        if non_prim(self.tcx.tys.kind(sb)) {
+            return true;
+        }
+        if let TyKind::Ref(_, inner, _) = self.tcx.tys.kind(sb).clone() {
+            let si = self.shallow(inner);
+            return non_prim(self.tcx.tys.kind(si));
+        }
+        false
+    }
+
+    /// A reference to a type not known yet (`|t| x - t` where `t: &?V` comes from a map whose value
+    /// type a later `insert` gives): rustc's overloaded path, where `f64: Sub<&?V>` selects core's
+    /// `Sub<&f64> for f64`; the built-in one would unify `f64` with `&?V` (E0308).
+    fn ref_to_var(&mut self, sb: TyId) -> bool {
+        if let TyKind::Ref(_, inner, _) = self.tcx.tys.kind(sb).clone() {
+            let si = self.shallow(inner);
+            return matches!(self.tcx.tys.kind(si), TyKind::Infer(_));
+        }
+        false
+    }
+
     /// `prim op adt`: the operator trait impl of the primitive for the right type. A literal
     /// left operand takes the type of the single primitive impl with that right type.
     /// With `assign`, `prim op= adt` through the `<Op>Assign` impl (`n /= NonZero<u32>`).
@@ -7574,6 +7643,8 @@ impl<'a> Fcx<'a> {
             (BinOp::BitAnd, true) => ("BitAndAssign", "bitand_assign"),
             (BinOp::BitOr, true) => ("BitOrAssign", "bitor_assign"),
             (BinOp::BitXor, true) => ("BitXorAssign", "bitxor_assign"),
+            (BinOp::Shl, true) => ("ShlAssign", "shl_assign"),
+            (BinOp::Shr, true) => ("ShrAssign", "shr_assign"),
             (_, true) => return None,
             (op, false) => match op {
                 BinOp::Add => ("Add", "add"),
@@ -7584,6 +7655,8 @@ impl<'a> Fcx<'a> {
                 BinOp::BitAnd => ("BitAnd", "bitand"),
                 BinOp::BitOr => ("BitOr", "bitor"),
                 BinOp::BitXor => ("BitXor", "bitxor"),
+                BinOp::Shl => ("Shl", "shl"),
+                BinOp::Shr => ("Shr", "shr"),
                 _ => return None,
             },
         };

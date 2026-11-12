@@ -23,7 +23,7 @@
 //! wrapper and one [`Entry`] in the `relax_api` link section; [`entries`] reads them all back.
 //! Nothing generated is checked in.
 
-pub use makepad_relax_api_macro::relax_api;
+pub use relax_api_macro::relax_api;
 
 static APP_CALL: std::sync::OnceLock<fn(unsafe extern "C" fn(*mut u8), *mut u8) -> bool> = std::sync::OnceLock::new();
 

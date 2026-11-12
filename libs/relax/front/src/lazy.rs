@@ -168,7 +168,7 @@ impl PendingPlan {
         let _ = self.early.notify.set(Box::new(notify));
     }
     pub fn skips(&self, root: &str, test: bool, path: &str) -> bool {
-        // MAKEPAD_RUN_LAZY_DEFER=<path suffix>,..: these files are skipped whatever the
+        // RELAX_LAZY_DEFER=<path suffix>,..: these files are skipped whatever the
         // closure says; the post-boot loader brings them in when code needs them (its test)
         if self.pending_crates.first().is_some_and(|c| c.cfg.session.options.rs_lazy) && forced_deferral(path) {
             return true;
@@ -240,7 +240,7 @@ impl Plan {
         }
         let saved = &saved;
         let mut reused_outline = BTreeSet::new();
-        let verify_restore = std::env::var_os("MAKEPAD_RUN_DEMAND_RESTORE_CHECK").is_some_and(|v| v == "1");
+        let verify_restore = std::env::var_os("RELAX_DEMAND_RESTORE_CHECK").is_some_and(|v| v == "1");
         let mut restored_surfaces = BTreeSet::new();
         let mut demands = BTreeSet::new();
         let mut origins = BTreeMap::<String, (String, String)>::new();
@@ -878,9 +878,13 @@ impl Plan {
         let mut hash = crate::sip::Sip128::new();
         hash.str("source-demand-v24-impl-declarations");
         hash.u128(graph);
-        for (p, h) in &inputs { hash.str(p); hash.u128(*h); }
-        for (p, exists) in &plan.probes { hash.str(p); hash.u8(*exists as u8); }
-        for (c, kind, name, content) in &late_inputs { hash.str(c); hash.u8(*kind); hash.str(name); hash.u128(*content); }
+        for (p, h) in &inputs { hash.str(&crate::dirs::anchored(p)); hash.u128(*h); }
+        for (p, exists) in &plan.probes { hash.str(&crate::dirs::anchored(p)); hash.u8(*exists as u8); }
+        for (c, kind, name, content) in &late_inputs {
+            hash.str(c); hash.u8(*kind);
+            if crate::sip::late_base(*kind) == crate::sip::LATE_FILE { hash.str(&crate::dirs::anchored(name)); } else { hash.str(name); }
+            hash.u128(*content);
+        }
         let fingerprint = hash.finish128();
         drop(inputs_profile);
         // The closure is certified. Transient glob lookup results are not part
@@ -952,11 +956,11 @@ impl Plan {
             eprintln!("source-lazy: language={extension} indexed={indexed} reached={reached} deferred={}", indexed - reached);
         }
     }
-    /// MAKEPAD_RUN_DEMAND_DUMP=<file>: the plan's observable result (per-crate selection
+    /// RELAX_DEMAND_DUMP=<file>: the plan's observable result (per-crate selection
     /// identity and deferred list, reached/indexed counts), to diff an incremental
-    /// plan against one built from scratch (MAKEPAD_RUN_LAZY_VERIFY=1) for the same sources.
+    /// plan against one built from scratch (RELAX_LAZY_VERIFY=1) for the same sources.
     fn dump(&self) {
-        let Some(path) = std::env::var_os("MAKEPAD_RUN_DEMAND_DUMP") else { return; };
+        let Some(path) = std::env::var_os("RELAX_DEMAND_DUMP") else { return; };
         use std::fmt::Write as _;
         let mut out = String::new();
         let _ = writeln!(out, "reached={} indexed={}", self.reached.len(), self.indexed.len());
@@ -985,7 +989,7 @@ impl Plan {
                 hash.str("source-demand-crate-v1");
                 hash
             });
-            hash.str(&key.1);
+            hash.str(&crate::dirs::anchored(&key.1));
             hash.u8(self.reached.contains(key) as u8);
         }
         self.selection = hashes.into_iter().map(|h| h.map_or(0, |h| h.finish128())).collect();
@@ -1019,7 +1023,7 @@ impl Plan {
                     lo, hi, ..crate::pm_tokens::Span::DUMMY
                 }).map_err(|e| e.to_string())?;
                 let eager = crate::rs_index::of_tokens(&stream);
-                if outline.index != eager { return Err(format!("MAKEPAD_RUN_LAZY_VERIFY: Rust outline differs: {path}")); }
+                if outline.index != eager { return Err(format!("RELAX_LAZY_VERIFY: Rust outline differs: {path}")); }
             }
         }
         Ok(())
@@ -1458,7 +1462,7 @@ pub fn recipe_identity(crates: &[PreCrate]) -> u128 {
     hash.str("source-demand-v24-impl-declarations");
     hash.u128(crate::macro_reg::outline_identity());
     for c in crates {
-        hash.str(&c.name); hash.str(&c.root); hash.u32(c.edition as u32);
+        hash.str(&c.name); hash.str(&crate::dirs::anchored(&c.root)); hash.u32(c.edition as u32);
         hash.u128(c.cfg.session.options.fingerprint()); hash.u8(c.proc_macro as u8);
         let mut cfg = c.cfg.set.clone(); cfg.sort();
         for value in cfg { hash.str(&value); }
@@ -1711,7 +1715,7 @@ fn rust_eager_reason(src: &[u8], tokens: &[Tok], names: &Names, ci: usize, modul
 
 fn forced_deferral(path: &str) -> bool {
     static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| std::env::var("MAKEPAD_RUN_LAZY_DEFER").map(|v| v.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect()).unwrap_or_default())
+    LIST.get_or_init(|| std::env::var("RELAX_LAZY_DEFER").map(|v| v.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect()).unwrap_or_default())
         .iter().any(|suffix| path.ends_with(suffix.as_str()))
 }
 

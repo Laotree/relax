@@ -19,7 +19,7 @@ pub(crate) fn symbols(u: &Unit) -> &HashMap<String, u64> {
     u.global_asm.get_or_init(|| match place_all(u) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("makepad run: global_asm!: {}", e);
+            eprintln!("relax run: global_asm!: {}", e);
             HashMap::new()
         }
     })
@@ -172,6 +172,9 @@ fn place_all(u: &Unit) -> Result<HashMap<String, u64>, String> {
             }
             if let Some(a) = crate::jit::loader_symbol(name.as_bytes()) {
                 return Ok(a as u64);
+            }
+            if let Some(a) = crate::run::native_definition(name) {
+                return Ok(a);
             }
             let z = format!("{}\0", name);
             let p = unsafe { crate::os::proc::find(z.as_ptr()) };

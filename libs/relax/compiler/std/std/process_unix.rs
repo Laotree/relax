@@ -440,8 +440,8 @@ impl Command {
             ChildDir::Same => {}
             ChildDir::Virtual(workspace, vfs) => {
                 flags |= 4;
-                wire_push(&mut plumbing, b"MAKEPAD_RUN_WORKSPACE", Some(workspace.as_encoded_bytes()));
-                wire_push(&mut plumbing, b"MAKEPAD_RUN_VFS", Some(vfs.as_encoded_bytes()));
+                wire_push(&mut plumbing, b"RELAX_WORKSPACE", Some(workspace.as_encoded_bytes()));
+                wire_push(&mut plumbing, b"RELAX_VFS", Some(vfs.as_encoded_bytes()));
             }
             ChildDir::Real => flags |= 8,
         }
@@ -464,17 +464,17 @@ impl Command {
     /// Under `makepad run` the program's executable is Relax itself: spawning it runs this
     /// program again (Relax's command line up to `--`, then the new arguments). A spawn of the
     /// loader whose first argument is `run` or `app` is a launcher starting another program
-    /// through it (`$MAKEPAD_RUN_LOADER run [flags] <package> ...`, `... app <id>`: a launch
+    /// through it (`$RELAX_LOADER run [flags] <package> ...`, `... app <id>`: a launch
     /// record), and one whose first argument is `export` asks the loader for a source tree (the
     /// runner's Install natively): those run as written.
     fn self_exec_args(&self) -> Option<Vec<OsString>> {
-        let pre = crate::env::host_var_os("MAKEPAD_RUN_SELF_EXEC")?.into_string().ok()?;
+        let pre = crate::env::host_var_os("RELAX_SELF_EXEC")?.into_string().ok()?;
         if self.args.get(1).is_some_and(|a| matches!(a.as_encoded_bytes(), b"run" | b"app" | b"export")) {
             return None;
         }
-        // inside a build script (MAKEPAD_RUN_AS_RUSTC): its spawns of this executable are RUSTC
+        // inside a build script (RELAX_AS_RUSTC): its spawns of this executable are RUSTC
         // questions, answered as written (relax_as_rustc); re-running the script would recurse
-        if crate::env::host_var_os("MAKEPAD_RUN_AS_RUSTC").is_some() {
+        if crate::env::host_var_os("RELAX_AS_RUSTC").is_some() {
             return None;
         }
         let parts: Vec<&str> = pre.split('\u{1f}').collect();
@@ -506,8 +506,8 @@ impl Command {
     }
 
     /// A current folder under Relax's VFS (a git repository run) is no folder the OS knows: the
-    /// child keeps this process's real folder and gets the virtual one as MAKEPAD_RUN_WORKSPACE plus the
-    /// mount table (MAKEPAD_RUN_VFS), which a Relax program's std and Relax itself serve paths from. A
+    /// child keeps this process's real folder and gets the virtual one as RELAX_WORKSPACE plus the
+    /// mount table (RELAX_VFS), which a Relax program's std and Relax itself serve paths from. A
     /// real current folder clears an inherited virtual one.
     fn spawn_with_mode(&mut self, default: Stdio, exec: bool) -> io::Result<Child> {
         // NDK r28 spawn.h: addchdir_np requires API 34; spawning itself requires API 28.
@@ -545,7 +545,7 @@ impl Command {
         }
         // replacing this process with the program again (an exec, not a spawn) continues the
         // live session: the `--silent` Relax added for re-runs (it ends live editing) goes
-        if let Some(v) = self_exec.as_mut().filter(|_| exec && crate::env::host_var_os("MAKEPAD_RUN_SELF_EXEC_SILENT_ADDED").is_some()) {
+        if let Some(v) = self_exec.as_mut().filter(|_| exec && crate::env::host_var_os("RELAX_SELF_EXEC_SILENT_ADDED").is_some()) {
             if v.get(2).is_some_and(|a| a.as_encoded_bytes() == b"--silent") {
                 v.remove(2);
             }
@@ -553,8 +553,8 @@ impl Command {
         // ... and its clocks go on from this process's start (relax base clock.rs EXEC_ORIGIN_ENV)
         let mut host: Vec<(OsString, OsString)> = Vec::new();
         if exec && self_exec.is_some() {
-            if let Some(t0) = crate::env::host_var_os("MAKEPAD_RUN_STARTUP_T0") {
-                host.push((OsString::from("MAKEPAD_RUN_EXEC_ORIGIN_EPOCH"), t0));
+            if let Some(t0) = crate::env::host_var_os("RELAX_STARTUP_T0") {
+                host.push((OsString::from("RELAX_EXEC_ORIGIN_EPOCH"), t0));
             }
         }
         let prog = match &self_exec {

@@ -60,7 +60,7 @@ pub struct Host {
     /// first (`provide` registers them too)
     pub run_host: fn(),
     /// how much the JIT compiles ahead of the program's calls when neither `--ahead=` nor
-    /// MAKEPAD_RUN_AHEAD says (jit::AheadPolicy): the entry point's default
+    /// RELAX_AHEAD says (jit::AheadPolicy): the entry point's default
     pub ahead: relax_compiler::options::AheadLevel,
     /// which proc-macro crates may use `unsafe` and std capabilities (pmhost::Policy): `relax`
     /// runs crates.io macros as cargo does, `makepad` sandboxes third-party ones
@@ -90,10 +90,10 @@ pub fn set_host(host: &'static Host) {
     if HOST.set(host).is_ok() {
         relax_compiler::pmhost::set_policy(host.proc_macros);
         relax_compiler::reload::set_loader_package(host.package, host.manifest);
-        // the entry point's ahead level, unless the environment names one; MAKEPAD_RUN_AHEAD
+        // the entry point's ahead level, unless the environment names one; RELAX_AHEAD
         // carries it to the session (options.rs) and to every process this one starts
-        if std::env::var_os("MAKEPAD_RUN_AHEAD").is_none() {
-            std::env::set_var("MAKEPAD_RUN_AHEAD", host.ahead.name());
+        if std::env::var_os("RELAX_AHEAD").is_none() {
+            std::env::set_var("RELAX_AHEAD", host.ahead.name());
         }
         (host.init)();
     }
@@ -139,19 +139,34 @@ pub fn main(host: &'static Host) {
     relax_compiler::progenv::init();
     set_host(host);
     relax_compiler::set_tool_name(help::command());
+    warn_legacy_env();
     relax_compiler::wasm_export::startup();
     run(relax_compiler::os::proc::args_bytes())
 }
 
+/// Warn about legacy environment names still carried in people's notes.
+fn warn_legacy_env() {
+    const OLD_PREFIX: &str = concat!("MAKEPAD_", "RUN_");
+    if std::env::var_os("RELAX_SELF_EXEC").is_some() {
+        return;
+    }
+    for (name, _) in std::env::vars_os() {
+        let name = name.to_string_lossy();
+        if let Some(rest) = name.strip_prefix(OLD_PREFIX) {
+            eprintln!("relax: {name} is ignored; it is now RELAX_{rest}");
+        }
+    }
+}
+
 /// What the loader sets up before it runs a package, for an embedder whose process is not the
 /// loader's executable (the Android host library in an Activity's process): `exe` is Relax's own
-/// executable, which build scripts and `MAKEPAD_RUN_LOADER` programs run as.
+/// executable, which build scripts and `RELAX_LOADER` programs run as.
 pub fn init_embedded(exe: &std::path::Path, host: &'static Host) {
     set_host(host);
     relax_compiler::unitgraph::set_self_exe(exe.to_path_buf());
     // the program's argv[0] / current_exe: the embedder has no command line of its own
     relax_compiler::os::proc::set_args(vec![exe.as_os_str().as_encoded_bytes().to_vec()]);
-    std::env::set_var("MAKEPAD_RUN_LOADER", exe);
+    std::env::set_var("RELAX_LOADER", exe);
     macros::register();
 }
 
@@ -231,7 +246,7 @@ fn run(raw_args: Vec<Vec<u8>>) {
     // edits folder) serves this run only when this run's workspace lies in it; a launch record,
     // a git URL or a --workspace-dir elsewhere name their own, before a record's environment applies
     let words: Vec<String> = raw_args.iter().skip(1).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
-    if !fetch::inherited_mount_serves(&words, &std::env::var("MAKEPAD_RUN_VFS").unwrap_or_default()) {
+    if !fetch::inherited_mount_serves(&words, &std::env::var("RELAX_VFS").unwrap_or_default()) {
         for n in relax_compiler::progenv::MOUNT {
             std::env::remove_var(std::str::from_utf8(n).unwrap());
         }
@@ -245,7 +260,7 @@ fn run(raw_args: Vec<Vec<u8>>) {
             words
         }
         Some(Err(e)) => {
-            eprintln!("makepad: {e}");
+            eprintln!("relax: {e}");
             std::process::exit(2);
         }
     };
@@ -254,7 +269,7 @@ fn run(raw_args: Vec<Vec<u8>>) {
     relax_compiler::restart_parent::enter(&raw_args);
     // a child started in a virtual folder of a git repository run gets the mount table
     if let Err(e) = relax_compiler::vfs::mount_from_env() {
-        eprintln!("makepad: MAKEPAD_RUN_VFS: {e}");
+        eprintln!("relax: RELAX_VFS: {e}");
         std::process::exit(2);
     }
     let mut raw_args = raw_args;
@@ -267,21 +282,21 @@ fn run(raw_args: Vec<Vec<u8>>) {
         if help::bare() {
             // the stamps read `makepad <host> jit <relax>`: the source tree's name, then the hashes
             let ids = |p: &'static str| p.strip_prefix("makepad ").unwrap_or(p);
-            println!("relax {} (beta): runs a Rust crate from source through the Relax JIT (build {}, compiler {})", env!("CARGO_PKG_VERSION"), ids(host().provenance), ids(relax_compiler::PROVENANCE));
+            println!("{tool} {} (experimental): runs a Rust crate from source through the Relax JIT (build {}, compiler {})", env!("CARGO_PKG_VERSION"), ids(host().provenance), ids(relax_compiler::PROVENANCE), tool = relax_compiler::tool_name());
         } else {
-            println!("makepad {} (compiler: {})", host().provenance, relax_compiler::PROVENANCE);
+            println!("{tool} {} (compiler: {})", host().provenance, relax_compiler::PROVENANCE, tool = relax_compiler::tool_name());
         }
         return;
     }
     // every program this loader runs (and every program those start) finds it here: a program
     // runs under the loader when its own executable is this file (std::env::current_exe), and
-    // starts other apps with `$MAKEPAD_RUN_LOADER run ...` (std process.rs: a spawn of the loader
+    // starts other apps with `$RELAX_LOADER run ...` (std process.rs: a spawn of the loader
     // with `run` arguments is a launch, never a re-run of the program)
     if let Some(e) = loader_exe() {
-        std::env::set_var("MAKEPAD_RUN_LOADER", e);
+        std::env::set_var("RELAX_LOADER", e);
     }
     // the programs it runs (the runner app) keep their launch records in the same home
-    std::env::set_var("MAKEPAD_RUN_HOME", fetch::home());
+    std::env::set_var("RELAX_HOME", fetch::home());
     #[cfg(target_os = "linux")]
     nvidia_shader_cache();
     macros::register();
@@ -315,7 +330,7 @@ fn run(raw_args: Vec<Vec<u8>>) {
         Some("pack-src") => match relax_compiler::packsrc::parse_args(&args[2..]).and_then(relax_compiler::packsrc::run) {
             Ok(()) => std::process::exit(0),
             Err(e) => {
-                eprintln!("makepad pack-src: {e}");
+                eprintln!("relax pack-src: {e}");
                 std::process::exit(1);
             }
         },
@@ -333,7 +348,7 @@ fn run(raw_args: Vec<Vec<u8>>) {
         Some("run") => match fetch::split_args(&args[2..]) {
             None => {}
             Some(Err(e)) => {
-                eprintln!("makepad: {e}");
+                eprintln!("relax: {e}");
                 std::process::exit(2);
             }
             Some(Ok((opts, spec, cached, rest))) => relax_compiler::os::proc::exit(run_spec(opts, &spec, cached, rest)),
@@ -348,26 +363,26 @@ fn run(raw_args: Vec<Vec<u8>>) {
                     std::process::exit(0)
                 }
                 Err(e) => {
-                    eprintln!("makepad: {e}");
+                    eprintln!("relax: {e}");
                     std::process::exit(1)
                 }
             },
             Some(Err(e)) => {
-                eprintln!("makepad: {e}");
+                eprintln!("relax: {e}");
                 std::process::exit(2);
             }
             _ => {
-                eprintln!("usage: makepad fetch <git url>[#ref] [--mount <dir>=<git url>[#ref]]...");
+                eprintln!("usage: {tool} fetch <git url>[#ref] [--mount <dir>=<git url>[#ref]]...", tool = relax_compiler::tool_name());
                 std::process::exit(2);
             }
         },
         Some("export") if args.get(2).is_some_and(|a| a == "--mounted") => {
             let [out] = &args[3..] else {
-                eprintln!("usage: makepad export --mounted <folder>");
+                eprintln!("usage: {tool} export --mounted <folder>", tool = relax_compiler::tool_name());
                 std::process::exit(2);
             };
-            let table = std::env::var("MAKEPAD_RUN_VFS").unwrap_or_default();
-            let workspace = std::env::var("MAKEPAD_RUN_WORKSPACE").unwrap_or_default();
+            let table = std::env::var("RELAX_VFS").unwrap_or_default();
+            let workspace = std::env::var("RELAX_WORKSPACE").unwrap_or_default();
             export_to(fetch::mounted(&table, &workspace), out)
         }
         Some("export") => match fetch::split_args(&args[2..]) {
@@ -376,11 +391,11 @@ fn run(raw_args: Vec<Vec<u8>>) {
                 export_to(if cached { fetch::cached(&home, &spec) } else { fetch::fetch(&home, &spec) }, &rest[0])
             }
             Some(Err(e)) => {
-                eprintln!("makepad: {e}");
+                eprintln!("relax: {e}");
                 std::process::exit(2);
             }
             _ => {
-                eprintln!("usage: makepad export <git url>[#ref] [--mount <dir>=<git url>[#ref]]... [--cached] <folder>");
+                eprintln!("usage: {tool} export <git url>[#ref] [--mount <dir>=<git url>[#ref]]... [--cached] <folder>", tool = relax_compiler::tool_name());
                 std::process::exit(2);
             }
         },
@@ -466,7 +481,7 @@ fn apply_run_env(workspace: &str, package: &str) {
 /// on Relax's VFS as a virtual workspace, then the normal run.
 fn run_spec(opts: Vec<String>, spec: &fetch::Spec, cached: bool, rest: Vec<String>) -> i32 {
     if rest.first().map_or(true, |p| p.starts_with('-')) {
-        eprintln!("makepad run <git url> needs a package after the URL");
+        eprintln!("{tool} run <git url> needs a package after the URL", tool = relax_compiler::tool_name());
         return 2;
     }
     let home = fetch::home();
@@ -486,8 +501,8 @@ fn run_spec(opts: Vec<String>, spec: &fetch::Spec, cached: bool, rest: Vec<Strin
         // what the run says of itself is set before its window's threads run (the environment is
         // the process's: a write while another thread reads it is a race); what only its source
         // says follows the mount (`mount_vars`)
-        std::env::set_var("MAKEPAD_RUN_SPEC", spec.args().join("\u{1f}"));
-        relax_compiler::progenv::set_run_fact("MAKEPAD_RUN_WORKSPACE", &workspace);
+        std::env::set_var("RELAX_SPEC", spec.args().join("\u{1f}"));
+        relax_compiler::progenv::set_run_fact("RELAX_WORKSPACE", &workspace);
         let words: Vec<String> = opts.iter().chain(&rest).cloned().collect();
         let package = rest[0].clone();
         let (home, spec, opts, rest) = (home.clone(), spec.clone(), opts.clone(), rest.clone());
@@ -515,7 +530,7 @@ fn run_spec(opts: Vec<String>, spec: &fetch::Spec, cached: bool, rest: Vec<Strin
     let snap = match if cached { fetch::cached(&home, spec) } else { fetch::fetch(&home, spec) } {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("makepad: {e}");
+            eprintln!("relax: {e}");
             relax_compiler::run::report_failed(&e, 1);
             return 1;
         }
@@ -523,13 +538,13 @@ fn run_spec(opts: Vec<String>, spec: &fetch::Spec, cached: bool, rest: Vec<Strin
     let workspace = match fetch::mount(&home, &snap) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("makepad: {e}");
+            eprintln!("relax: {e}");
             relax_compiler::run::report_failed(&e, 1);
             return 1;
         }
     };
     // and the spec itself (the runner names its own repositories for apps that share them)
-    std::env::set_var("MAKEPAD_RUN_SPEC", spec.args().join("\u{1f}"));
+    std::env::set_var("RELAX_SPEC", spec.args().join("\u{1f}"));
     let code = run_mounted(&workspace, opts, rest);
     // compiler-arena blocks (the boot thread compiles): see boot_package
     std::mem::forget((home, snap, workspace));
@@ -548,7 +563,7 @@ fn run_src(words: &[String]) -> i32 {
         let n = match words[i].as_str() {
             "--src" => {
                 let Some(s) = words.get(i + 1) else {
-                    eprintln!("makepad: --src wants <store>[@<offset>+<len>]");
+                    eprintln!("relax: --src wants <store>[@<offset>+<len>]");
                     return 2;
                 };
                 src = Some(s.clone());
@@ -557,7 +572,7 @@ fn run_src(words: &[String]) -> i32 {
             }
             "--root" => {
                 let Some(r) = words.get(i + 1) else {
-                    eprintln!("makepad: --root wants a folder");
+                    eprintln!("relax: --root wants a folder");
                     return 2;
                 };
                 root = Some(r.clone());
@@ -572,11 +587,11 @@ fn run_src(words: &[String]) -> i32 {
     }
     let rest = words[i..].to_vec();
     let Some(src) = src else {
-        eprintln!("makepad: --src goes before the package");
+        eprintln!("relax: --src goes before the package");
         return 2;
     };
     if rest.first().map_or(true, |p| p.starts_with('-')) {
-        eprintln!("makepad run --src <store> needs a package after the store");
+        eprintln!("{tool} run --src <store> needs a package after the store", tool = relax_compiler::tool_name());
         return 2;
     }
     let (path, range) = match src.rsplit_once('@').and_then(|(p, r)| relax_compiler::vfs::parse_range(r).map(|r| (p, Some(r)))) {
@@ -591,7 +606,7 @@ fn run_src(words: &[String]) -> i32 {
     match mounted {
         Ok(workspace) => run_mounted(&workspace, opts, rest),
         Err(e) => {
-            eprintln!("makepad: {e}");
+            eprintln!("relax: {e}");
             1
         }
     }
@@ -606,7 +621,7 @@ pub fn mount_archive(file: &std::path::Path, offset: u64, len: u64, root: Option
     let _k = relax_compiler::zone_alloc::kept();
     let store = relax_compiler::gitstore::Store::open_range(file, offset, len)
         .map_err(|e| format!("{}: {e}", file.display()))?
-        .ok_or_else(|| format!("{}: not a makepad run git store", file.display()))?;
+        .ok_or_else(|| format!("{}: not a Relax git store", file.display()))?;
     let [(commit, _)] = store.index.tables.as_slice() else {
         return Err(format!("{}: a source archive holds exactly one commit", file.display()));
     };
@@ -619,16 +634,16 @@ pub fn mount_archive(file: &std::path::Path, offset: u64, len: u64, root: Option
     Ok(workspace)
 }
 
-/// `makepad export`: writes a snapshot out with `$MAKEPAD_RUN_EDITS` over it, and ends the process.
+/// `makepad export`: writes a snapshot out with `$RELAX_EDITS` over it, and ends the process.
 fn export_to(snap: Result<fetch::Snapshot, String>, out: &str) -> ! {
-    let edits = std::env::var_os("MAKEPAD_RUN_EDITS").filter(|d| !d.is_empty()).map(std::path::PathBuf::from);
+    let edits = std::env::var_os("RELAX_EDITS").filter(|d| !d.is_empty()).map(std::path::PathBuf::from);
     match snap.and_then(|snap| fetch::export(&snap, edits.as_deref(), std::path::Path::new(out))) {
         Ok((files, wrote)) => {
             println!("{files} files, {wrote} written");
             std::process::exit(0)
         }
         Err(e) => {
-            eprintln!("makepad: {e}");
+            eprintln!("relax: {e}");
             std::process::exit(1)
         }
     }
@@ -645,19 +660,19 @@ pub fn run_mounted(workspace: &str, opts: Vec<String>, rest: Vec<String>) -> i32
 /// What a run of the mounted workspace and the programs it starts see: the workspace and its
 /// mounts, its std, the package's run-env.
 fn mount_env(workspace: &str, package: &str) {
-    relax_compiler::progenv::set_run_fact("MAKEPAD_RUN_WORKSPACE", workspace);
+    relax_compiler::progenv::set_run_fact("RELAX_WORKSPACE", workspace);
     mount_vars(workspace, package);
 }
 
 /// What only the mounted source says: its mounts, its std, the package's run-env.
 fn mount_vars(workspace: &str, package: &str) {
     // programs it starts that run on Relax (the runner's apps) mount the same repositories
-    relax_compiler::progenv::set_run_fact("MAKEPAD_RUN_VFS", relax_compiler::vfs::mounts_text());
+    relax_compiler::progenv::set_run_fact("RELAX_VFS", relax_compiler::vfs::mounts_text());
     // Verify the mounted std against the compiler build before any std disk probes.
     let own = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../libs/relax/compiler/std");
     relax_compiler::std_source::select(workspace, &own);
     // the run's own files (unit graph, build script outputs, code cache): no workspace on disk,
-    // so its relax dir is $MAKEPAD_RUN_HOME/target/<hash of the virtual workspace> (relax dirs.rs), one
+    // so its relax dir is $RELAX_HOME/target/<hash of the virtual workspace> (relax dirs.rs), one
     // per spec shape (the same across updates)
     apply_run_env(workspace, package);
     // compiler-arena blocks (the boot thread compiles): see boot_package

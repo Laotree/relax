@@ -231,7 +231,7 @@ impl Hub {
 
     /// The endpoint local clients talk to: `route` and `hosts`.
     pub fn client_endpoint(&self) -> Endpoint {
-        let ep = Endpoint::new("makepad-run-hub");
+        let ep = Endpoint::new("relax-hub");
         ep.register("route", 1, route_factory(self.clone()));
         let hub = self.clone();
         ep.register("hosts", 1, lines::service("hosts", Arc::new(move |_, out| hub.hosts_report(out))));
@@ -253,7 +253,7 @@ impl Hub {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn listen_dial(&self, bind: &str, identity: makepad_network::tls::TlsIdentity, source: Source) -> io::Result<std::net::SocketAddr> {
         self.set_source(source.clone());
-        let ep = Endpoint::new("makepad-run-hub");
+        let ep = Endpoint::new("relax-hub");
         let s2 = source.clone();
         let keys: crate::carrier::tcp::KeySource = Arc::new(move || s2().dial_keys());
         let hub = self.clone();
@@ -291,7 +291,7 @@ impl Hub {
     #[cfg(test)]
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn accept_dialed(&self, car: crate::carrier::Carrier) -> Result<Conn, crate::hello::HandshakeError> {
-        let conn = Endpoint::new("makepad-run-hub").serve(car.reader, car.writer, car.shutdown)?;
+        let conn = Endpoint::new("relax-hub").serve(car.reader, car.writer, car.shutdown)?;
         self.bind_link(&conn.peer().name.clone(), &conn);
         Ok(conn)
     }
