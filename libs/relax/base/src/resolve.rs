@@ -2608,9 +2608,10 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
                 if let Some(&ci) = index.get(&(*k, UKind::BuildCompile)) {
                     deps.push((ci, "build_script_build".to_string()));
                 }
-                // the run units of dependencies with `links` (their DEP_* variables)
+                // the run units of the normal dependencies with `links` (their DEP_* variables;
+                // cargo connects no build- or dev-dependency's script to this one)
                 for (di, tk) in &node.edges {
-                    if m.deps[*di].build || r.manifests[tk.0].links.is_none() {
+                    if m.deps[*di].build || m.deps[*di].dev || r.manifests[tk.0].links.is_none() {
                         continue;
                     }
                     if let Some(&ri) = index.get(&(*tk, UKind::BuildRun)) {

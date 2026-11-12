@@ -675,6 +675,17 @@ fn stringify_o(buf: Buf, toks: &(impl TokSeq + ?Sized), lo: usize, hi: usize, or
             if t.kind == T::Pound && n.kind == T::OpenBracket {
                 space = false;
             }
+            // IDENT|`fn`|`Self`|`pub` + `(`: `f(3)`, `fn(x: u8)`, `Self()`, `pub(crate)`; another
+            // reserved word keeps a space it had (`let (a, b)`). The keyword kinds follow the
+            // edition, as rustc's `is_reserved` does; the unused reserved words lex as idents.
+            let glues_paren = match t.kind {
+                T::RawIdent | T::KwFn | T::KwSelfType | T::KwPub => true,
+                T::Ident => !matches!(text, "_" | "abstract" | "become" | "do" | "final" | "macro" | "override" | "priv" | "typeof" | "unsized" | "virtual"),
+                _ => false,
+            };
+            if glues_paren && n.kind == T::OpenParen {
+                space = false;
+            }
             // paths print without spaces around `::` (a `$p:path` / `$t:ty` fragment is
             // pretty-printed by rustc: `std::option`)
             if t.kind == T::PathSep || n.kind == T::PathSep {

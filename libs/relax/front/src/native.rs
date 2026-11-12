@@ -196,11 +196,15 @@ pub fn native_reason(g: &Graph, bs: &BuildScript) -> Option<NativeReason> {
     if links {
         return Some(NativeReason::Links);
     }
-    let src = crate::vfs::read_to_string(&bs.src_path).unwrap_or_default();
-    if src.contains("DEP_") {
+    if reads_dep_metadata(bs) {
         return Some(NativeReason::DepMetadata);
     }
     None
+}
+
+/// Whether a build script reads `DEP_*` metadata (its source names such a variable).
+pub fn reads_dep_metadata(bs: &BuildScript) -> bool {
+    crate::vfs::read_to_string(&bs.src_path).unwrap_or_default().contains("DEP_")
 }
 
 fn fnv(data: &[u8], mut h: u64) -> u64 {

@@ -29,6 +29,10 @@ pub struct BuildScript {
     pub features: Vec<String>,
     /// build-dependencies: (raw unit index, extern crate name), compiled with the host rustc
     pub build_deps: Vec<(usize, String)>,
+    /// the scripts (indices into `Graph::build_scripts`) of the package's dependencies with
+    /// `links =`: cargo runs them first and gives this script their metadata as
+    /// `DEP_<LINKS>_<KEY>` (the unit graph lists their runs among this run's dependencies)
+    pub links_deps: Vec<usize>,
 }
 
 impl BuildScript {
@@ -278,7 +282,7 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
                 }
                 let build_deps = raw.get(*bu).map(|r| r.deps.clone()).unwrap_or_default();
                 script_of_run.insert(*i, build_scripts.len());
-                build_scripts.push(BuildScript { krate: ci, also: Vec::new(), src_path: p.clone(), edition: *ed, features: f.clone(), build_deps });
+                build_scripts.push(BuildScript { krate: ci, also: Vec::new(), src_path: p.clone(), edition: *ed, features: f.clone(), build_deps, links_deps: Vec::new() });
             }
         }
         c.deps = nd;
@@ -287,6 +291,10 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
                 map.get(*i).filter(|&&ci| ci != usize::MAX).map(|&ci| (ci, n.clone()))
             }).collect();
         }
+    }
+    // a script run's dependencies on other runs: those of its package's dependencies with `links`
+    for (&run, &s) in &script_of_run {
+        build_scripts[s].links_deps = raw[run].deps.iter().filter_map(|(d, _)| script_of_run.get(d).copied()).filter(|&t| t != s).collect();
     }
 
     let n = crates.len();
@@ -562,6 +570,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
     // cargo builds the native packages (C compiles, a cold build's longest step) while Relax runs
     // the other scripts: they share nothing (each script's output is its own crate's)
     let gr: &Graph = g;
+    let meta: LinksMeta = Default::default();
     let (native_built, results) = std::thread::scope(|scope| {
         let native_job = match (native, native_seeds.is_empty()) {
             (Some(crate::native::Mode::Build(req)), false) if !prebuilt => Some(scope.spawn(|| {
@@ -580,7 +589,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
             _ => Vec::new(),
         };
         let receipts: Vec<Option<&str>> = reach.iter().map(|&r| if r { receipt.as_deref() } else { None }).collect();
-        let mut results = relax_scripts(sess, gr, target_dir, &native_krates, &check_skipped, &receipts, &|k| world.is_empty() || world[k]);
+        let mut results = relax_scripts(sess, gr, target_dir, &native_krates, &check_skipped, &receipts, &meta, &|k| world.is_empty() || world[k]);
         let mut _kept = None;
         if let (Some(job), Some(done)) = (&native_job, scripts_done) {
             if !job.is_finished() {
@@ -596,7 +605,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
             }
         }
         if !world.is_empty() {
-            results.extend(relax_scripts(sess, gr, target_dir, &native_krates, &check_skipped, &receipts, &|k| !world[k]));
+            results.extend(relax_scripts(sess, gr, target_dir, &native_krates, &check_skipped, &receipts, &meta, &|k| !world[k]));
         }
         (native_job.map(|j| j.join().unwrap_or_else(|_| Err("--allow-c: the native build panicked".to_string()))), results)
     });
@@ -689,69 +698,181 @@ fn apply_native_scripts(g: &mut Graph, scripts: Vec<crate::native::ScriptOut>) {
     }
 }
 
+/// What each script handed on to the scripts of its dependents, by script index: the metadata
+/// its output carried (`script_metadata`), or why it has none (its script was not run, or failed).
+/// One table for both calls of `relax_scripts` (the macro world's scripts first).
+type LinksMeta = Mutex<std::collections::HashMap<usize, Result<Vec<(String, String)>, String>>>;
+
 /// The scripts Relax runs itself (every one but the native packages' and a check's skipped
-/// ones), on the pool: (crates, stdout or error, OUT_DIR) per script.
+/// ones), on the pool: (crates, stdout or error, OUT_DIR) per script. A script whose package
+/// depends on `links` packages runs after their scripts, given their metadata (cargo orders the
+/// runs the same way); most graphs have no such pair and run every script at once.
 fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &str, native_krates: &[usize], check_skipped: &[usize],
-    receipts: &[Option<&str>], only: &(dyn Fn(usize) -> bool + Sync)) -> Vec<(Vec<usize>, Result<String, String>, String)> {
+    receipts: &[Option<&str>], meta: &LinksMeta,
+    only: &(dyn Fn(usize) -> bool + Sync)) -> Vec<(Vec<usize>, Result<String, String>, String)> {
     let results: Mutex<Vec<(Vec<usize>, Result<String, String>, String)>> = Mutex::new(Vec::new());
-    crate::pool::scope(|s| {
-        for (si, bs) in g.build_scripts.iter().enumerate() {
-            if native_krates.contains(&bs.krate) || !only(bs.krate) {
-                continue;
+    let done = |i: usize, r: Result<String, String>, out_dir: String| {
+        meta.lock().unwrap().insert(i, match &r {
+            Ok(stdout) => Ok(script_metadata(stdout)),
+            Err(_) => Err("its build script failed".to_string()),
+        });
+        results.lock().unwrap().push((g.build_scripts[i].krates(), r, out_dir));
+    };
+    let unbuilt = |bs: &BuildScript| {
+        let out_dir = format!("{}/build/{}-unbuilt/out", target_dir, g.crates[bs.krate].name);
+        let _ = std::fs::create_dir_all(&out_dir);
+        out_dir
+    };
+    let mut to_run: Vec<usize> = Vec::new();
+    for (i, bs) in g.build_scripts.iter().enumerate() {
+        if native_krates.contains(&bs.krate) || !only(bs.krate) {
+            continue;
+        }
+        if check_skipped.contains(&bs.krate) {
+            let out_dir = unbuilt(bs);
+            results.lock().unwrap().push((bs.krates(), Ok(String::new()), out_dir));
+            meta.lock().unwrap().insert(i, Err("its build script compiles C, which is not run without `--allow-c`".to_string()));
+            continue;
+        }
+        let (dir, pname, _) = &g.pkg[bs.krate];
+        let name = &g.crates[bs.krate].name;
+        let role = if noop::script(bs, &g.raw) {
+            if sess.runtime.profile {
+                eprintln!("makepad-run build-script: {} skipped (no effect under MAKEPAD_RUN_BUILD_SCRIPT)", pname);
             }
-            if check_skipped.contains(&bs.krate) {
-                let out_dir = format!("{}/build/{}-unbuilt/out", target_dir, g.crates[bs.krate].name);
+            ScriptRole::Answered(Vec::new())
+        } else { script_role(pname, &bs.features) };
+        match role {
+            ScriptRole::Answered(lines) => {
+                // cargo sets OUT_DIR for every package with a build script
+                let out_dir = format!("{}/build/{}-answered/out", target_dir, name);
                 let _ = std::fs::create_dir_all(&out_dir);
-                results.lock().unwrap().push((bs.krates(), Ok(String::new()), out_dir));
+                done(i, Ok(lines.join("\n")), out_dir);
                 continue;
             }
-            let results = &results;
-            let (dir, pname, ver) = g.pkg[bs.krate].clone();
-            let name = g.crates[bs.krate].name.clone();
-            let raw = &g.raw;
-            let cenv = g.env[bs.krate].clone();
-            let role = if noop::script(bs, raw) {
-                if sess.runtime.profile {
-                    eprintln!("makepad-run build-script: {} skipped (no effect under MAKEPAD_RUN_BUILD_SCRIPT)", pname);
+            ScriptRole::ToRemove => {
+                let mut t = TO_REMOVE.lock().unwrap();
+                if !t.iter().any(|x| x.0 == *pname) {
+                    crate::zone_alloc::kept_with(|| t.push((pname.clone(), bs.src_path.clone())));
                 }
-                ScriptRole::Answered(Vec::new())
-            } else { script_role(&pname, &bs.features) };
-            match role {
-                ScriptRole::Answered(lines) => {
-                    // cargo sets OUT_DIR for every package with a build script
-                    let out_dir = format!("{}/build/{}-answered/out", target_dir, name);
-                    let _ = std::fs::create_dir_all(&out_dir);
-                    results.lock().unwrap().push((bs.krates(), Ok(lines.join("\n")), out_dir));
-                    continue;
-                }
-                ScriptRole::ToRemove => {
-                    let mut t = TO_REMOVE.lock().unwrap();
-                    if !t.iter().any(|x| x.0 == pname) {
-                        crate::zone_alloc::kept_with(|| t.push((pname.clone(), bs.src_path.clone())));
+            }
+            ScriptRole::SelfStamp => {
+                let out_dir = format!("{}/build/{}-answered/out", target_dir, name);
+                let r = std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {}", out_dir, e)).and_then(|_| self_stamp_answer(dir, pname, &bs.features, &out_dir));
+                done(i, r.map(|_| String::new()), out_dir);
+                continue;
+            }
+            ScriptRole::Platform => {
+                let out_dir = format!("{}/build/{}-answered/out", target_dir, name);
+                let r = std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {}", out_dir, e)).and_then(|_| platform_answer(sess, &out_dir));
+                done(i, r.map(|l| l.join("\n")), out_dir);
+                continue;
+            }
+            ScriptRole::Artefact => {}
+        }
+        to_run.push(i);
+    }
+    // the level of each script to run: one past the deepest `links` script of this call it takes
+    // metadata from (cargo refuses a dependency cycle; the rounds end one anyway)
+    let mut level = vec![0usize; g.build_scripts.len()];
+    let mut in_call = vec![false; g.build_scripts.len()];
+    for &i in &to_run {
+        in_call[i] = true;
+    }
+    for _ in 0..to_run.len() {
+        let mut changed = false;
+        for &i in &to_run {
+            let l = g.build_scripts[i].links_deps.iter().filter(|&&d| in_call[d]).map(|&d| level[d] + 1).max().unwrap_or(0);
+            if l != level[i] {
+                level[i] = l;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let levels = to_run.iter().map(|&i| level[i]).max().map_or(0, |l| l + 1);
+    for l in 0..levels {
+        crate::pool::scope(|s| {
+            for &i in to_run.iter().filter(|&&i| level[i] == l) {
+                let bs = &g.build_scripts[i];
+                let mut cenv = g.env[bs.krate].clone();
+                match links_env(g, bs, meta) {
+                    Ok(dep_env) => cenv.extend(dep_env),
+                    Err(e) => {
+                        let out_dir = unbuilt(bs);
+                        done(i, Err(e), out_dir);
+                        continue;
                     }
                 }
-                ScriptRole::SelfStamp => {
-                    let out_dir = format!("{}/build/{}-answered/out", target_dir, name);
-                    let r = std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {}", out_dir, e)).and_then(|_| self_stamp_answer(&dir, &pname, &bs.features, &out_dir));
-                    results.lock().unwrap().push((bs.krates(), r.map(|_| String::new()), out_dir));
-                    continue;
-                }
-                ScriptRole::Platform => {
-                    let out_dir = format!("{}/build/{}-answered/out", target_dir, name);
-                    let r = std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {}", out_dir, e)).and_then(|_| platform_answer(sess, &out_dir));
-                    results.lock().unwrap().push((bs.krates(), r.map(|l| l.join("\n")), out_dir));
-                    continue;
-                }
-                ScriptRole::Artefact => {}
+                let (dir, pname, ver) = g.pkg[bs.krate].clone();
+                let name = g.crates[bs.krate].name.clone();
+                let raw = &g.raw;
+                let done = &done;
+                let receipt = receipts[i];
+                s.spawn(move || {
+                    let r = run_one(sess, bs, raw, &cenv, &dir, &pname, &ver, &name, target_dir, receipt);
+                    done(i, r.0, r.1);
+                });
             }
-            let receipt = receipts[si];
-            s.spawn(move || {
-                let r = run_one(sess, bs, raw, &cenv, &dir, &pname, &ver, &name, target_dir, receipt);
-                results.lock().unwrap().push((bs.krates(), r.0, r.1));
-            });
-        }
-    });
+        });
+    }
     results.into_inner().unwrap()
+}
+
+/// The `DEP_<LINKS>_<KEY>` variables cargo gives a script (custom_build.rs build_work): the
+/// metadata the scripts of its package's `links` dependencies printed. Err: such a script handed
+/// nothing on (not run, or failed) and this script reads `DEP_` variables, so it is not run: it
+/// would fail on the missing value, or answer other than under cargo. A dependency built by
+/// cargo (`--allow-c`) is not in the table: a script reading its metadata is cargo's too.
+fn links_env(g: &Graph, bs: &BuildScript, meta: &LinksMeta) -> Result<Vec<(String, String)>, String> {
+    let mut env = Vec::new();
+    for &d in &bs.links_deps {
+        let (ddir, dname, _) = &g.pkg[g.build_scripts[d].krate];
+        let Some(links) = crate::resolve::package_links(ddir) else { continue };
+        match meta.lock().unwrap().get(&d) {
+            Some(Ok(pairs)) => {
+                for (k, v) in pairs {
+                    env.push((format!("DEP_{}_{}", envify(&links), envify(k)), v.clone()));
+                }
+            }
+            Some(Err(why)) if crate::native::reads_dep_metadata(bs) => {
+                return Err(format!("{}: the build script of `{}` was not run: it reads the `DEP_` metadata of `{}` (links = \"{}\"), and {}",
+                    bs.src_path, g.pkg[bs.krate].1, dname, links, why));
+            }
+            _ => {}
+        }
+    }
+    Ok(env)
+}
+
+/// cargo's `envify`: a `links` name or metadata key as part of a variable name.
+fn envify(s: &str) -> String {
+    s.chars().flat_map(|c| c.to_uppercase()).map(|c| if c == '-' { '_' } else { c }).collect()
+}
+
+/// The keys of the old `cargo:KEY=VALUE` syntax that are instructions to cargo; every other key
+/// is metadata (cargo custom_build.rs BuildOutput::parse).
+const SCRIPT_INSTRUCTIONS: [&str; 17] = ["rustc-flags", "rustc-link-lib", "rustc-link-search", "rustc-link-arg-cdylib", "rustc-cdylib-link-arg",
+    "rustc-link-arg-bins", "rustc-link-arg-bin", "rustc-link-arg-tests", "rustc-link-arg-benches", "rustc-link-arg-examples", "rustc-link-arg",
+    "rustc-cfg", "rustc-check-cfg", "rustc-env", "warning", "rerun-if-changed", "rerun-if-env-changed"];
+
+/// The metadata a script's output hands to the scripts of the packages that depend on its
+/// package (when that package has `links`): `cargo::metadata=KEY=VALUE`, and `cargo:KEY=VALUE`
+/// with a key that is no instruction.
+fn script_metadata(stdout: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let pair = match line.strip_prefix("cargo::") {
+            Some(rest) => rest.strip_prefix("metadata=").and_then(|kv| kv.split_once('=')),
+            None => line.strip_prefix("cargo:").and_then(|kv| kv.split_once('=')).filter(|(k, _)| !SCRIPT_INSTRUCTIONS.contains(k)),
+        };
+        if let Some((k, v)) = pair {
+            out.push((k.to_string(), v.trim_end().to_string()));
+        }
+    }
+    out
 }
 
 /// The scripts' `cargo:` lines into the graph: cfgs, link libraries, env (OUT_DIR included).
