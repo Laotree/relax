@@ -118,8 +118,10 @@ impl Niche {
         }
     }
 
+    /// A niche with invalid values left; a 16-byte one (u128 / i128 scalars and tags) too: its
+    /// tag is read and written as its two words (lower.rs emit_load_disc / emit_store_disc).
     fn some(self) -> Option<Niche> {
-        if self.available() > 0 && self.bytes <= 8 {
+        if self.available() > 0 && self.bytes <= 16 {
             Some(self)
         } else {
             None
@@ -944,7 +946,11 @@ impl Layouts {
                         // `rustc_layout_scalar_valid_range_*`: the range of the struct's scalar
                         if let Some(first) = l.leaves.as_ref().and_then(|v| v.first().copied()) {
                             if first.off == 0 && matches!(first.mem, Mem::Int(..)) {
+                                // a 128-bit integer is two word leaves but one 16-byte scalar, which
+                                // rustc's niche covers whole (Option<NonZero<u128>>: None is 0 in both words)
+                                let wide = matches!(fts.as_slice(), [f] if matches!(tcx.tys.kind(*f), TyKind::Int(p) if tcx.tys.int_info(*p).0 == 16));
                                 let bytes = match first.mem {
+                                    _ if wide => 16,
                                     Mem::Int(b, _) => b as u32,
                                     _ => 8,
                                 };

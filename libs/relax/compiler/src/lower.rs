@@ -13298,6 +13298,25 @@ pub fn emit_decode_tag(u: &Unit, f: &mut Func, b: u32, pos: u64, raw: Vec<VReg>,
             };
             let inr = f.vreg(Cls::I);
             push_at(f, b, pos, Inst::ICmpI(Cond::Le, false, inr, rel, (hi - lo) as i64));
+            // a 16-byte tag (Option<NonZero<u128>>) has a 128-bit relative value: in the range only
+            // when its high word, less the low word's borrow, is 0 too
+            let inr = if raw.len() == 2 {
+                let borrow = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::ICmp(Cond::Lt, false, borrow, raw[0], ks));
+                let ks_hi = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::Iconst(ks_hi, (start >> 64) as u64 as i64));
+                let rel_hi = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::IBin(IOp::Sub, U64, rel_hi, raw[1], ks_hi));
+                let rel_hi2 = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::IBin(IOp::Sub, U64, rel_hi2, rel_hi, borrow));
+                let zero_hi = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::ICmpI(Cond::Eq, false, zero_hi, rel_hi2, 0));
+                let both = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::IBin(IOp::And, U64, both, inr, zero_hi));
+                both
+            } else {
+                inr
+            };
             // one niche variant: in range means exactly that variant
             let vidx = f.vreg(Cls::I);
             if hi == lo {
