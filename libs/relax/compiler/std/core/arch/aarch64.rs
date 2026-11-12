@@ -968,6 +968,117 @@ pub fn vsha256su1q_u32(tw0_3: uint32x4_t, w8_11: uint32x4_t, w12_15: uint32x4_t)
     }
 }
 
+// ---- SHA-512 and SHA-3 (FEAT_SHA512, FEAT_SHA3: target feature `sha3`), as the Arm ARM pseudocode
+// defines SHA512H / SHA512H2 / SHA512SU0 / SHA512SU1 and EOR3 / BCAX / RAX1 / XAR. Lane 0 is the
+// pseudocode's <63:0>, lane 1 its <127:64>; every addition wraps.
+
+fn sha512_sum1(x: u64) -> u64 {
+    x.rotate_right(14) ^ x.rotate_right(18) ^ x.rotate_right(41)
+}
+
+fn sha512_sum0(x: u64) -> u64 {
+    x.rotate_right(28) ^ x.rotate_right(34) ^ x.rotate_right(39)
+}
+
+/// SHA512H (Qd = hash_ed, Qn, Vm): two rounds' Ch and Sigma1 part. The second round takes the
+/// first's result as its e.
+#[inline]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "sha3"))]
+pub fn vsha512hq_u64(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
+    let (w, x, y) = (a.0, b.0, c.0);
+    let hi = ((y[1] & x[0]) ^ (!y[1] & x[1])).wrapping_add(sha512_sum1(y[1])).wrapping_add(w[1]);
+    let e = hi.wrapping_add(y[0]);
+    let lo = ((e & y[1]) ^ (!e & x[0])).wrapping_add(sha512_sum1(e)).wrapping_add(w[0]);
+    uint64x2_t([lo, hi])
+}
+
+/// SHA512H2 (Qd, Qn, Vm): two rounds' Maj and Sigma0 part. The second round takes the first's
+/// result as its a.
+#[inline]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "sha3"))]
+pub fn vsha512h2q_u64(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
+    let (w, x, y) = (a.0, b.0, c.0);
+    let hi = ((x[0] & y[1]) ^ (x[0] & y[0]) ^ (y[1] & y[0])).wrapping_add(sha512_sum0(y[0])).wrapping_add(w[1]);
+    let lo = ((hi & y[0]) ^ (hi & y[1]) ^ (y[1] & y[0])).wrapping_add(sha512_sum0(hi)).wrapping_add(w[0]);
+    uint64x2_t([lo, hi])
+}
+
+/// SHA512SU0 (Vd, Vn): message schedule, sigma0 of the next two words added.
+#[inline]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "sha3"))]
+pub fn vsha512su0q_u64(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+    let sigma0 = |v: u64| v.rotate_right(1) ^ v.rotate_right(8) ^ (v >> 7);
+    uint64x2_t([a.0[0].wrapping_add(sigma0(a.0[1])), a.0[1].wrapping_add(sigma0(b.0[0]))])
+}
+
+/// SHA512SU1 (Vd, Vn, Vm): message schedule, sigma1 of b and c added lane by lane.
+#[inline]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "sha3"))]
+pub fn vsha512su1q_u64(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
+    let sigma1 = |v: u64| v.rotate_right(19) ^ v.rotate_right(61) ^ (v >> 6);
+    uint64x2_t([
+        a.0[0].wrapping_add(sigma1(b.0[0])).wrapping_add(c.0[0]),
+        a.0[1].wrapping_add(sigma1(b.0[1])).wrapping_add(c.0[1]),
+    ])
+}
+
+/// RAX1: a ^ (b rotated left by one), per lane.
+#[inline]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "sha3"))]
+pub fn vrax1q_u64(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+    uint64x2_t([a.0[0] ^ b.0[0].rotate_left(1), a.0[1] ^ b.0[1].rotate_left(1)])
+}
+
+/// XAR: (a ^ b) rotated right by IMM6, per lane.
+#[inline]
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "sha3"))]
+pub fn vxarq_u64<const IMM6: i32>(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+    let r = IMM6 as u32;
+    uint64x2_t([(a.0[0] ^ b.0[0]).rotate_right(r), (a.0[1] ^ b.0[1]).rotate_right(r)])
+}
+
+macro_rules! neon_sha3_bitwise {
+    ($($eor3:ident $bcax:ident $t:ident;)*) => {$(
+        /// EOR3: a ^ b ^ c.
+        #[inline]
+        #[cfg_attr(target_arch = "aarch64", target_feature(enable = "sha3"))]
+        pub fn $eor3(a: $t, b: $t, c: $t) -> $t {
+            let mut r = a;
+            let mut i = 0;
+            while i < r.0.len() {
+                r.0[i] = a.0[i] ^ b.0[i] ^ c.0[i];
+                i += 1;
+            }
+            r
+        }
+
+        /// BCAX: a ^ (b & !c).
+        #[inline]
+        #[cfg_attr(target_arch = "aarch64", target_feature(enable = "sha3"))]
+        pub fn $bcax(a: $t, b: $t, c: $t) -> $t {
+            let mut r = a;
+            let mut i = 0;
+            while i < r.0.len() {
+                r.0[i] = a.0[i] ^ (b.0[i] & !c.0[i]);
+                i += 1;
+            }
+            r
+        }
+    )*};
+}
+
+neon_sha3_bitwise! {
+    veor3q_s8 vbcaxq_s8 int8x16_t;
+    veor3q_s16 vbcaxq_s16 int16x8_t;
+    veor3q_s32 vbcaxq_s32 int32x4_t;
+    veor3q_s64 vbcaxq_s64 int64x2_t;
+    veor3q_u8 vbcaxq_u8 uint8x16_t;
+    veor3q_u16 vbcaxq_u16 uint16x8_t;
+    veor3q_u32 vbcaxq_u32 uint32x4_t;
+    veor3q_u64 vbcaxq_u64 uint64x2_t;
+}
+
 #[derive(Copy, Clone)]
 #[repr(C, align(8))]
 pub struct float32x2_t(pub [f32; 2]);
