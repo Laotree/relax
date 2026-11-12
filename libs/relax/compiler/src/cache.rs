@@ -233,8 +233,11 @@ const LEDGER_KEY: u128 = 0;
 // follows the trait objects its roots are passed, not every one its code calls through). 32: a
 // closure is named by its owner's closure ordinal and its text (closure_ordinal), not by its
 // file version and position, in slot keys and types alike; a block-scoped item by its fn and
-// its ordinal there (stable::block_place), not its offset.
-const ENTRY_VERSION: u32 = 34;
+// its ordinal there (stable::block_place), not its offset. 35: a glue kind is a u16
+// (jit.rs FnKey::Glue). A kind below 0xFF is still one byte; 0xFF escapes to a u32. That byte
+// used to be a real kind (GLUE_CTOR + variant 239), so an entry written before this version is
+// dropped rather than misread.
+const ENTRY_VERSION: u32 = 35;
 /// the level of a code entry's code (its tier byte)
 const TIER_O1: u8 = 0;
 const TIER_O3: u8 = 1;
@@ -2330,7 +2333,12 @@ impl Cache {
             }
             FnKey::Glue(g, t) => {
                 e.u8(KeyKind::Glue as u8);
-                e.u8(g);
+                if g < 0xFF {
+                    e.u8(g as u8);
+                } else {
+                    e.u8(0xFF);
+                    e.u32(g as u32);
+                }
                 self.enc_ty(u, t, e, crates, 0)
             }
         }
@@ -7886,6 +7894,12 @@ mod data_tests {
         let owner_closures = cache.item_closures(&u, owner);
         assert_eq!(owner_closures.len(), 2);
         keys.extend(owner_closures.iter().map(|&expr| FnKey::Closure(owner_file, expr, owner_slot)));
+        // glue kinds: a single byte below 0xFF, and the 0xFF escape (variant 239, and a constructor
+        // past it). skip_fnkey has to consume the escape or the rest of the key is misread.
+        keys.push(FnKey::Glue(crate::jit::GLUE_DROP, callable));
+        keys.push(FnKey::Glue(0xFE, callable));
+        keys.push(FnKey::Glue(0xFF, callable));
+        keys.push(FnKey::Glue(crate::jit::GLUE_CTOR + 246, callable));
         let mut encoded = Vec::new();
         for key in keys {
             let mut bytes = E::default();
@@ -8956,7 +8970,10 @@ impl Linker {
                 FnKey::Closure(file, expr, parent)
             }
             KeyKind::Glue => {
-                let g = d.u8()?;
+                let g = match d.u8()? {
+                    0xFF => u16::try_from(d.u32()?).ok()?,
+                    b => b as u16,
+                };
                 FnKey::Glue(g, self.cache().dec_ty(u, d, 0)?)
             }
             KeyKind::Shim => {
