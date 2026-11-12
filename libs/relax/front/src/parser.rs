@@ -1002,10 +1002,13 @@ impl<'a> Parser<'a> {
     /// `parse_cfg_entry`, `parse_cfg_attr`): a cfg predicate is `name`, `name = "str"`,
     /// `all(..)`, `any(..)`, `not(..)` or a boolean.
     /// `cfg` / `cfg_attr` are read (and so checked) while the configuration is evaluated; the other
-    /// attributes only once their item is known to be configured in.
+    /// attributes only once their item is known to be configured in. Inside code that is already
+    /// configured out nothing is evaluated, so nothing is checked: rustc's StripUnconfigured never
+    /// visits a stripped node's attributes (`#[cfg(any())] { #[cfg(version("1.76"))] .. }`).
     fn attr_shape_now_or_later(&mut self, toks: TokRange) -> PResult<()> {
         let first = if (toks.lo as usize) < self.toks.len() { self.tok_text(self.toks.at(toks.lo as usize)) } else { b"" };
         if first == b"cfg" || first == b"cfg_attr" {
+            if self.cfg_out > 0 { return Ok(()); }
             return self.check_attr_shape(toks);
         }
         self.pending_shape.push((toks, None));
@@ -7066,6 +7069,23 @@ mod diagnostic_tests {
         let call = source.windows(9).rposition(|s| s == b"outer!();").unwrap() as u32;
         let result = parse_owned_ctx(sess, source,None,2021,Some(crate::macros::MacroScope::new(std::sync::Arc::new(crate::macros::MacroTable::default()))),"test",None,false);
         match result { Err((pos,_)) => assert_eq!(pos,call), Ok(_) => panic!("expected a parse error") }
+    }
+
+    /// relax issue 111: a cfg predicate inside configured-out code is never evaluated, so its
+    /// shape is not checked either (rustc only needs the stripped code to parse).
+    #[test]
+    fn cfg_predicates_inside_configured_out_code_are_not_checked() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let ctx = std::rc::Rc::new(crate::builtins::FileCtx::new("test", "/fake/cfg_out.rs", "test", &crate::cfg::CfgSet::host(sess, &[])));
+        let parse = |src: &str| {
+            let scope = crate::macros::MacroScope::new(std::sync::Arc::new(crate::macros::MacroTable::default()));
+            parse_owned_ctx(sess, src.as_bytes().to_vec(), None, 2021, Some(scope), "test", Some(ctx.clone()), false).map(|_| ()).map_err(|(_, msg)| msg)
+        };
+        let stripped = "fn main() {\n    #[cfg(any())]\n    {\n        #[cfg(version(\"1.76\"))]\n        let unused = 1;\n    }\n}\n#[cfg(any())]\nfn gone() { #[cfg(version(\"1.76\"))] let unused = 1; }\n";
+        assert_eq!(parse(stripped), Ok(()), "a predicate in stripped code");
+        let live = "fn main() {\n    #[cfg(all())]\n    {\n        #[cfg(version(\"1.76\"))]\n        let unused = 1;\n    }\n}\n";
+        let msg = parse(live).expect_err("a predicate in configured-in code is still checked");
+        assert!(msg.contains("invalid predicate"), "{msg}");
     }
 
     fn parse_error_with_macros(source: &str) -> (usize, usize, String) {
