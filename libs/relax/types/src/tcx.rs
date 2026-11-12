@@ -694,7 +694,7 @@ impl Tcx {
             Some(Some(a)) => match Abi::from_name(&crate::lit::unescape_str(prog.files[file as usize].text(a))) {
                 Some(abi) => {
                     let target = &prog.session.options.target;
-                    let arch = if target.is_empty() { std::env::consts::ARCH } else { target.split('-').next().unwrap() };
+                    let arch = target.split('-').next().unwrap();
                     if !abi.is_supported_on_arch(arch) {
                         self.err(cx, prog, file, a.lo, format!("E0570: \"{}\" is not a supported ABI for the current target", abi.name()));
                     }

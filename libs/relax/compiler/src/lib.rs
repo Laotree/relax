@@ -506,19 +506,7 @@ pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
     }
     options.spec_hot = Some(options.spec_hot.unwrap_or_else(crate::jit::on_battery));
     let mut session = crate::Session { options, runtime: crate::options::RuntimeOptions::from_env() };
-    session.options.target = match session.options.check_target {
-        crate::options::CheckTarget::WindowsX64 => "x86_64-pc-windows-gnu",
-        crate::options::CheckTarget::MacosArm64 => "aarch64-apple-darwin",
-        crate::options::CheckTarget::LinuxX64 => "x86_64-unknown-linux-gnu",
-        crate::options::CheckTarget::AndroidArm64 => "aarch64-linux-android",
-        crate::options::CheckTarget::IosArm64 => "aarch64-apple-ios",
-        crate::options::CheckTarget::Web(w) => crate::options::CheckTarget::web_triple(w),
-        _ if cfg!(target_os = "android") => "aarch64-linux-android",
-        _ if cfg!(all(target_os = "macos", target_arch = "aarch64")) => "aarch64-apple-darwin",
-        _ if cfg!(target_os = "ios") => "aarch64-apple-ios",
-        _ if cfg!(windows) => "x86_64-pc-windows-gnu",
-        _ => "x86_64-unknown-linux-gnu",
-    }.to_string();
+    session.options.target = session.options.check_target.triple().to_string();
     std::sync::Arc::new(session)
 }
 

@@ -66,6 +66,18 @@ impl CheckTarget {
     pub fn web_triple(w: PtrWidth) -> &'static str {
         Self::WEB_TRIPLES.iter().find(|(_, x)| *x == w).unwrap().0
     }
+    /// The triple a session checks and compiles for (`Options::target`): Host is the machine's.
+    pub fn triple(self) -> &'static str {
+        match self {
+            CheckTarget::Web(w) => Self::web_triple(w),
+            CheckTarget::Host if cfg!(target_os = "android") => "aarch64-linux-android",
+            CheckTarget::Host if cfg!(all(target_os = "macos", target_arch = "aarch64")) => "aarch64-apple-darwin",
+            CheckTarget::Host if cfg!(target_os = "ios") => "aarch64-apple-ios",
+            CheckTarget::Host if cfg!(windows) => "x86_64-pc-windows-gnu",
+            CheckTarget::Host => "x86_64-unknown-linux-gnu",
+            native => Self::TRIPLES.iter().find(|(_, c)| *c == native).unwrap().0,
+        }
+    }
     pub fn from_triple(triple: &str) -> Option<CheckTarget> {
         if let Some((_, w)) = Self::WEB_TRIPLES.iter().find(|(t, _)| *t == triple) {
             return Some(CheckTarget::Web(*w));
@@ -300,7 +312,8 @@ pub struct Options {
     /// `--cfg <name>` / `--cfg name="value"` of `makepad run|check` (what `RUSTFLAGS=--cfg` is to
     /// cargo), as `name` / `name=value` entries added to the cfg set the program is read with.
     pub cfgs: Vec<String>,
-    /// Effective target triple, finalized by the driver.
+    /// Effective target triple: the check target's (CheckTarget::triple), the machine's by
+    /// default, so a session no driver finalized reads and checks code for one machine.
     pub target: String,
     pub cpu: CpuFeatures,
 }
@@ -384,7 +397,7 @@ impl Default for Options {
             ra_quick_coalesce: false,
             nan_exact: false,
             cfgs: Vec::new(),
-            target: String::new(),
+            target: CheckTarget::Host.triple().to_string(),
             cpu: CpuFeatures::default(),
         }
     }
@@ -404,7 +417,7 @@ impl Options {
     }
 
     fn read(get: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Self {
-        Self {
+        let mut options = Self {
             verbose: get("MAKEPAD_RUN_VERBOSE").is_some_and(|v| v == "1"),
             check_windows: { let os = get("MAKEPAD_RUN_CHECK_WINDOWS"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
             no_asm: get("MAKEPAD_RUN_NO_ASM").is_some_and(|v| v == "1"),
@@ -492,7 +505,9 @@ impl Options {
             cfgs: Vec::new(),
             target: String::new(),
             cpu: CpuFeatures::default(),
-        }
+        };
+        options.target = options.check_target.triple().to_string();
+        options
     }
 
     /// Exhaustive destructuring makes adding an unhashed field a compile error.
