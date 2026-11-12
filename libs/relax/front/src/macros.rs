@@ -33,6 +33,9 @@ pub enum Frag {
     Vis,
     Lifetime,
     Meta,
+    /// `expr_2021`: parsed as `expr`, but whatever the edition it never begins with `_` or
+    /// `const` (rustc NonterminalKind::Expr(Expr2021))
+    Expr2021,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2794,7 +2797,8 @@ pub(crate) fn close_of(toks: &[MTok], i: usize) -> usize {
 /// rustc_expand mbe/quoted.rs: `pat` is `PatParam` (no top-level `|`) before edition 2021.
 fn frag_of(s: &str, edition: u16) -> Option<Frag> {
     Some(match s {
-        "expr" | "expr_2021" => Frag::Expr,
+        "expr" => Frag::Expr,
+        "expr_2021" => Frag::Expr2021,
         "ident" => Frag::Ident,
         "ty" => Frag::Ty,
         "tt" => Frag::Tt,
@@ -2992,6 +2996,7 @@ enum Follow {
 fn frag_name(f: Frag) -> &'static str {
     match f {
         Frag::Expr => "expr",
+        Frag::Expr2021 => "expr_2021",
         Frag::Ident => "ident",
         Frag::Ty => "ty",
         Frag::Tt => "tt",
@@ -3044,7 +3049,7 @@ fn follow_ok(frag: Frag, fol: &Follow, edition: u16) -> bool {
     }
     let tok_in = |set: &[&str]| matches!(fol, Follow::Tok(t) if set.contains(&t.as_str()));
     match frag {
-        Frag::Expr | Frag::Stmt => matches!(fol, Follow::End) || tok_in(&["=>", ",", ";"]),
+        Frag::Expr | Frag::Expr2021 | Frag::Stmt => matches!(fol, Follow::End) || tok_in(&["=>", ",", ";"]),
         Frag::Pat if edition >= 2021 => matches!(fol, Follow::End) || tok_in(&["=>", ",", "=", "if", "in"]),
         Frag::Pat => matches!(fol, Follow::End) || tok_in(&["=>", ",", "=", "|", "if", "in"]),
         Frag::PatParam => matches!(fol, Follow::End) || tok_in(&["=>", ",", "=", "|", "if", "in"]),
@@ -3254,7 +3259,7 @@ fn is_reserved_word(s: &[u8], edition: u16) -> bool {
 /// What a fragment parse failure names.
 fn frag_desc(f: Frag) -> &'static str {
     match f {
-        Frag::Expr => "expression",
+        Frag::Expr | Frag::Expr2021 => "expression",
         Frag::Ident => "identifier",
         Frag::Ty => "type",
         Frag::Tt => "token tree",
@@ -3475,7 +3480,7 @@ impl<'a> Parser<'a> {
             return match f {
                 Frag::Tt | Frag::Item | Frag::Stmt | Frag::Vis => true,
                 Frag::Ident | Frag::Lifetime => false,
-                Frag::Expr => matches!(fk, Frag::Block | Frag::Expr | Frag::Literal | Frag::Path),
+                Frag::Expr | Frag::Expr2021 => matches!(fk, Frag::Block | Frag::Expr | Frag::Literal | Frag::Path),
                 Frag::Ty => matches!(fk, Frag::Ty | Frag::Path),
                 // an expression that is a literal (a forwarded one-token expression)
                 Frag::Literal => fk == Frag::Literal || (fk == Frag::Expr && !self.synth_parens.contains(&{ t.lo }) && is_lit(k)),
@@ -3498,12 +3503,13 @@ impl<'a> Parser<'a> {
                     || matches!(k, T::OpenParen | T::OpenBracket | T::And | T::Minus | T::AndAnd | T::DotDot | T::DotDotDot | T::PathSep | T::Lt | T::Shl | T::Interp)
                     || (k == T::Or && f == Frag::Pat)
             }
-            // `let` never begins one, `const` not before edition 2024 (`expr_2021`); `_` does
-            // from edition 2024 on
-            Frag::Expr => {
+            // `let` never begins one; `const` and `_` only begin edition 2024's `expr`, never
+            // `expr_2021` nor `expr` before edition 2024
+            Frag::Expr | Frag::Expr2021 => {
+                let current = f == Frag::Expr && edition >= 2024;
                 k != T::KwLet
-                    && (edition >= 2024 || k != T::KwConst)
-                    && (self.can_begin_expr_tok(i, edition) || (edition >= 2024 && k == T::Ident && self.tok_text(t) == b"_"))
+                    && (current || k != T::KwConst)
+                    && (self.can_begin_expr_tok(i, edition) || (current && k == T::Ident && self.tok_text(t) == b"_"))
             }
         }
     }
@@ -3644,13 +3650,15 @@ impl<'a> Parser<'a> {
                 (0, 1) => {
                     // the black-box parser: one fragment
                     let mut mp = bb.pop().unwrap();
-                    let MLoc::Var { frag, var, depth, .. } = locs[mp.idx] else { unreachable!() };
+                    let MLoc::Var { frag: declared, var, depth, .. } = locs[mp.idx] else { unreachable!() };
+                    // `expr_2021` only differs in what may begin it
+                    let frag = if declared == Frag::Expr2021 { Frag::Expr } else { declared };
                     let (e, taken, bare) = if frag == Frag::Vis && self.empty_vis_left(&mp, i) > 0 {
                         // the forwarded empty fragment itself, not the tokens after it
                         mp.vis_taken = (i, if mp.vis_taken.0 == i { mp.vis_taken.1 + 1 } else { 1 });
                         (i, None, false)
                     } else {
-                        self.match_frag(frag, i, hi).map_err(|m| format!("{m} (while parsing argument for this `{}` macro fragment)", frag_name(frag)))?
+                        self.match_frag(frag, i, hi).map_err(|m| format!("{m} (while parsing argument for this `{}` macro fragment)", frag_name(declared)))?
                     };
                     mp.push_match(var, depth, Bind::One(i, e, frag, taken, bare));
                     mp.idx += 1;
@@ -4235,12 +4243,11 @@ mod spacing_tests {
     use super::*;
     use crate::pm_tokens::TokenTree;
 
-    /// The expansion of the last call `name!(..)` in `src` of the `macro_rules! name` written there:
-    /// its text, and the punctuation inside the group after its `m!`, with the spacing a proc macro
-    /// reads (pm_tokens::from_toks, as a call's input is built).
-    fn expand(src: &str, name: &str) -> (String, String) {
+    /// The expansion of the last call `name!(..)` in `src` of the `macro_rules! name` written there,
+    /// both in a crate of `edition`: its text and tokens, or the matcher's error.
+    fn expand_in(src: &str, name: &str, edition: u16) -> Result<(String, Vec<Tok>), String> {
         let mut toks = Vec::new();
-        crate::lexer::lex(src.as_bytes(), 2021, &mut toks).unwrap_or_else(|e| panic!("{}", e.msg));
+        crate::lexer::lex(src.as_bytes(), edition, &mut toks).unwrap_or_else(|e| panic!("{}", e.msg));
         let text = |i: usize| &src[toks[i].lo as usize..toks[i].hi as usize];
         let close = |open: usize| {
             let mut depth = 0;
@@ -4256,11 +4263,18 @@ mod spacing_tests {
         let at = (2..toks.len()).find(|&i| text(i) == name && text(i - 2) == "macro_rules").unwrap();
         let end = close(at + 1);
         let rules = definition_tokens(&toks[at + 2..end], |lo, hi| &src.as_bytes()[lo as usize..hi as usize]);
-        let def = parse_def(name, "c", 2021, &rules).unwrap();
+        let def = parse_def(name, "c", edition, &rules)?;
         let call = (end..toks.len()).rev().find(|&i| text(i) == name).unwrap();
         let session = std::sync::Arc::new(crate::Session::default());
-        let mut p = Parser::new(&session, src.as_bytes(), toks.clone(), 2021);
-        let (s, etoks, ..) = p.expand_rules(&def, call + 3, close(call + 2)).unwrap();
+        let mut p = Parser::new(&session, src.as_bytes(), toks.clone(), edition);
+        p.expand_rules(&def, call + 3, close(call + 2)).map(|(s, etoks, ..)| (s, etoks))
+    }
+
+    /// The expansion of the last call `name!(..)` in `src` of the `macro_rules! name` written there:
+    /// its text, and the punctuation inside the group after its `m!`, with the spacing a proc macro
+    /// reads (pm_tokens::from_toks, as a call's input is built).
+    fn expand(src: &str, name: &str) -> (String, String) {
+        let (s, etoks) = expand_in(src, name, 2021).unwrap();
         // the transcription's text lexes back to its tokens (RELAX_VERIFY_TOKENS)
         let mut lexed = Vec::new();
         crate::lexer::lex(s.as_bytes(), 2021, &mut lexed).unwrap_or_else(|e| panic!("{}", e.msg));
@@ -4294,6 +4308,21 @@ mod spacing_tests {
         // parts apart in the text: it still lexes to the transcribed tokens (checked in `expand`)
         let (s, _) = expand("macro_rules! fld { ($e:expr) => { m!($e) } }\nfld!(x.0.1)", "fld");
         assert!(s.contains("x.0"), "{s}");
+    }
+
+    /// rustc nonterminal_may_begin_with: `expr_2021` never begins with `_`, whatever the edition,
+    /// so in an edition-2024 crate a `_ => ..` arm after `$($m:expr_2021 => ..),+` is no ambiguity
+    /// (relax issue 113); edition 2024's `expr` does begin with `_`, and there it is one.
+    #[test]
+    fn an_expr_2021_fragment_never_begins_with_an_underscore() {
+        let def = "macro_rules! pick { ($($m:expr_2021 => $s:expr),+ , _ => $f:expr $(,)?) => { [$($s),+, $f] } }\n";
+        let call = "pick!(a(1) => 1, b => 2, _ => 3,)";
+        match expand_in(&format!("{def}{call}"), "pick", 2024) {
+            Ok((s, _)) => assert!(s.contains('3'), "{s}"),
+            Err(e) => panic!("expr_2021 at `_`: {e}"),
+        }
+        let e = expand_in(&format!("{}{call}", def.replace("expr_2021", "expr")), "pick", 2024).expect_err("expr at `_` in edition 2024");
+        assert!(e.contains("local ambiguity") && e.contains("expr ('m') or 1 other option"), "{e}");
     }
 }
 
