@@ -565,6 +565,8 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
         eprintln!("makepad run: --allow-c: building native dependencies with cargo (opt-level 0 now, optimized in the background; cached afterwards): {}", script_pkgs.iter().take(8).cloned().collect::<Vec<_>>().join(", "));
     }
     let mut cmd = Command::new("cargo");
+    // cargo runs in the real workspace: nothing of this run crosses
+    crate::progenv::scrub_run_facts(&mut cmd);
     match tier {
         // the scripts see OPT_LEVEL=0 (cc and cmake compile the C unoptimized)
         Tier::Fast => { cmd.env("CARGO_PROFILE_RELEASE_OPT_LEVEL", "0"); }
@@ -589,7 +591,6 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
         .env("MAKEPAD_RUN_NATIVE_TARGET", triple)
         .env("MAKEPAD_RUN_NATIVE_BUILD_DIR", &build)
         .env_remove("MAKEPAD_RUN_AS_RUSTC")
-        .env_remove("MAKEPAD_RUN_SELF_EXEC")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .stdout(Stdio::piped())
