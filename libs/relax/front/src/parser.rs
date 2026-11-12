@@ -4859,6 +4859,7 @@ impl<'a> Parser<'a> {
             T::OpenBrace | T::KwIf | T::KwMatch | T::KwLoop | T::KwWhile | T::KwFor => true,
             T::KwUnsafe => self.nth(1) == T::OpenBrace,
             T::KwConst => self.nth(1) == T::OpenBrace,
+            T::KwTry => self.nth(1) == T::OpenBrace,
             T::KwAsync => self.nth(1) == T::OpenBrace || (self.nth(1) == T::KwMove && self.nth(2) == T::OpenBrace),
             T::Lifetime => self.nth(1) == T::Colon,
             _ => false,
@@ -5406,10 +5407,12 @@ impl<'a> Parser<'a> {
                 let b = self.block()?;
                 Ok(self.mk_expr(ExprKind::ConstBlock(b), lo))
             }
-            T::KwTry if self.nth(1) == T::OpenBrace && self.cfg_out > 0 => {
+            // (`try` is a keyword from 2018 on; feature_gate.rs gates the block)
+            T::KwTry if self.nth(1) == T::OpenBrace => {
                 self.pos += 1;
+                self.no_block_frag()?;
                 let b = self.block()?;
-                Ok(self.mk_expr(ExprKind::Block(b, OptIdent::NONE), lo))
+                Ok(self.mk_expr(ExprKind::TryBlock(b), lo))
             }
             T::Lifetime => {
                 let label = self.label()?;

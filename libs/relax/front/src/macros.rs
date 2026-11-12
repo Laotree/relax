@@ -3244,7 +3244,7 @@ impl<'a> Parser<'a> {
                     Frag::Expr => self.expr().map(|id| {
                         // rustc_ast classify::expr_requires_semi_to_be_stmt: such an expression
                         // is its own statement where the fragment starts one
-                        { use crate::ast::ExprKind as K; bare = matches!(self.ast.expr(id).kind, K::If(..) | K::Match(..) | K::Block(..) | K::Unsafe(..) | K::ConstBlock(..) | K::While(..) | K::Loop(..) | K::For(..)); }
+                        { use crate::ast::ExprKind as K; bare = matches!(self.ast.expr(id).kind, K::If(..) | K::Match(..) | K::Block(..) | K::Unsafe(..) | K::ConstBlock(..) | K::TryBlock(..) | K::While(..) | K::Loop(..) | K::For(..)); }
                     }),
                     // `...` is no type start (rustc Token::can_begin_type): only a C-variadic parameter
                     Frag::Ty if k == T::DotDotDot => Err(crate::parser::PErr { pos: self.toks.at(i).lo, msg: "expected a type".to_string() }),

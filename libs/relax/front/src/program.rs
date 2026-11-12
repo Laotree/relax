@@ -5556,7 +5556,7 @@ pub fn blocks_in_item_signature(ast: &Ast, kind: &ItemKind, out: &mut Vec<BlockI
 /// Blocks directly reachable from an expression (not through nested blocks' statements).
 pub fn blocks_in_expr(ast: &Ast, e: ExprId, out: &mut Vec<BlockId>) {
     match &ast.expr(e).kind {
-        ExprKind::Block(b, _) | ExprKind::Unsafe(b) | ExprKind::Async(_, b) | ExprKind::ConstBlock(b) | ExprKind::Loop(b, _) => {
+        ExprKind::Block(b, _) | ExprKind::Unsafe(b) | ExprKind::TryBlock(b) | ExprKind::Async(_, b) | ExprKind::ConstBlock(b) | ExprKind::Loop(b, _) => {
             out.push(*b)
         }
         ExprKind::If(c, t, el) => {
