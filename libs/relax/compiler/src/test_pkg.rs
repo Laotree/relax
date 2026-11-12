@@ -13,6 +13,7 @@
 //! `--live` keeps one harness target (default: the lib, else the package's only harness target) running across source edits.
 
 pub fn cmd_test_package(args: &[String]) -> i32 {
+    stop::install();
     // Loader options go before each run's package; feature flags go after it.
     let mut i = 0;
     let mut pre: Vec<String> = Vec::new();
@@ -240,7 +241,17 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         }
         a.push("--".to_string());
         a.extend(prog.iter().cloned());
-        let status = std::process::Command::new(&exe).args(&a).env(makepad_remote::hot::TEST_PACKAGE_ENV, "1").status();
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(&a).env(makepad_remote::hot::TEST_PACKAGE_ENV, "1");
+        // the run leads a process group of its own, which a signal to this command ends (`stop`)
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let status = cmd.spawn().and_then(|mut child| {
+            stop::started(child.id());
+            let status = child.wait();
+            stop::ended();
+            status
+        });
         let c = match status {
             Ok(s) => s.code().unwrap_or(101),
             Err(e) => {
@@ -248,6 +259,8 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
                 101
             }
         };
+        // ended by a signal: the run it started has ended with it, and so does the command
+        if let Some(sig) = stop::signalled() { return 128 + sig; }
         if c == makepad_remote::hot::NO_TESTS_EXIT {
             unmatched = true;
             continue;
@@ -279,6 +292,57 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         }
     }
     code
+}
+
+/// A signal that ends `makepad test` (a driver's terminate: SIGTERM; SIGINT, SIGHUP) ends the
+/// run it started, and everything that run started, before the command exits as the signal asks
+/// (128 + the signal). The run leads a process group of its own and the handler ends that group,
+/// as the build host ends the cargo it started (reload_host.rs end_group). Before, the command
+/// alone ended: a `--live` session's run kept watching the sources and testing every save, about
+/// 1 GB each (relax issue 88).
+mod stop {
+    use std::sync::atomic::{AtomicI32, AtomicU32, Ordering::SeqCst};
+
+    /// the running child's pid (0: none)
+    static CHILD: AtomicU32 = AtomicU32::new(0);
+    /// the signal that ended the command (0: none)
+    static SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+    #[cfg(unix)]
+    extern "C" fn on_signal(sig: i32) {
+        // async-signal-safe: atomics and kill(2)
+        SIGNAL.store(sig, SeqCst);
+        let pid = CHILD.load(SeqCst);
+        if pid != 0 { crate::reload::host::end_group(pid); }
+    }
+
+    pub(super) fn install() {
+        #[cfg(unix)]
+        {
+            extern "C" { fn signal(sig: i32, handler: usize) -> usize; }
+            // SIGHUP, SIGINT, SIGTERM: the same numbers on Linux and macOS
+            for sig in [1, 2, 15] {
+                // SAFETY: the handler does only async-signal-safe work
+                unsafe { signal(sig, on_signal as extern "C" fn(i32) as usize) };
+            }
+        }
+    }
+
+    /// The run `pid` started: a signal from now on ends its group, and one that came before
+    /// it was recorded ends it now.
+    pub(super) fn started(pid: u32) {
+        CHILD.store(pid, SeqCst);
+        if SIGNAL.load(SeqCst) != 0 { crate::reload::host::end_group(pid); }
+    }
+
+    /// The run was waited for: its pid is no longer this command's to signal.
+    pub(super) fn ended() {
+        CHILD.store(0, SeqCst);
+    }
+
+    pub(super) fn signalled() -> Option<i32> {
+        Some(SIGNAL.load(SeqCst)).filter(|&s| s != 0)
+    }
 }
 
 fn live_usage() -> i32 {

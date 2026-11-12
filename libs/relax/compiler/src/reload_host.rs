@@ -646,7 +646,7 @@ impl Gate {
 }
 
 /// `pid` leads a process group (`run_cargo`): the group ends.
-fn end_group(pid: u32) {
+pub(crate) fn end_group(pid: u32) {
     #[cfg(unix)]
     {
         extern "C" { fn kill(pid: i32, sig: i32) -> i32; }
