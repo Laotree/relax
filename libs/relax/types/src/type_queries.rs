@@ -609,8 +609,19 @@ impl Providers<'_> {
         // errors `makepad check` reports are the body's errors too, for the crates the borrow
         // checker covers -- safe code may not dereference raw pointers or forge Send/Sync.
         // (Errors, not a stub body: closures' layouts still read its tables.)
+        // A body that compile-time evaluation runs (a constant, a static, an anonymous constant, a
+        // const fn) never starts the crate's impl checks: they evaluate the impls' constants (an
+        // array length in an impl header of a trait with supertraits), and that evaluation may
+        // need this very body's check, then in progress: a false E0391, and an impl whose header
+        // is an error, which instance selection then finds ambiguous. rustc's body checks never
+        // depend on its impl checks. (The next other body starts them; the app check checks the
+        // impls on its own.)
+        let evaluable = match self.prog.def(def).kind {
+            crate::program::DefKind::Fn | crate::program::DefKind::AssocFn => self.tcx.fn_sig(self.prog, def).is_some_and(|s| s.is_const),
+            _ => true,
+        };
         if body.errors.is_empty() && !crate::lint::enabled() && crate::borrowck::event::admit(self.prog, self.prog.def(def).krate) {
-            let mut errors: Vec<String> = crate::unsafety::run_crate_impl_errors(self.prog, self.tcx, self.prog.def(def).krate).to_vec();
+            let mut errors: Vec<String> = if evaluable { Vec::new() } else { crate::unsafety::run_crate_impl_errors(self.prog, self.tcx, self.prog.def(def).krate).to_vec() };
             errors.extend(crate::unsafety::run_body_errors(self.prog, self.tcx, &body));
             for e in errors { body.errors.push(e); }
         }
