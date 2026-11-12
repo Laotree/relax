@@ -609,7 +609,11 @@ impl Session {
             self.front.values().chain(self.items.values()).flatten().chain(self.deep_errors.iter()).cloned().collect()
         } else { self.parse_errors.values().cloned().collect() };
         out.sort_by(|a, b| (&a.file, a.line, a.col, &a.message, a.phase).cmp(&(&b.file, b.line, b.col, &b.message, b.phase)));
-        out.dedup(); out
+        out.dedup();
+        // As in a one-shot check: typeck's cascade notes go when an error they follow is reported.
+        let follow_on = |d: &Diagnostic| crate::check::is_follow_on(&d.notes.first().map_or(d.message.clone(), |n| format!("{} -- {n}", d.message)));
+        if out.iter().any(|d| d.severity == crate::diag::Severity::Error && !follow_on(d)) { out.retain(|d| !follow_on(d)); }
+        out
     }
 
     pub fn emit_diagnostics(&self) {

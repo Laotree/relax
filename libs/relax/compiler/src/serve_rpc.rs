@@ -251,7 +251,7 @@ fn run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> Result<(), Str
                 let method = r.get("method").map_or("", Json::str);
                 let answer = (|| -> Result<String, String> {
                     match method {
-                        "status" => Ok(format!("{{\"workspace\":{},\"packages\":[{}],\"uptime_s\":{:.3}}}", quote(&root.to_string_lossy()), packages.iter().map(|(name,p)|format!("{{\"pkg\":{},\"loaded_ms\":{:.3},\"last_check_ms\":{:.3},\"items\":{},\"rss_mb\":{:.3}}}",quote(name),p.loaded_ms,p.session.ms,p.session.items.len(),p.session.rss_mb)).collect::<Vec<_>>().join(","),start.elapsed().as_secs_f64())),
+                        "status" => Ok(format!("{{\"workspace\":{},\"compiler\":{},\"packages\":[{}],\"uptime_s\":{:.3}}}", quote(&root.to_string_lossy()), quote(crate::jit::PROVENANCE), packages.iter().map(|(name,p)|format!("{{\"pkg\":{},\"loaded_ms\":{:.3},\"last_check_ms\":{:.3},\"items\":{},\"rss_mb\":{:.3}}}",quote(name),p.loaded_ms,p.session.ms,p.session.items.len(),p.session.rss_mb)).collect::<Vec<_>>().join(","),start.elapsed().as_secs_f64())),
                         "shutdown" => { serve_os::STOP.store(true, Ordering::Relaxed); Ok("null".into()) }
                         "check" | "subscribe" | "schema" => {
                             let pkg = string(params,"pkg")?;
@@ -345,7 +345,22 @@ pub fn request(dir: &Path, method: &str, params: &str) -> Result<Json, String> {
 fn connect(start: bool) -> Result<PathBuf, String> {
     let root = workspace(&std::env::current_dir().map_err(|e|e.to_string())?)?;
     let dir = directory(&root)?;
-    if request(&dir,"status","{}").is_ok() { return Ok(dir); }
+    if let Ok(status) = request(&dir,"status","{}") {
+        // A server built from another compiler answers with that compiler's verdicts, stale after
+        // any upgrade: it is stopped by the pid it recorded, and this compiler checks.
+        let theirs = status.get("compiler").map_or("", Json::str);
+        if theirs == crate::jit::PROVENANCE { return Ok(dir); }
+        if let Ok((_, _, pid)) = endpoint(&dir) {
+            serve_os::stop(pid);
+            eprintln!("makepad: the check server (pid {pid}) runs another compiler ({}): stopped it{}", if theirs.is_empty() { "unnamed" } else { theirs }, if start { "" } else { "; checking in-process" });
+            if !start { return Err("the check server ran another compiler".into()); }
+            let stopping = Instant::now();
+            while serve_os::alive(pid) {
+                if stopping.elapsed() > Duration::from_secs(1800) { return Err("timed out stopping the check server".into()); }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
     if !start { return Err("no check server".into()); }
     eprintln!("makepad: starting the check server...");
     let log_path = dir.join("serve.log");

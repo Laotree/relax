@@ -1800,7 +1800,7 @@ fn unit_stage(e: &str) -> crate::check_order::Stage {
 }
 
 /// A check that could not run because of an error reported elsewhere (typeck's cascade notes).
-fn is_follow_on(e: &str) -> bool {
+pub(crate) fn is_follow_on(e: &str) -> bool {
     let first = e.lines().next().unwrap_or("");
     first.contains("type checking failed due to previous errors")
         || first.contains("signature has unresolved types -- fix the signature errors first")
