@@ -296,6 +296,17 @@ fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
     names.sort();
     names.dedup();
     let dir = format!("{}/native/{:016x}", req.relax_dir, h);
+    // Record the native directories this run uses: the cache's prune keeps them whatever its cap.
+    {
+        let selection = selection_key(&script_pkgs, &lib_pkgs);
+        let native = std::path::Path::new(req.relax_dir).join("native");
+        let _ = std::fs::create_dir_all(&native);
+        let text = format!("{dir}\n{}/native/cargo-target/{selection:016x}\n{}/native/cargo-target-opt/{selection:016x}\n", req.relax_dir, req.relax_dir);
+        let tmp = native.join(format!(".pinned.{}", std::process::id()));
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, native.join("pinned"));
+        }
+    }
     let messages_path = format!("{}/messages.jsonl", dir);
     let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
     let lib_path = format!("{}/libnative.{}", dir, ext);

@@ -21,7 +21,8 @@
 //! MAKEPAD_RUN_CACHE=on (default) | off | verify | readonly;
 //! Stores live in `<cargo target dir>/makepad-run/cache` (dirs.rs); MAKEPAD_RUN_CACHE_DIR replaces
 //! the run dir for tests and measurement. MAKEPAD_RUN_CACHE_MAX (MB) caps them (default: twice
-//! what the run uses, at least 4096; prune_root).
+//! what the run uses, at least 4096; prune_root). MAKEPAD_RUN_NATIVE_MAX (MB) caps `native/`
+//! build outputs (default 4096); the directories a run uses are pinned (native/pinned).
 
 use crate::borrowck::lazy::StoredVerdict;
 use crate::types::AliasTyKind;
@@ -4675,6 +4676,10 @@ pub fn app_store_files(dir: &std::path::Path, krate: &str) -> Vec<PathBuf> {
 
 /// The cap's floor (MB) when MAKEPAD_RUN_CACHE_MAX is unset.
 const CAP_FLOOR_MB: u64 = 4096;
+
+/// The default cap for `native/` build outputs (MB), unless MAKEPAD_RUN_NATIVE_MAX says
+/// otherwise.
+const NATIVE_CAP_FLOOR_MB: u64 = 4096;
 /// A store stamped this recently is taken to be in use by another run (every run stamps the
 /// stores it opens: store::mark_live).
 const IN_USE_BY_OTHERS: std::time::Duration = std::time::Duration::from_secs(10 * 60);
@@ -4695,7 +4700,68 @@ const IN_USE_BY_OTHERS: std::time::Duration = std::time::Duration::from_secs(10 
 /// deleted. Returns (bytes before, after).
 pub fn prune_root(root: &std::path::Path) -> (u64, u64) {
     let cap = std::env::var("MAKEPAD_RUN_CACHE_MAX").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20);
-    prune(root, &crate::store::live(), &crate::store::open_files(), &crate::store::programs(), cap)
+    let (before, after) = prune(root, &crate::store::live(), &crate::store::open_files(), &crate::store::programs(), cap);
+    let native_cap = std::env::var("MAKEPAD_RUN_NATIVE_MAX").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20);
+    let (native_before, native_after) = prune_native(root, native_cap);
+    (before + native_before, after + native_after)
+}
+
+/// Bytes under `p`, every level (a cargo target tree is many small files).
+fn dir_size(p: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![p.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let Ok(m) = e.metadata() else { continue };
+            if m.is_dir() { stack.push(e.path()); } else { total += m.len(); }
+        }
+    }
+    total
+}
+
+/// Caps `native/`: build-script outputs and the two cargo target trees of each selection are
+/// units; the least recently used go first, none touched in IN_USE_BY_OTHERS. A run whose
+/// selection was evicted rebuilds it.
+fn prune_native(root: &std::path::Path, cap: Option<u64>) -> (u64, u64) {
+    let dir = root.join("native");
+    let Ok(rd) = std::fs::read_dir(&dir) else { return (0, 0) };
+    let mut units: Vec<(std::time::SystemTime, PathBuf, u64)> = Vec::new();
+    for e in rd.flatten() {
+        let p = e.path();
+        let Ok(m) = std::fs::symlink_metadata(&p) else { continue };
+        if !m.is_dir() { continue; }
+        let name = e.file_name().to_string_lossy().to_string();
+        if name == "cargo-target" || name == "cargo-target-opt" {
+            if let Ok(inner) = std::fs::read_dir(&p) {
+                for c in inner.flatten() {
+                    let cp = c.path();
+                    let Ok(cm) = std::fs::symlink_metadata(&cp) else { continue };
+                    if cm.is_dir() {
+                        units.push((cm.modified().unwrap_or(std::time::UNIX_EPOCH), cp.clone(), dir_size(&cp)));
+                    }
+                }
+            }
+        } else {
+            units.push((m.modified().unwrap_or(std::time::UNIX_EPOCH), p.clone(), dir_size(&p)));
+        }
+    }
+    let before: u64 = units.iter().map(|u| u.2).sum();
+    // the directories the last run built or used: never evicted, whatever the cap
+    let pinned: Vec<PathBuf> = std::fs::read_to_string(dir.join("pinned"))
+        .map(|s| s.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect())
+        .unwrap_or_default();
+    let cap = cap.unwrap_or(NATIVE_CAP_FLOOR_MB << 20);
+    units.sort();
+    let now = std::time::SystemTime::now();
+    let mut total = before;
+    for (t, p, len) in &units {
+        if total <= cap { break; }
+        if pinned.iter().any(|q| p == q || p.starts_with(q)) { continue; }
+        let recent = now.duration_since(*t).map_or(true, |age| age < IN_USE_BY_OTHERS);
+        if !recent && std::fs::remove_dir_all(p).is_ok() { total -= len; }
+    }
+    (before, total)
 }
 
 /// At exit: every store's replaced generations go, including the ones this process itself
@@ -9940,6 +10006,48 @@ mod prune_tests {
         }
         // the folder also holds this process's live lock (store::hold_build)
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn native_build_dirs_are_evicted_least_recently_used_first() {
+        isolated_test!(native_build_dirs_are_evicted_least_recently_used_first);
+        let root = std::env::temp_dir().join(format!("relax-prune-native-{}-{}", std::process::id(), crate::clock::wall_ns()));
+        let native = root.join("native");
+        let day = 24 * 3600;
+        let unit = |rel: &str, age_s: u64| -> PathBuf {
+            let p = native.join(rel);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("blob"), vec![7u8; 4096]).unwrap();
+            let t = std::time::SystemTime::now() - std::time::Duration::from_secs(age_s);
+            std::fs::File::open(&p).unwrap().set_modified(t).unwrap();
+            p
+        };
+        let old = unit("aaaaaaaaaaaaaaaa", 2 * day);
+        let newer = unit("bbbbbbbbbbbbbbbb", day);
+        // a run used this selection a minute ago: it stays
+        let hot = unit("cccccccccccccccc", 60);
+        let sel = unit("cargo-target/1111111111111111", 2 * day);
+        let sel_opt = unit("cargo-target-opt/2222222222222222", day);
+        // the last run wrote this: it stays under any cap
+        let pinned = unit("dddddddddddddddd", 2 * day);
+        std::fs::write(native.join("pinned"), format!("{}\n", pinned.display())).unwrap();
+        let all = 6 * 4096u64;
+        // room for four units: the two oldest (one in each tree) have to go
+        let (before, after) = prune_native(&root, Some(all - 2 * 4096));
+        assert_eq!(before, all);
+        assert!(!old.exists());
+        assert!(!sel.exists());
+        assert!(newer.exists());
+        assert!(sel_opt.exists());
+        assert!(hot.exists());
+        assert!(after < all);
+        let (_, after) = prune_native(&root, Some(1));
+        assert!(!newer.exists());
+        assert!(!sel_opt.exists());
+        assert!(hot.exists());
+        assert!(pinned.exists());
+        assert!(after >= 4096);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
