@@ -1612,37 +1612,39 @@ mod tests {
     #[test]
     fn a_shared_workspace_reads_and_writes_its_checkout() {
         let _one = EDITS_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        // (the checkout's names are this test's own: the edits folder is the process's, and a test
+        // of another mount (gitstore.rs) that reads `Cargo.toml` or `src/lib.rs` would read these)
         let dir = std::env::temp_dir().join(format!("relax-vfs-share-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (file, commit) = store::empty_store(&dir).unwrap();
         assert_eq!(store::empty_store(&dir).unwrap(), (file.clone(), commit), "the store is made once");
         let checkout = dir.join("checkout");
-        std::fs::create_dir_all(checkout.join("src")).unwrap();
-        std::fs::write(checkout.join("Cargo.toml"), "[package]\n").unwrap();
-        std::fs::write(checkout.join("src/lib.rs"), "pub fn f() {}").unwrap();
+        std::fs::create_dir_all(checkout.join("shared")).unwrap();
+        std::fs::write(checkout.join("Share.toml"), "[package]\n").unwrap();
+        std::fs::write(checkout.join("shared/lib.rs"), "pub fn f() {}").unwrap();
         let root = "/share-test/vfs/ws";
         mount(root, Arc::new(Store::open(&file).unwrap().unwrap()), &commit).unwrap();
         set_edits(Some(checkout.clone()));
         SHARED.store(true, Ordering::Release);
-        let lib = format!("{root}/src/lib.rs");
-        assert!(is_virtual(&lib) && is_file(&lib) && is_dir(format!("{root}/src")));
+        let lib = format!("{root}/shared/lib.rs");
+        assert!(is_virtual(&lib) && is_file(&lib) && is_dir(format!("{root}/shared")));
         assert_eq!(read(&lib).unwrap(), b"pub fn f() {}");
-        assert_eq!(read_dir(root).unwrap(), vec![("Cargo.toml".to_string(), false), ("src".to_string(), true)]);
+        assert_eq!(read_dir(root).unwrap(), vec![("Share.toml".to_string(), false), ("shared".to_string(), true)]);
         assert!(file_stat(&lib).is_none(), "its content names it, not the checkout's stat");
-        std::fs::write(checkout.join("src/lib.rs"), "pub fn g() {}").unwrap();
+        std::fs::write(checkout.join("shared/lib.rs"), "pub fn g() {}").unwrap();
         assert_eq!(read(&lib).unwrap(), b"pub fn g() {}", "an edit of the checkout is read");
-        let new = format!("{root}/src/made/mod.rs");
+        let new = format!("{root}/shared/made/mod.rs");
         let disk = prepare_edit(&new, false).unwrap();
-        assert_eq!(disk, checkout.join("src/made/mod.rs"));
+        assert_eq!(disk, checkout.join("shared/made/mod.rs"));
         std::fs::write(&disk, "pub fn h() {}").unwrap();
         assert_eq!(read(&new).unwrap(), b"pub fn h() {}");
         assert!(!checkout.join(".makepad-run-edits").exists() && !checkout.join(".makepad-run-base").exists(), "no ledger in a checkout");
         assert_eq!(reconcile_edits(), Vec::<String>::new());
         let _ = SHARE_ROOTS.set((root.to_string(), normalize_path(&checkout.to_string_lossy())));
         if SHARE_ROOTS.get().is_some_and(|r| r.0 == root) {
-            assert_eq!(shown(&format!("{lib}:1:8: E0308")), format!("{}/src/lib.rs:1:8: E0308", normalize_path(&checkout.to_string_lossy())));
+            assert_eq!(shown(&format!("{lib}:1:8: E0308")), format!("{}/shared/lib.rs:1:8: E0308", normalize_path(&checkout.to_string_lossy())));
             assert_eq!(shown("/elsewhere/src/lib.rs:1:8"), "/elsewhere/src/lib.rs:1:8");
-            assert_eq!(on_disk(&format!("{root}/src")), format!("{}/src", normalize_path(&checkout.to_string_lossy())));
+            assert_eq!(on_disk(&format!("{root}/shared")), format!("{}/shared", normalize_path(&checkout.to_string_lossy())));
             assert_eq!(on_disk(root), normalize_path(&checkout.to_string_lossy()));
             assert_eq!(on_disk("/elsewhere/src"), "/elsewhere/src");
         }
