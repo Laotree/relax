@@ -114,6 +114,12 @@ pub fn run(core: &str) {
     }
     gen_bool_traits(&mut p);
     gen_conversions(&mut p);
+    p.push_str("\n// ---- additional integer shift impls\n");
+    for t in INTS.iter().filter(|t| t.pw != 32) {
+        for rhs in INTS.iter().filter(|r| r.pw != 32 && r.name != t.name && !matches!(r.name, "u32" | "i32" | "usize")) {
+            shift_impls(&mut p, t.name, rhs.name);
+        }
+    }
     std::fs::write(format!("{}/num/prim_traits.rs", core), p).expect("write prim_traits.rs");
 
     let mut z = String::new();
@@ -511,6 +517,8 @@ impl u8 {
     pub const fn is_ascii_uppercase(&self) -> bool { matches!(*self, b'A'..=b'Z') }
     pub const fn is_ascii_lowercase(&self) -> bool { matches!(*self, b'a'..=b'z') }
     pub const fn is_ascii_alphanumeric(&self) -> bool { matches!(*self, b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z') }
+    /// The byte as an ASCII escape sequence (`\xNN`, `\n`, `\'`...), as `core::ascii::escape_default`.
+    pub fn escape_ascii(self) -> crate::ascii::EscapeDefault { crate::ascii::escape_default(self) }
     pub const fn is_ascii_digit(&self) -> bool { matches!(*self, b'0'..=b'9') }
     pub const fn is_ascii_octdigit(&self) -> bool { matches!(*self, b'0'..=b'7') }
     pub const fn is_ascii_hexdigit(&self) -> bool { matches!(*self, b'0'..=b'9' | b'A'..=b'F' | b'a'..=b'f') }
@@ -547,6 +555,7 @@ fn gen_float(o: &mut String, f: &str) {
     pub const MAX_EXP: i32 = 1024;
     pub const MIN_10_EXP: i32 = -307;
     pub const MAX_10_EXP: i32 = 308;
+    #[rustc_diagnostic_item = \"f64_nan\"]
     pub const NAN: f64 = f64::from_bits(0x7ff8_0000_0000_0000);
     pub const INFINITY: f64 = f64::from_bits(0x7ff0_0000_0000_0000);
     pub const NEG_INFINITY: f64 = f64::from_bits(0xfff0_0000_0000_0000);
@@ -565,6 +574,7 @@ fn gen_float(o: &mut String, f: &str) {
     pub const MAX_EXP: i32 = 128;
     pub const MIN_10_EXP: i32 = -37;
     pub const MAX_10_EXP: i32 = 38;
+    #[rustc_diagnostic_item = \"f32_nan\"]
     pub const NAN: f32 = f32::from_bits(0x7fc0_0000);
     pub const INFINITY: f32 = f32::from_bits(0x7f80_0000);
     pub const NEG_INFINITY: f32 = f32::from_bits(0xff80_0000);
@@ -592,21 +602,21 @@ fn gen_float(o: &mut String, f: &str) {
     let _ = writeln!(o, "    pub const fn next_down(self) -> {f} {{ let bits = self.to_bits(); if self.is_nan() || bits == {f}::NEG_INFINITY.to_bits() {{ return self; }} let abs = bits & !{sign}; let next = if abs == 0 {{ {sign} | 1 }} else if bits == abs {{ bits - 1 }} else {{ bits + 1 }}; {f}::from_bits(next) }}");
     let _ = writeln!(o, "    pub const fn copysign(self, sign: {f}) -> {f} {{ {f}::from_bits((self.to_bits() & !{sign}) | (sign.to_bits() & {sign})) }}");
     let _ = writeln!(o, "    pub const fn signum(self) -> {f} {{ if self.is_nan() {{ {f}::NAN }} else {{ (1.0 as {f}).copysign(self) }} }}");
-    for (m, i) in [("sqrt", "sqrt"), ("floor", "floor"), ("ceil", "ceil"), ("trunc", "trunc"), ("round_ties_even", "rint")] {
-        let _ = writeln!(o, "    pub fn {m}(self) -> {f} {{ unsafe {{ intrinsics::{i}_{f}(self) }} }}");
+    for (m, i) in [("sqrt", "sqrt"), ("floor", "floor"), ("ceil", "ceil"), ("trunc", "trunc"), ("round_ties_even", "rint"), ("round", "round")] {
+        let constness = if m == "sqrt" { "" } else { "const " };
+        let _ = writeln!(o, "    pub {constness}fn {m}(self) -> {f} {{ unsafe {{ intrinsics::{i}_{f}(self) }} }}");
     }
-    let _ = writeln!(o, "    pub fn round(self) -> {f} {{ unsafe {{ libm::round{sfx}(self) }} }}");
-    let _ = writeln!(o, "    pub fn fract(self) -> {f} {{ self - self.trunc() }}");
-    let _ = writeln!(o, "    pub fn min(self, other: {f}) -> {f} {{ unsafe {{ intrinsics::fmin_{f}(self, other) }} }}");
-    let _ = writeln!(o, "    pub fn max(self, other: {f}) -> {f} {{ unsafe {{ intrinsics::fmax_{f}(self, other) }} }}");
-    let _ = writeln!(o, "    pub fn minimum(self, other: {f}) -> {f} {{ if self < other {{ self }} else if other < self {{ other }} else if self == other {{ if self.is_sign_negative() && other.is_sign_positive() {{ self }} else {{ other }} }} else {{ self + other }} }}");
-    let _ = writeln!(o, "    pub fn maximum(self, other: {f}) -> {f} {{ if self > other {{ self }} else if other > self {{ other }} else if self == other {{ if self.is_sign_positive() && other.is_sign_negative() {{ self }} else {{ other }} }} else {{ self + other }} }}");
-    let _ = writeln!(o, "    #[track_caller]\n    pub fn clamp(self, min: {f}, max: {f}) -> {f} {{ if !(min <= max) {{ crate::panicking::panic_fmt(format_args!(\"min > max, or either was NaN. min = {{min:?}}, max = {{max:?}}\")); }} let mut x = self; if x < min {{ x = min; }} if x > max {{ x = max; }} x }}");
-    let _ = writeln!(o, "    pub fn mul_add(self, a: {f}, b: {f}) -> {f} {{ unsafe {{ if intrinsics::fma_native() {{ intrinsics::fma_{f}(self, a, b) }} else {{ libm::fma{sfx}(self, a, b) }} }} }}");
+    let _ = writeln!(o, "    pub const fn fract(self) -> {f} {{ self - self.trunc() }}");
+    let _ = writeln!(o, "    pub const fn min(self, other: {f}) -> {f} {{ unsafe {{ intrinsics::fmin_{f}(self, other) }} }}");
+    let _ = writeln!(o, "    pub const fn max(self, other: {f}) -> {f} {{ unsafe {{ intrinsics::fmax_{f}(self, other) }} }}");
+    let _ = writeln!(o, "    pub const fn minimum(self, other: {f}) -> {f} {{ if self < other {{ self }} else if other < self {{ other }} else if self == other {{ if self.is_sign_negative() && other.is_sign_positive() {{ self }} else {{ other }} }} else {{ self + other }} }}");
+    let _ = writeln!(o, "    pub const fn maximum(self, other: {f}) -> {f} {{ if self > other {{ self }} else if other > self {{ other }} else if self == other {{ if self.is_sign_positive() && other.is_sign_negative() {{ self }} else {{ other }} }} else {{ self + other }} }}");
+    let _ = writeln!(o, "    #[track_caller]\n    pub const fn clamp(self, min: {f}, max: {f}) -> {f} {{ if !(min <= max) {{ crate::panicking::panic_fmt(format_args!(\"min > max, or either was NaN. min = {{min:?}}, max = {{max:?}}\")); }} let mut x = self; if x < min {{ x = min; }} if x > max {{ x = max; }} x }}");
+    let _ = writeln!(o, "    pub const fn mul_add(self, a: {f}, b: {f}) -> {f} {{ unsafe {{ if intrinsics::fma_native() {{ intrinsics::fma_{f}(self, a, b) }} else {{ libm::fma{sfx}(self, a, b) }} }} }}");
     let _ = writeln!(o, "    pub fn div_euclid(self, rhs: {f}) -> {f} {{ let q = (self / rhs).trunc(); if self % rhs < 0.0 {{ return if rhs > 0.0 {{ q - 1.0 }} else {{ q + 1.0 }}; }} q }}");
     let _ = writeln!(o, "    pub fn rem_euclid(self, rhs: {f}) -> {f} {{ let r = self % rhs; if r < 0.0 {{ r + rhs.abs() }} else {{ r }} }}");
-    // compiler-rt __powidf2 / __powisf2
-    let _ = writeln!(o, "    pub fn powi(self, n: i32) -> {f} {{ let recip = n < 0; let mut b = n; let mut a = self; let mut r: {f} = 1.0; loop {{ if (b & 1) != 0 {{ r *= a; }} b /= 2; if b == 0 {{ break; }} a *= a; }} if recip {{ 1.0 / r }} else {{ r }} }}");
+    // Small powers, Windows libm, then exponentiation by squaring with an unsigned magnitude.
+    let _ = writeln!(o, "    pub fn powi(self, n: i32) -> {f} {{ if n == 2 {{ return self * self; }} if n == 3 {{ return self * (self * self); }} if n == -1 {{ return 1.0 / self; }} if n == -2 {{ return 1.0 / (self * self); }} if n == 4 {{ let a = self * self; return a * a; }} if cfg!(windows) {{ return unsafe {{ libm::pow{sfx}(self, n as {f}) }}; }} let recip = n < 0; let mut b: u32 = if n < 0 {{ !(n as u32) + 1 }} else {{ n as u32 }}; let mut a = self; let mut r: {f} = 1.0; loop {{ if (b & 1) != 0 {{ r *= a; }} b >>= 1; if b == 0 {{ break; }} a *= a; }} if recip {{ 1.0 / r }} else {{ r }} }}");
     for (m, c) in [
         ("powf", "pow"),
     ] {
@@ -637,28 +647,29 @@ fn gen_float(o: &mut String, f: &str) {
     let _ = writeln!(o, "    pub fn hypot(self, other: {f}) -> {f} {{ unsafe {{ libm::hypot{sfx}(self, other) }} }}");
     let _ = writeln!(o, "    pub fn log(self, base: {f}) -> {f} {{ self.ln() / base.ln() }}");
     let _ = writeln!(o, "    pub fn sin_cos(self) -> ({f}, {f}) {{ (self.sin(), self.cos()) }}");
-    let _ = writeln!(o, "    pub fn asinh(self) -> {f} {{ let ax = self.abs(); let ix = 1.0 / ax; (ax + (ax / ((1.0 as {f}).hypot(ix) + ix))).ln_1p().copysign(self) }}");
-    let _ = writeln!(o, "    pub fn acosh(self) -> {f} {{ if self < 1.0 {{ {f}::NAN }} else {{ (self + ((self - 1.0).sqrt() * (self + 1.0).sqrt())).ln() }} }}");
+    let _ = writeln!(o, "    pub fn asinh(self) -> {f} {{ unsafe {{ libm::asinh{sfx}(self) }} }}");
+    let _ = writeln!(o, "    pub fn acosh(self) -> {f} {{ unsafe {{ libm::acosh{sfx}(self) }} }}");
     let _ = writeln!(o, "    pub fn atanh(self) -> {f} {{ 0.5 * ((2.0 * self) / (1.0 - self)).ln_1p() }}");
     if is64 {
-        let _ = writeln!(o, "    pub fn to_degrees(self) -> f64 {{ self * (180.0f64 / crate::f64::consts::PI) }}");
-        let _ = writeln!(o, "    pub fn to_radians(self) -> f64 {{ self * (crate::f64::consts::PI / 180.0) }}");
+        let _ = writeln!(o, "    pub const fn to_degrees(self) -> f64 {{ self * (180.0f64 / crate::f64::consts::PI) }}");
+        let _ = writeln!(o, "    pub const fn to_radians(self) -> f64 {{ self * (crate::f64::consts::PI / 180.0) }}");
     } else {
-        let _ = writeln!(o, "    pub fn to_degrees(self) -> f32 {{ const PIS_IN_180: f32 = 57.2957795130823208767981548141051703_f32; self * PIS_IN_180 }}");
-        let _ = writeln!(o, "    pub fn to_radians(self) -> f32 {{ self * (crate::f32::consts::PI / 180.0f32) }}");
+        let _ = writeln!(o, "    pub const fn to_degrees(self) -> f32 {{ const PIS_IN_180: f32 = 57.2957795130823208767981548141051703_f32; self * PIS_IN_180 }}");
+        let _ = writeln!(o, "    pub const fn to_radians(self) -> f32 {{ self * (crate::f32::consts::PI / 180.0f32) }}");
     }
-    let _ = writeln!(o, "    pub fn recip(self) -> {f} {{ 1.0 / self }}");
+    let _ = writeln!(o, "    pub const fn recip(self) -> {f} {{ 1.0 / self }}");
     let ibits = if is64 { "i64" } else { "i32" };
     let shift = if is64 { 63 } else { 31 };
-    let _ = writeln!(o, "    pub fn total_cmp(&self, other: &{f}) -> Ordering {{ let mut l = self.to_bits() as {ibits}; let mut r = other.to_bits() as {ibits}; l ^= (((l >> {shift}) as {bits_t}) >> 1) as {ibits}; r ^= (((r >> {shift}) as {bits_t}) >> 1) as {ibits}; l.cmp(&r) }}");
+    let _ = writeln!(o, "    pub const fn total_cmp(&self, other: &{f}) -> Ordering {{ let mut l = self.to_bits() as {ibits}; let mut r = other.to_bits() as {ibits}; l ^= (((l >> {shift}) as {bits_t}) >> 1) as {ibits}; r ^= (((r >> {shift}) as {bits_t}) >> 1) as {ibits}; l.cmp(&r) }}");
     let nb = if is64 { 8 } else { 4 };
-    let _ = writeln!(o, "    pub fn to_le_bytes(self) -> [u8; {nb}] {{ self.to_bits().to_le_bytes() }}");
-    let _ = writeln!(o, "    pub fn to_be_bytes(self) -> [u8; {nb}] {{ self.to_bits().to_be_bytes() }}");
-    let _ = writeln!(o, "    pub fn to_ne_bytes(self) -> [u8; {nb}] {{ self.to_bits().to_ne_bytes() }}");
-    let _ = writeln!(o, "    pub fn from_le_bytes(b: [u8; {nb}]) -> {f} {{ {f}::from_bits({bits_t}::from_le_bytes(b)) }}");
-    let _ = writeln!(o, "    pub fn from_be_bytes(b: [u8; {nb}]) -> {f} {{ {f}::from_bits({bits_t}::from_be_bytes(b)) }}");
-    let _ = writeln!(o, "    pub fn from_ne_bytes(b: [u8; {nb}]) -> {f} {{ {f}::from_bits({bits_t}::from_ne_bytes(b)) }}");
-    let _ = writeln!(o, "    pub fn midpoint(self, other: {f}) -> {f} {{ ((self as f64 + other as f64) / 2.0) as {f} }}");
+    let _ = writeln!(o, "    pub const fn to_le_bytes(self) -> [u8; {nb}] {{ self.to_bits().to_le_bytes() }}");
+    let _ = writeln!(o, "    pub const fn to_be_bytes(self) -> [u8; {nb}] {{ self.to_bits().to_be_bytes() }}");
+    let _ = writeln!(o, "    pub const fn to_ne_bytes(self) -> [u8; {nb}] {{ self.to_bits().to_ne_bytes() }}");
+    let _ = writeln!(o, "    pub const fn from_le_bytes(b: [u8; {nb}]) -> {f} {{ {f}::from_bits({bits_t}::from_le_bytes(b)) }}");
+    let _ = writeln!(o, "    pub const fn from_be_bytes(b: [u8; {nb}]) -> {f} {{ {f}::from_bits({bits_t}::from_be_bytes(b)) }}");
+    let _ = writeln!(o, "    pub const fn from_ne_bytes(b: [u8; {nb}]) -> {f} {{ {f}::from_bits({bits_t}::from_ne_bytes(b)) }}");
+    let _ = writeln!(o, "    pub const fn midpoint(self, other: {f}) -> {f} {{ ((self as f64 + other as f64) / 2.0) as {f} }}");
+    let _ = writeln!(o, "    pub unsafe fn to_int_unchecked<Int>(self) -> Int where Self: crate::convert::FloatToInt<Int> {{ unsafe {{ crate::convert::FloatToInt::<Int>::to_int_unchecked(self) }} }}");
     o.push_str("}\n\n");
 }
 
@@ -670,6 +681,13 @@ fn op_impls(o: &mut String, n: &str, ops: &[(&str, &str, &str)]) {
         let _ = writeln!(o, "impl<'a, 'b> {tr}<&'a {n}> for &'b {n} {{ type Output = {n}; fn {m}(self, rhs: &'a {n}) -> {n} {{ *self {sym} *rhs }} }}");
         let _ = writeln!(o, "impl {tr}Assign for {n} {{ fn {m}_assign(&mut self, rhs: {n}) {{ *self = *self {sym} rhs; }} }}");
         let _ = writeln!(o, "impl<'a> {tr}Assign<&'a {n}> for {n} {{ fn {m}_assign(&mut self, rhs: &'a {n}) {{ *self = *self {sym} *rhs; }} }}");
+    }
+}
+
+fn shift_impls(o: &mut String, n: &str, r: &str) {
+    for (tr, m, sym) in [("Shl", "shl", "<<"), ("Shr", "shr", ">>")] {
+        let _ = writeln!(o, "impl {tr}<{r}> for {n} {{ type Output = {n}; fn {m}(self, rhs: {r}) -> {n} {{ self {sym} rhs }} }}");
+        let _ = writeln!(o, "impl {tr}Assign<{r}> for {n} {{ fn {m}_assign(&mut self, rhs: {r}) {{ *self = *self {sym} rhs; }} }}");
     }
 }
 
@@ -689,16 +707,13 @@ fn gen_int_traits(o: &mut String, t: &Int) {
         &[("Add", "add", "+"), ("Sub", "sub", "-"), ("Mul", "mul", "*"), ("Div", "div", "/"), ("Rem", "rem", "%"), ("BitAnd", "bitand", "&"), ("BitOr", "bitor", "|"), ("BitXor", "bitxor", "^")],
     );
     let mut rhs_types: Vec<&str> = vec![n];
-    for r in ["u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize"] {
+    for r in ["u32", "i32", "usize"] {
         if r != n {
             rhs_types.push(r);
         }
     }
     for r in rhs_types {
-        for (tr, m, sym) in [("Shl", "shl", "<<"), ("Shr", "shr", ">>")] {
-            let _ = writeln!(o, "impl {tr}<{r}> for {n} {{ type Output = {n}; fn {m}(self, rhs: {r}) -> {n} {{ self {sym} rhs }} }}");
-            let _ = writeln!(o, "impl {tr}Assign<{r}> for {n} {{ fn {m}_assign(&mut self, rhs: {r}) {{ *self = *self {sym} rhs; }} }}");
-        }
+        shift_impls(o, n, r);
     }
     let _ = writeln!(o, "impl Not for {n} {{ type Output = {n}; fn not(self) -> {n} {{ !self }} }}");
     let _ = writeln!(o, "impl<'a> Not for &'a {n} {{ type Output = {n}; fn not(self) -> {n} {{ !*self }} }}");
@@ -898,6 +913,7 @@ fn check_copy(src: &str) -> String {
     let mut skip = false;
     let mut seen_u8 = false;
     let mut skip_next = false;
+    let mut skip_blank = false;
     for line in src.lines() {
         if line.starts_with("#[cfg(") && line.contains("target_pointer_width = \"32\"") {
             skip_next = true;
@@ -909,6 +925,7 @@ fn check_copy(src: &str) -> String {
         if skip_next && line.starts_with("impl ") {
             skip_next = false;
             skip = true;
+            skip_blank = true;
             continue;
         }
         if let Some(rest) = line.strip_prefix("impl ") {
@@ -929,6 +946,11 @@ fn check_copy(src: &str) -> String {
                 skip = false;
             }
             continue;
+        }
+        // Omit the separator after a skipped 32-bit pointer impl as well.
+        if skip_blank {
+            skip_blank = false;
+            if line.is_empty() { continue; }
         }
         let l = line.replace("pub const fn ", "pub fn ").replace("    const fn ", "    fn ");
         let t = l.trim_start();

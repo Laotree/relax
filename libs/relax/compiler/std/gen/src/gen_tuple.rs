@@ -28,7 +28,21 @@ pub fn run(core: &str) {
                 let _ = write!(pc, "match self.{i}.partial_cmp(&other.{i}) {{ Some(Ordering::Equal) => {{}} c => return c }} ");
             }
         }
-        let _ = writeln!(o, "impl<{}> PartialOrd for {tup} {{ fn partial_cmp(&self, other: &{tup}) -> Option<Ordering> {{ {pc} }} }}", bound("PartialOrd"));
+        let _ = write!(o, "impl<{}> PartialOrd for {tup} {{ fn partial_cmp(&self, other: &{tup}) -> Option<Ordering> {{ {pc} }}", bound("PartialOrd"));
+        if n > 1 {
+            for (m, ordering) in [("lt", "Less"), ("le", "Less"), ("gt", "Greater"), ("ge", "Greater")] {
+                let _ = write!(o, " fn {m}(&self, other: &{tup}) -> bool {{ ");
+                for (k, i) in idx.iter().enumerate() {
+                    if k + 1 == n {
+                        let _ = write!(o, "self.{i}.{m}(&other.{i})");
+                    } else {
+                        let _ = write!(o, "match self.{i}.partial_cmp(&other.{i}) {{ Some(Ordering::Equal) => {{}} c => return matches!(c, Some(Ordering::{ordering})) }} ");
+                    }
+                }
+                o.push_str(" }");
+            }
+        }
+        o.push_str(" }\n");
         let mut c = String::new();
         for (k, i) in idx.iter().enumerate() {
             if k + 1 == n {
