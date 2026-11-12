@@ -19,6 +19,8 @@ pub const O_NONBLOCK: c_int = 0x4;
 pub const O_APPEND: c_int = 0x8;
 pub const O_NOFOLLOW: c_int = 0x100;
 pub const O_CREAT: c_int = 0x200;
+/// sys/fcntl.h: the current directory, for the *at calls.
+pub const AT_FDCWD: c_int = -2;
 pub const O_TRUNC: c_int = 0x400;
 pub const O_EXCL: c_int = 0x800;
 pub const O_DIRECTORY: c_int = 0x100000;

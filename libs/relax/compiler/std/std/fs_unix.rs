@@ -1098,10 +1098,16 @@ pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> 
     })
 }
 
+/// As real std: linkat with flags 0, so a symlink `original` is linked itself, never followed
+/// (POSIX leaves that open for link(), and macOS's link() follows it). Android keeps link(),
+/// which never follows one there, as real std does.
 pub fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Result<()> {
     run_path_with_cstr(original.as_ref(), &|a| {
         run_path_with_cstr(link.as_ref(), &|b| {
+            #[cfg(target_os = "android")]
             cvt(unsafe { sys::link(a.as_ptr(), b.as_ptr()) })?;
+            #[cfg(not(target_os = "android"))]
+            cvt(unsafe { sys::linkat(sys::os::AT_FDCWD, a.as_ptr(), sys::os::AT_FDCWD, b.as_ptr(), 0) })?;
             Ok(())
         })
     })
