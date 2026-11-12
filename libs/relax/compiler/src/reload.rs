@@ -5471,7 +5471,6 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let mut removed_errs: Vec<String> = Vec::new();
     // fns declared again: a type their unchanged signature names moved (decls_naming_removed)
     let mut redeclared: Vec<DefId> = Vec::new();
-    let errors0 = u.prog.errors.len();
     trace_stage("gate_prepare");
     {
         // parsing may have served requests: more startup installs may have been made since the
@@ -5484,6 +5483,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             eprintln!("reload-front-wait: {:.1} ms (t={:.0}..{:.0} ms)", (now - wait_from) as f64 / 1e6, wait_from as f64 / 1e6, now as f64 / 1e6);
         }
         trace_stage("front_write_wait");
+        // the edit's own errors are those recorded from here: the wait above serves the owner's
+        // requests, and a module load among them records its file's errors in the program's (a
+        // count taken before the wait read them as this edit's and refused it, relax#33)
+        let errors0 = u.prog.errors.len();
         // (the tables are not the boot's from here on, kept or refused: PROGRAM_EDITS)
         if !versions.is_empty() { PROGRAM_EDITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
         let from = u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst);
@@ -8947,6 +8950,47 @@ impl Ledger {
 /// Stillness, not an overall deadline: a busy checkout can take as long as it needs. Also the
 /// stat poll of a watch without native file events.
 const LIVE_QUIET: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// A save's wait for the tree to settle (its quiet window, and the rounds an `again` adds): said
+/// once it is a second long, naming what moved then, and again when it ends. It has no end of
+/// its own (a slow writer is waited for); silent, a save held back by a lock or by a watched
+/// folder something keeps writing in looked like one the session ignored (relax#33).
+struct SettleWait {
+    since: Instant,
+    /// the first change seen: a lock made since can be this save's writer's (git::Snapshot::holding)
+    save: std::time::SystemTime,
+    /// the saved file(s), for the lines
+    file: String,
+    said: bool,
+}
+
+impl SettleWait {
+    fn new(file: String) -> SettleWait {
+        SettleWait { since: Instant::now(), save: std::time::SystemTime::now(), file, said: false }
+    }
+
+    /// `what` moved (or holds the tree): said once the wait is a second long
+    fn moved(&mut self, what: &str) {
+        if !self.said && self.since.elapsed() >= std::time::Duration::from_secs(1) {
+            self.said = true;
+            eprintln!("makepad live: {}: waits for the tree to settle ({what})", self.file);
+        }
+    }
+}
+
+impl Drop for SettleWait {
+    fn drop(&mut self) {
+        if self.said { eprintln!("makepad live: {}: the tree settled after {:.1} s", self.file, self.since.elapsed().as_secs_f64()); }
+    }
+}
+
+/// The first watched file whose stamp differs between two looks ("<path> moved"); one the watch
+/// added since names the last file
+fn moved_file(files: &[(String, u32, Option<(std::time::SystemTime, u64)>)], now: &[Option<(std::time::SystemTime, u64)>], before: &[Option<(std::time::SystemTime, u64)>]) -> Option<String> {
+    if now == before { return None; }
+    let k = now.iter().zip(before).position(|(a, b)| a != b).unwrap_or(now.len().saturating_sub(1));
+    files.get(k).map(|f| format!("{} moved", f.0))
+}
 /// How often a watcher whose startup scan waits for the first frames to pass looks again.
 const STARTUP_SCAN_LOOK: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -9056,6 +9100,12 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     let mut events = LiveWatch::new(files.iter().map(|f| f.0.as_str()));
     let mut repositories = git::Repositories::default();
     repositories.include(files.iter().map(|f| f.0.as_str()));
+    // the git identities as the tree last settled: a lock older than a save holds it only while
+    // its repository moved since (git::Snapshot::holding)
+    let mut settled_git = repositories.snapshot();
+    // a save's wait for the tree that an `again` re-queued: the next round goes on with it
+    let mut settle_wait: Option<SettleWait> = None;
+    let mut again_wait = false;
     if crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) { eprintln!("makepad live: watching {} source files; session log {}", files.len(), live_log_path()); }
     // the readiness signal for tools and tests, whatever the log verbosity: MAKEPAD_RUN_LIVE_READY=<file>
     // gets the watched file count once the watcher runs (edits saved from now on are seen)
@@ -9193,6 +9243,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             events = LiveWatch::new(files.iter().map(|f| f.0.as_str()));
             repositories = git::Repositories::default();
             repositories.include(files.iter().map(|f| f.0.as_str()));
+            settled_git = repositories.snapshot();
             hot.clear();
             stalled.clear();
             again = false;
@@ -9393,6 +9444,17 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             continue;
         }
         let seen = std::time::Instant::now();
+        let mut wait = match settle_wait.take() {
+            Some(w) if std::mem::take(&mut again_wait) => w,
+            _ => {
+                again_wait = false;
+                // named by the program's files it changed (a source folder's stamp moves with them)
+                let loaded: Vec<usize> = changed.iter().copied().filter(|&k| files[k].1 != u32::MAX).collect();
+                let named = if loaded.is_empty() { &changed } else { &loaded };
+                let first = files[named[0]].0.as_str();
+                SettleWait::new(if named.len() > 1 { format!("{first} (and {} more)", named.len() - 1) } else { first.to_string() })
+            }
+        };
         if live_trace() { eprintln!("makepad live: a change seen at t={:.0} ms ({} file(s))", crate::clock::ms_since_start(), changed.len()); }
         // from the save on, the post-boot loader keeps off the unit (the read below
         // compares with the running text on it)
@@ -9457,10 +9519,13 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             changed.sort_unstable();
             changed.dedup();
             let next_git = repositories.snapshot();
-            let moving = now != last || next_git != git_state || next_git.busy;
+            let moved = moved_file(&files, &now, &last)
+                .or_else(|| next_git.moved_from(&git_state).map(|p| format!("{} moved", p.display())))
+                .or_else(|| next_git.holding(wait.save, &settled_git).map(|p| format!("{} is there", p.display())));
             last = now;
             git_state = next_git;
-            if moving {
+            if let Some(what) = moved {
+                wait.moved(&what);
                 quiet_retry = false;
                 still_since = Instant::now();
             } else if committed || still_since.elapsed() >= LIVE_QUIET {
@@ -9468,6 +9533,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             }
             committed = false;
         }
+        settled_git = git_state.clone();
         // a wait above may have taken a wakeup meant for the loop's own (a streamed edit, a
         // retry, a domain's inputs): one more round sees what it was for
         if waited { watch_events::kick(); }
@@ -9752,10 +9818,16 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // A writer may have resumed while we read. Keep these texts pending and
         // collect its next batch before compiling or requesting a recovery.
         let look = Look::new();
-        if files.iter().enumerate().map(|(k, f)| look.stamp(&virt, k, &f.0)).ne(settled_stamps.iter().copied()) || repositories.snapshot() != git_state {
+        let now: Vec<_> = files.iter().enumerate().map(|(k, f)| look.stamp(&virt, k, &f.0)).collect();
+        let next_git = repositories.snapshot();
+        if let Some(what) = moved_file(&files, &now, &settled_stamps).or_else(|| next_git.moved_from(&git_state).map(|p| format!("{} moved", p.display()))) {
+            wait.moved(&what);
+            settle_wait = Some(wait);
             again = true;
+            again_wait = true;
             continue;
         }
+        drop(wait);
         trace_input(watch_ms, (read_started - seen).as_secs_f64() * 1000., ms(read_started), scanned);
         let mut o = apply_update(up, edits);
         let only_previous_errors = !o.lines.is_empty() && o.lines.iter().all(|l| l.ends_with("type checking failed due to previous errors"));
