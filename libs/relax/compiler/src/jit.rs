@@ -7355,6 +7355,14 @@ impl Unit {
                 LOWER_AHEAD_IDS.with(|x| x.borrow_mut().consts.push((d, Vec::new(), a)));
                 return a;
             }
+            // a background build's front: the owner's drain initializes and publishes it, and the
+            // front is made again after it. statics_ready asks for the statics a body names; this
+            // asks for one no body names (the allocator shim's #[global_allocator] static, which a
+            // warm run's disk-cache code initializes without publishing: core::heap::alloc & co
+            // failed their fronts for the whole run, and their hot callers' O3 builds left them out)
+            if WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
+                want(Wanted::Static(d), self.tcx.collect_epoch.load(Ordering::SeqCst));
+            }
             lower_ahead_needs_unit();
         }
         owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).static_addr(d) })

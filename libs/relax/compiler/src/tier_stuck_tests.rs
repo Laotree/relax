@@ -701,3 +701,58 @@ fn a_closures_twin_gets_its_front_off_the_owner() {
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+const ALLOCATOR_SOURCE: &str = r#"
+use std::alloc::{GlobalAlloc, Layout, System};
+struct Counting;
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 { unsafe { System.alloc(l) } }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) { unsafe { System.dealloc(p, l) } }
+}
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
+fn main() {
+    let v = vec![1u32];
+    let _ = v.len();
+}
+"#;
+
+/// The front of core::heap::alloc (and its allocator-shim siblings) is made off the owner in a
+/// program with a `#[global_allocator]`: the shim names the allocator static, which no body names,
+/// and lowering ahead asked the owner for nothing when it found the static unpublished. A warm
+/// launch's disk-cache code initializes that static without publishing it, so the fronts failed
+/// ("needs unit") for the rest of the run, and every hot caller's O3 build left the four heap fns
+/// out, built again after each drain that made anything (2425 loud lines in one run of a large app).
+#[test]
+fn the_allocator_shims_static_is_made_for_a_front_off_the_owner() {
+    isolated_test!(the_allocator_shims_static_is_made_for_a_front_off_the_owner);
+    crate::borrowck::lazy::disable_gandalf();
+    if std::env::var_os("RELAX_STD").is_none() {
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    }
+    let dir = std::env::temp_dir().join(format!("relax-alloc-front-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("input.rs");
+    std::fs::write(&path, ALLOCATOR_SOURCE).unwrap();
+    let (prog, core, krate) = crate::load_with_std(&std::sync::Arc::new(crate::Session::default()), path.to_str().unwrap(), "alloc_front", false).unwrap();
+    crate::layout::set_root_crate(krate);
+    let alloc_d = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = DefId(i as u32);
+        (d.krate == core && d.kind == DefKind::Fn && prog.name(id) == "alloc" && prog.def_path(id).ends_with("heap::alloc")).then_some(id)
+    }).expect("core::heap::alloc");
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    unsafe { UNIT = up };
+    let (allocator, _) = u.global_allocator().expect("the fixture's program has a #[global_allocator]");
+    assert!(u.front.consts.get(&(allocator, Vec::new())).is_none(), "the fixture's allocator static must not be published yet");
+    let id = crate::owner::call(crate::owner::Class::Program, || u.fn_id(FnKey::Inst(alloc_d, Vec::new())));
+    let front = crate::owner::call(crate::owner::Class::Program, || u.front.clone());
+    assert!(prefront_slot(&front, id), "the front of core::heap::alloc was not made off the owner: the allocator static was never asked for");
+    assert!(u.front.consts.get(&(allocator, Vec::new())).is_some(), "the owner's drain did not publish the allocator static");
+    // (process exit owns the runtime's teardown)
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
