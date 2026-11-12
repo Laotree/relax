@@ -8435,7 +8435,21 @@ impl<'a> Lcx<'a> {
         let bt = self.body_ty(b);
         let (pa, ta) = self.lower_place(a);
         let ra = self.ref_to_place(&pa, ta);
-        let (pb, tb) = self.lower_place(b);
+        // a right operand coerced to the impl's Rhs is borrowed as the coerced value: `&usize <
+        // &&usize` is `PartialOrd::lt(&a, &(*b as &usize))` (the one `PartialOrd<&B> for &A` impl
+        // fixes Rhs before the operand is coerced, rustc op.rs). Borrowing the operand's own place
+        // handed the impl a `&&&usize` as a `&&usize`, and it compared a pointer with the value
+        // (relax issue 87).
+        let (pb, tb, bt) = match args.get(1) {
+            Some(&rhs) if rhs != bt && self.b.coerce(b.0).is_some() => {
+                let v = self.lower_expr_coerced(b, rhs);
+                (self.val_to_place(v), rhs, rhs)
+            }
+            _ => {
+                let (pb, tb) = self.lower_place(b);
+                (pb, tb, bt)
+            }
+        };
         let rb = self.ref_to_place(&pb, tb);
         let instance = self.resolve_instance(method, args);
         let rta = self.u.tcx.tys.intern(TyKind::Ref(false, at, crate::types::RegionId::ERASED));

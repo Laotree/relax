@@ -7450,18 +7450,19 @@ impl<'a> Fcx<'a> {
         // Some(10)`, one impl); several impls (`&A: PartialEq<&B>` / `<&mut B>`, String's) leave
         // it open, as rustc's fresh variable does -- `x == &Unicode(y.as_ref())` with x:
         // &Unicode<CowStr> is `Unicode<&str>`, not `Unicode<CowStr>` (op.rs check_overloaded_binop)
-        let hint = if self.tcx.has_param(da) {
-            None
+        // `open`: the impls leave `L: Cmp<?R>` open, so rustc's ?R takes the right operand's own type
+        let (hint, open) = if self.tcx.has_param(da) {
+            (None, false)
         } else {
             let rhs = self.fresh(0);
             let mark = self.start_snapshot();
             let hint = match self.select_trait(td, da, &[rhs]) {
                 Ok(Some(_)) => {
                     let h = self.infcx.deeply_resolve_ignoring_regions(rhs);
-                    if self.tcx.tys.has_infer(h) { None } else { Some(h) }
+                    if self.tcx.tys.has_infer(h) { (None, true) } else { (Some(h), false) }
                 }
-                Ok(None) => None,
-                Err(_) => Some(ta),
+                Ok(None) => (None, true),
+                Err(_) => (Some(ta), false),
             };
             self.rollback_to(mark);
             hint
@@ -7475,6 +7476,19 @@ impl<'a> Fcx<'a> {
         let selection = self.select_trait(td, da, &[db]);
         let rhs = if selection.is_ok() {
             db
+        } else if checked_b.is_some() && open {
+            // a right operand checked as written is not coerced: rustc coerces it to ?R, which
+            // the impls left open (`&A: PartialEq<&B>` and `<&mut B>`), so ?R is its own type and
+            // `L: Cmp<R>` is unmet (op.rs check_overloaded_binop; relax issue 87: `&usize ==
+            // &&usize` compiled). The error names the innermost pair the impls for references
+            // reach: can't compare `usize` with `&usize`.
+            let (mut x, mut y) = (da, db);
+            while let (TyKind::Ref(_, i, _), TyKind::Ref(_, j, _)) = (self.tcx.tys.kind(x).clone(), self.tcx.tys.kind(y).clone()) {
+                (x, y) = (i, j);
+            }
+            let (x, y) = (self.ty_str(x), self.ty_str(y));
+            self.err(lo, format!("E0277: {}", binop_unimplemented(op, &x, &y)));
+            return Some(self.tcx.tys.bool_);
         } else if !matches!(self.select_trait(td, da, &[da]), Err(_)) {
             self.coerce_or_unify(tb, ta, Some(b), lo);
             da
