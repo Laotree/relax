@@ -981,8 +981,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     // script that names none: no file of its package changed)
     let mut env_key = format!("{:016x}", h);
     for (k, v) in cmd.get_envs() {
-        // (the mount's table and edits folder name where the sources are read, not what they are)
-        if k == "MAKEPAD_RUN_VFS" || k == "MAKEPAD_RUN_EDITS" {
+        if SCRIPT_RUN_SHAPE_VARS.iter().any(|s| k == *s) {
             continue;
         }
         env_key.push_str(&format!("\n{}={}", k.to_string_lossy(), v.map(|v| v.to_string_lossy().into_owned()).unwrap_or_default()));
@@ -1134,6 +1133,13 @@ fn rerun_reason(stored: &str, now: &str, stored_env: &str, env_key: &str) -> Str
 }
 
 /// Appends `why` to <build dir>/relax-rerun-why, keeping the last 20 lines.
+/// What a script's run is given that says how the run is shaped, not what the script reads: left
+/// out of its rerun key. The mount's table and edits folder name where the sources are read, not
+/// what they are; the nesting depth and chain say which script's run this one sits in, so a
+/// package reached at the top and inside another script's run (a dependency here and a
+/// build-dependency there) keeps one output (relax issue 69). No cargo script can read them.
+const SCRIPT_RUN_SHAPE_VARS: [&str; 4] = ["MAKEPAD_RUN_VFS", "MAKEPAD_RUN_EDITS", "MAKEPAD_RUN_SCRIPT_DEPTH", "MAKEPAD_RUN_SCRIPT_CHAIN"];
+
 fn note_rerun(build_dir: &str, why: &str) {
     let path = format!("{}/makepad-run-rerun-why", build_dir);
     let mut lines: Vec<String> = std::fs::read_to_string(&path).unwrap_or_default().lines().map(str::to_string).collect();
