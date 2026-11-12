@@ -86,7 +86,7 @@ pub trait Read {
     where
         Self: Sized,
     {
-        Take { inner: self, limit }
+        Take { inner: self, len: limit, limit }
     }
 
     fn chain<R: Read>(self, next: R) -> Chain<Self, R>
@@ -286,6 +286,7 @@ fn read_until<R: BufRead + ?Sized>(r: &mut R, delim: u8, buf: &mut Vec<u8>) -> R
     }
 }
 
+#[derive(Debug)]
 pub struct Bytes<R> {
     inner: R,
 }
@@ -309,8 +310,12 @@ impl<R: Read> Iterator for Bytes<R> {
     }
 }
 
+/// Real std's fields: `len` the limit as last set, `limit` what is left of it (its derived Debug
+/// prints both).
+#[derive(Debug)]
 pub struct Take<T> {
     inner: T,
+    len: u64,
     limit: u64,
 }
 
@@ -319,6 +324,7 @@ impl<T> Take<T> {
         self.limit
     }
     pub fn set_limit(&mut self, limit: u64) {
+        self.len = limit;
         self.limit = limit;
     }
     pub fn into_inner(self) -> T {
@@ -364,6 +370,51 @@ impl<T: BufRead> BufRead for Take<T> {
     }
 }
 
+impl<T> Take<T> {
+    /// Where the Take is, from where it began (real std's unstable `Take::position`).
+    fn position(&self) -> u64 {
+        self.len - self.limit
+    }
+}
+
+/// Real std's (seek_io_take): a position counts from where the Take began and stays within its
+/// `len`, else InvalidInput; the inner reader moves by seek_relative, in i64 steps when the
+/// distance is wider.
+impl<T: Seek> Seek for Take<T> {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        let new_position = match pos {
+            SeekFrom::Start(v) => Some(v),
+            SeekFrom::Current(v) => self.position().checked_add_signed(v),
+            SeekFrom::End(v) => self.len.checked_add_signed(v),
+        };
+        let new_position = match new_position {
+            Some(v) if v <= self.len => v,
+            _ => return Err(ErrorKind::InvalidInput.into()),
+        };
+        while new_position != self.position() {
+            let distance = new_position as i128 - self.position() as i128;
+            let offset = distance.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+            self.inner.seek_relative(offset)?;
+            self.limit = self.limit.wrapping_sub(offset as u64);
+        }
+        Ok(new_position)
+    }
+
+    fn stream_position(&mut self) -> Result<u64> {
+        Ok(self.position())
+    }
+
+    fn seek_relative(&mut self, offset: i64) -> Result<()> {
+        if !self.position().checked_add_signed(offset).is_some_and(|p| p <= self.len) {
+            return Err(ErrorKind::InvalidInput.into());
+        }
+        self.inner.seek_relative(offset)?;
+        self.limit = self.limit.wrapping_sub(offset as u64);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 pub struct Chain<T, U> {
     first: T,
     second: U,
@@ -391,6 +442,7 @@ impl<T: Read, U: Read> Read for Chain<T, U> {
     }
 }
 
+#[derive(Debug)]
 pub struct Split<B> {
     buf: B,
     delim: u8,
@@ -413,6 +465,7 @@ impl<B: BufRead> Iterator for Split<B> {
     }
 }
 
+#[derive(Debug)]
 pub struct Lines<B> {
     buf: B,
 }
