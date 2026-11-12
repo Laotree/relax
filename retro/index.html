@@ -27,13 +27,13 @@
 <tr valign="top"><td><b>Change one function in a running program</b></td><td>rebuild, relink, restart: state lost</td><td><b>patched in</b>: state kept</td></tr>
 <tr valign="top"><td><b>Save a file → 92 tests re-run</b></td><td>rebuild the test binary first</td><td><b>2.2 s</b> after the save</td></tr>
 <tr valign="top"><td><b>Type and borrow check</b></td><td><code>cargo check</code>; a build checks everything first</td><td><code>relax check</code>; a run type-checks each function before it runs and borrow-checks in the background</td></tr>
-<tr valign="top"><td><b>Speed of optimised code</b></td><td>1.00× (<code>--release</code> for the native CPU)</td><td><b>1.14–1.26×</b> the time; 2.3× on dense numeric loops</td></tr>
+<tr valign="top"><td><b>Speed of optimised code</b></td><td>1.00× (<code>--release</code>)</td><td><b>slower: 1.12× the time on x64, 1.24× on arm64</b> (geomean of 21 workloads)</td></tr>
 <tr valign="top"><td><b>Needs</b></td><td>rustc, LLVM, a linker</td><td><b>one Rust library</b>: 438k lines, 0 crates.io dependencies</td></tr>
 </table>
 <p>Code generation for x86-64 and AArch64; from a fresh clone the repository builds and its tests pass on Linux x86-64 and macOS arm64. Windows isn't tested.</p>
 <h2><a name="the-tradeoffs">The tradeoffs</a></h2>
 <ul>
-<li><b>Slower optimised code.</b> 1.14–1.26× the time of <code>--release</code> built for the native CPU on the workloads we profile most, 2.3× on dense numeric loops, which Relax doesn't vectorise yet. A broader run of 18 workloads came out slower and is being re-measured: see <a href="#where-llvm-still-wins">where LLVM still wins</a>.
+<li><b>Slower optimised code.</b> Overall the code Relax runs is slower than rustc's <code>--release</code>: 1.12× the time on x64 and 1.24× on arm64 (geomean of 21 workloads), 1.22× and 1.25× against a native-CPU build. It is faster on only a few workloads: see <a href="#where-llvm-still-wins">where LLVM still wins</a>.
 <li><b>More memory.</b> The compiler, its caches and every code version it publishes share your program's process, and JIT code is append-only. <code>relax inspect &lt;pid&gt; memory</code> shows the split, <code>code</code> the growth. The code cache in a package's <code>target/makepad-run</code> takes 120 to 190 MB for <code>hello</code>.
 <li><b><code>relax check</code> isn't faster than <code>cargo check</code> yet.</b> On a large package a cold check takes longer and uses more memory than <code>cargo check</code>, and an edit can re-check more than it needs to. We're working on it.
 <li><b>Not every crate runs yet.</b> <a href="https://github.com/makepad/relax/blob/main/libs/relax/KNOWN_GAPS.md">libs/relax/KNOWN_GAPS.md</a> lists the open gaps, each with a repro.
@@ -113,20 +113,37 @@ cd hello
 </table>
 <p>In practice nine agent lanes run side by side, devhub handles more than 300 build and test jobs an hour, and dozens of changes land every day, each checked under Relax before it merges.</p>
 <h2><a name="where-llvm-still-wins">Where LLVM still wins</a></h2>
-<p>In steady state LLVM's code is still faster. Our measurements: warm JIT against a native build of the same source and inputs, as wall-clock ratios (lower is better, 1.00× = LLVM).</p>
+<p>Relax's steady-state code is slower than LLVM's. Time of the same workload under Relax over its time under rustc (lower is better, 1.00× = rustc).</p>
 <table border="1" cellpadding="4" cellspacing="0">
-<tr><th>Workload</th><th>CPU</th><th>vs <code>--release</code>, native CPU</th><th>Measured</th></tr>
-<tr valign="top"><td>3D-print slicer, first slice of a part, 4 threads</td><td>x86-64 (Zen 4)</td><td><b>1.14×</b> (cycles 1.15×, instructions 1.26×)</td><td>2026-11-11</td></tr>
-<tr valign="top"><td>Same, 8 threads</td><td>x86-64 (Zen 4)</td><td><b>1.17×</b></td><td>2026-11-11</td></tr>
-<tr valign="top"><td>Same, 4 threads</td><td>AArch64 (Apple M4)</td><td><b>1.24×</b> (before this week's x86 gains were ported)</td><td>2026-11-09</td></tr>
-<tr valign="top"><td>CAD B-rep modelling round</td><td>x86-64 (Zen 4)</td><td><b>1.26×</b></td><td>2026-11-10</td></tr>
-<tr valign="top"><td>Script VM interpreter loop</td><td>x86-64 (Zen 4)</td><td><b>1.19×</b></td><td>2026-11-11</td></tr>
-<tr valign="top"><td>Dense numeric kernel (Cholesky factorisation)</td><td>x86-64 (Zen 4)</td><td><b>2.29×</b>: LLVM vectorises it with AVX-512, Relax doesn't vectorise loops yet</td><td>2026-11-10</td></tr>
-<tr valign="top"><td>Any workload against plain <code>--release</code> (portable CPU baseline)</td><td></td><td><b>not measured yet</b></td><td></td></tr>
+<tr><th>Workload</th><th>x64 vs stock</th><th>x64 vs native</th><th>arm64 vs stock</th><th>arm64 vs native</th></tr>
+<tr valign="top"><td>Text shaping and glyph rasterisation</td><td align="right">1.36×</td><td align="right">1.38×</td><td align="right">1.33×</td><td align="right">1.31×</td></tr>
+<tr valign="top"><td>Signed-distance-field glyph generation</td><td align="right">1.31×</td><td align="right">1.45×</td><td align="right">1.26×</td><td align="right">1.26×</td></tr>
+<tr valign="top"><td>DEFLATE decode</td><td align="right">1.20×</td><td align="right">1.19×</td><td align="right">1.26×</td><td align="right">1.25×</td></tr>
+<tr valign="top"><td>ZIP archive read</td><td align="right">1.22×</td><td align="right">1.26×</td><td align="right">1.11×</td><td align="right">1.10×</td></tr>
+<tr valign="top"><td>PNG decode</td><td align="right">1.21×</td><td align="right">1.25×</td><td align="right">1.32×</td><td align="right">1.32×</td></tr>
+<tr valign="top"><td>Brotli decode</td><td align="right">1.29×</td><td align="right">1.26×</td><td align="right">1.27×</td><td align="right">1.28×</td></tr>
+<tr valign="top"><td>Vector map tile decode</td><td align="right">1.06×</td><td align="right">1.06×</td><td align="right">1.01×</td><td align="right">0.99×</td></tr>
+<tr valign="top"><td>Widget tree layout</td><td align="right">1.54×</td><td align="right">1.49×</td><td align="right">1.75×</td><td align="right">1.74×</td></tr>
+<tr valign="top"><td>LLM decode host path</td><td align="right">1.12×</td><td align="right">0.91×</td><td align="right">0.87×</td><td align="right">1.05×</td></tr>
+<tr valign="top"><td>Rust source tokenizer</td><td align="right">1.06×</td><td align="right">1.06×</td><td align="right">1.20×</td><td align="right">1.21×</td></tr>
+<tr valign="top"><td>Markdown parse</td><td align="right">1.39×</td><td align="right">1.31×</td><td align="right">1.54×</td><td align="right">1.56×</td></tr>
+<tr valign="top"><td>HTML parse</td><td align="right">1.06×</td><td align="right">0.89×</td><td align="right">1.04×</td><td align="right">1.11×</td></tr>
+<tr valign="top"><td>Physical piano model audio</td><td align="right">1.22×</td><td align="right">1.25×</td><td align="right">1.44×</td><td align="right">1.44×</td></tr>
+<tr valign="top"><td>Ogg Vorbis audio decode</td><td align="right">1.20×</td><td align="right">1.20×</td><td align="right">1.24×</td><td align="right">1.27×</td></tr>
+<tr valign="top"><td>Game audio mixer</td><td align="right">1.03×</td><td align="right">1.16×</td><td align="right">1.17×</td><td align="right">1.18×</td></tr>
+<tr valign="top"><td>Script VM evaluation</td><td align="right">1.11×</td><td align="right">1.09×</td><td align="right">1.12×</td><td align="right">1.13×</td></tr>
+<tr valign="top"><td>Solid geometry (CSG) booleans</td><td align="right">1.20×</td><td align="right">1.25×</td><td align="right">1.11×</td><td align="right">1.12×</td></tr>
+<tr valign="top"><td>Rigid-body physics</td><td align="right">0.43×</td><td align="right">1.38×</td><td align="right">1.30×</td><td align="right">1.32×</td></tr>
+<tr valign="top"><td>Game simulation tick</td><td align="right">0.60×</td><td align="right">1.26×</td><td align="right">1.25×</td><td align="right">1.25×</td></tr>
+<tr valign="top"><td>Level walk (navigation grid and walker tours)</td><td align="right">0.87×</td><td align="right">0.87×</td><td align="right">0.91×</td><td align="right">0.91×</td></tr>
+<tr valign="top"><td>3D model build</td><td align="right">2.00×</td><td align="right">2.04×</td><td align="right">1.91×</td><td align="right">1.92×</td></tr>
+<tr valign="top"><td><b>Geomean (21)</b></td><td align="right"><b>1.12×</b></td><td align="right"><b>1.22×</b></td><td align="right"><b>1.24×</b></td><td align="right"><b>1.25×</b></td></tr>
 </table>
-<p>These are the workloads we profile most. A broader run of 18 workloads this week came out slower than these, and slower than in October; we're finding out why and will update this section.</p>
-<p><b>Which <code>--release</code>?</b> These numbers are against <code>--release</code> with <code>-C target-cpu=native</code>, where LLVM may use every instruction the machine has. Most Rust ships with plain <code>--release</code> for a portable baseline CPU; Relax always compiles for the CPU it runs on, so against that the gaps shrink, and on vector-heavy code they can flip. That comparison hasn't been measured yet.</p>
-<p><b>Where the gap comes from</b>, from instruction-level comparisons of the same functions: extra instructions rather than stalls (1.26× the instructions cost 1.15× the cycles).</p>
+<p>Overall, code run by Relax is slower than code built by rustc: the geomean over 21 workloads is 1.12× the time of stock <code>--release</code> on x64 and 1.24× on arm64, and 1.22× and 1.25× the time of a native-CPU build. Relax is faster on only a few workloads. Against stock it is faster on x64 for rigid-body physics (0.43×), game simulation tick (0.60×) and level walk (0.87×), and on arm64 for the LLM decode host path (0.87×) and level walk (0.91×). The two big x64 wins disappear against the native build (rigid-body physics 1.38×, game simulation tick 1.26×): those two wins are against a generic-CPU baseline. The worst workload is 3D model build, at about twice rustc's time.</p>
+<p>Kernel micro-benchmarks (30): steady-state geomean 1.14× against stock and 1.24× against native on x64, about 1.23× on arm64. These are provisional until a warm-cache tier-up bug is fixed: with a warm JIT cache some hot functions never tier up to O3, so the kernel figures can read too slow and are upper bounds. The 21-workload table above is not affected.</p>
+<p>x64: an 8-core desktop CPU, Linux; arm64: an Apple M4 laptop, macOS. rustc 1.99.1, LLVM 23.1.1. Each figure is the median of 3 rounds, measured 2026-11-12. Stock is <code>cargo build --release</code> for a generic CPU; native is <code>--release</code> with <code>-C target-cpu=native</code>. Relax is timed in its default mode, in steady state after tier-up. On x64 the stock and native columns come from separate runs on the same machine and binaries. On arm64 the generic CPU is already the M-series baseline, so the two columns differ only by noise.</p>
+<p><b>Which <code>--release</code>?</b> Both are measured: stock (<code>cargo build --release</code>, generic CPU) and native (<code>-C target-cpu=native</code>). Relax always compiles for the CPU it runs on, so native is the like-for-like column.</p>
+<p><b>Where the gap comes from</b>, from instruction-level comparisons of the same functions in one 3D-print slicer run: extra instructions rather than stalls (1.26× the instructions cost 1.15× the cycles).</p>
 <table border="1" cellpadding="4" cellspacing="0">
 <tr><th>Cause</th><th>Extra instructions (slicer run)</th></tr>
 <tr valign="top"><td>Compares kept as bool registers and recomputed</td><td>~25 G</td></tr>
@@ -137,7 +154,8 @@ cd hello
 <tr valign="top"><td>Runtime outside the generated code (memcpy, allocator wrappers, TLS access, stubs)</td><td>~40 G</td></tr>
 <tr valign="top"><td>No loop vectorisation, shallow unrolling</td><td>most of the numeric-kernel gap</td></tr>
 </table>
-<p>Inlining isn't a cause: Relax inlines more than rustc does. Every row is a work item, and the slicer gap went from 1.26× to 1.14× in the last three days.</p>
+<p>Inlining isn't a cause: Relax inlines more than rustc does. Every row is a work item.</p>
+<p>Relax is for development iteration: release builds use rustc.</p>
 <h2><a name="architecture">Architecture</a></h2>
 <p>Relax owns the whole pipeline, from source bytes to executable memory, in one process. It is a stack of layers, each its own crate, building only on the ones below; the layers compile in parallel, and a change in an upper layer never rebuilds the ones below.</p>
 <table border="1" cellpadding="4" cellspacing="0">

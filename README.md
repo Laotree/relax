@@ -21,7 +21,7 @@ called, optimises the hot ones while the program runs, and patches your edits in
 | **Change one function in a running program** | rebuild, relink, restart: state lost | **patched in**: state kept |
 | **Save a file → 92 tests re-run** | rebuild the test binary first | **2.2 s** after the save |
 | **Type and borrow check** | `cargo check`; a build checks everything first | `relax check`; a run type-checks each function before it runs and borrow-checks in the background |
-| **Speed of optimised code** | 1.00× (`--release` for the native CPU) | **1.14–1.26×** the time; 2.3× on dense numeric loops |
+| **Speed of optimised code** | 1.00× (`--release`) | **slower: 1.12× the time on x64, 1.24× on arm64** (geomean of 21 workloads) |
 | **Needs** | rustc, LLVM, a linker | **one Rust library**: 438k lines, 0 crates.io dependencies |
 
 Code generation for x86-64 and AArch64; from a fresh clone the repository
@@ -29,10 +29,9 @@ builds and its tests pass on Linux x86-64 and macOS arm64. Windows isn't tested.
 
 ## The tradeoffs
 
-- **Slower optimised code.** 1.14–1.26× the time of `--release` built for the native CPU on the
-  workloads we profile most, 2.3× on dense numeric loops, which Relax doesn't vectorise yet. A broader
-  run of 18 workloads came out slower and is being re-measured: see
-  [where LLVM still wins](#where-llvm-still-wins).
+- **Slower optimised code.** Overall the code Relax runs is slower than rustc's `--release`: 1.12× the time on x64
+  and 1.24× on arm64 (geomean of 21 workloads), 1.22× and 1.25× against a native-CPU build. It is faster on only
+  a few workloads: see [where LLVM still wins](#where-llvm-still-wins).
 - **More memory.** The compiler, its caches and every code version it publishes share your program's
   process, and JIT code is append-only. `relax inspect <pid> memory` shows the split, `code` the growth.
   The code cache in a package's `target/makepad-run` takes 120 to 190 MB for `hello`.
@@ -157,29 +156,42 @@ hour, and dozens of changes land every day, each checked under Relax before it m
 
 ## Where LLVM still wins
 
-In steady state LLVM's code is still faster. Our measurements: warm JIT against a native build of the
-same source and inputs, as wall-clock ratios (lower is better, 1.00× = LLVM).
+Relax's steady-state code is slower than LLVM's. Time of the same workload under Relax over its time under rustc (lower is better, 1.00× = rustc):
 
-| Workload | CPU | vs `--release`, native CPU | Measured |
-| --- | --- | --- | --- |
-| 3D-print slicer, first slice of a part, 4 threads | x86-64 (Zen 4) | **1.14×** (cycles 1.15×, instructions 1.26×) | 2026-11-11 |
-| Same, 8 threads | x86-64 (Zen 4) | **1.17×** | 2026-11-11 |
-| Same, 4 threads | AArch64 (Apple M4) | **1.24×** (before this week's x86 gains were ported) | 2026-11-09 |
-| CAD B-rep modelling round | x86-64 (Zen 4) | **1.26×** | 2026-11-10 |
-| Script VM interpreter loop | x86-64 (Zen 4) | **1.19×** | 2026-11-11 |
-| Dense numeric kernel (Cholesky factorisation) | x86-64 (Zen 4) | **2.29×**: LLVM vectorises it with AVX-512, Relax doesn't vectorise loops yet | 2026-11-10 |
-| Any workload against plain `--release` (portable CPU baseline) | | **not measured yet** | |
+| Workload | x64 vs stock | x64 vs native | arm64 vs stock | arm64 vs native |
+| --- | --: | --: | --: | --: |
+| Text shaping and glyph rasterisation | 1.36× | 1.38× | 1.33× | 1.31× |
+| Signed-distance-field glyph generation | 1.31× | 1.45× | 1.26× | 1.26× |
+| DEFLATE decode | 1.20× | 1.19× | 1.26× | 1.25× |
+| ZIP archive read | 1.22× | 1.26× | 1.11× | 1.10× |
+| PNG decode | 1.21× | 1.25× | 1.32× | 1.32× |
+| Brotli decode | 1.29× | 1.26× | 1.27× | 1.28× |
+| Vector map tile decode | 1.06× | 1.06× | 1.01× | 0.99× |
+| Widget tree layout | 1.54× | 1.49× | 1.75× | 1.74× |
+| LLM decode host path | 1.12× | 0.91× | 0.87× | 1.05× |
+| Rust source tokenizer | 1.06× | 1.06× | 1.20× | 1.21× |
+| Markdown parse | 1.39× | 1.31× | 1.54× | 1.56× |
+| HTML parse | 1.06× | 0.89× | 1.04× | 1.11× |
+| Physical piano model audio | 1.22× | 1.25× | 1.44× | 1.44× |
+| Ogg Vorbis audio decode | 1.20× | 1.20× | 1.24× | 1.27× |
+| Game audio mixer | 1.03× | 1.16× | 1.17× | 1.18× |
+| Script VM evaluation | 1.11× | 1.09× | 1.12× | 1.13× |
+| Solid geometry (CSG) booleans | 1.20× | 1.25× | 1.11× | 1.12× |
+| Rigid-body physics | 0.43× | 1.38× | 1.30× | 1.32× |
+| Game simulation tick | 0.60× | 1.26× | 1.25× | 1.25× |
+| Level walk (navigation grid and walker tours) | 0.87× | 0.87× | 0.91× | 0.91× |
+| 3D model build | 2.00× | 2.04× | 1.91× | 1.92× |
+| **Geomean (21)** | **1.12×** | **1.22×** | **1.24×** | **1.25×** |
 
-These are the workloads we profile most. A broader run of 18 workloads this week came out slower than
-these, and slower than in October; we're finding out why and will update this section.
+Overall, code run by Relax is slower than code built by rustc: the geomean over 21 workloads is 1.12× the time of stock `--release` on x64 and 1.24× on arm64, and 1.22× and 1.25× the time of a native-CPU build. Relax is faster on only a few workloads. Against stock it is faster on x64 for rigid-body physics (0.43×), game simulation tick (0.60×) and level walk (0.87×), and on arm64 for the LLM decode host path (0.87×) and level walk (0.91×). The two big x64 wins disappear against the native build (rigid-body physics 1.38×, game simulation tick 1.26×): those two wins are against a generic-CPU baseline. The worst workload is 3D model build, at about twice rustc's time.
 
-**Which `--release`?** These numbers are against `--release` with `-C target-cpu=native`, where LLVM may
-use every instruction the machine has. Most Rust ships with plain `--release` for a portable baseline
-CPU; Relax always compiles for the CPU it runs on, so against that the gaps shrink, and on vector-heavy
-code they can flip. That comparison hasn't been measured yet.
+Kernel micro-benchmarks (30): steady-state geomean 1.14× against stock and 1.24× against native on x64, about 1.23× on arm64. These are provisional until a warm-cache tier-up bug is fixed: with a warm JIT cache some hot functions never tier up to O3, so the kernel figures can read too slow and are upper bounds. The 21-workload table above is not affected.
 
-**Where the gap comes from**, from instruction-level comparisons of the same functions: extra
-instructions rather than stalls (1.26× the instructions cost 1.15× the cycles).
+x64: an 8-core desktop CPU, Linux; arm64: an Apple M4 laptop, macOS. rustc 1.99.1, LLVM 23.1.1. Each figure is the median of 3 rounds, measured 2026-11-12. Stock is `cargo build --release` for a generic CPU; native is `--release` with `-C target-cpu=native`. Relax is timed in its default mode, in steady state after tier-up. On x64 the stock and native columns come from separate runs on the same machine and binaries. On arm64 the generic CPU is already the M-series baseline, so the two columns differ only by noise.
+
+**Which `--release`?** Both are measured: stock (`cargo build --release`, generic CPU) and native (`-C target-cpu=native`). Relax always compiles for the CPU it runs on, so native is the like-for-like column.
+
+**Where the gap comes from**, from instruction-level comparisons of the same functions in one 3D-print slicer run: extra instructions rather than stalls (1.26× the instructions cost 1.15× the cycles).
 
 | Cause | Extra instructions (slicer run) |
 | --- | --- |
@@ -191,8 +203,9 @@ instructions rather than stalls (1.26× the instructions cost 1.15× the cycles)
 | Runtime outside the generated code (memcpy, allocator wrappers, TLS access, stubs) | ~40 G |
 | No loop vectorisation, shallow unrolling | most of the numeric-kernel gap |
 
-Inlining isn't a cause: Relax inlines more than rustc does. Every row is a work item, and the slicer
-gap went from 1.26× to 1.14× in the last three days.
+Inlining isn't a cause: Relax inlines more than rustc does. Every row is a work item.
+
+Relax is for development iteration: release builds use rustc.
 
 ## Architecture
 
