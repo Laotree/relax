@@ -272,7 +272,7 @@ fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
     // and of the resolved graph only the native closure (the packages whose scripts or libs
     // cargo builds for real): two packages whose closure resolves alike share the build.
     let selection = selection_key(&script_pkgs, &lib_pkgs);
-    let mut h = fnv(b"native-link-v14", 0xcbf29ce484222325);
+    let mut h = fnv(b"native-link-v15", 0xcbf29ce484222325);
     h = fnv(req.triple.as_bytes(), h);
     h = fnv(&selection.to_le_bytes(), h);
     for f in &flags {
@@ -881,7 +881,7 @@ fn link(lib_path: &str, archives: &[String], search: &[String], fw_search: &[Str
     }
     let tmp = format!("{}.tmp{}", lib_path, std::process::id());
     let symbols_path = format!("{}.symbols", tmp);
-    // the accessors' object (Linux): the callback relink below reuses the link's arguments
+    // the accessors' object: the callback relink below reuses the link's arguments
     let addresses_path = format!("{}.addresses.o", tmp);
     let mut cmd = Command::new(cc());
     if cfg!(target_os = "macos") {
@@ -889,6 +889,10 @@ fn link(lib_path: &str, archives: &[String], search: &[String], fw_search: &[Str
         for a in archives {
             cmd.arg(format!("-Wl,-force_load,{}", a));
         }
+        // C built with -fvisibility=hidden and assembly's `.private_extern` (ring's core) stay
+        // local to the library, where dlsym cannot see them: the same address accessors as Linux
+        compile_accessors(&macho_archive_symbols(archives)?, &tmp, &addresses_path)?;
+        cmd.arg(&addresses_path);
     } else {
         cmd.args(["-shared", "-fPIC", "-o", &tmp]);
         if cfg!(target_os = "linux") {
@@ -924,36 +928,9 @@ fn link(lib_path: &str, archives: &[String], search: &[String], fw_search: &[Str
         std::fs::write(&symbols_path, args).map_err(|e| format!("{symbols_path}: {e}"))?;
         cmd.arg(format!("-Wl,@{symbols_path}"));
         if cfg!(target_os = "linux") {
-            // Rust's static link can refer to hidden archive symbols, whereas dlsym cannot.
-            // Export an address accessor for each (crate::native::address_name, which the
-            // loader's lookup tries on a miss) without changing the symbols' own visibility.
-            // Thread-local symbols get none: an accessor would answer the calling thread's
-            // instance, and rustc links no plain extern static to a thread-local one. Names
-            // that need assembler directives (versioned ones) stay on the ordinary dlsym path.
-            let mut source = String::new();
-            let plain = symbols.iter().filter(|(name, tls)| {
-                !**tls && name.bytes().next().is_some_and(|b| b.is_ascii_alphabetic() || b"_.".contains(&b))
-                    && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.$".contains(&b))
-            });
-            for (i, (name, _)) in plain.enumerate() {
-                use std::fmt::Write;
-                let escaped = name.bytes().map(|b| format!("\\{b:03o}")).collect::<String>();
-                writeln!(source, "extern char s{i}[] __asm__(\"{escaped}\");").unwrap();
-                writeln!(source, "__attribute__((visibility(\"default\"))) void *{}(void) {{ return s{i}; }}", address_name(name.as_bytes())).unwrap();
-            }
-            let source_path = format!("{tmp}.addresses.c");
-            std::fs::write(&source_path, source).map_err(|e| format!("{source_path}: {e}"))?;
-            let compile = Command::new(cc()).args(["-fPIC", "-c", &source_path, "-o", &addresses_path]).output();
-            let _ = std::fs::remove_file(&source_path);
-            let failed = match compile {
-                Err(e) => Some(format!("cannot compile native address accessors: {e}")),
-                Ok(out) if !out.status.success() => Some(format!("compiling native address accessors failed: {}", String::from_utf8_lossy(&out.stderr))),
-                Ok(_) => None,
-            };
-            if let Some(e) = failed {
-                let _ = std::fs::remove_file(&addresses_path);
+            if let Err(e) = compile_accessors(&symbols, &tmp, &addresses_path) {
                 let _ = std::fs::remove_file(&symbols_path);
-                return Err(format!("--allow-c: {e}"));
+                return Err(e);
             }
             cmd.arg(&addresses_path);
         }
@@ -1017,6 +994,76 @@ fn link(lib_path: &str, archives: &[String], search: &[String], fw_search: &[Str
     }
     linked?;
     std::fs::rename(&tmp, lib_path).map_err(|e| format!("{}: {}", lib_path, e))
+}
+
+/// Rust's static link can refer to hidden archive symbols, whereas dlsym cannot. This compiles an
+/// exported address accessor for each of `symbols` (crate::native::address_name, which the
+/// loader's lookup tries on a miss) into `addresses_path`, without changing the symbols' own
+/// visibility. `symbols`: each defined global symbol as the object files spell it (Mach-O with
+/// its leading `_`), and whether it is thread-local. Thread-local symbols get none: an accessor
+/// would answer the calling thread's instance, and rustc links no plain extern static to a
+/// thread-local one. Names that need assembler directives (versioned ones) stay on the ordinary
+/// dlsym path, and on Mach-O so does a name with no C spelling (no leading `_`).
+fn compile_accessors(symbols: &std::collections::BTreeMap<String, bool>, tmp: &str, addresses_path: &str) -> Result<(), String> {
+    use std::fmt::Write;
+    let mut source = String::new();
+    let plain = symbols.iter().filter(|(name, tls)| {
+        !**tls && name.bytes().next().is_some_and(|b| b.is_ascii_alphabetic() || b"_.".contains(&b))
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.$".contains(&b))
+    });
+    for (i, (name, _)) in plain.enumerate() {
+        // the name dlsym is asked for: Mach-O spells C names with a leading `_`
+        let c_name = if cfg!(target_vendor = "apple") {
+            match name.strip_prefix('_') {
+                Some(n) => n,
+                None => continue,
+            }
+        } else {
+            name.as_str()
+        };
+        let escaped = name.bytes().map(|b| format!("\\{b:03o}")).collect::<String>();
+        writeln!(source, "extern char s{i}[] __asm__(\"{escaped}\");").unwrap();
+        writeln!(source, "__attribute__((visibility(\"default\"))) void *{}(void) {{ return s{i}; }}", address_name(c_name.as_bytes())).unwrap();
+    }
+    let source_path = format!("{tmp}.addresses.c");
+    std::fs::write(&source_path, source).map_err(|e| format!("{source_path}: {e}"))?;
+    let compile = Command::new(cc()).args(["-fPIC", "-c", &source_path, "-o", addresses_path]).output();
+    let _ = std::fs::remove_file(&source_path);
+    let failed = match compile {
+        Err(e) => Some(format!("cannot compile native address accessors: {e}")),
+        Ok(out) if !out.status.success() => Some(format!("compiling native address accessors failed: {}", String::from_utf8_lossy(&out.stderr))),
+        Ok(_) => None,
+    };
+    if let Some(e) = failed {
+        let _ = std::fs::remove_file(addresses_path);
+        return Err(format!("--allow-c: {e}"));
+    }
+    Ok(())
+}
+
+/// The defined global symbols of Mach-O archives (`nm -g --defined-only -m`: one
+/// `<value> (<segment>,<section>) [private ]external <name>` line each; the member headers have no
+/// section), thread-local when its section is one of `__thread_vars` / `_data` / `_bss`.
+fn macho_archive_symbols(archives: &[String]) -> Result<std::collections::BTreeMap<String, bool>, String> {
+    let mut symbols = std::collections::BTreeMap::new();
+    for archive in archives {
+        let out = Command::new("nm").args(["-g", "--defined-only", "-m", archive])
+            .output().map_err(|e| format!("--allow-c: cannot read archive symbols: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("--allow-c: nm failed for {archive}: {}", String::from_utf8_lossy(&out.stderr)));
+        }
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let Some(open) = line.find(" (") else { continue };
+            let Some(close) = line[open..].find(") ").map(|k| open + k) else { continue };
+            if !line[..open].bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let section = &line[open + 2..close];
+            let Some(name) = line[close + 2..].split_whitespace().last() else { continue };
+            symbols.insert(name.to_string(), section.contains(",__thread_"));
+        }
+    }
+    Ok(symbols)
 }
 
 // ---- cargo's RUSTC_WRAPPER

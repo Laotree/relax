@@ -1,6 +1,6 @@
 #include <stdint.h>
 #include <stddef.h>
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 #define CN_HIDDEN __attribute__((visibility("hidden")))
 #else
 #define CN_HIDDEN
