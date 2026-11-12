@@ -535,7 +535,7 @@ impl Plan {
                         }
                         {
                             let _profile = crate::load_profile::span(profile, "rust-demand-outline-names", path);
-                            names.add(*ci, module, &scan.src, &scan.toks, &scan.uses, &scan.mods);
+                            names.add(*ci, module, &scan.src, &scan.toks, &scan.uses, &scan.mods, &scan.inner_macro_use);
                         }
                         scans.push(entry);
                     }
@@ -1166,6 +1166,7 @@ fn crate_modules(c: &PreCrate, scans: &[part::Scan]) -> crate::macros::CrateMods
         }
         modules.mods.extend(scan.mods.iter().cloned());
         modules.items.extend(scan.mod_items.iter().cloned());
+        modules.inner_macro_use.extend(scan.inner_macro_use.iter().cloned());
         for u in &scan.uses { modules.add_use(u.clone()); }
     }
     modules
@@ -1261,7 +1262,7 @@ fn discover_crate(c: &PreCrate, ci: usize, context: &crate::source_context::Cont
             todo.extend(scan.children.iter().rev().cloned());
             {
                 let _profile = crate::load_profile::span(profile, "rust-demand-names", &path);
-                if !rust_lazy { local_names.add(ci, &module, &scan.src, &scan.toks, &scan.uses, &scan.mods); }
+                if !rust_lazy { local_names.add(ci, &module, &scan.src, &scan.toks, &scan.uses, &scan.mods, &scan.inner_macro_use); }
             }
             // These token walks belong to the file worker;
             // only their stable publication needs the merge.

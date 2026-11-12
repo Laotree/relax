@@ -217,17 +217,17 @@ impl<T: Pack + Ord + std::hash::Hash> Pack for crate::fxhash::HashSet<T> {
 impl Pack for crate::macros::CrateMods {
     fn pack(&self, w: &mut Vec<u8>, s: &mut Strings) {
         self.root.pack(w, s); self.src.pack(w, s); self.mods.pack(w, s);
-        self.items.pack(w, s);
+        self.items.pack(w, s); self.inner_macro_use.pack(w, s);
         self.uses.pack(w, s); self.externs.pack(w, s); self.renames.pack(w, s);
     }
     fn unpack(r: &mut Decode<'_>, s: &[String]) -> Option<Self> {
         Some(Self { root: Pack::unpack(r, s)?, src: Pack::unpack(r, s)?, mods: Pack::unpack(r, s)?,
-            items: Pack::unpack(r, s)?,
+            items: Pack::unpack(r, s)?, inner_macro_use: Pack::unpack(r, s)?,
             uses: Pack::unpack(r, s)?, externs: Pack::unpack(r, s)?, renames: Pack::unpack(r, s)?, ..Self::default() })
     }
     fn plain_size(&self) -> usize {
         self.root.plain_size() + self.src.plain_size() + self.mods.plain_size()
-            + self.items.plain_size()
+            + self.items.plain_size() + self.inner_macro_use.plain_size()
             + self.uses.plain_size() + self.externs.plain_size() + self.renames.plain_size()
     }
 }

@@ -2905,7 +2905,7 @@ impl<'a> Parser<'a> {
                     if no_prelude { self.no_prelude -= 1; }
                     self.scope_stack.truncate(scope_depth);
                     // `#[macro_use]` on the module: its macros stay in scope after it
-                    let escape = attrs.iter().any(|a| a.toks.hi > a.toks.lo && self.tok_text(self.toks.at(a.toks.lo as usize)) == b"macro_use");
+                    let escape = attrs.iter().chain(inner.iter()).any(|a| a.toks.hi > a.toks.lo && self.tok_text(self.toks.at(a.toks.lo as usize)) == b"macro_use");
                     if escape {
                         let outer = self.scope_stack.last().copied().unwrap_or(0);
                         for r in self.rule_scopes.iter_mut().filter(|r| r.1 == scope) { r.1 = outer; }
