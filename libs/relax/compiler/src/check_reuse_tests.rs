@@ -36,10 +36,10 @@ fn check_in_child_store(dir: &std::path::Path, reuse: bool, store: &std::path::P
         let count = |what: &str| l.strip_prefix("relax check: ").and_then(|r| r.split_once(what)).and_then(|(n, _)| n.split(' ').next()?.parse().ok());
         if let Some(n) = count(" bodies replayed from stored verdicts") { run.replayed = n; }
         if let Some(n) = count(" stored body verdicts verified") { run.verified = n; }
-        if let Some((_, r)) = l.strip_prefix("makepad check: unused-import candidates in ").and_then(|r| r.split_once(" with replayed bodies: ")) {
+        if let Some((_, r)) = l.strip_prefix("relax check: unused-import candidates in ").and_then(|r| r.split_once(" with replayed bodies: ")) {
             run.rechecked = r.split(' ').next().unwrap().parse().unwrap();
         }
-        if let Some(n) = l.strip_prefix("makepad check: unused-import candidates cleared by a recheck: ") { run.cleared = n.parse().unwrap(); }
+        if let Some(n) = l.strip_prefix("relax check: unused-import candidates cleared by a recheck: ") { run.cleared = n.parse().unwrap(); }
         // "N of M crates unchanged since a passing check" (some checked), "M crates unchanged .." (none)
         if let Some((n, _)) = l.strip_prefix("relax check: ").and_then(|r| r.split_once(" crates unchanged since a passing check")) {
             match n.split_once(" of ") {
@@ -209,7 +209,7 @@ fn a_dependency_body_edit_checks_only_that_dependency() {
     assert_eq!((reused.hits, reused.replayed, cold.verified), (1, 3, 5), "the body that looked up an import first edited: {reused:?}, {cold:?}");
     assert_eq!(reused.rechecked, 0, "no import report waits on a replayed body: {reused:?}");
     std::fs::write(dir.join("lib.rs"), uses.replace("Cursor::new(Arc::new(1u8)).position()", "1")).unwrap();
-    let dropped = [("MAKEPAD_RUN_JOBS", "1"), ("RELAX_CHECK_REUSE_DROP_USES", "cur_b")];
+    let dropped = [("RELAX_JOBS", "1"), ("RELAX_CHECK_REUSE_DROP_USES", "cur_b")];
     let (reused, _) = reused_and_verified(&dir, &dropped, "a replayed verdict without its uses");
     // both imports candidates; f, unused_in_lib and cur_b checked after all
     assert_eq!((reused.replayed, reused.rechecked, reused.cleared), (3, 3, 2), "a replayed verdict without its uses: {reused:?}");

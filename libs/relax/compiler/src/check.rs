@@ -1520,11 +1520,11 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
         #[cfg(test)]
         replayed_guard.retain(|d| !again_set.contains(d));
         if subjects_mode() == 0 {
-            eprintln!("makepad check: unused-import candidates in {} crate(s) with replayed bodies: {} replayed bodies checked in {:.2} s", krates.len(), again.len(), t_again.elapsed().as_secs_f64());
-            for c in &candidates { eprintln!("makepad check:   candidate: {c}"); }
-            eprintln!("makepad check: unused-import candidates cleared by a recheck: {}", cleared.len());
-            for c in &cleared { eprintln!("makepad check:   cleared: {c}"); }
-            for w in &differ { eprintln!("makepad check:   a stored verdict differs from its recheck: {w}"); }
+            eprintln!("relax check: unused-import candidates in {} crate(s) with replayed bodies: {} replayed bodies checked in {:.2} s", krates.len(), again.len(), t_again.elapsed().as_secs_f64());
+            for c in &candidates { eprintln!("relax check:   candidate: {c}"); }
+            eprintln!("relax check: unused-import candidates cleared by a recheck: {}", cleared.len());
+            for c in &cleared { eprintln!("relax check:   cleared: {c}"); }
+            for w in &differ { eprintln!("relax check:   a stored verdict differs from its recheck: {w}"); }
         }
         st.mark("recheck of replayed bodies");
     }
