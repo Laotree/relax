@@ -14,23 +14,23 @@
 #[allow(unused_macros)]
 macro_rules! eprintln {
     () => {{ use ::std::io::Write as _; let _ = ::std::io::stderr().write_all(b"\n"); }};
-    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stderr().write_fmt(format_args!("{}\n", format_args!($($t)+))); }};
+    ($($t:tt)+) => { $crate::vfs::write_err(format_args!("{}\n", format_args!($($t)+))) };
 }
 #[cfg(not(test))]
 #[allow(unused_macros)]
 macro_rules! eprint {
-    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stderr().write_fmt(format_args!($($t)+)); }};
+    ($($t:tt)+) => { $crate::vfs::write_err(format_args!($($t)+)) };
 }
 #[cfg(not(test))]
 #[allow(unused_macros)]
 macro_rules! println {
     () => {{ use ::std::io::Write as _; let _ = ::std::io::stdout().write_all(b"\n"); }};
-    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stdout().write_fmt(format_args!("{}\n", format_args!($($t)+))); }};
+    ($($t:tt)+) => { $crate::vfs::write_out(format_args!("{}\n", format_args!($($t)+))) };
 }
 #[cfg(not(test))]
 #[allow(unused_macros)]
 macro_rules! print {
-    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stdout().write_fmt(format_args!($($t)+)); }};
+    ($($t:tt)+) => { $crate::vfs::write_out(format_args!($($t)+)) };
 }
 
 pub mod fxhash;

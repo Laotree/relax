@@ -33,7 +33,8 @@
 //! (dirs.rs): checkouts of one repository at different places (git worktrees, clones) that give
 //! the same name share their stores, and a crate is compiled again only where its text differs.
 //! The checkout is a plain folder here, not an overlay on a release: a write into it goes to the
-//! disk as it is, with no ledger, base copy or whiteout.
+//! disk as it is, with no ledger, base copy or whiteout. What the run prints names the checkout's
+//! files (`shown`).
 use crate::gitstore::{self as store, Entry, Oid, Store};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -954,6 +955,44 @@ pub fn parse_range(s: &str) -> Option<(u64, u64)> {
 /// The edits folder is a shared workspace's checkout (SHARE): a plain folder.
 static SHARED: AtomicBool = AtomicBool::new(false);
 
+/// A shared workspace's mount root and its checkout's folder (both normalized).
+static SHARE_ROOTS: OnceLock<(String, String)> = OnceLock::new();
+
+/// `text` as a shared workspace's user reads it: each path under the mount as the checkout's.
+/// The paths a run holds, keys and stores are the mount's; what it prints (a diagnostic's
+/// location, a trace) names the files where an editor and a coding agent find them.
+pub fn shown(text: &str) -> std::borrow::Cow<'_, str> {
+    if SHARED.load(Ordering::Relaxed) {
+        if let Some((root, disk)) = SHARE_ROOTS.get() {
+            if text.contains(root.as_str()) {
+                return std::borrow::Cow::Owned(text.replace(root.as_str(), disk));
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(text)
+}
+
+/// The crates' print macros (lib.rs): a write whose error is dropped, a shared workspace's paths
+/// [`shown`].
+pub fn write_err(text: std::fmt::Arguments<'_>) {
+    use io::Write as _;
+    if !SHARED.load(Ordering::Relaxed) {
+        let _ = io::stderr().write_fmt(text);
+        return;
+    }
+    let _ = io::stderr().write_all(shown(&std::fmt::format(text)).as_bytes());
+}
+
+/// [`write_err`] for stdout.
+pub fn write_out(text: std::fmt::Arguments<'_>) {
+    use io::Write as _;
+    if !SHARED.load(Ordering::Relaxed) {
+        let _ = io::stdout().write_fmt(text);
+        return;
+    }
+    let _ = io::stdout().write_all(shown(&std::fmt::format(text)).as_bytes());
+}
+
 /// MAKEPAD_RUN_SHARE=<name>: the workspace of the current folder (cargo's root for it) becomes
 /// the edits folder of an empty store mounted at `<run home>/vfs/<name>`, and the run's workspace
 /// is the current folder's place under that mount. It is said in the variables a virtual run
@@ -965,15 +1004,19 @@ fn share_from_env() -> Result<(), String> {
         return Err(format!("MAKEPAD_RUN_SHARE: `{name}` is not a name (letters, digits, `-`, `_`, `.`)"));
     }
     SHARED.store(true, Ordering::Release);
+    let home = store::relax_home();
+    let root = normalize_path(&home.join("vfs").join(&name).to_string_lossy());
     if std::env::var_os("MAKEPAD_RUN_VFS").is_some_and(|v| !v.is_empty()) {
+        if let Some(disk) = std::env::var("MAKEPAD_RUN_EDITS").ok().filter(|d| !d.is_empty()) {
+            let _ = SHARE_ROOTS.set((root, normalize_path(&disk)));
+        }
         return Ok(());
     }
     let cwd = std::env::current_dir().map_err(|e| format!("MAKEPAD_RUN_SHARE: {e}"))?.to_string_lossy().into_owned();
     let disk = crate::resolve::find_root(&cwd).map_err(|e| format!("MAKEPAD_RUN_SHARE: {e}"))?;
     let rel = relative_path(&cwd, &disk).unwrap_or_default();
-    let home = store::relax_home();
-    let root = normalize_path(&home.join("vfs").join(&name).to_string_lossy());
     let (file, commit) = store::empty_store(&home.join("cache"))?;
+    let _ = SHARE_ROOTS.set((root.clone(), normalize_path(&disk)));
     std::env::set_var("MAKEPAD_RUN_VFS", format!("{root}\t{}\t{}", file.display(), store::hex(&commit)));
     std::env::set_var("MAKEPAD_RUN_EDITS", &disk);
     std::env::set_var("MAKEPAD_RUN_WORKSPACE", if rel.is_empty() { root } else { format!("{root}/{rel}") });
@@ -1577,7 +1620,13 @@ mod tests {
         assert_eq!(read(&new).unwrap(), b"pub fn h() {}");
         assert!(!checkout.join(".makepad-run-edits").exists() && !checkout.join(".makepad-run-base").exists(), "no ledger in a checkout");
         assert_eq!(reconcile_edits(), Vec::<String>::new());
+        let _ = SHARE_ROOTS.set((root.to_string(), normalize_path(&checkout.to_string_lossy())));
+        if SHARE_ROOTS.get().is_some_and(|r| r.0 == root) {
+            assert_eq!(shown(&format!("{lib}:1:8: E0308")), format!("{}/src/lib.rs:1:8: E0308", normalize_path(&checkout.to_string_lossy())));
+            assert_eq!(shown("/elsewhere/src/lib.rs:1:8"), "/elsewhere/src/lib.rs:1:8");
+        }
         SHARED.store(false, Ordering::Release);
+        assert_eq!(shown(&lib), lib.as_str(), "only a shared run's output is its checkout's");
         set_edits(None);
         MOUNTS.write().unwrap().retain(|m| m.root != normalize_path(root));
         let _ = std::fs::remove_dir_all(&dir);
