@@ -1,0 +1,12 @@
+[package]
+name = "cached-check-fixture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "relax check fixture: a path crate whose build script compiles C and writes an OUT_DIR file the crate includes (the libduckdb-sys/bindgen.rs shape), so a check without --allow-c needs the native build's receipt"
+
+[dependencies]
+cnative = { path = "cnative" }
+
+# its own workspace (no registry dependencies: runs offline anywhere with cargo and cc)
+[workspace]
