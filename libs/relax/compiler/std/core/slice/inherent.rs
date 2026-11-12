@@ -402,6 +402,14 @@ impl<T> [T] {
         let (mid, right) = super::split_at_mut(rest, 1);
         (left, &mut mid[0], right)
     }
+    #[track_caller]
+    pub fn select_nth_unstable_by_key<K: Ord, F: FnMut(&T) -> K>(&mut self, index: usize, f: F) -> (&mut [T], &mut T, &mut [T]) {
+        let mut f = f;
+        sort::select_nth(self, index, &mut |a: &T, b: &T| f(a).lt(&f(b)));
+        let (left, rest) = super::split_at_mut(self, index);
+        let (mid, right) = super::split_at_mut(rest, 1);
+        (left, &mut mid[0], right)
+    }
     pub fn is_sorted(&self) -> bool
     where
         T: PartialOrd,
