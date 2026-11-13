@@ -2,7 +2,7 @@
 //! The `impl<T> [T]` methods are in inherent.rs and forward to the free functions here.
 
 pub mod memchr;
-mod index;
+pub(crate) mod index;
 mod inherent;
 mod iter;
 mod join;
