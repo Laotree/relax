@@ -3485,6 +3485,24 @@ static DOMAIN_PRESENT_WALL: AtomicU64 = AtomicU64::new(0);
 /// ... and which domain that was (its package and id), for the settle rebuild's give-up line
 static DOMAIN_PRESENT_NAME: relax_session::sync::Mutex<String> = relax_session::sync::Mutex::new(String::new());
 
+/// The latest start a settle round follows: the program's first present, a domain's, or the
+/// quiet start of a program that never presents (jit::QUIET_START_NS); 0 before any.
+fn latest_present() -> u64 {
+    FIRST_PRESENT_WALL.load(Ordering::Acquire).max(DOMAIN_PRESENT_WALL.load(Ordering::Acquire)).max(jit::QUIET_START_NS.load(Ordering::Acquire))
+}
+
+/// A program that never presents rebuilds (the settle rebuild) only once it has lived this long past
+/// its quiet start: a CLI tool or a test run that ends soon after it would pay the rebuild's encode
+/// and restore (0.1 s off the program's threads for a small program, 1-2.5 s for a large one) just
+/// before its exit gives the memory back anyway. The wait only delays a rebuild, it never refuses one.
+const HEADLESS_REBUILD_AFTER_NS: u64 = 5_000_000_000;
+
+/// A program that never presents, quiet at its start since `quiet_start` (0: not yet), is too young
+/// at `now` to rebuild (HEADLESS_REBUILD_AFTER_NS).
+fn headless_too_young(quiet_start: u64, now: u64) -> bool {
+    quiet_start == 0 || now < quiet_start.saturating_add(HEADLESS_REBUILD_AFTER_NS)
+}
+
 pub(crate) fn domain_present(name: String) {
     *DOMAIN_PRESENT_NAME.lock().unwrap_or_else(|e| e.into_inner()) = name;
     DOMAIN_PRESENT_WALL.fetch_max(jit::wall_ns().max(1), Ordering::Release);
@@ -3548,13 +3566,14 @@ const MONITOR_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
 const MONITOR_QUIET: u32 = 50;
 
 /// What the monitor's duties follow: when none of it changes, there is nothing to do soon.
-fn monitor_activity() -> [u64; 7] {
+fn monitor_activity() -> [u64; 8] {
     [
         jit::COMPILED_FNS.load(Ordering::Relaxed) + jit::TIER1_INSTALLS.load(Ordering::Relaxed),
         jit::reclaim_generation(),
         jit::demand_compiled(),
         FIRST_PRESENT_WALL.load(Ordering::Relaxed),
         DOMAIN_PRESENT_WALL.load(Ordering::Relaxed),
+        jit::QUIET_START_NS.load(Ordering::Relaxed),
         crate::cache::RECORDS.load(Ordering::Relaxed),
         crate::borrowck::lazy::checked(),
     ]
@@ -3660,9 +3679,10 @@ fn try_settle(drops: &mut jit::SettleDrops, trim: bool) -> bool {
         let pending = u.cache.as_ref().map_or(0, |c| c.pending_bytes());
         let spill = u.cache.as_mut().and_then(|c| c.spill_take());
         let at = crate::clock::ms_since_start();
-        let present = FIRST_PRESENT_WALL.load(Ordering::Acquire).max(DOMAIN_PRESENT_WALL.load(Ordering::Acquire));
+        let present = latest_present();
         let landmark = if present == 0 { "before first present".to_owned() } else {
-            format!("latest first present +{:.0} ms", jit::wall_ns().saturating_sub(present) as f64 / 1e6)
+            let what = if jit::presented() { "latest first present" } else { "quiet start (no present)" };
+            format!("{what} +{:.0} ms", jit::wall_ns().saturating_sub(present) as f64 / 1e6)
         };
         Some((drops, pending, spill, at, landmark, retired))
     })) else { return false };
@@ -3760,7 +3780,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         loop {
             // idle: one look a second (a settle request wakes it at once)
             let idle = still >= MONITOR_QUIET && present.is_none() && mem_snapshot.is_none() && settle_stress.is_none()
-                && !mid_busy.load(Ordering::Relaxed) && FIRST_PRESENT_WALL.load(Ordering::Relaxed) != 0;
+                && !mid_busy.load(Ordering::Relaxed) && latest_present() != 0;
             if idle { std::thread::park_timeout(MONITOR_IDLE) } else { std::thread::sleep(MONITOR_TICK) }
             if crate::run_threads::ending() { return; }
             // inspect's timeline names the monitor's work (its owner requests and its own time)
@@ -3813,7 +3833,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             let start = MAIN_START_WALL.load(Ordering::Relaxed);
             let since = main_ms.saturating_sub(mid_last);
             // also with no new code: the manifest whose window closed, the collected program
-            let left = !MID_MANIFEST_DONE.load(Ordering::Relaxed) && jit::FIRST_PRESENT.load(Ordering::Acquire) && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed)
+            let left = !MID_MANIFEST_DONE.load(Ordering::Relaxed) && jit::started() && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed)
                 || !COLLECTED_CURRENT.load(Ordering::Relaxed) && !MID_COLLECTED_TRIED.load(Ordering::Relaxed)
                 || jit::live_startup_done() && crate::cache::front_graph_pending();
             // the warm record (manifest, front graph, collected program) is written as soon
@@ -3852,9 +3872,10 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                     busy.store(false, Ordering::SeqCst);
                 });
             }
-            // the program's teardown is built ahead once the first frame has been up for 1 s
-            // (jit::prepare_teardown): a quit then runs it instead of compiling it
-            let presented = jit::FIRST_PRESENT_NS.load(Ordering::Acquire);
+            // the program's teardown is built ahead once the first frame has been up for 1 s (a
+            // program that never presents: 1 s after its quiet start) (jit::prepare_teardown): a
+            // quit then runs it instead of compiling it
+            let presented = jit::started_ns();
             if !teardown_started && presented != 0 && jit::wall_ns().saturating_sub(presented) >= 1_000_000_000 {
                 teardown_started = true;
                 let up = unsafe { RUN_UNIT };
@@ -3868,7 +3889,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             // the deferred cache records of this tick's installs (rule I-PUB: bounded publishes)
             if jit::records_due() { let _s = crate::inspect::timeline::span("run-monitor cache records"); jit::drain_records_bounded(); }
             if settle_on {
-                let present = FIRST_PRESENT_WALL.load(Ordering::Acquire).max(DOMAIN_PRESENT_WALL.load(Ordering::Acquire));
+                let present = latest_present();
                 if present != settle_present {
                     settle_present = present;
                     settle_watch.settled = None;
@@ -3897,7 +3918,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 // main-thread request between two of them. None once the run quits: the process
                 // gives its memory back as it ends, and the app's shutdown has the owner
                 let now_ns = jit::wall_ns();
-                let settled_d = if !jit::QUIT_SEEN.load(Ordering::Relaxed) && (FIRST_PRESENT_WALL.load(Ordering::Acquire) != 0 || reclaim_requested)
+                let settled_d = if !jit::QUIT_SEEN.load(Ordering::Relaxed) && (latest_present() != 0 || reclaim_requested)
                     && (reclaimed != Some(n) && now_ns.saturating_sub(last_drop_ns) >= SETTLE_DROP_EVERY_NS || reclaim_requested) {
                     last_drop_ns = now_ns;
                     let _s = crate::inspect::timeline::span("run-monitor settle sweep");
@@ -3966,6 +3987,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             }
             let rebuild_block: Option<&'static str> = if rebuild_over || rebuild_done || Instant::now() < rebuild_next { Some("") }
                 else if settled.is_none() { Some("not settled") }
+                else if !jit::presented() && headless_too_young(jit::QUIET_START_NS.load(Ordering::Acquire), jit::wall_ns()) { Some("under 5 s since the quiet start of a program that never presents") }
                 else if !(COLLECTED_CURRENT.load(Ordering::Relaxed) || COLLECTED_RESTORED.load(Ordering::Relaxed)) { Some("the collected image is not current") }
                 else if COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).is_some() { Some("the collected image's tables are not adopted yet") }
                 else if !MID_MANIFEST_DONE.load(Ordering::Relaxed) { Some("the mid-run manifest is not written") }
@@ -4069,7 +4091,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 }
             }
             if runtime.mem_trim {
-                let n = if FIRST_PRESENT_WALL.load(Ordering::Acquire) != 0 {
+                let n = if latest_present() != 0 {
                     jit::reclaim_generation()
                 } else {
                     jit::COMPILED_FNS.load(Ordering::Relaxed) + jit::TIER1_INSTALLS.load(Ordering::Relaxed)
@@ -4458,7 +4480,7 @@ fn quit_mark() {
     // the quit write and the exit's commit without waiting on the disk (store.rs Slot::tail)
     crate::store::set_exiting();
     if ONCE.swap(true, Ordering::SeqCst) || unsafe { RUN_UNIT }.is_null() { return; }
-    if jit::FIRST_PRESENT.load(Ordering::Acquire) {
+    if jit::started() {
         jit::ORDER_UNTIL_NS.fetch_min(jit::wall_ns(), Ordering::Relaxed);
     }
     { let _k = crate::zone_alloc::kept();
@@ -4698,7 +4720,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     jit::drain_records_bounded();
     // the stores earlier spills wrote, opened here when the startup manifest may be recorded below
     // (cache.rs open_written): its image takes their entries, and the request only indexes them
-    if jit::FIRST_PRESENT.load(Ordering::Acquire) && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed)
+    if jit::started() && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed)
         && (!MID_MANIFEST_DONE.load(Ordering::Relaxed) || jit::QUIT_SEEN.load(Ordering::Relaxed)) {
         let dir = MID_CACHE_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(dir) = dir { crate::cache::open_written(&dir); }
@@ -4728,7 +4750,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         // (the quit write records it again when the session installed more since: the whole
         // session's order, linked ahead by the next launch)
         let again = jit::QUIT_SEEN.load(Ordering::Relaxed) && MID_MANIFEST_DONE.load(Ordering::Relaxed) && u.start_order.len() > MID_MANIFEST_LEN.load(Ordering::Relaxed);
-        if u.cache.is_some() && jit::FIRST_PRESENT.load(Ordering::Acquire) && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed) && (!MID_MANIFEST_DONE.swap(true, Ordering::Relaxed) || again) {
+        if u.cache.is_some() && jit::started() && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed) && (!MID_MANIFEST_DONE.swap(true, Ordering::Relaxed) || again) {
             MID_MANIFEST_LEN.store(u.start_order.len(), Ordering::Relaxed);
             let (order, present) = jit::manifest_order(u.start_order.clone(), jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed));
             let mut cache = u.cache.take();

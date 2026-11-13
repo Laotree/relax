@@ -184,7 +184,8 @@ fn not_now() -> Option<String> {
     if owner::request_waiting() {
         return Some("a request waits for the owner".into());
     }
-    if !FIRST_PRESENT.load(Ordering::Acquire) || startup_phase() {
+    // (its first present, or a program that never presents went quiet at its start)
+    if !started() || startup_phase() {
         return Some("still starting".into());
     }
     if RELOADING.load(Ordering::Acquire) > 0 {

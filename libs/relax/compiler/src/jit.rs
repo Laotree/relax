@@ -22451,7 +22451,27 @@ pub(crate) fn live_startup_done() -> bool {
 /// here, on the writers' threads, as an app's is after its first present, not only at its exit.
 fn headless_started() {
     if !FIRST_PRESENT.load(Ordering::Acquire) && live_startup_done() {
+        let _ = QUIET_START_NS.compare_exchange(0, wall_ns().max(1), Ordering::AcqRel, Ordering::Relaxed);
         crate::cache::start_deferred_front();
+    }
+}
+
+/// When a program that never presents went quiet at its start (headless_started; wall_ns): what
+/// its first present is to an app for the run monitor's settle, its mid-run startup manifest and
+/// its teardown built ahead (run.rs); 0 before, and in an app.
+pub(crate) static QUIET_START_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The program's start ended: its first present, or a program that never presents went quiet.
+pub(crate) fn started() -> bool {
+    FIRST_PRESENT.load(Ordering::Acquire) || QUIET_START_NS.load(Ordering::Acquire) != 0
+}
+
+/// When the program's start ended (wall_ns): its first present, or a program that never presents
+/// went quiet (QUIET_START_NS); 0 before.
+pub(crate) fn started_ns() -> u64 {
+    match FIRST_PRESENT_NS.load(Ordering::Acquire) {
+        0 => QUIET_START_NS.load(Ordering::Acquire),
+        p => p,
     }
 }
 /// A program that has not presented and made no demand compile for this long is headless:
@@ -31036,6 +31056,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&STARTUP_ROOTS, relax_session::sync::Mutex::new(Vec::new()));
     reset(&STARTUP_CACHED, relax_session::sync::Mutex::new(Vec::new()));
     reset(&FIRST_PRESENT_NS, AtomicU64::new(0));
+    reset(&QUIET_START_NS, AtomicU64::new(0));
     reset(&FIRST_PRESENT, AtomicBool::new(false));
     reset(&HEADLESS, AtomicBool::new(false));
     reset(&LIVE_STARTUP_DONE, AtomicBool::new(false));

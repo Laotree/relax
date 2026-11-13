@@ -131,6 +131,9 @@ pub(super) fn complete(v: Verdict, ms: f64) -> Edit {
     let (state, ready) = LIVE.get().unwrap();
     let mut s = state.lock().unwrap();
     s.runs += 1;
+    // a test session presents no frame: each run's end is its present, the settle and its rebuild
+    // follow it as they follow a domain's first frame (run.rs)
+    crate::run::domain_present(format!("live test run {}", s.runs));
     let Verdict { ran, passed, ignored, failures, stale, why, skipped, tests } = v;
     let failed = failures.len();
     let selected = if why.is_none() { "affected" } else { "all" };
