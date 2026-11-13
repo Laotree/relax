@@ -533,7 +533,10 @@ fn relax_meta(dir: &str, key: &str) -> Option<String> {
     None
 }
 
-/// `[package.metadata.relax] build-script = "keep"` in the manifest of the package in `dir`.
+/// `[package.metadata.relax] build-script = "keep"` in the manifest of the package in `dir`. The
+/// role says only that the script runs (it is never listed for removal); it grants no rights. A
+/// registry package can declare it in its own manifest: what its script may do is the process's
+/// policy for third-party compile-time code (sandbox.rs `Policy`), whatever the role says.
 fn kept_script(dir: &str) -> bool {
     relax_meta(dir, "build-script").as_deref() == Some("\"keep\"")
 }

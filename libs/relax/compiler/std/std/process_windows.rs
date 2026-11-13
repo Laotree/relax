@@ -71,6 +71,7 @@ extern "system" {
     fn TerminateProcess(process: HANDLE, code: u32) -> BOOL;
     fn GetProcessId(process: HANDLE) -> u32;
     fn GetCurrentProcess() -> HANDLE;
+    fn GetCurrentThread() -> HANDLE;
     fn DuplicateHandle(src_process: HANDLE, src: HANDLE, dst_process: HANDLE, dst: *mut HANDLE, access: u32, inherit: BOOL, options: u32) -> BOOL;
     fn CreatePipe(read: *mut HANDLE, write: *mut HANDLE, attrs: *mut c_void, size: u32) -> BOOL;
     fn SetHandleInformation(h: HANDLE, mask: u32, flags: u32) -> BOOL;
@@ -121,6 +122,10 @@ extern "C" {
     fn __relax_spawn_env(edits: *const u8, edits_len: usize, host: *const u8, host_len: usize, flags: u32, out: *mut *const u8, out_len: *mut usize);
     /// relax-base progenv.rs prepared_bin: 1 for a package binary this run prepared
     fn __relax_prepared_bin(path: *const u8, len: usize) -> i32;
+    /// Relax tool.rs: a build script's `$RUSTC` question answered by this process (a handle), or 0
+    fn __relax_tool_spawn(argv: *const u8, len: usize, stdin: i64, stdout: i64, stderr: i64) -> u64;
+    fn __relax_tool_wait(handle: u64, block: i32) -> i64;
+    fn __relax_tool_release(handle: u64);
 }
 
 pub fn exit(code: i32) -> ! {
@@ -600,6 +605,28 @@ impl Command {
         Some(out)
     }
 
+    /// Inside a build script's run (RELAX_AS_RUSTC), the host answers an option-led question of the
+    /// script's own `$RUSTC` in this process (Relax tool.rs) with the child's stdio ends: its
+    /// handle, or 0 when a process answers.
+    fn tool_spawn(&self, stdin: &Option<OwnedHandle>, stdout: &Option<OwnedHandle>, stderr: &Option<OwnedHandle>) -> u64 {
+        if crate::env::host_var_os("RELAX_AS_RUSTC").is_none() {
+            return 0;
+        }
+        let mut argv: Vec<u8> = Vec::new();
+        let program = self.program.as_encoded_bytes();
+        argv.extend_from_slice(alloc::format!("{}:", program.len()).as_bytes());
+        argv.extend_from_slice(program);
+        for a in &self.args {
+            let b = match a {
+                Arg::Regular(s) | Arg::Raw(s) => s.as_encoded_bytes(),
+            };
+            argv.extend_from_slice(alloc::format!("{}:", b.len()).as_bytes());
+            argv.extend_from_slice(b);
+        }
+        let raw = |h: &Option<OwnedHandle>| h.as_ref().map_or(-1, |h| h.as_raw_handle() as isize as i64);
+        unsafe { __relax_tool_spawn(argv.as_ptr(), argv.len(), raw(stdin), raw(stdout), raw(stderr)) }
+    }
+
     /// A child started in a virtual folder of a git run (Relax's VFS) cannot get it as its
     /// working directory: it runs from the current one and finds its workspace through
     /// RELAX_WORKSPACE + the mount table (RELAX_VFS), as on unix (process_unix.rs).
@@ -690,6 +717,23 @@ impl Command {
         let (stdin_child, stdin_parent) = to_handle(stdin_kind, win::STD_INPUT_HANDLE)?;
         let (stdout_child, stdout_parent) = to_handle(stdout_kind, win::STD_OUTPUT_HANDLE)?;
         let (stderr_child, stderr_parent) = to_handle(stderr_kind, win::STD_ERROR_HANDLE)?;
+        // a build script's `$RUSTC` question: this process answers it with the child's ends of
+        // the stdio (Relax tool.rs), and no process starts. Its process and thread handles are
+        // this process's own (as its id is): an answer has none of its own.
+        let tool = self.tool_spawn(&stdin_child, &stdout_child, &stderr_child);
+        if tool != 0 {
+            drop(stdin_child);
+            drop(stdout_child);
+            drop(stderr_child);
+            return Ok(Child {
+                handle: dup_own(unsafe { GetCurrentProcess() })?,
+                main_thread: dup_own(unsafe { GetCurrentThread() })?,
+                tool: Tool(tool),
+                stdin: stdin_parent.map(|h| ChildStdin { handle: h }),
+                stdout: stdout_parent.map(|h| ChildStdout { handle: h }),
+                stderr: stderr_parent.map(|h| ChildStderr { handle: h }),
+            });
+        }
 
         let mut si = zeroed_startupinfo();
         // with any of the three set, all three go in (a null one stays null); with none set the
@@ -718,6 +762,7 @@ impl Command {
             Ok(Child {
                 handle: OwnedHandle::from_raw_handle(pi.hProcess),
                 main_thread: OwnedHandle::from_raw_handle(pi.hThread),
+                tool: Tool(0),
                 stdin: match stdin_parent {
                     Some(h) => Some(ChildStdin { handle: h }),
                     None => None,
@@ -807,6 +852,16 @@ fn zeroed_startupinfo() -> STARTUPINFOW {
         hStdOutput: core::ptr::null_mut(),
         hStdError: core::ptr::null_mut(),
     }
+}
+
+/// `h` duplicated into this process, not inherited by its children.
+fn dup_own(h: HANDLE) -> io::Result<OwnedHandle> {
+    let mut out: HANDLE = core::ptr::null_mut();
+    let ok = unsafe { DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &mut out, 0, 0, DUPLICATE_SAME_ACCESS) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedHandle::from_raw_handle(out) })
 }
 
 /// `h` duplicated into this process, inheritable.
@@ -1401,6 +1456,8 @@ fn read2(out: Option<ChildStdout>, err: Option<ChildStderr>) -> io::Result<(Vec<
 pub struct Child {
     handle: OwnedHandle,
     main_thread: OwnedHandle,
+    /// a build script's `$RUSTC` question this process answers, or none (a process)
+    tool: Tool,
     pub stdin: Option<ChildStdin>,
     pub stdout: Option<ChildStdout>,
     pub stderr: Option<ChildStderr>,
@@ -1411,6 +1468,10 @@ impl Child {
         unsafe { GetProcessId(self.handle.as_raw_handle()) }
     }
     pub fn kill(&mut self) -> io::Result<()> {
+        // (an answer ends by itself: it reads at most what the script writes to its stdin)
+        if self.tool.0 != 0 {
+            return Ok(());
+        }
         if unsafe { TerminateProcess(self.handle.as_raw_handle(), 1) } == 0 {
             let error = io::Error::last_os_error();
             // ERROR_ACCESS_DENIED when the process has already ended (by us or otherwise): not
@@ -1423,6 +1484,9 @@ impl Child {
     }
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
         drop(self.stdin.take());
+        if self.tool.0 != 0 {
+            return Ok(ExitStatus(unsafe { __relax_tool_wait(self.tool.0, 1) } as u32));
+        }
         unsafe {
             if win::WaitForSingleObject(self.handle.as_raw_handle(), win::INFINITE) != WAIT_OBJECT_0 {
                 return Err(io::Error::last_os_error());
@@ -1435,6 +1499,10 @@ impl Child {
         }
     }
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        if self.tool.0 != 0 {
+            let code = unsafe { __relax_tool_wait(self.tool.0, 0) };
+            return Ok((code >= 0).then(|| ExitStatus(code as u32)));
+        }
         unsafe {
             let r = win::WaitForSingleObject(self.handle.as_raw_handle(), 0);
             if r == win::WAIT_TIMEOUT {
@@ -1464,6 +1532,18 @@ impl Child {
     }
     pub(crate) fn into_process_handle(self) -> OwnedHandle {
         self.handle
+    }
+}
+
+/// A build script's `$RUSTC` question this process answers (Relax tool.rs): its handle, 0 for a
+/// process. It goes with the Child.
+struct Tool(u64);
+
+impl Drop for Tool {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            unsafe { __relax_tool_release(self.0) };
+        }
     }
 }
 

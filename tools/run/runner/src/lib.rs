@@ -62,9 +62,11 @@ pub struct Host {
     /// how much the JIT compiles ahead of the program's calls when neither `--ahead=` nor
     /// RELAX_AHEAD says (jit::AheadPolicy): the entry point's default
     pub ahead: relax_compiler::options::AheadLevel,
-    /// whether third-party proc macros run confined (pmhost::Policy): `relax` runs crates.io
-    /// macros as cargo does, `makepad` runs them in the sandbox (pmhost.rs's module doc)
-    pub proc_macros: relax_compiler::pmhost::Policy,
+    /// what third-party packages' compile-time code may do (sandbox::Policy): `relax` runs a
+    /// registry or git package's proc macros and build scripts with the person's rights, as cargo
+    /// does; `makepad` confines them (proc macros today: pmhost.rs's module doc). Run-time code is
+    /// not covered: the program runs with the person's rights under either.
+    pub compile_time_code: relax_compiler::sandbox::Policy,
     /// what `makepad` with no arguments runs when no launch record says (launch.rs): None prints
     /// the usage
     pub default_launch: Option<fn() -> Option<launch::Launch>>,
@@ -121,7 +123,7 @@ pub enum HelpLine {
 
 /// The bare runner (bin `relax`): provides nothing; tests, checks and agents' boots compile only
 /// what runs.
-pub const BARE: Host = Host { provenance: None, init: || {}, provide: || {}, run_host: || {}, ahead: relax_compiler::options::AheadLevel::Minimal, proc_macros: relax_compiler::pmhost::Policy::Open, default_launch: None, package: env!("CARGO_PKG_NAME"), manifest: concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"), commands: &[], native_sets: &[], raw_body_macros: &[], script_answers: &[], pure_macro_crates: &[], env: relax_compiler::progenv::HostEnv { unseen: &[], offline: &[], detached_remove: &[], recorded: &[] }, tool: "relax" };
+pub const BARE: Host = Host { provenance: None, init: || {}, provide: || {}, run_host: || {}, ahead: relax_compiler::options::AheadLevel::Minimal, compile_time_code: relax_compiler::sandbox::Policy::Open, default_launch: None, package: env!("CARGO_PKG_NAME"), manifest: concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"), commands: &[], native_sets: &[], raw_body_macros: &[], script_answers: &[], pure_macro_crates: &[], env: relax_compiler::progenv::HostEnv { unseen: &[], offline: &[], detached_remove: &[], recorded: &[] }, tool: "relax" };
 
 static HOST: std::sync::OnceLock<&'static Host> = std::sync::OnceLock::new();
 
@@ -138,7 +140,7 @@ pub fn set_host(host: &'static Host) {
         for &a in host.script_answers {
             relax_compiler::unitgraph::register_script_answer(a);
         }
-        relax_compiler::pmhost::set_policy(host.proc_macros);
+        relax_compiler::sandbox::set_policy(host.compile_time_code);
         relax_compiler::macro_reg::set_pure_crates(host.pure_macro_crates);
         relax_compiler::progenv::set_host_env(host.env);
         relax_compiler::set_tool_name(host.tool);

@@ -530,6 +530,23 @@ impl Command {
         Some(out)
     }
 
+    /// Inside a build script's run (RELAX_AS_RUSTC), the host answers an option-led question of the
+    /// script's own `$RUSTC` in this process (Relax tool.rs) with the child's stdio ends: its
+    /// handle, or 0 when a process answers.
+    fn tool_spawn(&self, stdin: &Option<OwnedFd>, stdout: &Option<OwnedFd>, stderr: &Option<OwnedFd>) -> u64 {
+        if crate::env::host_var_os("RELAX_AS_RUSTC").is_none() {
+            return 0;
+        }
+        let mut argv: Vec<u8> = Vec::new();
+        for a in core::iter::once(&self.program).chain(self.args.iter().skip(1)) {
+            let b = a.as_encoded_bytes();
+            argv.extend_from_slice(alloc::format!("{}:", b.len()).as_bytes());
+            argv.extend_from_slice(b);
+        }
+        let raw = |fd: &Option<OwnedFd>| fd.as_ref().map_or(-1, |fd| fd.as_raw_fd() as i64);
+        unsafe { __relax_tool_spawn(argv.as_ptr(), argv.len(), raw(stdin), raw(stdout), raw(stderr)) }
+    }
+
     /// CommandExt::exec: replaces this process (real std sys/process/unix/unix.rs exec:
     /// stdio inherited by default, cwd, process group, SIGPIPE default, then execvp).
     pub(crate) fn exec_replace(&mut self) -> io::Error {
@@ -627,6 +644,24 @@ impl Command {
         let (stdin_child, stdin_parent) = setup_stdio(self.stdin.take(), default_piped, true)?;
         let (stdout_child, stdout_parent) = setup_stdio(self.stdout.take(), default_piped, false)?;
         let (stderr_child, stderr_parent) = setup_stdio(self.stderr.take(), default_piped, false)?;
+        // a build script's `$RUSTC` question: this process answers it with the child's ends of
+        // the stdio (Relax tool.rs), and no process starts
+        if !exec && self.closures.is_empty() && self.uid.is_none() && self.gid.is_none() {
+            let tool = self.tool_spawn(&stdin_child, &stdout_child, &stderr_child);
+            if tool != 0 {
+                drop(stdin_child);
+                drop(stdout_child);
+                drop(stderr_child);
+                return Ok(Child {
+                    pid: 0,
+                    tool: Tool(tool),
+                    status: None,
+                    stdin: stdin_parent.map(|fd| ChildStdin { fd }),
+                    stdout: stdout_parent.map(|fd| ChildStdout { fd }),
+                    stderr: stderr_parent.map(|fd| ChildStderr { fd }),
+                });
+            }
+        }
 
         #[cfg(not(target_os = "android"))]
         // (posix_spawn cannot change the child's user or group: real std forks for them too)
@@ -646,6 +681,7 @@ impl Command {
                 drop(stderr_child);
                 return Ok(Child {
                     pid,
+                    tool: Tool(0),
                     status: None,
                     stdin: match stdin_parent {
                         Some(fd) => Some(ChildStdin { fd }),
@@ -742,6 +778,7 @@ impl Command {
         drop(stderr_child);
         Ok(Child {
             pid,
+            tool: Tool(0),
             status: None,
             stdin: match stdin_parent {
                 Some(fd) => Some(ChildStdin { fd }),
@@ -996,6 +1033,10 @@ extern "C" {
     fn __relax_spawn_env(edits: *const u8, edits_len: usize, host: *const u8, host_len: usize, flags: u32, out: *mut *const u8, out_len: *mut usize);
     /// relax-base progenv.rs prepared_bin: 1 for a package binary this run prepared
     fn __relax_prepared_bin(path: *const u8, len: usize) -> i32;
+    /// Relax tool.rs: a build script's `$RUSTC` question answered by this process (a handle), or 0
+    fn __relax_tool_spawn(argv: *const u8, len: usize, stdin: i64, stdout: i64, stderr: i64) -> u64;
+    fn __relax_tool_wait(handle: u64, block: i32) -> i64;
+    fn __relax_tool_release(handle: u64);
 }
 
 /// Iterator over a Command's arguments (Command::get_args).
@@ -1237,6 +1278,8 @@ fn read2(out: Option<ChildStdout>, err: Option<ChildStderr>) -> io::Result<(Vec<
 
 pub struct Child {
     pid: sys::pid_t,
+    /// a build script's `$RUSTC` question this process answers, or none (a process)
+    tool: Tool,
     status: Option<ExitStatus>,
     pub stdin: Option<ChildStdin>,
     pub stdout: Option<ChildStdout>,
@@ -1244,11 +1287,16 @@ pub struct Child {
 }
 
 impl Child {
+    /// (an answer of this process's: this process's id)
     pub fn id(&self) -> u32 {
+        if self.tool.0 != 0 {
+            return id();
+        }
         self.pid as u32
     }
     pub fn kill(&mut self) -> io::Result<()> {
-        if self.status.is_some() {
+        // (an answer ends by itself: it reads at most what the script writes to its stdin)
+        if self.status.is_some() || self.tool.0 != 0 {
             return Ok(());
         }
         if unsafe { sys::kill(self.pid, sys::SIGKILL) } != 0 {
@@ -1259,6 +1307,11 @@ impl Child {
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
         drop(self.stdin.take());
         if let Some(s) = self.status {
+            return Ok(s);
+        }
+        if self.tool.0 != 0 {
+            let s = ExitStatus(((unsafe { __relax_tool_wait(self.tool.0, 1) } as c_int) & 0xff) << 8);
+            self.status = Some(s);
             return Ok(s);
         }
         let mut status: c_int = 0;
@@ -1280,6 +1333,15 @@ impl Child {
         if let Some(s) = self.status {
             return Ok(Some(s));
         }
+        if self.tool.0 != 0 {
+            let code = unsafe { __relax_tool_wait(self.tool.0, 0) };
+            if code < 0 {
+                return Ok(None);
+            }
+            let s = ExitStatus(((code as c_int) & 0xff) << 8);
+            self.status = Some(s);
+            return Ok(Some(s));
+        }
         let mut status: c_int = 0;
         let r = unsafe { sys::waitpid(self.pid, &mut status as *mut c_int, sys::WNOHANG) };
         if r < 0 {
@@ -1297,6 +1359,18 @@ impl Child {
         let (out, err) = read2(self.stdout.take(), self.stderr.take())?;
         let status = self.wait()?;
         Ok(Output { status, stdout: out, stderr: err })
+    }
+}
+
+/// A build script's `$RUSTC` question this process answers (Relax tool.rs): its handle, 0 for a
+/// process. It goes with the Child.
+struct Tool(u64);
+
+impl Drop for Tool {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            unsafe { __relax_tool_release(self.0) };
+        }
     }
 }
 

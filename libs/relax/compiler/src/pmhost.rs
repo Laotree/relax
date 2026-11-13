@@ -8,7 +8,8 @@
 //! with the macro fn's address, and decodes the output. Functions compile lazily on first call,
 //! like any Relax code; the world lives for the process (later calls reuse it).
 //!
-//! Trust: one policy per process, chosen by the entry point (`set_policy`; runner Host):
+//! Trust: the process's policy for third-party compile-time code (sandbox.rs `Policy`, chosen by
+//! the entry point):
 //! - `Policy::Open` (bare `relax`, the dev/test runner for general crates): every proc-macro
 //!   crate runs as cargo would run it, `unsafe` and std capabilities included.
 //! - `Policy::Sandboxed` (`makepad run`, and the default): a proc-macro root whose dependency
@@ -386,28 +387,6 @@ fn prewarm(sess: &std::sync::Arc<crate::Session>) -> Result<(), String> {
 
 
 
-/// Whether third-party proc macros run confined (module doc): the entry point's choice, one per
-/// process.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Policy {
-    /// every macro runs as host code, as cargo runs it (bare `relax`)
-    Open,
-    /// a macro whose code includes a registry or git package runs confined (`makepad run`)
-    Sandboxed,
-}
-
-/// 0 = Sandboxed (the default when no entry point chose), 1 = Open
-static POLICY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-/// The entry point's proc-macro policy, before any crate graph loads.
-pub fn set_policy(p: Policy) {
-    POLICY.store((p == Policy::Open) as u8, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub fn policy() -> Policy {
-    if POLICY.load(std::sync::atomic::Ordering::Relaxed) == 1 { Policy::Open } else { Policy::Sandboxed }
-}
-
 /// The confined macros' domain (sandbox.rs `Domain`). No fuel: the world's arena sets no budget,
 /// and a macro that never returns is the hang watchdog's (`watch_begin`). The clean-up always:
 /// the macro world's code never tiers up, so no O3 pass does it later.
@@ -513,7 +492,7 @@ fn build_world(sess: &std::sync::Arc<crate::Session>) -> Result<World, String> {
             closure[i] = true;
             st.extend(units[i].deps.iter().map(|&(d, _)| d));
         }
-        let confine = policy() == Policy::Sandboxed && (0..units.len()).any(|i| closure[i] && units[i].registry);
+        let confine = crate::sandbox::policy() == crate::sandbox::Policy::Sandboxed && (0..units.len()).any(|i| closure[i] && units[i].registry);
         for i in (0..units.len()).filter(|&i| closure[i]) {
             if confine { confined[i] = true } else { host[i] = true }
         }

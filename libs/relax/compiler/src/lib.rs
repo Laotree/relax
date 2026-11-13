@@ -194,6 +194,7 @@ pub mod live;
 pub mod reload;
 pub mod modules;
 pub mod sandbox;
+pub mod tool;
 pub mod stale;
 pub mod invalid;
 pub mod domain;
@@ -288,11 +289,9 @@ pub fn provenance_of(path: &std::path::Path) -> Option<String> {
 /// script's RUSTC is Relax itself; asked `--version`, it answers this (relax_as_rustc).
 pub const RUSTC_VERSION: &str = "1.98.0";
 
-/// RELAX_AS_RUSTC=1: a build script's RUSTC is Relax itself. `--version` / `-vV` / `-V` answer
-/// as a rustc of RUSTC_VERSION would (build scripts such as libc's read the minor version);
-/// `--print` requests about the target (cargo's target-info probe, which `cargo metadata
-/// --filter-platform` runs) answer from Relax's own target model (print_as_rustc). Returns whether
-/// it answered.
+/// RELAX_AS_RUSTC=1: a build script's RUSTC is Relax itself, as a process (a script whose own
+/// spawn of RUSTC the host answers in-process, tool.rs, never starts one). Returns whether it
+/// answered (`rustc_answer`); a failed answer exits with its status.
 pub fn relax_as_rustc() -> bool {
     let args: Vec<String> = os::proc::args_bytes().iter().skip(1).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
     if std::env::var_os("RELAX_AS_RUSTC").is_none() && !native::is_target_rustc_probe(&args) {
@@ -302,42 +301,49 @@ pub fn relax_as_rustc() -> bool {
     if args.first().is_some_and(|a| a == "run") {
         return false;
     }
-    let sess = &session_from_env(&args);
-    match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-        ["--version"] | ["-V"] => println!("rustc {} (Relax {})", RUSTC_VERSION, PROVENANCE),
-        ["-vV"] | ["--version", "--verbose"] | ["--verbose", "--version"] | ["-V", "--verbose"] | ["--verbose", "-V"] => {
-            println!("rustc {} (Relax {})", RUSTC_VERSION, PROVENANCE);
-            println!("binary: rustc");
-            println!("commit-hash: unknown");
-            println!("commit-date: unknown");
-            println!("host: {}", crate::cfg::CfgSet::machine(sess, &[]).triple());
-            println!("release: {}", RUSTC_VERSION);
-        }
-        _ => {
-            // probes pipe a program in (cargo's target info, rustix, autocfg): read it all, as rustc
-            // would, so the writer never sees a broken pipe
-            let mut input = Vec::new();
-            if args.iter().any(|a| a == "-") {
-                let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut input);
-            }
-            match print_as_rustc(sess, &args, &input) {
-                Ok(out) => {
-                    use std::io::Write;
-                    let mut o = std::io::stdout().lock();
-                    let _ = o.write_all(out.as_bytes());
-                    let _ = o.flush();
-                }
-                Err(e) => {
-                    // anything else asked of RUSTC (a compile probe: autocfg, rustc_version's
-                    // `--emit`): Relax is not rustc. Fail the probe as a missing rustc would (the
-                    // script decides); never run the script's program again.
-                    eprintln!("relax: not rustc: a build script asked RUSTC {:?}: {}", args, e);
-                    std::process::exit(1);
-                }
-            }
-        }
+    // probes pipe a program in (cargo's target info, rustix, autocfg): read it all, as rustc
+    // would, so the writer never sees a broken pipe
+    let mut input = Vec::new();
+    if args.iter().any(|a| a == "-") {
+        let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut input);
+    }
+    let (status, out, err) = rustc_answer(&args, &input);
+    {
+        use std::io::Write;
+        let mut o = std::io::stdout().lock();
+        let _ = o.write_all(&out);
+        let _ = o.flush();
+        let _ = std::io::stderr().write_all(&err);
+    }
+    if status != 0 {
+        std::process::exit(status);
     }
     true
+}
+
+/// What Relax answers as a build script's RUSTC, asked `args` (after the program) with `input` on
+/// its stdin: the exit status, stdout and stderr. `--version` / `-vV` / `-V` answer as a rustc of
+/// RUSTC_VERSION would (build scripts such as libc's read the minor version); `--print` requests
+/// about the target (cargo's target-info probe, which `cargo metadata --filter-platform` runs)
+/// answer from Relax's own target model (print_as_rustc). Anything else asked of RUSTC (a compile
+/// probe: autocfg, rustc_version's `--emit`) fails with status 1, as a missing rustc would: Relax
+/// is not rustc, and the script decides.
+pub fn rustc_answer(args: &[String], input: &[u8]) -> (i32, Vec<u8>, Vec<u8>) {
+    let sess = &session_from_env(args);
+    let out = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        ["--version"] | ["-V"] => format!("rustc {} (Relax {})\n", RUSTC_VERSION, PROVENANCE),
+        ["-vV"] | ["--version", "--verbose"] | ["--verbose", "--version"] | ["-V", "--verbose"] | ["--verbose", "-V"] => format!(
+            "rustc {v} (Relax {p})\nbinary: rustc\ncommit-hash: unknown\ncommit-date: unknown\nhost: {h}\nrelease: {v}\n",
+            v = RUSTC_VERSION,
+            p = PROVENANCE,
+            h = crate::cfg::CfgSet::machine(sess, &[]).triple()
+        ),
+        _ => match print_as_rustc(sess, args, input) {
+            Ok(out) => out,
+            Err(e) => return (1, Vec::new(), format!("relax: not rustc: a build script asked RUSTC {:?}: {}\n", args, e).into_bytes()),
+        },
+    };
+    (0, out.into_bytes(), Vec::new())
 }
 
 /// The `--print` requests of a rustc command line, answered for Relax's target model the way
