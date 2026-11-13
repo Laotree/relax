@@ -1790,6 +1790,12 @@ pub extern "C" fn relax_inspect_asker(buf: *mut u8, cap: usize) -> usize {
     who.len()
 }
 
+/// Whether a program of the process registered command `cmd` (a host provider that stands in for
+/// an app command until the app takes it, the host's `quit`, asks).
+pub fn program_provides(cmd: &str) -> bool {
+    provider(cmd).is_some()
+}
+
 fn provider(cmd: &str) -> Option<(ProgramQuery, crate::domain::Callback)> {
     PROVIDERS.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|x| x.0 == cmd).min_by_key(|x| x.2.domain()).map(|x| (x.1, x.2))
 }
