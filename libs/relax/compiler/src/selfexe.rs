@@ -359,7 +359,7 @@ fn open_handed(fd: i32, dev: u64, ino: u64) -> Option<std::fs::File> {
 /// said in one line, when neither is there.
 #[cfg(unix)]
 pub fn relaunch_build() -> Option<Vec<u8>> {
-    use std::os::unix::fs::{FileExt, MetadataExt};
+    use std::os::unix::fs::FileExt;
     let (pid, fd, dev, ino) = handed_at(&std::fs::read(std::env::current_exe().ok()?.parent()?.join(BUILD)).ok()?)?;
     let read = |f: &std::fs::File| -> Option<Vec<u8>> {
         let mut b = vec![0; f.metadata().ok()?.len() as usize];
@@ -371,6 +371,7 @@ pub fn relaunch_build() -> Option<Vec<u8>> {
     }
     #[cfg(target_os = "linux")]
     if let Ok(f) = std::fs::File::open(format!("/proc/{pid}/fd/{fd}")) {
+        use std::os::unix::fs::MetadataExt;
         if f.metadata().is_ok_and(|m| m.dev() == dev && m.ino() == ino) {
             return read(&f);
         }
