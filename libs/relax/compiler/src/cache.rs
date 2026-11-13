@@ -132,6 +132,16 @@ impl KeyInputs {
     }
 }
 
+/// Records that `key` (a path-free identity) is path-carrying in the store file `path`.
+pub(crate) fn write_share_placeholder(path: &std::path::Path, key: u128) -> Result<(), String> {
+    crate::store::append(path, vec![crate::pack::NewEntry { key, kind: KIND_SHARE_PLACEHOLDER, payload: SHARE_PLACEHOLDER.to_vec() }], false).map_err(|e| e.to_string())
+}
+
+/// Whether `key` in `store` is a path-carrying placeholder.
+pub(crate) fn is_share_placeholder(store: &crate::store::Store, key: u128) -> bool {
+    store.get_checked(key).is_some_and(|(kind, p)| kind == KIND_SHARE_PLACEHOLDER && p == SHARE_PLACEHOLDER)
+}
+
 /// The shared-cache gate's counters: what the compile-time mark says, what the payload scan
 /// says, and where they disagree. A divergence is a hole in the mark and must be fixed; the scan
 /// stays the truth meanwhile.
@@ -335,6 +345,11 @@ const KIND_DEMAND_STORES: u32 = 16;
 /// the names a fn body's macro expansions produced (cache/deps.rs exp_names), keyed by the code
 /// key the fn has without them: a later run keys the fn's code without parsing its body
 const KIND_EXP_NAMES: u32 = 17;
+/// A place, under a crate's path-free identity, that says the identity is path-carrying. It holds
+/// a conclusion, never a path, so it is safe to share; a later build reads it and looks the
+/// anchor identity up instead. The payload is never written under the path-free key.
+const KIND_SHARE_PLACEHOLDER: u32 = 18;
+const SHARE_PLACEHOLDER: &[u8] = b"relax-share-placeholder-v1";
 /// the program's item graph (cache/deps.rs Deps::encode), one per program (its root crate's code
 /// store, under a key of the program's view: replaced when the program changes)
 const KIND_DEPS: u32 = 18;
@@ -11063,6 +11078,21 @@ mod prune_tests {
         for m in muts {
             assert!(seen.insert(m.hash()), "a mutated input kept the hash");
         }
+    }
+
+    /// A placeholder is a conclusion under the path-free key, readable back, and says nothing for
+    /// another key.
+    #[test]
+    fn a_share_placeholder_round_trips() {
+        let d = std::env::temp_dir().join(format!("relax-placeholder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("crate-0000000000000001.rcs");
+        super::write_share_placeholder(&p, 0x1234).unwrap();
+        let st = crate::store::Store::open(&p).unwrap();
+        assert!(super::is_share_placeholder(&st, 0x1234));
+        assert!(!super::is_share_placeholder(&st, 0x9999));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// The counters separate what the mark claims from what the scan proves.
