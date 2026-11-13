@@ -193,7 +193,10 @@ fn requests_to_an_unreachable_fleet_host_leave_no_route_threads() {
     // the request line arrives while the dial is still failing: the route ends without an
     // upstream, and its client -> upstream thread must end with it
     let hub = Hub::new(&Hosts::default());
-    hub.set_fleet(std::sync::Arc::new(|_addr: &str| {
+    let dials = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = dials.clone();
+    hub.set_fleet(std::sync::Arc::new(move |_addr: &str| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(50));
         Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "down"))
     }));
@@ -212,6 +215,9 @@ fn requests_to_an_unreachable_fleet_host_leave_no_route_threads() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(hub.routes(), 0, "route threads left behind");
+    // a down host is dialled again only after a pause: ten requests in a row are not ten dials
+    let n = dials.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(n < 5, "{n} dials for 10 requests to a down host");
 }
 
 #[test]

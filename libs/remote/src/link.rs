@@ -10,7 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub enum Error {
@@ -65,11 +65,25 @@ pub enum Target {
     Routed(Client, String),
 }
 
+/// A dial that failed: when it ended, how many failed in a row, and why.
+struct Failed {
+    at: Instant,
+    n: u32,
+    why: String,
+}
+
+/// How long a remote endpoint whose last `n` dials failed waits before the next: 1 s, doubling,
+/// at most 10 s (a hub's round of its hosts).
+fn redial_pause(n: u32) -> Duration {
+    Duration::from_millis((1000u64 << n.saturating_sub(1).min(4)).min(10_000))
+}
+
 struct Inner {
     target: Target,
     name: String,
     link_id: String,
     conn: Mutex<Option<Conn>>,
+    failed: Mutex<Option<Failed>>,
     ever: Mutex<bool>,
     seqs: Mutex<HashMap<String, u64>>,
     caps: Mutex<Vec<String>>,
@@ -95,6 +109,17 @@ fn link_id() -> String {
 }
 
 impl Target {
+    /// An endpoint across a network or another process, whose dial can take seconds to fail: its
+    /// failed dials pause the next ones ([`redial_pause`]).
+    fn remote(&self) -> bool {
+        match self {
+            Target::Dialer(_) | Target::Command(_) => true,
+            #[cfg(not(target_arch = "wasm32"))]
+            Target::Tcp(..) => true,
+            _ => false,
+        }
+    }
+
     /// The endpoint a discovery file names: its Unix socket, or where there are none (Windows)
     /// its `tcp:` loopback port and the file's token.
     pub fn of(app: &crate::discovery::App) -> Target {
@@ -118,7 +143,7 @@ fn local_client_name() -> String {
 
 impl Client {
     pub fn new(target: Target, name: &str) -> Client {
-        Client(Arc::new(Inner { target, name: name.to_string(), link_id: link_id(), conn: Mutex::new(None), ever: Mutex::new(false), seqs: Mutex::new(HashMap::new()), caps: Mutex::new(Vec::new()), timeout: Mutex::new(None) }))
+        Client(Arc::new(Inner { target, name: name.to_string(), link_id: link_id(), conn: Mutex::new(None), failed: Mutex::new(None), ever: Mutex::new(false), seqs: Mutex::new(HashMap::new()), caps: Mutex::new(Vec::new()), timeout: Mutex::new(None) }))
     }
 
     /// Dials a local endpoint: `spec` is a socket path, a discovery file's `tcp:` socket (Windows),
@@ -194,27 +219,51 @@ impl Client {
         }
     }
 
-    /// The live connection, dialling (and resuming) when there is none.
+    /// The live connection, dialling (and resuming) when there is none. A call that waited behind
+    /// a dial that failed answers with its failure, and a remote endpoint whose last dials failed
+    /// is dialled again only after a pause ([`redial_pause`]): every caller of a down host queued
+    /// behind one dial's 5 s connect and then dialled again itself (a devhub master held about 40
+    /// connects a minute to four down hubs, a thread each, 11-13).
     pub fn conn(&self) -> Result<Conn, Error> {
+        let asked = Instant::now();
         let mut slot = self.0.conn.lock().unwrap();
         if let Some(c) = slot.as_ref() {
             if c.is_usable() {
                 return Ok(c.clone());
             }
         }
-        let (mut car, settle, token, own) = self.carrier().map_err(|e| Error::LinkLost(e.to_string()))?;
-        car.reader.deadline = Some(std::time::Instant::now() + Duration::from_secs(10));
-        let hello = Hello { name: self.0.name.clone(), link_id: self.0.link_id.clone(), token, own, ..Hello::default() };
-        let ok = match hello::client_handshake(&mut car.reader, &mut *car.writer, &hello) {
-            Ok(ok) => ok,
+        if let Some(why) = self.no_redial(asked) {
+            return Err(Error::LinkLost(why));
+        }
+        let opened = self.carrier().map_err(|e| Error::LinkLost(e.to_string())).and_then(|(mut car, settle, token, own)| {
+            car.reader.deadline = Some(Instant::now() + Duration::from_secs(10));
+            let hello = Hello { name: self.0.name.clone(), link_id: self.0.link_id.clone(), token, own, ..Hello::default() };
+            match hello::client_handshake(&mut car.reader, &mut *car.writer, &hello) {
+                Ok(ok) => Ok((car, settle, ok)),
+                Err(e) => {
+                    (car.shutdown)();
+                    Err(match e {
+                        hello::HandshakeError::Refused(m) | hello::HandshakeError::Mismatch(m) => Error::Refused(CLOSE_NORMAL, m),
+                        hello::HandshakeError::Io(e) => Error::LinkLost(e.to_string()),
+                    })
+                }
+            }
+        });
+        let mut failed = self.0.failed.lock().unwrap();
+        let (car, settle, ok) = match opened {
+            Ok(opened) => {
+                *failed = None;
+                opened
+            }
             Err(e) => {
-                (car.shutdown)();
-                return Err(match e {
-                    hello::HandshakeError::Refused(m) | hello::HandshakeError::Mismatch(m) => Error::Refused(CLOSE_NORMAL, m),
-                    hello::HandshakeError::Io(e) => Error::LinkLost(e.to_string()),
-                });
+                if let Error::LinkLost(why) = &e {
+                    let n = failed.as_ref().map_or(0, |f| f.n) + 1;
+                    *failed = Some(Failed { at: Instant::now(), n, why: why.clone() });
+                }
+                return Err(e);
             }
         };
+        drop(failed);
         *self.0.caps.lock().unwrap() = ok.caps.clone();
         let conn = Conn::start(Io { reader: car.reader, writer: car.writer, shutdown: car.shutdown }, ok, true, None, Hooks::default());
         if let Some(s) = settle {
@@ -228,6 +277,18 @@ impl Client {
         *ever = true;
         *slot = Some(conn.clone());
         Ok(conn)
+    }
+
+    /// Why a call that asked at `asked` does not dial, if it does not: the dial it waited behind
+    /// failed (its answer is this call's), or a remote endpoint's last dial failed within its pause.
+    fn no_redial(&self, asked: Instant) -> Option<String> {
+        let failed = self.0.failed.lock().unwrap();
+        let f = failed.as_ref()?;
+        if f.at >= asked {
+            return Some(f.why.clone());
+        }
+        let (since, pause) = (f.at.elapsed(), redial_pause(f.n));
+        (self.0.target.remote() && since < pause).then(|| format!("{} (its last dial failed {:.1} s ago: the next is {:.0} s after it)", f.why, since.as_secs_f32(), pause.as_secs_f32()))
     }
 
     /// True once the connection this client had has ended (its next call dials a new one): a
