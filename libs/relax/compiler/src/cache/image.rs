@@ -660,12 +660,16 @@ fn call_targets(payload: &[u8]) -> Option<Vec<&[u8]>> {
     let nr = d.u32()? as usize;
     let mut out = Vec::new();
     let mut scratch = ImageTables::default();
+    let mut keys = Vec::new();
     for _ in 0..nr {
         d.u32()?;
         kind_of(d.u8()?)?;
         match d.b.get(d.p).copied()? {
-            20 | 25 => { d.u8()?; out.push(d.bytes()?); }
-            21 => { d.u8()?; d.bytes()?; }
+            tag @ (20 | 21 | 25 | 26 | 27 | 31) => {
+                d.u8()?;
+                let key = super::reloc_key(&mut d, tag, &mut keys)?;
+                if super::callee_tag(tag) != 21 { out.push(key); }
+            }
             22..=24 => { d.u8()?; }
             _ => { scratch.sym(&mut d)?; }
         }
@@ -712,15 +716,17 @@ fn image_slot(tab: &mut ImageTables, out: &mut E, blob: &mut Vec<u8>, entry_key:
     let code = d.bytes()?;
     let nr = d.u32()? as usize;
     let mut rel: Vec<(u32, u8, u8, u32)> = Vec::with_capacity(nr);
+    let mut keys = Vec::new();
     for _ in 0..nr {
         let at = d.u32()?;
         let kind = d.u8()?;
         kind_of(kind)?;
         let tag = d.b.get(d.p).copied()?;
         match tag {
-            20 | 21 | 25 => {
+            20 | 21 | 25 | 26 | 27 | 31 => {
                 d.u8()?;
-                let t = d.bytes()?;
+                let t = super::reloc_key(&mut d, tag, &mut keys)?;
+                let tag = super::callee_tag(tag);
                 let t = if retarget(t) { crate::jit::TWIN_RETARGETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); &t[1..] } else { t };
                 rel.push((at, kind, match tag { 20 => IMG_SLOT, 25 => IMG_CALL, _ => IMG_THUNK }, tab.keys.id(t)));
             }
@@ -959,6 +965,10 @@ fn skip_ty(d: &mut D, depth: u32, v: &mut dyn FnMut(Atom)) -> Option<()> {
         }
         20 => skip_const(d, depth + 1, v)?,
         27 => skip_def(d, v)?,
+        // a type the tree wrote before: its atoms were visited there
+        TY_BACKREF => {
+            d.u32()?;
+        }
         28 | 30 => {
             skip_ty(d, depth + 1, v)?;
             d.u32()?;
