@@ -88,6 +88,11 @@ fn payload_carries_anchor_in(bytes: &[u8], anchors: &[(&'static str, String)]) -
         if dir.is_empty() {
             continue;
         }
+        if !dir.is_ascii() {
+            // NFC and NFD spellings of a non-ASCII path differ byte-wise; without normalization
+            // tables the scan cannot match both, so such an anchor never shares.
+            return Some(tag);
+        }
         let mut spellings = vec![dir.clone()];
         if let Ok(c) = std::fs::canonicalize(dir) {
             let c = c.to_string_lossy().into_owned();
@@ -358,6 +363,9 @@ mod tests {
         // UTF-16LE wide strings
         let wide: Vec<u8> = "/w/src/lib.rs".encode_utf16().flat_map(u16::to_le_bytes).collect();
         assert_eq!(super::payload_carries_anchor_in(&wide, &a), Some("ws"));
+        // a non-ASCII anchor may be NFC in one worktree and NFD in another: never shared
+        let u = [("ws", "/w/\u{e9}".to_string())];
+        assert_eq!(super::payload_carries_anchor_in(b"/x", &u), Some("ws"));
     }
 
     /// A workspace entered through a symbolic link is found by its resolved spelling too.
