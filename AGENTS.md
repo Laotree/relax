@@ -29,6 +29,7 @@ Relax is slaved to the `work` branch of [makepad/makepad](https://github.com/mak
 libs/apple_sys
 libs/base64
 libs/core_util
+libs/cpu_budget
 libs/error_log
 libs/gpu_trace
 libs/live_id
@@ -42,7 +43,6 @@ libs/remote                     (except libs/remote/TUNNEL.md)
 libs/strict_json
 libs/toml_parser                (except libs/toml_parser/tests/manifests.rs)
 libs/windows/sys
-platform/cpu_budget
 platform/network
 tools/run/light_http
 tools/run/runner

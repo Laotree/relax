@@ -228,7 +228,7 @@ fn teardown_fixture_cycles_and_retiring_thread() {
 // The CPU budget's source and an app whose task pool lives in a static (tests/static_pool/pool.rs).
 // The budget's `#[relax_api]` marks name a crate a one-file program does not have.
 fn static_pool_fixture() -> String {
-    let budget = include_str!("../../../../platform/cpu_budget/src/lib.rs")
+    let budget = include_str!("../../../../libs/cpu_budget/src/lib.rs")
         .replace("use relax_api::relax_api;\n", "")
         .replace("#[relax_api]\n", "");
     let app = include_str!("../tests/static_pool/pool.rs");
