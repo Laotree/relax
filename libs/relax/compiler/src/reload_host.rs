@@ -38,7 +38,8 @@ pub(crate) fn loader() -> Option<PathBuf> {
     static LOADER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     LOADER.get_or_init(|| {
         let _k = crate::zone_alloc::kept();
-        let p = std::env::var_os("RELAX_LOADER").map(PathBuf::from).or_else(|| std::env::current_exe().ok());
+        // (never a run's own executable: dirs::loader_exe)
+        let p = crate::dirs::loader_exe().ok();
         // what this process runs: a rebuild that leaves the same file changed nothing it runs
         let _ = LOADED.set(p.as_deref().and_then(identity));
         p

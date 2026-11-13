@@ -104,12 +104,57 @@ pub fn workspace_dir() -> String {
 /// its start, else this process's executable. Never a run's own executable (relax-compiler
 /// selfexe.rs): a launch of that is its program again, so a run started from one (a test's run of
 /// itself) ran its build scripts as its test program, which waited for the build script lock its
-/// parent held (11-13).
+/// parent held (11-13), and a program that relaunched itself with a cleared environment exported
+/// its link as the loader, whose every spawn of "the loader" ran the program again, without end.
+/// RELAX_LOADER naming a run's executable is an error, not a spawn; this process running from one
+/// spawns the loader recorded beside it (`RUN_LOADER`).
 pub fn loader_exe() -> std::io::Result<PathBuf> {
     match std::env::var_os("RELAX_LOADER") {
-        Some(p) if !p.is_empty() => Ok(PathBuf::from(p)),
-        _ => std::env::current_exe(),
+        Some(p) if !p.is_empty() => {
+            let p = PathBuf::from(p);
+            if is_run_link(&p) {
+                return Err(std::io::Error::other(format!("RELAX_LOADER names {}, a run's own executable (a launch of it runs that run's program), not the loader", p.display())));
+            }
+            Ok(p)
+        }
+        _ => {
+            let exe = std::env::current_exe()?;
+            if !is_run_link(&exe) {
+                return Ok(exe);
+            }
+            recorded_loader(&exe).ok_or_else(|| std::io::Error::other(format!("{} is a run's own executable and no loader is recorded beside it (RELAX_LOADER is not set)", exe.display())))
+        }
     }
+}
+
+/// The files beside a run's own executable (relax-compiler selfexe.rs): names no link has (a link
+/// keeps a name's letters, digits, `-`, `_` and `.`). The run's command line (RELAX_SELF_EXEC's
+/// words), the loader the link was made of, the folder of the links a process starts runs from,
+/// and on Windows the command lines of a test's package binaries.
+pub const RUN_LINE: &str = "+self-exec";
+pub const RUN_LOADER: &str = "+loader";
+pub const LAUNCH_DIR: &str = "+launch";
+pub const BIN_LINES: &str = "+bin";
+
+/// Whether `exe` is a run's own executable (its command line beside it), a link a run was
+/// started from (in a `+launch` folder), or a package binary above a test's `deps/` (its line in
+/// `+bin`): none is the loader's own path. A launch of a run's link runs that run's program, as
+/// one of a package binary runs that binary; a launch link goes with its folder.
+pub fn is_run_link(exe: &std::path::Path) -> bool {
+    exe.parent().is_some_and(|d| {
+        d.join(RUN_LINE).is_file() || d.file_name().is_some_and(|n| n == LAUNCH_DIR) || exe.file_name().is_some_and(|f| d.join(BIN_LINES).join(f).is_file())
+    })
+}
+
+/// The loader a run's link (or a launch link) was made of, as its maker wrote it beside it; None
+/// when none is there or it names a run's link itself.
+pub fn recorded_loader(exe: &std::path::Path) -> Option<PathBuf> {
+    let bytes = std::fs::read(exe.parent()?.join(RUN_LOADER)).ok()?;
+    #[cfg(unix)]
+    let loader = PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(bytes));
+    #[cfg(not(unix))]
+    let loader = PathBuf::from(String::from_utf8(bytes).ok()?);
+    (loader.is_file() && !is_run_link(&loader)).then_some(loader)
 }
 
 /// This process's relax dir: the handed-over one, else RELAX_CACHE_DIR, else the workspace's
@@ -183,5 +228,33 @@ mod tests {
         assert_eq!(super::anchor_in("/b/f.rs", &anchors), None);
         assert_eq!(super::anchor_in("/a/wsx/f.rs", &anchors), None);
         assert_eq!(super::anchor_in("C:/a/ws/f.rs", &[("ws", "C:/a/ws".to_string())]).as_deref(), Some("\0ws\0f.rs"));
+    }
+
+    /// A run's link (its line beside it) and a launch link are no loader; each names the loader it
+    /// was made of, and a record that names a run's link is none.
+    #[test]
+    fn a_runs_link_names_the_loader_it_was_made_of() {
+        use super::{is_run_link, recorded_loader, LAUNCH_DIR, RUN_LINE, RUN_LOADER};
+        let root = std::env::temp_dir().join(format!("relax-run-link-{}", std::process::id()));
+        let file = |p: &std::path::Path, text: &[u8]| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        let loader = root.join("bin/relax");
+        let (run, again, launch) = (root.join("exe/1/app"), root.join("exe/2/app"), root.join(LAUNCH_DIR).join("app"));
+        file(&loader, b"");
+        for link in [&run, &again, &launch] {
+            file(link, b"");
+        }
+        file(&root.join("exe/1").join(RUN_LINE), b"");
+        file(&root.join("exe/2").join(RUN_LINE), b"");
+        file(&root.join("exe/1").join(RUN_LOADER), loader.as_os_str().as_encoded_bytes());
+        file(&root.join(LAUNCH_DIR).join(RUN_LOADER), loader.as_os_str().as_encoded_bytes());
+        file(&root.join("exe/2").join(RUN_LOADER), run.as_os_str().as_encoded_bytes());
+        let got = [is_run_link(&loader), is_run_link(&run), is_run_link(&launch)];
+        let recorded = [recorded_loader(&run), recorded_loader(&launch), recorded_loader(&again), recorded_loader(&loader)];
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(got, [false, true, true], "which is a link: loader, run's, launch");
+        assert_eq!(recorded, [Some(loader.clone()), Some(loader), None, None], "the recorded loader: run's, launch, one naming a run's link, the loader's own");
     }
 }

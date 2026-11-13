@@ -36,7 +36,18 @@ static LINK_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// The file name of this run's link
 static NAME: OnceLock<String> = OnceLock::new();
 /// A process's links that runs start from (`launch_link`), in its folder: a name no link has
-const LAUNCH: &str = "+launch";
+const LAUNCH: &str = crate::dirs::LAUNCH_DIR;
+
+/// Writes the loader a link in `dir` was made of beside it (dirs::RUN_LOADER): a process that
+/// runs from the link and was not told the loader (RELAX_LOADER: a program that relaunched itself
+/// with a cleared environment) spawns that loader, never its own link.
+fn record_loader(dir: &Path, loader: &Path) {
+    // a link made from another run's link (a program relaunched from it): that link's loader
+    let real = if crate::dirs::is_run_link(loader) { crate::dirs::recorded_loader(loader).or_else(|| crate::dirs::loader_exe().ok()) } else { Some(loader.to_path_buf()) };
+    if let Some(real) = real {
+        let _ = std::fs::write(dir.join(crate::dirs::RUN_LOADER), real.as_os_str().as_encoded_bytes());
+    }
+}
 
 /// The file name of a program's link: its name's letters, digits, `-`, `_` and `.` (`.exe` added
 /// on Windows).
@@ -82,6 +93,11 @@ pub fn link(loader: &Path, name: &str, test: bool) -> Result<PathBuf, String> {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&at).map_err(|e| format!("{}: {e}", at.display()))?;
     let _ = OWN_DIR.set(dir.clone());
+    // beside the link, and beside a test's package binaries above its deps/ (add_bins)
+    record_loader(&at, loader);
+    if at != dir {
+        record_loader(&dir, loader);
+    }
     let _ = LINK_DIR.set(at);
     std::fs::hard_link(loader, &link).map_err(|e| format!("hard link {} of {}: {e}", link.display(), loader.display()))?;
     link.canonicalize().map_err(|e| format!("{}: {e}", link.display()))
@@ -109,6 +125,7 @@ pub fn launch_link(loader: &Path, name: &str) -> Option<PathBuf> {
     });
     let dir = own.join(LAUNCH);
     std::fs::create_dir_all(&dir).ok()?;
+    record_loader(&dir, loader);
     let path = dir.join(file_name(name));
     if !same_file(&path, loader) {
         // (a restart may start another loader: the link is replaced whole)
@@ -166,7 +183,7 @@ pub fn name_process(link: &Path) {
 
 /// The command line beside the link: a name no link has (`link` keeps a name's letters, digits,
 /// `-`, `_` and `.`).
-const LINE: &str = "+self-exec";
+const LINE: &str = crate::dirs::RUN_LINE;
 
 /// Writes this run's command line (RELAX_SELF_EXEC's words, up to and with `--`) beside its link.
 pub fn set_line(words: &[String]) -> Result<(), String> {
@@ -175,7 +192,7 @@ pub fn set_line(words: &[String]) -> Result<(), String> {
 }
 
 /// The folder's command lines of the package's binaries on Windows (`add_bins`): a name no link has.
-const BIN: &str = "+bin";
+const BIN: &str = crate::dirs::BIN_LINES;
 
 /// The package's binaries in this run's folder, as cargo has them in target/<profile> beside a
 /// test's `deps/`: `launchers` are the CARGO_BIN_EXE_<name> values, each linked (else copied)
@@ -213,9 +230,7 @@ pub fn add_bins(launchers: &[String]) {
 /// package binary runs that binary; a launch link goes with its folder), so the loader running
 /// from one spawns itself by RELAX_LOADER (dirs::loader_exe).
 pub fn is_link(exe: &Path) -> bool {
-    exe.parent().is_some_and(|d| {
-        d.join(LINE).is_file() || d.file_name().is_some_and(|n| n == LAUNCH) || exe.file_name().is_some_and(|f| d.join(BIN).join(f).is_file())
-    })
+    crate::dirs::is_run_link(exe)
 }
 
 /// A start of a package binary above a test's `deps/` (Windows, `add_bins`): `args` with the

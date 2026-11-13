@@ -149,11 +149,18 @@ pub(crate) fn loader_exe() -> Option<std::path::PathBuf> {
         // a run's own executable (a test's run of itself, a shell's launch of it): a spawn of it
         // runs that run's program; a link its starter named after the program it runs (a launch
         // link, an app bundle's executable): nothing of the loader is beside it. This loader goes
-        // by the one its starter named
-        if let Some(l) = std::env::var_os("RELAX_LOADER").map(std::path::PathBuf::from).filter(|l| l.is_file()) {
-            if relax_compiler::selfexe::is_link(&exe) || same_file(&exe, &l) {
+        // by the one its starter named, else (a program that relaunched itself with a cleared
+        // environment) by the one recorded beside the link; never by a run's link: every spawn of
+        // "the loader" would run that program again (without end, or waiting for a build script's
+        // claim its parent holds)
+        let link = relax_compiler::selfexe::is_link(&exe);
+        if let Some(l) = std::env::var_os("RELAX_LOADER").map(std::path::PathBuf::from).filter(|l| l.is_file() && !relax_compiler::selfexe::is_link(l)) {
+            if link || same_file(&exe, &l) {
                 return Some(l);
             }
+        }
+        if link {
+            return relax_compiler::dirs::recorded_loader(&exe);
         }
         Some(exe)
     })
@@ -358,8 +365,15 @@ fn run(raw_args: Vec<Vec<u8>>) {
     // (std::env::current_exe, relax-compiler selfexe.rs), and starts other apps with
     // `$RELAX_LOADER run ...` (std process_unix.rs: a spawn of the loader by this name runs as
     // written, never the program again)
-    if let Some(e) = loader_exe() {
-        std::env::set_var("RELAX_LOADER", e);
+    match loader_exe() {
+        Some(e) => std::env::set_var("RELAX_LOADER", e),
+        // a run's link with no loader beside it: a spawn of the loader is an error
+        // (dirs::loader_exe), never one of the link a starter named
+        None => {
+            if std::env::var_os("RELAX_LOADER").is_some_and(|l| relax_compiler::selfexe::is_link(std::path::Path::new(&l))) {
+                std::env::remove_var("RELAX_LOADER");
+            }
+        }
     }
     // the programs it runs (the runner app) keep their launch records in the same home
     std::env::set_var("RELAX_HOME", fetch::home());
