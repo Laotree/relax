@@ -18208,6 +18208,7 @@ mod tier_cost_tests {
                         // retier_recount's record: a count stub in front of the O3 code
                         (*r.add(5)).fetch_or(RETIER_WAIT, Ordering::Relaxed);
                         count_again(r, th, cost, t, t, true);
+                        assert!(retier_waiting(r), "another ask for the rebuild while it counts again is not queued: its count stub queues it");
                         let picked = t;
                         let again = if runs_on { run(r, th, w, hot, &mut t, 10 * S) } else { None };
                         if !runs_on {
@@ -18216,6 +18217,7 @@ mod tier_cost_tests {
                         }
                         let (at, why) = again.expect("code that runs on queues itself again");
                         assert_eq!(why, Q_RETIER, "as the rebuild it waits to be");
+                        assert!(!retier_waiting(r), "queued, an ask for it no longer waits");
                         assert!(at - picked < 2 * S, "within a second or two: {} ms", (at - picked) / 1_000_000);
                         assert_eq!(retier_decision(r, th, at + 20 * S), Pick::Build, "and is built at that pick, however long it waits");
                         assert_eq!((*r.add(5)).load(Ordering::Relaxed) & (RETIER_WAIT | PICK_RECOUNTED), 0, "the marks go with the queueing and the pick");
@@ -19738,6 +19740,13 @@ fn o3_pick_cold(entry: (u32, u8, u64, u64)) -> bool {
     }
     unsafe {
         let rec = tier_rec(&u.slots, id);
+        // a rebuild waiting in its count stub (it left at an earlier pick): this entry asks for that
+        // same rebuild (queued before the leave, or after it), and leaves as well. Built here, it
+        // was built cold: the slot counts, it is not queued (one asked for correctness is built)
+        if why == Q_RETIER && ahead_policy().o3_cold_leaves && retier_waiting(rec) && (*rec.add(5)).load(Ordering::Relaxed) & RETIER_FIX == 0 {
+            crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::LEFT, why, wall_ns().saturating_sub(at), 0);
+            return true;
+        }
         if (*rec.add(3)).load(Ordering::Acquire) != T_QUEUED || !ahead_policy().o3_cold_leaves {
             if why == Q_RETIER {
                 (*rec.add(5)).fetch_and(!RETIER_FIX, Ordering::Relaxed);
@@ -20667,6 +20676,10 @@ impl Unit {
     #[track_caller]
     fn retier_as(&mut self, id: u32, fix: bool) {
         if tier1_trace() { eprintln!("O3 retier #{} from line {} (n={}{})", id, std::panic::Location::caller().line(), self.retiers.get(&id).copied().unwrap_or(0), if fix { ", for correctness" } else { "" }); }
+        if !fix && self.tier1.is_some() && unsafe { retier_waiting(tier_rec(&self.slots, id)) } {
+            if tier1_trace() { eprintln!("O3 retier #{}: waits in its count stub", id); }
+            return;
+        }
         const RETIERS: u8 = 4;
         let _k = crate::zone_alloc::kept();
         let n = self.retiers.entry(id).or_insert(0);
@@ -21277,6 +21290,16 @@ unsafe fn queued_as(rec: *const AtomicU64, why: u8) -> u8 {
     } else {
         why
     }
+}
+
+/// A rebuild left at its pick counts again as that rebuild (RETIER_WAIT, its count stub in the
+/// slot): another ask for it (Unit::retier, not for correctness) is the same rebuild, queued by
+/// its count stub once its code runs. Not pushed, and an entry already queued for it leaves at its
+/// pick (o3_pick_cold): its pick found the slot counting, not queued, and built it cold (a warm
+/// launch: a 300 KB draw build, 7 s CPU, on code that had stopped, from a second ask queued
+/// before the first left).
+unsafe fn retier_waiting(rec: *const AtomicU64) -> bool {
+    (*rec.add(5)).load(Ordering::Relaxed) & RETIER_WAIT != 0 && (*rec.add(3)).load(Ordering::Acquire) == T_COUNTING
 }
 
 /// Counting slot `id` (record `rec`) is queued for its O3 build, `why` at cost rate `rate`: by a
