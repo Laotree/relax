@@ -24,6 +24,12 @@ with tempfile.TemporaryDirectory(prefix="live-const-panic-") as tmp:
         process = subprocess.Popen([runner, "test", "--live", "live-const-example", "--lib"],
                                    cwd=pkg, env=env, stdout=log, stderr=log, start_new_session=True)
         try:
+            def belongs_to_run(entry):
+                try:
+                    return os.getsid(entry["pid"]) == process.pid
+                except ProcessLookupError:
+                    return False
+
             def query(*args):
                 result = subprocess.run([runner, "inspect", *map(str, args), "--json"], env=env,
                                         capture_output=True, text=True, timeout=90, check=True)
@@ -31,7 +37,7 @@ with tempfile.TemporaryDirectory(prefix="live-const-panic-") as tmp:
             pid = None
             deadline = time.monotonic() + 300
             while time.monotonic() < deadline:
-                runs = [r for r in query("list") if r.get("app") == "live-const-example"]
+                runs = [r for r in query("list") if r.get("app") == "live-const-example" and belongs_to_run(r)]
                 if runs:
                     assert len(runs) == 1, runs
                     pid = runs[0]["pid"]
