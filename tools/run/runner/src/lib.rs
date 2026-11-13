@@ -202,13 +202,15 @@ pub fn main(host: &'static Host) {
     // a package binary above a test's deps/ (Windows): its run, with the environment its .cmd
     // would give it, before anything reads the environment
     let bin = relax_compiler::selfexe::bin_start(&relax_compiler::os::proc::args_bytes());
+    // a run's own executable launched by a shell or a C library: that run's program again, built
+    // with the build environment that run left beside its link (selfexe.rs)
+    let relaunch = if bin.is_none() { relax_compiler::selfexe::relaunched(&relax_compiler::os::proc::args_bytes()) } else { None };
     // a self-exec child: the program values its parent passed, before anything reads the
     // environment (relax-base progenv.rs); a provided crate's read of the program's environment
     // (relax-api env) answers with them
-    relax_compiler::progenv::init();
+    relax_compiler::progenv::init_handed(relaunch.as_ref().and_then(|_| relax_compiler::selfexe::relaunch_build()));
     relax_api::env::set_program_read(relax_compiler::progenv::program_var_os);
-    // a run's own executable launched by a shell or a C library: that run's program again
-    if let Some(args) = bin.or_else(|| relax_compiler::selfexe::relaunched(&relax_compiler::os::proc::args_bytes())) {
+    if let Some(args) = bin.or(relaunch) {
         relax_compiler::os::proc::set_args(args);
     }
     set_host(host);

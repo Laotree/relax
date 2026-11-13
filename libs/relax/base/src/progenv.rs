@@ -668,6 +668,15 @@ pub extern "C" fn env_snapshot(out: *mut *const u8, out_len: *mut usize) {
 /// reads its own settings and the program its own. Absent: a launch by a person or a tool, with
 /// no program values.
 pub fn init() {
+    init_handed(None)
+}
+
+/// `init` of a run's own executable that a shell or a C library launched (selfexe.rs
+/// `relaunched`): `beside` is the build environment that run left beside its command line, which a
+/// spawn by Relax std hands in `BUILD_ENV` (relax issue 172). A hand-off in the environment stands
+/// over it, and either goes through `take_build`: neither grants anything. One that does not parse
+/// is not taken, said in one line.
+pub fn init_handed(beside: Option<Vec<u8>>) {
     if let Some(v) = std::env::var_os(std::str::from_utf8(PROGRAM_ENV).unwrap()) {
         std::env::remove_var(std::str::from_utf8(PROGRAM_ENV).unwrap());
         let own = parse(v.as_encoded_bytes()).unwrap_or_else(|e| panic!("RELAX_PROGRAM_ENV from the parent's Relax std: {e}"));
@@ -675,13 +684,24 @@ pub fn init() {
             write(k, v.as_deref());
         }
     }
-    let handed = std::env::var_os(std::str::from_utf8(BUILD_ENV).unwrap());
+    let set = |own: Own| -> Env { own.into_iter().filter_map(|(k, v)| Some((k, v?))).collect() };
+    let build = match std::env::var_os(std::str::from_utf8(BUILD_ENV).unwrap()) {
+        Some(handed) => Some(set(parse(handed.as_encoded_bytes()).unwrap_or_else(|e| panic!("RELAX_BUILD_ENV from the parent's Relax std: {e}")))),
+        // (the names and values become this process's environment: on Windows only what is
+        // UTF-8, as any OsString's bytes are)
+        None => beside.filter(|b| !cfg!(windows) || std::str::from_utf8(b).is_ok()).and_then(|b| match parse(&b) {
+            Ok(own) => Some(set(own)),
+            Err(e) => {
+                eprintln!("relax: the build environment beside this run's executable is not taken ({e}); it builds with its own");
+                None
+            }
+        }),
+    };
     let start = real();
-    let Some(handed) = handed else {
+    let Some(build) = build else {
         let _ = BUILD.set(build_part(&start));
         return;
     };
-    let build: Env = parse(handed.as_encoded_bytes()).unwrap_or_else(|e| panic!("RELAX_BUILD_ENV from the parent's Relax std: {e}")).into_iter().filter_map(|(k, v)| Some((k, v?))).collect();
     let (host, hidden, program) = take_build(&start, &build);
     let os = |b: &[u8]| unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(b) }.to_os_string();
     for (k, _) in &start {
@@ -704,6 +724,13 @@ pub fn init() {
 
 /// This run's build environment (`init`): the one it was handed, else its own as it started.
 static BUILD: std::sync::OnceLock<Env> = std::sync::OnceLock::new();
+
+/// This run's build environment in the wire form (`encode`): what a run of its program again
+/// builds with (`spawn_env`, and beside the run's command line for a launch by a shell).
+pub fn build_wire() -> Vec<u8> {
+    let build: Own = BUILD.get().cloned().unwrap_or_else(|| build_part(&real())).into_iter().map(|(k, v)| (k, Some(v))).collect();
+    encode(&build)
+}
 /// The program's environment as this process was started, when its host builds with a handed one.
 static PROGRAM_START: std::sync::OnceLock<Env> = std::sync::OnceLock::new();
 
@@ -783,8 +810,7 @@ pub extern "C" fn spawn_env(edits: *const u8, edits_len: usize, host: *const u8,
     // a run of this program again (2) or of a package binary this run prepared (16): its host
     // builds as this run does
     if flags & (2 | 16) != 0 {
-        let build: Own = BUILD.get().cloned().unwrap_or_else(|| build_part(&real())).into_iter().map(|(k, v)| (k, Some(v))).collect();
-        host.push((BUILD_ENV.to_vec(), encode(&build)));
+        host.push((BUILD_ENV.to_vec(), build_wire()));
     }
     let spawn = Spawn { edits: &edits, clear: flags & 1 != 0, self_exec: flags & 2 != 0, dir, host: &host };
     let env: Own = child_env(&real(), &own(), &spawn).into_iter().map(|(k, v)| (k, Some(v))).collect();

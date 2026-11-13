@@ -16,4 +16,6 @@ fn the_binary_is_the_tests_build_in_any_environment() {
     assert_eq!(run(Command::new(exe).arg("--empty").env_clear()), built, "started with a cleared environment");
     assert_eq!(run(Command::new(exe).arg("--nested").env_clear()), built, "started with a cleared environment, starting itself with one");
     assert_eq!(run(Command::new(exe).arg("--nested")), built, "started with the test's environment, starting itself with a cleared one");
+    #[cfg(unix)]
+    assert_eq!(run(Command::new(exe).args(["--shell-nested", "--shell-changed"]).env_clear()), built, "started with a cleared environment, exec'd again by a shell");
 }

@@ -8,7 +8,9 @@
 # `--allow-c` named the test's native build (RELAX_RUN_NATIVE), or handed a build environment
 # that says RELAX_ALLOW_C=1 (RELAX_BUILD_ENV), loads no native library; with `--allow-c`, a native
 # build named outside the run dir is not taken, said in one line. One line per case; the last
-# is "prepared_child: ok" or "prepared_child: FAILED" (exit 1).
+# is "prepared_child: ok" or "prepared_child: FAILED" (exit 1). And a run's program that a shell
+# execs again (its own executable, from a shell it starts with a cleared environment or another
+# build input) is that run's build too (relax issue 172, PR 175's shell case).
 H=$(cd "$(dirname "$0")" && pwd)
 T=$(mktemp -d)
 [ -n "$T" ] && [ -d "$T" ] || exit 2
@@ -46,6 +48,12 @@ rc=$?
 echo "$OUT" | tail -3
 ok=0; no_native "$OUT" $rc && ok=1
 case_is "a handed RELAX_ALLOW_C without --allow-c" $ok
+OUT=$(cd "$H" && "$1" run --quiet --allow-c pc-app -- --shell-nested --shell-changed 2>&1)
+rc=$?
+echo "$OUT" | tail -3
+ok=0
+[ $rc = 0 ] && [ "$(echo "$OUT" | tail -1)" = "home true path true 5" ] && ok=1
+case_is "a run's program a shell execs again" $ok
 mkdir "$T/elsewhere" && cp "$RECEIPT" "$T/elsewhere/"
 OUT=$(cd "$H" && RELAX_RUN_NATIVE=$T/elsewhere/$(basename "$RECEIPT") "$1" run --quiet --allow-c pc-app 2>&1)
 rc=$?

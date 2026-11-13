@@ -12,7 +12,10 @@
 //! The folder also holds the run's command line (`LINE`, RELAX_SELF_EXEC's value), so a launch of
 //! the link that did not come through Relax std's spawn (`sh -c "exec $EXE ..."`, a C library's
 //! exec) runs this program again too: the loader started by that path finds the line beside
-//! itself (`relaunched`), as std's spawn would have put it before the arguments.
+//! itself (`relaunched`), as std's spawn would have put it before the arguments. And the run's
+//! build environment (`BUILD`), which std's spawn hands such a run (progenv `BUILD_ENV`): that
+//! launch builds with it too, whatever environment the shell gave it, so it is this run's build
+//! and its program has the shell's environment (`relaunch_build`, relax issue 172).
 //!
 //! The folder is laid out as cargo lays out target/<profile>: a test's executable sits in its
 //! `deps/` folder and the package's binaries (their CARGO_BIN_EXE_<name> launchers) in the folder
@@ -237,10 +240,23 @@ pub fn name_process(link: &Path) {
 /// `-`, `_` and `.`).
 const LINE: &str = crate::dirs::RUN_LINE;
 
-/// Writes this run's command line (RELAX_SELF_EXEC's words, up to and with `--`) beside its link.
+/// The run's build environment beside the link: a name no link has.
+const BUILD: &str = crate::dirs::RUN_BUILD;
+
+/// Writes this run's command line (RELAX_SELF_EXEC's words, up to and with `--`) and its build
+/// environment beside its link. The folder is the owner's alone (`private_dirs`), as the process's
+/// own environment is.
 pub fn set_line(words: &[String]) -> Result<(), String> {
     let dir = LINK_DIR.get().ok_or("no link was made")?;
+    std::fs::write(dir.join(BUILD), crate::progenv::build_wire()).map_err(|e| format!("{}: {e}", dir.join(BUILD).display()))?;
     std::fs::write(dir.join(LINE), words.join("\u{1f}")).map_err(|e| format!("{}: {e}", dir.join(LINE).display()))
+}
+
+/// The build environment of the run whose link this process was launched from (`relaunched`),
+/// beside it: what the loader builds with before anything reads the environment (progenv
+/// `init_handed`).
+pub fn relaunch_build() -> Option<Vec<u8>> {
+    std::fs::read(std::env::current_exe().ok()?.parent()?.join(BUILD)).ok()
 }
 
 /// The folder's command lines of the package's binaries on Windows (`add_bins`): a name no link has.
