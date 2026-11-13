@@ -376,7 +376,8 @@ fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
     // and of the resolved graph only the native closure (the packages whose scripts or libs
     // cargo builds for real): two packages whose closure resolves alike share the build.
     let selection = selection_key(&script_pkgs, &lib_pkgs);
-    let mut h = fnv(b"native-link-v15", 0xcbf29ce484222325);
+    // (v16: a receipt holds its scripts' declared variables, `cached`)
+    let mut h = fnv(b"native-link-v16", 0xcbf29ce484222325);
     // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
     h = fnv(&crate::dirs::anchors_key().to_le_bytes(), h);
     h = fnv(req.triple.as_bytes(), h);
@@ -620,6 +621,9 @@ struct Outputs {
     scripts: Vec<ScriptOut>,
     /// (OUT_DIR, the script run the receipt saw there: `run_stamp`) of each script
     runs: Vec<(String, String)>,
+    /// each variable a script declared (`rerun-if-env-changed`) and its value when it ran (None:
+    /// unset), as `declared_env` read them
+    env: Vec<(String, Option<String>)>,
     statics: Vec<String>,
     archives: Vec<String>,
     search: Vec<String>,
@@ -651,7 +655,24 @@ fn cached(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<String>)],
     let links = !(out.archives.is_empty() && out.dylibs.is_empty() && out.frameworks.is_empty());
     let there = out.scripts.iter().all(|s| std::path::Path::new(&s.out_dir).is_dir()) && (!links || std::path::Path::new(lib_path).is_file());
     let same_runs = out.runs.iter().all(|(dir, seen)| !seen.is_empty() && *seen == run_stamp(dir));
-    (there && same_runs).then_some(out)
+    // a variable a script reads is one of its inputs, as cargo has it: another value runs it again
+    // (relax review B-M5: OPENSSL_DIR pointed at another OpenSSL, and the library built against
+    // the old one stayed linked)
+    let same_env = out.env.iter().all(|(k, v)| std::env::var(k).ok() == *v);
+    (there && same_runs && same_env).then_some(out)
+}
+
+/// The variables the script run that left `out_dir` declared with `rerun-if-env-changed` (cargo's
+/// `output` file beside it), each once, with this process's value (None: unset): cargo gives the
+/// script this environment.
+fn declared_env(out_dir: &str) -> Vec<(String, Option<String>)> {
+    let output = std::fs::read_to_string(std::path::Path::new(out_dir).with_file_name("output")).unwrap_or_default();
+    let mut names: Vec<&str> = output.lines().filter_map(|l| {
+        l.strip_prefix("cargo::").or_else(|| l.strip_prefix("cargo:"))?.strip_prefix("rerun-if-env-changed=")
+    }).map(str::trim_end).collect();
+    names.sort();
+    names.dedup();
+    names.into_iter().map(|k| (k.to_string(), std::env::var(k).ok())).collect()
 }
 
 /// The script run that left `out_dir` as it is: cargo's `output` file beside it (the script's
@@ -680,6 +701,7 @@ fn outputs_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<Stri
     let mut dylibs: Vec<String> = Vec::new();
     let mut frameworks: Vec<String> = Vec::new();
     let mut runs: Vec<(String, String)> = Vec::new();
+    let mut env_seen: Vec<(String, Option<String>)> = Vec::new();
     let mut link_args: Vec<String> = Vec::new();
     for line in messages.lines() {
         let j = crate::json::parse(line.as_bytes()).map_err(|e| format!("cargo message: {e}"))?;
@@ -695,6 +717,11 @@ fn outputs_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<Stri
         let strs = |k: &str| -> Vec<String> { j.get(k).map(|a| a.arr().iter().map(|x| x.str().to_string()).collect()).unwrap_or_default() };
         let mut out = ScriptOut { krate: scripts_of[s].0, host: matches!(j.get("relax_host"), Some(crate::json::Json::Bool(true))), cfgs: strs("cfgs"), env: Vec::new(), out_dir: j.get("out_dir").map(|o| o.str().to_string()).unwrap_or_default(), system: Vec::new() };
         runs.push((out.out_dir.clone(), j.get("relax_run").map(|r| r.str().to_string()).unwrap_or_default()));
+        for kv in j.get("relax_env").map(|e| e.arr()).unwrap_or(&[]) {
+            if let [k, v] = kv.arr() {
+                env_seen.push((k.str().to_string(), matches!(v, crate::json::Json::Str(_)).then(|| v.str().to_string())));
+            }
+        }
         if let Some(e) = j.get("env") {
             for kv in e.arr() {
                 if let [k, v] = kv.arr() {
@@ -754,7 +781,7 @@ fn outputs_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<Stri
             None => return Err(format!("--allow-c: a native build script links static library `{}`, but {} is in none of its search paths ({})", name, file, search.join(", "))),
         }
     }
-    Ok(Outputs { scripts, runs, statics, archives, search, fw_search, dylibs, frameworks, link_args })
+    Ok(Outputs { scripts, runs, env: env_seen, statics, archives, search, fw_search, dylibs, frameworks, link_args })
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -944,6 +971,13 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
                 // other keys' builds of the selection
                 let stamp = j.get("out_dir").map(|out| run_stamp(out.str())).unwrap_or_default();
                 keep.push_str(&format!("\"relax_run\":\"{stamp}\","));
+                // and the variables it declared (`rerun-if-env-changed`) with the values it ran
+                // with (`cached`)
+                let declared = j.get("out_dir").map(|out| declared_env(out.str())).unwrap_or_default();
+                let pairs: Vec<String> = declared.iter().map(|(k, v)| {
+                    format!("[{},{}]", json_string(k), v.as_deref().map_or("null".to_string(), json_string))
+                }).collect();
+                keep.push_str(&format!("\"relax_env\":[{}],", pairs.join(",")));
                 keep.push_str(body);
                 keep.push('\n');
             }

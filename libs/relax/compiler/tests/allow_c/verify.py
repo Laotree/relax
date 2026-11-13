@@ -33,8 +33,8 @@ env = dict(os.environ, CARGO_INCREMENTAL="0", CARGO_NET_OFFLINE="true",
            RELAX_CACHE_DIR=str(scratch / "jit"))
 
 
-def run(label, args, success=True):
-    result = subprocess.run(args, cwd=fixture, env=env, capture_output=True, text=True)
+def run(label, args, success=True, extra=None):
+    result = subprocess.run(args, cwd=fixture, env=dict(env, **(extra or {})), capture_output=True, text=True)
     (scratch / (label + ".stdout")).write_text(result.stdout)
     (scratch / (label + ".stderr")).write_text(result.stderr)
     assert (result.returncode == 0) == success, (
@@ -79,6 +79,18 @@ assert "building native dependencies with cargo" not in second.stderr, "warm lau
 assert keys == sorted(p.name for p in native.iterdir() if (p / "messages.jsonl").is_file()), "lock order changed native key"
 assert receipts == {key: (native / key / "messages.jsonl").stat().st_mtime_ns for key in keys}, "warm launch rewrote native build receipt"
 print("PASS cache: reordered unused patches keep one key; second launch reuses native build")
+
+# A variable a build script declares (`rerun-if-env-changed`, as a -sys crate's OPENSSL_DIR) is an
+# input of the native build: another value builds again, as cargo runs the script again, and the
+# value it had before builds again too (relax review B-M5: the build under the key was reused, and
+# the library built with the old value stayed linked)
+assert "offset 7\n" in baseline.stdout, f"cargo's baseline: {baseline.stdout}"
+changed = run("env-changed", command, extra={"CNATIVE_OFFSET": "9"})
+assert "offset 9\n" in changed.stdout, f"a changed declared variable reused the native build: {changed.stdout}"
+assert "building native dependencies with cargo" in changed.stderr, "a changed declared variable was not built again"
+back = run("env-back", command)
+assert back.stdout == baseline.stdout, f"the variable unset again: {back.stdout}"
+print("PASS env: a variable a build script declares builds the native library again when it changes")
 
 # `makepad selftest --allow-c` builds every fn against the libraries the run links: `add` reads the
 # C static cn_offset, which a selftest that linked nothing reported as "foreign static not found"

@@ -10,6 +10,7 @@ fn main() {
     println!("hash {:016x}", cnative::hash(b"makepad"));
     println!("apply {}", cnative::apply(inc, 20));
     println!("cfg {}", cnative::built());
+    println!("offset {}", cnative::offset());
     println!("callback {}", cnative::square_plus(7));
     println!("shadowed {}", cnative::shadowed());
 }
