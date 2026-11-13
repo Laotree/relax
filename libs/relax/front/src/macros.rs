@@ -2319,13 +2319,14 @@ impl MacroUse {
         Self { local, uses, looked: Vec::new(), uses_base: Default::default(), uses_log: Vec::new(), names: None, trusted_image: true, replay_image: None }
     }
 
-    /// The names of this parse's lookups that found no definition: textual ones and `crate::`
-    /// ones (another crate's path never names one of this crate's). Calls in code the cfg drops
-    /// make no lookup.
-    pub fn failed_lookups(&self) -> std::collections::BTreeSet<String> {
+    /// The names of this parse's lookups that found no definition: textual ones, and ones by a
+    /// path into this crate (`crate::`, `self::`, `super::`, or a first segment `is_crate` does not
+    /// take for another crate: `m::inner::bar!()`). Another crate's path never names one of this
+    /// crate's. Calls in code the cfg drops make no lookup.
+    pub fn failed_lookups(&self, is_crate: impl Fn(&str) -> bool) -> std::collections::BTreeSet<String> {
         let Some(names) = &self.names else { return Default::default() };
         self.looked.iter().filter(|l| l.got.is_none() && matches!(l.was, None | Some(None)))
-            .filter(|l| l.path.is_empty() || l.path.len() == 1 && names.str(l.path[0]) == "crate")
+            .filter(|l| l.path.first().is_none_or(|&first| matches!(names.str(first), "crate" | "self" | "super") || !is_crate(names.str(first))))
             .map(|l| names.str(l.name).to_string()).collect()
     }
 

@@ -1915,7 +1915,12 @@ impl<'a> Parser<'a> {
                         let line = self.src[..seg.name.lo as usize].iter().filter(|&&b| b == b'\n').count() + 1;
                         eprintln!("macscope {}:{}: {}! in module {} of crate {}: its import is not in scope here", self.bctx.as_ref().map_or("?", |c| c.path.as_str()), line, name, module, self.krate);
                     }
-                    self.macro_scope_miss.set(seg.name.lo);
+                    // A path names its module: the import there may be one an expansion of a file
+                    // the load has not read yet writes (`crate::made::inner::seven!()` before
+                    // `made`'s `pub(crate) use seven_inner as seven;`). That call is a lookup that
+                    // found nothing, left for the load's parse with the crate outline, as
+                    // `made::inner::seven!()` is; a plain name's scope is the module's own.
+                    if qual.is_none() && !path.global() { self.macro_scope_miss.set(seg.name.lo); }
                     return None;
                 }
                 let q2 = match q.as_str() {

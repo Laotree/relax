@@ -1820,7 +1820,9 @@ impl Program {
             let through_import = |n: &String| parse_table.aliases.get(&kname).and_then(|a| a.get(n)).is_some_and(|(first, orig)| {
                 orig != n || parse_table.crates.contains_key(first) || parse_table.crates.get(&kname).is_some_and(|c| c.externs.contains_key(first))
             });
-            let mut missing = used.failed_lookups();
+            let mut missing = used.failed_lookups(|first| {
+                parse_table.crates.contains_key(first) || parse_table.crates.get(&kname).is_some_and(|c| c.externs.contains_key(first))
+            });
             missing.retain(|n| !parse_table.defs.get(n).is_some_and(|defs| defs.iter().any(|d| d.krate == kname)) && !used.local.iter().any(|d| &d.name == n)
                 && !through_import(n)
                 && !BUILTIN_MACROS.contains(&n.as_str()) && crate::builtins::macro_def_for(&kname, n).is_none());
