@@ -40,7 +40,7 @@
 //! clones) that give the same name share their stores, and a crate compiles again only where its text
 //! differs. What the run prints names the checkout's files (`shown`, the crates' print macros); the
 //! JIT-run program's own output (panic locations, `file!()`) names the virtual paths, which keep its
-//! code stores shared.
+//! code stores shared. A current folder in no cargo workspace has none to share and mounts nothing.
 use crate::gitstore::{self as store, Entry, Oid, Store};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -1185,15 +1185,19 @@ pub fn share_root(name: &str) -> String {
 /// at [`share_root`] and the run's workspace is the current folder's place there, said in
 /// RELAX_VFS and RELAX_WORKSPACE as run facts (progenv.rs; the name is one too): this run again (a
 /// self-exec child) and a build script of the mount (unitgraph.rs) are handed them; no other child
-/// inherits them. A run handed a mount (RELAX_VFS) mounts that and never reaches here.
+/// inherits them. A run handed a mount (RELAX_VFS) mounts that and never reaches here. A current
+/// folder in no cargo workspace (or one whose manifest does not read) mounts nothing: the loader
+/// mounts before it knows the command, `--version` and `inspect` need no workspace, and a command
+/// that needs one reports the manifest as it does without RELAX_SHARE.
 fn share_from_env() -> Result<(), String> {
     let Some(name) = std::env::var("RELAX_SHARE").ok().filter(|n| !n.is_empty()) else { return Ok(()) };
     if name.starts_with('.') || !name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')) {
         return Err(format!("RELAX_SHARE: `{name}` is not a name (letters, digits, `-`, `_`, `.`)"));
     }
     let root = share_root(&name);
-    let cwd = std::env::current_dir().map_err(|e| format!("RELAX_SHARE: {e}"))?.to_string_lossy().into_owned();
-    let disk = crate::resolve::find_root(&cwd).map_err(|e| format!("RELAX_SHARE: {e}"))?;
+    let Ok(cwd) = std::env::current_dir() else { return Ok(()) };
+    let cwd = cwd.to_string_lossy().into_owned();
+    let Ok(disk) = crate::resolve::find_root(&cwd) else { return Ok(()) };
     let rel = relative_path(&cwd, &disk).unwrap_or_default();
     mount_folder(&root, std::path::Path::new(&disk));
     crate::progenv::set_run_fact("RELAX_VFS", mounts_text());
