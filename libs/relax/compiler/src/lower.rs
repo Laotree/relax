@@ -1204,6 +1204,9 @@ impl<'a> Lcx<'a> {
             _ => false,
         }
     }
+    fn is_prim_int(&self, t: TyId) -> bool {
+        matches!(self.u.tcx.tys.kind(t), TyKind::Int(_))
+    }
     fn is_wide(&self, t: TyId) -> bool {
         matches!(self.u.tcx.tys.kind(t), TyKind::Int(Prim::I128) | TyKind::Int(Prim::U128))
     }
@@ -6872,6 +6875,20 @@ impl<'a> Lcx<'a> {
             ExprKind::Unary(UnOp::Neg | UnOp::Not, x) | ExprKind::Cast(x, _) => self.is_wide(self.body_ty(*x)) || self.is_wide(t),
             _ => false,
         };
+        // An operator the checker resolved to its trait's method is the built-in operation only
+        // between integers, which may be behind references (`T + T`, `&T + &T` at u128). With a
+        // struct for an operand (`W(a) + b`, `u128 == W(a)`, `-small` giving an i128) it is the
+        // call below, not the two-word arithmetic, which read the struct's words as an integer's
+        // halves.
+        let wide = wide
+            && !(self.b.binops.contains_key(&e.0)
+                && match &ex.kind {
+                    ExprKind::Binary(_, a, b) | ExprKind::AssignOp(_, a, b) => {
+                        !(self.is_prim_int(self.prim_peeled(self.body_ty(*a))) && self.is_prim_int(self.prim_peeled(self.body_ty(*b))))
+                    }
+                    ExprKind::Unary(_, x) => !self.is_prim_int(self.prim_peeled(self.body_ty(*x))),
+                    _ => false,
+                });
         if wide {
             return self.lower_wide(e, t);
         }
