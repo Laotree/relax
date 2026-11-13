@@ -257,6 +257,7 @@ pub fn relax_dir() -> PathBuf {
         return d;
     }
     if matches!(shared_cache_mode(), Ok(true)) {
+        notice_non_ascii_anchor();
         return shared_relax_dir();
     }
     DEFAULT.get_or_init(|| crate::zone_alloc::kept_with(|| relax_dir_for(&workspace_dir()))).clone()
@@ -278,6 +279,18 @@ fn shared_mode_from(v: Option<&str>) -> Result<bool, String> {
         None | Some("") | Some("off") => Ok(false),
         Some("global") => Ok(true),
         Some(other) => Err(format!("RELAX_SHARED_CACHE must be `off` or `global`, not `{other}`")),
+    }
+}
+
+/// Say once that a non-ASCII anchor disables sharing: its NFC and NFD spellings cannot both be
+/// scanned without normalization tables, so a user with such a directory would otherwise see the
+/// feature silently do nothing.
+fn notice_non_ascii_anchor() {
+    static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if anchors().iter().any(|(_, d)| !d.is_ascii()) {
+        SAID.get_or_init(|| {
+            eprintln!("relax: RELAX_SHARED_CACHE=global: an anchor directory contains non-ASCII characters; entries under it are not shared");
+        });
     }
 }
 
