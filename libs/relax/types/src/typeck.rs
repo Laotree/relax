@@ -6583,12 +6583,15 @@ impl<'a> Fcx<'a> {
                 // borrow it in an instance -- two closure layouts for one closure
                 // unsized places compare through their impls too (`*l == *r` with l: &[T] is
                 // `<[T] as PartialEq>::eq(&*l, &*r)`, rustc op.rs: only scalars are built in)
+                // an opaque type (`impl PartialEq` returned by another fn) compares through its bound too,
+                // whatever its hidden type: a built-in comparison of an aggregate hidden type compared
+                // nothing (`structure(&a) != structure(&b)` with a tuple of maps was false)
                 // a type-variable left operand is an operator trait call too: rustc op.rs:41 takes the
                 // builtin path only when neither operand is a type variable, and check_overloaded_binop
                 // records the method for `?T: PartialEq<?R>` while it is ambiguous. Typing it as a
                 // built-in comparison unified both sides and made the capture analysis of
                 // `|p| *p == path` (p: &?T) consume `path` (a false E0382 in an app's code_graph).
-                if !prim_ref && matches!(self.tcx.tys.kind(sa), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..) | TyKind::Param(_) | TyKind::Infer(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. })) {
+                if !prim_ref && matches!(self.tcx.tys.kind(sa), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..) | TyKind::Param(_) | TyKind::Infer(_) | TyKind::Alias(..)) {
                     if let Some(r) = self.check_cmp_trait(e, op, sa, b, lo, None) {
                         return r;
                     }
