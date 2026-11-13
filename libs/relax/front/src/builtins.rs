@@ -1402,6 +1402,13 @@ fn env_value(ctx: Option<&FileCtx>, name: &str, flags: u8) -> Option<String> {
     v
 }
 
+/// A workspace path value as an anchored literal: the marker byte tells `lit_data` to keep the
+/// anchored spelling in the cache and materialise this run's absolute path.
+fn anchored_value(v: &str) -> String {
+    let a = crate::dirs::anchored(v);
+    if a.starts_with('\0') { format!("\u{1}{a}") } else { v.to_string() }
+}
+
 fn env_value_inner(ctx: Option<&FileCtx>, name: &str) -> Option<String> {
     // cargo's per-crate environment as `makepad run` registered it (unitgraph.rs), then what Relax
     // knows from the crate's Cargo.toml, then cargo's `[env]` configuration, then the process
@@ -1410,13 +1417,14 @@ fn env_value_inner(ctx: Option<&FileCtx>, name: &str) -> Option<String> {
         if let Some(v) = crate::crates::crate_env_registered(&c.krate, name) {
             if name == "OUT_DIR" {
                 crate::pathmarks::mark(&c.krate);
+                return Some(anchored_value(&v));
             }
             return Some(v);
         }
         match name {
             "CARGO_MANIFEST_DIR" => {
                 crate::pathmarks::mark(&c.krate);
-                return Some(c.manifest_dir.clone());
+                return Some(anchored_value(&c.manifest_dir));
             }
             "CARGO_PKG_NAME" => return Some(c.pkg_name.clone()),
             "CARGO_PKG_VERSION" => return Some(c.pkg_version.clone()),
