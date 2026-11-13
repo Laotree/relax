@@ -336,30 +336,38 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
                 // cargo builds a package's bins with the features its tests are built with (one
                 // feature set per package): the run of the bin selects exactly those
                 let features = crates[integration_tests[0]].features.join(",");
-                let (sh_features, cmd_features) = if features.is_empty() {
-                    ("--no-default-features".to_string(), "--no-default-features".to_string())
-                } else {
-                    (format!("--no-default-features --features {}", sh_quote(&features)), format!("--no-default-features --features \"{features}\""))
+                // a file the bin's starts read, replaced whole (another run's test may be reading it)
+                let put = |path: &std::path::Path, text: &str| {
+                    if std::fs::read(path).ok().as_deref() == Some(text.as_bytes()) {
+                        return;
+                    }
+                    let tmp = bin_dir.join(format!(".{}.tmp{}", path.file_name().unwrap_or_default().to_string_lossy(), std::process::id()));
+                    if std::fs::write(&tmp, text).is_ok() {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+                        }
+                        let _ = std::fs::rename(&tmp, path);
+                    }
                 };
                 for bin_name in &g.bins {
+                    // the bin's run: the loader's command line before the bin's own arguments
+                    let mut words: Vec<String> = [exe_str.as_str(), "run", "--quiet", "--silent", "--no-live", "--run-dir", td_str.as_str(), "--workspace-dir", pkg_dir.as_str(), pkg_name.as_str(), "--no-default-features"].iter().map(|w| w.to_string()).collect();
+                    if !features.is_empty() {
+                        words.extend(["--features".to_string(), features.clone()]);
+                    }
+                    words.extend(["--bin".to_string(), bin_name.clone(), "--".to_string()]);
                     let wrapper = bin_dir.join(if cfg!(windows) { format!("{bin_name}.cmd") } else { bin_name.clone() });
-                    let script = if cfg!(windows) {
-                        format!("@echo off\r\nset RELAX_SELF_EXEC=\r\nset RELAX_SELF_EXEC_SILENT_ADDED=\r\nset \"RELAX_ARG0=%~f0\"\r\n\"{}\" run --quiet --silent --no-live --run-dir \"{}\" --workspace-dir \"{}\" \"{}\" {} --bin \"{}\" -- %*\r\n",
-                            exe_str, td_str, pkg_dir, pkg_name, cmd_features, bin_name)
+                    if cfg!(windows) {
+                        let line: Vec<String> = words.iter().map(|w| format!("\"{w}\"")).collect();
+                        put(&wrapper, &format!("@echo off\r\nset RELAX_SELF_EXEC=\r\nset RELAX_SELF_EXEC_SILENT_ADDED=\r\nset \"RELAX_ARG0=%~f0\"\r\n{} %*\r\n", line.join(" ")));
+                        // the words alone, for the `.exe` a test finds above its `deps/` folder,
+                        // where cargo has the binary (relax-compiler selfexe.rs add_bins)
+                        put(&wrapper.with_extension("words"), &words.join("\u{1f}"));
                     } else {
-                        format!("#!/bin/sh\nunset RELAX_SELF_EXEC RELAX_SELF_EXEC_SILENT_ADDED\nRELAX_ARG0=$0\nexport RELAX_ARG0\nexec {} run --quiet --silent --no-live --run-dir {} --workspace-dir {} {} {} --bin {} -- \"$@\"\n",
-                            sh_quote(&exe_str), sh_quote(&td_str), sh_quote(pkg_dir), sh_quote(pkg_name), sh_features, sh_quote(bin_name))
-                    };
-                    if std::fs::read(&wrapper).ok().as_deref() != Some(script.as_bytes()) {
-                        let tmp = bin_dir.join(format!(".{}.tmp{}", bin_name, std::process::id()));
-                        if std::fs::write(&tmp, script.as_bytes()).is_ok() {
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::PermissionsExt;
-                                let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
-                            }
-                            let _ = std::fs::rename(&tmp, &wrapper);
-                        }
+                        let line: Vec<String> = words.iter().map(|w| sh_quote(w)).collect();
+                        put(&wrapper, &format!("#!/bin/sh\nunset RELAX_SELF_EXEC RELAX_SELF_EXEC_SILENT_ADDED\nRELAX_ARG0=$0\nexport RELAX_ARG0\nexec {} \"$@\"\n", line.join(" ")));
                     }
                     let wrapper_str = wrapper.display().to_string();
                     for &ci in &integration_tests {

@@ -182,11 +182,14 @@ fn plain(p: std::path::PathBuf) -> std::path::PathBuf {
 
 /// The runner on this process's command line, with `host` added.
 pub fn main(host: &'static Host) {
+    // a package binary above a test's deps/ (Windows): its run, with the environment its .cmd
+    // would give it, before anything reads the environment
+    let bin = relax_compiler::selfexe::bin_start(&relax_compiler::os::proc::args_bytes());
     // a self-exec child: the program values its parent passed, before anything reads the
     // environment (relax-base progenv.rs)
     relax_compiler::progenv::init();
     // a run's own executable launched by a shell or a C library: that run's program again
-    if let Some(args) = relax_compiler::selfexe::relaunched(&relax_compiler::os::proc::args_bytes()) {
+    if let Some(args) = bin.or_else(|| relax_compiler::selfexe::relaunched(&relax_compiler::os::proc::args_bytes())) {
         relax_compiler::os::proc::set_args(args);
     }
     set_host(host);

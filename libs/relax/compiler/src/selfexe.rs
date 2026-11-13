@@ -15,7 +15,8 @@
 //! The folder is laid out as cargo lays out target/<profile>: a test's executable sits in its
 //! `deps/` folder and the package's binaries (their CARGO_BIN_EXE_<name> launchers) in the folder
 //! itself (`add_bins`), so a test that finds a binary at `current_exe()/../../<name>`, as under
-//! cargo, finds it (relax issue 139's second case).
+//! cargo, finds it (relax issue 139's second case). On Windows that is `<name>.exe`, a link of the
+//! loader whose run's command line is in the folder's `+bin` (`bin_start`).
 //!
 //! A process gets its program's name from the file it starts from (Linux's comm, macOS's p_comm:
 //! what ps, top and a parent lookup show), as a cargo-built program has its own. So whoever starts
@@ -173,13 +174,31 @@ pub fn set_line(words: &[String]) -> Result<(), String> {
     std::fs::write(dir.join(LINE), words.join("\u{1f}")).map_err(|e| format!("{}: {e}", dir.join(LINE).display()))
 }
 
+/// The folder's command lines of the package's binaries on Windows (`add_bins`): a name no link has.
+const BIN: &str = "+bin";
+
 /// The package's binaries in this run's folder, as cargo has them in target/<profile> beside a
 /// test's `deps/`: `launchers` are the CARGO_BIN_EXE_<name> values, each linked (else copied)
-/// under its own file name. A test that finds a binary by that layout ran nothing before.
+/// under its own file name. A test that finds a binary by that layout ran nothing before. On
+/// Windows the launcher is a `.cmd`, and no `.exe` by the binary's name was there, which is
+/// where cargo has it (relax PR 153: NotFound): there the binary is `<name>.exe`, a link of the
+/// loader, and its run's words (unitgraph.rs, beside the `.cmd`) go in the folder's `+bin`
+/// under that name, which the loader started by it takes (`bin_start`).
 pub fn add_bins(launchers: &[String]) {
     let Some(dir) = OWN_DIR.get() else { return };
     for l in launchers {
         let from = Path::new(l);
+        if cfg!(windows) {
+            let (Some(stem), Ok(words)) = (from.file_stem(), std::fs::read(from.with_extension("words"))) else { continue };
+            let Some(loader) = words.split(|&b| b == 0x1f).next().map(|w| PathBuf::from(String::from_utf8_lossy(w).into_owned())) else { continue };
+            let mut file = stem.to_os_string();
+            file.push(".exe");
+            let lines = dir.join(BIN);
+            if std::fs::create_dir_all(&lines).is_ok() && std::fs::write(lines.join(&file), &words).is_ok() {
+                let _ = std::fs::hard_link(&loader, dir.join(&file));
+            }
+            continue;
+        }
         let Some(file) = from.file_name() else { continue };
         let to = dir.join(file);
         if !to.exists() && std::fs::hard_link(from, &to).is_err() {
@@ -188,12 +207,37 @@ pub fn add_bins(launchers: &[String]) {
     }
 }
 
-/// Whether `exe` is a run's own executable (its command line beside it), or a link a run was
-/// started from (`launch_link`): neither is the loader's own path (a launch of a run's link runs
-/// that run's program; a launch link goes with its folder), so the loader running from one spawns
-/// itself by RELAX_LOADER (dirs::loader_exe).
+/// Whether `exe` is a run's own executable (its command line beside it), a link a run was
+/// started from (`launch_link`), or a package binary above a test's `deps/` (its line in `+bin`):
+/// none is the loader's own path (a launch of a run's link runs that run's program, as one of a
+/// package binary runs that binary; a launch link goes with its folder), so the loader running
+/// from one spawns itself by RELAX_LOADER (dirs::loader_exe).
 pub fn is_link(exe: &Path) -> bool {
-    exe.parent().is_some_and(|d| d.join(LINE).is_file() || d.file_name().is_some_and(|n| n == LAUNCH))
+    exe.parent().is_some_and(|d| {
+        d.join(LINE).is_file() || d.file_name().is_some_and(|n| n == LAUNCH) || exe.file_name().is_some_and(|f| d.join(BIN).join(f).is_file())
+    })
+}
+
+/// A start of a package binary above a test's `deps/` (Windows, `add_bins`): `args` with the
+/// binary's run's words after argv[0], and this process's environment as the binary's `.cmd`
+/// gives it: no self-exec line of the test's run, RELAX_ARG0 the path the test started (the
+/// program's argv[0], as cargo's binary has it), RELAX_LOADER the loader the words name. None for
+/// any other start. The runner's main calls it first, before anything reads the environment or
+/// starts a thread.
+pub fn bin_start(args: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
+    let exe = std::env::current_exe().ok()?;
+    let line = std::fs::read(exe.parent()?.join(BIN).join(exe.file_name()?)).ok()?;
+    let mut out: Vec<Vec<u8>> = line.split(|&b| b == 0x1f).map(<[u8]>::to_vec).collect();
+    let arg0 = args.first()?.clone();
+    unsafe {
+        std::env::remove_var("RELAX_SELF_EXEC");
+        std::env::remove_var("RELAX_SELF_EXEC_SILENT_ADDED");
+        std::env::set_var("RELAX_ARG0", String::from_utf8_lossy(&arg0).into_owned());
+        std::env::set_var("RELAX_LOADER", String::from_utf8_lossy(&out[0]).into_owned());
+    }
+    out[0] = arg0;
+    out.extend(args.iter().skip(1).cloned());
+    Some(out)
 }
 
 /// A launch of a run's link whose arguments do not start with the run's command line (Relax std's
