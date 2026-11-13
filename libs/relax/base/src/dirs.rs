@@ -82,6 +82,14 @@ pub fn payload_carries_anchor(bytes: &[u8]) -> Option<&'static str> {
 }
 
 fn payload_carries_anchor_in(bytes: &[u8], anchors: &[(&'static str, String)]) -> Option<&'static str> {
+    payload_carries_anchor_with(bytes, anchors, &|d| std::fs::canonicalize(d).ok().map(|c| c.to_string_lossy().into_owned()))
+}
+
+/// The scan with an injectable resolver: `resolve` returns the canonical spelling of a directory,
+/// or None when it cannot be read. A None, and any failure to produce a spelling, counts as
+/// carried (fail closed): the scan never shares what it could not check, and tests can inject the
+/// failure a real file system will not produce on demand.
+fn payload_carries_anchor_with(bytes: &[u8], anchors: &[(&'static str, String)], resolve: &dyn Fn(&str) -> Option<String>) -> Option<&'static str> {
     // Prefix matching is intentional and conservative: a directory that starts with an anchor's
     // spelling counts as under it, so a false positive only costs a missing hit.
     for (tag, dir) in anchors {
@@ -94,11 +102,13 @@ fn payload_carries_anchor_in(bytes: &[u8], anchors: &[(&'static str, String)]) -
             return Some(tag);
         }
         let mut spellings = vec![dir.clone()];
-        if let Ok(c) = std::fs::canonicalize(dir) {
-            let c = c.to_string_lossy().into_owned();
-            if c != *dir {
-                spellings.push(c);
+        match resolve(dir) {
+            Some(c) => {
+                if c != *dir {
+                    spellings.push(c);
+                }
             }
+            None => return Some(tag),
         }
         let back: Vec<String> = spellings.iter().map(|d| d.replace('/', "\\")).collect();
         spellings.extend(back.iter().cloned());
@@ -404,22 +414,32 @@ mod tests {
     #[test]
     fn payload_scan_finds_anchor_spellings() {
         let a = [("ws", "/w".to_string()), ("cargo", "/c".to_string())];
-        assert_eq!(super::payload_carries_anchor_in(b"prefix/w/src/lib.rs", &a), Some("ws"));
-        assert_eq!(super::payload_carries_anchor_in(b"x\\w\\src\\lib.rs", &a), Some("ws"));
-        assert_eq!(super::payload_carries_anchor_in(b"/c/registry/a.rs", &a), Some("cargo"));
-        assert_eq!(super::payload_carries_anchor_in(b"/other/a.rs", &a), None);
-        assert_eq!(super::payload_carries_anchor_in(b"", &a), None);
+        let ok = |d: &str| Some(d.to_string());
+        assert_eq!(super::payload_carries_anchor_with(b"prefix/w/src/lib.rs", &a, &ok), Some("ws"));
+        assert_eq!(super::payload_carries_anchor_with(b"x\\w\\src\\lib.rs", &a, &ok), Some("ws"));
+        assert_eq!(super::payload_carries_anchor_with(b"/c/registry/a.rs", &a, &ok), Some("cargo"));
+        assert_eq!(super::payload_carries_anchor_with(b"/other/a.rs", &a, &ok), None);
+        assert_eq!(super::payload_carries_anchor_with(b"", &a, &ok), None);
         // case-insensitive (macOS/Windows file systems)
-        assert_eq!(super::payload_carries_anchor_in(b"/W/src/lib.rs", &a), Some("ws"));
+        assert_eq!(super::payload_carries_anchor_with(b"/W/src/lib.rs", &a, &ok), Some("ws"));
         // Windows extended-length prefix
         let w = [("ws", "C:\\w".to_string())];
-        assert_eq!(super::payload_carries_anchor_in(b"\\\\?\\C:\\w\\src\\lib.rs", &w), Some("ws"));
+        assert_eq!(super::payload_carries_anchor_with(b"\\\\?\\C:\\w\\src\\lib.rs", &w, &ok), Some("ws"));
         // UTF-16LE wide strings
         let wide: Vec<u8> = "/w/src/lib.rs".encode_utf16().flat_map(u16::to_le_bytes).collect();
-        assert_eq!(super::payload_carries_anchor_in(&wide, &a), Some("ws"));
+        assert_eq!(super::payload_carries_anchor_with(&wide, &a, &ok), Some("ws"));
         // a non-ASCII anchor may be NFC in one worktree and NFD in another: never shared
         let u = [("ws", "/w/\u{e9}".to_string())];
-        assert_eq!(super::payload_carries_anchor_in(b"/x", &u), Some("ws"));
+        assert_eq!(super::payload_carries_anchor_with(b"/x", &u, &ok), Some("ws"));
+    }
+
+    /// A resolver that cannot read a directory makes the scan fail closed, not open.
+    #[test]
+    fn payload_scan_fails_closed_when_it_cannot_resolve() {
+        let a = [("ws", "/w".to_string())];
+        let bad = |_: &str| None;
+        assert_eq!(super::payload_carries_anchor_with(b"/other/a.rs", &a, &bad), Some("ws"));
+        assert_eq!(super::payload_carries_anchor_with(b"/other/a.rs", &[], &bad), None);
     }
 
     /// A workspace entered through a symbolic link is found by its resolved spelling too.
