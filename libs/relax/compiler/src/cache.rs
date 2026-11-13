@@ -2604,8 +2604,9 @@ impl Cache {
                 let g = self.deps_graph(u);
                 let mut h = Sip128::new();
                 h.str("code-deps");
-                // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-                h.u128(crate::dirs::anchors_key());
+                // EXPERIMENT ONLY (not for merge): the absolute anchor dirs leave the key to test
+                // whether code keys alone bind entries to a worktree.
+
                 h.u128(self.cfg);
                 h.write(&e.0);
                 h.write(&shim.0);
