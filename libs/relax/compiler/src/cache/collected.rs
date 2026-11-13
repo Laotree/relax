@@ -76,8 +76,8 @@ fn key(identity: u128) -> u128 {
     let mut h = Sip128::new();
     h.str("collected-graph-v1");
     h.u128(crate::codegen_id::id()); h.str(&crate::codegen_id::target_tag()); h.u128(identity);
-    // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-    h.u128(crate::dirs::anchors_key());
+    // path-free in shared mode; the anchored variant when the mode keeps its anchors
+    h.u128(crate::cache::anchors_in_key());
     h.finish128()
 }
 pub(super) fn path(dir: &std::path::Path, identity: u128) -> PathBuf {

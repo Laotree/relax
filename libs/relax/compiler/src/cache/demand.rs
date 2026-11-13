@@ -111,7 +111,7 @@ impl DemandWriter for Images<'_> {
         let mut key = Sip128::new();
         key.str("demand-front-surface-v2"); key.str(&crate::dirs::anchored(path)); key.u128(hash);
         // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-        key.u128(crate::dirs::anchors_key());
+        key.u128(crate::cache::anchors_in_key());
         key.u128(src_hash); key.u128(toks_hash);
         key.u8(same_src as u8);
         let key = key.finish128();
