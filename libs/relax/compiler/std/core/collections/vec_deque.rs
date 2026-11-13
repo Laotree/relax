@@ -857,6 +857,16 @@ impl<'a, T> Iterator for Iter<'a, T> {
         let n = self.a.len() + self.b.len();
         (n, Some(n))
     }
+    // core vec_deque iter.rs: the front half, then the rest of `n` in the back one, each in O(1)
+    fn advance_by(&mut self, n: usize) -> Result<(), usize> {
+        match self.a.advance_by(n) {
+            Ok(()) => Ok(()),
+            Err(k) => {
+                crate::mem::swap(&mut self.a, &mut self.b);
+                self.a.advance_by(k)
+            }
+        }
+    }
     #[doc(hidden)]
     #[inline]
     unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> &'a T {
@@ -880,6 +890,16 @@ impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
             None => {
                 crate::mem::swap(&mut self.a, &mut self.b);
                 self.b.next_back()
+            }
+        }
+    }
+    // core vec_deque iter.rs: the back half from its end, then the rest of `n` in the front one
+    fn advance_back_by(&mut self, n: usize) -> Result<(), usize> {
+        match self.b.advance_back_by(n) {
+            Ok(()) => Ok(()),
+            Err(k) => {
+                crate::mem::swap(&mut self.a, &mut self.b);
+                self.b.advance_back_by(k)
             }
         }
     }
@@ -918,6 +938,16 @@ impl<'a, T> Iterator for IterMut<'a, T> {
         let n = self.a.len() + self.b.len();
         (n, Some(n))
     }
+    // core vec_deque iter.rs: the front half, then the rest of `n` in the back one, each in O(1)
+    fn advance_by(&mut self, n: usize) -> Result<(), usize> {
+        match self.a.advance_by(n) {
+            Ok(()) => Ok(()),
+            Err(k) => {
+                crate::mem::swap(&mut self.a, &mut self.b);
+                self.a.advance_by(k)
+            }
+        }
+    }
     #[doc(hidden)]
     #[inline]
     unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> &'a mut T {
@@ -941,6 +971,16 @@ impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
             None => {
                 crate::mem::swap(&mut self.a, &mut self.b);
                 self.b.next_back()
+            }
+        }
+    }
+    // core vec_deque iter.rs: the back half from its end, then the rest of `n` in the front one
+    fn advance_back_by(&mut self, n: usize) -> Result<(), usize> {
+        match self.b.advance_back_by(n) {
+            Ok(()) => Ok(()),
+            Err(k) => {
+                crate::mem::swap(&mut self.a, &mut self.b);
+                self.b.advance_back_by(k)
             }
         }
     }

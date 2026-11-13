@@ -51,16 +51,19 @@ impl<T> Iterator for IntoIter<T> {
     fn count(self) -> usize {
         self.end - self.start
     }
-    fn nth(&mut self, n: usize) -> Option<T> {
+    // alloc vec/into_iter.rs: the skipped items leave the live range first, then drop as one
+    // slice (a panicking drop leaves the others to the slice's drop); nth is the default's: this,
+    // then a next
+    fn advance_by(&mut self, n: usize) -> Result<(), usize> {
         let avail = self.end - self.start;
-        let skip = if n < avail { n } else { avail };
-        let mut i = 0;
-        while i < skip {
-            unsafe { im::drop_in_place(im::ptr_add_mut(self.buf.as_ptr(), self.start)) };
-            self.start += 1;
-            i += 1;
+        let k = if n < avail { n } else { avail };
+        let from = self.start;
+        self.start += k;
+        if crate::mem::needs_drop::<T>() {
+            // SAFETY: from..from + k were alive and are out of the live range now: dropped once
+            unsafe { crate::ptr::drop_in_place(crate::ptr::slice_from_raw_parts_mut(im::ptr_add_mut(self.buf.as_ptr(), from), k)) };
         }
-        self.next()
+        if k < n { Err(n - k) } else { Ok(()) }
     }
     #[doc(hidden)]
     #[inline]
