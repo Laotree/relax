@@ -1564,6 +1564,25 @@ mod tests {
         }
     }
 
+    /// Two writers appending to one store file serialize on its lock: both entries are readable.
+    #[test]
+    fn two_writers_share_a_store_file() {
+        let d = tmpdir("two-writers");
+        let p = d.join("crate-0000000000000001.rcs");
+        let hs: Vec<_> = (0u128..2).map(|k| {
+            let p = p.clone();
+            std::thread::spawn(move || {
+                for _ in 0..8 {
+                    crate::store::append(&p, vec![crate::pack::NewEntry { key: k, kind: 1, payload: vec![k as u8; 64] }], false).unwrap();
+                }
+            })
+        }).collect();
+        for t in hs { t.join().unwrap(); }
+        let s = Store::open(&p).unwrap();
+        assert!(s.get(0).is_some() && s.get(1).is_some(), "both writers' entries are readable");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn append_compact_newest_wins() {
         let d = tmpdir("a");
