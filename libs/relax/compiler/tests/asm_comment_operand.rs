@@ -2,6 +2,7 @@
 // operand inside a line comment; the comment runs to the end of the line, operand included (LLVM
 // parses the template after substitution), so the statement is empty. A `#` that starts a statement
 // is a comment on every target (LLVM AsmLexer), aarch64 included (relax #91).
+// needs-native: inline assembly
 #[test]
 fn operand_inside_line_comment() {
     let v = [1u8, 2, 3];
