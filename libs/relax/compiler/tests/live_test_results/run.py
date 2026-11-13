@@ -32,13 +32,19 @@ with tempfile.TemporaryDirectory(prefix="live-test-results-") as tmp:
             cwd=pkg, env=env, stdout=log, stderr=log, start_new_session=True,
         )
         try:
+            def belongs_to_run(entry):
+                try:
+                    return os.getsid(entry["pid"]) == process.pid
+                except ProcessLookupError:
+                    return False
+
             deadline = time.monotonic() + 300
             pid = None
             while time.monotonic() < deadline:
                 listed = subprocess.run([runner, "inspect", "list", "--json"], env=env,
                                         capture_output=True, text=True, check=True)
                 entries = [json.loads(line) for line in listed.stdout.splitlines()]
-                runs = [entry for entry in entries if entry.get("app") == "live-verdict-example"]
+                runs = [entry for entry in entries if entry.get("app") == "live-verdict-example" and belongs_to_run(entry)]
                 if runs:
                     assert len(runs) == 1, runs
                     pid = runs[0]["pid"]
@@ -92,7 +98,7 @@ with tempfile.TemporaryDirectory(prefix="live-test-results-") as tmp:
                 **{f"extra_{i:03}": ("passed", False) for i in range(320)},
             }, failed
             stale = subprocess.run(
-                [runner, "inspect", str(pid), "test-results", f"group={initial['group']}", "full=1", "--json"],
+                [runner, "inspect", str(pid), "test-results", f"group={initial['group']}", "--json"],
                 env=env, capture_output=True, text=True, timeout=30,
             )
             stale_rows = [json.loads(line) for line in stale.stdout.splitlines()]
@@ -105,7 +111,7 @@ with tempfile.TemporaryDirectory(prefix="live-test-results-") as tmp:
             recovered = watch("testverdict", refused["seq"])
             assert results(recovered)["value_is_one"] == ("passed", True), recovered
             assert recovered["failed"] == 0, recovered
-            print("live_test_results: PASS (324 results, default verdict limit, affected failure, stale group, build refusal, recovery)")
+            print("live_test_results: PASS (324 results, affected failure, stale group, build refusal, recovery)")
         except BaseException:
             print((root / "run.log").read_text(), file=sys.stderr)
             raise

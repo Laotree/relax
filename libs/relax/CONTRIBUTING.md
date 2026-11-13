@@ -86,20 +86,20 @@ Start one harness with `relax test --live <package> --lib` (or `--test <name>`).
 Use `relax inspect list --json` to find its PID. Read the initial verdict with:
 
 ```sh
-relax inspect <pid> events on=testverdict since=0 full=1 --json
+relax inspect <pid> events on=testverdict since=0 --json
 ```
 
 Before saving an edit, keep the newest event's `seq`. Wait for its outcome with:
 
 ```sh
-relax inspect <pid> watch on=testverdict,patchrefused,patchfailed,patchreverted since=<seq> full=1 --json
+relax inspect <pid> watch on=testverdict,patchrefused,patchfailed,patchreverted since=<seq> --json
 ```
 
 A `testverdict` names the edit paths and patch `group`. Its `results` field gives
-the query for individual outcomes, `test-results group=<n> full=1`. Run it with:
+the query for individual outcomes, `test-results group=<n>`. Run it with:
 
 ```sh
-relax inspect <pid> test-results group=<n> full=1 --json
+relax inspect <pid> test-results group=<n> --json
 ```
 
 The reply starts with the `group` and `test_count`, then one JSON line per test
@@ -108,9 +108,9 @@ with its `name`, `status` (`passed`, `failed`, `ignored`, or `filtered`) and `ra
 failing result has `ran:false`. The query retains the latest completed run and
 rejects a different `group` rather than returning another edit's results.
 `patchrefused` includes build errors in `reasons`.
-Advance the sequence cursor after every event, including patch errors. Use `full=1`
-to read all test results beyond inspect's default reply limit. Verdict events
-stay small regardless of the number of tests.
+Advance the sequence cursor after every event, including patch errors. Inspect
+streams every result line without a reply limit. Verdict events stay small
+regardless of the number of tests.
 
 The end-to-end check for this interface is:
 

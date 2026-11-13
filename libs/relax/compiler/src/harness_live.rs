@@ -135,7 +135,7 @@ pub(super) fn complete(v: Verdict, ms: f64) -> Edit {
         s.edit.fields(), failures.iter().map(|n| json_str(n)).collect::<Vec<_>>().join(","),
         stale.iter().map(|n| json_str(n)).collect::<Vec<_>>().join(","));
     s.results = Some((s.edit.group, tests));
-    let fields = format!("{fields},\"results\":\"test-results group={} full=1\"", s.edit.group);
+    let fields = format!("{fields},\"results\":\"test-results group={}\"", s.edit.group);
     crate::inspect::events::emit("testverdict", &s.runs.to_string(), &fields);
     println!("testverdict group={} ran={ran} passed={passed} failed={failed} ms={ms:.1} selected={selected} skipped={skipped}{}", s.edit.group, why.as_ref().map_or(String::new(), |s| format!(" why={s:?}")));
     use std::io::Write;
