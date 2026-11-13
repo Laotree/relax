@@ -15,7 +15,9 @@
 //! itself (`relaunched`), as std's spawn would have put it before the arguments. And the run's
 //! build environment, which std's spawn hands such a run (progenv `BUILD_ENV`): that launch builds
 //! with it too, whatever environment the shell gave it, so it is this run's build and its program
-//! has the shell's environment (`relaunch_build`, relax issue 172). The environment is never in a
+//! has the shell's environment (`relaunch_build`, relax issue 172). A test's package binary that a
+//! launcher clearing the environment (`env -i`) started through its CARGO_BIN_EXE_<name> wrapper
+//! takes its test's run's that way too (`prepared_build`, relax issue 205). The environment is never in a
 //! file: it holds the person's tokens, and a run that is killed leaves its folder. On Unix the run
 //! keeps it in a file that has no name, by a descriptor an exec keeps, and `BUILD` says which
 //! (`hand_build`); on Windows `BUILD` is that file, which goes with the run's last handle.
@@ -272,6 +274,7 @@ pub(crate) unsafe fn reset_statics() {
 extern "C" {
     fn dup(fd: i32) -> i32;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    fn getppid() -> i32;
 }
 
 /// The build environment (progenv `build_wire`, the person's whole environment as the run started,
@@ -359,25 +362,74 @@ fn open_handed(fd: i32, dev: u64, ino: u64) -> Option<std::fs::File> {
 /// said in one line, when neither is there.
 #[cfg(unix)]
 pub fn relaunch_build() -> Option<Vec<u8>> {
+    let handed = handed_at(&std::fs::read(std::env::current_exe().ok()?.parent()?.join(BUILD)).ok()?)?;
+    let build = read_handed(&[handed], handed.0);
+    if build.is_none() {
+        eprintln!("relax: the build environment of the run whose executable this is did not reach this process (its descriptor was closed on the way); it builds with its own");
+    }
+    build
+}
+
+/// The first of the handed build environments `at` (`BUILD`'s words) whose descriptor this
+/// process holds, read and closed; on Linux, where a launcher closed it on the way, `parent`'s own
+/// through /proc.
+#[cfg(unix)]
+fn read_handed(at: &[(u32, i32, u64, u64)], parent: u32) -> Option<Vec<u8>> {
     use std::os::unix::fs::FileExt;
-    let (pid, fd, dev, ino) = handed_at(&std::fs::read(std::env::current_exe().ok()?.parent()?.join(BUILD)).ok()?)?;
     let read = |f: &std::fs::File| -> Option<Vec<u8>> {
         let mut b = vec![0; f.metadata().ok()?.len() as usize];
         f.read_exact_at(&mut b, 0).ok()?;
         Some(b)
     };
-    if let Some(f) = open_handed(fd, dev, ino) {
+    if let Some(f) = at.iter().find_map(|&(_, fd, dev, ino)| open_handed(fd, dev, ino)) {
         return read(&f);
     }
     #[cfg(target_os = "linux")]
-    if let Ok(f) = std::fs::File::open(format!("/proc/{pid}/fd/{fd}")) {
-        use std::os::unix::fs::MetadataExt;
-        if f.metadata().is_ok_and(|m| m.dev() == dev && m.ino() == ino) {
-            return read(&f);
+    for &(pid, fd, dev, ino) in at.iter().filter(|h| h.0 == parent) {
+        if let Ok(f) = std::fs::File::open(format!("/proc/{pid}/fd/{fd}")) {
+            use std::os::unix::fs::MetadataExt;
+            if f.metadata().is_ok_and(|m| m.dev() == dev && m.ino() == ino) {
+                return read(&f);
+            }
         }
     }
-    let _ = pid;
-    eprintln!("relax: the build environment of the run whose executable this is did not reach this process (its descriptor was closed on the way); it builds with its own");
+    let _ = parent;
+    None
+}
+
+/// A test's package binary started through its CARGO_BIN_EXE_<name> wrapper (unitgraph.rs: it sets
+/// RELAX_ARG0, its words name the test's run dir) without the build environment Relax std's spawn
+/// hands it (BUILD_ENV): a launcher between the test and the binary cleared the environment
+/// (`env -i`). The descriptor the test's run hands its build environment by (`hand_build`) crossed
+/// those execs, as it does for a launch of a run's own link: the run in `<run dir>/exe` whose
+/// `BUILD` names a descriptor this process holds started it, the parent's first (relax issue 205:
+/// without its CARGO_HOME the binary resolved its registry packages elsewhere, its test's native
+/// build no longer matched, and it built again). None, said in one line when the binary was
+/// started that way, when no run handed one.
+#[cfg(unix)]
+pub fn prepared_build(args: &[Vec<u8>]) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    if std::env::var_os("RELAX_ARG0").is_none() || std::env::var_os("RELAX_BUILD_ENV").is_some() {
+        return None;
+    }
+    let run_dir = args.windows(2).find(|w| w[0] == b"--run-dir").map(|w| Path::new(std::ffi::OsStr::from_bytes(&w[1])).to_path_buf())?;
+    let parent = unsafe { getppid() } as u32;
+    let mut at: Vec<(u32, i32, u64, u64)> = std::fs::read_dir(run_dir.join("exe")).into_iter().flatten().flatten()
+        .flat_map(|e| [e.path().join(BUILD), e.path().join("deps").join(BUILD)])
+        .filter_map(|f| handed_at(&std::fs::read(f).ok()?))
+        .collect();
+    at.sort_by_key(|h| h.0 != parent);
+    let build = read_handed(&at, parent);
+    if build.is_none() {
+        eprintln!("relax: the build environment of the test run that prepared this binary did not reach it (a launcher cleared the environment and closed its descriptor); it builds with its own");
+    }
+    build
+}
+
+/// On Windows a test's binary is started by its `.cmd` or a link above `deps/` (`bin_start`), and
+/// a launcher that clears the environment drops the build environment Relax std's spawn handed it.
+#[cfg(windows)]
+pub fn prepared_build(_args: &[Vec<u8>]) -> Option<Vec<u8>> {
     None
 }
 

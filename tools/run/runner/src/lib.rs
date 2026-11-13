@@ -227,8 +227,14 @@ pub fn main(host: &'static Host) {
     let relaunch = if bin.is_none() { relax_compiler::selfexe::relaunched(&relax_compiler::os::proc::args_bytes()) } else { None };
     // a self-exec child: the program values its parent passed, before anything reads the
     // environment (relax-base progenv.rs); a provided crate's read of the program's environment
-    // (relax-api env) answers with them
-    relax_compiler::progenv::init_handed(relaunch.as_ref().and_then(|_| relax_compiler::selfexe::relaunch_build()));
+    // (relax-api env) answers with them. A test's package binary that a launcher clearing the
+    // environment started builds with its test's run's build environment (selfexe.rs prepared_build).
+    let handed = match &relaunch {
+        Some(_) => relax_compiler::selfexe::relaunch_build(),
+        None if bin.is_none() => relax_compiler::selfexe::prepared_build(&relax_compiler::os::proc::args_bytes()),
+        None => None,
+    };
+    relax_compiler::progenv::init_handed(handed);
     relax_api::env::set_program_read(relax_compiler::progenv::program_var_os);
     if let Some(args) = bin.or(relaunch) {
         relax_compiler::os::proc::set_args(args);

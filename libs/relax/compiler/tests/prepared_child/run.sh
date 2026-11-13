@@ -11,7 +11,8 @@
 # is "prepared_child: ok" or "prepared_child: FAILED" (exit 1). And a run's program that a shell
 # execs again (its own executable, from a shell it starts with a cleared environment or another
 # build input) is that run's build too (relax issue 172, PR 175's shell case), and no file in
-# that run's folder holds its environment (PREPARED_MARKER's value).
+# that run's folder holds its environment (PREPARED_MARKER's value). The test also starts its binary
+# through `env -i`, a launcher that clears the environment, and that is still its build (relax issue 205).
 H=$(cd "$(dirname "$0")" && pwd)
 T=$(mktemp -d)
 [ -n "$T" ] && [ -d "$T" ] || exit 2
