@@ -132,6 +132,25 @@ impl KeyInputs {
     }
 }
 
+/// The shared-cache gate's counters: what the compile-time mark says, what the payload scan
+/// says, and where they disagree. A divergence is a hole in the mark and must be fixed; the scan
+/// stays the truth meanwhile.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct ShareCounts {
+    pub marked: u64,
+    pub scanned: u64,
+    pub divergence: u64,
+}
+
+impl ShareCounts {
+    /// Record one entry: `marked` from the crate mark, `scanned` from the payload scan.
+    pub(crate) fn note(&mut self, marked: bool, scanned: bool) {
+        if marked { self.marked += 1; }
+        if scanned { self.scanned += 1; }
+        if scanned && !marked { self.divergence += 1; }
+    }
+}
+
 /// Whether an entry may use the path-free identity: the shared mode is on and the payload scan
 /// found no `ws` path. A carrying payload keeps its anchors, so it is rebuilt per worktree.
 pub(crate) fn path_free_identity(shared: bool, payload: &[u8]) -> bool {
@@ -11044,6 +11063,18 @@ mod prune_tests {
         for m in muts {
             assert!(seen.insert(m.hash()), "a mutated input kept the hash");
         }
+    }
+
+    /// The counters separate what the mark claims from what the scan proves.
+    #[test]
+    fn share_counts_record_divergence() {
+        let mut c = ShareCounts::default();
+        c.note(false, false);
+        c.note(true, true);
+        c.note(false, true);
+        assert_eq!(c.marked, 1);
+        assert_eq!(c.scanned, 2);
+        assert_eq!(c.divergence, 1, "the scan found a path the mark missed");
     }
 
     /// The path-free identity is used only in shared mode and only for a payload the scan found
