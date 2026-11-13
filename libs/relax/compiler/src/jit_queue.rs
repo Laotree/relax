@@ -1114,13 +1114,24 @@ mod tests {
 
     #[test]
     fn a_jobs_cpu_goes_to_its_tier_and_slot() {
+        // (the counts are process-wide and other tests add to theirs: it checks what its own jobs
+        // added, so it holds beside them and when a warm test process runs it again)
         let slot = u32::MAX - 11;
+        let of_slot = || SLOT_CPU.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&slot).copied()).unwrap_or_default();
+        let tiers = || [1, 2].map(|t| (JOB_CPU[t].load(Ordering::Relaxed), JOB_RUNS[t].load(Ordering::Relaxed)));
+        let (slot0, tiers0) = (of_slot(), tiers());
         note_job(2, Some(slot), 5_000_000);
         note_job(2, Some(slot), 5_000_000);
         note_job(1, Some(slot), 1_000_000);
+        let (slot1, tiers1) = (of_slot(), tiers());
+        assert_eq!([0, 1, 2, 3].map(|i| slot1[i] - slot0[i]), [1_000_000, 1, 10_000_000, 2], "the slot's O2 and O3 time and runs");
+        for (t, (ns, runs)) in [(0, (1_000_000, 1)), (1, (10_000_000, 2))] {
+            assert!(tiers1[t].0 - tiers0[t].0 >= ns && tiers1[t].1 - tiers0[t].1 >= runs, "tier {} totals hold the jobs", t + 1);
+        }
         let rows = spent(usize::MAX);
         assert!(rows[0].contains("O3 "), "by tier first: {}", rows[0]);
-        assert!(rows.iter().any(|r| r.starts_with(&format!("S{slot} O2 1.0 ms x1 O3 10.0 ms x2"))), "{rows:?}");
+        let row = format!("S{slot} O2 {:.1} ms x{} O3 {:.1} ms x{}", slot1[0] as f64 / 1e6, slot1[1], slot1[2] as f64 / 1e6, slot1[3]);
+        assert!(rows.iter().any(|r| r.starts_with(&row)), "{row} in {rows:?}");
     }
 
     #[test]
