@@ -2562,12 +2562,13 @@ pub fn veorq_u8(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
     }
 }
 
-// a + b * c: stdarch's full-vector FMLA operand order; indexed FMLA uses b, c.
+// a + b * c (the indexed forms below multiply b by a lane of c).
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vfmaq_f32(a: float32x4_t, b: float32x4_t, c: float32x4_t) -> float32x4_t {
+    // FMLA with c as its first multiplicand, as rustc's: a NaN in c takes precedence over one in b
     unsafe {
-        vx::vx_ternary(a, b, c, 8)
+        vx::vx_ternary(a, c, b, 8)
     }
 }
 
@@ -2614,22 +2615,24 @@ pub fn vfmaq_laneq_f64<const LANE: i32>(
     float64x2_t(r)
 }
 
-// a - b * c: stdarch's full-vector FMLS operand order.
+// a - b * c: FMLS with c as its (negated) first multiplicand, as rustc's: a NaN in c takes
+// precedence over one in b and comes out with its sign flipped
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vfmsq_f32(a: float32x4_t, b: float32x4_t, c: float32x4_t) -> float32x4_t {
     unsafe {
-        vx::vx_ternary(a, b, c, 9)
+        vx::vx_ternary(a, c, b, 9)
     }
 }
 
-// a - b * c: stdarch negates `b`, then vfmaq_f64 (a NaN taken from `b` comes back negated).
+// a - b * c: FMLS with c as its (negated) first multiplicand, as rustc's and vfmsq_f32: a NaN in
+// c takes precedence over one in b and comes out with its sign flipped, one in b keeps its sign
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vfmsq_f64(a: float64x2_t, b: float64x2_t, c: float64x2_t) -> float64x2_t {
     let mut r = [0.0; 2];
     let mut i = 0;
     while i < 2 {
-        r[i] = neon_fma_f64(a.0[i], c.0[i], -b.0[i]);
+        r[i] = neon_fma_f64(a.0[i], -c.0[i], b.0[i]);
         i += 1;
     }
     float64x2_t(r)
