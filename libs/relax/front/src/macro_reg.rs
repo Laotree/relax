@@ -561,7 +561,7 @@ fn merged_host_units_keep_features_and_dependencies() {
         pkg_id: format!("path+file://{dir}/{name}#0.1.0"),
         name: name.to_string(), kind: vec![kind.to_string()],
         src_path: format!("{dir}/{name}/src/lib.rs"), edition: "2021".to_string(),
-        host, mode: "build".to_string(), harness: false, sysroot: false, features: features.iter().map(|s| s.to_string()).collect(),
+        host, debug_assertions: false, mode: "build".to_string(), harness: false, sysroot: false, features: features.iter().map(|s| s.to_string()).collect(),
         deps: deps.iter().map(|(d, n)| (*d, n.to_string())).collect(),
     };
     let units = Units { units: vec![
@@ -644,8 +644,13 @@ pub fn set_build_outputs(sess: &std::sync::Arc<crate::Session>, units: &[CrateUn
                 if u.name == c.name && u.harness == c.harness {
                     let host_outputs = c.host.as_ref().and_then(|h| h.build_outputs.as_ref());
                     if let Some(cs) = host_outputs.map(|o| &o.0).or_else(|| cfgs.get(ci)) {
-                        if u.cfgs != *cs {
-                            u.cfgs = cs.clone();
+                        let mut cs = cs.clone();
+                        if let Some(host) = &c.host {
+                            cs.retain(|c| c != "debug_assertions");
+                            if host.debug_assertions { cs.push("debug_assertions".to_string()); }
+                        }
+                        if u.cfgs != cs {
+                            u.cfgs = cs;
                             if u.proc_macro {
                                 rescan.push((ui, u.src_path.clone(), u.edition));
                             }

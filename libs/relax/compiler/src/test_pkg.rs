@@ -26,6 +26,20 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
             i += 1;
             continue;
         }
+        if args[i] == "--release" || args[i] == "--profile" || args[i].starts_with("--profile=") {
+            let takes_value = args[i] == "--profile";
+            flags.push(args[i].clone());
+            i += 1;
+            if takes_value {
+                let Some(v) = args.get(i) else {
+                    eprintln!("relax test: --profile needs a value");
+                    return 2;
+                };
+                flags.push(v.clone());
+                i += 1;
+            }
+            continue;
+        }
         if is_feature_flag(&args[i]) {
             let takes_value = matches!(args[i].as_str(), "--features" | "-F");
             feature_flags.push(args[i].clone());
@@ -111,7 +125,14 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
             },
             // every target runs anyway: one failing says nothing about the next
             "--no-fail-fast" => {}
-            "--release" => {}
+            "--release" => flags.push(w.clone()),
+            "--profile" => {
+                let Some(v) = words.next() else {
+                    eprintln!("relax test: --profile needs a value");
+                    return 2;
+                };
+                flags.extend([w.clone(), v.clone()]);
+            }
             "--features" | "-F" => {
                 let Some(v) = words.next() else {
                     eprintln!("relax test: {w} needs a value");

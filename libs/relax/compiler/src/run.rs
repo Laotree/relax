@@ -648,7 +648,7 @@ fn with_sysroot_proc_macro(mut units: unitgraph::Units, std_dir: &str) -> unitgr
     units.units.push(unitgraph::GraphUnit {
         pkg_id: format!("path+file://{}/proc_macro#proc_macro@0.0.0", std_dir),
         kind: vec!["lib".to_string()], name: "proc_macro".to_string(), src_path: pm_root, edition: "2021".to_string(),
-        host: false, mode: "build".to_string(), harness: false, sysroot: true, features: Vec::new(), deps: Vec::new(),
+        host: false, debug_assertions: false, mode: "build".to_string(), harness: false, sysroot: true, features: Vec::new(), deps: Vec::new(),
     });
     for r in roots { units.units[r].deps.push((pm, "proc_macro".to_string())); }
     units

@@ -31,6 +31,7 @@ pub struct CrateUnit {
 
 pub struct HostUnit {
     pub features: Vec<String>,
+    pub debug_assertions: bool,
     pub deps: Vec<(usize, String)>,
     /// Build-script cfgs and environment for this host feature set, not the target's.
     pub build_outputs: Option<(Vec<String>, Vec<(String, String)>)>,

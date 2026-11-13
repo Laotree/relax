@@ -1,0 +1,18 @@
+[package]
+name = "test-profile-cfg"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+exclude = ["dep", "macros"]
+
+[dependencies]
+profile-dep = { path = "dep" }
+profile-macros = { path = "macros" }
+
+[features]
+debug = []
+dep-debug = []
+build-debug = []
+macro-debug = []
+host-dep-debug = []

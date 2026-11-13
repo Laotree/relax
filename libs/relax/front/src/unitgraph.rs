@@ -48,6 +48,7 @@ pub struct RawUnit {
     pub edition: u16,
     pub features: Vec<String>,
     pub proc_macro: bool,
+    pub debug_assertions: bool,
     pub deps: Vec<(usize, String)>,
     /// a `run-custom-build` unit: running its package's build script (deps[0] compiles it)
     pub run_script: bool,
@@ -151,9 +152,10 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
     let mut root_bins: Vec<(usize, String, String)> = Vec::new();
     // crates built with `--test` (cargo's unit mode "test"): cfg(test) is set for them
     let mut test_crates: Vec<usize> = Vec::new();
+    let mut debug_crates: Vec<usize> = Vec::new();
     // unit index of a run-custom-build unit -> its script (src_path, edition, features, build unit)
     let mut run_build: Vec<Option<(String, u16, Vec<String>, usize)>> = vec![None; n_units];
-    let mut raw: Vec<RawUnit> = vec![RawUnit { name: String::new(), src_path: String::new(), edition: 2015, features: Vec::new(), proc_macro: false, deps: Vec::new(), run_script: false, pkg: Default::default(), path_source: false }; n_units];
+    let mut raw: Vec<RawUnit> = vec![RawUnit { name: String::new(), src_path: String::new(), edition: 2015, features: Vec::new(), proc_macro: false, debug_assertions: false, deps: Vec::new(), run_script: false, pkg: Default::default(), path_source: false }; n_units];
     // a crate used on both sides (normal dependency and build-dependency / proc-macro side) is one
     // crate here: keep the target side for the app and the host side for the macro world.
     // Cargo reference features.md#feature-resolver-version-2 keeps their features separate;
@@ -198,7 +200,7 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
             }
             (d, n, v)
         };
-        raw[ui] = RawUnit { name: tname.clone(), src_path: src_path.clone(), edition, features: features.clone(), proc_macro: pm, deps: udeps.clone(), run_script: build && mode == "run-custom-build", pkg: (pkg_dir.clone(), pname.clone(), ver.clone()),
+        raw[ui] = RawUnit { name: tname.clone(), src_path: src_path.clone(), edition, features: features.clone(), proc_macro: pm, debug_assertions: u.debug_assertions, deps: udeps.clone(), run_script: build && mode == "run-custom-build", pkg: (pkg_dir.clone(), pname.clone(), ver.clone()),
             path_source: !u.sysroot && u.pkg_id.starts_with("path+") };
         // the run unit depends on the script's compile unit, whose deps are the build-dependencies
         let build_unit = udeps.first().map(|d| d.0).unwrap_or(usize::MAX);
@@ -211,7 +213,7 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
         if let Some(i) = crate_paths.iter().position(|p| *p == norm) {
             map[ui] = i;
             if u.host {
-                crates[i].host = Some(HostUnit { features, deps: udeps, build_outputs: None });
+                crates[i].host = Some(HostUnit { features, debug_assertions: u.debug_assertions, deps: udeps, build_outputs: None });
             }
             if is_root_bin || (root == usize::MAX && roots.contains(&ui)) { root = i; }
             continue;
@@ -234,6 +236,7 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
         if mode == "test" {
             test_crates.push(crates.len());
         }
+        if u.debug_assertions { debug_crates.push(crates.len()); }
         let tname = if u.sysroot { tname } else { crate::crates::own_crate_name(tname) };
         crates.push(CrateUnit { name: tname, src_path, edition, features, deps: udeps, host: None, proc_macro: pm, bin, harness: u.harness, build_script: false, version: ver.clone(), registry: !u.pkg_id.starts_with("path+") });
         crate_paths.push(norm);
@@ -363,6 +366,7 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
     for &ci in &test_crates {
         cfgs[ci].push("test".to_string());
     }
+    for &ci in &debug_crates { cfgs[ci].push("debug_assertions".to_string()); }
     // a single integration test is the graph's only test root: it is listed like several
     if bins.is_empty() && test_crates.contains(&root) && crates[root].bin {
         bins.push(root);
@@ -1034,12 +1038,13 @@ fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrit
         let edition = u.edition.to_string();
         let feats: Vec<String> = u.features.iter().map(|f| q(f)).collect();
         units.push(format!(
-            "{{\"pkg_id\":{},\"target\":{{\"kind\":[\"{}\"],\"name\":{},\"src_path\":{},\"edition\":\"{}\"}},\"profile\":{{\"opt_level\":\"3\"}},\"mode\":\"{}\",\"features\":[{}],\"dependencies\":[{}]}}",
+            "{{\"pkg_id\":{},\"target\":{{\"kind\":[\"{}\"],\"name\":{},\"src_path\":{},\"edition\":\"{}\"}},\"profile\":{{\"opt_level\":\"3\",\"debug_assertions\":{}}},\"mode\":\"{}\",\"features\":[{}],\"dependencies\":[{}]}}",
             q(&format!("path+file://{}#{}@{}", u.pkg.0, u.pkg.1, u.pkg.2)),
             kind,
             q(&name),
             q(&u.src_path),
             edition,
+            u.debug_assertions,
             mode,
             feats.join(","),
             deps_json(&u.deps)
@@ -1057,10 +1062,11 @@ fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrit
     let pkg_dir = manifest_dir_of(&bs.src_path);
     let sfeats: Vec<String> = bs.features.iter().map(|f| q(f)).collect();
     let script_unit = |src_path: &str| format!(
-        "{{\"pkg_id\":{},\"target\":{{\"kind\":[\"bin\"],\"name\":\"build-script-build\",\"src_path\":{},\"edition\":\"{}\"}},\"profile\":{{\"opt_level\":\"3\"}},\"mode\":\"build\",\"features\":[{}],\"dependencies\":[{}]}}",
+        "{{\"pkg_id\":{},\"target\":{{\"kind\":[\"bin\"],\"name\":\"build-script-build\",\"src_path\":{},\"edition\":\"{}\"}},\"profile\":{{\"opt_level\":\"3\",\"debug_assertions\":{}}},\"mode\":\"build\",\"features\":[{}],\"dependencies\":[{}]}}",
         q(&format!("path+file://{}#build-script-build@0.0.0", pkg_dir)),
         q(src_path),
         bs.edition,
+        raw.iter().find(|u| u.src_path == bs.src_path && !u.run_script).is_some_and(|u| u.debug_assertions),
         sfeats.join(","),
         deps_json(&build_deps)
     );

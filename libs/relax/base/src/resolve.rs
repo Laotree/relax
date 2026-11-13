@@ -1687,6 +1687,7 @@ fn enabled_features(features: &BTreeMap<String, Vec<String>>, implicit: &BTreeSe
 }
 
 pub struct Options {
+    pub profile: Option<String>,
     pub offline: bool,
     pub no_default_features: bool,
     pub all_features: bool,
@@ -1785,7 +1786,7 @@ pub enum TestSel {
 }
 
 pub fn parse_flags(flags: &[String]) -> Result<Options, String> {
-    let mut o = Options { offline: false, no_default_features: false, all_features: false, features: Vec::new(), bin: None, example: None, test: None, check: None };
+    let mut o = Options { profile: None, offline: false, no_default_features: false, all_features: false, features: Vec::new(), bin: None, example: None, test: None, check: None };
     let mut lib = false;
     let mut bins = false;
     let mut bin_names: Vec<String> = Vec::new();
@@ -1820,10 +1821,13 @@ pub fn parse_flags(flags: &[String]) -> Result<Options, String> {
                 let v = value(&mut i)?;
                 tests.get_or_insert_with(Vec::new).push(v);
             }
-            "--release" => {}
+            "--release" => o.profile = Some("release".to_string()),
+            "--profile" => o.profile = Some(value(&mut i)?),
             "--offline" | "--frozen" => o.offline = true,
             _ => {
-                if let Some(v) = f.strip_prefix("--features=").or_else(|| f.strip_prefix("-F").map(|v| v.trim_start_matches('='))) {
+                if let Some(v) = f.strip_prefix("--profile=") {
+                    o.profile = Some(v.to_string());
+                } else if let Some(v) = f.strip_prefix("--features=").or_else(|| f.strip_prefix("-F").map(|v| v.trim_start_matches('='))) {
                     o.features.extend(v.split(|c: char| c == ',' || c.is_whitespace()).filter(|x| !x.is_empty()).map(str::to_string));
                 } else if let Some(v) = f.strip_prefix("--bin=") {
                     bin_names.push(v.to_string());
@@ -2031,6 +2035,7 @@ pub struct GraphUnit {
     pub edition: String,
     /// a host-side unit (build-dependency / proc-macro side)
     pub host: bool,
+    pub debug_assertions: bool,
     /// build | run-custom-build
     pub mode: String,
     /// built with rustc's `--test`: libtest's generated main replaces the crate's own
@@ -2073,6 +2078,7 @@ impl Units {
                     src_path: s(t.and_then(|t| t.get("src_path"))),
                     edition: s(t.and_then(|t| t.get("edition"))),
                     host: matches!(u.get("relax_host"), Some(crate::json::Json::Bool(true))),
+                    debug_assertions: u.get("profile").and_then(|p| p.get("debug_assertions")).is_some_and(|v| matches!(v, crate::json::Json::Bool(true))),
                     mode: s(u.get("mode")),
                     harness: u.get("mode").is_some_and(|m| m.str() == "test"),
                     sysroot: false,
@@ -2396,7 +2402,47 @@ enum UKind {
     BuildRun,
 }
 
+fn profile_chain<'a>(profiles: &'a TomlTable, name: &str) -> Result<(bool, Vec<&'a TomlTable>), String> {
+    let mut chain = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut name = name.to_string();
+    let default;
+    loop {
+        if !seen.insert(name.clone()) { return Err(format!("profile `{name}` has cyclic inheritance")); }
+        let profile = table(profiles, &name);
+        if let Some(p) = profile { chain.push(p); }
+        name = match name.as_str() {
+            "dev" => { default = true; break; }
+            "release" => { default = false; break; }
+            "test" => "dev".to_string(),
+            "bench" => "release".to_string(),
+            _ => profile.and_then(|p| s(p, "inherits")).ok_or_else(|| format!("profile `{name}` needs `inherits`"))?,
+        };
+    }
+    chain.reverse();
+    Ok((default, chain))
+}
+
+fn profile_debug_assertions(default: bool, chain: &[&TomlTable], m: &Manifest, member: bool, host: bool) -> bool {
+    let (mut base, mut build, mut wildcard, mut package) = (default, None, None, None);
+    for p in chain {
+        if let Some(v) = b(p, "debug-assertions") { base = v; }
+        if let Some(v) = table(p, "build-override").and_then(|t| b(t, "debug-assertions")) { build = Some(v); }
+        if let Some(packages) = table(p, "package") {
+            if let Some(v) = table(packages, "*").and_then(|t| b(t, "debug-assertions")) { wildcard = Some(v); }
+            if let Some(v) = table(packages, &m.name).and_then(|t| b(t, "debug-assertions")) { package = Some(v); }
+        }
+    }
+    package.or(wildcard.filter(|_| !member)).or(build.filter(|_| host)).unwrap_or(base)
+}
+
 fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, bool)], root: usize, o: &Options) -> Result<Units, String> {
+    let manifest = read_toml(&format!("{}/Cargo.toml", r.ws.root))?;
+    let profiles = table(&manifest, "profile").cloned().unwrap_or_default();
+    let testing = o.test.is_some();
+    let (debug_default, profile) = profile_chain(&profiles, o.profile.as_deref().unwrap_or(if testing { "test" } else { "release" }))?;
+    let wildcard = profile.iter().any(|p| table(p, "package").and_then(|p| table(p, "*")).is_some());
+    let members: Vec<bool> = r.manifests.iter().map(|m| !wildcard || r.ws.has_member(&m.dir)).collect();
     // units: (node, kind) -> index
     let mut index: HashMap<((usize, bool), UKind), usize> = HashMap::new();
     let mut units: Vec<((usize, bool), UKind)> = Vec::new();
@@ -2688,6 +2734,7 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
             src_path: if cfg!(windows) { path.replace('/', "\\") } else { path },
             edition,
             host,
+            debug_assertions: profile_debug_assertions(debug_default, &profile, m, members[k.0], host),
             mode: mode.to_string(),
             harness: match u {
                 UKind::LibTest | UKind::BinTest(_) => true,

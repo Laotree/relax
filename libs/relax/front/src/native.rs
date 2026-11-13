@@ -1542,7 +1542,7 @@ fn test_selections_check_with_dev_dependencies() {
 fn script_selection_follows_every_unit_of_a_package() {
     // two units of `a` (host and target feature sets): the second one's dependency is a real build too
     let unit = |name: &str, deps: &[usize]| crate::unitgraph::RawUnit {
-        name: name.to_string(), src_path: String::new(), edition: 2021, features: Vec::new(), proc_macro: false,
+        name: name.to_string(), src_path: String::new(), edition: 2021, features: Vec::new(), proc_macro: false, debug_assertions: false,
         deps: deps.iter().map(|&d| (d, String::new())).collect(), run_script: false,
         pkg: (String::new(), name.to_string(), "1.0.0".to_string()), path_source: false,
     };
@@ -1560,7 +1560,7 @@ fn script_selection_follows_every_unit_of_a_package() {
 fn native_key_uses_sorted_resolved_packages() {
     let unit = |name: &str, version: &str, features: &[&str]| crate::unitgraph::RawUnit {
         name: name.into(), src_path: String::new(), edition: 2021,
-        features: features.iter().map(|f| f.to_string()).collect(), proc_macro: false,
+        features: features.iter().map(|f| f.to_string()).collect(), proc_macro: false, debug_assertions: false,
         deps: Vec::new(), run_script: false,
         pkg: (format!("packages/{name}"), name.into(), version.into()), path_source: false,
     };
@@ -1595,7 +1595,7 @@ fn native_key_follows_the_resolved_closure_and_its_path_sources() {
     let at = |rel: &str| ws.join(rel).display().to_string();
     let unit = |name: &str, dir: String, features: &[&str], deps: &[usize], path_source: bool| crate::unitgraph::RawUnit {
         name: name.into(), src_path: String::new(), edition: 2021, features: features.iter().map(|f| f.to_string()).collect(),
-        proc_macro: false, deps: deps.iter().map(|&d| (d, String::new())).collect(), run_script: false,
+        proc_macro: false, debug_assertions: false, deps: deps.iter().map(|&d| (d, String::new())).collect(), run_script: false,
         pkg: (dir, name.into(), "1.0.0".into()), path_source,
     };
     // the package a run is for (`root`), the native package n (its lib, and its script, which
