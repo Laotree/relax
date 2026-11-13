@@ -622,6 +622,25 @@ impl<I: Iterator> Iterator for Skip<I> {
             self.iter.next()
         }
     }
+    // core skip.rs: the skip and the `n` go to the inner iterator as one `nth`, which a slice
+    // iterator answers in O(1). The default would take `n` steps: `step_by` over a `skip` of a
+    // slice was quadratic.
+    fn nth(&mut self, n: usize) -> Option<I::Item> {
+        if self.n > 0 {
+            let skip = crate::mem::take(&mut self.n);
+            let n = match skip.checked_add(n) {
+                Some(nth) => nth,
+                None => {
+                    // more than usize::MAX items: the skip goes first, as an nth of its own
+                    self.iter.nth(skip - 1)?;
+                    n
+                }
+            };
+            self.iter.nth(n)
+        } else {
+            self.iter.nth(n)
+        }
+    }
     fn size_hint(&self) -> (usize, Option<usize>) {
         let (lower, upper) = self.iter.size_hint();
         let lower = lower.saturating_sub(self.n);
