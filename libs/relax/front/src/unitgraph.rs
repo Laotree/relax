@@ -553,9 +553,17 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
         Some(Inherit::Binary(r)) if !seeds.is_empty() && builds => Some((r, true)),
         _ => None,
     }.and_then(|(r, binary)| {
-        let taken = crate::native::read_receipt(r).and_then(|rc| Some((inherited_scripts(g, &seeds, &rc.scripts, binary)?, rc.lib)));
+        let mut taken = crate::native::read_receipt(r).and_then(|rc| Some((inherited_scripts(g, &seeds, &rc.scripts, binary)?, rc.lib)));
         if binary && taken.is_none() {
             eprintln!("relax run: the native build {r} does not cover this build's native packages; this run builds its own");
+        }
+        // a build script's run loads its parent's library only with the parent's `--allow-c`,
+        // which the parent passes it (run_one): the receipt names it and grants nothing; its
+        // outputs (cfgs, OUT_DIR) still compile the script
+        if let Some((_, lib)) = taken.as_mut().filter(|_| !binary && !sess.options.allow_c) {
+            if lib.take().is_some() {
+                eprintln!("relax run: the native library RELAX_NATIVE_RECEIPT names is not loaded: this run has no --allow-c");
+            }
         }
         taken
     });
