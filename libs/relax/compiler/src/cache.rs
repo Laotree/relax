@@ -2935,6 +2935,17 @@ impl Cache {
     /// Slot `id`'s code key and its identity bytes (`enc_fnkey`, as `slot_bytes` encodes them).
     fn slot_key_uncached(&mut self, u: &Unit, id: u32) -> Option<(u128, Vec<u8>)> {
         let key = u.fns[id as usize].key.clone();
+        // Shared mode computes both variants: the path-free identity is looked up first, and a
+        // placeholder under it says this identity carries paths, so the anchor identity is used.
+        // A payload is never written under the path-free key without that conclusion.
+        if matches!(crate::dirs::shared_cache_mode(), Ok(true)) {
+            let free = with_identity_anchors(false, || self.code_key_bytes(u, &key))?;
+            let anchored = with_identity_anchors(true, || self.code_key_bytes(u, &key))?;
+            let carries = self.get(free.0).is_some_and(|(kind, p)| kind == KIND_SHARE_PLACEHOLDER && p == SHARE_PLACEHOLDER);
+            self.slot_crates.insert(id, anchored.1);
+            let k = if carries { anchored.0 } else { free.0 };
+            return Some((k, anchored.2));
+        }
         let (k, crates, bytes) = self.code_key_bytes(u, &key)?;
         self.slot_crates.insert(id, crates);
         Some((k, bytes))
@@ -11046,8 +11057,8 @@ mod prune_tests {
     /// so both key variants of an identity can be computed.
     #[test]
     fn identity_anchor_switch_computes_both_variants() {
-        let on = super::with_identity_anchors(true, || super::anchors_in_key());
-        let off = super::with_identity_anchors(false, || super::anchors_in_key());
+        let on = with_identity_anchors(true, || super::anchors_in_key());
+        let off = with_identity_anchors(false, || super::anchors_in_key());
         assert_eq!(off, 0);
         assert_ne!(on, off, "the on variant mixes the anchor dirs");
         assert_eq!(super::anchors_in_key(), on, "on is the default");
