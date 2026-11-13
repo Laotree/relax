@@ -289,7 +289,11 @@ pub fn describe(e: &Ev, code: &dyn Fn(u64) -> String) -> String {
         ev::WINDOW_END => format!("counted window ended: {} ({} entries/s)", WIN_WHY.get(e.why as usize).unwrap_or(&"?"), e.a),
         ev::PARKED => "parked in counted code: too little work for O3".into(),
         ev::O3_INSTALLED => format!("O3 code installed ({} build)", ms(e.a)),
-        ev::O3_DROPPED => format!("O3 build dropped: {}", DROP_WHY.get(e.why as usize).unwrap_or(&"?")),
+        ev::O3_DROPPED => {
+            // (the slot changed: the kind of the code that went in, + 1)
+            let now = (e.why == DROP_SLOT_CHANGED && e.a != 0).then(|| crate::jit::CodeKind::new(((e.a - 1) & 0xff) as u8, ((e.a - 1) >> 8) as u8));
+            format!("O3 build dropped: {}{}", DROP_WHY.get(e.why as usize).unwrap_or(&"?"), now.map_or(String::new(), |k| format!(": now {} code ({})", k.tier_name(), k.origin_name())))
+        }
         ev::O3_REFUSED if e.why == REFUSE_TAKE => format!("O3 build not started: {}", describe_take_bail(e)),
         ev::O3_REFUSED => format!("O3 build not started: {}", REFUSE_WHY.get(e.why as usize).unwrap_or(&"?")),
         ev::RETIER => format!("queued to be built again (retier {} of 4)", e.a),

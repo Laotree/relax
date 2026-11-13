@@ -8107,6 +8107,7 @@ impl Unit {
                 self.fns[id as usize].unverified.store(true, Ordering::Relaxed);
                 note_unverified(self, id);
                 self.fns[id as usize].rir = None;
+                unsafe { (*tier_rec(&self.slots, id).add(5)).fetch_or(RETIER_FIX, Ordering::Relaxed) };
                 tier_push(id, Q_RETIER, 0);
             }
         }
@@ -9613,7 +9614,7 @@ unsafe fn cached_tier1(up: *mut Unit, id: u32, inlined: &[u32], kept: &[u32]) {
                 crate::zone_alloc::kept_with(|| for &c in &pending { a.push((up as usize, c, id)); });
             }
             if failed {
-                u.retier(id);
+                u.retier_fix(id);
             }
         }
     }
@@ -18157,6 +18158,74 @@ mod tier_cost_tests {
         }
     }
 
+    /// A rebuild (retier) of O3 code is built at its pick only while that code runs, as a calls
+    /// entry is: O3 code has no count stub, so its record only decays while the rebuild waits.
+    /// Under the threshold it counts again (RETIER_WAIT): code that runs on queues itself again as
+    /// that rebuild within a second or two and is built at that pick, code that stopped is not
+    /// built. One asked for correctness (RETIER_FIX) is built at its first pick, cold or not.
+    /// Counts and order only (the test's clocks).
+    #[test]
+    fn a_rebuild_is_built_only_while_its_code_runs() {
+        const S: u64 = 1_000_000_000;
+        let th = tier_threshold(2000);
+        let w = th / 64;
+        // `per_s` cost units a second for `ns` from `t` charged to a counting record, a check
+        // wherever its budget runs out (rt_hot); queued: when, and the reason it is queued for
+        unsafe fn run(r: *const AtomicU64, th: u64, w: u64, per_s: u64, t: &mut u64, ns: u64) -> Option<(u64, u8)> {
+            let (gap, end) = (w * S / per_s, *t + ns);
+            while *t < end {
+                *t += gap;
+                if ((*r).fetch_sub(w, Ordering::Relaxed) as i64) - (w as i64) <= 0
+                    && (*r.add(3)).load(Ordering::Relaxed) == T_COUNTING
+                    && tier_check(r, th, *t, *t).is_some()
+                {
+                    (*r.add(3)).store(T_QUEUED, Ordering::Relaxed);
+                    return Some((*t, queued_as(r, Q_CALLS)));
+                }
+            }
+            None
+        }
+        let hot = 4 * (th as f64 * std::f64::consts::LN_2 / (COST_HALF_LIFE_NS / 1e9)) as u64;
+        for (fix, runs_on) in [(true, false), (false, true), (false, false)] {
+            let rec: Vec<AtomicU64> = (0..TIER_REC / 8).map(|_| AtomicU64::new(0)).collect();
+            let r = rec.as_ptr();
+            unsafe {
+                tier_count_fresh(r, th, 1, 1);
+                (*r.add(3)).store(T_COUNTING, Ordering::Relaxed);
+                let mut t = 1;
+                assert_eq!(run(r, th, w, hot, &mut t, 10 * S).map(|q| q.1), Some(Q_CALLS), "hot code is queued for its calls");
+                // built at O3 (the record stays queued, nothing charges it), its rebuild asked
+                // for 20 s later
+                t += 20 * S;
+                if fix {
+                    (*r.add(5)).fetch_or(RETIER_FIX, Ordering::Relaxed);
+                }
+                match (fix, retier_decision(r, th, t)) {
+                    (true, Pick::Build) => {
+                        assert_eq!((*r.add(5)).load(Ordering::Relaxed) & RETIER_FIX, 0, "a rebuild for correctness is built, its mark gone with the pick");
+                    }
+                    (false, Pick::Recount(cost)) => {
+                        // retier_recount's record: a count stub in front of the O3 code
+                        (*r.add(5)).fetch_or(RETIER_WAIT, Ordering::Relaxed);
+                        count_again(r, th, cost, t, t, true);
+                        let picked = t;
+                        let again = if runs_on { run(r, th, w, hot, &mut t, 10 * S) } else { None };
+                        if !runs_on {
+                            assert!(again.is_none(), "code that stopped is not queued again: no rebuild");
+                            continue;
+                        }
+                        let (at, why) = again.expect("code that runs on queues itself again");
+                        assert_eq!(why, Q_RETIER, "as the rebuild it waits to be");
+                        assert!(at - picked < 2 * S, "within a second or two: {} ms", (at - picked) / 1_000_000);
+                        assert_eq!(retier_decision(r, th, at + 20 * S), Pick::Build, "and is built at that pick, however long it waits");
+                        assert_eq!((*r.add(5)).load(Ordering::Relaxed) & (RETIER_WAIT | PICK_RECOUNTED), 0, "the marks go with the queueing and the pick");
+                    }
+                    (fix, d) => panic!("a rebuild (for correctness {fix}), code running on {runs_on}: {d:?}"),
+                }
+            }
+        }
+    }
+
     /// A final slot counts again for its loop only at the rate its O3 decision needs: without PGO
     /// the threshold's rate, under PGO the counted window's bar (PGO_MIN_WORK RIR insts/s at
     /// WORK_PER_UNIT per back edge), ~3x over it. A loop between the two used to count again and be
@@ -19100,7 +19169,7 @@ pub fn sweep_verdicts() {
             if specv_trace() {
                 eprintln!("specv @{:.3} O3 #{} {} built again: it inlined a callee the borrow checker rejected", wall_ns() as f64 / 1e9, r, short_name(&u.fns[r as usize].name));
             }
-            (&mut *up).retier(r);
+            (&mut *up).retier_fix(r);
         }
         for &r in &again {
             if specv_trace() {
@@ -19543,6 +19612,12 @@ const CODE_BYTES: u64 = (1 << 48) - 1;
 /// Tier record word 5: the slot's O3 entry, queued by its calls, left at its pick to count again
 /// (o3_pick_cold): queued again since, it is built at its next pick, its recount the evidence.
 const PICK_RECOUNTED: u64 = 1 << 63;
+/// Tier record word 5: the slot's rebuild (a retier) left at its pick to count again (o3_pick_cold):
+/// queued again by its count stub, it is queued as that rebuild (queue_counting).
+const RETIER_WAIT: u64 = 1 << 57;
+/// Tier record word 5: the slot's queued rebuild is asked for correctness (its code inlined a callee
+/// the borrow checker rejected, or lacks its run-time checks): built at its pick, hot or not.
+const RETIER_FIX: u64 = 1 << 58;
 /// O3 queue entries that left at their pick: their code no longer ran at the threshold's rate
 /// (o3_pick_cold)
 pub static TIER_LEFT: AtomicU64 = AtomicU64::new(0);
@@ -19623,6 +19698,18 @@ unsafe fn pick_decision(rec: *const AtomicU64, why: u8, threshold: u64, now: u64
     }
 }
 
+/// A rebuild's pick (o3_pick_cold). One asked for correctness (RETIER_FIX) is built. One asked
+/// because the code could be better now (a callee it kept as a call turned hot, a verdict came, a
+/// twin tiered up, its build was dropped for other code) is built on the record's evidence as a
+/// calls entry is: no count stub charges the record while the slot waits, so under the threshold it
+/// counts again, and it is built once it queues itself again.
+unsafe fn retier_decision(rec: *const AtomicU64, threshold: u64, now: u64) -> Pick {
+    if (*rec.add(5)).fetch_and(!RETIER_FIX, Ordering::Relaxed) & RETIER_FIX != 0 {
+        return Pick::Build;
+    }
+    pick_decision(rec, Q_CALLS, threshold, now)
+}
+
 /// The O3 entry a worker picked (run_o3): an entry queued by its calls, its loops or its counted
 /// window is built only on evidence at the pick, not at the queueing seconds before (a large app's
 /// cold start: 3k entries, most of them load code that had stopped running when a worker reached
@@ -19632,10 +19719,12 @@ unsafe fn pick_decision(rec: *const AtomicU64, why: u8, threshold: u64, now: u64
 /// again it is built at its next pick (pick_decision). A slot queued by its calls or loops counts
 /// again in its count stub and queues itself again once it is hot; a profiled one stays in its
 /// counted code as a parked lukewarm window, which pgo_poll queues again once its counts show the
-/// work. True: it left. The AOT levels build every entry (o3_cold_leaves).
+/// work. A rebuild (retier) is decided by retier_decision; one that leaves gets a count stub in
+/// front of the code the slot runs now (Unit::retier_recount). True: it left. The AOT levels build
+/// every entry (o3_cold_leaves).
 fn o3_pick_cold(entry: (u32, u8, u64, u64)) -> bool {
     let (id, why, at, _) = entry;
-    if !matches!(why, Q_CALLS | Q_LOOP | Q_PROFILED) {
+    if !matches!(why, Q_CALLS | Q_LOOP | Q_PROFILED | Q_RETIER) {
         return false;
     }
     let up = TIER_UNIT.load(Ordering::Acquire);
@@ -19649,14 +19738,15 @@ fn o3_pick_cold(entry: (u32, u8, u64, u64)) -> bool {
     }
     unsafe {
         let rec = tier_rec(&u.slots, id);
-        if (*rec.add(3)).load(Ordering::Acquire) != T_QUEUED {
-            return false;
-        }
-        if !ahead_policy().o3_cold_leaves {
+        if (*rec.add(3)).load(Ordering::Acquire) != T_QUEUED || !ahead_policy().o3_cold_leaves {
+            if why == Q_RETIER {
+                (*rec.add(5)).fetch_and(!RETIER_FIX, Ordering::Relaxed);
+            }
             return false;
         }
         let (now, wall) = tier_clocks();
-        let (cost, recount) = match pick_decision(rec, why, threshold, now) {
+        let decision = if why == Q_RETIER { retier_decision(rec, threshold, now) } else { pick_decision(rec, why, threshold, now) };
+        let (cost, recount) = match decision {
             Pick::Build => return false,
             Pick::Recount(cost) => (cost, true),
             Pick::Cold(cost) => (cost, false),
@@ -19666,6 +19756,11 @@ fn o3_pick_cold(entry: (u32, u8, u64, u64)) -> bool {
             // its counted code stays, its window parked (its counters, as profiled_heat keeps
             // them while the build runs; gone: built)
             if !pgo_park_profiled(id) {
+                return false;
+            }
+        } else if why == Q_RETIER {
+            if !owner::publish(|| (&mut *up).retier_recount(id, threshold, cost, now, wall)) {
+                crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::KEPT, 0, waited, 0);
                 return false;
             }
         } else {
@@ -20422,7 +20517,7 @@ impl Unit {
                 at
             };
             (*rec.add(1)).store(code, Ordering::Relaxed);
-            (*rec.add(5)).store(((*rec.add(5)).load(Ordering::Relaxed) & (LOOP_CHARGED | UI_PATH | LOOP_HOT_AT | PICK_RECOUNTED)) | bytes, Ordering::Relaxed);
+            (*rec.add(5)).store(((*rec.add(5)).load(Ordering::Relaxed) & (LOOP_CHARGED | UI_PATH | LOOP_HOT_AT | PICK_RECOUNTED | RETIER_WAIT)) | bytes, Ordering::Relaxed);
             (*rec.add(2)).store(at, Ordering::Release);
             SlotWord::of(&self.slots, id).store(at, Ordering::SeqCst);
         }
@@ -20516,11 +20611,62 @@ impl Unit {
     }
 
     /// Queues O3 slot `id` to be built again (a callee it kept as a call turned hot, a verdict
-    /// or a twin changed what it may inline); at most RETIERS times per slot. RELAX_O3_TRACE
-    /// names the line that asked.
+    /// or a twin changed what it may inline); at most RETIERS times per slot. Its pick builds it
+    /// only while its code runs (retier_decision). RELAX_O3_TRACE names the line that asked.
     #[track_caller]
     fn retier(&mut self, id: u32) {
-        if tier1_trace() { eprintln!("O3 retier #{} from line {} (n={})", id, std::panic::Location::caller().line(), self.retiers.get(&id).copied().unwrap_or(0)); }
+        self.retier_as(id, false)
+    }
+
+    /// retier for correctness (its code inlined a callee the borrow checker rejected): built at
+    /// its pick, hot or not (RETIER_FIX).
+    #[track_caller]
+    fn retier_fix(&mut self, id: u32) {
+        self.retier_as(id, true)
+    }
+
+    /// A rebuild that left at its pick (o3_pick_cold): a count stub goes back in front of the code
+    /// the slot runs now (its O3 code, or what replaced a dropped build), and the record counts
+    /// again from `cost`. Code that runs on queues itself again as this rebuild (RETIER_WAIT) and
+    /// is built at that pick (PICK_RECOUNTED). False: the slot takes no count stub (a forwarder,
+    /// its record not tiered) or other code went in meanwhile: it is built now.
+    unsafe fn retier_recount(&mut self, id: u32, threshold: u64, cost: u64, now: u64, wall: u64) -> bool {
+        if self.forward_of(id).is_some() {
+            return false;
+        }
+        let rec = tier_rec(&self.slots, id);
+        if (*rec.add(3)).load(Ordering::Acquire) != T_QUEUED {
+            return false;
+        }
+        let s = SlotWord::of(&self.slots, id);
+        let code = s.load(Ordering::SeqCst);
+        let bytes = self.fns[id as usize].code_len as u64;
+        let at = if self.prog.session.options.no_codegen {
+            match relax_codegen::interp::count_entry(rec as u64, id, code, call_weight(bytes)) {
+                Ok(at) => at,
+                Err(_) => return false,
+            }
+        } else {
+            let at = bump(&self.code_next, x64::COUNT_STUB_SIZE as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+            os::mem::write_code(at, &x64::count_stub(at, rec as u64, id, code, self.hot_entry, call_weight(bytes)));
+            at
+        };
+        (*rec.add(1)).store(code, Ordering::Relaxed);
+        (*rec.add(5)).store(((*rec.add(5)).load(Ordering::Relaxed) & (UI_PATH | STORED_PARKED)) | RETIER_WAIT | bytes, Ordering::Relaxed);
+        (*rec.add(2)).store(at, Ordering::Release);
+        count_again(rec, threshold, cost, now, wall, true);
+        if s.compare_exchange(code, at, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            (*rec.add(5)).fetch_and(!(RETIER_WAIT | PICK_RECOUNTED), Ordering::Relaxed);
+            (*rec.add(3)).store(T_QUEUED, Ordering::Release);
+            return false;
+        }
+        crate::inspect::tierlog::note_arm(id, crate::inspect::tierlog::ARM_LEFT, code);
+        true
+    }
+
+    #[track_caller]
+    fn retier_as(&mut self, id: u32, fix: bool) {
+        if tier1_trace() { eprintln!("O3 retier #{} from line {} (n={}{})", id, std::panic::Location::caller().line(), self.retiers.get(&id).copied().unwrap_or(0), if fix { ", for correctness" } else { "" }); }
         const RETIERS: u8 = 4;
         let _k = crate::zone_alloc::kept();
         let n = self.retiers.entry(id).or_insert(0);
@@ -20531,6 +20677,9 @@ impl Unit {
         *n += 1;
         crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::RETIER, 0, *n as u64, 0);
         self.stats.tier1_retier += 1;
+        if fix {
+            unsafe { (*tier_rec(&self.slots, id).add(5)).fetch_or(RETIER_FIX, Ordering::Relaxed) };
+        }
         churn_queued(id);
         tier_push(id, Q_RETIER, 0);
     }
@@ -21120,6 +21269,16 @@ unsafe fn queued_check(rec: *const AtomicU64, threshold: u64, now: u64, wall: u6
     tier_record_check(rec, threshold, cost, now, wall);
 }
 
+/// The reason a counting slot is queued for: a rebuild that left at its pick to count again
+/// (RETIER_WAIT) is queued as that rebuild, and built at its pick (PICK_RECOUNTED).
+unsafe fn queued_as(rec: *const AtomicU64, why: u8) -> u8 {
+    if (*rec.add(5)).fetch_and(!RETIER_WAIT, Ordering::Relaxed) & RETIER_WAIT != 0 {
+        Q_RETIER
+    } else {
+        why
+    }
+}
+
 /// Counting slot `id` (record `rec`) is queued for its O3 build, `why` at cost rate `rate`: by a
 /// call (rt_hot) or from inside its loop (rt_loop_hot). Its count stub leaves the slot: its calls
 /// go straight to its code while it waits, and its O3 pick decides from what still charges the
@@ -21133,6 +21292,7 @@ unsafe fn queue_counting(u: &Unit, id: u32, rec: *const AtomicU64, why: u8, rate
     if (*rec.add(3)).compare_exchange(T_COUNTING, T_QUEUED, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         return false;
     }
+    let why = queued_as(rec, why);
     TIER_QUEUED.fetch_add(1, Ordering::Relaxed);
     note_ui_path(rec);
     crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::QUEUE, why, rate, code);
@@ -22567,13 +22727,20 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     Ok(Ok(_)) => "link check failed",
                 };
                 drop_why(up, why);
+                // (the slot changed: which code went in, kind + 1, for the tier log)
+                let now_kind = if why == "slot changed meanwhile" {
+                    let u = &*up;
+                    u.code.try_read().ok().map_or(0, |t| t.kind_of(u.fns[id as usize].code).pack() as u64 + 1)
+                } else {
+                    0
+                };
                 crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_DROPPED, match why {
                     "build panicked" => crate::inspect::tierlog::DROP_PANIC,
                     "codegen error" => crate::inspect::tierlog::DROP_CODEGEN,
                     "patch changed meanwhile" => crate::inspect::tierlog::DROP_PATCH,
                     "slot changed meanwhile" => crate::inspect::tierlog::DROP_SLOT_CHANGED,
                     _ => crate::inspect::tierlog::DROP_LINK,
-                }, 0, 0);
+                }, now_kind, 0);
                 let u = &mut *up;
                 u.stats.tier1_dropped += 1;
                 // The slot got other code while this build ran -- nearly always its O2 build from
@@ -22589,7 +22756,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // SPEC-V: a callee it took in unverified was rejected meanwhile: built again
                 // without it (the snapshot leaves a rejected callee out)
                 if why == "inlined a rejected callee" {
-                    u.retier(id);
+                    u.retier_fix(id);
                 }
                 if tier1_trace() {
                     let what = match &built {
