@@ -80,6 +80,36 @@ with `RELAX_CACHE_DIR=<dir>` so neither reuses the other's compiled code.
 - `--verbose` (or `RELAX_VERBOSE=1`): phase timings.
 - A running program: `relax inspect <pid> help` (panics, why-hung, probes).
 
+## Read live test results from an agent
+
+Start one harness with `relax test --live <package> --lib` (or `--test <name>`), and find its PID
+with `relax inspect list --json`. Read the first verdict with:
+
+```sh
+relax inspect <pid> events on=testverdict since=0 --json
+```
+
+Before saving an edit, keep the newest event's `seq`, then wait for the edit's outcome with:
+
+```sh
+relax inspect <pid> watch on=testverdict,patchrefused,patchfailed,patchreverted since=<seq> --json
+```
+
+A `testverdict` names the edited paths and the patch `group`, with counts and the failing tests.
+Its `results` field is the query for each test's outcome, `test-results group=<n>`:
+
+```sh
+relax inspect <pid> test-results group=<n> --json
+```
+
+The answer starts with the `group` and `test_count`, then one JSON line per test with its `name`,
+`status` (`passed`, `failed`, `ignored` or `filtered`) and `ran`. `ran` is true only when the test
+executed for this edit: a passed or failed result an earlier run left (the edit did not reach the
+test) has `ran:false`. The session keeps the latest completed run, and refuses a different `group`
+rather than answer with another edit's results. A `patchrefused` event carries the build errors
+in `reasons`. Move the `since` cursor past every event, the patch errors included.
+`libs/relax/compiler/tests/live_test_results/run.py <relax binary>` checks this interface.
+
 ## Shrinking a bug
 
 Shrink it to the smallest program that still differs from rustc. A counting `Drop` impl shows

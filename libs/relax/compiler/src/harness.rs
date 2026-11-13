@@ -228,8 +228,15 @@ extern "C" fn next_run(t: *mut Tests, ms: f64) -> u32 {
             run.why = Some(format!("unknown reach: {n} tests"));
             run.initial = false;
         }
-        let mut v = live::Verdict { ran: 0, passed: 0, ignored: 0, failures: Vec::new(), stale: Vec::new(), why: run.why.clone(), skipped: 0 };
+        let mut v = live::Verdict { ran: 0, passed: 0, ignored: 0, failures: Vec::new(), stale: Vec::new(), why: run.why.clone(), skipped: 0, tests: Vec::with_capacity(run.table.len()) };
         for (test, found) in run.table.iter().zip(&run.found) {
+            let status = match test.result {
+                1 => live::TestStatus::Passed,
+                2 => live::TestStatus::Failed,
+                3 => live::TestStatus::Ignored,
+                _ => live::TestStatus::Filtered,
+            };
+            v.tests.push(live::TestResult { name: found.name.clone(), status, ran: test.selected != 0 && matches!(test.result, 1 | 2) });
             if test.result != 0 && test.selected == 0 { v.skipped += 1; }
             if matches!(test.result, 1 | 2) && test.selected != 0 { v.ran += 1; }
             match test.result {
