@@ -8499,6 +8499,31 @@ mod data_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// Two impls one macro makes, `impl Raw<{ 1 + 1 }>` and `impl Raw<{ 2 + 2 }>`: the anonymous
+    /// constants of their headers have code-cache keys of their own, so neither takes the other's
+    /// stored value (makepad PR #1530 saw one width reuse the other's). Named by their impl
+    /// (stable::def_ident), whose header text and twin ordinal tell them apart.
+    #[test]
+    fn macro_twin_impls_key_their_header_constants_apart() {
+        isolated_test!(macro_twin_impls_key_their_header_constants_apart);
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let root = std::env::temp_dir().join(format!("relax-twin-consts-{}-{}", std::process::id(), crate::clock::wall_ns()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("twins.rs").to_string_lossy().into_owned();
+        std::fs::write(&path, "struct Raw<const N: usize>;\nmacro_rules! width { ($n:expr) => { impl Raw<{ $n }> { fn width() -> usize { $n } } }; }\n\
+            width!(1 + 1);\nwidth!(2 + 2);\n").unwrap();
+        let mut prog = crate::program::Program::new(sess);
+        prog.load_crate("twins", &path, 2021, crate::cfg::CfgSet::host(sess, &[]), Vec::new()).unwrap();
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        let consts: Vec<DefId> = (0..prog.defs.len() as u32).map(DefId).filter(|&d| prog.def(d).kind == DefKind::AnonConst && prog.def(prog.def(d).parent).kind == DefKind::Impl).collect();
+        assert_eq!(consts.len(), 2, "the two impls' header constants");
+        let (mut memo, mut files) = (HashMap::new(), HashMap::new());
+        let keys: Vec<u128> = consts.iter().map(|&d| def_key_in(&prog, &tcx, &[], &mut memo, &mut files, d)).collect();
+        assert_ne!(keys[0], keys[1], "the two header constants have one code-cache key");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn bound_crates_mark_only_the_interfaces_that_reach_them() {
         isolated_test!(bound_crates_mark_only_the_interfaces_that_reach_them);
