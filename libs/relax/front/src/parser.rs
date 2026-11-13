@@ -1004,11 +1004,13 @@ impl<'a> Parser<'a> {
     /// `cfg` / `cfg_attr` are read (and so checked) while the configuration is evaluated; the other
     /// attributes only once their item is known to be configured in. Inside code that is already
     /// configured out nothing is evaluated, so nothing is checked: rustc's StripUnconfigured never
-    /// visits a stripped node's attributes (`#[cfg(any())] { #[cfg(version("1.76"))] .. }`).
+    /// visits a stripped node's attributes (`#[cfg(any())] { #[cfg(version("1.76"))] .. }`), and
+    /// rustc expands nothing there (`#[link_section = concat!(dep::name!(..))]`, whose call only
+    /// configured-in code resolves).
     fn attr_shape_now_or_later(&mut self, toks: TokRange) -> PResult<()> {
+        if self.cfg_out > 0 { return Ok(()); }
         let first = if (toks.lo as usize) < self.toks.len() { self.tok_text(self.toks.at(toks.lo as usize)) } else { b"" };
         if first == b"cfg" || first == b"cfg_attr" {
-            if self.cfg_out > 0 { return Ok(()); }
             return self.check_attr_shape(toks);
         }
         self.pending_shape.push((toks, None));
@@ -7086,6 +7088,18 @@ mod diagnostic_tests {
         let live = "fn main() {\n    #[cfg(all())]\n    {\n        #[cfg(version(\"1.76\"))]\n        let unused = 1;\n    }\n}\n";
         let msg = parse(live).expect_err("a predicate in configured-in code is still checked");
         assert!(msg.contains("invalid predicate"), "{msg}");
+    }
+
+    /// relax issue 112: an attribute's value in configured-out code is not expanded (no macro
+    /// resolves there): a built-in around a macro call stopped the load with "expected a literal".
+    #[test]
+    fn attribute_values_inside_configured_out_code_are_not_expanded() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let ctx = std::rc::Rc::new(crate::builtins::FileCtx::new("test", "/fake/cfg_out_value.rs", "test", &crate::cfg::CfgSet::host(sess, &[])));
+        let scope = crate::macros::MacroScope::new(std::sync::Arc::new(crate::macros::MacroTable::default()));
+        let src = "macro_rules! name { () => { \".data.relax\" } }\n#[cfg(any())]\nmod gone {\n    #[link_section = concat!(name!())]\n    static S: u32 = 0;\n}\n#[link_section = concat!(name!())]\nstatic LIVE: u32 = 0;\n";
+        let r = parse_owned_ctx(sess, src.as_bytes().to_vec(), None, 2021, Some(scope), "test", Some(ctx), false).map(|_| ()).map_err(|(_, msg)| msg);
+        assert_eq!(r, Ok(()), "a value macro in a configured-out module");
     }
 
     fn parse_error_with_macros(source: &str) -> (usize, usize, String) {
