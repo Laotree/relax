@@ -1338,12 +1338,22 @@ fn fd_write(fd: &OwnedFd, buf: &[u8]) -> io::Result<usize> {
     }
 }
 
-impl Write for ChildStdin {
+// Writes through a shared reference, as real std's `impl Write for &ChildStdin`: the pipe is a
+// descriptor, so `writeln!(&stdin, ..)` needs no `&mut`.
+impl Write for &ChildStdin {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         fd_write(&self.fd, buf)
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+impl Write for ChildStdin {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (&*self).write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        (&*self).flush()
     }
 }
 impl Read for ChildStdout {

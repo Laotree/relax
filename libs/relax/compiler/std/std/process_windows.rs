@@ -1510,12 +1510,21 @@ fn handle_write(h: &OwnedHandle, buf: &[u8]) -> io::Result<usize> {
     Ok(n as usize)
 }
 
-impl Write for ChildStdin {
+// Writes through a shared reference, as real std's `impl Write for &ChildStdin`.
+impl Write for &ChildStdin {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         handle_write(&self.handle, buf)
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+impl Write for ChildStdin {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (&*self).write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        (&*self).flush()
     }
 }
 impl Read for ChildStdout {
