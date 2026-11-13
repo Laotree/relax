@@ -5263,15 +5263,28 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let mut flagged: Vec<u32> = slots.iter().chain(fresh.iter()).copied().collect();
     let mut inlining_callers: Vec<u32> = Vec::new();
     let mut work: Vec<u32> = flagged.clone();
+    let mut twins_walked: Vec<u32> = Vec::new();
     while let Some(s) = work.pop() {
         let inl = u.fns[s as usize].history().inlined_into.len();
         let mut deps = u.fns[s as usize].history().inlined_into.clone();
         deps.extend(crate::sandbox::twin_of(u, s));
+        // SPEC-V: the slot's unverified-mode twin is its old text too, and unverified code inlines
+        // it as it would the slot (jit::callee_attrs): the twin's flag is set with the slot's and
+        // the code that inlined it is rebuilt. The twin itself is built again below (`plain`).
+        let plain_twin = u.plain_twin_of(s);
+        deps.extend(plain_twin);
         for (k, d) in deps.into_iter().enumerate() {
             if k >= inl && flagged.contains(&s) && !flagged.contains(&d) {
                 flagged.push(d);
             }
             if slots.contains(&d) || fresh.contains(&d) {
+                continue;
+            }
+            if Some(d) == plain_twin {
+                if !twins_walked.contains(&d) {
+                    twins_walked.push(d);
+                    work.push(d);
+                }
                 continue;
             }
             if u.fns[d as usize].compiled {
@@ -6166,9 +6179,13 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             let inl = u.fns[s as usize].history().inlined_into.len();
             let mut deps = u.fns[s as usize].history().inlined_into.clone();
             deps.extend(crate::sandbox::twin_of(u, s));
+            // (its unverified-mode twin: flagged and walked, built again with `plain`)
+            let plain_twin = u.plain_twin_of(s);
+            deps.extend(plain_twin);
             for (k, d) in deps.into_iter().enumerate() {
                 if k >= inl && marked.contains(&s) && marked.insert(d) { flagged.push(d); }
                 if !seen.insert(d) { continue; }
+                if Some(d) == plain_twin { work.push(d); continue; }
                 if u.fns[d as usize].compiled {
                     if k < inl { inlining_callers.push(d); }
                     slots.push(d);
@@ -6348,7 +6365,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
         // SPEC-V: the unverified-mode twins of the edited bodies are the old text: rebuilt if they had
         // code, else only forgotten (they compile from the new text on their first call)
-        let plain: Vec<u32> = slots.iter().chain(fresh.iter()).filter_map(|&id| u.plain_twin_of(id)).collect();
+        // (a twin that inlined an edited body is rebuilt as one of `slots` already)
+        let plain: Vec<u32> = slots.iter().chain(fresh.iter()).filter_map(|&id| u.plain_twin_of(id)).filter(|t| !slots.contains(t) && !fresh.contains(t)).collect();
         for &id in &plain {
             let f = &mut u.fns[id as usize];
             f.rir = None;
