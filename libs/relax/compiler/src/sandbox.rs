@@ -166,10 +166,11 @@ impl State {
 /// name, address)))); None: not this domain's. Run-time modules add nothing (`MODULES`).
 pub type Allow = fn(&str) -> Option<Option<(&'static str, u64)>>;
 
-/// A confinement domain: its name, what its code may call beyond what every domain may, and
-/// whether its code meters fuel. The name is part of its twins' cache keys: code one domain's
-/// policy made is never linked into another domain's unit (cache.rs enc_fnkey); `allow` and
-/// `fuel` are fixed per domain, so the name covers them.
+/// A confinement domain: its name, what its code may call beyond what every domain may, whether
+/// its code meters fuel and whether its twins always get the clean-up. The name is part of its
+/// twins' cache keys: code one domain's policy made is never linked into another domain's unit
+/// (cache.rs enc_fnkey); `allow`, `fuel` and `clean_up` are fixed per domain, so the name covers
+/// them.
 #[derive(Clone, Copy)]
 pub struct Domain {
     pub name: &'static str,
@@ -177,11 +178,14 @@ pub struct Domain {
     /// its twins charge each block's instructions to the thread's fuel word (`add_fuel`): an
     /// arena's per-call budget (`Arena::fuel`) can only end a call in a domain that meters
     pub fuel: bool,
+    /// its twins always get the O1 clean-up of the masks (`transform`): a domain whose code never
+    /// tiers up to O3 (the proc-macro world) has no later pass that does it
+    pub clean_up: bool,
 }
 
 /// The run-time modules' domain: what every domain may call, nothing more; metered (a module's
 /// arena may set a per-call budget).
-pub const MODULES: Domain = Domain { name: "modules", allow: modules_allow, fuel: true };
+pub const MODULES: Domain = Domain { name: "modules", allow: modules_allow, fuel: true, clean_up: false };
 
 fn modules_allow(_: &str) -> Option<Option<(&'static str, u64)>> {
     None
@@ -190,10 +194,11 @@ fn modules_allow(_: &str) -> Option<Option<(&'static str, u64)>> {
 struct Sb {
     /// the symbol TlsAddr reads the sandbox words' offset from (this unit's; the offset is TLS_OFF)
     tls_sym: Sym,
-    /// the domain's name, own C entries and whether its twins meter fuel
+    /// the domain's name, own C entries, whether its twins meter fuel and get the clean-up
     domain: &'static str,
     allow: Allow,
     fuel: bool,
+    clean_up: bool,
     sbt_base: u64,
     /// the table's bytes (a power of two: the indirect-call mask)
     sbt_span: u64,
@@ -321,6 +326,7 @@ unsafe fn sb_init(up: *mut Unit, domain: Domain) -> Result<(), String> {
         domain: domain.name,
         allow: domain.allow,
         fuel: domain.fuel,
+        clean_up: domain.clean_up,
         sbt_base,
         sbt_span,
         sbt_n: 1,
@@ -2248,13 +2254,15 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
     }
     with_sb(&*up, |s| s.refs.insert(twin_id, refs));
     f.verify().map_err(|e| format!("{}: sandbox transform made invalid RIR: {}", f.name, e))?;
-    // the masks the transform added: common ones merged, loop-invariant ones hoisted. Only
-    // under O1 alone (RELAX_O3=0, O2 pipeline): with O3 on, O1 keeps
+    // the masks the transform added: common ones merged, loop-invariant ones hoisted. Under O1
+    // alone (RELAX_O3=0, O2 pipeline), and always in a domain whose code never tiers up
+    // (`Domain::clean_up`: the proc-macro world, whose macro calls of a warm start went 134 ->
+    // 114 ms with it, and its twins' compile 136 -> 126 ms CPU). With O3 on, O1 keeps
     // registers unoptimised and the hoisted masks cost more than they save (mini, particle
-    // kernel: +25% with the clean-up, +0.5% without). Hot twins retain this confined RIR
-    // for O3, whose full pipeline and register allocation perform the clean-up there.
-    // RELAX_SANDBOX_OPT=0/1 forces the O1 clean-up.
-    let opt = options.sandbox_opt.unwrap_or(!jit::TIER1_ENABLED.load(std::sync::atomic::Ordering::Relaxed));
+    // kernel: +25% with the clean-up, +0.5% without); hot twins retain this confined RIR for
+    // O3, whose full pipeline and register allocation perform the clean-up there.
+    // RELAX_SANDBOX_OPT=0/1 forces it either way.
+    let opt = options.sandbox_opt.unwrap_or_else(|| with_sb(&*up, |s| s.clean_up) || !jit::TIER1_ENABLED.load(std::sync::atomic::Ordering::Relaxed));
     if opt {
         relax_backend::passes::simplify(options, f, None, true, true);
         relax_backend::passes::licm(options, f);

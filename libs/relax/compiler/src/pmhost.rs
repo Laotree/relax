@@ -409,8 +409,9 @@ pub fn policy() -> Policy {
 }
 
 /// The confined macros' domain (sandbox.rs `Domain`). No fuel: the world's arena sets no budget,
-/// and a macro that never returns is the hang watchdog's (`watch_begin`).
-const MACRO_DOMAIN: crate::sandbox::Domain = crate::sandbox::Domain { name: "proc-macro", allow: macro_allow, fuel: false };
+/// and a macro that never returns is the hang watchdog's (`watch_begin`). The clean-up always:
+/// the macro world's code never tiers up, so no O3 pass does it later.
+const MACRO_DOMAIN: crate::sandbox::Domain = crate::sandbox::Domain { name: "proc-macro", allow: macro_allow, fuel: false, clean_up: true };
 
 /// The macro domain's own entries (sandbox.rs `Allow`): what a confined macro reaches of the
 /// host beyond memory, math and formatting.
