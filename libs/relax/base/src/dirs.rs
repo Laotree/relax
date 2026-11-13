@@ -90,6 +90,10 @@ fn payload_carries_anchor_in(bytes: &[u8], anchors: &[(&'static str, String)]) -
 /// carried (fail closed): the scan never shares what it could not check, and tests can inject the
 /// failure a real file system will not produce on demand.
 fn payload_carries_anchor_with(bytes: &[u8], anchors: &[(&'static str, String)], resolve: &dyn Fn(&str) -> Option<String>) -> Option<&'static str> {
+    // No anchor list means the scan cannot decide: carried, never shared.
+    if anchors.is_empty() {
+        return Some("no-anchor");
+    }
     // Prefix matching is intentional and conservative: a directory that starts with an anchor's
     // spelling counts as under it, so a false positive only costs a missing hit.
     for (tag, dir) in anchors {
@@ -398,7 +402,7 @@ mod tests {
         let a = [("ws", "/w".to_string())];
         let bad = |_: &str| None;
         assert_eq!(super::payload_carries_anchor_with(b"/other/a.rs", &a, &bad), Some("ws"));
-        assert_eq!(super::payload_carries_anchor_with(b"/other/a.rs", &[], &bad), None);
+        assert_eq!(super::payload_carries_anchor_with(b"/other/a.rs", &[], &bad), Some("no-anchor"));
     }
 
     /// A workspace entered through a symbolic link is found by its resolved spelling too.
