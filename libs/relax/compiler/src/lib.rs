@@ -478,10 +478,31 @@ pub fn print_as_rustc(sess: &std::sync::Arc<crate::Session>, args: &[String], in
     Ok(out)
 }
 
+/// rustup's homes named in this process's environment, as rustup's cargo names them for the
+/// programs it runs (rustup Toolchain::set_env: CARGO_HOME and RUSTUP_HOME): a program that runs a
+/// child with another HOME (a test starting its CARGO_BIN_EXE_* binary in a scratch home) has that
+/// child's Relax find the same toolchain and registry, as the binary cargo built needs neither
+/// (relax issue 129: the child's cargo said rustup could not choose a version). Only where rustup
+/// is in use (RUSTUP_HOME set, or ~/.rustup there); a variable already set keeps its folder, made
+/// absolute as rustup makes it (the child may start in another folder).
+fn keep_toolchain_homes() {
+    let set = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    let home = set(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(std::path::PathBuf::from);
+    let Some(rustup) = set("RUSTUP_HOME").map(std::path::PathBuf::from).or_else(|| home.as_ref().map(|h| h.join(".rustup")).filter(|d| d.is_dir())) else {
+        return;
+    };
+    let absolute = |p: std::path::PathBuf| std::path::absolute(&p).unwrap_or(p);
+    std::env::set_var("RUSTUP_HOME", absolute(rustup));
+    if let Some(cargo) = set("CARGO_HOME").map(std::path::PathBuf::from).or_else(|| home.map(|h| h.join(".cargo"))) {
+        std::env::set_var("CARGO_HOME", absolute(cargo));
+    }
+}
+
 /// Construct the invocation inputs before parsing; CLI overrides replace environment values.
 /// rustc: compiler/rustc_session/src/config.rs:2428, session.rs:90-93.
 pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
     crate::pool::thread_start(crate::jit::ensure_altstack);
+    keep_toolchain_homes();
     let mut options = crate::options::Options::from_env();
     // `--no-asm` / `--allow-c` anywhere before `--`, for every command (run, test, check, the
     // relax runner): the environment carries them to the processes this one starts (build
