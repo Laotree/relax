@@ -342,6 +342,7 @@ fn test_page(st: &Style) -> String {
     p.text("Keeps one target warm (default --lib); body edits rerun tests that entered the changed functions, including inlinees.");
     p.text("Non-body edits, unknown reach or changed unattributed code rerun all; the verdict says why.");
     p.text(&format!("Each run prints testverdict; {tool} inspect <pid> watch on=testverdict follows its JSON verdicts.", tool = command()));
+    p.text(&format!("Read individual outcomes with {tool} inspect <pid> test-results group=<verdict group> full=1 --json.", tool = command()));
     p.text("Hot-load failures restart the test process; only the replacement tests give a verdict.");
     p.out
 }

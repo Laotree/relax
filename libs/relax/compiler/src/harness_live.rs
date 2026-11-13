@@ -29,6 +29,7 @@ struct State {
     waiting: bool,
     faults: Vec<u32>,
     runs: u64,
+    results: Option<(u32, Vec<TestResult>)>,
 }
 
 static LIVE: OnceLock<(Mutex<State>, Condvar)> = OnceLock::new();
@@ -60,7 +61,7 @@ pub(crate) fn start(restart: Option<&str>) -> Result<(), String> {
             Edit { paths, group, compile_ms, restarted: true, changed: None, patch: None }
         }
     };
-    let _ = LIVE.set((Mutex::new(State { edit, waiting: false, faults: Vec::new(), runs: 0 }), Condvar::new()));
+    let _ = LIVE.set((Mutex::new(State { edit, waiting: false, faults: Vec::new(), runs: 0, results: None }), Condvar::new()));
     Ok(())
 }
 
@@ -86,6 +87,25 @@ impl TestResult {
         };
         format!("{{\"name\":{},\"status\":\"{status}\",\"ran\":{}}}", json_str(&self.name), self.ran)
     }
+}
+
+pub(crate) fn cmd_results(req: &crate::inspect::Req, out: &mut crate::inspect::Out) {
+    let Some((state, _)) = LIVE.get() else { out.err("not a live test session"); return };
+    let asked = match req.get("group").map(str::parse::<u32>).transpose() {
+        Ok(group) => group,
+        Err(_) => { out.err("group must be an unsigned 32-bit integer"); return; }
+    };
+    let (group, rows) = {
+        let s = state.lock().unwrap();
+        let Some((group, tests)) = &s.results else { out.err("no completed test run yet"); return };
+        if asked.is_some_and(|asked| asked != *group) {
+            out.err(&format!("test results are for group {group}; read its testverdict event"));
+            return;
+        }
+        (*group, tests.iter().map(TestResult::json).collect::<Vec<_>>())
+    };
+    out.line(&format!("{{\"group\":{group},\"test_count\":{}}}", rows.len()));
+    for row in rows { out.line(&row); }
 }
 
 /// Whole-target results, with counts for this run's selection.
@@ -114,7 +134,8 @@ pub(super) fn complete(v: Verdict, ms: f64) -> Edit {
     let fields = format!("{},\"ran\":{ran},\"passed\":{passed},\"failed\":{failed},\"ignored\":{ignored},\"failures\":[{}],\"ms\":{ms},\"selected\":\"{selected}\",\"skipped\":{skipped},\"stale\":[{}]{why_field}",
         s.edit.fields(), failures.iter().map(|n| json_str(n)).collect::<Vec<_>>().join(","),
         stale.iter().map(|n| json_str(n)).collect::<Vec<_>>().join(","));
-    let fields = format!("{fields},\"tests\":[{}]", tests.iter().map(TestResult::json).collect::<Vec<_>>().join(","));
+    s.results = Some((s.edit.group, tests));
+    let fields = format!("{fields},\"results\":\"test-results group={} full=1\"", s.edit.group);
     crate::inspect::events::emit("testverdict", &s.runs.to_string(), &fields);
     println!("testverdict group={} ran={ran} passed={passed} failed={failed} ms={ms:.1} selected={selected} skipped={skipped}{}", s.edit.group, why.as_ref().map_or(String::new(), |s| format!(" why={s:?}")));
     use std::io::Write;

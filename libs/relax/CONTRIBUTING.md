@@ -95,12 +95,22 @@ Before saving an edit, keep the newest event's `seq`. Wait for its outcome with:
 relax inspect <pid> watch on=testverdict,patchrefused,patchfailed,patchreverted since=<seq> full=1 --json
 ```
 
-A `testverdict` names the edit paths and patch `group`. Its `tests` array contains
-each test's `name`, `status` (`passed`, `failed`, `ignored`, or `filtered`) and `ran`.
+A `testverdict` names the edit paths and patch `group`. Its `results` field gives
+the query for individual outcomes, `test-results group=<n> full=1`. Run it with:
+
+```sh
+relax inspect <pid> test-results group=<n> full=1 --json
+```
+
+The reply starts with the `group` and `test_count`, then one JSON line per test
+with its `name`, `status` (`passed`, `failed`, `ignored`, or `filtered`) and `ran`.
 `ran` is true only when that test executed for this edit. A retained passing or
-failing result has `ran:false`. `patchrefused` includes build errors in `reasons`.
+failing result has `ran:false`. The query retains the latest completed run and
+rejects a different `group` rather than returning another edit's results.
+`patchrefused` includes build errors in `reasons`.
 Advance the sequence cursor after every event, including patch errors. Use `full=1`
-to read verdicts larger than inspect's default reply limit.
+to read all test results beyond inspect's default reply limit. Verdict events
+stay small regardless of the number of tests.
 
 The end-to-end check for this interface is:
 
