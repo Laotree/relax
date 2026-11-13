@@ -66,6 +66,7 @@ pub fn overlapping_impls(tcx: &Tcx, prog: &Program, a: DefId, b: DefId, krate: u
     let mut infcx=InferCtxt::for_item(tcx,prog,TypingMode::Coherence,b);
     infcx.coherence_crate=Some(krate);
     infcx.skip_leak_check=skip_leak_check;
+    infcx.rerun_overflow_at_twice_the_limit=false;
     let a=fresh_impl_header(&infcx,prog,a,is_trait);
     let b=fresh_impl_header(&infcx,prog,b,is_trait);
     let mut goals=equate_impl_headers(&infcx,prog,&a,&b)?;
