@@ -478,7 +478,7 @@ pub fn __sb_enter(module: u32) -> __SbFrame {
     match unsafe { __relax_sb_enter(module) } {
         0 => __SbFrame(()),
         1 => panic!("the module was unloaded"),
-        _ => panic!("too many threads inside the module at once"),
+        _ => panic!("this thread cannot enter the module (it is past its thread-local destructors, or out of memory)"),
     }
 }
 

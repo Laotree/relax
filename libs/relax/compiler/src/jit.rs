@@ -506,7 +506,7 @@ pub struct Unit {
     pub(crate) web_target: bool,
     // memory
     exec_base: u64,
-    exec_size: u64,
+    pub(crate) exec_size: u64,
     /// where every slot's thunk, stub, table word and tier record are (segments, reserved as ids reach them)
     pub slots: Box<relax_backend::rir::SlotTable>,
     pub(crate) lazy_entry: u64,
@@ -3803,6 +3803,11 @@ rt_fn! {
 fn rt_rethrow() {
     RETHROW.with(|c| c.set(true));
 }
+}
+
+/// This thread is unwinding a panic of JIT code (rt_panicking's answer, for the runtime).
+pub(crate) fn unwinding() -> bool {
+    UNWINDING.try_with(|c| c.get()).unwrap_or(false)
 }
 
 thread_local! {

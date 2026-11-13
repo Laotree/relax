@@ -1234,13 +1234,14 @@ pub extern "C" fn __relax_module_error(buf: *mut u8, cap: usize) -> usize {
     })
 }
 
-/// A wrapper enters module `idx`'s arena: 0, or 1 (the module was unloaded), or 2 (every
-/// per-thread segment of the module is in use).
+/// A wrapper enters module `idx`'s arena: 0, or 1 (the module was unloaded), or 2 (this thread
+/// cannot have a segment: it is past its thread-local destructors, or the segment cannot be
+/// mapped). A thread that finds every segment in use waits for one.
 pub extern "C" fn __relax_sb_enter(idx: u32) -> u32 {
     match crate::sandbox::enter_module(idx) {
         Ok(()) => 0,
         Err(crate::sandbox::EnterError::Unloaded) => 1,
-        Err(crate::sandbox::EnterError::Busy) => 2,
+        Err(crate::sandbox::EnterError::NoSegment) => 2,
     }
 }
 

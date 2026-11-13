@@ -119,6 +119,33 @@ pub fn end_code(addr: u64, len: usize) {
     }
 }
 
+/// Code memory [addr, addr + len) (whole pages) held back -- inaccessible, a fetch there faults --
+/// or given back as its reservation made it (executable; read-write too where code has one
+/// view). A table that grows into its reservation keeps the part it has not written held
+/// (sandbox.rs: zero bytes are no trap on x86). False: the protection did not change.
+#[cfg(unix)]
+pub fn code_held(addr: u64, len: usize, held: bool) -> bool {
+    const PROT_RX: i32 = 5;
+    const PROT_RWX: i32 = 7;
+    let prot = if held { 0 } else if single_code_view(addr) { PROT_RWX } else { PROT_RX };
+    unsafe { unix::mprotect(addr as *mut u8, len, prot) == 0 }
+}
+
+/// Writes held code (`code_held`) and only then lets it run: [addr, addr + len) is readable (and
+/// writable where code has one view) while `fill` writes it and the instruction cache is told,
+/// then executable. No thread can run the range before it holds what `fill` wrote.
+#[cfg(unix)]
+pub unsafe fn code_unhold_filled(addr: u64, len: usize, fill: impl FnOnce(&mut [u8])) -> bool {
+    const PROT_R: i32 = 1;
+    const PROT_RW: i32 = 3;
+    let prot = if single_code_view(addr) { PROT_RW } else { PROT_R };
+    if unix::mprotect(addr as *mut u8, len, prot) != 0 {
+        return false;
+    }
+    fill_code(addr, len, fill);
+    code_held(addr, len, false)
+}
+
 /// The OS page size (mprotect's granularity): 4 KB on x86-64, 16 KB on Apple arm64.
 pub fn page_size() -> u64 {
     static PAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
