@@ -45,6 +45,21 @@ pub fn link(loader: &Path, name: &str) -> Result<PathBuf, String> {
     link.canonicalize().map_err(|e| format!("{}: {e}", link.display()))
 }
 
+/// The kernel's name of this process becomes its own executable's file name, as an exec of that
+/// file names a process (`/proc/<pid>/comm`, cut to 15 bytes: what ps, top and a parent lookup
+/// show). It was the loader's (`makepad.jit-…`) while argv[0] and current_exe() named the link,
+/// where under cargo all three name the program (makepad-remote's process test, 11-13). macOS has
+/// no call that renames a process: there it stays the loader's.
+pub fn name_process(link: &Path) {
+    #[cfg(target_os = "linux")]
+    if let Some(name) = link.file_name() {
+        // any thread of the process may set its leader's name through /proc/<pid>/comm
+        let _ = std::fs::write(format!("/proc/{}/comm", std::process::id()), name.as_encoded_bytes());
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = link;
+}
+
 /// The command line beside the link: a name no link has (`link` keeps a name's letters, digits,
 /// `-`, `_` and `.`).
 const LINE: &str = "+self-exec";

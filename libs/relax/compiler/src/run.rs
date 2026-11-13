@@ -1255,6 +1255,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         eprintln!("relax run: the program's own executable could not be made ({why}): a spawn of it runs the loader, not the program");
     }
     if let Some(Ok(exe)) = own {
+        crate::selfexe::name_process(&exe);
         let mut pre: Vec<String> = crate::os::proc::args_bytes().iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
         if let Some(d) = pre.iter().position(|a| a == "--") {
             pre.truncate(d);
@@ -3046,10 +3047,13 @@ pub(crate) fn check_test_subjects(u: &mut Unit, root: u32, subjects: &[u32], har
 }
 
 /// The variables a run sets for its program that name that run: its start, when main was
-/// called, its cache's state, its session log, the file its first frame is reported in. A
-/// program's children inherit them (a test's run of its own binary, a `makepad check` it starts);
-/// they steer no check (check_reuse.rs env_key).
-pub(crate) const RUN_STATE_VARS: [&str; 5] = ["RELAX_STARTUP_T0", "RELAX_MAIN_MS", "RELAX_CACHE_STATE", "RELAX_LIVE_LOG", "RELAX_REPORT_TO"];
+/// called, its cache's state, its session log, the file its first frame is reported in, its
+/// command line (whose first word is the run's own executable, a link in a folder named by its
+/// pid: selfexe.rs) and whether it added `--silent` to it. A program's children inherit them (a
+/// test's run of its own binary, a `makepad check` it starts); they steer no check
+/// (check_reuse.rs env_key). With the per-run link in the key, a test's second run of its own
+/// binary found no verdict the first stored (check_reuse_tests: 11 reds after the link landed).
+pub(crate) const RUN_STATE_VARS: [&str; 7] = ["RELAX_STARTUP_T0", "RELAX_MAIN_MS", "RELAX_CACHE_STATE", "RELAX_LIVE_LOG", "RELAX_REPORT_TO", "RELAX_SELF_EXEC", "RELAX_SELF_EXEC_SILENT_ADDED"];
 
 /// Locations only: anchors_key covers workspace, run and std dirs, VFS content hashes cover
 /// edits, and the read log changes no checked input. Their spellings can leave env_key.
