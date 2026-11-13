@@ -46,14 +46,10 @@ platform/build.rs
 platform/build_gen.rs
 platform/cpu_budget
 platform/network
-platform/script/derive
-platform/script/derive_impl
 platform/src/restart.rs
 platform/src/thread.rs
 tools/run/light_http
 tools/run/runner
-widgets/derive_widget
-widgets/derive_widget_impl
 ```
 
 When a carried crate starts to depend on a path that is not in this list, add the path here and
