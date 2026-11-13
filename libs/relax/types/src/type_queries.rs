@@ -477,7 +477,7 @@ impl Providers<'_> {
             q.read_owner(self.prog, def)?;
             let parent = self.prog.def(def).parent;
             let parent = if parent != crate::program::NO_DEF && matches!(self.prog.def(parent).kind, crate::program::DefKind::Trait | crate::program::DefKind::Impl) { Some(self.resolve_lifetime_names(parent)?) } else { None };
-            let names = crate::tcx::lifetime_resolve::resolve_lifetimes(self.tcx, self.prog, def, parent.as_deref());
+            let names = crate::body_facts::item_text(self.prog, def, crate::body_facts::ItemCell::Lifetimes, || crate::tcx::lifetime_resolve::resolve_lifetimes(self.tcx, self.prog, def, parent.as_deref()));
             Ok((self.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), names.share()))
         }, &|id| self.force(id))?;
         Ok(names)
@@ -489,7 +489,7 @@ impl Providers<'_> {
             q.read_owner(self.prog, def)?;
             let parent = self.prog.def(def).parent;
             let parent = if parent != crate::program::NO_DEF && matches!(self.prog.def(parent).kind, crate::program::DefKind::Trait | crate::program::DefKind::Impl) { Some(self.resolve_bound_vars(parent)?) } else { None };
-            let vars = crate::tcx::resolve_bound_vars::resolve_bound_vars(self.tcx, self.prog, def, parent.as_deref());
+            let vars = crate::body_facts::item_text(self.prog, def, crate::body_facts::ItemCell::BoundVars, || crate::tcx::resolve_bound_vars::resolve_bound_vars(self.tcx, self.prog, def, parent.as_deref()));
             Ok((self.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), vars.share()))
         }, &|id| self.force(id))?;
         Ok(vars)

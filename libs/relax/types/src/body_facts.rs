@@ -4,7 +4,7 @@ use crate::borrowck::{event::BorrowError, field_views::{FvRecordRaw, RelaxedReco
 use crate::fxhash::{FxBuild, HashMap};
 use crate::lint::{AttrKey, Reported};
 use crate::lint_dead::BodyInfo;
-use crate::program::{capture_import_uses, DefId, DefKind, ImportUses, Program, Sym};
+use crate::program::{capture_import_uses, outside_capture, record_import_uses, DefId, DefKind, ImportUses, Program, Sym};
 use relax_session::sync::Mutex;
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -15,6 +15,11 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static FACTS: Mutex<HashMap<DefId, BodyFacts>> = Mutex::new(HashMap::with_hasher(FxBuild::new()));
 /// Sink writes inside the body phase without an owner: the check tests guard against escapes.
 static ESCAPED: AtomicUsize = AtomicUsize::new(0);
+/// The checked crates whose items a body should find resolved (fresh: not reused), by crate.
+static FRESH: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+/// Item cells of a fresh crate first computed inside a body, by `ItemCell`: cells the owners phase
+/// did not compute before the bodies ran.
+static IN_BODY: [AtomicUsize; ITEM_CELLS] = [const { AtomicUsize::new(0) }; ITEM_CELLS];
 
 thread_local! {
     /// The active owner on this thread, so nested work for the same body shares its buffer.
@@ -244,6 +249,66 @@ pub fn replay(prog: &Program, d: DefId, facts: BodyFacts) {
     FACTS.lock().unwrap_or_else(|e| e.into_inner()).entry(fact_owner(prog, d)).or_default().append(facts);
 }
 
+/// The lazily computed item cells whose text `item_text` keeps out of body facts.
+#[derive(Clone, Copy)]
+pub enum ItemCell { Signature, Declaration, ConstDecl, BoundVars, Lifetimes, AliasTy }
+const ITEM_CELLS: usize = 6;
+const ITEM_CELL_NAMES: [&str; ITEM_CELLS] = ["signatures", "declarations", "const declarations", "bound variables", "lifetime names", "alias types"];
+
+/// Computes item `d`'s cell `f` (its miss path): item text belongs to the text that wrote it, not
+/// to the body whose lookup first needed it. Interface text records its import uses outside any
+/// body's capture, in the program's sets, as the owners phase does; an item written inside a body
+/// (a local struct, fn, impl) is that body's text, so its uses go to that body's facts, whichever
+/// body asks. A body's own declarations stay in its capture.
+pub fn item_text<R>(prog: &Program, d: DefId, cell: ItemCell, f: impl FnOnce() -> R) -> R {
+    if !record_import_uses() { return f(); }
+    let key = fact_owner(prog, d);
+    let current = OWNER.with(|o| o.get());
+    if current == Some(key) { count_in_body(prog, d, cell); return f(); }
+    if let Some(root) = hole_owner(prog, key) {
+        if current == Some(root) { return f(); }
+        let (r, mut uses) = capture_import_uses(f);
+        let _k = crate::zone_alloc::kept();
+        uses.sort_dedup();
+        FACTS.lock().unwrap_or_else(|e| e.into_inner()).entry(root).or_default().import_uses.append(uses);
+        return r;
+    }
+    if current.is_some() { count_in_body(prog, d, cell); }
+    outside_capture(f)
+}
+
+/// Counts a fresh crate's item cell computed inside a body.
+fn count_in_body(prog: &Program, d: DefId, cell: ItemCell) {
+    if FRESH.lock().unwrap_or_else(|e| e.into_inner()).get(prog.def(d).krate as usize).copied().unwrap_or(false) {
+        IN_BODY[cell as usize].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The body owner whose body holds item `d`'s text (the outermost: a fn inside a fn is the outer
+/// one's text); None for interface text.
+fn hole_owner(prog: &Program, d: DefId) -> Option<DefId> {
+    let mut root = None;
+    let mut m = prog.def(d).scope;
+    while let Some(&f) = prog.block_owner.get(&m) {
+        root = Some(f);
+        m = prog.def(f).scope;
+    }
+    root
+}
+
+/// Starts a check's body phases: the crates whose items count when a body computes them.
+pub fn begin(fresh: &[bool]) {
+    *FRESH.lock().unwrap_or_else(|e| e.into_inner()) = fresh.to_vec();
+    for n in &IN_BODY { n.store(0, Ordering::Relaxed); }
+}
+
+/// The item cells of fresh crates first computed inside a body, in all, then "N kind" per kind.
+pub fn items_in_bodies() -> (usize, String) {
+    let counts: Vec<usize> = IN_BODY.iter().map(|n| n.load(Ordering::Relaxed)).collect();
+    let by_kind: Vec<String> = counts.iter().zip(ITEM_CELL_NAMES).filter(|(n, _)| **n > 0).map(|(n, k)| format!("{n} {k}")).collect();
+    (counts.iter().sum(), by_kind.join(", "))
+}
+
 /// Starts the body phase; the escape count belongs to this window alone.
 pub fn open() { ESCAPED.store(0, Ordering::Relaxed); ACTIVE.store(true, Ordering::Release); }
 
@@ -335,4 +400,6 @@ pub(crate) unsafe fn reset_statics() {
     reset(&ACTIVE, AtomicBool::new(false));
     reset(&FACTS, Mutex::new(HashMap::default()));
     reset(&ESCAPED, AtomicUsize::new(0));
+    reset(&FRESH, Mutex::new(Vec::new()));
+    for n in &IN_BODY { n.store(0, Ordering::Relaxed); }
 }

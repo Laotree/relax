@@ -1638,7 +1638,7 @@ impl Tcx {
     fn init_signature<'a>(&'a self, prog: &Program, d: DefId, cell: &'a std::sync::OnceLock<Box<SigParts>>) -> &'a SigParts {
         // (computed outside the cell's Once: relax_base::query::init_once)
         let diagnostics = std::cell::Cell::new(None);
-        let value: &Box<_> = crate::query::init_once(cell, || {
+        let value: &Box<_> = crate::query::init_once(cell, || crate::body_facts::item_text(prog, d, crate::body_facts::ItemCell::Signature, || {
             if crate::why::enabled() && prog.files.get(prog.def(d).file as usize)
                 .and_then(|f| f.ast.items.get(prog.def(d).item.0 as usize)).is_some() {
                 let cause = prog.why_def(d, "signature-demand");
@@ -1654,7 +1654,7 @@ impl Tcx {
             if !parts.errors.is_empty() { cx.errors().note_reported_error(); }
             diagnostics.set(Some(cx.errors().take_since(checkpoint)));
             Box::new(parts)
-        }, |parts| {
+        }), |parts| {
             let (errors, warnings) = diagnostics.take().unwrap_or_default();
             for error in errors {
                 let owner = if error.cause.body_id == NO_DEF { d } else { error.cause.body_id };
@@ -2356,7 +2356,7 @@ impl Tcx {
     fn init_const_decl<'a>(&'a self, prog: &Program, d: DefId, cell: &'a std::sync::OnceLock<Box<ConstDecl>>) -> &'a ConstDecl {
         // (computed outside the cell's Once: relax_base::query::init_once)
         let diagnostics = std::cell::Cell::new(None);
-        let value: &Box<_> = crate::query::init_once(cell, || {
+        let value: &Box<_> = crate::query::init_once(cell, || crate::body_facts::item_text(prog, d, crate::body_facts::ItemCell::ConstDecl, || {
             let _mem = crate::memstat::tag(crate::memstat::Tag::Sigs);
             let state = EvalState::new();
             let cx = EvalCx::new(prog, self, TypingEnv::fully_monomorphized(prog), &state);
@@ -2370,7 +2370,7 @@ impl Tcx {
             if !decl.errors.is_empty() { cx.errors().note_reported_error(); }
             diagnostics.set(Some(cx.errors().take_since(checkpoint)));
             Box::new(decl)
-        }, |decl| {
+        }), |decl| {
             let (errors, warnings) = diagnostics.take().unwrap_or_default();
             for error in errors {
                 let owner = if error.cause.body_id == NO_DEF { d } else { error.cause.body_id };
@@ -3292,7 +3292,7 @@ impl Tcx {
         }
         cx.state.lowering.borrow_mut().push(key);
         let read0 = cx.state.impl_read.replace(false);
-        let t = self.lower_alias_rhs(cx, prog, d);
+        let t = crate::body_facts::item_text(prog, d, crate::body_facts::ItemCell::AliasTy, || self.lower_alias_rhs(cx, prog, d));
         cx.state.lowering.borrow_mut().pop();
         let read = cx.state.impl_read.get();
         cx.state.impl_read.set(read0 || read);

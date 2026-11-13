@@ -92,21 +92,21 @@ impl Tcx {
     }
 
     pub fn explicit_super_predicates_of(&self, prog: &Program, def_id: DefId) -> &[Predicate] {
-        self.declaration_queries(prog, def_id).super_predicates.get_or_init_cyclic(||
-            self.implied_clauses_with_filter(prog, def_id, PredicateFilter::SelfOnly))
+        self.declaration_queries(prog, def_id).super_predicates.get_or_init_cyclic(|| crate::body_facts::item_text(prog, def_id, crate::body_facts::ItemCell::Declaration, || 
+            self.implied_clauses_with_filter(prog, def_id, PredicateFilter::SelfOnly)))
     }
 
     /// predicates_of.rs explicit_implied_predicates_of: the supertraits and the bounds their
     /// associated item constraints put on Self's projections (`trait B: A<X: Copy>` implies
     /// `<Self as A>::X: Copy`); what elaboration (Filter::All) adds for a `T: B`
     pub fn explicit_implied_predicates_of(&self, prog: &Program, def_id: DefId) -> &[Predicate] {
-        self.declaration_queries(prog, def_id).implied_predicates.get_or_init_cyclic(||
-            self.implied_clauses_with_filter(prog, def_id, PredicateFilter::SelfAndAssociatedTypeBounds))
+        self.declaration_queries(prog, def_id).implied_predicates.get_or_init_cyclic(|| crate::body_facts::item_text(prog, def_id, crate::body_facts::ItemCell::Declaration, || 
+            self.implied_clauses_with_filter(prog, def_id, PredicateFilter::SelfAndAssociatedTypeBounds)))
     }
 
     pub(crate) fn explicit_supertraits_containing_assoc_item(&self, prog: &Program, def_id: DefId, name: crate::program::Sym) -> Vec<Predicate> {
-        self.declaration_queries(prog, def_id).filtered_supers(name, ||
-            self.implied_clauses_with_filter(prog, def_id, PredicateFilter::SelfTraitThatDefines(name)))
+        self.declaration_queries(prog, def_id).filtered_supers(name, || crate::body_facts::item_text(prog, def_id, crate::body_facts::ItemCell::Declaration, || 
+            self.implied_clauses_with_filter(prog, def_id, PredicateFilter::SelfTraitThatDefines(name))))
     }
 
     // context.rs:2090 and type_ir/elaborate.rs:324: traverse the lowered

@@ -1333,6 +1333,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
         if !out.errors.is_empty() { out.needs_load = true; }
         out
     };
+    relax_types::body_facts::begin(&fresh);
     relax_types::body_facts::open();
     for (d, f) in replay { relax_types::body_facts::replay(&u.prog, d, f); }
     let t_par = t_check.elapsed();
@@ -1527,6 +1528,12 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
             for w in &differ { eprintln!("relax check:   a stored verdict differs from its recheck: {w}"); }
         }
         st.mark("recheck of replayed bodies");
+    }
+    // item text a body computed first (body_facts.rs item_text): each is a cell of a fresh crate
+    // the owners phase did not compute, so its uses could depend on which crates are fresh
+    if bodies.is_some() && subjects_mode() == 0 {
+        let (n, kinds) = relax_types::body_facts::items_in_bodies();
+        eprintln!("relax check: items resolved in a body: {n}{}", if kinds.is_empty() { String::new() } else { format!(" ({kinds})") });
     }
     // rustc_monomorphize: a program's `main` and what it reaches, instantiated -- the constants
     // generic code evaluates there (post-monomorphization E0080) -- in the check of a build only

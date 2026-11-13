@@ -10,9 +10,10 @@ const CHILD: &str = "RELAX_CHECK_REUSE_CHILD";
 /// One check's output: its diagnostic lines (as printed), how many crates it reused, whether it
 /// reused all (nothing checked), how many bodies it replayed from stored verdicts, how many
 /// stored body verdicts it verified, how many replayed bodies it checked after all for an import
-/// report their stored uses decided and how many of those candidates that cleared, its exit code.
+/// report their stored uses decided and how many of those candidates that cleared, how many item
+/// cells of a checked crate a body computed first, its exit code.
 #[derive(Debug)]
-struct Run { diags: Vec<String>, hits: usize, full: bool, replayed: usize, verified: usize, rechecked: usize, cleared: usize, code: i32 }
+struct Run { diags: Vec<String>, hits: usize, full: bool, replayed: usize, verified: usize, rechecked: usize, cleared: usize, in_body: usize, code: i32 }
 
 /// The check of the package in `dir` in a child (`reuse_child`), with the store when `reuse`,
 /// the variables `env` set.
@@ -30,7 +31,7 @@ fn check_in_child_store(dir: &std::path::Path, reuse: bool, store: &std::path::P
     let out = crate::test_child::output(&mut cmd);
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}\n{stderr}");
-    let mut run = Run { diags: Vec::new(), hits: 0, full: false, replayed: 0, verified: 0, rechecked: 0, cleared: 0, code: -1 };
+    let mut run = Run { diags: Vec::new(), hits: 0, full: false, replayed: 0, verified: 0, rechecked: 0, cleared: 0, in_body: 0, code: -1 };
     for l in stderr.lines().chain(stdout.lines()) {
         if l.contains(": warning: ") || l.contains(": error: ") || l.contains(": E0") || l.contains("internal: ") { run.diags.push(l.to_string()); }
         let count = |what: &str| l.strip_prefix("relax check: ").and_then(|r| r.split_once(what)).and_then(|(n, _)| n.split(' ').next()?.parse().ok());
@@ -40,6 +41,7 @@ fn check_in_child_store(dir: &std::path::Path, reuse: bool, store: &std::path::P
             run.rechecked = r.split(' ').next().unwrap().parse().unwrap();
         }
         if let Some(n) = l.strip_prefix("relax check: unused-import candidates cleared by a recheck: ") { run.cleared = n.parse().unwrap(); }
+        if let Some(n) = l.strip_prefix("relax check: items resolved in a body: ") { run.in_body = n.split(' ').next().unwrap().parse().unwrap(); }
         // "N of M crates unchanged since a passing check" (some checked), "M crates unchanged .." (none)
         if let Some((n, _)) = l.strip_prefix("relax check: ").and_then(|r| r.split_once(" crates unchanged since a passing check")) {
             match n.split_once(" of ") {
@@ -177,6 +179,9 @@ fn a_copy_in_another_worktree_prints_its_own_paths() {
 /// A replayed verdict that lacks the uses (a test hook drops them) prints no false warning: the
 /// imports it would call unused hold the reports back, the crate's replayed bodies are checked
 /// after all, and the candidates clear. With the last uses edited away, the warnings print once.
+/// Item text a binary body computes first (the library's generics, bounds and signature, with the
+/// library reused, so its own check did not compute them) records its import uses in no body's
+/// verdict: the binary's verdicts stored then are the ones a check of every crate makes.
 #[test]
 fn a_dependency_body_edit_checks_only_that_dependency() {
     if std::env::var_os(CHILD).is_some() { return; }
@@ -218,6 +223,20 @@ fn a_dependency_body_edit_checks_only_that_dependency() {
     // f, unused_in_lib and cur_a (stored by the check before) replayed, then checked after all
     assert_eq!((reused.replayed, reused.rechecked, reused.cleared), (3, 3, 0), "the last uses of two imports edited away: {reused:?}");
     assert_eq!(cold.diags.iter().filter(|d| d.contains("unused import")).count(), 2, "{cold:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+    let lib = "use std::fmt::Debug;\nuse std::io::Cursor;\npub fn show<T: Debug>(t: T) -> Cursor<T> { Cursor::new(t) }\n";
+    let bin = "fn a() -> u64 { pkg::show(1u8).position() }\nfn b() -> u64 { pkg::show(2u8).position() }\nfn main() { a(); b(); }\nfn unused_in_bin() {}\n";
+    let dir = package("item-uses", &[("lib.rs", lib), ("bin.rs", bin)]);
+    let first = check_in_child(&dir, true, &one);
+    assert_eq!((first.hits, first.code, first.diags.len()), (0, 0, 1), "{first:?}");
+    let bin = format!("{bin}pub fn g() {{}}\n");
+    std::fs::write(dir.join("bin.rs"), &bin).unwrap();
+    let (reused, cold) = reused_and_verified(&dir, &one, "the binary's interface edited");
+    // checked: the binary's five bodies, `a` computing `show`'s item text first; verified: those and `show`
+    assert_eq!((reused.hits, reused.replayed, cold.verified), (1, 0, 6), "the binary's interface edited: {reused:?}, {cold:?}");
+    std::fs::write(dir.join("bin.rs"), bin.replace("pkg::show(1u8).position()", "0")).unwrap();
+    let (reused, cold) = reused_and_verified(&dir, &one, "the body that computed the library's item text first edited");
+    assert_eq!((reused.hits, reused.replayed, cold.verified), (1, 4, 6), "the body that computed the library's item text first edited: {reused:?}, {cold:?}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

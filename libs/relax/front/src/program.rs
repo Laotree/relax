@@ -6011,6 +6011,21 @@ pub fn capture_import_uses<R>(f: impl FnOnce() -> R) -> (R, ImportUses) {
     (r, got)
 }
 
+/// Runs `f` with this thread's capture set aside: the uses `f` records go to the program's sets,
+/// as they do outside a body. Item text lowered on a cell's miss path (relax_types body_facts.rs
+/// item_text) belongs to the crate's interface, not to the body whose lookup first needed it.
+pub fn outside_capture<R>(f: impl FnOnce() -> R) -> R {
+    /// The set-aside capture, put back on return and on unwind.
+    struct Restore(Option<ImportUses>);
+    impl Drop for Restore {
+        fn drop(&mut self) { let prev = self.0.take(); IMPORT_USE_SINK.with(|s| *s.borrow_mut() = prev); }
+    }
+    let prev = IMPORT_USE_SINK.with(|s| s.borrow_mut().take());
+    if prev.is_none() { return f(); }
+    let _restore = Restore(prev);
+    f()
+}
+
 thread_local! {
     static QUIET_LOOKUPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
