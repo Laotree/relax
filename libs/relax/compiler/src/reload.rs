@@ -3965,6 +3965,13 @@ unsafe fn initializer_deps_changed(up: *mut Unit, root: u32, changed: &[DefId], 
             }
         };
         if hit { return Ok(true); }
+        if let FnKey::Inst(d, _) = &u.fns[s as usize].key {
+            // A completed initializer never entered a diverging callee. Its body cannot
+            // affect the cached value; changes to callers still visit their dependencies.
+            if u.tcx.fn_sig(&u.prog, *d).is_some_and(|sig| matches!(u.tcx.tys.kind(sig.ret), crate::types::TyKind::Never)) {
+                continue;
+            }
+        }
         if u.fns[s as usize].rir.is_none() {
             jit::build_rir(up, s).map_err(|e| format!("`{}`: {}", (&*up).fns[s as usize].name, e))?;
         }
