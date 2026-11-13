@@ -56,8 +56,8 @@ pub struct UnitInfo {
     pub deps: Vec<(usize, String)>,
     pub proc_macro: bool,
     pub harness: bool,
-    /// a registry/git package (CrateUnit::registry): third-party, sandboxed under a strict
-    /// proc-macro policy (pmhost::Policy)
+    /// a registry/git package (CrateUnit::registry): third-party, its macros confined under
+    /// pmhost::Policy::Sandboxed
     pub registry: bool,
     pub cfgs: Vec<String>,
     pub env: Vec<(String, String)>,

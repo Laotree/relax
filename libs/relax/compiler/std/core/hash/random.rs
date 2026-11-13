@@ -46,14 +46,11 @@ fn keys_from(buf: &[u8; 16]) -> (u64, u64) {
 // when the call is unavailable or would block, /dev/urandom
 #[cfg(all(not(relax_web), any(target_os = "linux", target_os = "android")))]
 fn hashmap_random_keys() -> (u64, u64) {
-    use crate::ffi::{c_char, c_int, c_void};
+    use crate::ffi::{c_int, c_void};
     use crate::sync::atomic::{AtomicBool, Ordering::Relaxed};
     extern "C" {
         fn getrandom(buf: *mut c_void, len: usize, flags: u32) -> isize;
         fn __errno_location() -> *mut c_int;
-        fn open(path: *const c_char, flags: c_int, ...) -> c_int;
-        fn read(fd: c_int, buf: *mut c_void, n: usize) -> isize;
-        fn close(fd: c_int) -> c_int;
     }
     const GRND_NONBLOCK: u32 = 1;
     const GRND_INSECURE: u32 = 4;
@@ -62,8 +59,6 @@ fn hashmap_random_keys() -> (u64, u64) {
     const EPERM: c_int = 1;
     const EINVAL: c_int = 22;
     const ENOSYS: c_int = 38;
-    const O_RDONLY: c_int = 0;
-    const O_CLOEXEC: c_int = 0o2000000;
     static GETRANDOM_AVAILABLE: AtomicBool = AtomicBool::new(true);
     static GRND_INSECURE_AVAILABLE: AtomicBool = AtomicBool::new(true);
     let mut buf = [0u8; 16];
@@ -89,22 +84,41 @@ fn hashmap_random_keys() -> (u64, u64) {
         }
     }
     if off < buf.len() {
-        // (std reads the rest from /dev/urandom: read_exact on the device)
-        let fd = unsafe { open(b"/dev/urandom\0".as_ptr() as *const c_char, O_RDONLY | O_CLOEXEC) };
-        if fd < 0 {
-            panic!("failed to generate random data");
-        }
-        while off < buf.len() {
-            let r = unsafe { read(fd, buf.as_mut_ptr().add(off) as *mut c_void, buf.len() - off) };
-            if r > 0 {
-                off += r as usize;
-            } else if r == 0 || unsafe { *__errno_location() } != EINTR {
-                panic!("failed to generate random data");
-            }
-        }
-        unsafe { close(fd) };
+        urandom_rest(&mut buf, off);
     }
     keys_from(&buf)
+}
+
+/// The rest of the keys from /dev/urandom (std's read_exact on the device), when getrandom is
+/// unavailable or would block. A function of its own: code that never takes this path (a
+/// sandbox twin, whose getrandom always answers) never compiles its file access.
+#[cfg(all(not(relax_web), any(target_os = "linux", target_os = "android")))]
+#[cold]
+#[inline(never)]
+fn urandom_rest(buf: &mut [u8; 16], mut off: usize) {
+    use crate::ffi::{c_char, c_int, c_void};
+    extern "C" {
+        fn __errno_location() -> *mut c_int;
+        fn open(path: *const c_char, flags: c_int, ...) -> c_int;
+        fn read(fd: c_int, buf: *mut c_void, n: usize) -> isize;
+        fn close(fd: c_int) -> c_int;
+    }
+    const EINTR: c_int = 4;
+    const O_RDONLY: c_int = 0;
+    const O_CLOEXEC: c_int = 0o2000000;
+    let fd = unsafe { open(b"/dev/urandom\0".as_ptr() as *const c_char, O_RDONLY | O_CLOEXEC) };
+    if fd < 0 {
+        panic!("failed to generate random data");
+    }
+    while off < buf.len() {
+        let r = unsafe { read(fd, buf.as_mut_ptr().add(off) as *mut c_void, buf.len() - off) };
+        if r > 0 {
+            off += r as usize;
+        } else if r == 0 || unsafe { *__errno_location() } != EINTR {
+            panic!("failed to generate random data");
+        }
+    }
+    unsafe { close(fd) };
 }
 
 // sys/random/apple.rs: CCRandomGenerateBytes

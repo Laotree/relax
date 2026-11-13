@@ -62,9 +62,8 @@ pub struct Host {
     /// how much the JIT compiles ahead of the program's calls when neither `--ahead=` nor
     /// RELAX_AHEAD says (jit::AheadPolicy): the entry point's default
     pub ahead: relax_compiler::options::AheadLevel,
-    /// which proc-macro crates may use `unsafe` and std capabilities (pmhost::Policy): `relax`
-    /// runs crates.io macros as cargo does, `makepad` runs third-party ones under the strict
-    /// policy (pmhost.rs's module doc says what that covers today)
+    /// whether third-party proc macros run confined (pmhost::Policy): `relax` runs crates.io
+    /// macros as cargo does, `makepad` runs them in the sandbox (pmhost.rs's module doc)
     pub proc_macros: relax_compiler::pmhost::Policy,
     /// what `makepad` with no arguments runs when no launch record says (launch.rs): None prints
     /// the usage

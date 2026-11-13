@@ -11,17 +11,17 @@
 //! Trust: one policy per process, chosen by the entry point (`set_policy`; runner Host):
 //! - `Policy::Open` (bare `relax`, the dev/test runner for general crates): every proc-macro
 //!   crate runs as cargo would run it, `unsafe` and std capabilities included.
-//! - `Policy::Sandboxed` (`makepad run`, and the default): before a third-party proc-macro crate
-//!   -- a registry or git package by its cargo package id, wherever its sources are stored --
-//!   compiles, a lexical scan of its source files (`sandbox_check`) refuses `unsafe`, `extern`
-//!   blocks, `asm!`, `static mut`, `transmute` and a `std::` path naming fs/net/process/env/
-//!   thread/time; a macro crate depending on a refused one is refused too. Path packages (the
-//!   workspace's own, makepad's) and std are not scanned.
-//!   The scan is not a capability boundary. It sees tokens, not code: `std::os::unix::fs`,
-//!   `Path`'s file-system methods, grouped or renamed imports of std, `#[path]` and `include!`
-//!   files and paths a macro pastes together all pass it, so a third-party proc macro that
-//!   passes it can do whatever the user can. It is being replaced by running that code confined
-//!   as sandbox twins (sandbox.rs), the mechanism run-time modules use.
+//! - `Policy::Sandboxed` (`makepad run`, and the default): a proc-macro root whose dependency
+//!   closure holds a third-party package (a registry or git package by its cargo package id,
+//!   wherever its sources are stored) runs confined, root and closure: as sandbox twins
+//!   (sandbox.rs, the mechanism run-time modules use) in the world's arena, entered through the
+//!   data-only bridge. Its code reaches memory of the arena only, and the host only through the
+//!   macro domain's entries (`macro_allow`): tokens in and out, the lexer, the invoking crate's
+//!   cargo environment, randomness. A file, socket, process, thread, clock or the process
+//!   environment is a C function a twin cannot call: the macro fails with that function named,
+//!   at its call site. A root whose closure is path packages only (the workspace's, makepad's)
+//!   runs as host code; a crate both kinds of root use has both forms. Where the sandbox has no
+//!   arena windows (Windows, so far) a confined root's macros fail, saying so: never run as host.
 //! Neither policy covers build scripts: a third-party package's `build.rs` runs as its own
 //! process with the user's rights (unitgraph.rs).
 //! Every call runs under the hang watchdog.
@@ -134,14 +134,21 @@ struct World {
     entries: relax_session::sync::Mutex<Vec<((usize, String), u64)>>,
     /// macro fns whose code does not compile: (unit, fn) -> the error (deterministic, not retried)
     broken: relax_session::sync::Mutex<Vec<((usize, String), String)>>,
-    /// unit -> why the sandbox refused it
-    refused: Vec<Option<String>>,
+    /// unit -> its macros run confined (Policy::Sandboxed, a third-party package in its closure)
+    confined: Vec<bool>,
+    /// the confined macros' arena and the bridge's twin, or why there is none (no arena windows
+    /// on this platform): every confined macro reports it
+    sandbox: Result<(std::sync::Arc<crate::sandbox::Arena>, u64), String>,
 }
 
 impl Drop for World {
     fn drop(&mut self) {
         // the last holder is gone (free_world): park compile jobs off the unit, then drop it
         unsafe {
+            if let Ok((a, _)) = &self.sandbox {
+                // (no call is inside: the window's pages go, its addresses stay taken)
+                crate::sandbox::free_arena(&*self.u, a);
+            }
             crate::jit::retire_unit(self.u);
             drop(Box::from_raw(self.u));
         }
@@ -345,13 +352,13 @@ fn prewarm(sess: &std::sync::Arc<crate::Session>) -> Result<(), String> {
 
 
 
-/// Which proc-macro crates may use `unsafe` and std capabilities (module doc): the entry
-/// point's choice, one per process.
+/// Whether third-party proc macros run confined (module doc): the entry point's choice, one per
+/// process.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Policy {
-    /// every macro crate is trusted (bare `relax`)
+    /// every macro runs as host code, as cargo runs it (bare `relax`)
     Open,
-    /// registry/git packages are sandboxed (`makepad run`)
+    /// a macro whose code includes a registry or git package runs confined (`makepad run`)
     Sandboxed,
 }
 
@@ -367,56 +374,65 @@ pub fn policy() -> Policy {
     if POLICY.load(std::sync::atomic::Ordering::Relaxed) == 1 { Policy::Open } else { Policy::Sandboxed }
 }
 
-/// Trusted crates may use unsafe/FFI: all of them under `Policy::Open`; else the path packages
-/// (and std): a registry/git package is sandboxed by what it is, not by where it is stored.
-fn trusted(unit: &crate::macro_reg::UnitInfo) -> bool {
-    policy() == Policy::Open || !unit.registry
+/// The macro domain's own entries (sandbox.rs `Allow`): what a confined macro reaches of the
+/// host beyond memory, math and formatting.
+fn macro_allow(name: &str) -> Option<Option<(&'static str, u64)>> {
+    Some(match name {
+        "relax_pm_parse" => Some(("sb_pm_parse", sb_pm_parse as *const () as u64)),
+        "relax_pm_getenv" => Some(("sb_pm_getenv", sb_pm_getenv as *const () as u64)),
+        // the process environment is not the macro's: `std::env::var` answers from the invoking
+        // crate's cargo environment (relax_pm_getenv) or not at all
+        "getenv" => Some(("sb_no_getenv", sb_no_getenv as *const () as u64)),
+        _ => return None,
+    })
 }
 
-/// The sandbox's dialect-level refusal for an untrusted macro crate's files.
-fn sandbox_check(root: &str, edition: u16) -> Result<(), String> {
-    use crate::lexer::T;
-    let mut stack = vec![root.to_string()];
-    let mut seen = Vec::new();
-    while let Some(path) = stack.pop() {
-        if seen.contains(&path) {
-            continue;
-        }
-        seen.push(path.clone());
-        let src = crate::vfs::read(&path).map_err(|e| format!("{}: {}", path, e))?;
-        let mut toks = Vec::new();
-        crate::lexer::lex(&src, edition, &mut toks).map_err(|e| format!("{}: {}", path, e.msg))?;
-        let text = |i: usize| -> &[u8] { &src[toks[i].lo as usize..toks[i].hi as usize] };
-        let dir = crate::program::dir_of(&path).to_string();
-        for i in 0..toks.len() {
-            let bad = match toks[i].kind {
-                T::KwUnsafe => Some("`unsafe`"),
-                T::KwExtern if i + 1 < toks.len() && matches!(toks[i + 1].kind, T::Str | T::OpenBrace) => Some("`extern` block"),
-                T::KwStatic if i + 1 < toks.len() && toks[i + 1].kind == T::KwMut => Some("`static mut`"),
-                T::Ident if text(i) == b"asm" || text(i) == b"global_asm" => Some("`asm!`"),
-                T::Ident if text(i) == b"transmute" => Some("`transmute`"),
-                T::Ident if i >= 2 && toks[i - 1].kind == T::PathSep && text(i - 2) == b"std" && matches!(text(i), b"fs" | b"net" | b"process" | b"env" | b"thread" | b"time") => {
-                    Some("a std capability (fs/net/process/env/thread/time)")
-                }
-                T::KwMod if i + 2 < toks.len() && toks[i + 2].kind == T::Semi => {
-                    let name = String::from_utf8_lossy(text(i + 1)).into_owned();
-                    for c in [format!("{}/{}.rs", dir, name), format!("{}/{}/mod.rs", dir, name)] {
-                        if crate::vfs::exists(&c) {
-                            stack.push(c);
-                            break;
-                        }
-                    }
-                    None
-                }
-                _ => None,
-            };
-            if let Some(what) = bad {
-                let (l, c) = crate::lexer::line_col(&src, toks[i].lo);
-                return Err(format!("{}:{}:{}: proc macro uses {} -- not allowed in compile-time code of a third-party crate under `{tool} run` (bare `relax` runs it)", path, l, c, what, tool = crate::tool_name()));
-            }
-        }
+/// `relax_pm_parse` for a confined macro: the source read from its arena, the encoded stream
+/// handed to it there (sandbox::give).
+extern "C" fn sb_pm_parse(src: u64, len: u64, out: u64, out_len: u64) -> i32 {
+    let src = crate::sandbox::arena_ptr(src, len);
+    let (out, out_len) = (crate::sandbox::arena_ptr(out, 8), crate::sandbox::arena_ptr(out_len, 8));
+    if src == 0 || out == 0 || out_len == 0 {
+        return 1;
     }
-    Ok(())
+    let s = unsafe { std::slice::from_raw_parts(src as *const u8, len as usize) };
+    let Ok(s) = std::str::from_utf8(s) else { return 1 };
+    let Some(ts) = crate::builtins::lex_stream(s) else { return 1 };
+    let b = crate::pm::encode(Span::DUMMY, &ts);
+    let p = crate::sandbox::give(&b);
+    if p == 0 {
+        return 1;
+    }
+    unsafe {
+        *(out as *mut u64) = p;
+        *(out_len as *mut u64) = b.len() as u64;
+    }
+    0
+}
+
+/// `relax_pm_getenv` for a confined macro: the invoking crate's cargo environment only.
+extern "C" fn sb_pm_getenv(key: u64, len: u64, out: u64, out_len: u64) -> i32 {
+    let key = crate::sandbox::arena_ptr(key, len);
+    let (out, out_len) = (crate::sandbox::arena_ptr(out, 8), crate::sandbox::arena_ptr(out_len, 8));
+    if key == 0 || out == 0 || out_len == 0 {
+        return 1;
+    }
+    let k = unsafe { std::slice::from_raw_parts(key as *const u8, len as usize) };
+    let Ok(k) = std::str::from_utf8(k) else { return 1 };
+    let Some(val) = crate::macro_reg::call_krate_env(k) else { return 1 };
+    let p = crate::sandbox::give(val.as_bytes());
+    if p == 0 {
+        return 1;
+    }
+    unsafe {
+        *(out as *mut u64) = p;
+        *(out_len as *mut u64) = val.len() as u64;
+    }
+    0
+}
+
+extern "C" fn sb_no_getenv(_name: u64) -> u64 {
+    0
 }
 
 fn build_world(sess: &std::sync::Arc<crate::Session>) -> Result<World, String> {
@@ -444,31 +460,23 @@ fn build_world(sess: &std::sync::Arc<crate::Session>) -> Result<World, String> {
             need[i] = false;
         }
     }
-    // the sandbox's refusal, per crate: a refused crate (and crates using it) stays out of the
-    // world; its macros report the reason at their call sites
-    let mut refused: Vec<Option<String>> = vec![None; units.len()];
-    for i in 0..units.len() {
-        if need[i] && !trusted(&units[i]) {
-            if let Err(e) = sandbox_check(&units[i].src_path, units[i].edition) {
-                refused[i] = Some(e);
+    // Policy::Sandboxed: a root whose closure holds a third-party package runs confined, root
+    // and closure; any other root runs as host code, its closure too (a crate both use has both)
+    let mut confined = vec![false; units.len()];
+    let mut host = vec![false; units.len()];
+    for root in (0..units.len()).filter(|&i| need[i] && units[i].proc_macro) {
+        let mut closure = vec![false; units.len()];
+        let mut st = vec![root];
+        while let Some(i) = st.pop() {
+            if closure[i] || !need[i] {
+                continue;
             }
+            closure[i] = true;
+            st.extend(units[i].deps.iter().map(|&(d, _)| d));
         }
-    }
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for i in 0..units.len() {
-            if need[i] && refused[i].is_none() {
-                if let Some(d) = units[i].deps.iter().find(|(d, _)| refused[*d].is_some()) {
-                    refused[i] = Some(format!("depends on refused crate {}: {}", units[d.0].name, refused[d.0].clone().unwrap_or_default()));
-                    changed = true;
-                }
-            }
-        }
-    }
-    for i in 0..units.len() {
-        if refused[i].is_some() {
-            need[i] = false;
+        let confine = policy() == Policy::Sandboxed && (0..units.len()).any(|i| closure[i] && units[i].registry);
+        for i in (0..units.len()).filter(|&i| closure[i]) {
+            if confine { confined[i] = true } else { host[i] = true }
         }
     }
     let mut boot_root = vec![false; units.len()];
@@ -530,15 +538,15 @@ fn build_world(sess: &std::sync::Arc<crate::Session>) -> Result<World, String> {
                     }
                 }
             }
-            let bw = build_world_inner(sess, &units, &std_dir, &stage_need, &stage_uses, refused.clone())?;
+            let bw = build_world_inner(sess, &units, &std_dir, &stage_need, &stage_uses, &confined, &host)?;
             BOOT_WORLDS.lock().unwrap_or_else(|e| e.into_inner()).push(std::sync::Arc::new(Ok(bw)));
             for p in fresh { have[p] = true; }
         }
     }
-    build_world_inner(sess, &units, &std_dir, &need, &uses_boot, refused)
+    build_world_inner(sess, &units, &std_dir, &need, &uses_boot, &confined, &host)
 }
 
-fn build_world_inner(sess: &std::sync::Arc<crate::Session>, units: &[crate::macro_reg::UnitInfo], std_dir: &str, need: &[bool], uses_boot: &[bool], refused: Vec<Option<String>>) -> Result<World, String> {
+fn build_world_inner(sess: &std::sync::Arc<crate::Session>, units: &[crate::macro_reg::UnitInfo], std_dir: &str, need: &[bool], uses_boot: &[bool], confined: &[bool], host_run: &[bool]) -> Result<World, String> {
     let t0 = std::time::Instant::now();
     let _mem = crate::memstat::tag(crate::memstat::Tag::PmHost);
     let mut prog = crate::program::Program::new(sess);
@@ -645,6 +653,23 @@ fn build_world_inner(sess: &std::sync::Arc<crate::Session>, units: &[crate::macr
     }
     let id = u.fn_id(crate::jit::FnKey::Inst(bridge_def, Vec::new()));
     let bridge = u.entry(id);
+    // the confined macros: the unit a confinement domain whose host code is std's and the
+    // host-run macros' crates, one arena (no fuel: the hang watchdog is the limit; its window
+    // bounds the memory), and the bridge's twin as their entry
+    let sandbox = if (0..units.len()).any(|i| need[i] && confined[i]) {
+        let up: *mut crate::jit::Unit = &mut *u;
+        let mut host_too: Vec<u32> = std_deps.iter().map(|&(_, k)| k).chain([pm]).collect();
+        host_too.extend((0..units.len()).filter(|&i| need[i] && host_run[i] && crate_of[i] != u32::MAX).map(|i| crate_of[i]));
+        unsafe { crate::sandbox::confine_unit(up, macro_allow, &host_too) }
+            .and_then(|()| crate::sandbox::new_arena(up, u32::MAX, "the proc-macro world", u64::MAX, 0))
+            .map(|a| {
+                let t = unsafe { crate::sandbox::twin(up, id) };
+                (a, unsafe { (*up).entry(t) })
+            })
+            .map_err(|e| format!("third-party proc macros run confined under `{} run`, and here they cannot: {}", crate::tool_name(), e))
+    } else {
+        Err("no confined proc macro in this world".to_string())
+    };
     if crate::preload::trace() {
         eprintln!("boot-trace: macro world: std {:.1} ms, + macro crates {:.1}, + resolve {:.1}, + collect {:.1}, + unit and cache {:.1} ms", t_std, t_crates, t_res, t_col, t0.elapsed().as_secs_f64() * 1e3);
         eprintln!("boot-trace: macro world heap (RELAX_MEM_REPORT): std {} MB, + macro crates {}, + collect {}, + unit {} MB", m_std, m_crates, m_col, crate::memstat::live_of(crate::memstat::Tag::PmHost) >> 20);
@@ -655,7 +680,8 @@ fn build_world_inner(sess: &std::sync::Arc<crate::Session>, units: &[crate::macr
         x.world_ns += ns;
         s.set(x);
     });
-    Ok(World { u: Box::into_raw(u), bridge, crate_of, entries: Default::default(), broken: Default::default(), refused })
+    let confined = (0..units.len()).map(|i| need[i] && confined[i]).collect();
+    Ok(World { u: Box::into_raw(u), bridge, crate_of, entries: Default::default(), broken: Default::default(), confined, sandbox })
 }
 
 /// Address of macro fn `fname` at the root of unit `unit`'s crate in the world.
@@ -674,10 +700,11 @@ fn entry_of(w: &World, unit: usize, fname: &str) -> Result<u64, String> {
         });
         d.map(|d| {
             let id = u.fn_id(crate::jit::FnKey::Inst(d, Vec::new()));
-            u.entry(id)
+            // a confined macro: its twin, as the fn value the bridge's twin calls
+            if w.confined[unit] { unsafe { crate::sandbox::fn_value(w.u, id) } } else { Ok(u.entry(id)) }
         })
     });
-    let a = a.ok_or_else(|| format!("macro fn `{}` not found", fname))?;
+    let a = a.ok_or_else(|| format!("macro fn `{}` not found", fname))??;
     w.entries.lock().unwrap().push(((unit, fname.to_string()), a));
     Ok(a)
 }
@@ -798,9 +825,10 @@ fn call(sess: &std::sync::Arc<crate::Session>, entry: &Entry, attr: Option<&Toke
     drop(wait);
     let _krate = crate::macro_reg::with_call_krate(&call_krate);
     let _held = crate::load_profile::span(sess.runtime.profile, "macro-unit-held", &entry.fname);
-    if let Some(Some(e)) = w.refused.get(entry.unit) {
-        return Err(format!("sandbox: {}", e));
-    }
+    let confined = match w.confined.get(entry.unit) {
+        Some(true) => Some(w.sandbox.as_ref().map_err(|e| e.clone())?),
+        _ => None,
+    };
     if let Some((_, e)) = w.broken.lock().unwrap().iter().find(|(k, _)| k.0 == entry.unit && k.1 == entry.fname) {
         STATS.with(|s| {
             let mut x = s.get();
@@ -822,10 +850,26 @@ fn call(sess: &std::sync::Arc<crate::Session>, entry: &Entry, attr: Option<&Toke
     let mut io = BridgeIo { f: f as usize, kind, inp: bytes.as_ptr(), inp_len: bytes.len(), attr: ap, attr_len: al, out: std::ptr::null_mut(), out_len: 0 };
     let tj = std::time::Instant::now();
     if trace() {
-        eprintln!("pmhost: enter {:?} unit={} fn={} crate={} input={}", std::thread::current().id(), entry.unit, entry.fname, call_krate, bytes.len());
+        eprintln!("pmhost: enter {:?} unit={} fn={} crate={} input={}{}", std::thread::current().id(), entry.unit, entry.fname, call_krate, bytes.len(), if confined.is_some() { " confined" } else { "" });
     }
     let slot = watch_begin();
-    let r = unsafe { crate::jit::call_jit(w.u, w.bridge, &mut io as *mut BridgeIo as u64) };
+    // a confined macro: the bridge's twin in the world's arena, with copies of the input there
+    // (the window is all its code reaches); its output range is checked and copied out
+    let mut confined_out: Option<Vec<u8>> = None;
+    let r = match confined {
+        None => unsafe { crate::jit::call_jit(w.u, w.bridge, &mut io as *mut BridgeIo as u64) },
+        Some((arena, bridge_twin)) => match call_confined(w, arena, *bridge_twin, &io) {
+            Ok(Ok(out)) => {
+                confined_out = Some(out);
+                Ok(0)
+            }
+            Ok(Err(p)) => Err(p),
+            Err(e) => {
+                slot.start.store(0, std::sync::atomic::Ordering::Release);
+                return Err(e);
+            }
+        },
+    };
     slot.start.store(0, std::sync::atomic::Ordering::Release);
     if trace() {
         eprintln!("pmhost: leave {:?} unit={} fn={} elapsed={:.1}ms", std::thread::current().id(), entry.unit, entry.fname, tj.elapsed().as_secs_f64() * 1e3);
@@ -859,11 +903,12 @@ fn call(sess: &std::sync::Arc<crate::Session>, entry: &Entry, attr: Option<&Toke
             return Err(msg);
         }
     }
-    if io.out.is_null() {
-        return Err("proc macro returned no output".to_string());
-    }
+    let out: &[u8] = match &confined_out {
+        Some(o) => o,
+        None if io.out.is_null() => return Err("proc macro returned no output".to_string()),
+        None => unsafe { std::slice::from_raw_parts(io.out, io.out_len) },
+    };
     tl_set_once(3, crate::clock::ms_since_start());
-    let out = unsafe { std::slice::from_raw_parts(io.out, io.out_len) };
     let td = std::time::Instant::now();
     let ts = crate::pm::decode_stream(out).ok_or("proc macro output is malformed")?;
     let dec_ns = td.elapsed().as_nanos() as u64;
@@ -878,7 +923,7 @@ fn call(sess: &std::sync::Arc<crate::Session>, entry: &Entry, attr: Option<&Toke
         x.calls += 1;
         x.call_ns += t0.elapsed().as_nanos() as u64;
         x.encode_ns += enc_ns;
-        x.out_bytes += io.out_len as u64;
+        x.out_bytes += out.len() as u64;
         x.decode_ns += dec_ns;
         x.compile_ns = cns;
         x.compiled = cnt;
@@ -890,6 +935,50 @@ fn call(sess: &std::sync::Arc<crate::Session>, entry: &Entry, attr: Option<&Toke
     if off_owner { body() } else { crate::owner::call(crate::owner::Class::Program, body) }
 }
 
+
+/// A confined macro's call: the bridge's twin runs in the world's arena on a copy of `io` and its
+/// input there. Ok(Ok(the output bytes)), Ok(Err(the panic or fault that ended it: the arena
+/// state before it is back)), or Err (the call could not start).
+fn call_confined(w: &World, arena: &crate::sandbox::Arena, bridge_twin: u64, io: &BridgeIo) -> Result<Result<Vec<u8>, crate::jit::PanicInfo>, String> {
+    use crate::sandbox as sb;
+    let depth = sb::entry_depth();
+    let saved = sb::save();
+    sb::enter_arena(arena).map_err(|_| "the proc-macro world's arena cannot be entered on this thread".to_string())?;
+    let put = |p: *const u8, len: usize| -> u64 {
+        let a = sb::arena_alloc(len.max(1) as u64, 16);
+        if a != 0 && len != 0 {
+            unsafe { std::ptr::copy_nonoverlapping(p, a as *mut u8, len) };
+        }
+        a
+    };
+    let inp = put(io.inp, io.inp_len);
+    let attr = if io.attr.is_null() { 0 } else { put(io.attr, io.attr_len) };
+    let at = sb::arena_alloc(std::mem::size_of::<BridgeIo>() as u64, 8);
+    if inp == 0 || at == 0 || (!io.attr.is_null() && attr == 0) {
+        for p in [inp, attr, at] {
+            sb::arena_free(p);
+        }
+        sb::leave();
+        return Err("the macro's input does not fit the proc-macro world's arena".to_string());
+    }
+    unsafe {
+        (at as *mut BridgeIo).write(BridgeIo { f: io.f, kind: io.kind, inp: inp as *const u8, inp_len: io.inp_len, attr: attr as *const u8, attr_len: io.attr_len, out: std::ptr::null_mut(), out_len: 0 })
+    };
+    let r = unsafe { crate::jit::call_jit(w.u, bridge_twin, at) };
+    if let Err(p) = r {
+        // (the arena state of the call is gone: its input copies stay in the heap)
+        sb::entry_recover(depth);
+        sb::restore(saved);
+        return Ok(Err(p));
+    }
+    let (out, out_len) = unsafe { ((*(at as *const BridgeIo)).out as u64, (*(at as *const BridgeIo)).out_len as u64) };
+    let bytes = unsafe { sb::arena_bytes(out, out_len) }.map(|b| b.to_vec());
+    for p in [out, inp, attr, at] {
+        sb::arena_free(p);
+    }
+    sb::leave();
+    bytes.map(Ok).ok_or_else(|| "the proc macro's output lies outside its arena".to_string())
+}
 
 /// After the program's files are loaded (no more expansions): the world's newly compiled code
 /// goes to the disk cache.

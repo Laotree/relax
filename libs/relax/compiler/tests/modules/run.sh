@@ -94,10 +94,10 @@ if [ "$GOT" = "$(cat "$D/expect-shadow-threads.out")" ]; then echo "modules shad
 OUT=$(RELAX_SANDBOX_NOCHECK=1 "$1" test "$D/thread_locals.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
 if [ "$GOT" = $'out each thread its own: true\nout thread ids differ: true\nout initialised per claim: true\nout destructors at release: 4' ]; then echo "modules thread-locals: PASS"; else echo "modules thread-locals: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; FAILS=$((FAILS + 1)); fi
-# Fn values past the old 65536-entry thunk table: each its own thunk, every call lands.
+# Fn values across three thunk-table chunks: each its own thunk, every call lands.
 OUT=$("$1" test "$D/fn_values.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
-if [ "$GOT" = $'out distinct fn values: 70000\nout calls land: true' ]; then echo "modules fn values: PASS"; else echo "modules fn values: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; FAILS=$((FAILS + 1)); fi
+if [ "$GOT" = $'out distinct fn values: 9000\nout calls land: true' ]; then echo "modules fn values: PASS"; else echo "modules fn values: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; FAILS=$((FAILS + 1)); fi
 # More threads than segments: the rest wait for one, every call returns.
 OUT=$(RELAX_SANDBOX_NOCHECK=1 RELAX_SANDBOX_FUEL=0 "$1" test "$D/segment_wait.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')

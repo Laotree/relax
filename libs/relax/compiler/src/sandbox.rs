@@ -61,8 +61,9 @@ const SEG_GUARD: u32 = 64 << 10;
 const SCRATCH_LEN: u32 = 1 << 20;
 /// a segment's thread-locals: [SEG_GUARD + SCRATCH_LEN, STACK_LO), laid out per unit (`tls_offset`),
 /// zero when the segment is claimed. Its first two words stand for the thread block's (std's
-/// LocalKey reads them): no domain, no runtime record.
+/// LocalKey reads them): no domain, no runtime record. The third is the thread's errno (sb_errno).
 const TLS_LEN: u32 = 1 << 20;
+const TLS_ERRNO: u32 = 16;
 /// a segment's shadow stack: [STACK_LO, SEG)
 const STACK_LO: u32 = SEG_GUARD + SCRATCH_LEN + TLS_LEN;
 const HEAP_BASE: u32 = SEGS + NSEG * SEG;
@@ -192,6 +193,9 @@ struct Sb {
     twins: HashMap<u32, u32>,
     /// crates whose code always runs as twins (std's and the modules')
     sandboxed: HashSet<u32>,
+    /// of those, the crates whose code is host code too (both forms: std's, and in a macro world
+    /// the crates a host-run macro uses as well); the rest are only ever twins
+    host_too: HashSet<u32>,
     /// crates of generated host wrappers (their calls into modules go to twins)
     wrappers: HashSet<u32>,
     /// the data image
@@ -304,9 +308,10 @@ unsafe fn sb_init(up: *mut Unit, allow: Allow) -> Result<(), String> {
         trap,
         tls: HashMap::new(),
         // (words 0 and 1: the thread block's two words)
-        tls_used: Arc::new(std::sync::atomic::AtomicU32::new(16)),
+        tls_used: Arc::new(std::sync::atomic::AtomicU32::new(TLS_ERRNO + 8)),
         twins: HashMap::new(),
         sandboxed: HashSet::new(),
+        host_too: HashSet::new(),
         wrappers: HashSet::new(),
         placed: HashMap::new(),
         ro: Vec::new(),
@@ -334,9 +339,30 @@ pub unsafe fn add_sandboxed_crate(up: *mut Unit, krate: u32) -> Result<(), Strin
     let std_crates: Vec<u32> = (0..u.prog.crates.len() as u32).filter(|&c| matches!(u.prog.syms.str(u.prog.crates[c as usize].name), "core" | "alloc" | "std")).collect();
     with_sb(u, |s| {
         s.sandboxed.insert(krate);
-        s.sandboxed.extend(std_crates);
+        s.sandboxed.extend(std_crates.iter().copied());
+        s.host_too.extend(std_crates);
     });
     Ok(())
+}
+
+/// Unit `up` becomes a confinement domain allowing `allow`: every crate of it runs as twins when
+/// reached from twins (nothing in it is a host API), and `host_too` are host code as well.
+pub unsafe fn confine_unit(up: *mut Unit, allow: Allow, host_too: &[u32]) -> Result<(), String> {
+    sb_init(up, allow)?;
+    let u = &*up;
+    let all = 0..u.prog.crates.len() as u32;
+    with_sb(u, |s| {
+        s.sandboxed.extend(all);
+        s.host_too.extend(host_too.iter().copied());
+    });
+    Ok(())
+}
+
+/// The address twin code of unit `up` sees for slot `base` as a fn value: its twin's sandbox
+/// thunk (on the owner thread).
+pub unsafe fn fn_value(up: *mut Unit, base: u32) -> Result<u64, String> {
+    let t = twin(up, base);
+    sbthunk(up, t)
 }
 
 pub fn add_wrapper_crate(u: &Unit, krate: u32) {
@@ -374,8 +400,7 @@ pub fn is_sandboxed_slot(u: &Unit, id: u32) -> bool {
         _ => return false,
     };
     // std code is host code too: only module crates are exclusively sandboxed
-    let kname = u.prog.syms.str(u.prog.crates[k as usize].name);
-    s.sandboxed.contains(&k) && !matches!(kname, "core" | "alloc" | "std")
+    s.sandboxed.contains(&k) && !s.host_too.contains(&k)
 }
 
 /// As is_sandboxed_slot, from a key (the inliner's view): `sb` and `prog` are one unit's.
@@ -394,7 +419,7 @@ pub fn is_sandboxed_crate_key(sb: &State, prog: &crate::program::Program, key: &
         },
         _ => return false,
     };
-    s.sandboxed.contains(&k) && !matches!(prog.syms.str(prog.crates[k as usize].name), "core" | "alloc" | "std")
+    s.sandboxed.contains(&k) && !s.host_too.contains(&k)
 }
 
 /// Whether host code of unit `u`'s crate `krate` is a generated wrapper (its calls into modules
@@ -722,7 +747,8 @@ pub fn free_arena(u: &Unit, a: &Arc<Arena>) {
         let _ = ARENAS[a.module as usize].compare_exchange(Arc::as_ptr(a) as *mut Arena, std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst);
     }
     // registered before the range turns inaccessible: a fault there finds its module
-    crate::stale::register(a.base - GUARD, a.base + WINDOW + GUARD, "unloaded module", a.name.clone(), a.module as u64, format!("Module::unload of module #{} (`{}`): its window is reserved and inaccessible for good", a.module, a.name));
+    let why = if (a.module as usize) < MAX_MODULES { format!("Module::unload of module #{} (`{}`)", a.module, a.name) } else { format!("{} was freed", a.name) };
+    crate::stale::register(a.base - GUARD, a.base + WINDOW + GUARD, "unloaded module", a.name.clone(), a.module as u64, format!("{}: its window is reserved and inaccessible for good", why));
     // the window's pages go, its addresses stay taken
     if !retire_window(a.base - GUARD, WINDOW + 2 * GUARD) {
         eprintln!("relax: an unloaded module's memory at {:#x} could not be made inaccessible", a.base);
@@ -1095,6 +1121,58 @@ pub fn enter_module(idx: u32) -> Result<(), EnterError> {
         return Err(EnterError::Unloaded);
     }
     enter_raw(unsafe { &*p })
+}
+
+/// A host call enters arena `a` (a macro world's): as a wrapper's entry, left with `leave`.
+pub fn enter_arena(a: &Arena) -> Result<(), EnterError> {
+    enter_raw(a)
+}
+
+/// `len` bytes of the current arena's heap, aligned to `align` (0: none left, or no arena).
+pub fn arena_alloc(len: u64, align: u64) -> u64 {
+    sb_alloc(len, align)
+}
+
+/// Gives back what `arena_alloc` (or the arena's code) allocated in the current arena.
+pub fn arena_free(p: u64) {
+    sb_free(p)
+}
+
+/// The current arena's bytes [p, p + len), when the range lies inside its window.
+pub unsafe fn arena_bytes<'a>(p: u64, len: u64) -> Option<&'a [u8]> {
+    let a = cur_arena()?;
+    if p & !0xffff_ffff != a.base || !fits(p, len) {
+        return None;
+    }
+    Some(std::slice::from_raw_parts(p as *const u8, len as usize))
+}
+
+/// The current arena's address of a module pointer `p` with `len` bytes behind it (0: out of
+/// the window).
+pub fn arena_ptr(p: u64, len: u64) -> u64 {
+    let pm = m(p);
+    if pm == 0 || !fits(pm, len) { 0 } else { pm }
+}
+
+thread_local! {
+    /// the last buffer `give` handed this thread's code (arena base, address): freed by the next
+    static GIVEN: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Hands `b` to the current arena's code, in its heap: valid until this thread's next `give`
+/// in the same arena (the code copies it right away). 0: no room.
+pub fn give(b: &[u8]) -> u64 {
+    let Some(a) = cur_arena() else { return 0 };
+    let p = sb_alloc(b.len().max(1) as u64, 16);
+    if p == 0 {
+        return 0;
+    }
+    unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), p as *mut u8, b.len()) };
+    let (base, last) = GIVEN.with(|g| g.replace((a.base, p)));
+    if base == a.base && last != 0 {
+        sb_free(last);
+    }
+    p
 }
 
 /// The entry proper.
@@ -1471,6 +1549,131 @@ extern "C" fn sb_strlen(p: u64) -> u64 {
     n
 }
 
+/// Fills [p, p + len) of the current arena with random bytes (false: out of the window).
+fn fill_random(p: u64, len: u64) -> bool {
+    use std::hash::{BuildHasher, Hasher};
+    let pm = m(p);
+    if pm == 0 || !fits(pm, len) {
+        return false;
+    }
+    let out = unsafe { std::slice::from_raw_parts_mut(pm as *mut u8, len as usize) };
+    let seed = std::collections::hash_map::RandomState::new();
+    for (k, c) in out.chunks_mut(8).enumerate() {
+        let mut h = seed.build_hasher();
+        h.write_usize(k);
+        c.copy_from_slice(&h.finish().to_le_bytes()[..c.len()]);
+    }
+    true
+}
+extern "C" fn sb_getrandom(buf: u64, len: u64, _flags: u32) -> i64 {
+    if fill_random(buf, len) {
+        len as i64
+    } else {
+        set_errno(EFAULT)
+    }
+}
+extern "C" fn sb_arc4random_buf(buf: u64, len: u64) {
+    fill_random(buf, len);
+}
+extern "C" fn sb_cc_random(buf: u64, len: u64) -> i32 {
+    if fill_random(buf, len) { 0 } else { -1 }
+}
+
+// errno: a word of this thread's segment (its thread-locals' third), what the C functions here
+// set on failure
+extern "C" fn sb_errno() -> u64 {
+    unsafe { *words().add(5) as u64 - TLS_LEN as u64 + TLS_ERRNO as u64 }
+}
+/// Sets this thread's errno to `e`; -1, the C functions' failure.
+fn set_errno(e: i32) -> i64 {
+    unsafe { *(sb_errno() as *mut i32) = e };
+    -1
+}
+const EFAULT: i32 = 14;
+#[cfg(unix)]
+const EINVAL: i32 = 22;
+
+// std's futex (sys/linux.rs, sys/macos.rs): waits and wakes on a word of the arena, nothing else
+// of the kernel. Linux reaches it through syscall(2); macOS through __ulock_* (std's dlsym
+// lookup of os_sync_* finds nothing here: sb_no_symbol).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+extern "C" fn sb_syscall(n: i64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> i64 {
+    extern "C" {
+        fn syscall(n: i64, ...) -> i64;
+    }
+    #[cfg(target_arch = "x86_64")]
+    const SYS_FUTEX: i64 = 202;
+    #[cfg(not(target_arch = "x86_64"))]
+    const SYS_FUTEX: i64 = 98;
+    const ENOSYS: i32 = 38;
+    // FUTEX_WAIT_BITSET and FUTEX_WAKE, process-private
+    const WAIT: u64 = 9 | 128;
+    const WAKE: u64 = 1 | 128;
+    if n != SYS_FUTEX {
+        return set_errno(ENOSYS);
+    }
+    let w = arena_ptr(a1, 4);
+    if w == 0 || w % 4 != 0 {
+        return set_errno(EFAULT);
+    }
+    let r = match a2 {
+        WAIT if a5 == 0 => {
+            let ts = if a4 == 0 { 0 } else { arena_ptr(a4, 16) };
+            if a4 != 0 && ts == 0 {
+                return set_errno(EFAULT);
+            }
+            unsafe { syscall(n, w, a2, a3 as u32, ts, 0u64, a6 as u32) }
+        }
+        WAKE => unsafe { syscall(n, w, a2, a3 as u32) },
+        _ => return set_errno(EINVAL),
+    };
+    if r < 0 {
+        set_errno(std::io::Error::last_os_error().raw_os_error().unwrap_or(EINVAL))
+    } else {
+        r
+    }
+}
+#[cfg(target_vendor = "apple")]
+extern "C" {
+    fn __ulock_wait(op: u32, addr: *mut u8, value: u64, timeout_us: u32) -> i32;
+    fn __ulock_wake(op: u32, addr: *mut u8, wake_value: u64) -> i32;
+}
+/// UL_COMPARE_AND_WAIT, with ULF_WAKE_ALL for a wake
+#[cfg(target_vendor = "apple")]
+fn ulock_op(op: u32, wake: bool) -> bool {
+    op == 1 || (wake && op == 1 | 0x100)
+}
+#[cfg(target_vendor = "apple")]
+extern "C" fn sb_ulock_wait(op: u32, addr: u64, value: u64, timeout_us: u32) -> i32 {
+    let w = arena_ptr(addr, 4);
+    if w == 0 || w % 4 != 0 || !ulock_op(op, false) {
+        return set_errno(if w == 0 { EFAULT } else { EINVAL }) as i32;
+    }
+    let r = unsafe { __ulock_wait(op, w as *mut u8, value, timeout_us) };
+    if r < 0 {
+        set_errno(std::io::Error::last_os_error().raw_os_error().unwrap_or(EINVAL));
+    }
+    r
+}
+#[cfg(target_vendor = "apple")]
+extern "C" fn sb_ulock_wake(op: u32, addr: u64, wake_value: u64) -> i32 {
+    let w = arena_ptr(addr, 4);
+    if w == 0 || w % 4 != 0 || !ulock_op(op, true) {
+        return set_errno(if w == 0 { EFAULT } else { EINVAL }) as i32;
+    }
+    let r = unsafe { __ulock_wake(op, w as *mut u8, wake_value) };
+    if r < 0 {
+        set_errno(std::io::Error::last_os_error().raw_os_error().unwrap_or(EINVAL));
+    }
+    r
+}
+extern "C" fn sb_no_symbol() -> u64 {
+    0
+}
+/// What a twin's call leaves out: makepad inspect's wait registry and wake timeline (std
+/// sync/raw.rs), the runtime's panic hook (std sys/rt.rs)
+extern "C" fn sb_unrecorded() {}
+
 /// The current arena and this thread's segment of it (from its shadow stack's floor, W_SSLO).
 fn cur_seg() -> Option<(&'static Arena, usize)> {
     let a = cur_arena()?;
@@ -1628,6 +1831,26 @@ fn c_policy(allow: Allow, name: &str) -> Option<Option<(&'static str, u64)>> {
         "memset" => Some(("sb_memset", sb_memset as *const () as u64)),
         "memcmp" | "bcmp" => Some(("sb_memcmp", sb_memcmp as *const () as u64)),
         "strlen" => Some(("sb_strlen", sb_strlen as *const () as u64)),
+        // std's hash seeds (RandomState): random bytes, nothing else of the host
+        "getrandom" => Some(("sb_getrandom", sb_getrandom as *const () as u64)),
+        "arc4random_buf" => Some(("sb_arc4random_buf", sb_arc4random_buf as *const () as u64)),
+        "CCRandomGenerateBytes" => Some(("sb_cc_random", sb_cc_random as *const () as u64)),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "errno_location" | "errno" => Some(("sb_errno", sb_errno as *const () as u64)),
+        #[cfg(target_vendor = "apple")]
+        "error" => Some(("sb_errno", sb_errno as *const () as u64)),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "syscall" => Some(("sb_syscall", sb_syscall as *const () as u64)),
+        #[cfg(target_vendor = "apple")]
+        "ulock_wait" => Some(("sb_ulock_wait", sb_ulock_wait as *const () as u64)),
+        #[cfg(target_vendor = "apple")]
+        "ulock_wake" => Some(("sb_ulock_wake", sb_ulock_wake as *const () as u64)),
+        "dlsym" => Some(("sb_no_symbol", sb_no_symbol as *const () as u64)),
+        "relax_wait_enter" | "relax_wait_leave" | "relax_wake" => Some(("sb_unrecorded", sb_unrecorded as *const () as u64)),
+        // std's runtime panic hook and payload end (sys/rt.rs install_core_hook): host code never
+        // calls into twins; their panics record their payload through core's hook in the arena,
+        // and a runtime check's failure in a twin is a contained fault
+        "relax_set_panic_hook" | "relax_set_payload_end" => Some(("sb_unrecorded", sb_unrecorded as *const () as u64)),
         "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "exp" | "exp2" | "expm1" | "log" | "log2" | "log10" | "log1p" | "pow" | "sqrt" | "cbrt" | "hypot" | "fmod" | "floor" | "ceil" | "round" | "trunc" | "fma" | "fmax" | "fmin" | "fdim" | "erf" | "erfc" | "tgamma" | "lgamma" | "ldexp" | "nextafter" | "copysign" | "rint" | "nearbyint" | "sinf" | "cosf" | "tanf" | "asinf" | "acosf" | "atanf" | "atan2f" | "sinhf" | "coshf" | "tanhf" | "asinhf" | "acoshf" | "atanhf" | "expf" | "exp2f" | "expm1f" | "logf" | "log2f" | "log10f" | "log1pf" | "powf" | "sqrtf" | "cbrtf" | "hypotf" | "fmodf" | "floorf" | "ceilf" | "roundf" | "truncf" | "fmaf" | "fmaxf" | "fminf" | "fdimf" | "erff" | "erfcf" | "tgammaf" | "lgammaf" | "ldexpf" | "nextafterf" | "copysignf" | "rintf" | "nearbyintf" => None,
         // std's thread-locals with lazy init or drop glue (thread/local.rs LazyKey): the arena's
         // own keys, a value per segment
@@ -1794,6 +2017,13 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                             emit(Inst::Iconst(d, (sbthunk(up, t)? as i64).wrapping_add(sym.off)), &mut insts, &mut pos);
                         }
                         Some(SymKind::Site(_)) | Some(SymKind::Rt("null")) => emit(Inst::Addr(d, sym), &mut insts, &mut pos),
+                        // std's "makepad inspect records" flag (sync/raw.rs): never for twins, a
+                        // word of the thread's that stays zero (its thread block's first)
+                        Some(SymKind::Foreign(n)) if n == "__relax_recording" => {
+                            let lo = f.vreg(Cls::I);
+                            emit(Inst::Load(relax_backend::rir::Mem::Int(8, false), lo, t_arena, (W_SSLO - W_ARENA) as i32), &mut insts, &mut pos);
+                            emit(Inst::IBinI(IOp::Add, U64, d, lo, -(TLS_LEN as i64)), &mut insts, &mut pos);
+                        }
                         other => return Err(format!("{}: refers to {:?}, which a sandboxed module cannot reach", f.name, other)),
                     }
                 }
@@ -1809,7 +2039,7 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                     emit(Inst::Load(relax_backend::rir::Mem::Int(8, false), lo, t_arena, (W_SSLO - W_ARENA) as i32), &mut insts, &mut pos);
                     emit(Inst::IBinI(IOp::Add, U64, d, lo, off as i64 + sym.off - TLS_LEN as i64), &mut insts, &mut pos);
                 }
-                Inst::VGather(..) | Inst::VTbl(..) => return Err(format!("{}: vector gathers are not available to sandboxed modules", f.name)),
+                Inst::VGather(..) | Inst::VTbl(..) => return Err(format!("{}: vector gathers are not available to sandboxed code", f.name)),
                 Inst::Load(mm, d, base, off) => {
                     let (b2, o2) = mask(f, &mut insts, &mut pos, &mut cache, base, off);
                     emit(Inst::Load(mm, d, b2, o2), &mut insts, &mut pos);
@@ -1858,7 +2088,7 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                 }
                 Inst::Call(callee, args, rets) => {
                     let callee = match callee {
-                        Callee::Asm(_) => return Err(format!("{}: inline assembly, which sandboxed modules cannot run", f.name)),
+                        Callee::Asm(_) => return Err(format!("{}: inline assembly, which sandboxed code cannot run", f.name)),
                         Callee::Fn(id) => Callee::Fn(call_target(up, id, &sandboxed, allow)?),
                         Callee::CFn(id, sig) => Callee::CFn(call_target(up, id, &sandboxed, allow)?, sig),
                         Callee::Indirect(v) => Callee::Indirect(mask_fn(&*up, f, &mut insts, &mut pos, p, v)),
@@ -1875,15 +2105,15 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                             Some(SymKind::Rt(name)) => match rt_policy(name) {
                                 Some(None) => Callee::Host(s),
                                 Some(Some((nn, addr))) => Callee::Host(u.syms.intern(SymKind::Rt(nn), addr)),
-                                None => return Err(format!("{}: calls the runtime's `{}`, which sandboxed modules cannot use", f.name, name)),
+                                None => return Err(format!("{}: calls the runtime's `{}`, which sandboxed code cannot use", f.name, name)),
                             },
-                            other => return Err(format!("{}: calls {:?}, which sandboxed modules cannot use", f.name, other)),
+                            other => return Err(format!("{}: calls {:?}, which sandboxed code cannot use", f.name, other)),
                         },
                         Callee::CHost(s, sig) => {
                             let name = match u.syms.kind(s.id) {
                                 Some(SymKind::Foreign(n)) => n,
                                 Some(SymKind::Rt(n)) => n.to_string(),
-                                other => return Err(format!("{}: calls {:?}, which sandboxed modules cannot use", f.name, other)),
+                                other => return Err(format!("{}: calls {:?}, which sandboxed code cannot use", f.name, other)),
                             };
                             match c_policy(allow, &name) {
                                 Some(Some(("abort", _))) => {
@@ -1894,7 +2124,7 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                                 }
                                 Some(Some((nn, addr))) => Callee::CHost(u.syms.intern(SymKind::Rt(nn), addr), sig),
                                 Some(None) => Callee::CHost(s, sig),
-                                None => return Err(format!("{}: reaches the C function `{}`, which sandboxed modules cannot call", f.name, name)),
+                                None => return Err(format!("{}: reaches the C function `{}`, which sandboxed code cannot call", f.name, name)),
                             }
                         }
                     };
@@ -1903,7 +2133,7 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                 }
                 // the FP control register is the host thread's (rounding, flush-to-zero): a module
                 // may read it, not change it under the host
-                Inst::FpEnv(true, _) => return Err(format!("{}: writes the floating-point control register (_mm_setcsr / set_fpcr), which sandboxed modules cannot", f.name)),
+                Inst::FpEnv(true, _) => return Err(format!("{}: writes the floating-point control register (_mm_setcsr / set_fpcr), which sandboxed code cannot", f.name)),
                 other => emit(other, &mut insts, &mut pos),
             }
             for d in defs {
@@ -2003,7 +2233,7 @@ unsafe fn call_target(up: *mut Unit, id: u32, sandboxed: &HashSet<u32>, allow: A
                 let name = u.prog.syms.str(def.name).to_string();
                 return match c_policy(allow, &name) {
                     Some(None) => Ok(id),
-                    _ => Err(format!("reaches the C function `{}`, which sandboxed modules cannot call", name)),
+                    _ => Err(format!("reaches the C function `{}`, which sandboxed code cannot call", name)),
                 };
             }
             if !sandboxed.contains(&def.krate) {

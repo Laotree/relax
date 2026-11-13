@@ -3191,8 +3191,11 @@ fn raise_with(kind: &str, message: String, site: u64, fault: u64, rbp: u64, ret:
         std::process::abort();
     }
     // makepad inspect: a watched run parks the panic here, stack intact, until a client decides
-    // (a resume_unwind continues a panic inspect already parked: no second park)
-    if !RETHROW.with(|c| c.replace(false)) {
+    // (a resume_unwind continues a panic inspect already parked: no second park). Not in the
+    // proc-macro world: a macro's panic (a confined macro's refused call among them) is its
+    // expansion's error, reported where it is expanded, and no live edit resumes it
+    let in_macro_world = { let u = cur_unit(); !u.is_null() && unsafe { (*u).aux } };
+    if !RETHROW.with(|c| c.replace(false)) && !in_macro_world {
         crate::inspect::events::on_panic(&info, regs);
     }
     PANIC.with(|p| *p.borrow_mut() = Some(info));
@@ -10141,8 +10144,10 @@ unsafe fn install_error(up: *mut Unit, id: u32, e: &str) -> u64 {
         }
     }
     // a program thread's call of it parks (PARK_COMPILE_ERRORS): no stub, the slot stays lazy with
-    // its failure kept (a live patch clears it), the error reported once
-    if PARK_SLOT.with(|s| s.get()) == id && PARK_COMPILE_ERRORS.load(Ordering::Relaxed) {
+    // its failure kept (a live patch clears it), the error reported once. Not in the proc-macro
+    // world: no live patch reaches it, and its failure (a confined macro's call of a C function
+    // the sandbox refuses among them) is the macro call's, reported where it is expanded
+    if PARK_SLOT.with(|s| s.get()) == id && PARK_COMPILE_ERRORS.load(Ordering::Relaxed) && !(*up).aux {
         let u = &mut *up;
         let f = &mut u.fns[id as usize];
         if f.build_err.as_deref() != Some(e) {
