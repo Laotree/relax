@@ -306,6 +306,9 @@ pub struct Command {
     stdout: Option<Stdio>,
     stderr: Option<Stdio>,
     pgroup: Option<sys::pid_t>,
+    /// CommandExt::uid / gid: the child's user and group, set before its exec
+    uid: Option<sys::uid_t>,
+    gid: Option<sys::gid_t>,
     /// CommandExt::pre_exec closures, run in the child between fork and exec
     closures: Vec<PreExec>,
 }
@@ -313,7 +316,7 @@ pub struct Command {
 impl Command {
     pub fn new<S: AsRef<OsStr>>(program: S) -> Command {
         let program = program.as_ref().to_os_string();
-        Command { args: alloc::vec![program.clone()], program, env_clear: false, env: Vec::new(), cwd: None, stdin: None, stdout: None, stderr: None, pgroup: None, closures: Vec::new() }
+        Command { args: alloc::vec![program.clone()], program, env_clear: false, env: Vec::new(), cwd: None, stdin: None, stdout: None, stderr: None, pgroup: None, uid: None, gid: None, closures: Vec::new() }
     }
     pub fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Command {
         self.args.push(arg.as_ref().to_os_string());
@@ -392,6 +395,34 @@ impl Command {
     }
     pub(crate) fn set_pgroup(&mut self, pgroup: sys::pid_t) {
         self.pgroup = Some(pgroup);
+    }
+    pub(crate) fn set_uid(&mut self, uid: sys::uid_t) {
+        self.uid = Some(uid);
+    }
+    pub(crate) fn set_gid(&mut self, gid: sys::gid_t) {
+        self.gid = Some(gid);
+    }
+    /// real std (sys/process/unix/unix.rs do_exec): the group, then the user; root dropping to
+    /// another user also drops its supplementary groups (an EPERM there, no CAP_SETGID, is not
+    /// an error). Runs in the child, or in this process before CommandExt::exec.
+    unsafe fn set_ids(&self) -> io::Result<()> {
+        if let Some(gid) = self.gid {
+            if setgid(gid) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        if let Some(uid) = self.uid {
+            if sys::getuid() == 0 && setgroups(0, core::ptr::null()) != 0 {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() != Some(EPERM) {
+                    return Err(e);
+                }
+            }
+            if setuid(uid) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
     }
     pub(crate) fn add_pre_exec(&mut self, f: alloc::boxed::Box<dyn FnMut() -> io::Result<()> + Send + Sync>, run: unsafe fn(*mut u8) -> io::Result<()>) {
         self.closures.push(PreExec { f, run });
@@ -520,8 +551,8 @@ impl Command {
         // NDK r28 spawn.h: addchdir_np requires API 34; spawning itself requires API 28.
         // The launcher will provide --cwd; never change the Activity process's cwd or fork it.
         #[cfg(target_os = "android")]
-        if self.cwd.is_some() || !self.closures.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "Android posix_spawn does not support cwd or pre_exec"));
+        if self.cwd.is_some() || !self.closures.is_empty() || self.uid.is_some() || self.gid.is_some() {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "Android posix_spawn does not support cwd, pre_exec, uid or gid"));
         }
         let Some(dir) = self.cwd.clone() else {
             // the child runs in this program's folder: the one it changed to, if it did
@@ -598,7 +629,8 @@ impl Command {
         let (stderr_child, stderr_parent) = setup_stdio(self.stderr.take(), default_piped, false)?;
 
         #[cfg(not(target_os = "android"))]
-        if !self.closures.is_empty() || self.searches_own_path() {
+        // (posix_spawn cannot change the child's user or group: real std forks for them too)
+        if !self.closures.is_empty() || self.uid.is_some() || self.gid.is_some() || self.searches_own_path() {
             if exec {
                 // CommandExt::exec: real std runs the closures in this process before the exec
                 for p in self.closures.iter_mut() {
@@ -644,6 +676,7 @@ impl Command {
                         }
                     }
                 }
+                self.set_ids()?;
                 if let Some(c) = &cwd {
                     if chdir(c.as_ptr()) != 0 {
                         return Err(io::Error::last_os_error());
@@ -785,6 +818,9 @@ impl Command {
                     child_fail(w, io::Error::last_os_error());
                 }
             }
+        }
+        if let Err(e) = self.set_ids() {
+            child_fail(w, e);
         }
         if let Some(c) = cwd {
             if sys::chdir(c.as_ptr()) != 0 {
@@ -1103,6 +1139,12 @@ struct PollFd {
 }
 
 const POLLIN: c_short = 1;
+const EPERM: i32 = 1;
+// setgroups' count: size_t on Linux, int on the BSDs and Darwin
+#[cfg(any(target_os = "linux", target_os = "android"))]
+type SetgroupsLen = usize;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+type SetgroupsLen = c_int;
 
 extern "C" {
     fn posix_spawnp(pid: *mut sys::pid_t, file: *const c_char, actions: *const SpawnFileActions, attr: *const SpawnAttr, argv: *const *const c_char, envp: *const *const c_char) -> c_int;
@@ -1120,6 +1162,9 @@ extern "C" {
     fn dup2(fd: c_int, to: c_int) -> c_int;
     fn chdir(path: *const c_char) -> c_int;
     fn setpgid(pid: sys::pid_t, pgid: sys::pid_t) -> c_int;
+    fn setuid(uid: sys::uid_t) -> c_int;
+    fn setgid(gid: sys::gid_t) -> c_int;
+    fn setgroups(len: SetgroupsLen, groups: *const sys::gid_t) -> c_int;
     fn signal(sig: c_int, handler: usize) -> usize;
     fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
     fn sigaddset(set: *mut SigSet, sig: c_int) -> c_int;

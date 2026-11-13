@@ -141,11 +141,12 @@ fn hot_fns_reach_o3() {
     });
     assert_eq!(ids.iter().map(|&id| run(id)).collect::<Vec<u32>>(), expected, "O3 code must compute what baseline code did");
     // an instance's promoted constants are one object, evaluated once by the owner for the slot's
-    // body: the callees' (table, pieces, f32::clamp, char::to_digit) whose bodies the O3 builds took
+    // body: the callees' (table, pieces, f32::clamp, char::methods::to_digit) whose bodies the O3
+    // builds took
     crate::owner::call(crate::owner::Class::Program, || {
         let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
         let named: Vec<String> = u.front.body_consts.snapshot().keys().filter(|k| k.0 == epoch && !k.3).map(|k| u.fns[k.1 as usize].name.to_string()).collect();
-        for want in ["tier_stuck::table", "tier_stuck::pieces", "f32::clamp", "char::to_digit"] {
+        for want in ["tier_stuck::table", "tier_stuck::pieces", "f32::clamp", "char::methods::to_digit"] {
             assert!(named.iter().any(|n| n.ends_with(want)), "no promoted value evaluated for {}: {:?}", want, named);
         }
     });
