@@ -455,19 +455,22 @@ pub fn build(g: &Graph, seeds: &[usize], req: &Request) -> Result<Built, String>
         Some(out) => out,
         None => {
             let m = run_cargo(g, req, &exe, &flags, &plan.script_pkgs, &plan.lib_pkgs, seeds, Tier::Fast)?;
+            let out = outputs(g, seeds, &m)?;
             std::fs::create_dir_all(&plan.dir).map_err(|e| format!("{}: {}", plan.dir, e))?;
+            // an earlier build's library and receipt under this key stay until this build's library
+            // has linked (link writes it beside, then renames it over the old one): an executable
+            // prepared with them still runs when this link fails, and no receipt is ever newer than
+            // the library beside it (relax issue 160: the library went before a link that failed)
+            if !(out.archives.is_empty() && out.dylibs.is_empty() && out.frameworks.is_empty()) {
+                link(&plan.lib_path, &out, req.triple, req.resolvable)?;
+            }
             std::fs::write(&plan.fast_mark, b"").map_err(|e| format!("{}: {}", plan.fast_mark, e))?;
-            std::fs::write(&plan.messages_path, &m).map_err(|e| format!("{}: {}", plan.messages_path, e))?;
-            // a stale library of an earlier link under this key is not trusted
-            let _ = std::fs::remove_file(&plan.lib_path);
-            outputs(g, seeds, &m)?
+            write_beside(&plan.messages_path, m.as_bytes())?;
+            out
         }
     };
     if out.archives.is_empty() && out.dylibs.is_empty() && out.frameworks.is_empty() {
         return Ok(Built { scripts: out.scripts, lib: None });
-    }
-    if !std::path::Path::new(&plan.lib_path).is_file() {
-        link(&plan.lib_path, &out, req.triple, req.resolvable)?;
     }
     if std::path::Path::new(&plan.fast_mark).is_file() {
         optimize_later(g, req, exe, &flags, plan.script_pkgs, plan.lib_pkgs, seeds, &out, plan.lib_path.clone(), plan.fast_mark);
@@ -553,11 +556,19 @@ pub fn write_receipt(g: &Graph, seeds: &[usize], scripts: &[ScriptOut], lib: Opt
     out.push('}');
     let path = format!("{}/native-scripts-{:016x}.json", dir, fnv(out.as_bytes(), 0xcbf29ce484222325));
     if std::fs::read_to_string(&path).ok().as_deref() != Some(out.as_str()) {
-        let tmp = format!("{}.tmp{}", path, std::process::id());
-        std::fs::write(&tmp, &out).map_err(|e| format!("{}: {}", tmp, e))?;
-        std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {}", path, e))?;
+        write_beside(&path, out.as_bytes())?;
     }
     Ok(path)
+}
+
+/// Writes the file `path` beside it, then renames it over `path`: a reader sees the old file
+/// whole or the new one, and a write that fails leaves the old one.
+fn write_beside(path: &str, data: &[u8]) -> Result<(), String> {
+    let tmp = format!("{}.tmp{}", path, std::process::id());
+    std::fs::write(&tmp, data).and_then(|_| std::fs::rename(&tmp, path)).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {}", path, e)
+    })
 }
 
 /// A script receipt (`write_receipt`), or None when there is none to use: unreadable, or naming an
