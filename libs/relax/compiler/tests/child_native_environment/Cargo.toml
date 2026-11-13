@@ -1,0 +1,9 @@
+[package]
+name = "child-native-fixture"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+cnative = { path = "cnative" }
+[build-dependencies]
+host-gen = { path = "host-gen" }
+[workspace]

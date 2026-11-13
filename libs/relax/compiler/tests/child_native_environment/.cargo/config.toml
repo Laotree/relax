@@ -1,0 +1,3 @@
+[env]
+HOME = { value = "configured-home", relative = true, force = true }
+PATH = "no-tools-for-this-fixture"

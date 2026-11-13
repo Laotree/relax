@@ -501,8 +501,9 @@ fn keep_toolchain_homes() {
 /// Construct the invocation inputs before parsing; CLI overrides replace environment values.
 /// rustc: compiler/rustc_session/src/config.rs:2428, session.rs:90-93.
 pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
+    crate::toolenv::init_args(args);
     crate::pool::thread_start(crate::jit::ensure_altstack);
-    keep_toolchain_homes();
+    if !crate::toolenv::is_prepared() { keep_toolchain_homes(); }
     let mut options = crate::options::Options::from_env();
     // `--no-asm` / `--allow-c` anywhere before `--`, for every command (run, test, check, the
     // relax runner): the environment carries them to the processes this one starts (build

@@ -405,7 +405,7 @@ fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
         h = fnv(&v, h);
         h = fnv(b"\0", h);
     }
-    let cc_version = Command::new(cc()).arg("--version").output().map(|o| o.stdout).unwrap_or_default();
+    let cc_version = crate::toolenv::command(cc()).arg("--version").output().map(|o| o.stdout).unwrap_or_default();
     h = fnv(cc_version.split(|&b| b == b'\n').next().unwrap_or(&[]), h);
     let mut native_packages: Vec<_> = seeds.iter().map(|&s| {
         let bs = &g.build_scripts[s];
@@ -836,7 +836,7 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
     // configured build root, then isolate wrapper selections there as well.
     // Otherwise OUT_DIR no longer identifies target probes, and Cargo can
     // reuse stubs or nightly cfgs from a different native selection.
-    let metadata = Command::new("cargo")
+    let metadata = crate::toolenv::command("cargo")
         .args(["metadata", "--format-version", "1", "--no-deps"])
         .current_dir(&*crate::vfs::on_disk(workspace))
         .env("CARGO_TARGET_DIR", &target)
@@ -857,7 +857,7 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
     let link_dir = build.join(format!("relax-link-args.{}.{run_id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&link_dir);
     std::fs::create_dir_all(&link_dir).map_err(|e| format!("{}: {e}", link_dir.display()))?;
-    let mut cmd = Command::new("cargo");
+    let mut cmd = crate::toolenv::command("cargo");
     // cargo runs in the real workspace: nothing of this run crosses
     crate::progenv::scrub_run_facts(&mut cmd);
     match tier {
@@ -1170,7 +1170,7 @@ fn cargo_selection(flags: &[&String]) -> Vec<String> {
 /// symbol version off.
 fn library_imports(lib: &str) -> Result<Vec<String>, String> {
     let apple = cfg!(target_vendor = "apple");
-    let mut nm = Command::new("nm");
+    let mut nm = crate::toolenv::command("nm");
     nm.args(if apple { ["-m", "-u"] } else { ["-D", "-u"] }).arg(lib);
     let out = nm.output().map_err(|e| format!("--allow-c: cannot read the native library's imports: {e}"))?;
     if !out.status.success() {
@@ -1216,7 +1216,7 @@ fn link(lib_path: &str, out: &Outputs, triple: &str, resolvable: Resolvable) -> 
     let symbols_path = format!("{}.symbols", tmp);
     // the accessors' object: the callback relink below reuses the link's arguments
     let addresses_path = format!("{}.addresses.o", tmp);
-    let mut cmd = Command::new(cc());
+    let mut cmd = crate::toolenv::command(cc());
     if cfg!(target_os = "macos") {
         cmd.args(["-dynamiclib", "-o", &tmp, "-Wl,-undefined,dynamic_lookup"]);
         for a in archives {
@@ -1242,7 +1242,7 @@ fn link(lib_path: &str, out: &Outputs, triple: &str, resolvable: Resolvable) -> 
         // it is thread-local (the address accessors below leave those out).
         let mut symbols = std::collections::BTreeMap::new();
         for archive in archives {
-            let out = Command::new("nm").args(["-g", "--defined-only", "--format=sysv", archive])
+            let out = crate::toolenv::command("nm").args(["-g", "--defined-only", "--format=sysv", archive])
                 .output().map_err(|e| format!("--allow-c: cannot read archive symbols: {e}"))?;
             if !out.status.success() {
                 return Err(format!("--allow-c: nm failed for {archive}: {}", String::from_utf8_lossy(&out.stderr)));
@@ -1316,7 +1316,7 @@ fn link(lib_path: &str, out: &Outputs, triple: &str, resolvable: Resolvable) -> 
                 return Ok(());
             }
             std::fs::write(&stubs_path, crate::native_stub::object(triple, &callbacks)?).map_err(|e| format!("{stubs_path}: {e}"))?;
-            let mut with_stubs = Command::new(cc());
+            let mut with_stubs = crate::toolenv::command(cc());
             with_stubs.arg(&stubs_path).args(cmd.get_args());
             run(&mut with_stubs)
         });
@@ -1362,7 +1362,7 @@ fn compile_accessors(symbols: &std::collections::BTreeMap<String, bool>, tmp: &s
     }
     let source_path = format!("{tmp}.addresses.c");
     std::fs::write(&source_path, source).map_err(|e| format!("{source_path}: {e}"))?;
-    let compile = Command::new(cc()).args(["-fPIC", "-c", &source_path, "-o", addresses_path]).output();
+    let compile = crate::toolenv::command(cc()).args(["-fPIC", "-c", &source_path, "-o", addresses_path]).output();
     let _ = std::fs::remove_file(&source_path);
     let failed = match compile {
         Err(e) => Some(format!("cannot compile native address accessors: {e}")),
@@ -1382,7 +1382,7 @@ fn compile_accessors(symbols: &std::collections::BTreeMap<String, bool>, tmp: &s
 fn macho_archive_symbols(archives: &[String]) -> Result<std::collections::BTreeMap<String, bool>, String> {
     let mut symbols = std::collections::BTreeMap::new();
     for archive in archives {
-        let out = Command::new("nm").args(["-g", "--defined-only", "-m", archive])
+        let out = crate::toolenv::command("nm").args(["-g", "--defined-only", "-m", archive])
             .output().map_err(|e| format!("--allow-c: cannot read archive symbols: {e}"))?;
         if !out.status.success() {
             return Err(format!("--allow-c: nm failed for {archive}: {}", String::from_utf8_lossy(&out.stderr)));
@@ -1448,7 +1448,7 @@ pub fn wrapper() -> Option<i32> {
     let from = if direct { 1 } else { 2 };
     let (rest, os_rest) = (&args[from..], &os_args[from..]);
     if direct {
-        return Some(match Command::new(&rustc).args(os_rest).status() {
+        return Some(match crate::toolenv::command(&rustc).args(os_rest).status() {
             Ok(s) => s.code().unwrap_or(1),
             Err(e) => { eprintln!("relax run: native compiler probe: {}: {}", rustc_name, e); 1 }
         });
@@ -1478,7 +1478,7 @@ pub fn wrapper() -> Option<i32> {
         }
     };
     if real {
-        return Some(match Command::new(&rustc).args(os_rest).status() {
+        return Some(match crate::toolenv::command(&rustc).args(os_rest).status() {
             Ok(s) => s.code().unwrap_or(1),
             Err(e) => {
                 eprintln!("relax run: native wrapper: cannot run {}: {}", rustc_name, e);

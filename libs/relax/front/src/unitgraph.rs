@@ -143,6 +143,18 @@ pub fn check_unit_graph(sess: &std::sync::Arc<crate::Session>, workspace: &str, 
     crate::resolve::check_unit_graph(sess, workspace, package, cargo_flags)
 }
 
+fn sh_quote(s: &str) -> String { format!("'{}'", s.replace('\'', "'\\''")) }
+
+fn with_bin_native_receipt(text: &str, receipt: &str) -> Option<String> {
+    let markers = [format!(" '{}", crate::toolenv::ARG_PREFIX), format!(" \"{}", crate::toolenv::ARG_PREFIX), format!("\u{1f}{}", crate::toolenv::ARG_PREFIX)];
+    let start = markers.iter().filter_map(|m| text.find(m).map(|at| at + m.len())).min()?;
+    let end = start + text[start..].bytes().take_while(u8::is_ascii_hexdigit).count();
+    let value = crate::toolenv::with_native(&text[start..end], receipt);
+    let mut result = text.to_string();
+    result.replace_range(start..end, &value);
+    Some(result)
+}
+
 pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
     let units = &g.units;
     let roots = &g.roots;
@@ -335,16 +347,15 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
                 let td_str = absolute(&target_dir);
                 let pkg_dir = &absolute(std::path::Path::new(pkg_dir));
                 let exe_str = exe.display().to_string();
-                let sh_quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+                let build_env = crate::toolenv::with_native(&crate::toolenv::capture(), "");
                 // cargo builds a package's bins with the features its tests are built with (one
                 // feature set per package): the run of the bin selects exactly those
                 let features = crates[integration_tests[0]].features.join(",");
                 let allow_c = std::env::var_os("RELAX_ALLOW_C").is_some_and(|v| v == "1");
                 // a file the bin's starts read, replaced whole (another run's test may be reading it)
                 let put = |path: &std::path::Path, text: &str| {
-                    if std::fs::read(path).ok().as_deref() == Some(text.as_bytes()) {
-                        return;
-                    }
+                    let old = std::fs::read_to_string(path).ok();
+                    if old.as_deref().and_then(|s| with_bin_native_receipt(s, "")).as_deref() == Some(text) { return; }
                     let tmp = bin_dir.join(format!(".{}.tmp{}", path.file_name().unwrap_or_default().to_string_lossy(), std::process::id()));
                     if std::fs::write(&tmp, text).is_ok() {
                         #[cfg(unix)]
@@ -358,12 +369,8 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
                 for bin_name in &g.bins {
                     // the bin's run: the loader's command line before the bin's own arguments
                     let mut words: Vec<String> = [exe_str.as_str(), "run", "--quiet", "--silent", "--no-live", "--run-dir", td_str.as_str(), "--workspace-dir", pkg_dir.as_str(), pkg_name.as_str(), "--no-default-features"].iter().map(|w| w.to_string()).collect();
-                    // the test run's native permission is the binary's, as cargo builds the binary
-                    // with the test: a test that clears its child's environment (or takes
-                    // RELAX_ALLOW_C out of it) still starts the binary (relax issue 157)
-                    if allow_c {
-                        words.push("--allow-c".to_string());
-                    }
+                    words.insert(2, format!("{}{build_env}", crate::toolenv::ARG_PREFIX));
+                    words.insert(2, "--binary-child".to_string());
                     if !features.is_empty() {
                         words.extend(["--features".to_string(), features.clone()]);
                     }
@@ -681,7 +688,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
     });
     root.finish();
     // the package's binaries its integration tests start compile and link with this build
-    let launches = !check_only && !native_seeds.is_empty() && g.env.iter().flatten().any(|(k, _)| k.starts_with("CARGO_BIN_EXE_"));
+    let launches = !check_only && !native_seeds.is_empty();
     let mut for_bins = if launches && prebuilt { receipt.clone() } else { None };
     if let Some(built) = native_built {
         let built = built?;
@@ -745,6 +752,29 @@ fn reaches_native(g: &Graph, bs: &BuildScript, native_krates: &[usize]) -> bool 
         stack.extend(u.deps.iter().map(|d| d.0));
     }
     false
+}
+
+/// The prepared binary keeps its native build even when Command clears every variable.
+pub fn keep_bin_native_receipt(g: &Graph, receipt: &str) -> Result<(), String> {
+    let mut paths: Vec<_> = g.env.iter().flatten().filter_map(|(k, v)| k.starts_with("CARGO_BIN_EXE_").then_some(v)).collect();
+    paths.sort();
+    paths.dedup();
+    let paths: Vec<_> = paths.into_iter().flat_map(|p| {
+        let mut paths = vec![std::path::PathBuf::from(p)];
+        if cfg!(windows) { paths.push(std::path::Path::new(p).with_extension("words")); }
+        paths
+    }).collect();
+    for path in paths {
+        let path = path.to_str().ok_or_else(|| "non-Unicode binary launcher path".to_string())?;
+        let script = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        let permissions = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?.permissions();
+        let script = with_bin_native_receipt(&script, receipt).ok_or_else(|| format!("{path}: no prepared build argument"))?;
+        let tmp = format!("{path}.tmp{}", std::process::id());
+        std::fs::write(&tmp, script)
+            .and_then(|_| std::fs::set_permissions(&tmp, permissions))
+            .and_then(|_| std::fs::rename(&tmp, path)).map_err(|e| format!("{path}: {e}"))?;
+    }
+    Ok(())
 }
 
 /// The native outputs a child run's receipt names, onto this graph's native scripts by their
@@ -1267,9 +1297,11 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         return (Err(format!("{}: the build script of `{}` runs again inside its own run (build-dependency cycle: {} -> {}); refused", bs.src_path, me, chain.replace('>', " -> "), me)), out_dir);
     }
     let chain = if chain.is_empty() { me } else { format!("{chain}>{me}") };
-    let mut cmd = std::process::Command::new(&exe);
-    // a run of its own: nothing this run says of itself crosses; its folder's mount is set below,
-    // and this invocation's `--allow-c` is the script's too
+    let mut cmd = crate::toolenv::command(&exe);
+    // Retained tool locations are defaults; Cargo's resolved [env] overrides them. The
+    // package and build-script variables set below retain their Cargo-owned precedence.
+    for (k, v) in crate::crates::config_env() { cmd.env(k, v); }
+    // a run of its own: nothing this run says of itself crosses; its folder's mount is set below
     crate::progenv::scrub_run_facts(&mut cmd);
     if sess.options.allow_c {
         cmd.env("RELAX_ALLOW_C", "1");
@@ -1338,12 +1370,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         // there, found nothing and chose its libc backend)
         cmd.current_dir(dir);
     }
-    // cargo's `[env]` configuration, after every variable set above (cargo apply_env_config)
-    for (k, v) in crate::crates::config_env() {
-        if !cmd.get_envs().any(|(n, _)| n == k.as_str()) {
-            cmd.env(k, v);
-        }
-    }
+
     // cargo's rerun rules: the previous output stands while the script's units, the environment
     // it was given and its `rerun-if-changed` / `rerun-if-env-changed` inputs are unchanged (a
     // script that names none: no file of its package changed)
@@ -1551,18 +1578,8 @@ fn rerun_reason(stored: &str, now: &str, stored_env: &str, env_key: &str) -> Str
 /// The variable that hands a build script's child run its parent's native receipt.
 pub const NATIVE_RECEIPT: &str = "RELAX_NATIVE_RECEIPT";
 /// The variable that hands the package binaries an integration test starts (CARGO_BIN_EXE_<name>)
-/// its run's native receipt (`Inherit::Binary`): set in the test's environment. Empty: none, the
-/// binary builds its own natives. A binary whose test cleared it from its environment (or cleared
-/// the whole environment) takes the receipt the test's run named beside its wrapper
-/// (`bin_native`).
-pub const BIN_NATIVE_RECEIPT: &str = "RELAX_BIN_NATIVE_RECEIPT";
-
-/// Beside the CARGO_BIN_EXE_<bin> wrappers of the run dir `run_dir` (`--run-dir`): the file that
-/// names the native receipt of the test run that last started `bin` (relax issue 157: a test's
-/// cleared environment held none).
-pub fn bin_native(run_dir: &std::path::Path, bin: &str) -> std::path::PathBuf {
-    run_dir.join("relax-bin").join(format!("{bin}.native"))
-}
+/// its run's native receipt (`Inherit::Binary`): set in the test's environment.
+pub const BIN_NATIVE_RECEIPT: &str = crate::toolenv::NATIVE_RECEIPT;
 
 const SCRIPT_RUN_SHAPE_VARS: [&str; 4] = ["RELAX_VFS", "RELAX_EDITS", "RELAX_SCRIPT_DEPTH", "RELAX_SCRIPT_CHAIN"];
 

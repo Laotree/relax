@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 pub fn home() -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_default();
-    std::env::var_os("CARGO_HOME").filter(|h| !h.is_empty()).map(|h| cwd.join(h)).unwrap_or_else(|| {
-        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).unwrap_or(cwd).join(".cargo")
+    crate::toolenv::get("CARGO_HOME").filter(|h| !h.is_empty()).map(|h| cwd.join(h)).unwrap_or_else(|| {
+        crate::toolenv::get(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).unwrap_or(cwd).join(".cargo")
     })
 }
 
@@ -15,7 +15,7 @@ pub fn offline(dir: &Path) -> Result<bool, String> {
     if std::env::var_os("RELAX_OFFLINE").is_some_and(|v| v != "0") {
         return Ok(true);
     }
-    if let Some(v) = std::env::var_os("CARGO_NET_OFFLINE") {
+    if let Some(v) = crate::toolenv::get("CARGO_NET_OFFLINE") {
         return match v.to_str() {
             Some("true") => Ok(true),
             Some("false") => Ok(false),

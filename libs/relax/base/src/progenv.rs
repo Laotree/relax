@@ -468,7 +468,7 @@ unsafe fn wide_bytes(p: *const u16) -> Vec<u8> {
 
 // WTF-8 preserves lone surrogates; the A API can also store individual non-UTF-8 bytes.
 #[cfg(windows)]
-fn wide(mut bytes: &[u8]) -> Vec<u16> {
+pub(crate) fn wide(mut bytes: &[u8]) -> Vec<u16> {
     let mut out = Vec::new();
     while !bytes.is_empty() {
         match std::str::from_utf8(bytes) {

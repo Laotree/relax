@@ -568,7 +568,7 @@ impl Resolver {
         // only the ones the requirement accepts are candidates; without a parsable match, all.
         let matching: Vec<String> = vers.iter().filter(|v| crate::registry::Version::parse(v).is_some_and(|ver| crate::registry::matches(req, &ver))).cloned().collect();
         let vers: &Vec<String> = if matching.is_empty() { vers } else { &matching };
-        let home = std::env::var("CARGO_HOME").ok().or_else(|| std::env::var("HOME").ok().map(|h| format!("{}/.cargo", h))).unwrap_or_default();
+        let home = crate::toolenv::get("CARGO_HOME").and_then(|v| v.into_string().ok()).or_else(|| crate::toolenv::get("HOME").and_then(|v| v.into_string().ok()).map(|h| format!("{}/.cargo", h))).unwrap_or_default();
         let src = format!("{}/registry/src", home);
         for v in vers {
             if let Ok(rd) = std::fs::read_dir(&src) {
@@ -1428,8 +1428,8 @@ pub fn cargo_config_files(dir: &str) -> Vec<(String, String)> {
         if let Some(path) = in_dir(&format!("{}/.cargo", d)) { files.push((d.clone(), path)); }
         cur = parent(&d);
     }
-    let home = std::env::var("CARGO_HOME").ok().filter(|h| !h.is_empty()).map(|h| normalize(&h)).or_else(|| {
-        std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok().map(|h| format!("{}/.cargo", normalize(&h)))
+    let home = crate::toolenv::get("CARGO_HOME").and_then(|v| v.into_string().ok()).filter(|h| !h.is_empty()).map(|h| normalize(&h)).or_else(|| {
+        crate::toolenv::get(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).and_then(|v| v.into_string().ok()).map(|h| format!("{}/.cargo", normalize(&h)))
     });
     if let Some(path) = home.as_deref().and_then(in_dir) {
         if !files.iter().any(|(_, p)| *p == path) { files.push((parent(home.as_deref().unwrap_or_default()).unwrap_or_default(), path)); }
@@ -1497,7 +1497,7 @@ pub fn cargo_env(dir: &str) -> Result<Vec<(String, String)>, String> {
                 (value, force == Some(true))
             }
         };
-        if force || std::env::var_os(&k).is_none() { out.push((k, value)); }
+        if force || crate::toolenv::get(&k).is_none() { out.push((k, value)); }
     }
     Ok(out)
 }

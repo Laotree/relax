@@ -831,7 +831,10 @@ pub(crate) fn resolve_package(
             // packages its parent built, from the receipt the parent handed it; a binary its test
             // started, those its test's run built
             let receipt = native_request.is_none().then(|| std::env::var(unitgraph::NATIVE_RECEIPT).ok()).flatten();
-            let inherit = match (&receipt, TESTS_NATIVE.get()) {
+            let binary_receipt = if boot {
+                crate::toolenv::native_receipt().unwrap_or_else(|| TESTS_NATIVE.get().map(String::as_str))
+            } else { None };
+            let inherit = match (&receipt, binary_receipt) {
                 (Some(r), _) => Some(unitgraph::Inherit::Script(r)),
                 (None, Some(r)) if native_request.is_some() => Some(unitgraph::Inherit::Binary(r)),
                 _ => None,
@@ -849,20 +852,18 @@ pub(crate) fn resolve_package(
             if let Some((_, took)) = &sources { eprintln!("boot-trace: provided sources hashed in {:.1} ms (beside the build scripts)", took.as_secs_f64() * 1e3); }
         }
         if let Some((checked, _)) = sources { checked?; }
-        // the package binaries the tests start take this run's native build: named in the tests'
-        // environment, and beside the binaries' wrappers for a test that clears it
+        // The prepared launchers and self-exec children keep this run's native build.
         if let Some(r) = scripts? {
-            for bin in g.env.iter().flatten().filter_map(|(k, _)| k.strip_prefix("CARGO_BIN_EXE_")) {
-                let file = unitgraph::bin_native(&crate::dirs::relax_dir(), bin);
-                if std::fs::read_to_string(&file).ok().as_deref() != Some(r.as_str()) {
-                    let tmp = file.with_extension(format!("native.tmp{}", std::process::id()));
-                    if std::fs::write(&tmp, &r).is_err() || std::fs::rename(&tmp, &file).is_err() {
-                        let _ = std::fs::remove_file(&tmp);
-                        eprintln!("relax test: {}: could not name this run's native build for its package binaries; one started with a cleared environment builds its own", file.display());
-                    }
+            unitgraph::keep_bin_native_receipt(&g, &r)?;
+            if let Some(line) = boot.then(|| std::env::var("RELAX_SELF_EXEC").ok()).flatten() {
+                let mut words: Vec<String> = line.split('\u{1f}').map(str::to_string).collect();
+                if let Some(word) = words.iter_mut().take_while(|w| w.as_str() != "--").find(|w| w.starts_with(crate::toolenv::ARG_PREFIX)) {
+                    let encoded = word.strip_prefix(crate::toolenv::ARG_PREFIX).unwrap();
+                    *word = format!("{}{}", crate::toolenv::ARG_PREFIX, crate::toolenv::with_native(encoded, &r));
+                    crate::selfexe::set_line(&words)?;
+                    crate::progenv::set_run_fact("RELAX_SELF_EXEC", words.join("\u{1f}"));
                 }
             }
-            std::env::set_var(unitgraph::BIN_NATIVE_RECEIPT, r);
         }
         crate::macro_reg::set_build_outputs(sess, &g.crates, &g.cfgs, &g.env, &host_checks);
     }
@@ -986,6 +987,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // `makepad test <package>` (lib.rs): the program is the package's test harness, not its main
     let mut harness = false;
     let mut self_exec = false;
+    let mut binary_child = false;
     let mut live_tests = false;
     let mut test_restart = None;
     let mut plain_test = false;
@@ -1018,6 +1020,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 jit::COMPILE_ERRORS_FATAL.store(false, Ordering::Relaxed);
             }
             "--self-exec" => self_exec = true,
+            "--binary-child" => binary_child = true,
+            a if a.starts_with(crate::toolenv::ARG_PREFIX) => {},
             "--profile" if i + 1 < args.len() => {
                 let _ = TEST_PROFILE.set(args[i + 1].clone());
                 i += 1;
@@ -1361,9 +1365,16 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             }
         }
         // Re-runs made by std::process share the parent's dependency check.
+        // Keep the auto-added --silent at index 2: std's exec removes it there.
+        let at = if pre.get(2).is_some_and(|a| a == "--silent") { 3 } else { 2 };
         if (harness || plain_test) && !pre.iter().any(|a| a == "--self-exec") {
-            let at = if pre.get(2).is_some_and(|a| a == "--silent") { 3 } else { 2 };
             pre.insert(at, "--self-exec".to_string());
+        }
+        if !pre.iter().any(|a| a.starts_with(crate::toolenv::ARG_PREFIX)) {
+            pre.insert(at, format!("{}{}", crate::toolenv::ARG_PREFIX, crate::toolenv::capture()));
+        }
+        if !pre.iter().any(|a| a == "--binary-child") {
+            pre.insert(at, "--binary-child".to_string());
         }
         pre.push("--".to_string());
         // (a launch of the link by another way than std's spawn finds the line there)
@@ -1379,17 +1390,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if let Some(arg0) = std::env::var_os("RELAX_ARG0") {
         prog_args[0] = arg0.into_encoded_bytes();
         unsafe { std::env::remove_var("RELAX_ARG0") };
-        // and the native build of the test's run, which the binary compiles and links with: the
-        // one its environment names (empty: none), else the one beside its wrapper (a test that
-        // cleared its environment, relax issue 157)
-        let receipt = std::env::var(unitgraph::BIN_NATIVE_RECEIPT).ok().or_else(|| {
-            let bin = crate::selfexe::program_name(&cargo_flags, &package);
-            std::fs::read_to_string(unitgraph::bin_native(&crate::dirs::relax_dir(), &bin)).ok()
-        });
-        if let Some(r) = receipt.filter(|r| !r.is_empty()) {
-            let _ = TESTS_NATIVE.set(r);
-        }
+    }
+    // Accept a receipt from callers that do not use a prepared launcher argument.
+    if crate::toolenv::native_receipt().is_none() {
+      if let Some(r) = std::env::var(unitgraph::BIN_NATIVE_RECEIPT).ok().filter(|r| !r.is_empty()) {
+        let _ = TESTS_NATIVE.set(r);
         unsafe { std::env::remove_var(unitgraph::BIN_NATIVE_RECEIPT) };
+      }
     }
     let workspace = workspace_dir();
     // everything this run writes: the workspace's <target>/relax (dirs.rs), made private above
@@ -1461,7 +1468,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // its checkout's. A build script's run has its
     // environment from the run that started it (cargo's build-script variables of its package):
     // its own graph's package is the script's.
-    let program_env = if std::env::var_os("RELAX_SCRIPT_DEPTH").is_some() { Vec::new() } else { program_env(&g, subject_ci) };
+    let program_env = if binary_child || std::env::var_os("RELAX_SCRIPT_DEPTH").is_some() { Vec::new() } else { program_env(&g, subject_ci) };
     let program_dir = (harness || plain_test).then(|| g.pkg[subject_ci].0.clone()).filter(|d| !crate::vfs::in_store(d)).map(|d| crate::vfs::on_disk(&d).into_owned());
     let mut also_graph = Vec::new();
     for name in &also {

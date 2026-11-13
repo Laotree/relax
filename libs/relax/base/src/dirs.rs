@@ -165,11 +165,11 @@ pub fn cargo_exe() -> Option<String> {
     CARGO
         .get_or_init(|| {
             let cargo = |p: &Path| p.is_absolute() && p.is_file() && p.file_stem().is_some_and(|s| s == "cargo");
-            if let Some(c) = std::env::var_os("CARGO").map(PathBuf::from).filter(|c| cargo(c)) {
+            if let Some(c) = crate::toolenv::get("CARGO").map(PathBuf::from).filter(|c| cargo(c)) {
                 return Some(c.display().to_string());
             }
             let name = if cfg!(windows) { "cargo.exe" } else { "cargo" };
-            std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(name)).find(|c| cargo(c)).map(|c| c.display().to_string())
+            std::env::split_paths(&crate::toolenv::get("PATH")?).map(|d| d.join(name)).find(|c| cargo(c)).map(|c| c.display().to_string())
         })
         .clone()
 }
