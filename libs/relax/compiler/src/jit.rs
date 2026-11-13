@@ -1978,33 +1978,45 @@ pub(crate) fn fork_child() {
 }
 
 
-/// Most functions one `__relax_precompile` builds (a pre_exec closure reaching a large library
-/// stops there; the rest compiles in the parent on first use, and a forked child that reaches
-/// it ends with its name: forkexec.rs).
-#[cfg(unix)]
+/// Most functions a bounded `__relax_precompile` builds (a pre_exec closure reaching a large
+/// library stops there; the rest compiles in the parent on first use, and a forked child that
+/// reaches it ends with its name: forkexec.rs).
 const FORK_PRECOMPILE_MAX: usize = 4096;
 
-/// `__relax_precompile(addr)` (Relax std's fork_exec, before its fork): builds the function at
-/// `addr` (its code, thunk or lazy stub) and every function its code calls or takes the address
-/// of, transitively, on the calling thread as its lazy compiles would. Returns how many were
-/// built. A forked child runs only code built before the fork (forkexec.rs).
-#[cfg(unix)]
-pub(crate) extern "C" fn relax_precompile(addr: u64) -> u64 {
+/// `__relax_precompile(roots, len, exhaustive)`: builds the functions at the `len` addresses at
+/// `roots` (each one's code, thunk or lazy stub) and every function their code calls or takes the
+/// address of, transitively and in one walk, on the calling thread as its lazy compiles would.
+/// Returns how many were built. Relax std's fork_exec asks before its fork, bounded by
+/// FORK_PRECOMPILE_MAX (a forked child runs only code built before the fork: forkexec.rs); the
+/// test harness's `--precompile` asks for the whole graph of its selected tests before any of
+/// them starts.
+/// # Safety
+/// `roots` points to `len` addresses that stay alive for the call.
+pub(crate) unsafe extern "C" fn relax_precompile(roots: *const usize, len: usize, exhaustive: bool) -> u64 {
+    let at = roots as usize;
     crate::jit::host_boundary("relax_precompile", move || {
         let _keep = os::proc::KeepLastError::new();
         let up = cur_unit();
-        if up.is_null() || addr == 0 || crate::forkexec::exec_child() {
+        if up.is_null() || at == 0 || len == 0 {
+            return 0;
+        }
+        #[cfg(unix)]
+        if crate::forkexec::exec_child() {
             return 0;
         }
         ensure_altstack();
-        let root = owner::publish(|| unsafe {
+        let addrs = unsafe { std::slice::from_raw_parts(at as *const usize, len) };
+        let roots: Vec<u32> = owner::publish(|| unsafe {
             let u = &*up;
-            u.find_fn(addr).or_else(|| (0..2).find_map(|k| u.slots.find(k, addr).map(|x| x.0))).filter(|&id| (id as usize) < u.fns.len())
+            addrs
+                .iter()
+                .filter_map(|&a| {
+                    let a = a as u64;
+                    u.find_fn(a).or_else(|| (0..2).find_map(|k| u.slots.find(k, a).map(|x| x.0))).filter(|&id| (id as usize) < u.fns.len())
+                })
+                .collect()
         });
-        match root {
-            Some(root) => precompile_from(root),
-            None => 0,
-        }
+        precompile_from(&roots, exhaustive)
     })
 }
 
@@ -2019,24 +2031,25 @@ pub(crate) fn precompile_reachable(up: *mut Unit, addr: u64) -> u64 {
         let u = &*up;
         u.find_fn(addr).or_else(|| (0..2).find_map(|k| u.slots.find(k, addr).map(|x| x.0))).filter(|&id| (id as usize) < u.fns.len())
     });
-    let built = root.map_or(0, precompile_from);
+    let built = root.map_or(0, |r| precompile_from(&[r], false));
     queue::warm_workers_for_test();
     CUR_UNIT.with(|c| c.set(prev));
     built
 }
 
-/// `relax_precompile` from slot `root`.
-#[cfg(unix)]
-pub(crate) fn precompile_from(root: u32) -> u64 {
+/// `relax_precompile` from the slots `roots`: up to FORK_PRECOMPILE_MAX functions, or with
+/// `exhaustive` all they reach.
+pub(crate) fn precompile_from(roots: &[u32], exhaustive: bool) -> u64 {
     let up = cur_unit();
     if up.is_null() {
         return 0;
     }
-    let mut todo = vec![root];
+    let limit = if exhaustive { usize::MAX } else { FORK_PRECOMPILE_MAX };
+    let mut todo = roots.to_vec();
     let mut seen = std::collections::HashSet::new();
     let mut built = 0u64;
     while let Some(id) = todo.pop() {
-        if seen.len() >= FORK_PRECOMPILE_MAX {
+        if seen.len() >= limit {
             break;
         }
         if !seen.insert(id) {
@@ -24565,7 +24578,6 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         // (the C library's atexit is there too; and a handler in its list would run after this
         // thread's locals are gone, where a lazy compile of it cannot run: makepad-remote's cleanup)
         b"atexit" => Some(os::proc::program_atexit as *const () as usize),
-        #[cfg(unix)]
         b"__relax_precompile" => Some(relax_precompile as *const () as usize),
         #[cfg(unix)]
         b"__relax_fork_exec" => Some(crate::forkexec::relax_fork_exec as *const () as usize),

@@ -304,3 +304,101 @@ pub(crate) unsafe fn reset_statics() {
     live::reset_statics();
     reach::reset_statics();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The first test asks the loader to build the second test and its return value's adapter
+    // (their addresses come in as argv[0]): with `--precompile` the harness built them, with all
+    // they call, before the first test started, so nothing is left to build.
+    const SOURCE: &str = r#"
+use std::sync::atomic::{AtomicU32, Ordering};
+static RAN: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+extern "C" {
+    fn __relax_precompile(roots: *const usize, len: usize, exhaustive: bool) -> u64;
+}
+#[test]
+fn chosen_first() {
+    let roots: Vec<usize> = std::env::args().next().unwrap().split(',').map(|s| s.parse().unwrap()).collect();
+    let built = unsafe { __relax_precompile(roots.as_ptr(), roots.len(), true) };
+    assert_eq!(built, 0, "a selected test still had code to build when the first test started");
+    RAN[0].fetch_add(1, Ordering::SeqCst);
+}
+#[test]
+fn chosen_second() -> Result<(), String> {
+    RAN[1].fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+#[test]
+#[ignore]
+fn chosen_ignored() {
+    panic!("an ignored test ran");
+}
+#[test]
+fn other() {
+    panic!("a filtered-out test ran");
+}
+pub fn ran(out: *mut [u32; 2]) {
+    unsafe { *out = [RAN[0].load(Ordering::SeqCst), RAN[1].load(Ordering::SeqCst)] };
+}
+"#;
+
+    /// `-- --precompile` with a filter and one thread: the selected tests (one returning a value)
+    /// are built before the first starts, the ignored and the filtered-out ones are not built, and
+    /// each selected test runs once (none as a warm-up).
+    #[test]
+    fn precompile_builds_the_selected_tests_before_the_first_starts() {
+        isolated_test!(precompile_builds_the_selected_tests_before_the_first_starts);
+        if std::env::var_os("RELAX_STD").is_none() {
+            std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+        }
+        let dir = std::env::temp_dir().join(format!("relax-harness-precompile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lib.rs");
+        std::fs::write(&path, SOURCE).unwrap();
+        let mut session = crate::Session::default();
+        session.options.tier1 = false;
+        session.options.tyck_ahead = false;
+        let (prog, core, krate) = crate::load_with_std(&std::sync::Arc::new(session), path.to_str().unwrap(), "harness_fixture", true).unwrap();
+        crate::layout::set_root_crate(krate);
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+        let mut u = Unit::new(prog, tcx, core);
+        let up = &mut *u as *mut Unit;
+        unsafe { jit::UNIT = up };
+        let slot = |u: &mut Unit, path: &str| {
+            let d = find_fn(u, path).unwrap_or_else(|| panic!("no {path}"));
+            u.fn_id(FnKey::Inst(d, Vec::new()))
+        };
+        let roots = crate::owner::call(crate::owner::Class::Program, || {
+            let second = find_fn(&u, "harness_fixture::chosen_second").unwrap();
+            let ret = u.tcx.fn_sig(&u.prog, second).unwrap().ret;
+            let start = find_fn(&u, "std::relax::test::__relax_test_start").unwrap();
+            let adapter = u.fn_id(FnKey::Inst(start, vec![ret]));
+            let second = slot(&mut u, "harness_fixture::chosen_second");
+            format!("{},{}", u.entry(second), u.entry(adapter))
+        });
+        jit::set_program_args(vec![roots.into_bytes(), b"chosen".to_vec(), b"--precompile".to_vec(), b"--test-threads=1".to_vec()]);
+        assert_eq!(run(&mut u, up, &[("fixture".into(), krate)]), 0, "the selected tests pass");
+        let (unbuilt, ran) = crate::owner::call(crate::owner::Class::Program, || {
+            let unbuilt: Vec<bool> = ["harness_fixture::chosen_ignored", "harness_fixture::other"]
+                .iter()
+                .map(|p| {
+                    let id = slot(&mut u, p);
+                    !u.fns[id as usize].compiled
+                })
+                .collect();
+            let ran = slot(&mut u, "harness_fixture::ran");
+            (unbuilt, u.entry(ran))
+        });
+        assert_eq!(unbuilt, [true, true], "the ignored and the filtered-out test stay unbuilt");
+        let mut counts = [0u32; 2];
+        unsafe { jit::call_jit(up, ran, &mut counts as *mut [u32; 2] as u64) }.unwrap_or_else(|p| panic!("{}", p.message));
+        assert_eq!(counts, [1, 1], "each selected test ran once");
+        // the harness's threads may still be retiring: the unit outlives them, as the CLI's does
+        Box::leak(u);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

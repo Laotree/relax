@@ -2,7 +2,9 @@
 //! (library/test: lib.rs run_test, test_result.rs calc_result, console.rs, cli.rs), running in
 //! the program. The loader collects the crate's `#[test]` fns and hands their table to `main`;
 //! the command line after `--` is libtest's (filters, --exact, --skip, --ignored,
-//! --include-ignored, --test-threads, --list, --nocapture, -q).
+//! --include-ignored, --test-threads, --list, --nocapture, -q). Relax's own `--precompile` builds
+//! the selected tests and all they reach before the first one starts, so no lazy compile runs
+//! inside a test's own deadlines.
 //! Not here: output capture (every test prints as under --nocapture), benches, --format.
 
 use crate::string::String;
@@ -91,6 +93,8 @@ struct Opts {
     /// libtest OutputFormat::Terse (`-q` / `--format=terse`): one character per test
     quiet: bool,
     threads: usize,
+    /// `--precompile`: build every selected test's code graph before any test starts
+    precompile: bool,
 }
 
 /// libtest cli.rs get_format: `--format` (pretty, terse; json and junit only on nightly with
@@ -105,12 +109,13 @@ fn format_terse(v: &str) -> Result<bool, String> {
 }
 
 fn parse_args() -> Result<Opts, String> {
-    let mut o = Opts { filters: Vec::new(), skip: Vec::new(), exact: false, ignored: false, include_ignored: false, list: false, quiet: false, threads: 0 };
+    let mut o = Opts { filters: Vec::new(), skip: Vec::new(), exact: false, ignored: false, include_ignored: false, list: false, quiet: false, threads: 0, precompile: false };
     let mut format: Option<bool> = None;
     let mut args = crate::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--exact" => o.exact = true,
+            "--precompile" => o.precompile = true,
             "--ignored" => o.ignored = true,
             "--include-ignored" => o.include_ignored = true,
             "--list" => o.list = true,
@@ -285,6 +290,27 @@ fn run(t: &mut Tests, opts: &Opts, descs: Arc<Vec<Desc>>, filtered_out: usize) -
     if t.verbose != 0 {
         let names: Vec<&str> = selected.iter().map(|&i| descs[i].name.as_str()).collect();
         eprintln!("relax test selection: selected={:?}", names);
+    }
+    // every test that will run, with its return value's adapter, in one walk before the first
+    // starts: a build beside a running test would still spend that test's deadlines
+    if opts.precompile {
+        extern "C" {
+            fn __relax_precompile(roots: *const usize, len: usize, exhaustive: bool) -> u64;
+        }
+        let mut roots = Vec::with_capacity(selected.len() * 2);
+        for &i in &selected {
+            let d = &descs[i];
+            if !d.ignore {
+                roots.push(d.run);
+                if d.start != 0 {
+                    roots.push(d.start);
+                }
+            }
+        }
+        let built = unsafe { __relax_precompile(roots.as_ptr(), roots.len(), true) };
+        if t.verbose != 0 {
+            eprintln!("relax test precompile: roots={} built={}", roots.len(), built);
+        }
     }
     let started = crate::time::Instant::now();
     println!();
