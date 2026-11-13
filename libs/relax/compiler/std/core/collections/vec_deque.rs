@@ -893,6 +893,16 @@ impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
             }
         }
     }
+    // core vec_deque iter.rs: the second half from the back, then the rest of n in the first
+    fn advance_back_by(&mut self, n: usize) -> Result<(), usize> {
+        match self.b.advance_back_by(n) {
+            Ok(()) => Ok(()),
+            Err(k) => {
+                crate::mem::swap(&mut self.a, &mut self.b);
+                self.b.advance_back_by(k)
+            }
+        }
+    }
 }
 
 impl<'a, T> ExactSizeIterator for Iter<'a, T> {}
@@ -961,6 +971,16 @@ impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
             None => {
                 crate::mem::swap(&mut self.a, &mut self.b);
                 self.b.next_back()
+            }
+        }
+    }
+    // core vec_deque iter.rs: the second half from the back, then the rest of n in the first
+    fn advance_back_by(&mut self, n: usize) -> Result<(), usize> {
+        match self.b.advance_back_by(n) {
+            Ok(()) => Ok(()),
+            Err(k) => {
+                crate::mem::swap(&mut self.a, &mut self.b);
+                self.b.advance_back_by(k)
             }
         }
     }

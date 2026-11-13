@@ -164,3 +164,133 @@ fn array_into_iter_nth_drops_the_skipped() {
     let got: Vec<u32> = [0u32, 1, 2, 3, 4, 5, 6].into_iter().step_by(3).collect();
     assert_eq!(got, [0, 3, 6]);
 }
+
+thread_local!(static DROPS: Cell<u32> = Cell::new(0));
+
+/// Counts its drops; the one numbered 0 panics in its drop.
+struct Bomb(u32);
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        DROPS.with(|d| d.set(d.get() + 1));
+        if self.0 == 0 {
+            panic!("bomb");
+        }
+    }
+}
+
+fn drops() -> u32 {
+    DROPS.with(|d| d.replace(0))
+}
+
+#[test]
+fn skipped_items_are_all_dropped_when_one_panics() {
+    drops();
+    // array::IntoIter: a skip past a panicking drop still drops the other skipped items
+    let mut it = [Bomb(0), Bomb(1), Bomb(2), Bomb(3)].into_iter();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| it.nth(3).map(|b| b.0)));
+    assert!(r.is_err());
+    assert_eq!(drops(), 3);
+    drop(it);
+    assert_eq!(drops(), 1);
+    // and so does its drop of the items left
+    let it = [Bomb(5), Bomb(0), Bomb(6), Bomb(7)].into_iter();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(it))).is_err());
+    assert_eq!(drops(), 4);
+    // vec::IntoIter's nth
+    let mut it = vec![Bomb(0), Bomb(1), Bomb(2), Bomb(3)].into_iter();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| it.nth(3).map(|b| b.0)));
+    assert!(r.is_err());
+    assert_eq!(drops(), 3);
+    drop(it);
+    assert_eq!(drops(), 1);
+    // plain data: nothing to drop, the same items
+    assert_eq!([7u8; 4096].into_iter().nth(4000), Some(7));
+    assert_eq!(vec![1u32, 2, 3, 4, 5].into_iter().step_by(2).collect::<Vec<_>>(), [1, 3, 5]);
+}
+
+/// Every nth and nth_back of `make()` (front, back, through a chain on either side, and every
+/// step) gives the items a plain collect gives.
+fn same_as_collect<I, F>(what: &str, make: F)
+where
+    I: DoubleEndedIterator,
+    I::Item: PartialEq + std::fmt::Debug + Clone,
+    F: Fn() -> I,
+{
+    let all: Vec<I::Item> = make().collect();
+    let len = all.len();
+    for n in 0..len + 3 {
+        assert_eq!(make().nth(n), all.get(n).cloned(), "{what}: nth({n})");
+        let back = if n < len { Some(all[len - 1 - n].clone()) } else { None };
+        assert_eq!(make().nth_back(n), back, "{what}: nth_back({n})");
+        // through Chain::nth (the front's advance_by) and Chain::nth_back (the back's advance_back_by)
+        let tail: Vec<I::Item> = all.iter().take(2).cloned().collect();
+        let mut joined = all.clone();
+        joined.extend(tail.iter().cloned());
+        assert_eq!(make().chain(tail.iter().cloned()).nth(n), joined.get(n).cloned(), "{what}: chain nth({n})");
+        let mut back_joined = tail.clone();
+        back_joined.extend(all.iter().cloned());
+        let bl = back_joined.len();
+        let want = if n < bl { Some(back_joined[bl - 1 - n].clone()) } else { None };
+        assert_eq!(tail.iter().cloned().chain(make()).nth_back(n), want, "{what}: chain nth_back({n})");
+        // a chain's nth runs its front on, and then the item after it
+        let mut it = make().chain(tail.iter().cloned());
+        let first = it.nth(n);
+        assert_eq!(first, joined.get(n).cloned());
+        assert_eq!(it.next(), joined.get(n + 1).cloned(), "{what}: next after chain nth({n})");
+    }
+    for step in 1..len + 2 {
+        let want: Vec<I::Item> = all.iter().step_by(step).cloned().collect();
+        assert_eq!(make().step_by(step).collect::<Vec<_>>(), want, "{what}: step_by({step})");
+        let want: Vec<I::Item> = all.iter().rev().step_by(step).cloned().collect();
+        assert_eq!(make().rev().step_by(step).collect::<Vec<_>>(), want, "{what}: rev step_by({step})");
+    }
+}
+
+#[test]
+fn advance_by_and_nth_back_agree_with_a_collect() {
+    let v: Vec<u32> = (0..23).collect();
+    let w: Vec<u32> = (100..107).collect();
+    let mut d: VecDeque<u32> = (0..10).collect();
+    d.rotate_left(4);
+    same_as_collect("slice", || v.iter());
+    same_as_collect("copied", || v.iter().copied());
+    same_as_collect("enumerate", || v.iter().enumerate());
+    same_as_collect("take", || v.iter().take(17));
+    same_as_collect("skip", || v.iter().skip(5));
+    same_as_collect("fuse", || v.iter().fuse());
+    same_as_collect("rev", || v.iter().rev());
+    same_as_collect("chain", || v.iter().chain(w.iter()));
+    same_as_collect("chain chain", || w.iter().chain(v.iter()).chain(w.iter()));
+    same_as_collect("range", || 3u32..40);
+    same_as_collect("range of chars", || 'a'..'q');
+    same_as_collect("vec into_iter", || v.clone().into_iter());
+    same_as_collect("array into_iter", || [1u8, 2, 3, 4, 5, 6, 7].into_iter());
+    same_as_collect("vec_deque", || d.iter());
+    same_as_collect("chain of enumerate skip", || v.iter().skip(3).enumerate().chain(w.iter().enumerate()));
+    let mut m: Vec<u32> = v.clone();
+    let mut ms: Vec<u32> = Vec::new();
+    for n in 0..30 {
+        ms.push(m.iter_mut().nth_back(n).map(|x| *x).unwrap_or(999));
+    }
+    let want: Vec<u32> = (0..30).map(|n| if n < 23 { 22 - n } else { 999 }).collect();
+    assert_eq!(ms, want);
+    let mut it = m.iter_mut();
+    *it.nth_back(3).unwrap() += 100;
+    assert_eq!(it.next_back(), Some(&mut 18));
+    assert_eq!(m[19], 119);
+    let mut dm = d.clone();
+    *dm.iter_mut().rev().nth(7).unwrap() += 50;
+    assert_eq!(dm[2], d[2] + 50);
+}
+
+#[test]
+fn chain_nth_past_a_skip_that_runs_out() {
+    // Chain::nth advances its front (a skip of 10 over 5 items, which runs out in its skip: the
+    // inner iterator's own advance_by, 5 items and the None) and goes on in the back
+    let (inner, nexts, nths) = counting(5);
+    let (b, _, b_nths) = counting(3);
+    let mut it = inner.skip(10).chain(b);
+    assert_eq!(it.nth(1), Some(1));
+    assert_eq!((nexts.get(), nths.get(), b_nths.get()), (6, 0, 1));
+    assert_eq!(it.next(), Some(2));
+}

@@ -86,6 +86,19 @@ impl<A: Step> Iterator for Range<A> {
             (0, Some(0))
         }
     }
+    // core range.rs: the items left, counted once, and start moved past at most that many
+    fn advance_by(&mut self, n: usize) -> Result<(), usize> {
+        let available = if self.start < self.end {
+            let steps = Step::steps_between(&self.start, &self.end);
+            steps.1.unwrap_or(steps.0)
+        } else {
+            0
+        };
+        let taken = if available < n { available } else { n };
+        // SAFETY: taken steps from start stay within start..=end
+        self.start = unsafe { Step::forward_unchecked(self.start.clone(), taken) };
+        if taken < n { Err(n - taken) } else { Ok(()) }
+    }
     fn nth(&mut self, n: usize) -> Option<A> {
         if let Some(plus_n) = Step::forward_checked(self.start.clone(), n) {
             if plus_n < self.end {
@@ -133,6 +146,18 @@ impl<A: Step> DoubleEndedIterator for Range<A> {
         } else {
             None
         }
+    }
+    fn advance_back_by(&mut self, n: usize) -> Result<(), usize> {
+        let available = if self.start < self.end {
+            let steps = Step::steps_between(&self.start, &self.end);
+            steps.1.unwrap_or(steps.0)
+        } else {
+            0
+        };
+        let taken = if available < n { available } else { n };
+        // SAFETY: taken steps back from end stay within start..=end
+        self.end = unsafe { Step::backward_unchecked(self.end.clone(), taken) };
+        if taken < n { Err(n - taken) } else { Ok(()) }
     }
     fn nth_back(&mut self, n: usize) -> Option<A> {
         if let Some(minus_n) = Step::backward_checked(self.end.clone(), n) {

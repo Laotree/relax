@@ -35,6 +35,20 @@ fn len_between<T>(p: *const T, end: *const T) -> usize {
     if zst::<T>() { bytes } else { bytes / crate::mem::size_of::<T>() }
 }
 
+/// advance_by (advance_back_by) of a slice iterator, whose nth (nth_back) is O(1): at most the items
+/// left, in one nth
+macro_rules! advance_by_nth {
+    ($it:expr, $n:expr, $nth:ident) => {{
+        let n = $n;
+        let len = $it.len_left();
+        let k = if n < len { n } else { len };
+        if k > 0 {
+            $it.$nth(k - 1);
+        }
+        if k < n { Err(n - k) } else { Ok(()) }
+    }};
+}
+
 pub struct Iter<'a, T> {
     ptr: *const T,
     end: *const T,
@@ -110,12 +124,7 @@ impl<'a, T> Iterator for Iter<'a, T> {
     // core slice iter macros: advance_by moves the pointer in O(1) (Chain::nth and VecDeque's
     // iterators lean on it)
     fn advance_by(&mut self, n: usize) -> Result<(), usize> {
-        let len = self.len_left();
-        let k = if n < len { n } else { len };
-        if k > 0 {
-            self.nth(k - 1);
-        }
-        if k < n { Err(n - k) } else { Ok(()) }
+        advance_by_nth!(self, n, nth)
     }
     fn nth(&mut self, n: usize) -> Option<&'a T> {
         if n >= self.len_left() {
@@ -178,6 +187,9 @@ impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
                 Some(&*self.end)
             }
         }
+    }
+    fn advance_back_by(&mut self, n: usize) -> Result<(), usize> {
+        advance_by_nth!(self, n, nth_back)
     }
     fn nth_back(&mut self, n: usize) -> Option<&'a T> {
         let len = self.len_left();
@@ -275,12 +287,7 @@ impl<'a, T> Iterator for IterMut<'a, T> {
     // core slice iter macros: advance_by moves the pointer in O(1) (Chain::nth and VecDeque's
     // iterators lean on it)
     fn advance_by(&mut self, n: usize) -> Result<(), usize> {
-        let len = self.len_left();
-        let k = if n < len { n } else { len };
-        if k > 0 {
-            self.nth(k - 1);
-        }
-        if k < n { Err(n - k) } else { Ok(()) }
+        advance_by_nth!(self, n, nth)
     }
     fn nth(&mut self, n: usize) -> Option<&'a mut T> {
         if n >= self.len_left() {
@@ -328,6 +335,28 @@ impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
                 Some(&mut *self.end)
             }
         }
+    }
+    // core slice iter macros: end moves back by n + 1 in O(1)
+    fn nth_back(&mut self, n: usize) -> Option<&'a mut T> {
+        let len = self.len_left();
+        if n >= len {
+            self.end = self.ptr;
+            None
+        } else {
+            // SAFETY: n < len
+            unsafe {
+                if zst::<T>() {
+                    self.end = (self.end as *mut u8).wrapping_sub(n + 1) as *mut T;
+                    Some(&mut *self.ptr)
+                } else {
+                    self.end = self.end.sub(n + 1);
+                    Some(&mut *self.end)
+                }
+            }
+        }
+    }
+    fn advance_back_by(&mut self, n: usize) -> Result<(), usize> {
+        advance_by_nth!(self, n, nth_back)
     }
 }
 
