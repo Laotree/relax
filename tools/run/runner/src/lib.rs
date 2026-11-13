@@ -77,6 +77,12 @@ pub struct Host {
     /// the commands this binary adds to the runner's: listed in its help, run before anything of
     /// the runner's own
     pub commands: &'static [HostCommand],
+    /// the native proc-macro sets this binary links (relax_native_macros::Set), registered before
+    /// the compiler reads them; a macro of no set is JIT-compiled and hosted (pmhost.rs)
+    pub native_sets: &'static [&'static relax_native_macros::Set],
+    /// fn-like macros whose bodies are another language: the lexer keeps each body as one token
+    /// (relax-lex lexer.rs register_raw_body)
+    pub raw_body_macros: &'static [&'static str],
 }
 
 /// A command a host adds to its binary: its word, its row on the main help page, its own help
@@ -103,7 +109,7 @@ pub enum HelpLine {
 
 /// The bare runner (bin `relax`): provides nothing; tests, checks and agents' boots compile only
 /// what runs.
-pub const BARE: Host = Host { provenance: None, init: || {}, provide: || {}, run_host: || {}, ahead: relax_compiler::options::AheadLevel::Minimal, proc_macros: relax_compiler::pmhost::Policy::Open, default_launch: None, package: env!("CARGO_PKG_NAME"), manifest: concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"), commands: &[] };
+pub const BARE: Host = Host { provenance: None, init: || {}, provide: || {}, run_host: || {}, ahead: relax_compiler::options::AheadLevel::Minimal, proc_macros: relax_compiler::pmhost::Policy::Open, default_launch: None, package: env!("CARGO_PKG_NAME"), manifest: concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"), commands: &[], native_sets: &[], raw_body_macros: &[] };
 
 static HOST: std::sync::OnceLock<&'static Host> = std::sync::OnceLock::new();
 
@@ -114,6 +120,9 @@ fn host() -> &'static Host {
 /// The runner's host, once, before `main`/`init_embedded`/`run_checkout`.
 pub fn set_host(host: &'static Host) {
     if HOST.set(host).is_ok() {
+        for &set in host.native_sets {
+            relax_native_macros::register(set);
+        }
         relax_compiler::pmhost::set_policy(host.proc_macros);
         relax_compiler::reload::set_loader_package(host.package, host.manifest);
         // the entry point's ahead level, unless the environment names one; RELAX_AHEAD
@@ -223,7 +232,7 @@ pub fn init_embedded(exe: &std::path::Path, host: &'static Host) {
     // the program's argv[0] / current_exe: the embedder has no command line of its own
     relax_compiler::os::proc::set_args(vec![exe.as_os_str().as_encoded_bytes().to_vec()]);
     std::env::set_var("RELAX_LOADER", exe);
-    macros::register();
+    macros::register(host.raw_body_macros);
 }
 
 /// The loader's command line as an embedder gives it. A host library loaded into another process
@@ -356,7 +365,7 @@ fn run(raw_args: Vec<Vec<u8>>) {
     std::env::set_var("RELAX_HOME", fetch::home());
     #[cfg(target_os = "linux")]
     nvidia_shader_cache();
-    macros::register();
+    macros::register(host().raw_body_macros);
     // a command the host adds: its own, no compiler started here
     if let Some(c) = args.get(1).and_then(|w| host().commands.iter().find(|c| c.name == w)) {
         std::process::exit((c.main)(&args[2..]));

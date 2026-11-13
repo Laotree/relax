@@ -20,6 +20,7 @@ path = "src/bin/relax.rs"
 
 [dependencies]
 relax-compiler = { workspace = true }
+relax-native-macros = { workspace = true }
 makepad-remote = { workspace = true }
 # fetching sources (`run <git url>`): Relax's git client (relax's `git` module) on the
 # system's HTTP stack
