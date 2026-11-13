@@ -17,7 +17,6 @@ pub trait SliceIndex<T: ?Sized> {
     fn index_mut(self, slice: &mut T) -> &mut Self::Output;
 }
 
-#[cfg(not(relax_check))]
 impl<T, I: SliceIndex<[T]>> Index<I> for [T] {
     type Output = I::Output;
     #[track_caller]
@@ -26,7 +25,6 @@ impl<T, I: SliceIndex<[T]>> Index<I> for [T] {
     }
 }
 
-#[cfg(not(relax_check))]
 impl<T, I: SliceIndex<[T]>> IndexMut<I> for [T] {
     #[track_caller]
     fn index_mut(&mut self, index: I) -> &mut I::Output {
@@ -34,7 +32,6 @@ impl<T, I: SliceIndex<[T]>> IndexMut<I> for [T] {
     }
 }
 
-#[cfg(not(relax_check))]
 impl<T, I: SliceIndex<[T]>, const N: usize> Index<I> for [T; N] {
     type Output = I::Output;
     #[track_caller]
@@ -43,7 +40,6 @@ impl<T, I: SliceIndex<[T]>, const N: usize> Index<I> for [T; N] {
     }
 }
 
-#[cfg(not(relax_check))]
 impl<T, I: SliceIndex<[T]>, const N: usize> IndexMut<I> for [T; N] {
     #[track_caller]
     fn index_mut(&mut self, index: I) -> &mut I::Output {

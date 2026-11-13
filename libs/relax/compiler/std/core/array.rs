@@ -76,7 +76,6 @@ impl fmt::Display for TryFromSliceError {
 
 impl crate::error::Error for TryFromSliceError {}
 
-#[cfg(not(relax_check))]
 impl<T, const N: usize> [T; N] {
     pub const fn map<U, F: FnMut(T) -> U>(self, f: F) -> [U; N] {
         let mut f = f;

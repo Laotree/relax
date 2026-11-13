@@ -31,7 +31,7 @@ pub type c_char = u8;
 pub type c_char = i8;
 
 #[repr(u8)]
-#[cfg_attr(not(relax_check), lang = "c_void")]
+#[lang = "c_void"]
 pub enum c_void {
     __variant1,
     __variant2,
@@ -49,7 +49,7 @@ extern "C" {
 
 /// A borrowed, nul-terminated C string. `inner` includes the trailing nul.
 #[repr(transparent)]
-#[cfg_attr(not(relax_check), lang = "CStr")]
+#[lang = "CStr"]
 pub struct CStr {
     inner: [c_char],
 }
@@ -234,7 +234,6 @@ fn escape_ascii_byte(b: u8, f: &mut fmt::Formatter) -> fmt::Result {
 }
 
 /// Byte copy of the whole value (real std's CloneToUninit for CStr), for Rc/Arc::make_mut.
-#[cfg(not(relax_shim))]
 unsafe impl crate::clone_uninit::CloneToUninit for CStr {
     unsafe fn clone_to_uninit(&self, dest: *mut u8) {
         let n = crate::mem::size_of_val(self);

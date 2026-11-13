@@ -6,7 +6,7 @@ use crate::fmt;
 /// A source location, as `#[track_caller]` / `Location::caller()` report it.
 // (Eq / Ord / Hash over the bytes with the nul order exactly as over `file()`)
 #[derive(Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(not(relax_check), lang = "panic_location")]
+#[lang = "panic_location"]
 pub struct Location<'a> {
     // the file name and its terminating nul (rustc Location::file_bytes_with_nul)
     file_bytes_with_nul: &'a [u8],
@@ -52,7 +52,7 @@ impl<'a> fmt::Display for Location<'a> {
 }
 
 /// What a panic hook sees.
-#[cfg_attr(not(relax_check), lang = "panic_info")]
+#[lang = "panic_info"]
 pub struct PanicInfo<'a> {
     message: fmt::Arguments<'a>,
     location: &'a Location<'a>,

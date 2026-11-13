@@ -431,10 +431,7 @@ impl<T: ?Sized> From<crate::boxed::Box<T>> for Rc<T> {
 /// Frees a Box's allocation whose value was moved out (bytes copied, not dropped).
 pub(crate) unsafe fn free_box_allocation(p: *mut u8, size: usize, align: usize) {
     if size != 0 {
-        #[cfg(not(relax_check))]
         crate::heap::dealloc(p, crate::heap::Layout::from_size_align_unchecked(size, align));
-        #[cfg(relax_check)]
-        std::alloc::dealloc(p, std::alloc::Layout::from_size_align_unchecked(size, align));
     }
 }
 

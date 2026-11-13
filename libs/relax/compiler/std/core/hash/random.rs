@@ -5,7 +5,7 @@
 //! The OS sources are real std's (library/std/src/sys/random/{linux,apple,mod}.rs), except
 //! Windows, which uses RtlGenRandom like the rest of Relax's std instead of ProcessPrng.
 
-#[cfg(all(not(relax_check), not(relax_web)))]
+#[cfg(not(relax_web))]
 use crate::cell::Cell;
 
 // The web profile: every RandomState takes the same fixed keys (hashmap_random_keys below), with
@@ -15,13 +15,13 @@ use crate::cell::Cell;
 // than in the trace, and so another iteration order (a game's nodegate a1 with fixed base keys:
 // first difference still the freed texture order at frame 16727). Iteration orders then depend
 // on each map's contents and history only, the same in the trace and on the page.
-#[cfg(all(not(relax_check), relax_web))]
+#[cfg(relax_web)]
 pub(crate) fn next_keys() -> (u64, u64) {
     hashmap_random_keys()
 }
 
 /// The calling thread's next keys (std's `KEYS.with(|keys| ..)` in RandomState::new).
-#[cfg(all(not(relax_check), not(relax_web)))]
+#[cfg(not(relax_web))]
 pub(crate) fn next_keys() -> (u64, u64) {
     // None until the thread's first RandomState (std: the thread_local's lazy initialiser)
     #[thread_local]
@@ -34,22 +34,6 @@ pub(crate) fn next_keys() -> (u64, u64) {
     (k0, k1)
 }
 
-/// The rustc-compiled shim (std/check): the host std's keys, one pair per thread, stepped as above.
-#[cfg(relax_check)]
-pub(crate) fn next_keys() -> (u64, u64) {
-    use std::hash::BuildHasher;
-    std::thread_local!(static KEYS: std::cell::Cell<(u64, u64)> = {
-        let s = std::hash::RandomState::new();
-        std::cell::Cell::new((s.hash_one(0u8), s.hash_one(1u8)))
-    });
-    KEYS.with(|keys| {
-        let (k0, k1) = keys.get();
-        keys.set((k0.wrapping_add(1), k1));
-        (k0, k1)
-    })
-}
-
-#[cfg(not(relax_check))]
 fn keys_from(buf: &[u8; 16]) -> (u64, u64) {
     let mut a = [0u8; 8];
     let mut b = [0u8; 8];
@@ -60,7 +44,7 @@ fn keys_from(buf: &[u8; 16]) -> (u64, u64) {
 
 // sys/random/linux.rs: getrandom(bytes, insecure = true) -- GRND_INSECURE, else GRND_NONBLOCK;
 // when the call is unavailable or would block, /dev/urandom
-#[cfg(all(not(relax_check), not(relax_web), any(target_os = "linux", target_os = "android")))]
+#[cfg(all(not(relax_web), any(target_os = "linux", target_os = "android")))]
 fn hashmap_random_keys() -> (u64, u64) {
     use crate::ffi::{c_char, c_int, c_void};
     use crate::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -124,7 +108,7 @@ fn hashmap_random_keys() -> (u64, u64) {
 }
 
 // sys/random/apple.rs: CCRandomGenerateBytes
-#[cfg(all(not(relax_check), not(relax_web), target_vendor = "apple"))]
+#[cfg(all(not(relax_web), target_vendor = "apple"))]
 fn hashmap_random_keys() -> (u64, u64) {
     use crate::ffi::{c_int, c_void};
     extern "C" {
@@ -136,7 +120,7 @@ fn hashmap_random_keys() -> (u64, u64) {
     keys_from(&buf)
 }
 
-#[cfg(all(not(relax_check), not(relax_web), windows))]
+#[cfg(all(not(relax_web), windows))]
 fn hashmap_random_keys() -> (u64, u64) {
     #[link(name = "advapi32")]
     extern "system" {
@@ -153,7 +137,7 @@ fn hashmap_random_keys() -> (u64, u64) {
 // iteration orders are fixed too -- but a wasm export's trace runs the program natively, where
 // those addresses are the host process's, and the page must replay the trace exactly (the
 // export's frame gate: HashMap iteration orders reach what the page draws and frees)
-#[cfg(all(not(relax_check), relax_web))]
+#[cfg(relax_web)]
 fn hashmap_random_keys() -> (u64, u64) {
     (0x082e_fa98_ec4e_6c89, 0x082e_fa98_ec4e_6c89)
 }

@@ -220,7 +220,7 @@ impl ExitCode {
 }
 
 /// rustc library/std/src/process.rs: what `fn main` may return.
-#[cfg_attr(not(relax_check), lang = "termination")]
+#[lang = "termination"]
 pub trait Termination {
     fn report(self) -> ExitCode;
 }
@@ -231,8 +231,6 @@ impl Termination for () {
     }
 }
 
-// `!` as a type is unstable under rustc; the shim (check_os) builds without this impl.
-#[cfg(not(relax_shim))]
 impl Termination for ! {
     fn report(self) -> ExitCode {
         self
@@ -739,7 +737,6 @@ impl Command {
         // (POSIX: only async-signal-safe work between fork and exec). The loader builds the
         // child's half and the closures, with what they call, now; its fork marks the child
         // (a stub reached there anyway ends it with the function's name, never a hang).
-        // Under rustc (std/check_os) there is no loader: plain fork.
         // A child that reached code built only now (a vtable's fn) ended before its exec, with
         // none of its effects left: the loader built that code, and the fork goes again.
         let loader = ForkLoader::get();
@@ -865,8 +862,8 @@ pub(crate) unsafe fn run_pre_exec<F: FnMut() -> io::Result<()>>(f: *mut u8) -> i
     (*(f as *mut F))()
 }
 
-/// The loader's fork-for-exec entry points (jit.rs / forkexec.rs, found through dlsym: none
-/// when std runs without Relax, e.g. under rustc in std/check_os).
+/// The loader's fork-for-exec entry points (jit.rs / forkexec.rs), found through dlsym.
+/// When the symbols are unavailable, spawning uses plain fork.
 #[cfg(not(target_os = "android"))]
 struct ForkLoader {
     precompile: Option<extern "C" fn(usize) -> u64>,

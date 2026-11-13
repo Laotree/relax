@@ -1429,7 +1429,6 @@ extern "system" {
 }
 
 /// Byte copy of the whole value (real std's CloneToUninit for Path), for Rc/Arc::make_mut.
-#[cfg(not(relax_shim))]
 unsafe impl core::clone::CloneToUninit for Path {
     unsafe fn clone_to_uninit(&self, dest: *mut u8) {
         let n = core::mem::size_of_val(self);

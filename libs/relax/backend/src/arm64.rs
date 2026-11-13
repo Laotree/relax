@@ -2895,8 +2895,8 @@ impl<'a> Gen<'a> {
             self.fin_f(d, xd);
             return;
         }
-        // core::arch exposes Intel semantics on Arm too (check_arch's cross-ISA
-        // fixtures exercise them). Keep these in hardware, with lane conversion.
+        // core::arch exposes Intel semantics on Arm too (tests/std/core_arch_x86_64.rs run on an
+        // Arm host exercises them). Keep these in hardware, with lane conversion.
         if matches!(op, VX::X86Sha1Rnds4(_) | VX::X86Sha1NextE | VX::X86Sha1Msg1
             | VX::X86Sha1Msg2 | VX::X86Sha256Msg1 | VX::X86Sha256Msg2) {
             let xa = self.use_f(a, FS0);

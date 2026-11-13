@@ -293,7 +293,7 @@ impl ExitCode {
 }
 
 /// rustc library/std/src/process.rs: what `fn main` may return.
-#[cfg_attr(not(relax_check), lang = "termination")]
+#[lang = "termination"]
 pub trait Termination {
     fn report(self) -> ExitCode;
 }
@@ -304,8 +304,6 @@ impl Termination for () {
     }
 }
 
-// `!` as a type is unstable under rustc; the shim (check_os) builds without this impl.
-#[cfg(not(relax_shim))]
 impl Termination for ! {
     fn report(self) -> ExitCode {
         self

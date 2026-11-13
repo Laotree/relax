@@ -62,7 +62,6 @@ impl<T> Iterator for IntoIter<T> {
         }
         self.next()
     }
-    #[cfg(not(relax_check))]
     #[doc(hidden)]
     #[inline]
     unsafe fn __iterator_get_unchecked(&mut self, i: usize) -> T {
@@ -89,7 +88,6 @@ unsafe impl<T> crate::iter::TrustedLen for IntoIter<T> {}
 impl<T> crate::iter::FusedIterator for IntoIter<T> {}
 // real alloc: `T: NonDrop`, its marker for Copy (the indexed reads leave the items in the buffer, and
 // its drop drops start..end)
-#[cfg(not(relax_check))]
 unsafe impl<T: Copy> crate::iter::TrustedRandomAccessNoCoerce for IntoIter<T> {
     const MAY_HAVE_SIDE_EFFECT: bool = false;
 }

@@ -1,6 +1,6 @@
 //! str: UTF-8 validation, slicing with real core's panic messages, the Pattern API,
-//! splitting, trimming, escapes and parsing. The `impl str` methods (str/inherent.rs, Relax
-//! only) forward to the free fns here, which the rustc shim tests against real std.
+//! splitting, trimming, escapes and parsing. The `impl str` methods (str/inherent.rs)
+//! forward to the free fns here.
 
 pub mod pattern;
 
@@ -9,9 +9,7 @@ mod lossy;
 mod split;
 mod validations;
 
-#[cfg(not(relax_check))]
 mod inherent;
-#[cfg(not(relax_check))]
 mod traits_impls;
 
 pub use iter::{Bytes, CharIndices, Chars, EncodeUtf16, EscapeDebug, EscapeDefault, EscapeUnicode};
@@ -819,7 +817,6 @@ impl fmt::Display for ParseBoolError {
     }
 }
 
-#[cfg(not(relax_check))]
 impl crate::error::Error for ParseBoolError {}
 
 impl FromStr for bool {

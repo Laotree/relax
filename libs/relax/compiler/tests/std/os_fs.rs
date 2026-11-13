@@ -1,5 +1,5 @@
-// std-os lane: std::fs (differential: os_diff.sh, and agree.sh's differential files). Works in a
-// fresh dir under $TMPDIR. a03: fs::hard_link links a symlink itself, dangling or not (relax #107).
+// std-os lane: std::fs (differential: agree.sh). Works in a fresh dir under $TMPDIR. a03:
+// fs::hard_link links a symlink itself, dangling or not (relax #107).
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};

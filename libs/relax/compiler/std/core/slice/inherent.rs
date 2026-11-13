@@ -1,5 +1,5 @@
-//! `impl<T> [T]` and `impl [u8]` (Relax only: inherent impls on primitive types). Bodies
-//! forward to the free functions of this module tree, which the rustc shim checks.
+//! Relax's `impl<T> [T]` and `impl [u8]`. Bodies forward to the free functions of this
+//! module tree.
 
 use super::iter as it;
 use super::sort;
@@ -48,7 +48,7 @@ impl<T> [T] {
         let right = crate::slice::from_raw_parts_mut(ptr.add(rest_len - ts_len), ts_len);
         (left, mid, right)
     }
-    #[cfg_attr(not(relax_check), lang = "slice_len_fn")]
+    #[lang = "slice_len_fn"]
     #[rustc_no_implicit_autorefs]
     pub const fn len(&self) -> usize {
         unsafe { im::slice_len(self) }

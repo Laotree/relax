@@ -6,8 +6,8 @@ use crate::ops::{Deref, DerefMut};
 
 /// The primitive for interior mutability (Relax knows it: no `noalias` on what it covers).
 #[repr(transparent)]
-#[cfg_attr(not(relax_check), rustc_layout_no_niche)]
-#[cfg_attr(not(relax_check), lang = "unsafe_cell")]
+#[rustc_layout_no_niche]
+#[lang = "unsafe_cell"]
 pub struct UnsafeCell<T: ?Sized> {
     value: T,
 }
@@ -266,9 +266,7 @@ impl fmt::Display for BorrowMutError {
     }
 }
 
-#[cfg(not(relax_check))]
 impl crate::error::Error for BorrowError {}
-#[cfg(not(relax_check))]
 impl crate::error::Error for BorrowMutError {}
 
 #[inline(never)]

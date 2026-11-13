@@ -3,7 +3,7 @@
 
 use crate::result::Result::{self, Ok};
 
-#[cfg_attr(not(relax_check), lang = "From")]
+#[lang = "From"]
 pub trait From<T>: Sized {
     fn from(value: T) -> Self;
 }

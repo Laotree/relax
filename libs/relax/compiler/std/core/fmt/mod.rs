@@ -108,7 +108,7 @@ pub mod rt {
 
     /// A type-erased argument: a pointer to the value and its formatting function.
     #[derive(Copy, Clone)]
-    #[cfg_attr(not(relax_check), lang = "format_argument")]
+    #[lang = "format_argument"]
     pub struct Argument<'a> {
         value: *const u8,
         formatter: fn(*const u8, &mut Formatter<'_>) -> Result,
@@ -168,7 +168,7 @@ pub mod rt {
 
 /// A precompiled format string and its arguments.
 #[derive(Copy, Clone)]
-#[cfg_attr(not(relax_check), lang = "format_arguments")]
+#[lang = "format_arguments"]
 pub struct Arguments<'a> {
     pieces: &'a [&'static str],
     /// None = every argument formatted with the default spec, in order
@@ -803,13 +803,11 @@ impl Debug for () {
     }
 }
 
-#[cfg(not(relax_check))]
 impl Debug for ! {
     fn fmt(&self, _f: &mut Formatter<'_>) -> Result {
         *self
     }
 }
-#[cfg(not(relax_check))]
 impl Display for ! {
     fn fmt(&self, _f: &mut Formatter<'_>) -> Result {
         *self

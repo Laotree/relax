@@ -78,9 +78,6 @@ mod group {
 
 #[cfg(target_arch = "x86_64")]
 mod group {
-    #[cfg(relax_check)]
-    use core::arch::x86_64::*;
-    #[cfg(not(relax_check))]
     use crate::arch::x86_64::*;
     pub(super) struct BitMask(u16);
     impl BitMask {
@@ -134,9 +131,6 @@ mod group {
 
 #[cfg(target_arch = "aarch64")]
 mod group {
-    #[cfg(relax_check)]
-    use core::arch::aarch64::*;
-    #[cfg(not(relax_check))]
     use crate::arch::aarch64::*;
     pub(super) struct BitMask(u64);
     impl BitMask {

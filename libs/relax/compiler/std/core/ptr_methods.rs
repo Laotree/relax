@@ -6,7 +6,6 @@
 use crate::cmp::Ordering;
 use crate::intrinsics_mem as im;
 
-#[cfg(not(relax_check))]
 impl<T: crate::marker::PointeeSized> *const T {
     #[rustc_diagnostic_item = "ptr_const_is_null"]
     pub const fn is_null(self) -> bool {
@@ -68,7 +67,6 @@ impl<T: crate::marker::PointeeSized> *const T {
     }
 }
 
-#[cfg(not(relax_check))]
 impl<T> *const T {
     pub const unsafe fn add(self, count: usize) -> *const T {
         im::ptr_add(self, count)
@@ -140,7 +138,6 @@ impl<T> *const T {
     }
 }
 
-#[cfg(not(relax_check))]
 impl<T> *const [T] {
     pub const fn len(self) -> usize {
         unsafe { im::slice_len(&*self) }
@@ -162,7 +159,6 @@ impl<T> *const [T] {
     }
 }
 
-#[cfg(not(relax_check))]
 impl<T: crate::marker::PointeeSized> *mut T {
     #[rustc_diagnostic_item = "ptr_is_null"]
     pub const fn is_null(self) -> bool {
@@ -240,7 +236,6 @@ impl<T: crate::marker::PointeeSized> *mut T {
     }
 }
 
-#[cfg(not(relax_check))]
 impl<T> *mut T {
     pub const unsafe fn add(self, count: usize) -> *mut T {
         im::ptr_add_mut(self, count)
@@ -313,7 +308,6 @@ impl<T> *mut T {
     }
 }
 
-#[cfg(not(relax_check))]
 impl<T> *mut [T] {
     pub const fn len(self) -> usize {
         unsafe { im::slice_len(&*self) }

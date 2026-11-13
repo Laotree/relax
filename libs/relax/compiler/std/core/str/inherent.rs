@@ -1,5 +1,4 @@
-//! `impl str` (Relax only: real core owns str's inherent methods). Each method forwards to
-//! the free fns in str/ and string.rs, which the rustc shim tests against real std.
+//! Relax's `impl str`. Each method forwards to the free fns in str/ and string.rs.
 
 use super::pattern::{DoubleEndedSearcher, Pattern, ReverseSearcher};
 use super::*;

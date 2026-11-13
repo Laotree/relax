@@ -4,7 +4,7 @@
 // held at the fork and never reached exec (makepad-app-aihub: GpuCache -> nvidia-smi with a
 // PR_SET_PDEATHSIG pre_exec, 2026-10-24). Every pre_exec closure here is a fresh instantiation
 // (not compiled before its fork) so that the child is where its code is first reached.
-// Lines starting with "| " must equal real std's (os_diff.sh / core_diff.sh). The file is kept
+// Lines starting with "| " must equal real std's (agree.sh). The file is kept
 // twice, byte-identical: here, for the std diff runners, and as tools/run/fixture/src/os_fork_busy.rs,
 // the `makepad run relax-fork-busy` program (fork_busy.rs, fork_busy.sh), so the fixture crate holds
 // no file from outside itself (tests copy it alone). fork_busy.sh fails when the two differ.
@@ -253,7 +253,7 @@ impl Probe for ParentCheck {
 /// code names): under the JIT the child ends before exec at the unbuilt fn, the spawn builds it
 /// and forks again -- the spawn succeeds as with real std, and never hangs.
 #[test]
-fn a02_pre_exec_through_a_vtable() {
+fn a05_pre_exec_through_a_vtable() {
     let o: &'static dyn Probe = Box::leak(Box::new(ParentCheck(std::env::args().count() as i32)));
     for round in 0..2 {
         let st = unsafe {

@@ -416,13 +416,13 @@ pub fn vget_high_u8(a: uint8x16_t) -> uint8x8_t {
     uint8x8_t(r)
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vget_lane_u32<const LANE: i32>(v: uint32x2_t) -> u32 {
     v.0[LANE as usize]
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vget_lane_u64<const LANE: i32>(v: uint64x1_t) -> u64 {
     v.0[LANE as usize]
@@ -472,7 +472,7 @@ pub fn vget_low_u8(a: uint8x16_t) -> uint8x8_t {
     uint8x8_t(r)
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vgetq_lane_u32<const LANE: i32>(v: uint32x4_t) -> u32 {
     v.0[LANE as usize]
@@ -567,7 +567,7 @@ pub fn vminq_s16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
     }
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(3))]
+#[rustc_legacy_const_generics(3)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vmlal_high_laneq_s16<const LANE: i32>(
     a: int32x4_t,
@@ -605,7 +605,7 @@ pub fn vmlal_high_u32(a: uint64x2_t, b: uint32x4_t, c: uint32x4_t) -> uint64x2_t
     uint64x2_t(r)
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(3))]
+#[rustc_legacy_const_generics(3)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vmlal_laneq_s16<const LANE: i32>(
     a: int32x4_t,
@@ -743,7 +743,7 @@ pub fn vqmovn_u16(a: uint16x8_t) -> uint8x8_t {
     }
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vqshlq_n_u32<const N: i32>(a: uint32x4_t) -> uint32x4_t {
     let mut r = [0; 4];
@@ -755,7 +755,7 @@ pub fn vqshlq_n_u32<const N: i32>(a: uint32x4_t) -> uint32x4_t {
     uint32x4_t(r)
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vqshrun_n_s32<const N: i32>(a: int32x4_t) -> uint16x4_t {
     let mut r = [0; 4];
@@ -778,7 +778,7 @@ pub fn vrev32q_u8(a: uint8x16_t) -> uint8x16_t {
     uint8x16_t(r)
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+#[rustc_legacy_const_generics(2)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vsetq_lane_u32<const LANE: i32>(a: u32, b: uint32x4_t) -> uint32x4_t {
     let mut r = b;
@@ -835,7 +835,7 @@ pub fn vsha1su1q_u32(tw0_3: uint32x4_t, w12_15: uint32x4_t) -> uint32x4_t {
     }
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vshlq_n_u32<const N: i32>(a: uint32x4_t) -> uint32x4_t {
@@ -844,7 +844,7 @@ pub fn vshlq_n_u32<const N: i32>(a: uint32x4_t) -> uint32x4_t {
     }
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vshrq_n_s16<const N: i32>(a: int16x8_t) -> int16x8_t {
@@ -853,7 +853,7 @@ pub fn vshrq_n_s16<const N: i32>(a: int16x8_t) -> int16x8_t {
     }
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vshrq_n_s32<const N: i32>(a: int32x4_t) -> int32x4_t {
@@ -1064,7 +1064,7 @@ pub fn vrax1q_u64(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
 
 /// XAR: (a ^ b) rotated right by IMM6, per lane.
 #[inline]
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+#[rustc_legacy_const_generics(2)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "sha3"))]
 pub fn vxarq_u64<const IMM6: i32>(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
     let r = IMM6 as u32;
@@ -2446,7 +2446,7 @@ pub fn vdivq_f64(a: float64x2_t, b: float64x2_t) -> float64x2_t {
     float64x2_t(r)
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vdupq_laneq_f32<const N: i32>(a: float32x4_t) -> float32x4_t {
     float32x4_t([a.0[N as usize]; 4])
@@ -2492,7 +2492,7 @@ pub fn vdupq_n_u64(value: u64) -> uint64x2_t {
     }
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vdups_laneq_f32<const N: i32>(a: float32x4_t) -> f32 {
     a.0[N as usize]
@@ -2583,7 +2583,7 @@ pub fn vfmaq_f64(a: float64x2_t, b: float64x2_t, c: float64x2_t) -> float64x2_t 
     float64x2_t(r)
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(3))]
+#[rustc_legacy_const_generics(3)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vfmaq_laneq_f32<const LANE: i32>(
     a: float32x4_t,
@@ -2599,7 +2599,7 @@ pub fn vfmaq_laneq_f32<const LANE: i32>(
     float32x4_t(r)
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(3))]
+#[rustc_legacy_const_generics(3)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vfmaq_laneq_f64<const LANE: i32>(
     a: float64x2_t,
@@ -2693,25 +2693,25 @@ pub fn vget_low_s8(a: int8x16_t) -> int8x8_t {
     int8x8_t(r)
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vgetq_lane_f32<const IMM5: i32>(v: float32x4_t) -> f32 {
     v.0[IMM5 as usize]
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vgetq_lane_f64<const IMM5: i32>(a: float64x2_t) -> f64 {
     a.0[IMM5 as usize]
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vgetq_lane_s64<const IMM5: i32>(v: int64x2_t) -> i64 {
     v.0[IMM5 as usize]
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vgetq_lane_u64<const IMM5: i32>(v: uint64x2_t) -> u64 {
     v.0[IMM5 as usize]
@@ -2750,7 +2750,7 @@ pub unsafe fn vld1q_f64(ptr: *const f64) -> float64x2_t {
     vx::vx_load(ptr as *const u8)
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+#[rustc_legacy_const_generics(2)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub unsafe fn vld1q_lane_f32<const LANE: i32>(ptr: *const f32, src: float32x4_t) -> float32x4_t {
     let mut r = src;
@@ -2758,7 +2758,7 @@ pub unsafe fn vld1q_lane_f32<const LANE: i32>(ptr: *const f32, src: float32x4_t)
     r
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+#[rustc_legacy_const_generics(2)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub unsafe fn vld1q_lane_f64<const LANE: i32>(ptr: *const f64, src: float64x2_t) -> float64x2_t {
     let mut r = src;
@@ -3234,7 +3234,7 @@ pub fn vmulq_f64(a: float64x2_t, b: float64x2_t) -> float64x2_t {
     float64x2_t(r)
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+#[rustc_legacy_const_generics(2)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vmulq_laneq_f32<const LANE: i32>(a: float32x4_t, b: float32x4_t) -> float32x4_t {
     let mut r = [0.0; 4];
@@ -3284,7 +3284,7 @@ pub fn vmulq_u32(a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
     }
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+#[rustc_legacy_const_generics(2)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vmuls_laneq_f32<const LANE: i32>(a: f32, b: float32x4_t) -> f32 {
     neon_mul_f32(a, b.0[LANE as usize])
@@ -3936,7 +3936,7 @@ pub fn vrndq_f64(a: float64x2_t) -> float64x2_t {
     float64x2_t(r)
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+#[rustc_legacy_const_generics(2)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vsetq_lane_f32<const LANE: i32>(a: f32, b: float32x4_t) -> float32x4_t {
     let mut r = b;
@@ -3944,7 +3944,7 @@ pub fn vsetq_lane_f32<const LANE: i32>(a: f32, b: float32x4_t) -> float32x4_t {
     r
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+#[rustc_legacy_const_generics(2)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vsetq_lane_u64<const LANE: i32>(a: u64, b: uint64x2_t) -> uint64x2_t {
     let mut r = b;
@@ -3952,7 +3952,7 @@ pub fn vsetq_lane_u64<const LANE: i32>(a: u64, b: uint64x2_t) -> uint64x2_t {
     r
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vshlq_n_s32<const N: i32>(a: int32x4_t) -> int32x4_t {
@@ -4137,7 +4137,7 @@ pub fn vshlq_u8(a: uint8x16_t, b: int8x16_t) -> uint8x16_t {
     uint8x16_t(r)
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vshrn_n_u16<const N: i32>(a: uint16x8_t) -> uint8x8_t {
     let mut r = [0; 8];
@@ -4149,7 +4149,7 @@ pub fn vshrn_n_u16<const N: i32>(a: uint16x8_t) -> uint8x8_t {
     uint8x8_t(r)
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vshrn_n_u64<const N: i32>(a: uint64x2_t) -> uint32x2_t {
     let mut r = [0; 2];
@@ -4161,7 +4161,7 @@ pub fn vshrn_n_u64<const N: i32>(a: uint64x2_t) -> uint32x2_t {
     uint32x2_t(r)
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vshrq_n_u32<const N: i32>(a: uint32x4_t) -> uint32x4_t {
@@ -4200,13 +4200,13 @@ pub unsafe fn vst1q_f64(ptr: *mut f64, a: float64x2_t) {
     vx::vx_store(ptr as *mut u8, a)
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+#[rustc_legacy_const_generics(2)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub unsafe fn vst1q_lane_f32<const LANE: i32>(a: *mut f32, b: float32x4_t) {
     crate::ptr::write_unaligned(a, b.0[LANE as usize]);
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+#[rustc_legacy_const_generics(2)]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub unsafe fn vst1q_lane_f64<const LANE: i32>(a: *mut f64, b: float64x2_t) {
     crate::ptr::write_unaligned(a, b.0[LANE as usize]);
@@ -5170,7 +5170,7 @@ pub fn vzip2q_s8(a: int8x16_t, b: int8x16_t) -> int8x16_t {
 
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 pub fn vshlq_n_s8<const N: i32>(a: int8x16_t) -> int8x16_t {
     unsafe {
         vx::vx_unary(a, 1, 8, N)
@@ -5179,7 +5179,7 @@ pub fn vshlq_n_s8<const N: i32>(a: int8x16_t) -> int8x16_t {
 
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 pub fn vshrq_n_s8<const N: i32>(a: int8x16_t) -> int8x16_t {
     unsafe {
         vx::vx_unary(a, 3, 8, N)
@@ -5202,7 +5202,7 @@ pub fn vbicq_s16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
 
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 pub fn vshlq_n_s16<const N: i32>(a: int16x8_t) -> int16x8_t {
     unsafe {
         vx::vx_unary(a, 1, 16, N)
@@ -5259,7 +5259,7 @@ pub fn vzip2q_s64(a: int64x2_t, b: int64x2_t) -> int64x2_t {
 
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 pub fn vshlq_n_s64<const N: i32>(a: int64x2_t) -> int64x2_t {
     unsafe {
         vx::vx_unary(a, 1, 64, N)
@@ -5268,7 +5268,7 @@ pub fn vshlq_n_s64<const N: i32>(a: int64x2_t) -> int64x2_t {
 
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 pub fn vshrq_n_s64<const N: i32>(a: int64x2_t) -> int64x2_t {
     unsafe {
         vx::vx_unary(a, 3, 64, N)
@@ -5313,7 +5313,7 @@ pub fn vzip2q_u8(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
 
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 pub fn vshlq_n_u8<const N: i32>(a: uint8x16_t) -> uint8x16_t {
     unsafe {
         vx::vx_unary(a, 1, 8, N)
@@ -5322,7 +5322,7 @@ pub fn vshlq_n_u8<const N: i32>(a: uint8x16_t) -> uint8x16_t {
 
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 pub fn vshrq_n_u8<const N: i32>(a: uint8x16_t) -> uint8x16_t {
     unsafe {
         vx::vx_unary(a, 2, 8, N)
@@ -5332,7 +5332,7 @@ pub fn vshrq_n_u8<const N: i32>(a: uint8x16_t) -> uint8x16_t {
 /// vsri: shift right and insert. Each lane of `b` shifted right by N (1..=8) replaces all but the
 /// top N bits of `a`'s lane; N = 8 keeps `a` whole.
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+#[rustc_legacy_const_generics(2)]
 pub fn vsriq_n_u8<const N: i32>(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
     let n = N as u32;
     let low = if n >= 8 { 0 } else { 0xffu8 >> n };
@@ -5371,7 +5371,7 @@ pub fn vzip2q_u16(a: uint16x8_t, b: uint16x8_t) -> uint16x8_t {
 
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 pub fn vshlq_n_u16<const N: i32>(a: uint16x8_t) -> uint16x8_t {
     unsafe {
         vx::vx_unary(a, 1, 16, N)
@@ -5380,7 +5380,7 @@ pub fn vshlq_n_u16<const N: i32>(a: uint16x8_t) -> uint16x8_t {
 
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 pub fn vshrq_n_u16<const N: i32>(a: uint16x8_t) -> uint16x8_t {
     unsafe {
         vx::vx_unary(a, 2, 16, N)
@@ -5427,7 +5427,7 @@ pub fn vzip1q_u64(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
 
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 pub fn vshlq_n_u64<const N: i32>(a: uint64x2_t) -> uint64x2_t {
     unsafe {
         vx::vx_unary(a, 1, 64, N)
@@ -5436,7 +5436,7 @@ pub fn vshlq_n_u64<const N: i32>(a: uint64x2_t) -> uint64x2_t {
 
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+#[rustc_legacy_const_generics(1)]
 pub fn vshrq_n_u64<const N: i32>(a: uint64x2_t) -> uint64x2_t {
     unsafe {
         vx::vx_unary(a, 2, 64, N)
@@ -5557,7 +5557,7 @@ macro_rules! neon_ext {
     ($feat:literal: $($name:ident $v:ident $l:literal);* $(;)?) => {$(
         #[inline]
         #[cfg_attr(target_arch = "aarch64", target_feature(enable = $feat))]
-        #[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+        #[rustc_legacy_const_generics(2)]
         pub fn $name<const N: i32>(a: $v, b: $v) -> $v {
             let n = N as usize;
             let mut r = a;
@@ -5605,7 +5605,7 @@ macro_rules! neon_ld1_lane {
     ($feat:literal: $($name:ident $e:ident $v:ident);* $(;)?) => {$(
         #[inline]
         #[cfg_attr(target_arch = "aarch64", target_feature(enable = $feat))]
-        #[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+        #[rustc_legacy_const_generics(2)]
         pub unsafe fn $name<const LANE: i32>(ptr: *const $e, src: $v) -> $v {
             let mut r = src;
             r.0[LANE as usize] = ptr.read_unaligned();
@@ -5618,7 +5618,7 @@ macro_rules! neon_st1_lane {
     ($feat:literal: $($name:ident $e:ident $v:ident);* $(;)?) => {$(
         #[inline]
         #[cfg_attr(target_arch = "aarch64", target_feature(enable = $feat))]
-        #[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+        #[rustc_legacy_const_generics(2)]
         pub unsafe fn $name<const LANE: i32>(ptr: *mut $e, a: $v) {
             ptr.write_unaligned(a.0[LANE as usize])
         }
@@ -5718,7 +5718,7 @@ macro_rules! neon_get_lane {
     ($feat:literal: $($name:ident $e:ident $v:ident);* $(;)?) => {$(
         #[inline]
         #[cfg_attr(target_arch = "aarch64", target_feature(enable = $feat))]
-        #[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+        #[rustc_legacy_const_generics(1)]
         pub fn $name<const IMM5: i32>(v: $v) -> $e {
             v.0[IMM5 as usize]
         }
@@ -5729,7 +5729,7 @@ macro_rules! neon_set_lane {
     ($feat:literal: $($name:ident $e:ident $v:ident);* $(;)?) => {$(
         #[inline]
         #[cfg_attr(target_arch = "aarch64", target_feature(enable = $feat))]
-        #[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+        #[rustc_legacy_const_generics(2)]
         pub fn $name<const LANE: i32>(a: $e, b: $v) -> $v {
             let mut r = b;
             r.0[LANE as usize] = a;
@@ -5911,7 +5911,7 @@ macro_rules! neon_shl_n {
     ($feat:literal: $($name:ident $e:ident $v:ident);* $(;)?) => {$(
         #[inline]
         #[cfg_attr(target_arch = "aarch64", target_feature(enable = $feat))]
-        #[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+        #[rustc_legacy_const_generics(1)]
         pub fn $name<const N: i32>(a: $v) -> $v {
             unsafe {
                 simd::simd_shl(a, simd::simd_splat::<$v, $e>(N as $e))
@@ -5925,7 +5925,7 @@ macro_rules! neon_shr_n_signed {
     ($feat:literal: $($name:ident $e:ident $v:ident);* $(;)?) => {$(
         #[inline]
         #[cfg_attr(target_arch = "aarch64", target_feature(enable = $feat))]
-        #[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+        #[rustc_legacy_const_generics(1)]
         pub fn $name<const N: i32>(a: $v) -> $v {
             unsafe {
                 let n = if N as u32 >= $e::BITS { $e::BITS - 1 } else { N as u32 };
@@ -5940,7 +5940,7 @@ macro_rules! neon_shr_n_unsigned {
     ($feat:literal: $($name:ident $e:ident $v:ident);* $(;)?) => {$(
         #[inline]
         #[cfg_attr(target_arch = "aarch64", target_feature(enable = $feat))]
-        #[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+        #[rustc_legacy_const_generics(1)]
         pub fn $name<const N: i32>(a: $v) -> $v {
             unsafe {
                 if N as u32 >= $e::BITS {
@@ -5957,7 +5957,7 @@ macro_rules! neon_shll_n {
     ($feat:literal: $($name:ident $v:ident $we:ident $w:ident);* $(;)?) => {$(
         #[inline]
         #[cfg_attr(target_arch = "aarch64", target_feature(enable = $feat))]
-        #[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+        #[rustc_legacy_const_generics(1)]
         pub fn $name<const N: i32>(a: $v) -> $w {
             unsafe {
                 simd::simd_shl(simd::simd_cast::<$v, $w>(a), simd::simd_splat::<$w, $we>(N as $we))
@@ -5971,7 +5971,7 @@ macro_rules! neon_shrn_n {
     ($feat:literal: $($name:ident $e:ident $v:ident $n:ident);* $(;)?) => {$(
         #[inline]
         #[cfg_attr(target_arch = "aarch64", target_feature(enable = $feat))]
-        #[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+        #[rustc_legacy_const_generics(1)]
         pub fn $name<const N: i32>(a: $v) -> $n {
             unsafe {
                 simd::simd_cast::<$v, $n>(simd::simd_shr(a, simd::simd_splat::<$v, $e>(N as $e)))
