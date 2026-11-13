@@ -653,6 +653,81 @@ fn main() {}
     std::mem::forget(u);
 }
 
+/// A quit write's pass stays valid on its own: the exit's write may be skipped (the owner thread
+/// held past its wait, a harness's kill after the quit), and the next launch links what the pass
+/// wrote rather than build it again.
+#[test]
+fn the_next_launch_links_what_a_quit_writes_pass_stored_without_the_exits_write() {
+    const CHILD: &str = "RELAX_QUIT_PASS_TEST";
+    const DIR: &str = "RELAX_QUIT_PASS_TEST_DIR";
+    let Ok(phase) = std::env::var(CHILD) else {
+        let dir = std::env::temp_dir().join(format!("relax-quit-pass-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("input.rs"), r#"
+pub fn hot(out: &mut u32) {
+    let mut i = 0u32;
+    let mut sum = 0u32;
+    while i < 200 { sum = sum.wrapping_add(i); i += 1; }
+    *out = sum;
+}
+fn main() {}
+"#).unwrap();
+        for phase in ["quit", "next"] {
+            let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "jit::settle_tests::the_next_launch_links_what_a_quit_writes_pass_stored_without_the_exits_write", "--nocapture", "--test-threads=1"])
+                .env(CHILD, phase).env(DIR, &dir).env("RELAX_SPEC", "0"));
+            assert!(output.status.success(), "{phase}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        return;
+    };
+    crate::borrowck::lazy::disable_gandalf();
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::path::PathBuf::from(std::env::var_os(DIR).unwrap());
+    std::env::set_var("RELAX_CACHE_DIR", dir.join("cache"));
+    let session = std::sync::Arc::new(crate::Session::default());
+    let (prog, core, krate) = crate::load_with_std(&session, dir.join("input.rs").to_str().unwrap(), "quit_pass", false).unwrap();
+    let def = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = DefId(i as u32);
+        (d.krate == krate && prog.name(id) == "hot").then_some(id)
+    }).unwrap();
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    let (id, entry) = crate::owner::call(crate::owner::Class::Program, || {
+        let id = u.fn_id(FnKey::Inst(def, Vec::new()));
+        let mut cache = crate::cache::Cache::open(&u, crate::cache::Mode::ReadOnly).unwrap();
+        cache.mode = crate::cache::Mode::On;
+        u.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
+        if phase == "quit" {
+            let built = unsafe { compile_fn(up, id) }.unwrap();
+            let entry = u.install(id, &built.0, &built.2, built.1.clone(), 0).unwrap();
+            let mut cache = u.cache.take().unwrap();
+            cache.record_o2(&u, id, &built.0, &built.2, &built.1);
+            u.cache = Some(cache);
+            (id, entry)
+        } else {
+            let entry = unsafe { ready_code_locked(up, id) }.expect("the next launch links the quit write's code");
+            assert!(u.cache.as_ref().unwrap().stats.hits >= 1, "the code came from the quit write's store, not a build");
+            (id, entry)
+        }
+    });
+    if phase == "quit" {
+        // the quit write's pass, and no exit write after it (the process ends here)
+        let written = unsafe { crate::run::quit_write_pass(up) };
+        assert!(matches!(written, Some((n, _)) if n > 0), "the quit write's pass stored nothing: {written:?}");
+    }
+    let _ = id;
+    let mut result = 0u32;
+    unsafe { call_jit(up, entry, &mut result as *mut u32 as u64) }
+        .unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+    assert_eq!(result, 19900);
+    // As in the settling fixture, process exit owns the runtime's teardown.
+    std::mem::forget(u);
+}
+
 #[test]
 fn prebuild_link_needing_initializer_bails() {
     // Rule I-PUB (a remote-XR app on a node: "O3 build of slot N panicked: initializer inside a

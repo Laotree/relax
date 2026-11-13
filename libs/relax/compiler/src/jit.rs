@@ -18335,6 +18335,14 @@ pub(crate) fn stop_compiling() {
     tier_wake_all();
 }
 
+/// The run quits (run.rs quit_mark): no O3 build starts, and the compiles queued and not started
+/// are dropped (queue::quit); the builds running finish, their code stored by the exit's write.
+/// Returns how many queued compiles were dropped.
+pub(crate) fn quit_compiles() -> usize {
+    TIER_STOP.store(true, Ordering::SeqCst);
+    queue::quit()
+}
+
 /// The compile queue's workers leave (`run_end`): returns once none is in a job, saying every
 /// `report` which jobs it waits for.
 pub(crate) fn stop_queue_workers(report: std::time::Duration) {

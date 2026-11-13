@@ -54,8 +54,10 @@ pub fn start(up: *mut Unit, root: u32, main: Option<DefId>) {
     if spawned.is_err() { RUNNING.store(false, Ordering::Release); }
 }
 
+/// The run stops, or quits: a crate's verdict is stored only once all of it is checked, and the
+/// next launch checks what this one left
 fn stopping() -> bool {
-    crate::preempt::is_stopped() || crate::owner::exit_tid() != 0
+    crate::preempt::is_stopped() || crate::owner::exit_tid() != 0 || crate::jit::QUIT_SEEN.load(Ordering::Relaxed)
 }
 
 /// The crates this check covers -- not the app's (checked before main), not a proc-macro crate,

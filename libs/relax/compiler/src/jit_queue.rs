@@ -104,11 +104,14 @@ pub(super) struct Queue {
     timer: Option<std::thread::ThreadId>,
     /// AHEAD_INBOX's other buffer (its entries move in without a new allocation per move)
     inbox: Vec<(Arc<FrontShared>, AheadWork, u64)>,
+    /// the run quits (`quit`): no check or lowering ahead, O2 or speculative build nobody waits for
+    /// is queued
+    quitting: bool,
 }
 impl Queue {
     fn new() -> Self {
         Self { entries: Vec::new(), running: Vec::new(), serial: 0, waiters: HashMap::default(), plan: std::array::from_fn(|_| std::array::from_fn(|_| BTreeSet::new())), indices: HashMap::default(), by_slot: HashMap::default(), refresh_cursor: 0, ahead_class: budget::BACKGROUND, ahead_len: 0,
-            tick_at: Instant::now(), tick_queued: false, timer: None, inbox: Vec::new() }
+            tick_at: Instant::now(), tick_queued: false, timer: None, inbox: Vec::new(), quitting: false }
     }
     /// Queues `job`; returns whether it can start now.
     pub(super) fn push(&mut self, job: Job, at: u64) -> bool {
@@ -119,6 +122,8 @@ impl Queue {
         let now = HeatNow::take();
         let slot = job.slot();
         let wanted = slot.and_then(|slot| self.wanted(slot));
+        // the run quits: a compile nobody waits for is speculative (`quit`)
+        if wanted.is_none() && self.quitting && quit_drops(job.tier()) { return false; }
         let promoted = wanted.is_some();
         let class = if job.tier() == 0 { budget::BACKGROUND } else { job_class(&job, &now) };
         let class = wanted.map_or(class, |w| w.min(self.bucket_class(job.tier(), class)));
@@ -595,6 +600,35 @@ pub(super) fn wake_all() {
 /// This process is a plain fork's child (jit::fork_child): it has no workers, and a parent's worker
 /// may have held the queue's lock or inbox at the fork, held for good there: nothing is queued.
 static FORKED: AtomicBool = AtomicBool::new(false);
+/// The run quits (`quit`): ahead work found from now on is not queued (Queue::quitting decides,
+/// under the lock; this spares the inbox and the workers' wake).
+static QUITTING: AtomicBool = AtomicBool::new(false);
+/// A queued job of `tier` the quit drops: checks and lowering ahead, O2 and speculative builds.
+fn quit_drops(tier: usize) -> bool {
+    matches!(tier, 0 | 1 | 3)
+}
+/// The run quits (run.rs quit_mark): the compiles queued and not started -- checks and lowering
+/// ahead, O2 and speculative builds -- are dropped, unless a thread waits for one: they are
+/// speculative, and the next launch asks again. None is queued from now on. The O3 tier-ups were
+/// stopped (TIER_STOP) and stay queued, for the exit to record their verdicts
+/// (record_queued_at_exit); the checks beside the program and the tick go on. In batches, the
+/// queue's lock held for one at a time (a lazy compile of the app's shutdown may queue behind
+/// it). Returns how many were dropped.
+pub(super) fn quit() -> usize {
+    QUITTING.store(true, Ordering::SeqCst);
+    if FORKED.load(Ordering::Relaxed) { return 0; }
+    let _kept = crate::zone_alloc::kept();
+    let serials = lock().quit();
+    let mut dropped = 0;
+    for batch in serials.chunks(QUIT_DROP_BATCH) {
+        // (the entries go after the lock is given back)
+        let gone = lock().quit_drop(batch);
+        dropped += gone.len();
+    }
+    dropped
+}
+/// `quit`'s entries dropped per hold of the queue's lock.
+const QUIT_DROP_BATCH: usize = 1024;
 #[cfg(unix)]
 pub(super) fn fork_child() {
     FORKED.store(true, Ordering::SeqCst);
@@ -629,7 +663,8 @@ static AHEAD_PENDING: AtomicBool = AtomicBool::new(false);
 /// width (STARTUP_AHEAD; a running check takes the next itself when it ends). Ahead work blocked
 /// otherwise starts when the startup's phases change (they wake the workers).
 fn push_ahead(front: &Arc<FrontShared>, work: impl Iterator<Item = AheadWork>) {
-    if FORKED.load(Ordering::Relaxed) { return; }
+    // (the run quits: nothing is checked or lowered ahead any more, `quit`)
+    if FORKED.load(Ordering::Relaxed) || QUITTING.load(Ordering::Relaxed) { return; }
     // A producer can finish discovering work after the settle rebuild retired its front.
     if !front.alive.load(Ordering::Acquire) { return; }
     let at = wall_ns();
@@ -715,6 +750,20 @@ pub(super) fn retain(mut keep: impl FnMut(&Job) -> bool) {
     }
 }
 impl Queue {
+    /// The run quits (`quit`): nothing it drops is queued from now on; the queued entries it drops.
+    fn quit(&mut self) -> Vec<u64> {
+        self.quitting = true;
+        self.entries.iter().filter(|e| quit_drops(e.job.tier()) && !e.promoted).map(|e| e.serial).collect()
+    }
+    /// `serials`' entries out of the queue, but one a worker took since or a thread came to wait for.
+    fn quit_drop(&mut self, serials: &[u64]) -> Vec<Entry> {
+        let mut gone = Vec::with_capacity(serials.len());
+        for serial in serials {
+            let Some(&i) = self.indices.get(serial) else { continue };
+            if !self.entries[i].promoted { gone.push(self.remove(i)); }
+        }
+        gone
+    }
     fn drop_tiers(&mut self, gone: &std::collections::HashSet<TierEntry>) {
         let mut i = 0;
         while i < self.entries.len() {
@@ -1192,6 +1241,42 @@ mod tests {
         assert!(q.head(&now, Takes::NoTierUps).is_none(), "the tier-up waits for an idle worker");
         assert!(q.first().is_some(), "which some worker may start: one of the other kind is woken");
     }
+
+    /// At the quit the compiles queued and not started go, but one a thread waits for; the O3
+    /// tier-ups stay queued (stopped: the exit records their verdicts), and nothing new nobody
+    /// waits for is queued after it.
+    #[test]
+    fn a_quit_drops_the_queued_compiles_nobody_waits_for() {
+        let mut q = Queue::new();
+        let front = Arc::new(FrontShared::new(&Arc::new(crate::Session::default())));
+        front.alive.store(true, Ordering::Release);
+        q.push(Job::Ahead(front.clone(), AheadWork::Slot(30)), 1);
+        q.push(Job::O2(1, 31, O2Kind::Normal), 2);
+        q.push(Job::Spec(1, 32), 3);
+        q.push(Job::O2(1, 33, O2Kind::Normal), 4);
+        q.push(Job::O3((34, 0, 0, 0)), 5);
+        q.push(Job::Tick, 6);
+        q.waiters.insert((1, 33), [1, 0]);
+        q.promote(1, 33);
+        let serials = q.quit();
+        // (a worker takes one of them before its batch is dropped)
+        let taken = q.indices[&serials[0]];
+        q.remove(taken);
+        let gone = q.quit_drop(&serials);
+        assert_eq!(gone.len(), 2, "the queued checks ahead, O2 and speculative builds nobody waits for are dropped, once");
+        let left: Vec<usize> = q.entries.iter().map(|e| e.job.tier()).collect();
+        assert_eq!(left.len(), 3, "the waited-for O2 build, the O3 tier-up and the tick stay: {left:?}");
+        assert!(q.entries.iter().any(|e| e.job.slot() == Some((1, 33))), "a compile a thread waits for stays queued");
+        assert!(q.entries.iter().any(|e| matches!(e.job, Job::O3(..))), "a queued O3 tier-up stays for the exit's verdicts");
+        assert_eq!(q.ahead_len, 0, "the dropped check ahead leaves the bucket accounting balanced");
+        q.push(Job::O2(1, 35, O2Kind::Normal), 7);
+        q.push(Job::Spec(1, 36), 8);
+        q.push(Job::Ahead(front, AheadWork::Slot(37)), 9);
+        assert_eq!(q.entries.len(), 3, "after the quit nothing nobody waits for is queued");
+        q.waiters.insert((1, 38), [1, 0]);
+        q.push(Job::O2(1, 38, O2Kind::Normal), 10);
+        assert_eq!(q.entries.len(), 4, "a compile a thread waits for is still queued");
+    }
 }
 
 static LOOKS_GONE: AtomicBool = AtomicBool::new(false);
@@ -1250,4 +1335,5 @@ pub(crate) unsafe fn reset_statics() {
     reset(&AHEAD_INBOX, relax_session::sync::Mutex::new(Vec::new()));
     reset(&AHEAD_PENDING, AtomicBool::new(false));
     reset(&LOOKS_GONE, AtomicBool::new(false));
+    reset(&QUITTING, AtomicBool::new(false));
 }

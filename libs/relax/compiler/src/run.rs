@@ -3732,9 +3732,10 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 // at most every SETTLE_DROP_EVERY_NS (a request goes at once): each pass scans every
                 // slot, and an O3 tail bumped the generation with every install. The pass runs in
                 // steps, each its own owner request (jit::SettleSweep): the owner serves a waiting
-                // main-thread request between two of them
+                // main-thread request between two of them. None once the run quits: the process
+                // gives its memory back as it ends, and the app's shutdown has the owner
                 let now_ns = jit::wall_ns();
-                let settled_d = if (FIRST_PRESENT_WALL.load(Ordering::Acquire) != 0 || reclaim_requested)
+                let settled_d = if !jit::QUIT_SEEN.load(Ordering::Relaxed) && (FIRST_PRESENT_WALL.load(Ordering::Acquire) != 0 || reclaim_requested)
                     && (reclaimed != Some(n) && now_ns.saturating_sub(last_drop_ns) >= SETTLE_DROP_EVERY_NS || reclaim_requested) {
                     last_drop_ns = now_ns;
                     let _s = crate::inspect::timeline::span("run-monitor settle sweep");
@@ -4040,6 +4041,19 @@ fn finish_run(why: &'static str, code: Option<i32>) {
     // ending on the owner thread itself (an initializer's process::exit): it cannot serve the
     // exit worker while it waits for it
     EXIT_CALLER_HOLDS.store(crate::owner::is_owner(), Ordering::SeqCst);
+    // the quit write ends before the exit stops the keys and takes the owner thread: the window is
+    // gone and the app's shutdown compiles are over, so what its passes gave way to them for (the
+    // whole session's manifest -- at exit no slot key can be made, and the exit keeps the manifest
+    // it has -- and the crate records) is written now, not dropped, and no pass of it runs beside
+    // the exit's write (the hang guard of the exit's write below; not by the thread the owner serves)
+    if QUIT_WRITE_RUNNING.load(Ordering::SeqCst) && !exit_caller_holds_owner() {
+        QUIT_WRITE_FINISHING.store(true, Ordering::SeqCst);
+        let start = Instant::now();
+        while QUIT_WRITE_RUNNING.load(Ordering::SeqCst) && start.elapsed().as_secs() < 30 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        verbose!("relax quit: the quit write's last passes before the exit took {:.1} ms", start.elapsed().as_secs_f64() * 1e3);
+    }
     jit::begin_exit();
     jit::solver_work_report_at_exit();
     // a JIT thread that panicked during the run is said once more at its end (inspect threads has the rows)
@@ -4175,6 +4189,12 @@ fn drop_program_memos() -> bool {
 static MID_COLLECTED_TRIED: AtomicBool = AtomicBool::new(false);
 /// A mid-run write recorded the startup manifest (its window had closed).
 static MID_MANIFEST_DONE: AtomicBool = AtomicBool::new(false);
+/// Mid-run writes that gave the owner back to a waiting request before they were whole (their
+/// manifest, crate records or collected program): a quit write's pass that saw one passes again.
+static MID_YIELDS: AtomicU64 = AtomicU64::new(0);
+fn mid_yielded() {
+    MID_YIELDS.fetch_add(1, Ordering::Relaxed);
+}
 /// The manifest's slot count when a mid-run write last recorded it: the quit write records it
 /// again with the session's later installs
 static MID_MANIFEST_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -4246,6 +4266,17 @@ static QUIT_WRITE_DONE: AtomicBool = AtomicBool::new(false);
 pub fn quit_write_done() -> bool {
     QUIT_WRITE_DONE.load(Ordering::SeqCst)
 }
+/// The quit write's thread runs: finish_run lets it end before the exit's own write (a pass of it
+/// beside the exit's write held what the exit needed until the exit's hang guard ended the process).
+static QUIT_WRITE_RUNNING: AtomicBool = AtomicBool::new(false);
+/// finish_run waits for the quit write: its passes come back to back, and the first whole one is
+/// its last.
+static QUIT_WRITE_FINISHING: AtomicBool = AtomicBool::new(false);
+/// Ends QUIT_WRITE_RUNNING when the quit write's thread ends, however it ends.
+struct QuitWriteEnds;
+impl Drop for QuitWriteEnds {
+    fn drop(&mut self) { QUIT_WRITE_RUNNING.store(false, Ordering::SeqCst); }
+}
 
 static ONCE: AtomicBool = AtomicBool::new(false);
 
@@ -4260,17 +4291,32 @@ fn quit_mark() {
         jit::ORDER_UNTIL_NS.fetch_min(jit::wall_ns(), Ordering::Relaxed);
     }
     { let _k = crate::zone_alloc::kept();
-    let _ = crate::run_threads::spawn("run-quit-write", || { let _z = crate::zone_alloc::compiler_thread();
+    QUIT_WRITE_RUNNING.store(true, Ordering::SeqCst);
+    let spawned = crate::run_threads::spawn("run-quit-write", || { let _ends = QuitWriteEnds; let _z = crate::zone_alloc::compiler_thread();
         let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
         let t = Instant::now();
-        // the owner thread is busy while the app's shutdown compiles: retried until it is written
-        // (no time cap: the session's final code must reach the cache; the exit ends this thread)
+        // the compiles queued and not started go (here, not on the thread that quits: the drop
+        // takes the queue's lock in batches)
+        let dropped = jit::quit_compiles();
+        verbose!("relax quit: {} queued compiles dropped in {:.1} ms", dropped, t.elapsed().as_secs_f64() * 1e3);
+        // the owner thread is busy while the app's shutdown compiles, and the write gives it back
+        // to each of them (mid_flush): retried until a pass is whole (no time cap: the session's
+        // final code must reach the cache; once the window is gone finish_run waits for this
+        // thread to end, its next whole pass the last, before the exit's write does the rest)
         let mut r = None;
         loop {
-            r = mid_flush(true, true).or(r);
-            if r.is_some() && (COLLECTED_CURRENT.load(Ordering::Relaxed) || MID_COLLECTED_TRIED.load(Ordering::Relaxed)) { break; }
-            // written, the collected program still waiting for the front-end lock: retried less often
-            std::thread::sleep(std::time::Duration::from_millis(if r.is_some() { 100 } else { 10 }));
+            // (the exit's write does the rest)
+            if EXIT_STAGE.load(Ordering::SeqCst) != 0 { break; }
+            let yields = MID_YIELDS.load(Ordering::Relaxed);
+            let pass = mid_flush(true, true);
+            r = pass.or(r);
+            let whole = MID_YIELDS.load(Ordering::Relaxed) == yields;
+            if whole && (QUIT_WRITE_FINISHING.load(Ordering::SeqCst)
+                || r.is_some() && (COLLECTED_CURRENT.load(Ordering::Relaxed) || MID_COLLECTED_TRIED.load(Ordering::Relaxed))) { break; }
+            // written, a part of it or the collected program still waiting: retried less often,
+            // and at once while the exit waits for it
+            let ms = if QUIT_WRITE_FINISHING.load(Ordering::SeqCst) { 1 } else if r.is_some() { 100 } else { 10 };
+            std::thread::sleep(std::time::Duration::from_millis(ms));
         }
         // the generations the write replaced go now: the exit summary may never run (a harness
         // kills the app, a framework ends the process)
@@ -4281,7 +4327,18 @@ fn quit_mark() {
         crate::cache::write_trace();
         QUIT_WRITE_DONE.store(true, Ordering::SeqCst);
     });
+    if spawned.is_err() { QUIT_WRITE_RUNNING.store(false, Ordering::SeqCst); }
     }
+}
+
+/// (tests) One pass of the quit write over unit `up`, as quit_mark's thread runs it: the entries
+/// and front images it wrote.
+#[cfg(test)]
+pub(crate) unsafe fn quit_write_pass(up: *mut Unit) -> Option<(usize, usize)> {
+    RUN_UNIT = up;
+    let r = mid_flush(true, true);
+    RUN_UNIT = std::ptr::null_mut();
+    r
 }
 
 /// `__relax_self_spawn` (Relax std process.rs, before a spawn or an exec that runs this program
@@ -4507,9 +4564,10 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
             if let Some(c) = cache.as_mut() {
                 // a waiting request (a frame's lazy compile, a live patch, a back end's Job) goes
                 // first: the manifest is made again by a later write
-                let stop = || { probe.tick("manifest"); crate::owner::request_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed) };
+                let stop = || { probe.tick("manifest"); crate::owner::request_waiting() };
                 if !c.record_manifest(u, crate::layout::root_crate(), &order, present, &stop) {
                     MID_MANIFEST_DONE.store(false, Ordering::Relaxed);
+                    mid_yielded();
                     verbose!("relax cache: startup manifest yielded to a waiting request; retried later");
                 }
             }
@@ -4531,21 +4589,22 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
             parts[1] = held.elapsed().as_secs_f64() * 1e3;
             yield_section("crate records");
             probe.tick("front images");
-            let stop = || { probe.tick("crate records"); crate::owner::request_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed) };
+            let stop = || { probe.tick("crate records"); crate::owner::request_waiting() };
             let complete = c.record_front_crates_until(&u.prog, &stop);
             parts[2] = held.elapsed().as_secs_f64() * 1e3;
             yield_section("spill take");
             probe.tick("crate records");
             // (the collected program is recorded once every crate's record is: a later write
             // records the rest)
-            if complete { imaged_files = u.prog.files.len(); } else { crates_left = true; }
+            if complete { imaged_files = u.prog.files.len(); } else { crates_left = true; mid_yielded(); }
         }
         let s = c.spill_take();
         probe.tick("spill take");
         s
     };
+    yield_section("");
     Some((held, spill))
-    }) else { return None };
+    }) else { yield_section(""); return None };
     probe.report("mid write");
     let held1 = held.elapsed().as_secs_f64() * 1e3;
     let n = match spill {
@@ -4585,10 +4644,10 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
             let t = Instant::now();
             // asked at each step and through the encode: a waiting request (a frame's lazy
             // compile, a live patch, a back end's Job) goes first, and a later pass tries again
-            let stop = || { cprobe.tick("collected"); crate::owner::request_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed) };
+            let stop = || { cprobe.tick("collected"); crate::owner::request_waiting() };
             // the front-end lock: for at most 50 ms, and not while a request waits for the owner
             // thread this holds
-            let front = if jit::QUIT_SEEN.load(Ordering::Relaxed) { jit::front_write_within(1000) } else {
+            let front = {
                 let t = Instant::now();
                 loop {
                     if let Some(g) = jit::front_write_within(1) { break Some(g); }
@@ -4603,7 +4662,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
                 // taken now, under the locks, so the record can be made in this pass (their store
                 // write runs after the owner thread is released, before the record's commit)
                 if wait && u.prog.files.len() != imaged_files && front_recordable() {
-                    if stop() { crates_left = true; } else if let Some(c) = u.cache.as_mut() {
+                    if stop() { crates_left = true; mid_yielded(); } else if let Some(c) = u.cache.as_mut() {
                         push_front_images(&u.prog, c);
                         crates_left = !c.record_front_crates_until(&u.prog, &stop);
                         late_spill = c.spill_take();
@@ -4617,12 +4676,13 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
                     match c.encode_collected(&u.prog, &u.tcx, &stop) {
                         crate::cache::CollectedRecord::Ready(dest, payload) => { MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); ready = Some((u.prog.session.options.verbose.then_some(c.collected_crates(&u.prog)), dest, payload)); }
                         crate::cache::CollectedRecord::Current => { MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); COLLECTED_CURRENT.store(true, Ordering::Relaxed); retired_boot = Some(c.finish_collected()); }
-                        crate::cache::CollectedRecord::Yielded => verbose!("relax collected: record yielded to a waiting request after {:.1} ms; retried later", t.elapsed().as_secs_f64() * 1e3),
+                        crate::cache::CollectedRecord::Yielded => { mid_yielded(); verbose!("relax collected: record yielded to a waiting request after {:.1} ms; retried later", t.elapsed().as_secs_f64() * 1e3); }
                         crate::cache::CollectedRecord::Failed => MID_COLLECTED_TRIED.store(true, Ordering::Relaxed),
                     }
                 }
             }
             cprobe.tick("collected end");
+            yield_section("");
             (ready, retired_boot, late_spill, t)
         }) {
             cprobe.report("collected record");
@@ -4695,6 +4755,13 @@ fn summary_inner(why: &str) {
             verbose!("relax: {}: waited {:.1} ms for the owner thread (serving {})", why, t_wait.elapsed().as_secs_f64() * 1e3, holder);
         }
         if why != "stats" { exit_mark("quiesce"); jit::tier1_stats_report(); }
+        if !got && why != "stats" {
+            // never silent: what the earlier writes (the quit write's passes) stored stays valid on
+            // its own, and the next launch loads it; only what came after them is cold
+            let section = *YIELD_SECTION.lock().unwrap_or_else(|e| e.into_inner());
+            eprintln!("relax: {}: the exit's cache write is skipped: the owner thread was held past {} ms by {}{}, {:.0} ms so far; the next launch loads what earlier writes stored",
+                why, exit_quiesce_ms(), crate::owner::serving_detail(), if section.is_empty() { String::new() } else { format!(" (a cache write's section `{section}`)") }, crate::owner::serving_ns() as f64 / 1e6);
+        }
         if !got {
             verbose!("relax: {}: no summary -- the owner thread is still serving {}", why, crate::owner::serving_note());
             return false;
@@ -5271,6 +5338,8 @@ pub(crate) unsafe fn reset_statics() {
     reset(&MID_CACHE_DIR, relax_session::sync::Mutex::new(None));
     reset(&MAIN_START_WALL, AtomicU64::new(0));
     reset(&QUIT_WRITE_DONE, AtomicBool::new(false));
+    reset(&QUIT_WRITE_RUNNING, AtomicBool::new(false));
+    reset(&QUIT_WRITE_FINISHING, AtomicBool::new(false));
     reset(&ONCE, AtomicBool::new(false));
     reset(&LAST, relax_session::sync::Mutex::new(""));
     reset(&FRONT_REPORTED, AtomicBool::new(false));

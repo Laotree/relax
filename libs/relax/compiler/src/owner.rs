@@ -904,6 +904,12 @@ pub fn serving_note() -> String {
     }
 }
 
+/// How long the owner thread has served its current request (0: idle).
+pub fn serving_ns() -> u64 {
+    if NOW_CLASS.load(Ordering::Relaxed) == u8::MAX { return 0; }
+    crate::jit::wall_ns().saturating_sub(NOW_T0.load(Ordering::Relaxed))
+}
+
 /// `serving_note` with the site of the request served (atomics only: an abort's report, which
 /// names what kept the owner from its lookups).
 pub fn serving_detail() -> String {
