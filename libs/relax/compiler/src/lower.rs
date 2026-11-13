@@ -4382,8 +4382,8 @@ impl<'a> Lcx<'a> {
     }
 
     /// `&` operands in extending position of a `let` initializer (rustc's temporary lifetime
-    /// extension): `&e`, and through tuples, arrays, struct literals, casts, parens,
-    /// block tails, if branches and match arms.
+    /// extension): `&e`, and through tuples, arrays, struct literals, tuple struct and variant
+    /// constructor calls, casts, parens, block tails, if branches and match arms.
     fn collect_extending(&self, e: ExprId, out: &mut Vec<u32>) {
         let ast = self.ast();
         match &ast.expr(e).kind {
@@ -4402,6 +4402,16 @@ impl<'a> Lcx<'a> {
             ExprKind::Struct(row) => {
                 for f in ast.list(ast.row(*row).fields) {
                     self.collect_extending(f.expr, out);
+                }
+            }
+            // a tuple struct's or variant's constructor call extends its arguments, as typeck's
+            // region scopes do (region_scope.rs extend_borrows): `let v = Some(&f());` keeps f()'s
+            // value to the end of v's scope; any other call's arguments end with their statement
+            ExprKind::Call(f, args)
+                if matches!(self.b.res.get(&strip_paren(ast, *f).0), Some(Res::Def(d)) if matches!(self.u.prog.def(*d).kind, DefKind::Variant | DefKind::Struct)) =>
+            {
+                for x in ast.list(*args) {
+                    self.collect_extending(*x, out);
                 }
             }
             ExprKind::Block(b, _) | ExprKind::Unsafe(b) => {
