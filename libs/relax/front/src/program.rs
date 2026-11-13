@@ -6799,11 +6799,11 @@ struct GlobQuery {
     taints: usize,
 }
 
-/// One walk of trait bindings through glob imports (see GlobQuery).
 /// A trait a module's scope binds: the trait, the binding's visibility and its name (None for
 /// an `as _` import, which no other binding can shadow).
 type TraitBinding = (DefId, BindVis, Option<Sym>);
 
+/// One walk of trait bindings through glob imports (see GlobQuery).
 #[derive(Default)]
 struct TraitQuery {
     memo: HashMap<u32, std::sync::Arc<Vec<TraitBinding>>>,

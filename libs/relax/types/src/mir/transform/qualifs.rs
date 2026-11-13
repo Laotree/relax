@@ -14,6 +14,7 @@
 //! - A body with unresolved types, error types or coroutine locals is `Blocked` up front, so the
 //!   `in_*` functions are infallible.
 use super::const_check::ConstCx;
+use crate::mir::dataflow::{self, Analysis, BitSet, CallReturnPlaces, TerminatorEdges};
 use crate::mir::visit::Visitor;
 use crate::mir::*;
 use crate::program::DefId;
@@ -346,7 +347,7 @@ pub fn in_operand<Q: Qualif, F: FnMut(Local) -> bool>(cx: &ConstCx<'_>, in_local
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
     n: usize,
-    bits: crate::mir::dataflow::BitSet,
+    bits: BitSet,
 }
 
 impl State {
@@ -376,7 +377,7 @@ impl State {
 /// borrows it already had (none on its first visit), and a move after the block boundary clears the
 /// qualif of a local borrowed before it: rustc 1.100.0 accepts `let r = &mut x; f(); x` in a
 /// `const fn` with `x: String`, and rejects it without the call `f()`.
-fn join_packed(n: usize, state: &mut crate::mir::dataflow::BitSet, incoming: &crate::mir::dataflow::BitSet) -> bool {
+fn join_packed(n: usize, state: &mut BitSet, incoming: &BitSet) -> bool {
     let mut qualif_changed = false;
     for i in incoming.iter().take_while(|&i| i < n) {
         qualif_changed |= state.insert(i);
@@ -580,34 +581,32 @@ struct FlowSensitiveAnalysis<'a, Q> {
 }
 
 impl<Q: Qualif> FlowSensitiveAnalysis<'_, Q> {
-    fn transfer(&self, bits: &mut crate::mir::dataflow::BitSet, f: impl FnOnce(&mut TransferFunction<'_, Q>)) {
-        let mut state = State { n: self.n, bits: std::mem::replace(bits, crate::mir::dataflow::BitSet::new_empty(0)) };
+    fn transfer(&self, bits: &mut BitSet, f: impl FnOnce(&mut TransferFunction<'_, Q>)) {
+        let mut state = State { n: self.n, bits: std::mem::replace(bits, BitSet::new_empty(0)) };
         f(&mut TransferFunction::<Q>::new(self.ccx, &mut state));
         *bits = state.bits;
     }
 }
 
-impl<Q: Qualif> crate::mir::dataflow::Analysis for FlowSensitiveAnalysis<'_, Q> {
-    fn bottom_value(&self, _body: &Body) -> crate::mir::dataflow::BitSet {
-        crate::mir::dataflow::BitSet::new_empty(2 * self.n)
+impl<Q: Qualif> Analysis for FlowSensitiveAnalysis<'_, Q> {
+    fn bottom_value(&self, _body: &Body) -> BitSet {
+        BitSet::new_empty(2 * self.n)
     }
-    fn initialize_start_block(&self, _body: &Body, state: &mut crate::mir::dataflow::BitSet) {
+    fn initialize_start_block(&self, _body: &Body, state: &mut BitSet) {
         self.transfer(state, |t| t.initialize_state());
     }
-    fn join(&self, state: &mut crate::mir::dataflow::BitSet, incoming: &crate::mir::dataflow::BitSet) -> bool {
+    fn join(&self, state: &mut BitSet, incoming: &BitSet) -> bool {
         join_packed(self.n, state, incoming)
     }
-    fn apply_primary_statement_effect(&self, state: &mut crate::mir::dataflow::BitSet, stmt: &Statement, at: Location) {
+    fn apply_primary_statement_effect(&self, state: &mut BitSet, stmt: &Statement, at: Location) {
         self.transfer(state, |t| t.visit_statement(stmt, at));
     }
-    fn apply_primary_terminator_effect<'t>(&self, state: &mut crate::mir::dataflow::BitSet, term: &'t Terminator, at: Location) -> crate::mir::dataflow::TerminatorEdges<'t> {
+    fn apply_primary_terminator_effect<'t>(&self, state: &mut BitSet, term: &'t Terminator, at: Location) -> TerminatorEdges<'t> {
         self.transfer(state, |t| t.visit_terminator(term, at));
-        crate::mir::dataflow::TerminatorEdges::for_terminator(term)
+        TerminatorEdges::for_terminator(term)
     }
-    fn apply_call_return_effect(&self, state: &mut crate::mir::dataflow::BitSet, _block: BasicBlock, places: crate::mir::dataflow::CallReturnPlaces<'_>) {
-        let place = match places {
-            crate::mir::dataflow::CallReturnPlaces::Call(place) | crate::mir::dataflow::CallReturnPlaces::Yield(place) => place,
-        };
+    fn apply_call_return_effect(&self, state: &mut BitSet, _block: BasicBlock, places: CallReturnPlaces<'_>) {
+        let (CallReturnPlaces::Call(place) | CallReturnPlaces::Yield(place)) = places;
         self.transfer(state, |t| t.apply_call_return_effect(place));
     }
 }
@@ -628,7 +627,7 @@ impl<Q: Qualif> QualifResults<Q> {
     pub fn compute(ccx: &ConstCx<'_>) -> Self {
         let body = ccx.body;
         let analysis = FlowSensitiveAnalysis::<Q> { ccx, n: body.local_decls.len(), _qualif: std::marker::PhantomData };
-        let results = crate::mir::dataflow::iterate_to_fixpoint(body, &analysis);
+        let results = dataflow::iterate_to_fixpoint(body, &analysis);
         let entry = (0..body.basic_blocks.len())
             .map(|b| {
                 let block = BasicBlock(b as u32);

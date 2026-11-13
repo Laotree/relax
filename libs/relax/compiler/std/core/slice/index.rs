@@ -346,8 +346,8 @@ pub(crate) fn into_slice_range(len: usize, bounds: (Bound<usize>, Bound<usize>))
     }
 }
 
-/// `into_range_unchecked`: the caller promises an in-bounds pair.
-fn bounds_to_range(b: (Bound<usize>, Bound<usize>), len: usize) -> Range<usize> {
+/// core's `into_range_unchecked`: the caller promises an in-bounds pair.
+fn into_range_unchecked(b: (Bound<usize>, Bound<usize>), len: usize) -> Range<usize> {
     let start = match b.0 {
         Bound::Included(s) => s,
         Bound::Excluded(s) => s + 1,
@@ -370,10 +370,10 @@ impl<T> SliceIndex<[T]> for (Bound<usize>, Bound<usize>) {
         try_into_slice_range(slice.len(), self).ok()?.get_mut(slice)
     }
     unsafe fn get_unchecked(self, slice: *const [T]) -> *const [T] {
-        bounds_to_range(self, (*slice).len()).get_unchecked(slice)
+        into_range_unchecked(self, (*slice).len()).get_unchecked(slice)
     }
     unsafe fn get_unchecked_mut(self, slice: *mut [T]) -> *mut [T] {
-        bounds_to_range(self, (*slice).len()).get_unchecked_mut(slice)
+        into_range_unchecked(self, (*slice).len()).get_unchecked_mut(slice)
     }
     #[track_caller]
     fn index(self, slice: &[T]) -> &[T] {
@@ -381,7 +381,6 @@ impl<T> SliceIndex<[T]> for (Bound<usize>, Bound<usize>) {
     }
     #[track_caller]
     fn index_mut(self, slice: &mut [T]) -> &mut [T] {
-        let len = slice.len();
-        into_slice_range(len, self).index_mut(slice)
+        into_slice_range(slice.len(), self).index_mut(slice)
     }
 }
