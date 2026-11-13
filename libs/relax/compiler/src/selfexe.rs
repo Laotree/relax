@@ -7,6 +7,11 @@
 //! keeps its name, the OS runs it as the loader (the same file, so the same code signature on
 //! macOS), and it takes no space beyond a directory entry while the loader file exists.
 //!
+//! The folder also holds the run's command line (`LINE`, RELAX_SELF_EXEC's value), so a launch of
+//! the link that did not come through Relax std's spawn (`sh -c "exec $EXE ..."`, a C library's
+//! exec) runs this program again too: the loader started by that path finds the line beside
+//! itself (`relaunched`), as std's spawn would have put it before the arguments.
+//!
 //! The folder goes when the run exits (os::proc::exit); a run that did not get there (killed)
 //! leaves it, and the next run's `link` removes the folders of processes that are gone. They
 //! matter: a link keeps an old loader's blocks alive after cargo replaces the binary.
@@ -38,6 +43,38 @@ pub fn link(loader: &Path, name: &str) -> Result<PathBuf, String> {
     let link = dir.join(file);
     std::fs::hard_link(loader, &link).map_err(|e| format!("hard link {} of {}: {e}", link.display(), loader.display()))?;
     link.canonicalize().map_err(|e| format!("{}: {e}", link.display()))
+}
+
+/// The command line beside the link: a name no link has (`link` keeps a name's letters, digits,
+/// `-`, `_` and `.`).
+const LINE: &str = "+self-exec";
+
+/// Writes this run's command line (RELAX_SELF_EXEC's words, up to and with `--`) beside its link.
+pub fn set_line(words: &[String]) -> Result<(), String> {
+    let dir = OWN_DIR.get().ok_or("no link was made")?;
+    std::fs::write(dir.join(LINE), words.join("\u{1f}")).map_err(|e| format!("{}: {e}", dir.join(LINE).display()))
+}
+
+/// A launch of a run's link whose arguments do not start with the run's command line (Relax std's
+/// spawn and exec put it after argv[0], an exec without the `--silent` at its index 2): `args`
+/// with that line after argv[0], as std's spawn gives them. None for any other launch of the
+/// loader. (The arguments, not RELAX_SELF_EXEC, tell: a C library's exec passes this process's
+/// own environment, which names it, with the program's arguments alone.)
+pub fn relaunched(args: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
+    let exe = std::env::current_exe().ok()?;
+    let line = std::fs::read(exe.parent()?.join(LINE)).ok()?;
+    let mut out: Vec<Vec<u8>> = line.split(|&b| b == 0x1f).map(<[u8]>::to_vec).collect();
+    let rest = args.get(1..).unwrap_or_default();
+    let mut unsilenced = out[1..].to_vec();
+    if unsilenced.get(1).is_some_and(|w| w == b"--silent") {
+        unsilenced.remove(1);
+    }
+    if rest.starts_with(&out[1..]) || rest.starts_with(&unsilenced) {
+        return None;
+    }
+    out[0] = args.first()?.clone();
+    out.extend(rest.iter().cloned());
+    Some(out)
 }
 
 /// Removes this process's folder (os::proc::exit). On Windows the link of a re-run that still

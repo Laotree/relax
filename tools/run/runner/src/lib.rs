@@ -162,6 +162,10 @@ pub fn main(host: &'static Host) {
     // a self-exec child: the program values its parent passed, before anything reads the
     // environment (relax-base progenv.rs)
     relax_compiler::progenv::init();
+    // a run's own executable launched by a shell or a C library: that run's program again
+    if let Some(args) = relax_compiler::selfexe::relaunched(&relax_compiler::os::proc::args_bytes()) {
+        relax_compiler::os::proc::set_args(args);
+    }
     set_host(host);
     relax_compiler::set_tool_name(help::command());
     warn_legacy_env();

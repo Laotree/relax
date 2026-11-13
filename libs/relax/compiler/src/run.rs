@@ -1297,6 +1297,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             pre.insert(at, "--self-exec".to_string());
         }
         pre.push("--".to_string());
+        // (a launch of the link by another way than std's spawn finds the line there)
+        if let Err(why) = crate::selfexe::set_line(&pre) {
+            eprintln!("relax run: the program's command line could not be kept beside its executable ({why}): a launch of it by a shell runs the loader");
+        }
         crate::progenv::set_run_fact("RELAX_SELF_EXEC", pre.join("\u{1f}"));
         prog_args[0] = exe.display().to_string().into_bytes();
     }
