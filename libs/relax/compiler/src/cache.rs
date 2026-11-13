@@ -190,6 +190,27 @@ pub(crate) fn share_write(carries_path: bool) -> ShareWrite {
     if carries_path { ShareWrite::Anchored } else { ShareWrite::PathFree }
 }
 
+/// Whether the identities computed right now hash the absolute anchor dirs. Target B's shared
+/// mode computes both variants of a key: path-free (no anchor dirs) for lookup and storage of a
+/// clean payload, anchored for a payload the scan found carrying a workspace path.
+thread_local! {
+    static IDENTITY_ANCHORS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Runs `f` with the identity anchor switch at `on` (restores the previous value).
+pub(crate) fn with_identity_anchors<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let prev = IDENTITY_ANCHORS.with(|c| c.replace(on));
+    let r = f();
+    IDENTITY_ANCHORS.with(|c| c.set(prev));
+    r
+}
+
+/// The anchor-dir hash an identity mixes in: the absolute dirs, or nothing in the path-free
+/// variant.
+fn anchors_in_key() -> u128 {
+    if IDENTITY_ANCHORS.with(|c| c.get()) { crate::dirs::anchors_key() } else { 0 }
+}
+
 const KIND_CODE: u32 = 1;
 const KIND_DATA: u32 = 2;
 const KIND_LEDGER: u32 = 3;
@@ -236,7 +257,7 @@ impl OwnerVerdicts {
         let mut h = Sip128::new();
         h.str("borrowck-owner");
         // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-        h.u128(crate::dirs::anchors_key());
+        h.u128(anchors_in_key());
         h.u32(BORROWCK_VERSION);
         h.u128(self.cfg);
         h.u128(*fp); // includes the crate's transitive dependencies
@@ -1650,7 +1671,7 @@ impl Cache {
         let mut h = Sip128::new();
         h.str("front");
         // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-        h.u128(crate::dirs::anchors_key());
+        h.u128(anchors_in_key());
         h.u32(crate::image::VERSION);
         h.u128(crate::codegen_id::front_id());
         h.str(&crate::dirs::anchored(path));
@@ -1663,7 +1684,7 @@ impl Cache {
         let mut h = Sip128::new();
         h.str("front-part");
         // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-        h.u128(crate::dirs::anchors_key());
+        h.u128(anchors_in_key());
         h.u32(crate::image::VERSION);
         h.u128(crate::codegen_id::front_id());
         h.str(&crate::dirs::anchored(path));
@@ -2882,7 +2903,7 @@ impl Cache {
                 let mut h = Sip128::new();
                 h.str("code-deps");
                 // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-                h.u128(crate::dirs::anchors_key());
+                h.u128(anchors_in_key());
                 h.u128(self.cfg);
                 h.write(&e.0);
                 h.write(&shim.0);
@@ -3052,7 +3073,7 @@ impl Cache {
         let mut h = Sip128::new();
         h.str("deps-graph-v2");
         // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-        h.u128(crate::dirs::anchors_key());
+        h.u128(anchors_in_key());
         h.u128(self.cfg);
         h.u128(*self.crate_ident.get(root as usize)?);
         Some(h.finish128())
@@ -3237,7 +3258,7 @@ impl Cache {
         let mut h = Sip128::new();
         h.str("coherence-verdict");
         // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-        h.u128(crate::dirs::anchors_key());
+        h.u128(anchors_in_key());
         h.u32(COHERENCE_VERSION);
         h.u128(self.cfg);
         // by the crates' interfaces (their impls and every item they can name; a fn body is
@@ -3270,7 +3291,7 @@ impl Cache {
         let mut h = Sip128::new();
         h.str(if mode == 0 { "run-typeck-crate" } else { "test-check-crate" });
         // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-        h.u128(crate::dirs::anchors_key());
+        h.u128(anchors_in_key());
         h.u8(mode);
         h.u32(CRATE_CHECK_VERSION);
         h.u128(self.cfg);
@@ -3324,7 +3345,7 @@ impl Cache {
         let mut h = Sip128::new();
         h.str("test-deps-check-crate");
         // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-        h.u128(crate::dirs::anchors_key());
+        h.u128(anchors_in_key());
         h.u32(CRATE_CHECK_VERSION);
         h.u128(self.cfg);
         h.u128(own);
@@ -3577,7 +3598,7 @@ impl Cache {
                 let mut h = Sip128::new();
                 h.str("data");
                 // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-                h.u128(crate::dirs::anchors_key());
+                h.u128(anchors_in_key());
                 h.u128(self.cfg);
                 h.write(&e.0);
                 // a named object (a constant, a vtable, a location) is its own entry: two
@@ -4217,7 +4238,7 @@ impl Cache {
         let mut h = Sip128::new();
         h.str("startup slots");
         // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-        h.u128(crate::dirs::anchors_key());
+        h.u128(anchors_in_key());
         h.u128(self.cfg);
         // the program's view, not its interface: the manifest names each slot's key, which says
         // whether its entry holds after an edit (load_manifest)
@@ -5877,7 +5898,7 @@ fn front_store_name_with(parse_options: u128, name: &str, fp: u128) -> String {
     let mut h = Sip128::new();
     h.str("store");
     // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-    h.u128(crate::dirs::anchors_key());
+    h.u128(anchors_in_key());
     h.u128(crate::codegen_id::id());
     h.str(&crate::codegen_id::target_tag());
     h.u128(fp);
@@ -5892,7 +5913,7 @@ fn code_store_name(options: &crate::options::Options, name: &str, iface: u128) -
     let mut h = Sip128::new();
     h.str("code-store");
     // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-    h.u128(crate::dirs::anchors_key());
+    h.u128(anchors_in_key());
     h.u128(crate::codegen_id::id());
     h.str(&crate::codegen_id::target_tag());
     h.u128(iface);
@@ -5905,7 +5926,7 @@ fn front_crate_key(name: &str, root: &str) -> u128 {
     let mut h = Sip128::new();
     h.str("front-crate");
     // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-    h.u128(crate::dirs::anchors_key());
+    h.u128(anchors_in_key());
     h.u32(crate::crate_image::VERSION);
     h.u128(crate::codegen_id::front_id());
     h.str(name);
@@ -5918,7 +5939,7 @@ fn front_graph_key(identity: u128) -> u128 {
     let mut h = Sip128::new();
     h.str("front-graph");
     // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-    h.u128(crate::dirs::anchors_key());
+    h.u128(anchors_in_key());
     h.u128(crate::codegen_id::id());
     h.str(&crate::codegen_id::target_tag());
     h.u128(identity);
@@ -5929,7 +5950,7 @@ fn front_order_key(set: u128) -> u128 {
     let mut h = Sip128::new();
     h.str("front-order");
     // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-    h.u128(crate::dirs::anchors_key());
+    h.u128(anchors_in_key());
     h.u128(crate::codegen_id::id());
     h.str(&crate::codegen_id::target_tag());
     h.u128(set);
@@ -10371,7 +10392,7 @@ impl Cache {
         let mut h = Sip128::new();
         h.str("const-value-v2");
         // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-        h.u128(crate::dirs::anchors_key());
+        h.u128(anchors_in_key());
         h.u128(self.cfg);
         h.write(&e.0);
         let dom = self.dominant(&crates);
@@ -10666,6 +10687,17 @@ mod prune_tests {
         assert_ne!(hash_set([1u128, 2, 3]), hash_set([1, 2, 4]));
     }
 
+    /// The identity anchor switch: on (the default) mixes the absolute dirs, off mixes nothing,
+    /// so both key variants of an identity can be computed.
+    #[test]
+    fn identity_anchor_switch_computes_both_variants() {
+        let on = super::with_identity_anchors(true, || super::anchors_in_key());
+        let off = super::with_identity_anchors(false, || super::anchors_in_key());
+        assert_eq!(off, 0);
+        assert_ne!(on, off, "the on variant mixes the anchor dirs");
+        assert_eq!(super::anchors_in_key(), on, "on is the default");
+    }
+
     /// Every input field changes the key: mutate one at a time and the hash must move.
     #[test]
     fn each_key_input_changes_the_hash() {
@@ -10747,7 +10779,7 @@ mod prune_tests {
     /// is built at run time so this test does not count itself.
     #[test]
     fn anchor_dirs_are_hashed_only_by_the_known_identities() {
-        let needle = concat!("anchors", "_key()");
+        let needle = concat!("anchors", "_in_key()");
         let src = include_str!("cache.rs");
         let mut cur = String::new();
         let mut fns = std::collections::BTreeSet::new();
@@ -10760,7 +10792,7 @@ mod prune_tests {
                     break;
                 }
             }
-            if line.contains(needle) { fns.insert(cur.clone()); }
+            if line.contains(needle) && !line.contains(concat!("fn anchors", "_in_key")) { fns.insert(cur.clone()); }
         }
         let want: std::collections::BTreeSet<String> = [
             "lookup", "front_key", "front_part_key", "code_key_bytes", "deps_key", "coherence_key",
