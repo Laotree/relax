@@ -189,7 +189,10 @@ impl From<String> for SourceCheckError {
 
 fn check_manifest(name: &str, source: u64, manifest: &[u8], current: &crate::srchash::Manifest, pkgs: &[crate::srchash::SrcPkg]) -> Result<(), SourceCheckError> {
     if crate::srchash::manifest_hash(current) == source { return Ok(()); }
-    let built = crate::srchash::decode_manifest(manifest)?;
+    // what the program's graph builds of the closure (srchash reached_by): a dependency that only
+    // the loader's host-shims brings in is no change
+    let built = crate::srchash::reached_by(&crate::srchash::decode_manifest(manifest)?, current);
+    if crate::srchash::diff_entries(&built, current).next().is_none() { return Ok(()); }
     let mut files = std::collections::BTreeSet::new();
     for (package, path) in crate::srchash::diff_entries(&built, current) {
         let package = package.strip_prefix("host:").unwrap_or(package);
@@ -240,6 +243,27 @@ mod source_tests {
         features.insert(("fixture_dep@1".into(), "\0features".into()), "enabled".into());
         assert_eq!(check_manifest("fixture", source, &encoded, &features, &pkgs), Err(SourceCheckError::Changed(ProvidedChange { crate_name: "fixture".into(), files: vec!["fixture/Cargo.toml".into()] })));
         assert!(matches!(check_manifest("fixture", source, &[1], &current, &pkgs), Err(SourceCheckError::Invalid(_))));
+    }
+
+    #[test]
+    fn a_dependency_only_the_loaders_shims_bring_in_is_no_change() {
+        use crate::srchash::closure_manifest;
+        // relax-api's makepad-alloc-phase: optional behind host-shims (the loader's build enables
+        // it, a program never does) and a dependency on Apple's targets only
+        let pkg = |name: &str, features: &[&str], deps: Vec<usize>| SrcPkg { name: name.into(), version: "1".into(), dir: format!("/.cargo/registry/{name}"),
+            features: features.iter().map(|f| f.to_string()).collect(), deps, proc_macro: false };
+        let built = closure_manifest(&[pkg("fixture", &["host-shims"], vec![1]), pkg("fixture-phase", &[], vec![])], 0);
+        let (source, encoded) = (manifest_hash(&built), encode_manifest(&built));
+        let check = |pkgs: &[SrcPkg]| check_manifest("fixture", source, &encoded, &closure_manifest(pkgs, 0), pkgs);
+        assert_eq!(check(&[pkg("fixture", &[], vec![])]), Ok(()), "Linux: the program's graph builds the crate without the dependency");
+        assert_eq!(check(&[pkg("fixture", &[], vec![1]), pkg("fixture-phase", &[], vec![])]), Ok(()), "Apple: both graphs have it");
+        // what the program builds still counts
+        let changed = |result: Result<(), SourceCheckError>| matches!(result, Err(SourceCheckError::Changed(_)));
+        assert!(changed(check(&[pkg("fixture", &[], vec![1]), pkg("fixture-other", &[], vec![])])), "a dependency only the program has");
+        let mut moved = [pkg("fixture", &[], vec![1]), pkg("fixture-phase", &[], vec![])];
+        moved[1].version = "2".into();
+        assert!(changed(check(&moved)), "another version of the dependency");
+        assert!(changed(check(&[pkg("fixture", &["other"], vec![])])), "a feature the identity keeps");
     }
 }
 

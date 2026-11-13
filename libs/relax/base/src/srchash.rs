@@ -21,7 +21,8 @@ pub struct SrcPkg {
 }
 
 /// Features that select the shim file only (`host-shims`): the loader's build enables them,
-/// a program never does, and they change no code a program calls.
+/// a program never does, and they change no code a program calls. A dependency only they bring in
+/// is the loader's alone ([`reached_by`]).
 const IGNORED_FEATURES: &[&str] = &["host-shims"];
 
 struct H(u64);
@@ -368,6 +369,24 @@ pub fn decode_manifest(mut bytes: &[u8]) -> Result<Manifest, String> {
         if out.insert((package, path), value).is_some() { return Err("duplicate provided source manifest entry".into()); }
     }
     Ok(out)
+}
+
+/// A package's name in a manifest key: no host role, no version.
+fn key_name(package: &str) -> &str {
+    let package = package.strip_prefix("host:").unwrap_or(package);
+    package.rsplit_once('@').map_or(package, |(name, _)| name)
+}
+
+/// `built` (a provided crate's closure as the loader's build resolved it) without the packages
+/// the program's closure of that crate (`current`) does not reach, by name. A package leaves a
+/// closure only by a dependency that features or the target select, and every such change shows
+/// in the entries both closures keep (a manifest's bytes, a package's features or version) but
+/// one: a dependency that only an ignored feature brings in (relax-api's makepad-alloc-phase,
+/// optional behind host-shims), which the loader's build links and a program's graph never does.
+/// Another version of a package keeps its name, so it still counts.
+pub fn reached_by(built: &Manifest, current: &Manifest) -> Manifest {
+    let names: std::collections::HashSet<&str> = current.keys().map(|(package, _)| key_name(package)).collect();
+    built.iter().filter(|((package, _), _)| names.contains(key_name(package))).map(|(key, value)| (key.clone(), value.clone())).collect()
 }
 
 /// Every changed manifest entry, including added/removed files and metadata. Shared by the
