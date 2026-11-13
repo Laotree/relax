@@ -1463,7 +1463,7 @@ fn round18_rpit_diagnostic() {
     let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "round18_rpit_diagnostic", "--nocapture", "--test-threads=1"])
         .env(CHILD, "1").env("RELAX_STD", format!("{dir}/std")).env("RELAX_CACHE", "off")
-        .env("MAKEPAD_HIDE_WINDOWS", "1").env("SANDBOX_MUTE", "1"));
+        .env("MAKEPAD_HIDE_WINDOWS", "1").env("MAKEPAD_MUTE", "1"));
     let all = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     eprintln!("{all}");
     assert!(output.status.success());

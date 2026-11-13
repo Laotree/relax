@@ -85,7 +85,7 @@ pub fn relay(args: &[String]) -> i32 {
             return 1;
         };
         let name = flag(args, "--name").unwrap_or("relay").to_string();
-        let mut env: Vec<(String, String)> = vec![("MAKEPAD_HIDE_WINDOWS".into(), "1".into()), ("SANDBOX_MUTE".into(), "1".into())];
+        let mut env: Vec<(String, String)> = vec![("MAKEPAD_HIDE_WINDOWS".into(), "1".into()), ("MAKEPAD_MUTE".into(), "1".into())];
         for (i, a) in args.iter().enumerate() {
             if a != "--env" {
                 continue;

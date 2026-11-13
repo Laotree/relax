@@ -3013,13 +3013,13 @@ required-features = ["b", "manual"]
         let sess = &std::sync::Arc::new(crate::Session::default());
         let root = tree("broken-member", &[
             ("Cargo.toml", "[workspace]\nmembers = [\"slice\", \"other\"]\n"),
-            ("slice/Cargo.toml", "[package]\nname = \"fab-slice\"\nversion = \"0.1.0\"\n\n[dev-dependencies]\nsdf = { path = \"../other\" }\nsdf = { path = \"../other\" }\n"),
+            ("slice/Cargo.toml", "[package]\nname = \"tool-a\"\nversion = \"0.1.0\"\n\n[dev-dependencies]\nsdf = { path = \"../other\" }\nsdf = { path = \"../other\" }\n"),
             ("slice/src/lib.rs", ""),
             ("other/Cargo.toml", "[package]\nname = \"other\"\nversion = \"0.1.0\"\n"),
             ("other/src/lib.rs", ""),
         ]);
         let mut r = Resolver::new(sess, &root).unwrap();
-        let e = r.find_member("fab-slice").err().unwrap();
+        let e = r.find_member("tool-a").err().unwrap();
         let path = format!("{}/slice/Cargo.toml", normalize(&root));
         assert!(e.starts_with(&format!("{path}:7:1: duplicate key `sdf`\n")), "{e}");
         assert!(!e.contains("not a member"), "{e}");

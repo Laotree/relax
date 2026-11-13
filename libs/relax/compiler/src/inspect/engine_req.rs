@@ -269,7 +269,7 @@ pub fn symbol(name: &[u8]) -> Option<usize> {
 mod tests {
     #[test]
     fn post_reply_and_read_back() {
-        let id = super::post("pips-leap\0add a grappling hook verb\0game.grapple(target)\0player: can I swing?\0chat:1").unwrap();
+        let id = super::post("game-a\0add a grappling hook verb\0game.grapple(target)\0player: can I swing?\0chat:1").unwrap();
         assert!(id.ends_with(&format!(".{}.1", std::process::id())) || id.contains('.'));
         assert!(super::post("g\0 \0d\0c\0r").is_err(), "a summary is required");
         assert!(super::reply(&id, "shipped", "x").is_err(), "unknown status");

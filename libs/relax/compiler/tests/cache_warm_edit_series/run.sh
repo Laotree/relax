@@ -31,7 +31,7 @@ for step in "" "" "vm 1" "hal 1" "vm 2" "closure+" "hal 2" "closure-" "vm 3" "";
   rep=$C/report$k
   : > "$rep"
   (cd "$S" && env -u RELAX_PRELINK -u RELAX_CACHE_TRACE RELAX_HOME="$C/home" RELAX_TARGET_DIR="$C/home/target" RELAX_CACHE_DIR="$C/home/cache" \
-    TMPDIR="$C/home/tmp" MAKEPAD_HIDE_WINDOWS=1 SANDBOX_MUTE=1 MAKEPAD_MUTE=1 "$R" run --report-to "$rep" makepad-app-calculator --no-default-features --features standalone) > "$C/run$k.log" 2>&1 &
+    TMPDIR="$C/home/tmp" MAKEPAD_HIDE_WINDOWS=1 MAKEPAD_MUTE=1 "$R" run --report-to "$rep" makepad-app-calculator --no-default-features --features standalone) > "$C/run$k.log" 2>&1 &
   pid=$!
   for i in $(seq 1 900); do grep -q present "$rep" && break; kill -0 $pid 2>/dev/null || break; sleep 0.2; done
   sleep 3

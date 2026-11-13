@@ -37,7 +37,7 @@ fn ledger_dir(test: &str) -> std::path::PathBuf {
 fn relay_endpoint() -> Endpoint {
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    relay::endpoint(relay::Config { name: "d".into(), launch: vec!["sleep".into()], env: vec![("SANDBOX_MUTE".into(), "1".into())], ledger: ledger_dir(&format!("shared{n}")) })
+    relay::endpoint(relay::Config { name: "d".into(), launch: vec!["sleep".into()], env: vec![("MAKEPAD_MUTE".into(), "1".into())], ledger: ledger_dir(&format!("shared{n}")) })
 }
 
 /// A relay on an existing ledger (what a restarted relay does).

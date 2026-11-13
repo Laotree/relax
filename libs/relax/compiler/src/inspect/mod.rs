@@ -2087,22 +2087,22 @@ mod tests {
     #[test]
     fn a_held_landing_names_each_file_with_its_blob_id() {
         let id = "0123456789abcdef0123456789abcdef01234567";
-        let files = super::hold_files(&format!("apps/fab/src/a.rs={id}\n\napps/commercial/x=y/b.rs=-\n")).unwrap();
+        let files = super::hold_files(&format!("apps/tool-a/src/a.rs={id}\n\napps/tool-b/x=y/b.rs=-\n")).unwrap();
         assert_eq!(files.len(), 2);
-        assert_eq!((files[0].0.as_str(), files[0].1.map(|o| crate::gitstore::hex(&o))), ("apps/fab/src/a.rs", Some(id.to_string())));
-        assert_eq!((files[1].0.as_str(), files[1].1), ("apps/commercial/x=y/b.rs", None), "a path may hold `=`; `-`: removed");
-        assert!(super::hold_files("apps/fab/src/a.rs").unwrap_err().contains("no <path>=<blob id>"));
-        assert!(super::hold_files("apps/fab/src/a.rs=xyz").unwrap_err().contains("no blob id"));
+        assert_eq!((files[0].0.as_str(), files[0].1.map(|o| crate::gitstore::hex(&o))), ("apps/tool-a/src/a.rs", Some(id.to_string())));
+        assert_eq!((files[1].0.as_str(), files[1].1), ("apps/tool-b/x=y/b.rs", None), "a path may hold `=`; `-`: removed");
+        assert!(super::hold_files("apps/tool-a/src/a.rs").unwrap_err().contains("no <path>=<blob id>"));
+        assert!(super::hold_files("apps/tool-a/src/a.rs=xyz").unwrap_err().contains("no blob id"));
     }
 
     /// `inputs of=`: a saved path names an input at a whole path component, either separator.
     #[test]
     fn a_saved_path_names_an_input_at_a_whole_component() {
         use super::ends_with_rel as ends;
-        assert!(ends("/w/apps/fab/src/a.rs", "apps/fab/src/a.rs"));
-        assert!(ends("apps/fab/src/a.rs", "apps/fab/src/a.rs"));
-        assert!(ends("C:\\w\\apps\\fab\\a.rs", "apps/fab/a.rs"));
-        assert!(!ends("/w/xapps/fab/a.rs", "apps/fab/a.rs"));
+        assert!(ends("/w/apps/tool-a/src/a.rs", "apps/tool-a/src/a.rs"));
+        assert!(ends("apps/tool-a/src/a.rs", "apps/tool-a/src/a.rs"));
+        assert!(ends("C:\\w\\apps\\tool-a\\a.rs", "apps/tool-a/a.rs"));
+        assert!(!ends("/w/xapps/tool-a/a.rs", "apps/tool-a/a.rs"));
         assert!(!ends("a.rs", "src/a.rs"));
         assert!(!ends("/w/a.rs", ""));
     }

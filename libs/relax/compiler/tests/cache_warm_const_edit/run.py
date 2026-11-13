@@ -258,7 +258,7 @@ if window:
     open(manifest, "w").write(text + "\n[patch.crates-io]\n" + "\n".join(patch) + "\n")
 env = dict(os.environ, RELAX_CACHE_DIR=os.path.join(tmp, "cache"), RELAX_TARGET_DIR=os.path.join(tmp, "target"))
 if window:
-    env.update(MAKEPAD_HIDE_WINDOWS="1", MAKEPAD_MUTE="1", SANDBOX_MUTE="1", MUSIC_MUTE="1")
+    env.update(MAKEPAD_HIDE_WINDOWS="1", MAKEPAD_MUTE="1")
 for k in ("RELAX_CACHE", "RELAX_PRELINK", "WARM_EDIT_ONCE", "WARM_EDIT_LATE"):
     env.pop(k, None)
 # (every run: the image's selection is the boot's)

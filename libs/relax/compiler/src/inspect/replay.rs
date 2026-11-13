@@ -102,7 +102,7 @@ pub fn file_main(path: &str, words: &[String]) -> i32 {
     }
     if get("show").as_deref() != Some("1") {
         cmd.env("MAKEPAD_HIDE_WINDOWS", "1");
-        cmd.env("SANDBOX_MUTE", "1");
+        cmd.env("MAKEPAD_MUTE", "1");
     }
     let what = format!(
         "{} input events (frames {}..{}{}) into `{}`{}{}",

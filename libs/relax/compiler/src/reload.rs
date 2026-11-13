@@ -10969,7 +10969,7 @@ mod dock_gate_tests {
         let mut gate = DockGate::new(rev.clone());
         // files changed, no new revision: a lane's write into the tree
         assert!(!gate.synced(), "a change without a sync is held");
-        gate.held(["apps/fab/src/main.rs"].into_iter());
+        gate.held(["apps/tool-a/src/main.rs"].into_iter());
         assert!(!gate.synced());
         // the sync moved the files, then wrote the revision: this round applies, once
         std::fs::write(&rev, "makepad bbbb\nsynced 2 (devhub sync)\n").unwrap();

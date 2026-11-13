@@ -63,7 +63,7 @@ def main():
     orig = open(path).read()
     log = "/tmp/live-corpus-%s-%d.jsonl" % (a.app, os.getpid())
     out_txt = "/tmp/live-corpus-%s-%d.out" % (a.app, os.getpid())
-    env = dict(os.environ, RELAX_LIVE_LOG=log, MAKEPAD_TRACE="startup", RELAX_TRACE="startup", SANDBOX_MUTE="1")
+    env = dict(os.environ, RELAX_LIVE_LOG=log, MAKEPAD_TRACE="startup", RELAX_TRACE="startup", MAKEPAD_MUTE="1")
     env.setdefault("RELAX_STD", os.path.join(a.tree, "libs/relax/compiler/std"))
     cmd = [a.makepad, "run", c.PKG] + list(getattr(c, "ARGS", []))
     outf = open(out_txt, "w")

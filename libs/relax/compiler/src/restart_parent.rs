@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn only_a_run_that_can_restart_gets_a_parent() {
-        for live in [&["makepad", "run", "makepad-fab"][..], &["makepad", "run", "--quiet", "makepad-fab"], &["makepad", "run", "--harness", "--live", "p"]] {
+        for live in [&["makepad", "run", "tool-a"][..], &["makepad", "run", "--quiet", "tool-a"], &["makepad", "run", "--harness", "--live", "p"]] {
             assert!(can_restart(&words(live)), "{live:?}");
         }
         for other in [
