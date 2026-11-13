@@ -7936,9 +7936,17 @@ pub(crate) fn hand_back() {
     }
 }
 
+/// The native builds a run takes from the run that prepared it (run.rs: a run of the program again,
+/// a test's package binary). A restart drops them: it compiles the edited inputs and builds its
+/// native packages again, or finds them cached under their key, by exec into this loader or a
+/// rebuilt one, or in place. Taken, a live relaunch after an edit to a native package's build
+/// script ran the old library.
+pub(crate) const NATIVE_RECEIPTS: [&str; 2] = ["RELAX_RUN_NATIVE", crate::unitgraph::BIN_NATIVE_RECEIPT];
+
 /// What the next run reads (run_end::run_input; a value, or none): the recovery on its way, `state`
-/// as the app left it, when the edit behind this was saved. A process started for the next run
-/// finds it in its environment, a run started in place in the restart's hand-over.
+/// as the app left it, when the edit behind this was saved, and none of this run's native builds
+/// (`NATIVE_RECEIPTS`). A process started for the next run finds it in its environment, a run
+/// started in place in the restart's hand-over.
 pub(crate) fn next_run_env(state: Option<&[u8]>) -> Result<Vec<(&'static str, Option<std::ffi::OsString>)>, String> {
     let recovery = crate::hot_failure::hand_over()?.map(|path| path.into_os_string());
     let restore = match state {
@@ -7946,7 +7954,9 @@ pub(crate) fn next_run_env(state: Option<&[u8]>) -> Result<Vec<(&'static str, Op
         None => None,
     };
     let saved = RESTART_SAVED_MS.load(std::sync::atomic::Ordering::Relaxed).to_string();
-    Ok(vec![("MAKEPAD_JIT_RECOVERY", recovery), ("RELAX_RESTORE", restore), ("RELAX_RESTART_T0", Some(saved.into()))])
+    let mut next = vec![("MAKEPAD_JIT_RECOVERY", recovery), ("RELAX_RESTORE", restore), ("RELAX_RESTART_T0", Some(saved.into()))];
+    next.extend(NATIVE_RECEIPTS.map(|name| (name, None)));
+    Ok(next)
 }
 
 /// A restart that waited out the run's boot (run_end::restart) and hands no state of its own: the
@@ -8062,9 +8072,6 @@ fn exec_restart(state: Option<&[u8]>) -> Result<(), String> {
             }
         }
         if let Some(dir) = dir { cmd.current_dir(dir); }
-        // a restart compiles the edited inputs: no native build this run took or made stands for
-        // the next one (it builds its own, or finds it cached under the same key)
-        cmd.env_remove("RELAX_RUN_NATIVE");
         for (name, value) in next_run_env(state)? {
             match value {
                 Some(value) => { cmd.env(name, value); }

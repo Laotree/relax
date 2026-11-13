@@ -830,11 +830,11 @@ pub(crate) fn resolve_package(
             let hook: Option<&unitgraph::ScriptsDone<'_>> = (boot && !check_only).then_some(&early_world);
             // a build script's own child run (no native request of its own) compiles the native
             // packages its parent built, from the receipt the parent handed it; a binary its test
-            // started, those its test's run built
+            // started, those its test's run built (the run's own package: a domain's is another)
             let receipt = native_request.is_none().then(|| std::env::var(unitgraph::NATIVE_RECEIPT).ok()).flatten();
             let inherit = match (&receipt, TESTS_NATIVE.get()) {
                 (Some(r), _) => Some(unitgraph::Inherit::Script(r)),
-                (None, Some(r)) if native_request.is_some() => Some(unitgraph::Inherit::Binary(r)),
+                (None, Some(r)) if boot && native_request.is_some() => Some(unitgraph::Inherit::Binary(r)),
                 _ => None,
             };
             let scripts = unitgraph::run_build_scripts(sess, &mut g, target_dir, native_mode, check_only, inherit, hook);
@@ -856,7 +856,10 @@ pub(crate) fn resolve_package(
         // executable), as cargo's child is the binary built: it compiled and linked the native
         // packages again, with a C compiler the built program need not have (relax issue 177)
         if let Some(r) = scripts? {
-            crate::progenv::set_run_fact("RELAX_RUN_NATIVE", &r);
+            // (the run's own package: a domain's build is not the program's)
+            if boot {
+                crate::progenv::set_run_fact("RELAX_RUN_NATIVE", &r);
+            }
             let mut bins = g.env.iter().flatten().filter_map(|(k, _)| k.strip_prefix("CARGO_BIN_EXE_")).peekable();
             let launches = bins.peek().is_some();
             for bin in bins {
@@ -1401,7 +1404,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             let _ = TESTS_NATIVE.set(r);
         }
         unsafe { std::env::remove_var(unitgraph::BIN_NATIVE_RECEIPT) };
-    } else if let Some(r) = std::env::var("RELAX_RUN_NATIVE").ok().filter(|r| !r.is_empty()).and_then(|r| run_dir_receipt("RELAX_RUN_NATIVE", r, &target_dir)) {
+    } else if let Some(r) = crate::run_end::run_input("RELAX_RUN_NATIVE").and_then(|r| r.into_string().ok()).filter(|r| !r.is_empty()).and_then(|r| run_dir_receipt("RELAX_RUN_NATIVE", r, &target_dir)) {
         // this program again, of a run that took its native build from its test's run (relax
         // issue 168: it built its own then, without the test's inputs)
         let _ = TESTS_NATIVE.set(r);
@@ -2902,12 +2905,18 @@ pub(crate) struct NativeCallbacks {
 /// program's own C, whose definitions its extern blocks bind to first.
 static NATIVE_BUNDLES: std::sync::Mutex<Vec<(usize, std::path::PathBuf, usize)>> = std::sync::Mutex::new(Vec::new());
 
-fn note_native_bundle(handle: usize, path: &str) {
+pub(crate) fn note_native_bundle(handle: usize, path: &str) {
     let file = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
     let mut bundles = NATIVE_BUNDLES.lock().unwrap_or_else(|e| e.into_inner());
     if !bundles.iter().any(|b| b.0 == handle) {
         crate::zone_alloc::kept_with(|| bundles.push((handle, file, 0)));
     }
+}
+
+/// (tests) The native libraries noted so far.
+#[cfg(test)]
+pub(crate) fn native_bundle_count() -> usize {
+    NATIVE_BUNDLES.lock().unwrap_or_else(|e| e.into_inner()).len()
 }
 
 /// `name`'s address when an --allow-c native library defines it itself: what the system linker
@@ -5496,8 +5505,10 @@ pub(crate) unsafe fn reset_statics() {
     reset(&ONCE, AtomicBool::new(false));
     reset(&LAST, relax_session::sync::Mutex::new(""));
     reset(&FRONT_REPORTED, AtomicBool::new(false));
-    // a restart in place compiles the edited inputs: the native build this run took or named
-    // stands for no next run (it builds its own, or finds it cached under its key)
+    // a restart in place compiles the edited inputs: the native build this run took stands for no
+    // next run (reload.rs NATIVE_RECEIPTS: its hand-over names none), and the libraries this run
+    // loaded stay loaded but define nothing for it: their entries came first, so the next run's
+    // extern blocks bound the ended run's C after an edit to a native package
     reset(&TESTS_NATIVE, std::sync::OnceLock::new());
-    std::env::remove_var("RELAX_RUN_NATIVE");
+    reset(&NATIVE_BUNDLES, std::sync::Mutex::new(Vec::new()));
 }

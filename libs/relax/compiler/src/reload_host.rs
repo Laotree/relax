@@ -309,6 +309,8 @@ pub(crate) fn apply_at_boot(change: &crate::provided::ProvidedChange) -> i32 {
         use std::os::unix::process::CommandExt;
         let mut cmd = std::process::Command::new(&exe);
         cmd.args(std::env::args_os().skip(1)).env(REBUILT_ENV, std::process::id().to_string());
+        // the rebuilt loader builds the program's native packages as a restart does (NATIVE_RECEIPTS)
+        for name in super::NATIVE_RECEIPTS { cmd.env_remove(name); }
         // fd 2 back to the terminal before the exec (the transcript tee is a thread of this process)
         crate::tui::exit_code(0);
         crate::tui::finish(false);
@@ -928,8 +930,8 @@ fn restart(h: Handover, state: Option<&[u8]>) {
         let reason = super::RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()).clone();
         cmd.env("RELAX_RESTART_T0", super::RESTART_SAVED_MS.load(std::sync::atomic::Ordering::Relaxed).to_string());
         // the restart compiles the edited inputs: no native build this run took or made stands
-        // for the next one (reload.rs exec_restart)
-        cmd.env_remove("RELAX_RUN_NATIVE");
+        // for the next one (NATIVE_RECEIPTS)
+        for name in super::NATIVE_RECEIPTS { cmd.env_remove(name); }
         super::restart_begins();
         // the run ends as at exit (exec skips the exit handlers); fd 2 goes back to the terminal
         // now (the transcript tee is a thread of this process: the new one starts its own), so
@@ -954,6 +956,44 @@ fn restart(h: Handover, state: Option<&[u8]>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The next run takes none of this run's native builds: a run's end in place forgets the
+    /// native libraries it noted (they stay loaded; run.rs reset_statics), and a restart into a
+    /// rebuilt loader hands it neither receipt (reload.rs NATIVE_RECEIPTS) and the rest of the
+    /// environment as it was. This test runs again as the child that does both, and restarts into
+    /// a loader that prints what it was given.
+    #[cfg(unix)]
+    #[test]
+    fn the_next_run_takes_none_of_the_run_s_native_builds() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "RELAX_TEST_RESTART_LOADER";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            // a handle no library has stands for one: noting it loads nothing
+            crate::run::note_native_bundle(usize::MAX, "/relax-test/libnative.so");
+            let noted = crate::run::native_bundle_count();
+            unsafe { crate::run::reset_statics() };
+            println!("native libraries noted {noted}, after the run's end {}", crate::run::native_bundle_count());
+            std::env::set_var("RELAX_RUN_NATIVE", "run-native");
+            std::env::set_var(crate::unitgraph::BIN_NATIVE_RECEIPT, "bin-native");
+            std::env::set_var("RELAX_TEST_RESTART_KEPT", "kept");
+            restart(Handover { loader: PathBuf::from(dir).join("loader"), stamps: Vec::new() }, None);
+            panic!("the restart did not exec the rebuilt loader");
+        }
+        let dir = std::env::temp_dir().join(format!("relax-restart-loader-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let loader = dir.join("loader");
+        std::fs::write(&loader, "#!/bin/sh\necho \"loader got [${RELAX_RUN_NATIVE-}] [${RELAX_BIN_NATIVE_RECEIPT-}] [${RELAX_TEST_RESTART_KEPT-}]\"\n").unwrap();
+        std::fs::set_permissions(&loader, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "reload::host::tests::the_next_run_takes_none_of_the_run_s_native_builds", "--nocapture"])
+            .env(CHILD, &dir));
+        let _ = std::fs::remove_dir_all(&dir);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "the restarting child: {stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+        assert!(stdout.contains("native libraries noted 1, after the run's end 0"), "a run's end in place kept the native libraries it noted: {stdout}");
+        assert!(stdout.contains("loader got [] [] [kept]"), "the rebuilt loader got a native build of the run, or lost the rest of its environment: {stdout}");
+    }
 
     #[cfg(unix)]
     #[test]
