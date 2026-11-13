@@ -2003,11 +2003,11 @@ impl<'a> Fcx<'a> {
         // before fallback.
         self.try_handle_opaque_type_uses_next();
         self.retry_goals(false);
-        // diverging fallback (rustc fallback.rs): a variable only a `!` value flowed into is `()`
-        // before edition 2024 and `!` from 2024 (`f(|_| panic!())` instantiates R = ())
+        // diverging fallback (rustc fallback.rs): a variable only a `!` value flowed into is `!`, in
+        // every edition since rustc 1.100.0 (before it, `()` before edition 2024): `f(|_| panic!())`
+        // instantiates R = !
         if !self.diverging.is_empty() {
-            let ed = self.prog.crates[self.prog.def(self.b.def).krate as usize].edition;
-            let fb = if ed >= 2024 { self.tcx.tys.never } else { self.tcx.tys.unit };
+            let fb = self.tcx.tys.never;
             for v in std::mem::take(&mut self.diverging) {
                 let s = self.shallow(v);
                 if matches!(self.tcx.tys.kind(s), TyKind::Infer(_)) {

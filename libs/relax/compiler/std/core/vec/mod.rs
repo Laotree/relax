@@ -145,6 +145,14 @@ impl<T> Vec<T> {
         v
     }
 
+    /// rustc 1.100.0 (vec_from_fn): `[f(0), f(1), .., f(length - 1)]`
+    pub fn from_fn<F>(length: usize, f: F) -> Self
+    where
+        F: FnMut(usize) -> T,
+    {
+        (0..length).map(f).collect()
+    }
+
     /// # Safety: `ptr` must be non-null and aligned, with `length` initialized elements.
     /// For non-ZSTs it must own an allocation for `capacity` elements, fitting in
     /// isize::MAX bytes, and `length` must not exceed `capacity`.
@@ -931,6 +939,35 @@ where
     T: PartialEq<U>,
 {
     fn eq(&self, other: &&'b mut [U]) -> bool {
+        crate::slice::slice_eq(&**self, &**other)
+    }
+}
+
+// rustc 1.100.0 (partialeq_cow_for_vec_and_slice): a vector or slice reference compares with a borrowed or
+// owned slice
+impl<'a, T, U: Clone> PartialEq<Cow<'a, [U]>> for Vec<T>
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &Cow<'a, [U]>) -> bool {
+        crate::slice::slice_eq(self.as_slice(), &**other)
+    }
+}
+
+impl<'a, 'b, T, U: Clone> PartialEq<Cow<'a, [U]>> for &'b [T]
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &Cow<'a, [U]>) -> bool {
+        crate::slice::slice_eq(*self, &**other)
+    }
+}
+
+impl<'a, 'b, T, U: Clone> PartialEq<Cow<'a, [U]>> for &'b mut [T]
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &Cow<'a, [U]>) -> bool {
         crate::slice::slice_eq(&**self, &**other)
     }
 }

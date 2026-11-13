@@ -58,6 +58,27 @@ impl<T> Box<T> {
         unsafe { im::write_bytes(b.ptr.as_ptr() as *mut u8, 0, crate::mem::size_of::<T>()) };
         b
     }
+    /// rustc 1.100.0 (box_take): the value, and its allocation left uninitialized
+    pub fn take(boxed: Self) -> (T, Box<crate::mem::MaybeUninit<T>>) {
+        unsafe {
+            let raw = Box::into_raw(boxed);
+            let value = im::ptr_read(raw as *const T);
+            let uninit = Box::from_raw(raw as *mut crate::mem::MaybeUninit<T>);
+            (value, uninit)
+        }
+    }
+    /// rustc 1.100.0 (smart_pointer_map): `f` of the value, in the same allocation when `U` fits it exactly
+    pub fn map<U>(this: Self, f: impl FnOnce(T) -> U) -> Box<U> {
+        let (value, allocation) = Box::take(this);
+        if crate::mem::size_of::<T>() == crate::mem::size_of::<U>() && crate::mem::align_of::<T>() == crate::mem::align_of::<U>() {
+            let allocation = unsafe { Box::from_raw(Box::into_raw(allocation) as *mut crate::mem::MaybeUninit<U>) };
+            Box::write(allocation, f(value))
+        } else {
+            // frees the allocation (a MaybeUninit drops nothing) before `f` runs, as alloc's deallocate does
+            drop(allocation);
+            Box::new(f(value))
+        }
+    }
 }
 
 impl<T: ?Sized> Box<T> {

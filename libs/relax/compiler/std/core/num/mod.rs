@@ -79,8 +79,8 @@ impl fmt::Display for TryFromIntError {
 
 impl crate::error::Error for TryFromIntError {}
 
-impl From<crate::convert::Infallible> for TryFromIntError {
-    fn from(x: crate::convert::Infallible) -> TryFromIntError {
-        match x {}
+impl From<!> for TryFromIntError {
+    fn from(never: !) -> TryFromIntError {
+        never
     }
 }

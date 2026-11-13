@@ -250,6 +250,16 @@ impl str {
     {
         strip_suffix(self, suffix)
     }
+    /// rustc 1.100.0 (trim_prefix_suffix): `self` without `prefix` if it starts with it, else `self`
+    pub fn trim_prefix<'a, P: Pattern<'a>>(&'a self, prefix: P) -> &'a str {
+        strip_prefix(self, prefix).unwrap_or(self)
+    }
+    pub fn trim_suffix<'a, P: Pattern<'a>>(&'a self, suffix: P) -> &'a str
+    where
+        P::Searcher: ReverseSearcher<'a>,
+    {
+        strip_suffix(self, suffix).unwrap_or(self)
+    }
     pub const fn trim_ascii_start(&self) -> &str {
         trim_ascii_start(self)
     }

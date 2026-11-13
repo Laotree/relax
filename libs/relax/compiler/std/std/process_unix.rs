@@ -237,12 +237,6 @@ impl Termination for ! {
     }
 }
 
-impl Termination for core::convert::Infallible {
-    fn report(self) -> ExitCode {
-        match self {}
-    }
-}
-
 impl Termination for ExitCode {
     fn report(self) -> ExitCode {
         self

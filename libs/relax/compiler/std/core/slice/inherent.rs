@@ -340,6 +340,33 @@ impl<T> [T] {
             None
         }
     }
+    /// rustc 1.100.0 (trim_prefix_suffix): `self` without `prefix` if it starts with it, else `self`
+    pub fn trim_prefix(&self, prefix: &[T]) -> &[T]
+    where
+        T: PartialEq,
+    {
+        let n = prefix.len();
+        if n <= self.len() {
+            let (head, tail) = self.split_at(n);
+            if head == prefix {
+                return tail;
+            }
+        }
+        self
+    }
+    pub fn trim_suffix(&self, suffix: &[T]) -> &[T]
+    where
+        T: PartialEq,
+    {
+        let (len, n) = (self.len(), suffix.len());
+        if n <= len {
+            let (head, tail) = self.split_at(len - n);
+            if tail == suffix {
+                return head;
+            }
+        }
+        self
+    }
     pub fn binary_search(&self, x: &T) -> Result<usize, usize>
     where
         T: Ord,

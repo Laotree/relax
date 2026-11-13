@@ -31,16 +31,17 @@ impl<T: ?Sized> UnsafeCell<T> {
     pub const fn get_mut(&mut self) -> &mut T {
         &mut self.value
     }
+    // replace, as_ref_unchecked, as_mut_unchecked: const and stable since rustc 1.100.0 (unsafe_cell_access)
     #[rustc_should_not_be_called_on_const_items]
-    pub unsafe fn replace(&self, value: T) -> T where T: Sized {
-        crate::mem::replace(&mut *self.get(), value)
+    pub const unsafe fn replace(&self, value: T) -> T where T: Sized {
+        self.get().replace(value)
     }
     #[rustc_should_not_be_called_on_const_items]
-    pub unsafe fn as_ref_unchecked(&self) -> &T {
+    pub const unsafe fn as_ref_unchecked(&self) -> &T {
         &*self.get()
     }
     #[rustc_should_not_be_called_on_const_items]
-    pub unsafe fn as_mut_unchecked(&self) -> &mut T {
+    pub const unsafe fn as_mut_unchecked(&self) -> &mut T {
         &mut *self.get()
     }
     #[rustc_diagnostic_item = "unsafe_cell_raw_get"]
