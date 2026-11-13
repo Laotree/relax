@@ -10842,6 +10842,34 @@ mod prune_tests {
         std::fs::remove_dir(&root).unwrap();
     }
 
+    /// Only the identity functions below may hash the absolute anchor dirs. A new use is a
+    /// worktree leak: entries stop being shareable and the mv/negative tests miss it. The needle
+    /// is built at run time so this test does not count itself.
+    #[test]
+    fn anchor_dirs_are_hashed_only_by_the_known_identities() {
+        let needle = concat!("anchors", "_key()");
+        let src = include_str!("cache.rs");
+        let mut cur = String::new();
+        let mut fns = std::collections::BTreeSet::new();
+        for line in src.lines() {
+            let t = line.trim_start();
+            for pre in ["pub fn ", "pub(crate) fn ", "fn "] {
+                if let Some(rest) = t.strip_prefix(pre) {
+                    let name: String = rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).next().unwrap_or("").to_string();
+                    if !name.is_empty() { cur = name; }
+                    break;
+                }
+            }
+            if line.contains(needle) { fns.insert(cur.clone()); }
+        }
+        let want: std::collections::BTreeSet<String> = [
+            "lookup", "front_key", "front_part_key", "code_key_bytes", "deps_key", "coherence_key",
+            "crate_check_key", "dep_check_key", "data_entry", "manifest_key", "front_store_name_with",
+            "code_store_name", "front_crate_key", "front_graph_key", "front_order_key", "const_key",
+        ].iter().map(|s| s.to_string()).collect();
+        assert_eq!(fns, want, "a cache identity hashes the absolute anchor dirs");
+    }
+
     /// A store another Relax build wrote is never read by this one: prune reclaims it at the next
     /// start, unless a process of that build runs or it was stamped a moment ago.
     #[test]
