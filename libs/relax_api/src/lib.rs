@@ -17,6 +17,9 @@
 //!   only that side's code makes and reads, laid out by that side's std). Without it, JIT code
 //!   that reaches a provided crate's static of a type not the same bytes on both sides is refused:
 //!   rustc's one copy cannot be read with Relax's layouts.
+//! - `run`, beside any of these: the ops allocate in the program's heap ([`run_op`]), so the
+//!   program's end takes what they made. A crate whose objects are the program's (a script VM)
+//!   says it on every attribute. Without it an op allocates in the host's heap ([`host_op`]).
 //!
 //! In a normal build the attribute leaves the item as it is. With the crate's `host-shims`
 //! feature (only the `makepad` loader build enables it) it also emits, next to the item, an extern "C"

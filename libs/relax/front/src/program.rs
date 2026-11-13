@@ -439,6 +439,8 @@ pub struct CrateInfo {
     /// relaxed-Rust features this crate opts in to (relaxed.rs; empty = strict), read on first
     /// use (only a relaxable error or the borrow checker asks; strict programs never read it)
     relaxed: std::sync::OnceLock<Vec<String>>,
+    /// its package's `export-opt-level` (unitgraph.rs), read on first use (a web export asks)
+    export_opt_level: std::sync::OnceLock<Option<u8>>,
     /// the crate's `#![feature(..)]` declarations, read on first use (the check's gates)
     features: std::sync::OnceLock<crate::features::Features>,
     /// the crates whose impls this crate's solver sees (`Program::crate_sees`), a bitset over crate
@@ -484,6 +486,11 @@ impl CrateInfo {
     /// the crate's root source file
     pub fn root_path(&self) -> &str {
         &self.root_path
+    }
+    /// The opt-level its package's manifest gives its code in a web export
+    /// (`[package.metadata.relax] export-opt-level`; None: the export's default).
+    pub fn export_opt_level(&self) -> Option<u8> {
+        *self.export_opt_level.get_or_init(|| crate::unitgraph::export_opt_level(&crate::unitgraph::manifest_dir_of(&self.root_path)))
     }
     /// The relaxed-Rust features this crate opts in to (std crates: none).
     pub fn relaxed(&self, prog: &Program) -> &[String] {
@@ -1328,7 +1335,7 @@ impl Program {
         let root_mod = self.new_module(root_def, None, None, krate, 0);
         self.defs[root_def.0 as usize].sub = root_mod;
         self.defs[root_def.0 as usize].scope = root_mod;
-        self.crates.push(CrateInfo { name: cname, root_mod, edition, recursion_limit: 128, deps, cfg, proc_macro: false, is_bin: false, harness: false, validate: false, rustc_laid: false, relaxed: Default::default(), features: Default::default(), impl_view: Default::default(), root_path: root.to_string(), context: crate::source_context::Context::new(root, self.sources.clone(), &self.session) });
+        self.crates.push(CrateInfo { name: cname, root_mod, edition, recursion_limit: 128, deps, cfg, proc_macro: false, is_bin: false, harness: false, validate: false, rustc_laid: false, relaxed: Default::default(), export_opt_level: Default::default(), features: Default::default(), impl_view: Default::default(), root_path: root.to_string(), context: crate::source_context::Context::new(root, self.sources.clone(), &self.session) });
         let kname = self.syms.str(cname).to_string();
         let akey = crate::preload::crate_key(&kname, root, &self.crates[krate as usize].cfg);
         if !self.ahead.contains_key(&akey) {

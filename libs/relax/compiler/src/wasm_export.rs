@@ -1632,30 +1632,37 @@ fn module_inline(u: &Unit, funcs: &mut BTreeMap<u32, Func>, kept: &std::collecti
 }
 
 /// The crate that defines slot `id` (a closure's or shim's owner's), "" for generated code.
-pub(crate) fn slot_crate(u: &Unit, id: u32) -> &str {
+fn slot_crate(u: &Unit, id: u32) -> Option<&crate::program::CrateInfo> {
     let mut owner = id;
     loop {
         match &u.fns[owner as usize].key {
-            crate::jit::FnKey::Inst(d, _) => return u.prog.syms.str(u.prog.crates[u.prog.def(*d).krate as usize].name),
+            crate::jit::FnKey::Inst(d, _) => return u.prog.crates.get(u.prog.def(*d).krate as usize),
             crate::jit::FnKey::Closure(_, _, p) | crate::jit::FnKey::Plain(p) | crate::jit::FnKey::Sandbox(p)
                 if *p != owner && (*p as usize) < u.fns.len() => owner = *p,
-            _ => return "",
+            _ => return None,
         }
     }
 }
 
-/// RELAX_WASM_EXPORT_O3_CRATES=a,b: crates whose functions all take the O3 pipeline, as the
-/// rustc web build compiles its hot crates at opt-level 3 (default: the Splash VM, makepad_script,
-/// the old film exporter's HOT_CRATES).
+/// The crates whose functions all take the O3 pipeline, as the rustc web build compiles its hot
+/// crates at opt-level 3: those whose manifest says `[package.metadata.relax] export-opt-level = 3`
+/// (the Splash VM's), or the list RELAX_WASM_EXPORT_O3_CRATES=a,b names instead.
 /// Only the crate's own code, as rustc compiles it: a generic instance (or a closure of one) is
 /// codegened in the crate that instantiates it, at that crate's opt-level (opt z for the derive
 /// helpers the widget crates instantiate: `script_derive_proto_field::<T>`, 316 instances at O3
 /// were 3.8 MB of code against rustc's 35 KB); trace-hot instances still take O3 (o3_policy).
 pub(crate) fn o3_crate(u: &Unit, id: u32) -> bool {
-    static C: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    let crates = C.get_or_init(|| std::env::var("RELAX_WASM_EXPORT_O3_CRATES").unwrap_or_else(|_| "makepad_script".to_string())
-        .split(',').filter(|c| !c.is_empty()).map(|c| c.replace('-', "_")).collect());
-    !crates.is_empty() && !generic_instance(u, id) && crates.iter().any(|c| c == slot_crate(u, id))
+    static C: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+    let named = C.get_or_init(|| std::env::var("RELAX_WASM_EXPORT_O3_CRATES").ok()
+        .map(|v| v.split(',').filter(|c| !c.is_empty()).map(|c| c.replace('-', "_")).collect()));
+    if named.as_ref().is_some_and(|c| c.is_empty()) || generic_instance(u, id) {
+        return false;
+    }
+    let Some(k) = slot_crate(u, id) else { return false };
+    match named {
+        Some(c) => c.iter().any(|c| c == u.prog.syms.str(k.name)),
+        None => k.export_opt_level() == Some(3),
+    }
 }
 
 /// Slot `id` is an instance with generic arguments, or a closure / shim / twin of one.

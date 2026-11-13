@@ -508,21 +508,51 @@ pub fn script_role(pkg: &str, bs: &BuildScript) -> ScriptRole {
     }
 }
 
-/// `[package.metadata.relax] build-script = "keep"` in the manifest of the package in `dir`.
-fn kept_script(dir: &str) -> bool {
-    let text = crate::vfs::read_to_string(std::path::Path::new(dir).join("Cargo.toml")).unwrap_or_default();
+/// The value of `key` in the `[package.metadata.relax]` section of the manifest of the package
+/// in `dir`, as written (`"keep"`, `true`).
+fn relax_meta(dir: &str, key: &str) -> Option<String> {
+    if dir.is_empty() {
+        return None;
+    }
+    let text = crate::vfs::read_to_string(std::path::Path::new(dir).join("Cargo.toml")).ok()?;
     let mut inside = false;
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.starts_with('[') {
             inside = line == "[package.metadata.relax]";
         } else if let Some((k, v)) = line.split_once('=').filter(|_| inside) {
-            if k.trim() == "build-script" {
-                return v.trim() == "\"keep\"";
+            if k.trim() == key {
+                return Some(v.trim().to_string());
             }
         }
     }
-    false
+    None
+}
+
+/// `[package.metadata.relax] build-script = "keep"` in the manifest of the package in `dir`.
+fn kept_script(dir: &str) -> bool {
+    relax_meta(dir, "build-script").as_deref() == Some("\"keep\"")
+}
+
+/// `[package.metadata.relax] window-host = true`: the package hosts a program's windows (an
+/// app's start opens its window early, the main thread serves it, and a run that provides the
+/// crate is always hosted).
+pub fn window_host(dir: &str) -> bool {
+    relax_meta(dir, "window-host").as_deref() == Some("true")
+}
+
+/// `[package.metadata.relax] presents = true`: a program that links the package presents frames
+/// and ends each with `relax_frame_done` (live edits wait for a present; the first frame is
+/// watched).
+pub fn presents(dir: &str) -> bool {
+    relax_meta(dir, "presents").as_deref() == Some("true")
+}
+
+/// `[package.metadata.relax] export-opt-level = <n>`: the opt-level the package's own code ships
+/// at in a web export (wasm_export.rs o3_crate: 3 takes the O3 pipeline), as rustc's web build
+/// compiles that crate.
+pub fn export_opt_level(dir: &str) -> Option<u8> {
+    relax_meta(dir, "export-opt-level")?.parse().ok()
 }
 
 /// A host's own answer to a package's build script: what the script prints (`cargo:` lines) and

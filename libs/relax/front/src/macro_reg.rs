@@ -439,25 +439,35 @@ pub fn bang_name(i: usize) -> Option<String> {
 }
 
 /// Hosted proc macros re-run on every edited input unless their package is a
-/// pure token transformation: makepad's shader derives (makepad_shader_derive +
-/// derive_impl + micro_proc_macro read no filesystem, environment, clock or
-/// process state; audited 2026-10-09), or the runner certifies the entry as a
-/// token transform. Their expansion is a function of the item's tokens and
-/// spans, which the reuse key covers.
-const PURE_DERIVE_UNITS: &[&str] = &["makepad_shader_derive"];
+/// pure token transformation the host binary vouches for (`set_pure_crates`), or
+/// the runner certifies the entry as a token transform. Their expansion is a
+/// function of the item's tokens and spans, which the reuse key covers.
+static PURE_CRATES: std::sync::OnceLock<&'static [&'static str]> = std::sync::OnceLock::new();
+
+/// The proc-macro crates the host binary has audited as pure token transforms (they read no
+/// filesystem, environment, clock or process state), once, before any crate graph loads
+/// (relax_runner Host.pure_macro_crates). A crate never certifies itself. None (the bare
+/// runner): every hosted macro re-runs on each edited input, slower, never stale.
+pub fn set_pure_crates(crates: &'static [&'static str]) {
+    let _ = PURE_CRATES.set(crates);
+}
+
+fn pure_crate(name: &str) -> bool {
+    PURE_CRATES.get().is_some_and(|c| c.contains(&name))
+}
 pub fn reusable_bang(i: usize) -> bool {
     let entry = REG.with(|r| r.borrow().as_ref().and_then(|r| r.macros.get(i).map(|(_, e)| e.clone())));
     entry.as_ref().is_some_and(|e| RUNNER.get().is_some_and(|r| r.reusable(e)))
 }
 pub fn reusable_derive(name: &str) -> bool {
     let (entry, pure) = REG.with(|r| r.borrow().as_ref().and_then(|r| r.derives.iter().find(|(n, _)| n == name)
-        .map(|(_, e)| (Some(e.clone()), PURE_DERIVE_UNITS.contains(&r.units[e.unit].name.as_str())))).unwrap_or((None, false)));
+        .map(|(_, e)| (Some(e.clone()), pure_crate(&r.units[e.unit].name)))).unwrap_or((None, false)));
     pure || entry.as_ref().is_some_and(|e| RUNNER.get().is_some_and(|r| r.reusable(e)))
 }
 
 /// Is the resolved attribute a pure token transform (derive rule)?
 pub fn reusable_attr(entry: &Entry) -> bool {
-    let pure = REG.with(|r| r.borrow().as_ref().is_some_and(|r| PURE_DERIVE_UNITS.contains(&r.units[entry.unit].name.as_str())));
+    let pure = REG.with(|r| r.borrow().as_ref().is_some_and(|r| pure_crate(&r.units[entry.unit].name)));
     pure || RUNNER.get().is_some_and(|r| r.reusable(entry))
 }
 

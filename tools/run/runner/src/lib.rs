@@ -85,6 +85,10 @@ pub struct Host {
     /// the build scripts this binary answers natively (relax-front unitgraph.rs ScriptAnswer):
     /// none of them starts a process; the bare runner runs every kept script
     pub script_answers: &'static [&'static relax_compiler::unitgraph::ScriptAnswer],
+    /// proc-macro crates this binary vouches for as pure token transforms (macro_reg.rs
+    /// set_pure_crates): their hosted expansions are reused across edits; the bare runner
+    /// vouches for none
+    pub pure_macro_crates: &'static [&'static str],
 }
 
 /// A command a host adds to its binary: its word, its row on the main help page, its own help
@@ -111,7 +115,7 @@ pub enum HelpLine {
 
 /// The bare runner (bin `relax`): provides nothing; tests, checks and agents' boots compile only
 /// what runs.
-pub const BARE: Host = Host { provenance: None, init: || {}, provide: || {}, run_host: || {}, ahead: relax_compiler::options::AheadLevel::Minimal, proc_macros: relax_compiler::pmhost::Policy::Open, default_launch: None, package: env!("CARGO_PKG_NAME"), manifest: concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"), commands: &[], native_sets: &[], raw_body_macros: &[], script_answers: &[] };
+pub const BARE: Host = Host { provenance: None, init: || {}, provide: || {}, run_host: || {}, ahead: relax_compiler::options::AheadLevel::Minimal, proc_macros: relax_compiler::pmhost::Policy::Open, default_launch: None, package: env!("CARGO_PKG_NAME"), manifest: concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"), commands: &[], native_sets: &[], raw_body_macros: &[], script_answers: &[], pure_macro_crates: &[] };
 
 static HOST: std::sync::OnceLock<&'static Host> = std::sync::OnceLock::new();
 
@@ -129,6 +133,7 @@ pub fn set_host(host: &'static Host) {
             relax_compiler::unitgraph::register_script_answer(a);
         }
         relax_compiler::pmhost::set_policy(host.proc_macros);
+        relax_compiler::macro_reg::set_pure_crates(host.pure_macro_crates);
         relax_compiler::reload::set_loader_package(host.package, host.manifest);
         // the entry point's ahead level, unless the environment names one; RELAX_AHEAD
         // carries it to the session (options.rs) and to every process this one starts
@@ -261,50 +266,6 @@ pub fn run_with_args(args: Vec<Vec<u8>>) {
     run(args)
 }
 
-/// NVIDIA's shader disk cache (GL and Vulkan) for every program this loader runs. The driver keys
-/// its files by the executable's path, and every JIT build is a new executable: each binary's first
-/// runs compiled every pipeline cold (a large app held its first frame 9 s for 109 pipelines), so they
-/// all take one name. And a folder of their own, `$XDG_CACHE_HOME/makepad/nvidia`: the driver's
-/// shared folder takes no entry once it holds its 1 GB, and every other program's per-path keys
-/// fill it (a pool box at 1025 MB: each cold start of a large app compiled its pipelines again, the first
-/// frame held 20.5 s for 177 pipelines; in a folder of its own 0.3 s). The driver trims neither: past
-/// 3/4 of its cap this one is emptied, and the next runs fill it again. It is renamed away before
-/// it is removed, so a start beside this one finds the full folder or a new empty one, never one
-/// half removed, and a running program's open files go with the old one (its writes are lost, not
-/// mixed into the new folder).
-#[cfg(target_os = "linux")]
-fn nvidia_shader_cache() {
-    if std::env::var_os("__GL_SHADER_DISK_CACHE_APP_NAME").is_none() {
-        std::env::set_var("__GL_SHADER_DISK_CACHE_APP_NAME", "makepad");
-    }
-    if std::env::var_os("__GL_SHADER_DISK_CACHE_PATH").is_some() {
-        return;
-    }
-    let abs = |v: Option<std::ffi::OsString>| v.map(std::path::PathBuf::from).filter(|p| p.is_absolute());
-    let Some(base) = abs(std::env::var_os("XDG_CACHE_HOME")).or_else(|| abs(std::env::var_os("HOME")).map(|h| h.join(".cache"))) else {
-        return;
-    };
-    let dir = base.join("makepad").join("nvidia");
-    fn bytes(dir: &std::path::Path) -> u64 {
-        let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
-        entries.flatten().map(|e| match e.file_type() {
-            Ok(t) if t.is_dir() => bytes(&e.path()),
-            _ => e.metadata().map_or(0, |m| m.len()),
-        }).sum()
-    }
-    if bytes(&dir) > 768 << 20 {
-        // (one name: what a killed removal left goes with the next one)
-        let old = dir.with_extension("old");
-        let _ = std::fs::remove_dir_all(&old);
-        if std::fs::rename(&dir, &old).is_ok() {
-            let _ = std::fs::remove_dir_all(&old);
-        }
-    }
-    if std::fs::create_dir_all(&dir).is_ok() {
-        std::env::set_var("__GL_SHADER_DISK_CACHE_PATH", &dir);
-    }
-}
-
 fn run(raw_args: Vec<Vec<u8>>) {
     {
         let _k = relax_compiler::zone_alloc::kept();
@@ -387,8 +348,6 @@ fn run(raw_args: Vec<Vec<u8>>) {
     }
     // the programs it runs (the runner app) keep their launch records in the same home
     std::env::set_var("RELAX_HOME", fetch::home());
-    #[cfg(target_os = "linux")]
-    nvidia_shader_cache();
     macros::register(host().raw_body_macros);
     // a command the host adds: its own, no compiler started here
     if let Some(c) = args.get(1).and_then(|w| host().commands.iter().find(|c| c.name == w)) {
@@ -408,16 +367,6 @@ fn run(raw_args: Vec<Vec<u8>>) {
         Some("inspect") => std::process::exit(relax_compiler::inspect::client::main(&args[2..])),
         // the remote hub: `hub [--listen <addr>]`, `remote-relay [--dial ..]`, `remote add|pair|list`
         Some("hub") => std::process::exit(remote::hub(&args[2..])),
-        // `devhub` (or `observe`) `stream|ls|inspect|reply|inbox|hubs`: the local devhub (every JIT
-        // on the LAN from the master), its own binary
-        Some("devhub" | "observe") => {
-            if args.get(2).map(String::as_str) == Some("ci") {
-                eprintln!("use `makepad ci`");
-                std::process::exit(2);
-            }
-            std::process::exit(devhub(&args[2..]));
-        }
-        Some("ci") => std::process::exit(devhub(&args[1..])),
         Some("remote-relay") => std::process::exit(remote::relay(&args[2..])),
         Some("remote") => std::process::exit(remote::remote(&args[2..])),
         // `pack-src [--target <triple>] <out.store> <package>...`: the source archive `run --src` runs from
@@ -827,41 +776,4 @@ fn session(opts: Vec<String>, rest: Vec<String>) -> (std::sync::Arc<relax_compil
     invocation.extend_from_slice(&a);
     let sess = relax_compiler::session_from_env(&invocation);
     (sess, a, invocation)
-}
-
-
-/// `makepad devhub <words>`: the `makepad-devhub` binary of the checkout this JIT came from (else
-/// the one this folder is in), as built: the devhub master swaps a landing's build in when its
-/// rebuild finishes, so a call never waits on a build lock. A checkout with none yet goes through
-/// `cargo run`, which builds it. devhub is not linked here, so its changes never rebuild the JIT.
-/// Returns only when it could not start.
-fn devhub(words: &[String]) -> i32 {
-    let exe = std::env::current_exe().ok();
-    let cwd = std::env::current_dir().ok();
-    let is_root = |d: &&std::path::Path| d.join("libs/devhub/Cargo.toml").is_file();
-    let root = exe.iter().flat_map(|e| e.ancestors()).find(is_root).or_else(|| cwd.iter().flat_map(|c| c.ancestors()).find(is_root));
-    let Some(root) = root else {
-        eprintln!("makepad devhub: no makepad checkout above {} or this folder (devhub builds from one)", exe.as_ref().map_or_else(String::new, |e| e.display().to_string()));
-        return 2;
-    };
-    let built = root.join("target/host").join(format!("makepad-devhub{}", std::env::consts::EXE_SUFFIX));
-    let mut command = if built.is_file() {
-        std::process::Command::new(built)
-    } else {
-        let cargo = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cargo/bin/cargo")).filter(|c| c.exists()).unwrap_or_else(|| "cargo".into());
-        let mut c = std::process::Command::new(cargo);
-        c.args(["run", "--profile", "host", "-q", "--manifest-path"]).arg(root.join("Cargo.toml")).args(["-p", "makepad-devhub", "--bin", "makepad-devhub", "--"]);
-        c
-    };
-    // (rustup counts its nested proxies in this one and refuses past 20: cargo -> makepad -> cargo must not count)
-    command.args(words).env_remove("RUST_RECURSION_COUNT");
-    #[cfg(unix)]
-    let e = std::os::unix::process::CommandExt::exec(&mut command);
-    #[cfg(not(unix))]
-    let e = match command.status() {
-        Ok(status) => return status.code().unwrap_or(1),
-        Err(e) => e,
-    };
-    eprintln!("makepad devhub: {}: {e}", command.get_program().to_string_lossy());
-    1
 }

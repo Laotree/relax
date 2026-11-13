@@ -381,8 +381,9 @@ fn run_ended(code: i32, json: bool, args: &[String], start: Instant) -> i32 {
     code
 }
 
-/// Whether the program is a HAL program: its crate graph links makepad-hal (or the run starts
-/// `--domain` packages into it). Only such a program gets the main-thread host (the HAL's main
+/// Whether the program is a HAL program: its crate graph links a window host (a package marked
+/// `[package.metadata.relax] window-host = true`), or the run starts `--domain` packages into it.
+/// Only such a program gets the main-thread host (the HAL's main
 /// loop, the window, the boot screen); any other program -- a terminal tool, a pure-Rust crate --
 /// runs on the process's main thread with its output on the terminal, as its rustc build does.
 /// The graph resolved here is the boot's (BOOT_UNITS): the resolve does not run twice.
@@ -411,7 +412,7 @@ fn hosted_program(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> boo
         }
     }
     let Ok(units) = unitgraph::unit_graph(sess, &workspace, &package, &flags) else { return false };
-    let hal = units.units.iter().any(|u| u.name.replace('-', "_") == "makepad_hal");
+    let hal = units.units.iter().any(|u| unitgraph::window_host(&unitgraph::manifest_dir_of(&u.src_path)));
     *BOOT_UNITS.lock().unwrap() = Some((package, flags, units));
     hal
 }
@@ -697,7 +698,7 @@ pub(crate) fn resolve_package(
     // The graph is enough to choose the host. Its window opens now, beside the rest of the
     // resolve (the watch inputs, the substitutions, the hash and the build scripts); the process
     // main thread is already serving the HAL. The resolve ends when the window is open.
-    let hal = g.crates.iter().any(|c| c.name == "makepad_hal");
+    let hal = g.pkg.iter().any(|(dir, _, _)| unitgraph::window_host(dir));
     // an app start's window opened before its graph was known (`cmd_run_app`): a program that
     // links no HAL draws nothing in it, so it closes and the run goes on
     if boot && !hal && APP_START.load(Ordering::Acquire) {
@@ -2558,7 +2559,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     jit::start_completion(up);
     // the dependencies' bodies no build asked for are type-checked after the first frame
     if !harness && !plain_test { crate::typeck_bg::start(up, root, main_def); }
-    let platform = u.prog.crates.iter().any(|c| u.prog.syms.str(c.name) == "makepad_platform");
+    let platform = u.prog.crates.iter().any(|c| unitgraph::presents(&unitgraph::manifest_dir_of(c.root_path())));
     jit::live_needs_present(!live_tests && platform);
     // a test harness never presents, nor does a program without the platform: no startup to wait out
     jit::startup_main(platform && !HARNESS_RUN.load(Ordering::Acquire));

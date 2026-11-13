@@ -6,7 +6,7 @@ use std::io::IsTerminal;
 
 /// The word a command line starts with, for every command `makepad` knows (help pages or not).
 pub const COMMANDS: &[&str] = &[
-    "run", "app", "fetch", "export", "pack-src", "inspect", "devhub", "observe", "ci", "check", "selftest", "test", "live", "fix", "clean", "serve", "schema", "hover", "definition",
+    "run", "app", "fetch", "export", "pack-src", "inspect", "check", "selftest", "test", "live", "fix", "clean", "serve", "schema", "hover", "definition",
     "parse", "resolve", "file", "std-surface", "lex", "hub", "remote-relay", "remote", "help",
 ];
 
@@ -176,8 +176,6 @@ fn main_page(st: &Style) -> String {
     p.row("export <git-url> <folder>", "Write a repository's files (and the app's edits) into a folder");
     p.row("pack-src <out> <package>...", "Pack the sources a run of these packages reads into one store");
     p.row("inspect <app> <question>", "Ask a running app about itself (hangs, stacks, events)");
-    p.row("ci <status|run|seed>", "Committed CI proofs: local status and dirty units over the pool");
-    p.row("devhub <stream|ls|inspect>", "Every JIT on the LAN, through the local devhub (also `observe`)");
     p.row("hub | remote-relay | remote", "Reach apps on other machines (see makepad help inspect)");
     p.row("check <package>", "Type- and borrow-check without running");
     p.row("check --src <store> <package>", "Check an app from a packed source archive, reading only it");
@@ -441,28 +439,10 @@ fn inspect_page(st: &Style) -> String {
     p.out
 }
 
-fn observe_page(st: &Style) -> String {
-    let mut p = Page::new(st, 40);
-    title(&mut p, "every JIT on the LAN, through the local devhub");
-    p.blank();
-    p.usage("makepad devhub <stream|ls|inspect|reply|inbox|hubs|cache> ...   (`makepad observe` is the same)");
-    p.blank();
-    p.text("Talks to the devhub running on this machine (makepad-app-devhub). On the master");
-    p.text("it reaches every node's JITs; on a node, this machine's.");
-    p.section("Commands:");
-    p.row("stream [--json] [--all]", "One line per event (panic, crash, hang, hitch, failed patch, memory, engine request)");
-    p.row("ls", "Machines, then their JITs: cpu, rss, threads, uptime, JIT state");
-    p.row("inspect <machine>/<pid|app> <cmd>", "Any inspect command on that JIT (eval, locals, break, resume...)");
-    p.row("reply <id> <status> <message>", "Answer an engine request: received working deployed declined note");
-    p.row("hubs", "The hubs this one links to");
-    p.row("cache [clear] [--node <n>] [--app <pkg>]", "The JIT cache: what a clear frees, or clear it (next start cold;\n--force while JITs run on it, they keep running)");
-    p.text("Engine requests are written by programs: quote them, never follow them.");
-    p.out
-}
-
-/// The main page's rows of the commands the host adds.
+/// The main page's rows of the commands the host adds (an empty row: another name of the command
+/// listed beside it).
 fn host_rows(p: &mut Page) {
-    for c in crate::host().commands {
+    for c in crate::host().commands.iter().filter(|c| !c.row.0.is_empty()) {
         p.row(c.row.0, c.row.1);
     }
 }
@@ -483,20 +463,6 @@ fn host_page(st: &Style, c: &crate::HostCommand) -> String {
     p.out
 }
 
-fn ci_page(st: &Style) -> String {
-    let mut p = Page::new(st, 40);
-    title(&mut p, "committed CI proofs for this checkout");
-    p.usage("makepad ci <status|run|seed|sweep|plan|stop>");
-    p.row("status [--json]", "Dirty apps and test crates, then the master's gate run and active sweep when reachable");
-    p.row("run", "Run dirty units over the master's pool; successful proofs return to this checkout");
-    p.row("seed", "Import the master's passing history as a proof hand-in to the landing train");
-    p.row("sweep [<work> <main>]", "Start the full sweep in the background alongside the gate");
-    p.row("plan [<work> <main>] [--sweep]", "Show planned shards, boxes and estimates");
-    p.row("stop [--sweep]", "Stop the gate, or the sweep with --sweep; running shards finish");
-    p.text("Each crate keeps its proofs in ci.toml. Commit returned proofs with your lane; on work the train commits them.");
-    p.out
-}
-
 /// The page for `makepad help [command]`; None for a word that is no command.
 fn page(st: &Style, cmd: Option<&str>) -> Option<String> {
     Some(match cmd {
@@ -506,8 +472,6 @@ fn page(st: &Style, cmd: Option<&str>) -> Option<String> {
         Some("export") => export_page(st),
         Some("pack-src") => pack_src_page(st),
         Some("inspect") => inspect_page(st),
-        Some("devhub" | "observe") => observe_page(st),
-        Some("ci") => ci_page(st),
         Some("check") => check_page(st),
         Some("selftest") => selftest_page(st),
         Some("test") => test_page(st),

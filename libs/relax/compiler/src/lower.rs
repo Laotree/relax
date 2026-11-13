@@ -10783,11 +10783,11 @@ impl<'a> Lcx<'a> {
                 let foreign = self.u.prog.def(d).kind == DefKind::ForeignFn;
                 let mut types = Vec::new();
                 for value in &vals { types.push(value.1); }
-                // std::relax::main_hosted with the HAL bound to the loader: always hosted (the
-                // program's own main loop would be the HAL compiled from source, which a run
-                // with the HAL provided cannot run), so the standalone path folds away under a
-                // check and the boundary audit does not lower it
-                if foreign && vals.is_empty() && self.u.link_name(d) == "__relax_main_hosted" && self.u.provided.iter().any(|(k, _)| self.u.prog.syms.str(self.u.prog.crates[*k as usize].name) == "makepad_hal") {
+                // std::relax::main_hosted with the window host (`window-host = true`) bound to the
+                // loader: always hosted (the program's own main loop would be the host compiled
+                // from source, which a run with the host provided cannot run), so the standalone
+                // path folds away under a check and the boundary audit does not lower it
+                if foreign && vals.is_empty() && self.u.link_name(d) == "__relax_main_hosted" && self.u.provided.iter().any(|(k, _)| crate::unitgraph::window_host(&crate::unitgraph::manifest_dir_of(self.u.prog.crates[*k as usize].root_path()))) {
                     return Val::L(vec![self.iconst(1)]);
                 }
                 let callee = if foreign {
