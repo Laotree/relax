@@ -327,7 +327,7 @@ fn id_name_version(id: &str) -> (String, String) {
 struct Plan {
     script_pkgs: Vec<String>,
     lib_pkgs: Vec<String>,
-    /// cargo flags without `--release` (cargo check runs the release profile)
+    /// cargo flags without profile selection (native cargo checks use the release profile)
     flags: Vec<String>,
     /// "name version" of each native package
     names: Vec<String>,
@@ -365,8 +365,16 @@ fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
     }
     script_pkgs.sort();
     lib_pkgs.sort();
-    // cargo flags without `--release` (cargo check runs the release profile below)
-    let flags: Vec<String> = req.cargo_flags.iter().filter(|f| f.as_str() != "--release").cloned().collect();
+    let mut flags: Vec<String> = Vec::new();
+    let mut args = req.cargo_flags.iter();
+    while let Some(f) = args.next() {
+        match f.as_str() {
+            "--release" => {}
+            "--profile" => { args.next(); }
+            f if f.starts_with("--profile=") => {}
+            _ => flags.push(f.clone()),
+        }
+    }
 
     // ---- the key: what the native scripts' outputs depend on. Not the package the run is for,
     // and of the resolved graph only the native closure (the packages whose scripts or libs

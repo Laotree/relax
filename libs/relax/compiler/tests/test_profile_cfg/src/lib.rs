@@ -7,6 +7,8 @@ fn profile_cfg() {
     let mut checks = 0;
     debug_assert!({ checks += 1; true });
     assert_eq!(checks, if cfg!(feature = "debug") { 1 } else { 0 });
+    #[cfg(feature = "native")]
+    assert_eq!(profile_native::value(), 7);
 }
 
 #[cfg(debug_assertions)]

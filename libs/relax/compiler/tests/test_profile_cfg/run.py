@@ -22,6 +22,8 @@ cases = [
     ("release", "", ["--release"], "", "release_only"),
     ("release override", "[profile.release]\ndebug-assertions = true\n", ["--release"], "debug,dep-debug,build-debug,macro-debug,host-dep-debug", "debug_only"),
     ("custom", '[profile.checked]\ninherits = "release"\ndebug-assertions = true\n', ["--profile", "checked"], "debug,dep-debug,build-debug,macro-debug,host-dep-debug", "debug_only"),
+    ("native custom", '[profile.checked]\ninherits = "release"\ndebug-assertions = true\n', ["--profile", "checked"], "debug,dep-debug,build-debug,macro-debug,host-dep-debug,native", "debug_only"),
+    ("native custom equals", '[profile.checked]\ninherits = "release"\ndebug-assertions = true\n', ["--profile=checked"], "debug,dep-debug,build-debug,macro-debug,host-dep-debug,native", "debug_only"),
 ]
 
 with tempfile.TemporaryDirectory(prefix="test-profile-cfg-") as tmp:
@@ -31,7 +33,8 @@ with tempfile.TemporaryDirectory(prefix="test-profile-cfg-") as tmp:
     env = dict(os.environ, RELAX_CACHE_DIR=str(Path(tmp) / "cache"))
     for label, profile, flags, features, selected in cases:
         (pkg / "Cargo.toml").write_text(manifest + "\n" + profile)
-        for command in (["cargo", "test", "--lib"], [runner, "test", "test-profile-cfg", "--lib"]):
+        native_flags = ["--allow-c"] if "native" in features.split(",") else []
+        for command in (["cargo", "test", "--lib"], [runner, "test", *native_flags, "test-profile-cfg", "--lib"]):
             result = subprocess.run(command + flags + ["--features", features], cwd=pkg, env=env,
                                     text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             print(f"{label}: {' '.join(command)}\n{result.stdout}", flush=True)

@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace]
-exclude = ["dep", "macros"]
+exclude = ["dep", "macros", "native"]
 
 [dependencies]
 profile-dep = { path = "dep" }
 profile-macros = { path = "macros" }
+profile-native = { path = "native", optional = true }
 
 [features]
 debug = []
@@ -16,3 +17,4 @@ dep-debug = []
 build-debug = []
 macro-debug = []
 host-dep-debug = []
+native = ["dep:profile-native"]
