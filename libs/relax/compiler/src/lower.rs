@@ -7087,6 +7087,9 @@ impl<'a> Lcx<'a> {
                     // a coercion cast without a representation change (`Some(4) as Option<u32>`)
                     return self.lower_expr(*x);
                 }
+                if let Some(discr) = self.variant_path_discr(*x).filter(|_| matches!(self.kind_ref(t), TyKind::Int(_))) {
+                    return self.variant_discr_cast(discr, t);
+                }
                 let v = self.lower_expr(*x);
                 self.cast(v, xt, t)
             }
@@ -9067,6 +9070,9 @@ impl<'a> Lcx<'a> {
                 Val::L(vec![self.ibin(IOp::Xor, false, p.0, m), self.ibin(IOp::Xor, false, p.1, m)])
             }
             ExprKind::Cast(x, _) => {
+                if let Some(discr) = self.variant_path_discr(*x).filter(|_| self.is_wide(t)) {
+                    return self.variant_discr_cast(discr, t);
+                }
                 let xt = self.body_ty(*x);
                 let v = self.lower_expr(*x);
                 if matches!(self.kind(xt), TyKind::Adt(..)) { return self.cast(v, xt, t); }
@@ -9423,6 +9429,42 @@ impl<'a> Lcx<'a> {
             self.term(Term::Unreachable);
             self.switch(ok2);
         }
+    }
+
+    /// `variant_cast_discr` of a cast's operand that is a path (in parentheses or not).
+    fn variant_path_discr(&self, x: ExprId) -> Option<(Option<DefId>, u32, TyId)> {
+        let x = strip_paren(self.ast(), x);
+        if !matches!(self.ast().expr(x).kind, ExprKind::Path(..)) {
+            return None;
+        }
+        let Some(&Res::Def(d)) = self.b.res.get(&x.0) else { return None };
+        variant_cast_discr(self.u, d, self.body_ty(x))
+    }
+
+    /// `variant_path_discr`'s discriminant cast to the integer type `t`. The explicit
+    /// discriminant is read as any constant is (rustc: an unevaluated constant operand of its
+    /// anonymous constant): one that fails, or needs the constant being evaluated, is that
+    /// constant's own error, never a stand-in value.
+    fn variant_discr_cast(&mut self, (explicit, offset, rt): (Option<DefId>, u32, TyId), t: TyId) -> Val {
+        let (lo, hi) = match explicit {
+            Some(d) => {
+                let v = self.const_val(d, Vec::new(), rt);
+                let base = self.wide_parts(v, rt);
+                if offset == 0 {
+                    base
+                } else {
+                    let off = (self.iconst(offset as i64), self.iconst(0));
+                    self.wide_arith(BinOp::Add, false, base, off).unwrap()
+                }
+            }
+            None => (self.iconst(offset as i64), self.iconst(0)),
+        };
+        if self.is_wide(t) {
+            return Val::L(vec![lo, hi]);
+        }
+        let r = self.f.vreg(Cls::I);
+        self.emit(Inst::Conv(Conv::IntToInt(self.int_ty(t)), r, lo));
+        Val::L(vec![r])
     }
 
     fn cast(&mut self, v: Val, from: TyId, to: TyId) -> Val {
@@ -13401,6 +13443,27 @@ pub fn emit_store_disc(u: &Unit, f: &mut Func, b: u32, pos: u64, p: VReg, off: i
         push_at(f, b, pos, Inst::Store(Mem::Int(8, false), p, off + toff as i32, k));
         push_at(f, b, pos, Inst::Store(Mem::Int(8, false), p, off + toff as i32 + 8, hi));
     } else { push_at(f, b, pos, Inst::Store(tmem, p, off + toff as i32, k)); }
+}
+
+/// rustc_mir_build thir/cx/expr.rs `mirror_expr_cast`: a cast of a path to a fieldless variant
+/// is that variant's discriminant: the explicit discriminant constant before it (None: the enum's
+/// first value, 0) plus the variant's offset, in the enum's repr type. No enum value is built and
+/// no layout is read, so an enum's own discriminants can cast its earlier variants
+/// (`B = f(E::A as u128) as u64`): the layout needs every discriminant, the ones being evaluated
+/// among them. `d` is the definition the path resolved to, `ty` the path's type.
+pub(crate) fn variant_cast_discr(u: &Unit, d: DefId, ty: TyId) -> Option<(Option<DefId>, u32, TyId)> {
+    let def = u.prog.def(d);
+    if def.kind != DefKind::Variant {
+        return None;
+    }
+    // a tuple variant's path is its constructor fn, not an enum value
+    let &TyKind::Adt(ad, _, _) = u.tcx.tys.kind(ty) else { return None };
+    let adt = u.tcx.adts.get(&ad)?;
+    if !adt.is_enum {
+        return None;
+    }
+    let (explicit, offset) = adt.discriminant_def_for_variant(def.sub)?;
+    Some((explicit, offset, u.tcx.tys.prim(adt.repr_int.unwrap_or(Prim::Isize))))
 }
 
 /// The discriminant of a constant's enum value whose tag field reads `raw` (sign-extended

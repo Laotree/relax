@@ -564,6 +564,9 @@ impl<'a> Ctx<'a> {
                 Some(Vec::new())
             }
             ExprKind::Cast(x, _) => {
+                if let Some(v) = self.variant_cast(b, x, t) {
+                    return v;
+                }
                 let v = self.eval(b, env, x)?;
                 self.cast(&v, b.ty(x), t)
             }
@@ -1265,6 +1268,32 @@ impl<'a> Ctx<'a> {
             return None;
         }
         Some(store_int(r, n))
+    }
+
+    /// A fieldless variant's path cast to an integer: its discriminant (lower::variant_cast_discr),
+    /// the explicit discriminant constant read as any constant is, plus the variant's offset. No
+    /// enum value is built, so no layout is asked for. None: not such a cast.
+    fn variant_cast(&mut self, b: &Body, x: ExprId, t: TyId) -> Option<Option<Vec<u8>>> {
+        if !matches!(self.kind(t), TyKind::Int(_)) {
+            return None;
+        }
+        let ast = &self.u.prog.files[b.file as usize].ast;
+        let x = crate::lit::strip_paren(ast, x);
+        if !matches!(ast.expr(x).kind, ExprKind::Path(_)) {
+            return None;
+        }
+        let Some(&Res::Def(d)) = b.res.get(&x.0) else { return None };
+        let (explicit, offset, rt) = crate::lower::variant_cast_discr(self.u, d, b.ty(x))?;
+        let (n, signed) = self.int_of(rt)?;
+        let base = match explicit {
+            Some(c) => match self.const_data(c, Vec::new()) {
+                Some(a) => load_int(unsafe { std::slice::from_raw_parts(a as *const u8, n) }, n, signed),
+                None => return Some(None),
+            },
+            None => 0,
+        };
+        let repr = store_int(base.wrapping_add(offset as i128), n);
+        Some(self.cast(&repr, rt, t))
     }
 
     fn cast(&mut self, v: &[u8], from: TyId, to: TyId) -> Option<Vec<u8>> {
