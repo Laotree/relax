@@ -356,8 +356,11 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
                     }
                 };
                 for bin_name in &g.bins {
-                    // the bin's run: the loader's command line before the bin's own arguments
-                    let mut words: Vec<String> = [exe_str.as_str(), "run", "--quiet", "--silent", "--no-live", "--run-dir", td_str.as_str(), "--workspace-dir", pkg_dir.as_str(), pkg_name.as_str(), "--no-default-features"].iter().map(|w| w.to_string()).collect();
+                    // the bin's run: the loader's command line before the bin's own arguments. A
+                    // run no one attends, as the test's own: a panic unwinds and a compile error
+                    // ends it at once, as a rustc build's binary ends, however the test run is
+                    // watched (a devhub-observed run parked a panic 600 s)
+                    let mut words: Vec<String> = [exe_str.as_str(), "run", "--quiet", "--silent", "--no-live", "--unattended", "--run-dir", td_str.as_str(), "--workspace-dir", pkg_dir.as_str(), pkg_name.as_str(), "--no-default-features"].iter().map(|w| w.to_string()).collect();
                     // the test run's native permission is the binary's, as cargo builds the binary
                     // with the test: a test that clears its child's environment (or takes
                     // RELAX_ALLOW_C out of it) still starts the binary (relax issue 157)
