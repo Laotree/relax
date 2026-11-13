@@ -1249,7 +1249,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         let name = cargo_flags.iter().position(|f| f == "--bin").and_then(|j| cargo_flags.get(j + 1)).cloned()
             .or_else(|| cargo_flags.iter().find_map(|f| f.strip_prefix("--bin=").map(str::to_string)))
             .unwrap_or_else(|| std::path::Path::new(&package).file_stem().map_or_else(|| package.clone(), |s| s.to_string_lossy().into_owned()));
-        crate::selfexe::link(&exe, &name)
+        crate::selfexe::link(&exe, &name, harness || plain_test)
     }));
     if let Some(Err(why)) = &own {
         eprintln!("relax run: the program's own executable could not be made ({why}): a spawn of it runs the loader, not the program");
@@ -1350,6 +1350,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             return 1;
         }
     };
+    // a test's package binaries where cargo puts them, above its own executable's `deps/`
+    if harness || plain_test {
+        let mut launchers: Vec<String> = g.env.iter().flatten().filter(|(k, _)| k.starts_with("CARGO_BIN_EXE_")).map(|(_, v)| v.clone()).collect();
+        launchers.sort();
+        launchers.dedup();
+        crate::selfexe::add_bins(&launchers);
+    }
     // a test process's target (test_subjects): its --subject in a graph of several test targets
     // (test_pkg.rs), else the graph's one (the lib's unit tests); the graph's other targets are
     // loaded with it (one program, one collected image) and never run here

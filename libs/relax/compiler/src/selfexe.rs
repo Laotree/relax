@@ -12,6 +12,11 @@
 //! exec) runs this program again too: the loader started by that path finds the line beside
 //! itself (`relaunched`), as std's spawn would have put it before the arguments.
 //!
+//! The folder is laid out as cargo lays out target/<profile>: a test's executable sits in its
+//! `deps/` folder and the package's binaries (their CARGO_BIN_EXE_<name> launchers) in the folder
+//! itself (`add_bins`), so a test that finds a binary at `current_exe()/../../<name>`, as under
+//! cargo, finds it (relax issue 139's second case).
+//!
 //! The folder goes when the run exits (os::proc::exit); a run that did not get there (killed)
 //! leaves it, and the next run's `link` removes the folders of processes that are gone. They
 //! matter: a link keeps an old loader's blocks alive after cargo replaces the binary.
@@ -19,10 +24,13 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 static OWN_DIR: OnceLock<PathBuf> = OnceLock::new();
+/// The folder of the link: OWN_DIR, a test's `deps/` in it
+static LINK_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// This process's link to `loader`, named `name` (a package or binary name), made once; the
 /// reason when the run dir's file system cannot hold it (another volume than the loader's).
-pub fn link(loader: &Path, name: &str) -> Result<PathBuf, String> {
+/// `test`: a test's executable, in the folder's `deps/` as cargo puts it.
+pub fn link(loader: &Path, name: &str, test: bool) -> Result<PathBuf, String> {
     let root = crate::dirs::relax_dir().join("exe");
     sweep(&root);
     let dir = root.join(std::process::id().to_string());
@@ -32,15 +40,18 @@ pub fn link(loader: &Path, name: &str) -> Result<PathBuf, String> {
     // current_exe() failed: not found, 11-13)
     if dir.canonicalize().is_ok_and(|d| loader.starts_with(d)) {
         let _ = OWN_DIR.set(dir);
+        let _ = LINK_DIR.set(loader.parent().map_or_else(PathBuf::new, Path::to_path_buf));
         return Ok(loader.to_path_buf());
     }
     // a folder under this pid is a gone process's (pids are reused)
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let at = if test { dir.join("deps") } else { dir.clone() };
+    std::fs::create_dir_all(&at).map_err(|e| format!("{}: {e}", at.display()))?;
     let _ = OWN_DIR.set(dir.clone());
     let name: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect();
     let file = if cfg!(windows) { format!("{name}.exe") } else { name };
-    let link = dir.join(file);
+    let link = at.join(file);
+    let _ = LINK_DIR.set(at);
     std::fs::hard_link(loader, &link).map_err(|e| format!("hard link {} of {}: {e}", link.display(), loader.display()))?;
     link.canonicalize().map_err(|e| format!("{}: {e}", link.display()))
 }
@@ -66,8 +77,23 @@ const LINE: &str = "+self-exec";
 
 /// Writes this run's command line (RELAX_SELF_EXEC's words, up to and with `--`) beside its link.
 pub fn set_line(words: &[String]) -> Result<(), String> {
-    let dir = OWN_DIR.get().ok_or("no link was made")?;
+    let dir = LINK_DIR.get().ok_or("no link was made")?;
     std::fs::write(dir.join(LINE), words.join("\u{1f}")).map_err(|e| format!("{}: {e}", dir.join(LINE).display()))
+}
+
+/// The package's binaries in this run's folder, as cargo has them in target/<profile> beside a
+/// test's `deps/`: `launchers` are the CARGO_BIN_EXE_<name> values, each linked (else copied)
+/// under its own file name. A test that finds a binary by that layout ran nothing before.
+pub fn add_bins(launchers: &[String]) {
+    let Some(dir) = OWN_DIR.get() else { return };
+    for l in launchers {
+        let from = Path::new(l);
+        let Some(file) = from.file_name() else { continue };
+        let to = dir.join(file);
+        if !to.exists() && std::fs::hard_link(from, &to).is_err() {
+            let _ = std::fs::copy(from, &to);
+        }
+    }
 }
 
 /// A launch of a run's link whose arguments do not start with the run's command line (Relax std's
