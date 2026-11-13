@@ -509,7 +509,6 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
         _ => None,
     };
     let mut native_seeds: Vec<usize> = Vec::new();
-    let mut check_skipped: Vec<usize> = Vec::new();
     for (i, reason) in native_scripts {
         let bs = &g.build_scripts[i];
         let (_, pname, _) = &g.pkg[bs.krate];
@@ -522,12 +521,8 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
             continue;
         }
         // a script that runs a C compiler cannot work without one; `links =` / DEP_ metadata
-        // alone run under Relax as before
-        if reason.compiles_c() && check_only {
-            eprintln!("relax check: `{}`'s build script compiles C ({}): not run without `--allow-c` (its cfgs and OUT_DIR are missing; a `--allow-c` run fills the cache this check reads)", pname, why);
-            check_skipped.push(bs.krate);
-            continue;
-        }
+        // alone run under Relax as before. Checks still need the script's cfgs and generated
+        // files: a missing native receipt cannot stand in for a successful build script.
         if reason.compiles_c() {
             return Err(format!("`{}` compiles C ({}): it {}", pname, why, relax_session::options::C_GATE));
         }
@@ -537,7 +532,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
     // compile it, so they read the native outputs from a receipt (native.rs `write_receipt`).
     // Only they wait for a cold native build and only their rerun keys hold the receipt's name.
     let reach: Vec<bool> = g.build_scripts.iter().map(|bs| {
-        !native_krates.is_empty() && !native_krates.contains(&bs.krate) && !check_skipped.contains(&bs.krate) && reaches_native(g, bs, &native_krates)
+        !native_krates.is_empty() && !native_krates.contains(&bs.krate) && reaches_native(g, bs, &native_krates)
     }).collect();
     let mut receipt: Option<String> = None;
     let mut prebuilt = false;
@@ -593,7 +588,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
             _ => Vec::new(),
         };
         let receipts: Vec<Option<&str>> = reach.iter().map(|&r| if r { receipt.as_deref() } else { None }).collect();
-        let mut results = relax_scripts(sess, gr, target_dir, &native_krates, &check_skipped, &receipts, &meta, &|k| world.is_empty() || world[k]);
+        let mut results = relax_scripts(sess, gr, target_dir, &native_krates, &receipts, &meta, &|k| world.is_empty() || world[k]);
         let mut _kept = None;
         if let (Some(job), Some(done)) = (&native_job, scripts_done) {
             if !job.is_finished() {
@@ -609,7 +604,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
             }
         }
         if !world.is_empty() {
-            results.extend(relax_scripts(sess, gr, target_dir, &native_krates, &check_skipped, &receipts, &meta, &|k| !world[k]));
+            results.extend(relax_scripts(sess, gr, target_dir, &native_krates, &receipts, &meta, &|k| !world[k]));
         }
         (native_job.map(|j| j.join().unwrap_or_else(|_| Err("--allow-c: the native build panicked".to_string()))), results)
     });
@@ -707,11 +702,11 @@ fn apply_native_scripts(g: &mut Graph, scripts: Vec<crate::native::ScriptOut>) {
 /// One table for both calls of `relax_scripts` (the macro world's scripts first).
 type LinksMeta = Mutex<std::collections::HashMap<usize, Result<Vec<(String, String)>, String>>>;
 
-/// The scripts Relax runs itself (every one but the native packages' and a check's skipped
-/// ones), on the pool: (crates, stdout or error, OUT_DIR) per script. A script whose package
+/// The scripts Relax runs itself (every one but the native packages'), on the pool:
+/// (crates, stdout or error, OUT_DIR) per script. A script whose package
 /// depends on `links` packages runs after their scripts, given their metadata (cargo orders the
 /// runs the same way); most graphs have no such pair and run every script at once.
-fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &str, native_krates: &[usize], check_skipped: &[usize],
+fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &str, native_krates: &[usize],
     receipts: &[Option<&str>], meta: &LinksMeta,
     only: &(dyn Fn(usize) -> bool + Sync)) -> Vec<(Vec<usize>, Result<String, String>, String)> {
     let results: Mutex<Vec<(Vec<usize>, Result<String, String>, String)>> = Mutex::new(Vec::new());
@@ -732,12 +727,6 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
         if native_krates.contains(&bs.krate) || !only(bs.krate) {
             continue;
         }
-        if check_skipped.contains(&bs.krate) {
-            let out_dir = unbuilt(bs);
-            results.lock().unwrap().push((bs.krates(), Ok(String::new()), out_dir));
-            meta.lock().unwrap().insert(i, Err("its build script compiles C, which is not run without `--allow-c`".to_string()));
-            continue;
-        }
         let (dir, pname, _) = &g.pkg[bs.krate];
         let name = &g.crates[bs.krate].name;
         let role = if noop::script(bs, &g.raw) {
@@ -750,8 +739,8 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
             ScriptRole::Answered(lines) => {
                 // cargo sets OUT_DIR for every package with a build script
                 let out_dir = format!("{}/build/{}-answered/out", target_dir, name);
-                let _ = std::fs::create_dir_all(&out_dir);
-                done(i, Ok(lines.join("\n")), out_dir);
+                let r = std::fs::create_dir_all(&out_dir).map(|_| lines.join("\n")).map_err(|e| format!("{}: {}", out_dir, e));
+                done(i, r, out_dir);
                 continue;
             }
             ScriptRole::ToRemove => {
@@ -882,16 +871,8 @@ fn script_metadata(stdout: &str) -> Vec<(String, String)> {
 /// The scripts' `cargo:` lines into the graph: cfgs, link libraries, env (OUT_DIR included).
 fn apply_script_results(g: &mut Graph, results: Vec<(Vec<usize>, Result<String, String>, String)>, check_only: bool) -> Result<(), String> {
     for (krates, r, out_dir) in results {
-        let stdout = match r {
-            Ok(s) => s,
-            // a check without `--allow-c`: a script that needed a skipped C package (aws-lc-rs reads
-            // aws-lc-sys's DEP_ metadata) leaves its crate unconfigured, said once, not fatal
-            Err(e) if check_only => {
-                eprintln!("relax check: {} (its crate is checked without the script's cfgs)", e.lines().next().unwrap_or(""));
-                String::new()
-            }
-            Err(e) => return Err(e),
-        };
+        // A failed prerequisite cannot produce a passing package verdict, even when only checking.
+        let stdout = r?;
         for k in krates { apply_script_output(g, k, &stdout, out_dir.clone(), check_only)?; }
     }
     Ok(())
