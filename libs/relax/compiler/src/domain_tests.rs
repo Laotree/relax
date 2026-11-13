@@ -1277,7 +1277,7 @@ extern "C" fn called_after_the_end() {}
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn signal(sig: i32, handler: usize) -> usize;
-    fn pthread_key_create(key: *mut u32, dtor: usize) -> i32;
+    fn pthread_key_create(key: *mut usize, dtor: usize) -> i32;
     fn pthread_atfork(prepare: Option<extern "C" fn()>, parent: Option<extern "C" fn()>, child: Option<extern "C" fn()>) -> i32;
 }
 #[cfg(unix)]
@@ -1292,7 +1292,8 @@ fn platform() -> *mut u8 {
     const SIGUSR2: i32 = 31;
     unsafe {
         signal(SIGUSR2, called_after_the_end as usize);
-        let mut key = 0;
+        // Apple's pthread_key_t is a usize; the shim writes that many bytes
+        let mut key: usize = 0;
         pthread_key_create(&mut key, called_after_the_end as usize);
         pthread_atfork(Some(called_after_the_end), None, None);
         mmap(std::ptr::null_mut(), 1 << 20, 3, 2 | MAP_ANON, -1, 0)
