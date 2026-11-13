@@ -21,8 +21,9 @@ pub mod ev {
     pub const CHECK: u8 = 2;
     /// queued for O3: `why` = the queue reason (Q_*), `a` = rate (calls/s), `b` = the code
     pub const QUEUE: u8 = 3;
-    /// an O3 queue entry that waited past REVALIDATE_NS went back to counting: `a` = its age
-    pub const REVALIDATE: u8 = 4;
+    /// an O3 queue entry left at its pick, its code under the threshold's rate (o3_pick_cold): `why` =
+    /// the queue reason, `a` = ns it waited, `b` = its cost then
+    pub const LEFT: u8 = 4;
     /// ... but other code was installed meanwhile: it stays queued (built)
     pub const KEPT: u8 = 5;
     /// a worker took it from the queue: `why` = queue reason, `a` = ns it waited
@@ -56,10 +57,10 @@ pub mod ev {
 
 pub const ARM_NEW: u8 = 0;
 pub const ARM_REARM: u8 = 1;
-pub const ARM_REVALIDATE: u8 = 2;
+pub const ARM_LEFT: u8 = 2;
 pub const ARM_SANDBOX: u8 = 3;
 pub const ARM_IMAGE: u8 = 4;
-pub const ARM_WHY: [&str; 5] = ["new code", "new code under the open window", "counted again (queued too long)", "sandbox twin", "startup image"];
+pub const ARM_WHY: [&str; 5] = ["new code", "new code under the open window", "counted again (cold at its O3 pick)", "sandbox twin", "startup image"];
 
 pub const WIN_DONE: u8 = 0;
 pub const WIN_IDLE: u8 = 1;
@@ -281,7 +282,7 @@ pub fn describe(e: &Ev, code: &dyn Fn(u64) -> String) -> String {
         ev::ARM => format!("count stub armed on {} ({})", code(e.b), ARM_WHY.get(e.why as usize).unwrap_or(&"?")),
         ev::CHECK => format!("cost check on {}: decayed cost {} under the threshold", code(e.b), e.a),
         ev::QUEUE => format!("queued for O3 by {}{}{}", Q_WHY.get(e.why as usize).unwrap_or(&"?"), if e.a > 0 { format!(" at {} cost/s", e.a) } else { String::new() }, if e.b != 0 { format!(" on {}", code(e.b)) } else { String::new() }),
-        ev::REVALIDATE => format!("O3 queue entry {} old: counted again", ms(e.a)),
+        ev::LEFT => format!("left the O3 queue at its pick ({}) after {}: cost {} under the threshold", Q_WHY.get(e.why as usize).unwrap_or(&"?"), ms(e.a), e.b),
         ev::KEPT => "O3 queue entry stays queued (other code was installed meanwhile)".into(),
         ev::POP => format!("taken by an O3 worker ({}) after {} in the queue", Q_WHY.get(e.why as usize).unwrap_or(&"?"), ms(e.a)),
         ev::COUNTED => format!("counted (PGO) build installed{}", if e.why == 1 { " (lukewarm: O3 once its counts show work)" } else { "" }),
