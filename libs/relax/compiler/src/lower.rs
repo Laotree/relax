@@ -6000,6 +6000,9 @@ impl<'a> Lcx<'a> {
             ExprKind::Paren(x) => self.promotable(x),
             ExprKind::Unary(UnOp::Neg | UnOp::Not, x) => self.promotable(x) && !self.b.binops.contains_key(&e.0),
             ExprKind::Array(v) | ExprKind::Tuple(v) => ast.list(v).iter().all(|x| self.promotable(*x)),
+            // The repeat count is already a constant in the array type; the repeated
+            // operand must itself be promotable just like each array element.
+            ExprKind::Repeat(x, _) => self.promotable(x),
             // rustc_mir_transform/src/promote_consts.rs: Validator::validate_rvalue accepts a
             // primitive BinaryOp of promotable operands (`&[0.0, PSI, -PSI / 4.0]` is a static),
             // except raw/fn pointer operands and an integer `/` or `%` whose divisor is not a
@@ -8148,11 +8151,10 @@ impl<'a> Lcx<'a> {
                     Some(&(d, f)) => (d as usize, f),
                     None => return (Place::Regs(Vec::new()), t),
                 };
-                // A shared projection from a constant borrows its immutable allocation,
-                // just like CONST[i] below. A stack copy leaves `&CONST.field` dangling
-                // when returned from a function (a hash table's static empty control group).
-                // Mutable projections still need an independent constant copy.
-                let promoted = if derefs == 0 && !self.want_mut && matches!(self.ast().expr(strip_paren(self.ast(), *x)).kind, ExprKind::Path(_))
+                // A shared projection of a promotable temporary borrows its immutable
+                // allocation. A stack copy would leave the returned reference dangling.
+                // Mutable projections still need an independent temporary.
+                let promoted = if derefs == 0 && !self.want_mut && !self.is_place_expr(*x)
                     && self.promotable(*x)
                     && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), self.body_ty(*x)) {
                     self.promote_rvalue(*x, true).map(|p| (Place::Mem(p, 0), self.body_ty(*x)))
@@ -8181,9 +8183,9 @@ impl<'a> Lcx<'a> {
             }
             ExprKind::Index(a, i) => {
                 let derefs = self.b.index_derefs(e.0);
-                // `CONST[i]` read: the constant's own immutable allocation (rustc reads a promoted
-                // constant's memory), not a copy of the whole array on the stack per use
-                let promoted = if derefs == 0 && !self.want_mut && matches!(self.ast().expr(strip_paren(self.ast(), *a)).kind, ExprKind::Path(_))
+                // A shared index into a promotable array borrows its immutable allocation,
+                // rather than a stack temporary that can dangle after returning.
+                let promoted = if derefs == 0 && !self.want_mut && !self.is_place_expr(*a)
                     && matches!(self.kind(self.body_ty(*a)), TyKind::Array(..)) && self.promotable(*a)
                     && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), self.body_ty(*a)) {
                     self.promote_rvalue(*a, true).map(|p| (Place::Mem(p, 0), self.body_ty(*a)))
@@ -8354,11 +8356,9 @@ impl<'a> Lcx<'a> {
         let at = self.body_ty(a);
         // autoderef recorded by type checking (Vec<T> -> [T], String -> str, &&[T] ..)
         let derefs = self.b.index_derefs(e.0);
-        // `CONST[lo..hi]` of a const array: the constant's own immutable allocation, as for
-        // `CONST[i]` (rustc promotes the index's `&CONST`), so the sub-slice is 'static -- a stack
-        // copy dangles once the fn or closure that sliced it returns (`GAPS[..1].iter()` returned
-        // from a closure). A mutable range slices a copy.
-        let promoted = if derefs == 0 && !self.want_mut && matches!(self.ast().expr(strip_paren(self.ast(), a)).kind, ExprKind::Path(_))
+        // A shared slice of a promotable array borrows its immutable allocation, as for
+        // indexing one element. A mutable range must keep an independent temporary.
+        let promoted = if derefs == 0 && !self.want_mut && !self.is_place_expr(a)
             && matches!(self.kind(at), TyKind::Array(..)) && self.promotable(a)
             && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), at) {
             self.promote_rvalue(a, true).map(|p| (Place::Mem(p, 0), at))
