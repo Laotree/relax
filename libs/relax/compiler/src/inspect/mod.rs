@@ -89,8 +89,8 @@ fn server_thread_exit() {
     SERVER_TIDS.lock().unwrap().retain(|t| *t != me);
 }
 
-/// A test harness's endpoint: there to answer when the run hangs. A test's panic is the test's
-/// (nothing parks), and its output says nothing about the endpoint.
+/// A test harness's endpoint: there to answer when the run hangs. A test's panic and stale access
+/// are the test's (nothing parks), and its output says nothing about the endpoint.
 static TEST_RUN: AtomicBool = AtomicBool::new(false);
 
 /// [`start`] for a test run.

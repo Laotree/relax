@@ -9,7 +9,8 @@
 //!   panel shows like a parked panic), pauses the program's threads so the state stays inspectable,
 //!   and waits for a decision: `restart` (the process starts again) or `stop` (the process ends by
 //!   the fault's signal). With nobody who could decide (no Run panel, no inspect
-//!   watcher or agent; RELAX_STALE_PARK=1 forces the park) the report is followed by `stop`.
+//!   watcher or agent; a test run's or an unattended run's is its own: events::can_decide;
+//!   RELAX_STALE_PARK=1 forces the park) the report is followed by `stop`.
 //!   A quit (a signal, the app's own quit) ends the wait as its domain's stop does: the program
 //!   goes on so its quit runs to the end (inspect::events::quit_releases).
 //!
@@ -302,7 +303,8 @@ fn wait() {
     std::thread::sleep(std::time::Duration::from_millis(250));
 }
 
-/// Somebody can answer a parked stale access: the Run panel, an inspect watcher or agent.
+/// Somebody can answer a parked stale access: the Run panel, an inspect watcher or agent, devhub
+/// (not for a test run or an unattended run).
 fn decidable() -> bool {
     std::env::var_os("RELAX_STALE_PARK").is_some_and(|v| v != "0") || crate::inspect::events::can_decide()
 }
@@ -441,7 +443,7 @@ fn handle(rec: &Rec) {
     }
     crate::zone_alloc::kept_with(|| ANSWERS.lock().unwrap_or_else(|e| e.into_inner()).push((verdict.clone(), report.clone())));
     if !decidable() {
-        eprintln!("relax: nobody can decide on the stale access (no Run panel, inspect watcher or agent; RELAX_STALE_PARK=1 parks): the process ends");
+        eprintln!("relax: nobody can decide on the stale access (no Run panel, inspect watcher or agent, or a test or unattended run; RELAX_STALE_PARK=1 parks): the process ends");
         crate::os::fault::die_by(sig);
     }
     // (a paused process must answer: `makepad test` and hosted runs may not have started inspect)

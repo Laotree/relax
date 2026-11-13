@@ -553,9 +553,15 @@ pub fn on_panic(info: &crate::jit::PanicInfo, regs: *const u64) {
 }
 
 /// Somebody could answer a parked stop now: the Run panel, an inspect watcher, an agent, devhub.
-/// A terminal alone cannot justify a stale access's park, which has no timeout.
+/// A terminal alone cannot justify a stale access's park, which has no timeout. A test run's stop
+/// is the test's, as its panics are (`makepad test`: a fixture that asserts its child dies parked
+/// under devhub's observer and paused the whole job, J13263, 11-13), and an unattended run has
+/// nobody by definition: both end with the report.
 pub fn can_decide() -> bool {
-    super::STARTED.load(Relaxed) && (WATCHERS.load(SeqCst) > 0 || super::AGENT.load(Relaxed) || OBSERVERS.load(SeqCst) > 0 || RUN_STATE_AVAILABLE.load(SeqCst))
+    super::STARTED.load(Relaxed)
+        && !super::TEST_RUN.load(Relaxed)
+        && !UNATTENDED.load(Relaxed)
+        && (WATCHERS.load(SeqCst) > 0 || super::AGENT.load(Relaxed) || OBSERVERS.load(SeqCst) > 0 || RUN_STATE_AVAILABLE.load(SeqCst))
 }
 
 /// What the user decided for a parked stale access.
