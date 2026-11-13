@@ -114,6 +114,9 @@ fn host() -> &'static Host {
 pub fn set_host(host: &'static Host) {
     if HOST.set(host).is_ok() {
         relax_compiler::pmhost::set_policy(host.proc_macros);
+        // what a program's spawn of this executable may start with to run it, not itself again
+        // (std process.rs `loader_command`): the runner's commands and the host's own
+        relax_compiler::set_loader_commands(help::COMMANDS.iter().copied().chain(host.commands.iter().map(|c| c.name)).collect());
         relax_compiler::reload::set_loader_package(host.package, host.manifest);
         // the entry point's ahead level, unless the environment names one; RELAX_AHEAD
         // carries it to the session (options.rs) and to every process this one starts
@@ -164,7 +167,6 @@ pub fn main(host: &'static Host) {
     relax_compiler::progenv::init();
     set_host(host);
     relax_compiler::set_tool_name(help::command());
-    relax_compiler::set_loader_commands(help::COMMANDS);
     warn_legacy_env();
     relax_compiler::wasm_export::startup();
     run(relax_compiler::os::proc::args_bytes())
@@ -189,7 +191,6 @@ fn warn_legacy_env() {
 /// executable, which build scripts and `RELAX_LOADER` programs run as.
 pub fn init_embedded(exe: &std::path::Path, host: &'static Host) {
     set_host(host);
-    relax_compiler::set_loader_commands(help::COMMANDS);
     relax_compiler::unitgraph::set_self_exe(exe.to_path_buf());
     // the program's argv[0] / current_exe: the embedder has no command line of its own
     relax_compiler::os::proc::set_args(vec![exe.as_os_str().as_encoded_bytes().to_vec()]);

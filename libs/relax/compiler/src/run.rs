@@ -1286,7 +1286,11 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
         pre.push("--".to_string());
         crate::progenv::set_run_fact("RELAX_SELF_EXEC", pre.join("\u{1f}"));
-        crate::progenv::set_run_fact("RELAX_SELF_EXEC_COMMANDS", crate::loader_commands().join("\u{1f}"));
+        // stated only when the host gave its commands: without the fact std runs every spawn of the
+        // loader as written, so an embedder without a list starts no re-run it did not mean
+        if !crate::loader_commands().is_empty() {
+            crate::progenv::set_run_fact("RELAX_SELF_EXEC_COMMANDS", crate::loader_commands().join("\u{1f}"));
+        }
         prog_args[0] = exe.display().to_string().into_bytes();
     }
     // started through an integration test's CARGO_BIN_EXE_<bin> (unitgraph.rs writes that wrapper):

@@ -95,16 +95,17 @@ pub fn tool_name() -> &'static str {
 }
 
 /// The words a command line of this executable starts with (`run`, `app`, `export`, `check`,
-/// `test`, ...), as the runner sets them at start from its own command list. A program run under
-/// the loader whose spawn of the loader's executable starts with one of them runs that command;
-/// any other spawn of it runs the program again (the run fact RELAX_SELF_EXEC_COMMANDS, std
-/// process.rs `loader_command`). A property of the process, so reset_statics leaves it.
-static LOADER_COMMANDS: std::sync::OnceLock<&'static [&'static str]> = std::sync::OnceLock::new();
-pub fn set_loader_commands(words: &'static [&'static str]) {
+/// `test`, ...), as the runner sets them with its host from its own command list and the host's
+/// commands. A program run under the loader whose spawn of the loader's executable starts with one
+/// of them runs that command; any other spawn of it runs the program again (the run fact
+/// RELAX_SELF_EXEC_COMMANDS, std process.rs `loader_command`). A property of the process, so
+/// reset_statics leaves it.
+static LOADER_COMMANDS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+pub fn set_loader_commands(words: Vec<&'static str>) {
     let _ = LOADER_COMMANDS.set(words);
 }
 pub fn loader_commands() -> &'static [&'static str] {
-    LOADER_COMMANDS.get().copied().unwrap_or(&[])
+    LOADER_COMMANDS.get().map_or(&[], Vec::as_slice)
 }
 
 // This crate's source stamp (build.rs, libs/relax/self_stamp.rs): relax-compiler folds it into the codegen identity.
