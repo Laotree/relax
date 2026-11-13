@@ -194,7 +194,8 @@ pub fn concurrent_spawns_while_tiers_build() {
 /// Between `pipe` and `fcntl(FD_CLOEXEC)` another thread's fork left this spawn's error pipe open in
 /// its child, and the spawn read that pipe until that child ended (a devhub test's hub held its
 /// lease table through it, and its tools waited for the run that never started, 2026-11-04). Real
-/// std's `pipe2` has no such moment on Linux; macOS has no pipe2, in real std either.
+/// std's `pipe2` has no such moment on Linux; macOS has no pipe2, in real std either, so there the count
+/// is a race in both std's and goes to stderr, not into the compared lines.
 #[test]
 fn a04_spawns_never_wait_for_each_others_children() {
     spawns_never_wait_for_each_others_children();
@@ -226,7 +227,12 @@ pub fn spawns_never_wait_for_each_others_children() {
             });
         }
     });
-    println!("| spawns that waited for another spawn's child: {}", waited.load(Ordering::Relaxed));
+    let waited = waited.load(Ordering::Relaxed);
+    if cfg!(target_vendor = "apple") {
+        eprintln!("os_fork_busy: spawns that waited for another spawn's child: {waited}");
+    } else {
+        println!("| spawns that waited for another spawn's child: {waited}");
+    }
 }
 
 trait Probe: Sync {
