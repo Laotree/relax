@@ -3563,8 +3563,8 @@ pub(crate) fn domain_present(name: String) {
     DOMAIN_PRESENT_WALL.fetch_max(jit::wall_ns().max(1), Ordering::Release);
 }
 
-/// The settle rebuild of this round stopped trying (every try said not now): the run goes on with
-/// its state as it is. Logged and in the flight recorder, with the domain whose first frame
+/// The settle rebuild of this round stopped trying (every try said not now, or a costly one failed
+/// as the last one had: settle_rebuild::Round): the run goes on with its state as it is. Logged and in the flight recorder, with the domain whose first frame
 /// started the round.
 fn settle_gave_up(tries: u32, why: &str) {
     let domain = if DOMAIN_PRESENT_WALL.load(Ordering::Acquire) > FIRST_PRESENT_WALL.load(Ordering::Acquire) {
@@ -3811,9 +3811,9 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         let settle_stress = std::env::var("RELAX_SETTLE_STRESS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&ms| ms > 0);
         let mut last_stress = Instant::now();
         // the settle rebuild (jit settle_rebuild.rs): once per first present, retried while its
-        // preconditions fail
+        // preconditions fail (settle_rebuild::Round: how often)
         let (mut rebuild_over, mut rebuild_round, mut rebuild_done) = (!jit::settle_rebuild::enabled(), None, false);
-        let (mut rebuild_next, mut rebuild_tries, mut rebuild_said) = (Instant::now(), 0u32, String::new());
+        let (mut rebuild_next, mut rebuild, mut rebuild_said) = (Instant::now(), jit::settle_rebuild::Round::default(), String::new());
         let mut present_bytes = Vec::new();
         let (mut quiet, mut seen, mut trimmed) = (0u32, 0u64, 0u64);
         // growth relief (below): the resident size after the last trim and when it ran
@@ -4037,7 +4037,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             if settled.is_some() && rebuild_round != Some(settle_present) {
                 rebuild_round = Some(settle_present);
                 rebuild_done = false;
-                rebuild_tries = 0;
+                rebuild = jit::settle_rebuild::Round::default();
                 rebuild_next = Instant::now();
             }
             let rebuild_block: Option<&'static str> = if rebuild_over || rebuild_done || Instant::now() < rebuild_next { Some("") }
@@ -4058,26 +4058,30 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             if rebuild_block.is_none() {
                 let up = unsafe { RUN_UNIT };
                 if !up.is_null() {
-                    rebuild_tries += 1;
+                    rebuild.tries += 1;
+                    let tries = rebuild.tries;
                     let _s = crate::inspect::timeline::span("run-monitor settle rebuild");
-                    match jit::settle_rebuild::run(up, settle_stress.is_none() && rebuild_tries <= jit::settle_rebuild::TAIL_WAIT) {
+                    match jit::settle_rebuild::run(up, settle_stress.is_none() && tries <= jit::settle_rebuild::TAIL_WAIT) {
                         jit::settle_rebuild::Outcome::Done => rebuild_done = true,
                         jit::settle_rebuild::Outcome::Refused(why) => {
-                            crate::inspect::flightrec::event("settle.refused", &why, rebuild_tries as u64, 0);
+                            crate::inspect::flightrec::event("settle.refused", &why, tries as u64, 0);
                             verbose!("relax settle rebuild refused: {why}");
                             rebuild_over = true;
                         }
-                        jit::settle_rebuild::Outcome::Retry(why) => {
-                            rebuild_next = Instant::now() + std::time::Duration::from_secs(1);
-                            if rebuild_tries >= jit::settle_rebuild::TAIL_WAIT + 40 {
-                                rebuild_done = true;
-                                settle_gave_up(rebuild_tries, &why);
+                        retry => {
+                            let why = retry.why();
+                            match rebuild.wait(&retry) {
+                                Some(wait) => rebuild_next = Instant::now() + wait,
+                                None => {
+                                    rebuild_done = true;
+                                    settle_gave_up(tries, why);
+                                }
                             }
                             if why != rebuild_said {
                                 // each new reason once: why a run's rebuild waits shows without --verbose
-                                crate::inspect::flightrec::event("settle.deferred", &why, rebuild_tries as u64, 0);
-                                verbose!("relax settle rebuild deferred (try {rebuild_tries}): {why}");
-                                rebuild_said = why;
+                                crate::inspect::flightrec::event("settle.deferred", why, tries as u64, 0);
+                                verbose!("relax settle rebuild deferred (try {tries}): {why}");
+                                rebuild_said = why.to_string();
                             }
                         }
                     }
