@@ -212,7 +212,7 @@ mod tests {
                 "[package]\nname = \"renamed-helper\"\n[package.metadata.relax]\nbuild-script-noop = [\"build\", \"empty\"]\n").unwrap();
             let mut f = Self {
                 script: BuildScript { krate: 0, also: Vec::new(), src_path: dir.join("build.rs").display().to_string(), edition: 2021,
-                    features: Vec::new(), build_deps: vec![(0, "helper".into())], links_deps: Vec::new(), profile: crate::resolve::ScriptProfile::RUN },
+                    features: Vec::new(), build_deps: vec![(0, "helper".into())], links_deps: Vec::new(), kept: false, profile: crate::resolve::ScriptProfile::RUN },
                 dir, units: Vec::new(),
             };
             f.units.push(f.unit("helper", Vec::new()));

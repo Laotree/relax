@@ -885,7 +885,7 @@ pub(crate) fn resolve_package(
         if !l.is_empty() && !silent() {
             l.sort();
             let names: Vec<String> = l.iter().map(|(p, src)| format!("{} ({})", p, src)).collect();
-            verbose!("relax: build scripts to remove ({}; only makepad-platform keeps one): {}", l.len(), names.join(", "));
+            verbose!("relax: build scripts to remove ({}; a package keeps its script with `[package.metadata.relax] build-script = \"keep\"`): {}", l.len(), names.join(", "));
         }
     }
     if boot {

@@ -14,10 +14,6 @@ use relax_session::sync::Mutex;
 #[path = "unitgraph_noop.rs"]
 mod noop;
 
-/// What platform/build.rs generates (the same file build.rs includes): answered natively here.
-#[path = "../../../../platform/build_gen.rs"]
-mod platform_gen;
-
 pub struct BuildScript {
     /// crate index (into `Graph::crates`) of the lib the script belongs to
     pub krate: usize,
@@ -33,6 +29,9 @@ pub struct BuildScript {
     /// `links =`: cargo runs them first and gives this script their metadata as
     /// `DEP_<LINKS>_<KEY>` (the unit graph lists their runs among this run's dependencies)
     pub links_deps: Vec<usize>,
+    /// its package's manifest keeps it (`[package.metadata.relax] build-script = "keep"`): it runs
+    /// as a Relax program, unless a host answers it (`ScriptAnswer`)
+    pub kept: bool,
     /// what the script is told of its profile (PROFILE, OPT_LEVEL, DEBUG): a run's builds are
     /// release's, a test's its profile's (relax-compiler run.rs)
     pub profile: crate::resolve::ScriptProfile,
@@ -292,7 +291,7 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
                 }
                 let build_deps = raw.get(*bu).map(|r| r.deps.clone()).unwrap_or_default();
                 script_of_run.insert(*i, build_scripts.len());
-                build_scripts.push(BuildScript { krate: ci, also: Vec::new(), src_path: p.clone(), edition: *ed, features: f.clone(), build_deps, links_deps: Vec::new(), profile: crate::resolve::ScriptProfile::RUN });
+                build_scripts.push(BuildScript { krate: ci, also: Vec::new(), src_path: p.clone(), edition: *ed, features: f.clone(), build_deps, links_deps: Vec::new(), kept: kept_script(&pkg[ci].0), profile: crate::resolve::ScriptProfile::RUN });
             }
         }
         c.deps = nd;
@@ -463,16 +462,17 @@ fn host_triple(sess: &std::sync::Arc<crate::Session>) -> &'static str {
 /// `<target>/relax` (OUT_DIR = <target>/relax/build/<crate>-<hash>/out: as deep as cargo's
 /// <target>/release/build/<crate>-<hash>/out, since scripts look 5 ancestors up for the
 /// workspace root).
-/// What Relax does with a package's build script. The user's rule (2026-10-10): only
-/// makepad-platform keeps a build script; the GPU kernel crates (ai-cuda/ai-metal and the ai crates
-/// that read their outputs) keep theirs until their replacement is decided. Probe scripts of
-/// third-party crates Relax answers itself. Every other script is to be removed from the source;
-/// until it is, it still runs and `makepad run` / `check` list it (`to_remove`).
+/// What Relax does with a package's build script. A package keeps its script by its manifest
+/// (`[package.metadata.relax] build-script = "keep"`), and a host can answer a script natively
+/// (`register_script_answer`). Probe scripts of third-party crates Relax answers itself. Every
+/// other script is to be removed from the source; until it is, it still runs and `run` / `check`
+/// list it (`to_remove`).
 pub enum ScriptRole {
     /// kept: runs (as a Relax program), its output cached by the rerun rules as cargo does
     Artefact,
-    /// makepad-platform's: answered by `platform_answer` from the code build.rs shares (build_gen.rs)
-    Platform,
+    /// a host's answer (`ScriptAnswer`): the script's `cargo:` lines and OUT_DIR files without
+    /// running it
+    Native(&'static ScriptAnswer),
     /// the script's `cargo:` lines as Relax knows them, without running it
     Answered(Vec<String>),
     /// a Relax crate's own source stamp (libs/relax/self_stamp.rs): answered by `self_stamp_text`
@@ -481,15 +481,16 @@ pub enum ScriptRole {
     ToRemove,
 }
 
-pub fn script_role(pkg: &str, features: &[String]) -> ScriptRole {
-    let has = |f: &str| features.iter().any(|x| x == f);
+pub fn script_role(pkg: &str, bs: &BuildScript) -> ScriptRole {
+    let has = |f: &str| bs.features.iter().any(|x| x == f);
+    if let Some(a) = script_answer(pkg) {
+        return ScriptRole::Native(a);
+    }
     match pkg {
-        "makepad-platform" => ScriptRole::Platform,
         // Relax's crates compiled from source by a program (makepad-script-compute's non-provided
         // code reaches relax-backend): their script only writes the source stamp
         "relax-base" | "relax-lex" | "relax-session" | "relax-types" | "relax-backend" | "relax-codegen" | "relax-front" => ScriptRole::SelfStamp,
-        // pending the GPU-kernel decision (no build scripts proposal)
-        "makepad-ai-cuda" | "makepad-ai-metal" | "makepad-ai-llm" | "makepad-ai-common" | "makepad-ai-speech" => ScriptRole::Artefact,
+        _ if bs.kept => ScriptRole::Artefact,
         // pkg-config probes: the libraries of the enabled features (none with dlopen)
         "wayland-sys" => {
             if has("dlopen") {
@@ -505,6 +506,52 @@ pub fn script_role(pkg: &str, features: &[String]) -> ScriptRole {
         }
         _ => ScriptRole::ToRemove,
     }
+}
+
+/// `[package.metadata.relax] build-script = "keep"` in the manifest of the package in `dir`.
+fn kept_script(dir: &str) -> bool {
+    let text = crate::vfs::read_to_string(std::path::Path::new(dir).join("Cargo.toml")).unwrap_or_default();
+    let mut inside = false;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') {
+            inside = line == "[package.metadata.relax]";
+        } else if let Some((k, v)) = line.split_once('=').filter(|_| inside) {
+            if k.trim() == "build-script" {
+                return v.trim() == "\"keep\"";
+            }
+        }
+    }
+    false
+}
+
+/// A host's own answer to a package's build script: what the script prints (`cargo:` lines) and
+/// writes to its OUT_DIR, from the code the script shares, without running it. Its cfg lines and
+/// OUT_DIR files key the crate as a run script's output does (crate_image Record: cfg, files).
+pub struct ScriptAnswer {
+    pub package: &'static str,
+    pub answer: fn(&ScriptEnv) -> Result<Vec<String>, String>,
+}
+
+/// What the script would be given: cargo's build-script environment (CARGO_CFG_*, TARGET, ..),
+/// the target triple and its OUT_DIR (made, empty or as the last answer left it).
+pub struct ScriptEnv<'a> {
+    pub env: &'a [(String, String)],
+    pub target: &'a str,
+    pub out_dir: &'a std::path::Path,
+}
+
+static SCRIPT_ANSWERS: Mutex<Vec<&'static ScriptAnswer>> = Mutex::new(Vec::new());
+
+/// A host's answer (Host.script_answers), registered before any graph is made; one per package.
+pub fn register_script_answer(a: &'static ScriptAnswer) {
+    let mut v = SCRIPT_ANSWERS.lock().unwrap();
+    assert!(!v.iter().any(|x| x.package == a.package), "two answers to {}'s build script", a.package);
+    v.push(a);
+}
+
+fn script_answer(pkg: &str) -> Option<&'static ScriptAnswer> {
+    SCRIPT_ANSWERS.lock().unwrap().iter().copied().find(|a| a.package == pkg)
 }
 
 /// Packages whose build script ran although it is to be removed: (package, script path).
@@ -538,8 +585,8 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
         // A kept GPU-kernel script (`Artefact`) that links native code (makepad-ai-cuda's nvcc
         // archives, `links =`) is cargo's too with `--allow-c`: its archives join the run's
         // native library. Without the flag it runs under Relax as before.
-        let kept_native = builds && matches!(script_role(pname, &bs.features), ScriptRole::Artefact);
-        if noop::script(bs, &g.raw) || !(kept_native || matches!(script_role(pname, &bs.features), ScriptRole::ToRemove)) {
+        let kept_native = builds && matches!(script_role(pname, bs), ScriptRole::Artefact);
+        if noop::script(bs, &g.raw) || !(kept_native || matches!(script_role(pname, bs), ScriptRole::ToRemove)) {
             return None;
         }
         crate::native::native_reason(g, bs).map(|reason| (i, reason))
@@ -636,13 +683,13 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
             receipt = Some(crate::native::write_receipt(g, &seeds, &scripts, lib.as_ref(), target_dir)?);
         }
     }
-    // makepad-platform's script is answered by makepad run itself (`platform_answer`, no process);
+    // a script a host answers (`ScriptAnswer`) starts no process;
     // in no-codegen mode (the platforms that run no generated code, iOS) no other script runs: any
     // other crate with a build script is an error.
     if sess.options.no_codegen {
         for bs in &g.build_scripts {
             let (_, pname, _) = &g.pkg[bs.krate];
-            if !matches!(script_role(pname, &bs.features), ScriptRole::Platform | ScriptRole::SelfStamp) && !noop::script(bs, &g.raw) {
+            if !matches!(script_role(pname, bs), ScriptRole::Native(_) | ScriptRole::SelfStamp) && !noop::script(bs, &g.raw) {
                 return Err(format!("build scripts are not supported in no-codegen mode: {} ({})", pname, bs.src_path));
             }
         }
@@ -866,7 +913,7 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
                 eprintln!("relax build-script: {} skipped (no effect under RELAX_BUILD_SCRIPT)", pname);
             }
             ScriptRole::Answered(Vec::new())
-        } else { script_role(pname, &bs.features) };
+        } else { script_role(pname, bs) };
         match role {
             ScriptRole::Answered(lines) => {
                 // cargo sets OUT_DIR for every package with a build script
@@ -901,9 +948,11 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
                 done(i, r, out_dir);
                 continue;
             }
-            ScriptRole::Platform => {
+            ScriptRole::Native(a) => {
                 let out_dir = format!("{}/out", root.take(&format!("{}-answered", name)));
-                let r = std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {}", out_dir, e)).and_then(|_| platform_answer(sess, &out_dir));
+                let env: Vec<(String, String)> = crate::cfg::CfgSet::host(sess, &[]).build_script_env();
+                let r = std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {}", out_dir, e))
+                    .and_then(|_| (a.answer)(&ScriptEnv { env: &env, target: target_triple(sess), out_dir: std::path::Path::new(&out_dir) }));
                 done(i, r.map(|l| l.join("\n")), out_dir);
                 continue;
             }
@@ -2151,32 +2200,6 @@ fn self_stamp_text(dir: &str, pkg: &str, features: &[String]) -> Result<String, 
 
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// What makepad-platform's build.rs (platform/build.rs) gives the build, answered by makepad run
-/// itself from the code build.rs includes (platform/build_gen.rs), without running the script: its cfgs (`apple_sim` from the target, the
-/// `lines` / `apple_bundle` words of the MAKEPAD_BUILD variable) and its two OUT_DIR files, app_meta_gen.rs (the default bundle name and
-/// identifier, from the folder that holds the target folder) and app_icon_gen.rs (the icons in
-/// that folder's resources/). Its link lines are the host binary's: in this mode nothing is
-/// linked at run time. Its side files (makepad-platform.path, a target-folder Info.plist) are for
-/// cargo runs only.
-fn platform_answer(sess: &std::sync::Arc<crate::Session>, out_dir: &str) -> Result<Vec<String>, String> {
-    let env: Vec<(String, String)> = crate::cfg::CfgSet::host(sess, &[]).build_script_env();
-    let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
-    let target_os = get("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let target = target_triple(sess);
-    let makepad = std::env::var("MAKEPAD_BUILD").ok();
-    let lines: Vec<String> = platform_gen::cfgs(makepad.as_deref(), &target_os, target).into_iter().map(|c| format!("cargo:rustc-cfg={}", c)).collect();
-    let out = std::path::Path::new(out_dir);
-    for (f, text) in [("app_meta_gen.rs", platform_gen::app_meta_gen(out)), ("app_icon_gen.rs", platform_gen::app_icon_gen(out).source)] {
-        let path = format!("{}/{}", out_dir, f);
-        // unchanged files stay as they are (their stamps decide what is reparsed)
-        if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
-            std::fs::write(&path, text).map_err(|e| format!("{}: {}", path, e))?;
-        }
-    }
-    Ok(lines)
-}
-
-
 /// The lease a devhub runs this process in (`MAKEPAD_DEVHUB_LEASE`: its ledger dir and the
 /// lease), else `none`.
 fn devhub_lease() -> String {
@@ -2391,51 +2414,6 @@ mod shared_script_tests {
         roots_left.retain(|n| n.len() != 32);
         assert_eq!(roots_left, ["other"], "a gone checkout's root and a stale root write go");
         std::fs::remove_dir_all(&base).unwrap();
-    }
-}
-
-#[cfg(test)]
-mod platform_script_tests {
-    use super::platform_gen;
-    use std::process::Command;
-
-    /// platform/build.rs, compiled and run for real, writes the bytes `makepad run` answers with
-    /// natively (both call platform/build_gen.rs): app_meta_gen.rs, app_icon_gen.rs and the cfg lines.
-    /// The script is this crate's build input, not a file read beside its sources: under the JIT
-    /// those are a virtual tree, and rustc, another process, reads only files on disk.
-    #[test]
-    fn native_answer_is_byte_identical_to_the_build_script() {
-        let tmp = std::env::temp_dir().join(format!("relax-platform-script-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let platform = tmp.join("platform");
-        std::fs::create_dir_all(&platform).unwrap();
-        std::fs::write(platform.join("build.rs"), include_str!("../../../../platform/build.rs")).unwrap();
-        std::fs::write(platform.join("build_gen.rs"), include_str!("../../../../platform/build_gen.rs")).unwrap();
-        let root = tmp.join("some app");
-        std::fs::create_dir_all(root.join("resources")).unwrap();
-        std::fs::write(root.join("resources/icon_64.png"), b"png").unwrap();
-        std::fs::write(root.join("resources/icon.ico"), b"ico").unwrap();
-        let out = root.join("target/release/build/makepad-platform-0123456789abcdef/out");
-        std::fs::create_dir_all(&out).unwrap();
-        let exe = tmp.join("build-script");
-        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
-        let built = Command::new(rustc).args(["--edition", "2021", "-o"]).arg(&exe).arg(platform.join("build.rs")).output().expect("rustc");
-        assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
-        for (os, target, makepad_build) in [("linux", "x86_64-unknown-linux-gnu", None), ("ios", "aarch64-apple-ios-sim", Some("lines+apple_bundle,other"))] {
-            let mut cmd = Command::new(&exe);
-            cmd.current_dir(&platform).env_clear().env("OUT_DIR", &out).env("CARGO_CFG_TARGET_OS", os).env("TARGET", target);
-            if let Some(b) = makepad_build { cmd.env("MAKEPAD_BUILD", b); }
-            let ran = cmd.output().expect("build script");
-            assert!(ran.status.success(), "{}", String::from_utf8_lossy(&ran.stderr));
-            let said: Vec<String> = String::from_utf8_lossy(&ran.stdout).lines().filter_map(|l| l.strip_prefix("cargo:rustc-cfg=")).map(str::to_string).collect();
-            let native: Vec<String> = platform_gen::cfgs(makepad_build, os, target).into_iter().map(str::to_string).collect();
-            assert_eq!(said, native, "{os}");
-            assert_eq!(std::fs::read_to_string(out.join("app_meta_gen.rs")).unwrap(), platform_gen::app_meta_gen(&out));
-            assert_eq!(std::fs::read_to_string(out.join("app_icon_gen.rs")).unwrap(), platform_gen::app_icon_gen(&out).source);
-        }
-        assert!(platform_gen::app_meta_gen(&out).contains("\"Some app\""));
-        assert!(platform_gen::app_icon_gen(&out).source.contains("icon_64.png"));
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 

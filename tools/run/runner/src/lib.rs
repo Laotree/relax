@@ -83,6 +83,9 @@ pub struct Host {
     /// fn-like macros whose bodies are another language: the lexer keeps each body as one token
     /// (relax-lex lexer.rs register_raw_body)
     pub raw_body_macros: &'static [&'static str],
+    /// the build scripts this binary answers natively (relax-front unitgraph.rs ScriptAnswer):
+    /// none of them starts a process; the bare runner runs every kept script
+    pub script_answers: &'static [&'static relax_compiler::unitgraph::ScriptAnswer],
 }
 
 /// A command a host adds to its binary: its word, its row on the main help page, its own help
@@ -109,7 +112,7 @@ pub enum HelpLine {
 
 /// The bare runner (bin `relax`): provides nothing; tests, checks and agents' boots compile only
 /// what runs.
-pub const BARE: Host = Host { provenance: None, init: || {}, provide: || {}, run_host: || {}, ahead: relax_compiler::options::AheadLevel::Minimal, proc_macros: relax_compiler::pmhost::Policy::Open, default_launch: None, package: env!("CARGO_PKG_NAME"), manifest: concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"), commands: &[], native_sets: &[], raw_body_macros: &[] };
+pub const BARE: Host = Host { provenance: None, init: || {}, provide: || {}, run_host: || {}, ahead: relax_compiler::options::AheadLevel::Minimal, proc_macros: relax_compiler::pmhost::Policy::Open, default_launch: None, package: env!("CARGO_PKG_NAME"), manifest: concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"), commands: &[], native_sets: &[], raw_body_macros: &[], script_answers: &[] };
 
 static HOST: std::sync::OnceLock<&'static Host> = std::sync::OnceLock::new();
 
@@ -122,6 +125,9 @@ pub fn set_host(host: &'static Host) {
     if HOST.set(host).is_ok() {
         for &set in host.native_sets {
             relax_native_macros::register(set);
+        }
+        for &a in host.script_answers {
+            relax_compiler::unitgraph::register_script_answer(a);
         }
         relax_compiler::pmhost::set_policy(host.proc_macros);
         relax_compiler::reload::set_loader_package(host.package, host.manifest);

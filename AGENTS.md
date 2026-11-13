@@ -42,8 +42,6 @@ libs/remote                     (except libs/remote/TUNNEL.md)
 libs/strict_json
 libs/toml_parser                (except libs/toml_parser/tests/manifests.rs)
 libs/windows/sys
-platform/build.rs
-platform/build_gen.rs
 platform/cpu_budget
 platform/network
 platform/src/restart.rs
