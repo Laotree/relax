@@ -80,6 +80,34 @@ with `RELAX_CACHE_DIR=<dir>` so neither reuses the other's compiled code.
 - `--verbose` (or `RELAX_VERBOSE=1`): phase timings.
 - A running program: `relax inspect <pid> help` (panics, why-hung, probes).
 
+## Read live test results from an agent
+
+Start one harness with `relax test --live <package> --lib` (or `--test <name>`).
+Use `relax inspect list --json` to find its PID. Read the initial verdict with:
+
+```sh
+relax inspect <pid> events on=testverdict since=0 full=1 --json
+```
+
+Before saving an edit, keep the newest event's `seq`. Wait for its outcome with:
+
+```sh
+relax inspect <pid> watch on=testverdict,patchrefused,patchfailed,patchreverted since=<seq> full=1 --json
+```
+
+A `testverdict` names the edit paths and patch `group`. Its `tests` array contains
+each test's `name`, `status` (`passed`, `failed`, `ignored`, or `filtered`) and `ran`.
+`ran` is true only when that test executed for this edit. A retained passing or
+failing result has `ran:false`. `patchrefused` includes build errors in `reasons`.
+Advance the sequence cursor after every event, including patch errors. Use `full=1`
+to read verdicts larger than inspect's default reply limit.
+
+The end-to-end check for this interface is:
+
+```sh
+uv run libs/relax/compiler/tests/live_test_results/run.py target/release/relax
+```
+
 ## Shrinking a bug
 
 Shrink it to the smallest program that still differs from rustc. A counting `Drop` impl shows

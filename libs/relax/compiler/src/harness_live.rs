@@ -68,6 +68,26 @@ pub(crate) fn group() -> u32 {
     LIVE.get().map_or(0, |(state, _)| state.lock().unwrap().edit.group)
 }
 
+pub(super) enum TestStatus { Passed, Failed, Ignored, Filtered }
+
+pub(super) struct TestResult {
+    pub name: String,
+    pub status: TestStatus,
+    pub ran: bool,
+}
+
+impl TestResult {
+    fn json(&self) -> String {
+        let status = match self.status {
+            TestStatus::Passed => "passed",
+            TestStatus::Failed => "failed",
+            TestStatus::Ignored => "ignored",
+            TestStatus::Filtered => "filtered",
+        };
+        format!("{{\"name\":{},\"status\":\"{status}\",\"ran\":{}}}", json_str(&self.name), self.ran)
+    }
+}
+
 /// Whole-target results, with counts for this run's selection.
 pub(super) struct Verdict {
     pub ran: usize,
@@ -77,6 +97,7 @@ pub(super) struct Verdict {
     pub stale: Vec<String>,
     pub why: Option<String>,
     pub skipped: usize,
+    pub tests: Vec<TestResult>,
 }
 
 /// Park outside the compiler owner until the next verified edit.
@@ -86,13 +107,14 @@ pub(super) fn complete(v: Verdict, ms: f64) -> Edit {
     let (state, ready) = LIVE.get().unwrap();
     let mut s = state.lock().unwrap();
     s.runs += 1;
-    let Verdict { ran, passed, ignored, failures, stale, why, skipped } = v;
+    let Verdict { ran, passed, ignored, failures, stale, why, skipped, tests } = v;
     let failed = failures.len();
     let selected = if why.is_none() { "affected" } else { "all" };
     let why_field = why.as_ref().map_or(String::new(), |s| format!(",\"why\":{}", json_str(s)));
     let fields = format!("{},\"ran\":{ran},\"passed\":{passed},\"failed\":{failed},\"ignored\":{ignored},\"failures\":[{}],\"ms\":{ms},\"selected\":\"{selected}\",\"skipped\":{skipped},\"stale\":[{}]{why_field}",
         s.edit.fields(), failures.iter().map(|n| json_str(n)).collect::<Vec<_>>().join(","),
         stale.iter().map(|n| json_str(n)).collect::<Vec<_>>().join(","));
+    let fields = format!("{fields},\"tests\":[{}]", tests.iter().map(TestResult::json).collect::<Vec<_>>().join(","));
     crate::inspect::events::emit("testverdict", &s.runs.to_string(), &fields);
     println!("testverdict group={} ran={ran} passed={passed} failed={failed} ms={ms:.1} selected={selected} skipped={skipped}{}", s.edit.group, why.as_ref().map_or(String::new(), |s| format!(" why={s:?}")));
     use std::io::Write;
