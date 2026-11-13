@@ -239,7 +239,51 @@ const LEDGER_KEY: u128 = 0;
 // FnKey::Glue): one byte below 0xFF, else 0xFF and a u32; that byte used to be a constructor's
 // kind (GLUE_CTOR + variant 239), so an older entry is dropped rather than misread.
 // 36: a coroutine's closure type has tags of its own (enc_ty 29 for 17's form, 30 for 28's).
-const ENTRY_VERSION: u32 = 36;
+// 37: a type its tree has written before is a back-reference (TY_BACKREF) when that is shorter,
+// and a callee key the entry's relocation list has written before is one (RELOC_KEY_REF).
+const ENTRY_VERSION: u32 = 37;
+/// enc_ty's tag for "the n-th type this tree wrote in full" (a u32 n follows): written for a type
+/// whose first write was longer than this back-reference.
+const TY_BACKREF: u8 = 63;
+/// A back-reference's length (its tag and its u32).
+const TY_BACKREF_LEN: u32 = 5;
+/// A callee relocation's tag (20 slot, 21 thunk, 25 call) plus this: its key is the n-th one the
+/// entry's relocation list wrote (a u32 n follows instead of the key's bytes): 26, 27 and 31.
+const RELOC_KEY_REF: u8 = 6;
+
+/// The callee tag (20, 21, 25) of a callee relocation's tag, written in full or as a reference.
+fn callee_tag(tag: u8) -> u8 {
+    if tag >= 20 + RELOC_KEY_REF { tag - RELOC_KEY_REF } else { tag }
+}
+
+/// Writes a callee relocation (tag 20, 21 or 25) to slot `x`: the bytes of its key (`key`) the
+/// first time the list names `x`, after that the position of that key (RELOC_KEY_REF). False when
+/// the key cannot be encoded.
+fn write_callee(e: &mut E, tag: u8, x: u32, keyed: &mut HashMap<u32, u32>, key: impl FnOnce() -> Option<Vec<u8>>) -> bool {
+    if let Some(&n) = keyed.get(&x) {
+        e.u8(tag + RELOC_KEY_REF);
+        e.u32(n);
+        return true;
+    }
+    let Some(b) = key() else { return false };
+    e.u8(tag);
+    e.bytes(&b);
+    let n = keyed.len() as u32;
+    keyed.insert(x, n);
+    true
+}
+
+/// Reads a callee relocation's key after its tag byte `tag` and gives what `first` makes of it:
+/// `first` runs once per key, the first time the list writes it, and a later reference (a
+/// RELOC_KEY_REF tag) gives that result again from `seen`.
+fn read_callee<'a, T: Copy>(d: &mut D<'a>, tag: u8, seen: &mut Vec<T>, first: impl FnOnce(&'a [u8]) -> Option<T>) -> Option<T> {
+    if tag >= 20 + RELOC_KEY_REF {
+        return seen.get(d.u32()? as usize).copied();
+    }
+    let t = first(d.bytes()?)?;
+    seen.push(t);
+    Some(t)
+}
 /// the level of a code entry's code (its tier byte)
 const TIER_O1: u8 = 0;
 const TIER_O3: u8 = 1;
@@ -919,6 +963,14 @@ pub struct Cache {
     /// expression has, for expressions this run has not parsed yet: checked when one is
     /// decoded again and when the closure is built (jit: closure_identity_ok)
     closure_fps: HashMap<(u32, u32), u64>,
+    /// The type trees being encoded (enc_ty), innermost last (a tree in progress can start one in
+    /// another buffer, a callee's key), and spare tables for the next ones.
+    ty_written: Vec<TyTree>,
+    ty_written_spare: Vec<TyTree>,
+    /// The type trees being decoded (dec_ty): the input's address and the types read in full so
+    /// far, in order (TY_BACKREF names one); and spare lists.
+    ty_read: Vec<(usize, Vec<TyId>)>,
+    ty_read_spare: Vec<Vec<TyId>>,
     /// (item, its file) -> the item's closures in order (program::closure_exprs): what an
     /// owner-local closure identity's ordinal counts (closure_ordinal, closure_at)
     closure_ords: HashMap<(DefId, u32), std::sync::Arc<[u32]>>,
@@ -933,6 +985,16 @@ type LinkedCode = (Vec<u8>, Vec<(u32, u64)>, Vec<RelocAt>);
 
 #[derive(Default)]
 struct E(Vec<u8>);
+
+/// One type tree being encoded (enc_ty): its output buffer's address, how many types it has
+/// written in full (what dec_ty counts), and each type's first write: its position in that count
+/// and its length.
+#[derive(Default)]
+struct TyTree {
+    buf: usize,
+    written: u32,
+    first: HashMap<TyId, (u32, u32)>,
+}
 
 impl E {
     fn u8(&mut self, x: u8) {
@@ -1204,6 +1266,10 @@ impl Cache {
             pending_verdicts: HashMap::new(),
             slot_by_bytes: Default::default(),
             closure_fps: HashMap::new(),
+            ty_written: Vec::new(),
+            ty_written_spare: Vec::new(),
+            ty_read: Vec::new(),
+            ty_read_spare: Vec::new(),
             closure_ords: HashMap::new(),
             stats: CacheStats::default(),
             why_unencodable: HashMap::new(),
@@ -1901,7 +1967,50 @@ impl Cache {
     }
 
     /// A monomorphic type by structure. Inference variables, params, etc. cannot be stored.
+    /// Written as a tree in which a type the same tree has written before, when that write was
+    /// longer than a back-reference, is its position (TY_BACKREF): a closure's type holds its
+    /// owner's arguments, which hold other closures of that owner, and a parser built of nested
+    /// closures spelled that out in full in keys of megabytes and code entries of gigabytes.
+    /// Each top-level type (a key's argument, a list's element) is a tree of its own, so its
+    /// bytes are the same wherever it is written.
     fn enc_ty(&mut self, u: &Unit, t: TyId, e: &mut E, crates: &mut Vec<u32>, depth: u32) -> Option<()> {
+        let buf = e as *const E as usize;
+        let top = self.ty_written.last().is_none_or(|w| w.buf != buf);
+        if top {
+            let mut w = self.ty_written_spare.pop().unwrap_or_default();
+            w.buf = buf;
+            self.ty_written.push(w);
+        }
+        let seen = self.ty_written.last().and_then(|w| w.first.get(&t).copied());
+        let written = match seen {
+            Some((n, len)) if len > TY_BACKREF_LEN => {
+                e.u8(TY_BACKREF);
+                e.u32(n);
+                Some(())
+            }
+            _ => {
+                let start = e.0.len();
+                let r = self.enc_ty_tree(u, t, e, crates, depth);
+                // (a tree in another buffer, started inside this one, has ended: this is the last)
+                if let (Some(()), Some(w)) = (r, self.ty_written.last_mut()) {
+                    let n = w.written;
+                    w.written += 1;
+                    w.first.entry(t).or_insert((n, (e.0.len() - start) as u32));
+                }
+                r
+            }
+        };
+        if top {
+            if let Some(mut w) = self.ty_written.pop() {
+                w.written = 0;
+                w.first.clear();
+                self.ty_written_spare.push(w);
+            }
+        }
+        written
+    }
+
+    fn enc_ty_tree(&mut self, u: &Unit, t: TyId, e: &mut E, crates: &mut Vec<u32>, depth: u32) -> Option<()> {
         if depth > 64 {
             return None;
         }
@@ -2157,7 +2266,34 @@ impl Cache {
         Some(u.tcx.tys.intern_region_args(&regions))
     }
 
+    /// enc_ty's tree: a TY_BACKREF is the type the same tree read in full at that position.
     fn dec_ty(&mut self, u: &Unit, d: &mut D, depth: u32) -> Option<TyId> {
+        let buf = d.b.as_ptr() as usize;
+        let top = self.ty_read.last().is_none_or(|r| r.0 != buf);
+        if top {
+            let v = self.ty_read_spare.pop().unwrap_or_default();
+            self.ty_read.push((buf, v));
+        }
+        let read = if d.b.get(d.p) == Some(&TY_BACKREF) {
+            d.p += 1;
+            d.u32().and_then(|n| self.ty_read.last()?.1.get(n as usize).copied())
+        } else {
+            let t = self.dec_ty_tree(u, d, depth);
+            if let (Some(t), Some(r)) = (t, self.ty_read.last_mut()) {
+                r.1.push(t);
+            }
+            t
+        };
+        if top {
+            if let Some((_, mut v)) = self.ty_read.pop() {
+                v.clear();
+                self.ty_read_spare.push(v);
+            }
+        }
+        read
+    }
+
+    fn dec_ty_tree(&mut self, u: &Unit, d: &mut D, depth: u32) -> Option<TyId> {
         if depth > 64 {
             return None;
         }
@@ -3820,6 +3956,9 @@ impl Cache {
         e.bytes(code);
         e.u32(relocs.len() as u32);
         let mut rw = Vec::new();
+        // each callee's key once: a later relocation to it names the key's position (RELOC_KEY_REF).
+        // A key is the callee's whole instance identity, and a fn calls the same callees many times.
+        let mut keyed = HashMap::new();
         for rl in relocs {
             e.u32(rl.at);
             e.u8(kind_code(rl.kind));
@@ -3827,17 +3966,12 @@ impl Cache {
             let ok = match r {
                 Reloc::Sym(s) => self.enc_sym(u, *s, &mut e, &mut rw).is_some(),
                 Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => {
-                    e.u8(match r { Reloc::Slot(_) => 20, Reloc::Call(_) => 25, _ => 21 });
-                    match self.slot_bytes(u, *x) {
-                        Some(b) => {
-                            e.bytes(&b);
-                            true
-                        }
-                        None => {
-                            self.why("callee key");
-                            false
-                        }
+                    let tag = match r { Reloc::Slot(_) => 20, Reloc::Call(_) => 25, _ => 21 };
+                    let ok = write_callee(&mut e, tag, *x, &mut keyed, || self.slot_bytes(u, *x));
+                    if !ok {
+                        self.why("callee key");
                     }
+                    ok
                 }
                 Reloc::TlsKey => {
                     e.u8(22);
@@ -5408,6 +5542,8 @@ impl Cache {
         let start = d.p;
         let _ = start;
         let mut rw = Vec::new();
+        // the callee keys written so far, as the entry's writer counts them (write_callee)
+        let mut keyed = HashMap::new();
         for rl in relocs.iter().take(n) {
             let (o, r) = (&rl.at, &rl.target);
             let co = d.u32().unwrap_or(u32::MAX);
@@ -5416,14 +5552,8 @@ impl Cache {
             let ok = match r {
                 Reloc::Sym(s) => self.enc_sym(u, *s, &mut e, &mut rw).is_some(),
                 Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => {
-                    e.u8(match r { Reloc::Slot(_) => 20, Reloc::Call(_) => 25, _ => 21 });
-                    match self.slot_bytes(u, *x) {
-                        Some(b) => {
-                            e.bytes(&b);
-                            true
-                        }
-                        None => false,
-                    }
+                    let tag = match r { Reloc::Slot(_) => 20, Reloc::Call(_) => 25, _ => 21 };
+                    write_callee(&mut e, tag, *x, &mut keyed, || self.slot_bytes(u, *x))
                 }
                 Reloc::TlsKey => { e.u8(22); true }
                 Reloc::TlsSlow => { e.u8(23); true }
@@ -8349,6 +8479,74 @@ mod data_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A type tree writes a repeated subtree once (TY_BACKREF): a type 12 levels deep, each level
+    /// holding the one below three times, stays small instead of 3^12 copies and decodes to the
+    /// same type. A repeated type shorter than a back-reference is written again, so an encoding
+    /// never grows by one, and each element of a list is a tree of its own: its bytes are the same
+    /// wherever it is written.
+    #[test]
+    fn a_repeated_subtype_is_written_once_and_reads_back() {
+        isolated_test!(a_repeated_subtype_is_written_once_and_reads_back);
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let root = std::env::temp_dir().join(format!("relax-ty-backref-{}", std::process::id()));
+        let u = Unit::new(crate::program::Program::new(sess), crate::tcx::Tcx::new(), 0);
+        let mut cache = open_test_cache(&u, &root);
+        let tys = &u.tcx.tys;
+        let tuple = |v: &[TyId]| tys.intern(TyKind::Tuple(tys.mk_list(v)));
+        let enc = |cache: &mut Cache, t: TyId| {
+            let mut e = E::default();
+            assert!(cache.enc_ty(&u, t, &mut e, &mut Vec::new(), 0).is_some());
+            e.0
+        };
+        let mut ty = tuple(&[tys.u8_, tys.i32_]);
+        for _ in 0..12 {
+            ty = tuple(&[ty, tys.intern(TyKind::Slice(ty)), ty]);
+        }
+        let b = enc(&mut cache, ty);
+        assert!(b.len() < 1024, "{} bytes for a 13-level tree", b.len());
+        let mut d = D { b: &b, p: 0 };
+        assert_eq!(cache.dec_ty(&u, &mut d, 0), Some(ty), "the tree reads back");
+        assert_eq!(d.p, b.len());
+        let (same, other) = (tuple(&[tys.u8_, tys.u8_]), tuple(&[tys.u8_, tys.u32_]));
+        assert_eq!(enc(&mut cache, same).len(), enc(&mut cache, other).len(), "a back-reference to a type shorter than it");
+        let pair = tuple(&[ty, ty]);
+        let mut e = E::default();
+        assert!(cache.enc_tys(&u, &[ty, pair, ty], &mut e, &mut Vec::new(), 0).is_some());
+        assert_eq!(cache.dec_tys(&u, &mut D { b: &e.0, p: 0 }, 0), Some(vec![ty, pair, ty]), "the list reads back");
+        assert_eq!(e.0.windows(b.len()).filter(|w| *w == &b[..]).count(), 3, "each element a tree of its own, its first type in full");
+        drop(cache);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A relocation list writes each callee key once and names it again by its position
+    /// (RELOC_KEY_REF); its reader makes what it needs of each key once, and a reference past the
+    /// keys written does not read.
+    #[test]
+    fn a_callee_key_is_written_once_per_relocation_list() {
+        let keys = [b"key-one".to_vec(), b"key-two".to_vec()];
+        let (mut e, mut keyed, mut encoded) = (E::default(), HashMap::new(), 0);
+        for (tag, x) in [(20, 0u32), (21, 1), (25, 0), (21, 1)] {
+            assert!(write_callee(&mut e, tag, x, &mut keyed, || {
+                encoded += 1;
+                Some(keys[x as usize].clone())
+            }));
+        }
+        let (mut d, mut seen, mut firsts, mut read) = (D { b: &e.0, p: 0 }, Vec::new(), 0, Vec::new());
+        for _ in 0..4 {
+            let tag = d.u8().unwrap();
+            let key = read_callee(&mut d, tag, &mut seen, |b| {
+                firsts += 1;
+                Some(b)
+            });
+            read.push((callee_tag(tag), key.unwrap()));
+        }
+        assert_eq!(read, [(20u8, &keys[0][..]), (21, &keys[1][..]), (25, &keys[0][..]), (21, &keys[1][..])]);
+        assert_eq!((encoded, firsts, d.p), (2, 2, e.0.len()), "each key encoded and read once");
+        let mut past = E::default();
+        past.u32(2);
+        assert!(read_callee(&mut D { b: &past.0, p: 0 }, 20 + RELOC_KEY_REF, &mut seen, Some).is_none(), "a reference past the keys written");
+    }
+
     #[test]
     fn dyn_auto_traits_cache_roundtrip() {
         isolated_test!(dyn_auto_traits_cache_roundtrip);
@@ -9638,6 +9836,8 @@ impl Linker {
         let n = d.u32()? as usize;
         let mut relocs = Vec::with_capacity(n);
         let mut rw = Vec::new();
+        // the slot of each callee key the list wrote, in order (a RELOC_KEY_REF names one)
+        let mut keyed = Vec::new();
         for _ in 0..n {
             let o = d.u32()? as usize;
             let kind = kind_of(d.u8()?)?;
@@ -9645,15 +9845,14 @@ impl Linker {
             // the relocation keeps what it names (a slot, a symbol): the install records the
             // code's references from these (jit CodeRefs), as it does for code built this run
             let target = match tag {
-                20 | 21 | 25 => {
+                20 | 21 | 25 | 26 | 27 | 31 => {
                     d.u8()?;
-                    let b = d.bytes()?;
-                    let sid = self.slot_of_bytes(u, b)?;
+                    let sid = read_callee(&mut d, tag, &mut keyed, |b| self.slot_of_bytes(u, b))?;
                     let sid = {
                         let c = self.cache();
                         u.twin_link_target(id, sid, |b| c.has_stored_entry(u, b))
                     };
-                    match tag {
+                    match callee_tag(tag) {
                         20 => {
                             callees.push(sid);
                             Reloc::Slot(sid)
