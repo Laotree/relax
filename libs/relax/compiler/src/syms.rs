@@ -54,6 +54,17 @@ pub enum SymKind {
     /// a `#[thread_local]` static's offset (jit.rs Unit::thread_local_place): from the thread
     /// pointer, or in the thread-local block
     ThreadLocal(DefId),
+    /// sandboxed code (sandbox.rs): twin slot `.0`'s sandbox thunk, its value as a fn pointer
+    SbThunk(u32),
+    /// sandboxed code: the offset in the sandbox's data image of the data symbol `.0` names
+    SbPlace(u32),
+    /// sandboxed code: the offset in a segment's thread-locals of the thread-local symbol `.0`
+    SbTls(u32),
+    /// sandboxed code: the base of the sandbox thunk table (indirect calls are masked into it)
+    SbTable,
+    /// sandboxed code: the version of host entry `.0` (`c:<C name>`, `rt:<runtime entry>`) the
+    /// domain's policy gives its code
+    SbHost(String),
 }
 
 /// What the bytes of a data object hold.
@@ -991,6 +1002,11 @@ pub fn describe(u: &Unit, s: Sym) -> String {
         Some(SymKind::TierRec(id)) if s.off == crate::jit::PATCH_FLAG_OFF => format!("patch-flag:{}", stable_fn_name(u, id)),
         Some(SymKind::TierRec(id)) => format!("loop-counter:{}", stable_fn_name(u, id)),
         Some(SymKind::Provided(n)) => format!("provided:{}", n),
+        Some(SymKind::SbThunk(id)) => format!("sandbox-thunk:{}", stable_fn_name(u, id)),
+        Some(SymKind::SbPlace(id)) => format!("sandbox-place:{}", describe(u, Sym::new(id))),
+        Some(SymKind::SbTls(id)) => format!("sandbox-tls:{}", describe(u, Sym::new(id))),
+        Some(SymKind::SbTable) => "sandbox-table".to_string(),
+        Some(SymKind::SbHost(n)) => format!("sandbox-host:{}", n),
         Some(SymKind::Rw(k)) => {
             let b = u.syms.rw_blocks.lock().unwrap_or_else(|e| e.into_inner());
             let (sz, al) = b.get(k as usize).copied().unwrap_or((0, 0));
@@ -1268,6 +1284,8 @@ pub fn class_of(k: &SymKind) -> relax_backend::rir::SymClass {
         SymKind::Data(_) | SymKind::Thunk(_) | SymKind::Missing(_) => SymClass::Near,
         // (the tier records are a reservation of their own, outside the code area)
         SymKind::Foreign(_) | SymKind::Provided(_) | SymKind::StaticAddr(_) | SymKind::TierRec(_) => SymClass::Far,
+        // (an offset of the sandbox's own, or an address outside the unit's code area)
+        SymKind::SbThunk(_) | SymKind::SbPlace(_) | SymKind::SbTls(_) | SymKind::SbTable | SymKind::SbHost(_) => SymClass::Far,
         SymKind::Site(_) | SymKind::ThreadLocal(_) => SymClass::Imm,
     }
 }

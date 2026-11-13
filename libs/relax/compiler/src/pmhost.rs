@@ -22,6 +22,9 @@
 //!   at its call site. A root whose closure is path packages only (the workspace's, makepad's)
 //!   runs as host code; a crate both kinds of root use has both forms. Where the sandbox has no
 //!   arena windows (Windows, so far) a confined root's macros fail, saying so: never run as host.
+//!   The twins' code goes to the world's disk cache like its other code (keyed by the macro
+//!   domain and their base's key; what it holds of the run's sandbox is linked again): a warm
+//!   start compiles none of it.
 //! Neither policy covers build scripts: a third-party package's `build.rs` runs as its own
 //! process with the user's rights (unitgraph.rs).
 //! Every call runs under the hang watchdog.
@@ -374,6 +377,9 @@ pub fn policy() -> Policy {
     if POLICY.load(std::sync::atomic::Ordering::Relaxed) == 1 { Policy::Open } else { Policy::Sandboxed }
 }
 
+/// The confined macros' domain (sandbox.rs `Domain`).
+const MACRO_DOMAIN: crate::sandbox::Domain = crate::sandbox::Domain { name: "proc-macro", allow: macro_allow };
+
 /// The macro domain's own entries (sandbox.rs `Allow`): what a confined macro reaches of the
 /// host beyond memory, math and formatting.
 fn macro_allow(name: &str) -> Option<Option<(&'static str, u64)>> {
@@ -660,7 +666,7 @@ fn build_world_inner(sess: &std::sync::Arc<crate::Session>, units: &[crate::macr
         let up: *mut crate::jit::Unit = &mut *u;
         let mut host_too: Vec<u32> = std_deps.iter().map(|&(_, k)| k).chain([pm]).collect();
         host_too.extend((0..units.len()).filter(|&i| need[i] && host_run[i] && crate_of[i] != u32::MAX).map(|i| crate_of[i]));
-        unsafe { crate::sandbox::confine_unit(up, macro_allow, &host_too) }
+        unsafe { crate::sandbox::confine_unit(up, MACRO_DOMAIN, &host_too) }
             .and_then(|()| crate::sandbox::new_arena(up, u32::MAX, "the proc-macro world", u64::MAX, 0))
             .map(|a| {
                 let t = unsafe { crate::sandbox::twin(up, id) };

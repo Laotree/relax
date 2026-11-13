@@ -165,15 +165,27 @@ impl State {
 /// name, address)))); None: not this domain's. Run-time modules add nothing (`MODULES`).
 pub type Allow = fn(&str) -> Option<Option<(&'static str, u64)>>;
 
+/// A confinement domain: its name and what its code may call beyond what every domain may. The
+/// name is part of its twins' cache keys: code one domain's policy made is never linked into
+/// another domain's unit (cache.rs enc_fnkey).
+#[derive(Clone, Copy)]
+pub struct Domain {
+    pub name: &'static str,
+    pub allow: Allow,
+}
+
 /// The run-time modules' domain: what every domain may call, nothing more.
-pub fn modules_allow(_: &str) -> Option<Option<(&'static str, u64)>> {
+pub const MODULES: Domain = Domain { name: "modules", allow: modules_allow };
+
+fn modules_allow(_: &str) -> Option<Option<(&'static str, u64)>> {
     None
 }
 
 struct Sb {
     /// the symbol TlsAddr reads the sandbox words' offset from (this unit's; the offset is TLS_OFF)
     tls_sym: Sym,
-    /// the domain's own C entries
+    /// the domain's name and own C entries
+    domain: &'static str,
     allow: Allow,
     sbt_base: u64,
     /// the table's bytes (a power of two: the indirect-call mask)
@@ -256,9 +268,9 @@ fn map_rw(addr: u64, len: u64) -> bool {
     unsafe { mprotect(addr as *mut u8, len as usize, 3) == 0 }
 }
 
-/// Sets up unit `up`'s sandbox on first use (on the owner thread), its domain allowing `allow`.
-/// A unit has one domain: a second call keeps the first's.
-unsafe fn sb_init(up: *mut Unit, allow: Allow) -> Result<(), String> {
+/// Sets up unit `up`'s sandbox on first use (on the owner thread), in `domain`. A unit has one
+/// domain: a second call keeps the first's.
+unsafe fn sb_init(up: *mut Unit, domain: Domain) -> Result<(), String> {
     let u = &mut *up;
     if u.sandbox.ready.load(std::sync::atomic::Ordering::Acquire) {
         return Ok(());
@@ -299,7 +311,8 @@ unsafe fn sb_init(up: *mut Unit, allow: Allow) -> Result<(), String> {
     let trap = tgt::thunk(u.slots.table(trap_slot));
     *u.sandbox.sb.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(Sb {
         tls_sym,
-        allow,
+        domain: domain.name,
+        allow: domain.allow,
         sbt_base,
         sbt_span,
         sbt_n: 1,
@@ -334,7 +347,7 @@ fn with_sb<R>(u: &Unit, f: impl FnOnce(&mut Sb) -> R) -> R {
 /// Marks crates of unit `up` whose code runs only as twins (a module's crate; std's are added
 /// with the first), in the run-time modules' domain.
 pub unsafe fn add_sandboxed_crate(up: *mut Unit, krate: u32) -> Result<(), String> {
-    sb_init(up, modules_allow)?;
+    sb_init(up, MODULES)?;
     let u = &*up;
     let std_crates: Vec<u32> = (0..u.prog.crates.len() as u32).filter(|&c| matches!(u.prog.syms.str(u.prog.crates[c as usize].name), "core" | "alloc" | "std")).collect();
     with_sb(u, |s| {
@@ -345,10 +358,10 @@ pub unsafe fn add_sandboxed_crate(up: *mut Unit, krate: u32) -> Result<(), Strin
     Ok(())
 }
 
-/// Unit `up` becomes a confinement domain allowing `allow`: every crate of it runs as twins when
-/// reached from twins (nothing in it is a host API), and `host_too` are host code as well.
-pub unsafe fn confine_unit(up: *mut Unit, allow: Allow, host_too: &[u32]) -> Result<(), String> {
-    sb_init(up, allow)?;
+/// Unit `up` becomes confinement domain `domain`: every crate of it runs as twins when reached
+/// from twins (nothing in it is a host API), and `host_too` are host code as well.
+pub unsafe fn confine_unit(up: *mut Unit, domain: Domain, host_too: &[u32]) -> Result<(), String> {
+    sb_init(up, domain)?;
     let u = &*up;
     let all = 0..u.prog.crates.len() as u32;
     with_sb(u, |s| {
@@ -499,6 +512,62 @@ unsafe fn sbthunk(up: *mut Unit, t: u32) -> Result<u64, String> {
 pub fn extra_refs(u: &Unit, t: u32) -> Vec<u32> {
     let g = u.sandbox.sb.lock().unwrap_or_else(|e| e.into_inner());
     g.as_ref().and_then(|s| s.refs.get(&t).cloned()).unwrap_or_default()
+}
+
+// ------------------------------------------------------------------ twin code's symbols
+
+// What twin code holds of this run (thunk addresses, data and thread-local offsets, the thunk
+// table, the domain's host entries) it names by these symbols, never as immediates: the disk
+// cache stores a twin's code like any other and its link resolves them again here, placing the
+// data, thread-locals and thunks the code needs as the transform did (cache.rs link_symbol).
+
+/// Whether unit `u` has a sandbox (a twin's key decodes and its symbols link only then).
+pub fn ready(u: &Unit) -> bool {
+    u.sandbox.ready.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Unit `u`'s confinement domain (its sandbox must be set up).
+pub(crate) fn domain(u: &Unit) -> &'static str {
+    with_sb(u, |s| s.domain)
+}
+
+/// The symbol of twin `t`'s sandbox thunk (given out on first use).
+pub(crate) unsafe fn thunk_sym(up: *mut Unit, t: u32) -> Result<Sym, String> {
+    let a = sbthunk(up, t)?;
+    Ok((&*up).syms.intern(SymKind::SbThunk(t), a))
+}
+
+/// The symbol of the image offset of the data symbol `sym` names (placed on first use).
+pub(crate) unsafe fn place_sym(up: *mut Unit, sym: u32) -> Result<Sym, String> {
+    let o = place(up, sym, 0)?;
+    Ok((&*up).syms.intern(SymKind::SbPlace(sym), o as u64))
+}
+
+/// The symbol of the segment thread-local offset of thread-local symbol `sym` (laid out on first use).
+pub(crate) unsafe fn tls_offset_sym(up: *mut Unit, sym: u32) -> Result<Sym, String> {
+    let o = tls_offset(up, Sym::new(sym))?;
+    Ok((&*up).syms.intern(SymKind::SbTls(sym), o as u64))
+}
+
+/// The symbol of unit `u`'s sandbox thunk table.
+pub(crate) fn table_sym(u: &Unit) -> Sym {
+    let base = with_sb(u, |s| s.sbt_base);
+    u.syms.intern(SymKind::SbTable, base)
+}
+
+/// The symbol of the version of host entry `name` (`c:<C name>`, `rt:<runtime entry>`) unit `u`'s
+/// domain gives its twins in place of it. None: the domain keeps none (the entry itself, or no
+/// call at all).
+pub(crate) fn host_sym(u: &Unit, name: &str) -> Option<Sym> {
+    let p = match name.split_once(':')? {
+        ("c", n) => c_policy(with_sb(u, |s| s.allow), n),
+        ("rt", n) => rt_policy(n),
+        _ => None,
+    };
+    match p {
+        Some(Some((nn, addr))) if nn != "abort" => Some(u.syms.intern(SymKind::SbHost(name.to_string()), addr)),
+        _ => None,
+    }
 }
 
 // ------------------------------------------------------------------ the data image
@@ -2008,13 +2077,14 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                     let kind = u.syms.kind(sym.id);
                     match kind {
                         Some(SymKind::Data(_)) | Some(SymKind::Static(_)) | Some(SymKind::Rw(_)) => {
-                            let o = place(up, sym.id, 0)?;
-                            emit(Inst::IBinI(IOp::Add, U64, d, ar, o as i64 + sym.off), &mut insts, &mut pos);
+                            let o = f.vreg(Cls::I);
+                            emit(Inst::Addr(o, place_sym(up, sym.id)?.plus(sym.off)), &mut insts, &mut pos);
+                            emit(Inst::IBin(IOp::Add, U64, d, ar, o), &mut insts, &mut pos);
                         }
                         Some(SymKind::Thunk(id)) => {
                             let t = fn_target(up, id, &sandboxed)?;
                             refs.push(t);
-                            emit(Inst::Iconst(d, (sbthunk(up, t)? as i64).wrapping_add(sym.off)), &mut insts, &mut pos);
+                            emit(Inst::Addr(d, thunk_sym(up, t)?.plus(sym.off)), &mut insts, &mut pos);
                         }
                         Some(SymKind::Site(_)) | Some(SymKind::Rt("null")) => emit(Inst::Addr(d, sym), &mut insts, &mut pos),
                         // std's "makepad inspect records" flag (sync/raw.rs): never for twins, a
@@ -2030,14 +2100,21 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                 Inst::FnAddr(d, id) => {
                     let t = fn_target(up, id, &sandboxed)?;
                     refs.push(t);
-                    emit(Inst::Iconst(d, sbthunk(up, t)? as i64), &mut insts, &mut pos);
+                    emit(Inst::Addr(d, thunk_sym(up, t)?), &mut insts, &mut pos);
                 }
                 // a thread-local: in the thread's segment, below its shadow stack (W_SSLO)
                 Inst::TlsAddr(d, sym) | Inst::TlsStatic(d, sym) => {
-                    let off = tls_offset(up, sym).map_err(|e| format!("{}: {}", f.name, e))?;
                     let lo = f.vreg(Cls::I);
                     emit(Inst::Load(relax_backend::rir::Mem::Int(8, false), lo, t_arena, (W_SSLO - W_ARENA) as i32), &mut insts, &mut pos);
-                    emit(Inst::IBinI(IOp::Add, U64, d, lo, off as i64 + sym.off - TLS_LEN as i64), &mut insts, &mut pos);
+                    if matches!(u.syms.kind(sym.id), Some(SymKind::Rt("tls_base"))) {
+                        emit(Inst::IBinI(IOp::Add, U64, d, lo, sym.off - TLS_LEN as i64), &mut insts, &mut pos);
+                    } else {
+                        let o = f.vreg(Cls::I);
+                        let x = f.vreg(Cls::I);
+                        emit(Inst::Addr(o, tls_offset_sym(up, sym.id).map_err(|e| format!("{}: {}", f.name, e))?.plus(sym.off)), &mut insts, &mut pos);
+                        emit(Inst::IBin(IOp::Add, U64, x, lo, o), &mut insts, &mut pos);
+                        emit(Inst::IBinI(IOp::Add, U64, d, x, -(TLS_LEN as i64)), &mut insts, &mut pos);
+                    }
                 }
                 Inst::VGather(..) | Inst::VTbl(..) => return Err(format!("{}: vector gathers are not available to sandboxed code", f.name)),
                 Inst::Load(mm, d, base, off) => {
@@ -2078,7 +2155,7 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                         let n = f.vreg(Cls::I);
                         let r = f.vreg(Cls::I);
                         emit(Inst::Iconst(n, len as i64), &mut insts, &mut pos);
-                        let s = u.syms.intern(SymKind::Rt("sb_rt_memcpy"), sb_rt_memcpy as *const () as u64);
+                        let s = host_sym(u, "rt:memcpy").ok_or_else(|| format!("{}: no sandboxed memcpy", f.name))?;
                         emit(Inst::Call(Callee::Host(s), vec![dst, src, n], vec![r]), &mut insts, &mut pos);
                     } else {
                         let (d2, _) = mask(f, &mut insts, &mut pos, &mut cache, dst, 0);
@@ -2104,7 +2181,7 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                             }
                             Some(SymKind::Rt(name)) => match rt_policy(name) {
                                 Some(None) => Callee::Host(s),
-                                Some(Some((nn, addr))) => Callee::Host(u.syms.intern(SymKind::Rt(nn), addr)),
+                                Some(Some(_)) => Callee::Host(host_sym(u, &format!("rt:{}", name)).ok_or_else(|| format!("{}: no sandboxed `{}`", f.name, name))?),
                                 None => return Err(format!("{}: calls the runtime's `{}`, which sandboxed code cannot use", f.name, name)),
                             },
                             other => return Err(format!("{}: calls {:?}, which sandboxed code cannot use", f.name, other)),
@@ -2122,7 +2199,7 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                                     emit(Inst::Call(Callee::Host(panic_site), vec![v], Vec::new()), &mut insts, &mut pos);
                                     continue;
                                 }
-                                Some(Some((nn, addr))) => Callee::CHost(u.syms.intern(SymKind::Rt(nn), addr), sig),
+                                Some(Some(_)) => Callee::CHost(host_sym(u, &format!("c:{}", name)).ok_or_else(|| format!("{}: no sandboxed `{}`", f.name, name))?, sig),
                                 Some(None) => Callee::CHost(s, sig),
                                 None => return Err(format!("{}: reaches the C function `{}`, which sandboxed code cannot call", f.name, name)),
                             }
@@ -2203,15 +2280,16 @@ unsafe fn tls_offset(up: *mut Unit, sym: Sym) -> Result<u32, String> {
     })
 }
 
-/// An indirect call's target masked into unit `u`'s sandbox thunk table.
+/// An indirect call's target masked into unit `u`'s sandbox thunk table. (The span is the code
+/// area's slots' (Unit::exec_size, a compile-time constant): an immediate like any other.)
 fn mask_fn(u: &Unit, f: &mut Func, insts: &mut Vec<Inst>, pos: &mut Vec<u64>, p: u64, v: VReg) -> VReg {
-    let (base, span) = with_sb(u, |s| (s.sbt_base, s.sbt_span));
+    let span = with_sb(u, |s| s.sbt_span);
     let ts = jit::thunk_size() as u64;
     let b = f.vreg(Cls::I);
     let t1 = f.vreg(Cls::I);
     let t2 = f.vreg(Cls::I);
     let t3 = f.vreg(Cls::I);
-    insts.push(Inst::Iconst(b, base as i64));
+    insts.push(Inst::Addr(b, table_sym(u)));
     insts.push(Inst::IBin(IOp::Sub, U64, t1, v, b));
     insts.push(Inst::IBinI(IOp::And, U64, t2, t1, ((span - 1) & !(ts - 1)) as i64));
     insts.push(Inst::IBin(IOp::Add, U64, t3, t2, b));

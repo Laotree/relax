@@ -673,11 +673,17 @@ fn tls_shape(pl: &crate::jit::TlsPlace) -> u8 {
 }
 
 fn record_deps(u: &Unit, id: u32, extra: &[u32]) -> Vec<u32> {
-    let mut stack: Vec<u32> = extra.iter().copied().chain(u.body_deps.get(&id).into_iter().flatten().copied()).collect();
+    // a sandboxed twin's code is its base's lowered body transformed: the base's inputs are its own
+    let src = match u.fns[id as usize].key {
+        FnKey::Sandbox(b) if (b as usize) < u.fns.len() => b,
+        _ => id,
+    };
+    let mut stack: Vec<u32> = extra.iter().copied().chain(u.body_deps.get(&src).into_iter().flatten().copied()).collect();
     let mut deps = Vec::new();
     if stack.is_empty() { return deps; }
     let mut seen = HashSet::new();
     seen.insert(id);
+    seen.insert(src);
     while let Some(c) = stack.pop() {
         if !seen.insert(c) || c as usize >= u.fns.len() { continue; }
         if let Some(v) = u.body_deps.get(&c) { stack.extend(v.iter().copied()); }
@@ -2281,7 +2287,6 @@ impl Cache {
             return None;
         }
         match key.clone() {
-            // twins are never cached (their code depends on the sandbox layout of this run)
             FnKey::Shim(shim) => {
                 use relax_types::instance::{ShimKind, ReifyReason};
                 e.u8(KeyKind::Shim as u8);
@@ -2308,7 +2313,19 @@ impl Cache {
                 }
                 self.enc_tys(u, &shim.args, e, crates, 0)
             }
-            FnKey::Sandbox(_) => None,
+            // a sandboxed twin: its domain and its base's key. Its code names what it holds of the
+            // run's sandbox by symbols (sandbox.rs thunk_sym ..), linked again here; the domain
+            // keeps code one policy made out of another domain's units, and the kind keeps
+            // twin and base code apart (an Open macro world has no twins to share)
+            FnKey::Sandbox(base) => {
+                if base as usize >= u.fns.len() || !crate::sandbox::ready(u) {
+                    return None;
+                }
+                e.u8(KeyKind::Sandbox as u8);
+                e.str(crate::sandbox::domain(u));
+                let bk = u.fns[base as usize].key.clone();
+                self.enc_fnkey(u, &bk, e, crates, depth + 1)
+            }
             // SPEC-V: an unverified-mode twin is its base's body lowered as unverified code: keyed
             // by the base (the code that ran before its verdict, and the calls to it, are cached)
             FnKey::Plain(base) => {
@@ -3199,6 +3216,31 @@ impl Cache {
                 e.u8(tls_shape(&pl));
                 let mut cr = Vec::new();
                 self.enc_def(u, d, e, &mut cr);
+            }
+            // sandboxed code's values of the run (sandbox.rs thunk_sym ..): the twin, data,
+            // thread-local or host entry they are of; the link places each again
+            // (13 was a retired kind's)
+            SymKind::SbThunk(t) => {
+                e.u8(14);
+                let key = u.fns[t as usize].key.clone();
+                let mut cr = Vec::new();
+                if self.enc_fnkey(u, &key, e, &mut cr, 0).is_none() {
+                    self.why("sandbox thunk key");
+                    return None;
+                }
+            }
+            SymKind::SbPlace(inner) => {
+                e.u8(15);
+                self.enc_sym(u, Sym::new(inner), e, rw)?;
+            }
+            SymKind::SbTls(inner) => {
+                e.u8(16);
+                self.enc_sym(u, Sym::new(inner), e, rw)?;
+            }
+            SymKind::SbTable => e.u8(17),
+            SymKind::SbHost(n) => {
+                e.u8(18);
+                e.str(&n);
             }
         }
         e.u64(s.off as u64);
@@ -4297,6 +4339,8 @@ key_kinds! {
     Twin = 4,
     /// a closure by its owner's closure ordinal and its text (closure_ordinal)
     Closure = 5,
+    /// a sandboxed twin: its confinement domain's name and its base's key
+    Sandbox = 6,
 }
 
 impl KeyKind {
@@ -4304,7 +4348,7 @@ impl KeyKind {
     /// slots the startup image installs before their identities decode: jit arm_counters).
     pub(crate) fn counted(self) -> bool {
         match self {
-            KeyKind::Inst | KeyKind::ClosureInFile | KeyKind::Closure | KeyKind::Twin => true,
+            KeyKind::Inst | KeyKind::ClosureInFile | KeyKind::Closure | KeyKind::Twin | KeyKind::Sandbox => true,
             KeyKind::Glue | KeyKind::Shim => false,
         }
     }
@@ -4653,7 +4697,7 @@ fn key_defs(u: &Unit, key: &FnKey) -> Vec<DefId> {
     for _ in 0..32 {
         match k {
             FnKey::Inst(d, _) => { out.push(d); break; }
-            FnKey::Closure(_, _, parent) | FnKey::Plain(parent) if (parent as usize) < u.fns.len() => k = u.fns[parent as usize].key.clone(),
+            FnKey::Closure(_, _, parent) | FnKey::Plain(parent) | FnKey::Sandbox(parent) if (parent as usize) < u.fns.len() => k = u.fns[parent as usize].key.clone(),
             _ => break,
         }
     }
@@ -9176,6 +9220,23 @@ impl Linker {
                 };
                 FnKey::Plain(base)
             }
+            // a sandboxed twin of this unit's domain (none before its sandbox is set up: a startup
+            // image's key of one stays lazy), registered as its base's twin
+            KeyKind::Sandbox => {
+                let dom = d.str()?;
+                if !crate::sandbox::ready(u) || dom != crate::sandbox::domain(u) {
+                    return None;
+                }
+                let base = match self.image_slot_at(u, d) {
+                    Some(b) => b,
+                    None => {
+                        let bk = self.dec_fnkey(u, d, depth + 1)?;
+                        u.fn_id(bk)
+                    }
+                };
+                unsafe { crate::sandbox::twin(u, base) };
+                FnKey::Sandbox(base)
+            }
         })
     }
 
@@ -9301,6 +9362,26 @@ impl Linker {
                 let name = d.str()?;
                 let value = provided_value(u, name)?;
                 u.syms.intern(SymKind::Provided(name.to_string()), value)
+            }
+            // sandboxed code's values (enc_sym): this run's, placed as the transform places them
+            14..=18 if !crate::sandbox::ready(u) => return None,
+            14 => {
+                let FnKey::Sandbox(base) = self.dec_fnkey(u, d, 0)? else { return None };
+                let t = unsafe { crate::sandbox::twin(u, base) };
+                unsafe { crate::sandbox::thunk_sym(u, t) }.ok()?
+            }
+            15 => {
+                let inner = self.link_symbol(u, d, rw)?;
+                unsafe { crate::sandbox::place_sym(u, inner.id) }.ok()?
+            }
+            16 => {
+                let inner = self.link_symbol(u, d, rw)?;
+                unsafe { crate::sandbox::tls_offset_sym(u, inner.id) }.ok()?
+            }
+            17 => crate::sandbox::table_sym(u),
+            18 => {
+                let name = d.str()?;
+                crate::sandbox::host_sym(u, name)?
             }
             _ => return None,
         };

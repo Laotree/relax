@@ -35,8 +35,9 @@ impl Cache {
         let pend: HashMap<u128, usize> = self.pending.iter().enumerate().filter(|(_, e)| e.1.kind == KIND_CODE).map(|(i, e)| (e.1.key, i)).collect();
         for (i, &id) in ids.iter().enumerate() {
             if i % 64 == 63 && stop() { return Err(()); }
-            // interpreted slots link one by one (their code is not machine code to place)
-            if relax_codegen::interp::is_entry(u.fns[id as usize].code) { continue; }
+            // interpreted slots link one by one (their code is not machine code to place); so do
+            // sandboxed twins (the image prelinks before any sandbox is set up: not_in_image)
+            if relax_codegen::interp::is_entry(u.fns[id as usize].code) || not_in_image(u, id) { continue; }
             let Some(key0) = self.slot_key(u, id) else { continue };
             let crates = self.slot_crates.get(&id).cloned().unwrap_or_default();
             if let Some(k) = self.image_entry(id, key0, &pend) {
@@ -389,7 +390,7 @@ impl Cache {
                 None => continue,
             };
             for c in callees {
-                if (c as usize) >= u.fns.len() || have.contains(&c) || !ran(c) || relax_codegen::interp::is_entry(u.fns[c as usize].code) { continue; }
+                if (c as usize) >= u.fns.len() || have.contains(&c) || !ran(c) || relax_codegen::interp::is_entry(u.fns[c as usize].code) || not_in_image(u, c) { continue; }
                 have.insert(c);
                 let Some(key0) = self.slot_key(u, c) else { continue };
                 let crates = self.slot_crates.get(&c).cloned().unwrap_or_default();
@@ -1019,6 +1020,11 @@ pub(crate) fn skip_fnkey(d: &mut D, depth: u32, v: &mut dyn FnMut(Atom)) -> Opti
         }
         // an unverified-mode twin: its base's key
         KeyKind::Twin => skip_fnkey(d, depth + 1, v),
+        // a sandboxed twin: its domain's name and its base's key
+        KeyKind::Sandbox => {
+            d.str()?;
+            skip_fnkey(d, depth + 1, v)
+        }
     }
 }
 
@@ -2032,6 +2038,13 @@ impl Linker {
             self.name_unnamed(u, id);
         }
     }
+}
+
+/// Whether slot `id`'s code stays out of the startup image: a sandboxed twin's identity and
+/// symbols resolve only once its unit's sandbox is set up (a run-time module's load, a macro
+/// world's confinement), after the image's prelink; it links lazily from its entry.
+fn not_in_image(u: &Unit, id: u32) -> bool {
+    matches!(u.fns[id as usize].key, crate::jit::FnKey::Sandbox(_))
 }
 
 /// Whether slot `id` is a startup image slot whose identity is still encoded.
