@@ -70,13 +70,21 @@ pub fn def_ident(prog: &Program, d: DefId, h: &mut Sip128) {
         h.str("block of");
         def_ident(prog, o, h);
     }
+    // the ordinal counts among the parent's items alone, so a parent other than the owner names
+    // it too: an impl in a `const _` block (no fn body holds it) is told from its twin in another
+    // `const _` block by that const
+    let p = def.parent;
+    if p != NO_DEF && Some(p) != owner && prog.def(p).kind != crate::program::DefKind::Mod {
+        h.str("in");
+        def_ident(prog, p, h);
+    }
     h.u32(ord);
 }
 
 /// Where an item neither its path nor its parent names is, as rustc's DefPath disambiguates it:
-/// the fn whose body holds it (None: no fn body does -- a module's `const _`) and its ordinal
-/// among the items of its file with its name, kind and parent in that same place, in item
-/// order (one body's items are numbered in its text's order). No offset: a line added above it,
+/// the fn whose body holds it (None: no fn body does -- a module's `const _`, or an impl in its
+/// block) and its ordinal among the items of its file with its name, kind and parent in that
+/// same place, in item order (one body's items are numbered in its text's order). No offset: a line added above it,
 /// in its fn or anywhere before, leaves its identity as it was.
 pub fn block_place(prog: &Program, d: DefId) -> (Option<DefId>, u32) {
     let def = prog.def(d);
@@ -125,38 +133,35 @@ enum ParentNamed {
     /// a module-level impl: its header text (`impl<T> Trait for Type<T>`), whitespace dropped,
     /// and its ordinal among the file's impls with that header (identical twins differ)
     Impl(Vec<u8>),
-    /// an associated item or a variant, an anonymous constant or an opaque type: its parent's
-    /// identity names it with its own path
+    /// an associated item, a variant or field, a closure, an anonymous constant or an opaque
+    /// type: its parent's identity names it with its own path
     Item(DefId),
 }
 
-/// Whether `d` is named without its position: a module-level impl by its header, an item of
-/// an impl, trait or enum so named by that parent (def_path does not tell impls apart), an
-/// anonymous constant or opaque type by its parent and its name, which holds its ordinal among
-/// the parent's (`{constant#1}`), as rustc's DefPath has it. Two impls of one trait for
-/// `[u8; FOUR]` and `[u8; TWO]` have one def_path and one place each: their lengths' constants
-/// had one identity, so a warm run's cache gave both one value, and their impls one key.
+/// Whether `d` is named without its position: a module-level impl by its header, and an item
+/// that only exists inside its parent by that parent and its name, as rustc's DefPath has it:
+/// an impl's, trait's or enum's items, fields, closures, anonymous constants and opaque types
+/// (their names hold their ordinal among the parent's, `{constant#1}`). Wherever the parent is:
+/// two impls in one fn body, or in two `const _` blocks of one file, have one def_path for their
+/// methods of one name, and only the impls' places tell them apart. Named by their own place,
+/// they had one identity: one stored borrow-check verdict for both bodies, and one TypeId for
+/// the local types, closures and variants declared in them. Two impls of one trait for
+/// `[u8; FOUR]` and `[u8; TWO]` gave their lengths' constants one identity the same way. An item
+/// declared in a body (a struct, enum or impl in a fn's block) keeps its place: two enums `E`
+/// in two blocks of one fn have one parent and one name.
 fn parent_names(prog: &Program, d: DefId) -> Option<ParentNamed> {
     use crate::program::DefKind;
     let def = prog.def(d);
-    match def.kind {
-        DefKind::Impl => {
-            let m = prog.mods.get(def.scope as usize)?;
-            if m.lexical_parent.is_some() || m.def != def.parent { return None; }
-            let (head, twin) = prog.files.get(def.file as usize)?.impl_head(def.item)?;
-            let mut v = head.to_vec();
-            v.extend_from_slice(&twin.to_le_bytes());
-            Some(ParentNamed::Impl(v))
-        }
-        DefKind::AssocFn | DefKind::AssocConst | DefKind::AssocTy | DefKind::Variant => {
-            let p = def.parent;
-            if p == NO_DEF { return None; }
-            let named = path_names(prog, p) || matches!(parent_names(prog, p), Some(ParentNamed::Impl(_)));
-            (named && matches!(prog.def(p).kind, DefKind::Impl | DefKind::Trait | DefKind::Enum)).then_some(ParentNamed::Item(p))
-        }
-        DefKind::AnonConst | DefKind::OpaqueTy => (def.parent != NO_DEF).then_some(ParentNamed::Item(def.parent)),
-        _ => None,
+    if def.kind == DefKind::Impl {
+        let m = prog.mods.get(def.scope as usize)?;
+        if m.lexical_parent.is_some() || m.def != def.parent { return None; }
+        let (head, twin) = prog.files.get(def.file as usize)?.impl_head(def.item)?;
+        let mut v = head.to_vec();
+        v.extend_from_slice(&twin.to_le_bytes());
+        return Some(ParentNamed::Impl(v));
     }
+    let child = matches!(def.kind, DefKind::AssocFn | DefKind::AssocConst | DefKind::AssocTy | DefKind::Variant | DefKind::Field | DefKind::Closure | DefKind::AnonConst | DefKind::OpaqueTy);
+    (child && def.parent != NO_DEF && prog.def(def.parent).kind != DefKind::Mod).then_some(ParentNamed::Item(def.parent))
 }
 
 /// Whether `d`'s identity (def_ident) carries its place (block_place): an item neither its path

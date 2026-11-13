@@ -8472,6 +8472,33 @@ mod data_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// Two impls in two `const _` blocks of one file (serde-derive's shape), or in one fn body,
+    /// each with a method of one name: their borrow-check verdicts are stored apart. They had one
+    /// key, so a stored Clean verdict for one skipped the other's check on the next warm run and
+    /// its borrow error was gone (relax review B-M1).
+    #[test]
+    fn sibling_impls_keep_borrowck_verdicts_of_their_own() {
+        isolated_test!(sibling_impls_keep_borrowck_verdicts_of_their_own);
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let root = std::env::temp_dir().join(format!("relax-siblings-{}-{}", std::process::id(), crate::clock::wall_ns()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("siblings.rs").to_string_lossy().into_owned();
+        std::fs::write(&path, "trait Grow { fn grow(&mut self) -> usize; }\nstruct C(usize);\nstruct D(usize);\n\
+            const _: () = { impl Grow for C { fn grow(&mut self) -> usize { self.0 } } };\n\
+            const _: () = { impl Grow for D { fn grow(&mut self) -> usize { self.0 + 1 } } };\n\
+            fn in_one_body() { struct A; struct B; impl A { fn touch(&self) {} } impl B { fn touch(&self) {} } }\n").unwrap();
+        let mut prog = crate::program::Program::new(sess);
+        prog.load_crate("siblings", &path, 2021, crate::cfg::CfgSet::host(sess, &[]), Vec::new()).unwrap();
+        let snapshot = OwnerVerdicts::new(42, crate::stable::crate_fingerprints(&prog), vec![0; prog.crates.len()], 0, None);
+        for name in ["grow", "touch"] {
+            let methods: Vec<DefId> = (0..prog.defs.len() as u32).map(DefId).filter(|&d| prog.def(d).kind == DefKind::AssocFn && prog.def(prog.def(d).parent).kind == DefKind::Impl && prog.syms.str(prog.def(d).name) == name).collect();
+            assert_eq!(methods.len(), 2, "the two impls' `{name}` methods");
+            let keys: Vec<u128> = methods.iter().map(|&d| snapshot.lookup(&prog, d, 0).0.expect("a verdict key")).collect();
+            assert_ne!(keys[0], keys[1], "the two `{name}` methods have one borrow-check verdict key");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn bound_crates_mark_only_the_interfaces_that_reach_them() {
         isolated_test!(bound_crates_mark_only_the_interfaces_that_reach_them);
