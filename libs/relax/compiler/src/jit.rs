@@ -4135,6 +4135,12 @@ rt_fn! {
 /// No-codegen mode's lazy entry (static_glue.rs): `g` is the global slot of the precompiled
 /// pools; the window it is in names the unit and the unit's own slot.
 fn rt_compile_global(g: u64) -> u64 {
+    // a forked child on its way to exec never compiles, as rt_compile (forkexec.rs): the build
+    // waits for the owner thread, which the child does not have, and the window lookup takes a
+    // lock -- the child names the global slot, the parent maps it (nc_unit_slot)
+    if crate::forkexec::exec_child() {
+        crate::forkexec::child_reached_unbuilt_global(g as u32);
+    }
     let (up, off) = nc_window_of(g as u32);
     rt_compile_in(up, g - off as u64)
 }
@@ -29169,6 +29175,14 @@ fn nc_window_free(off: u32) {
 }
 #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
 fn nc_window_free(_off: u32) {}
+
+/// The unit's own slot of global slot `g` (forkexec.rs: the parent of a forked child that
+/// reached it unbuilt). None: no live unit's window holds it.
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+pub(crate) fn nc_unit_slot(g: u32) -> Option<u32> {
+    let w = NC_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    w.iter().find(|e| g >= e.0 && g < e.0 + e.1 && e.2 != 0).map(|e| g - e.0)
+}
 
 /// The unit and the first global slot of the window global slot `g` is in.
 #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
