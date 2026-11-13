@@ -10736,11 +10736,11 @@ mod prune_tests {
     /// so both key variants of an identity can be computed.
     #[test]
     fn identity_anchor_switch_computes_both_variants() {
-        let on = with_identity_anchors(true, || super::anchors_in_key());
-        let off = with_identity_anchors(false, || super::anchors_in_key());
+        let on = with_identity_anchors(true, super::anchors_in_key);
+        let off = with_identity_anchors(false, super::anchors_in_key);
         assert_eq!(off, 0);
         assert_ne!(on, off, "the on variant mixes the anchor dirs");
-        assert_eq!(super::anchors_in_key(), on, "on is the default");
+        assert_eq!(with_identity_anchors(true, super::anchors_in_key), on, "on is the default");
     }
 
     /// Every input field changes the key: mutate one at a time and the hash must move.
