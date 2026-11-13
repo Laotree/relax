@@ -113,14 +113,20 @@ impl<T> Default for IntoIter<T> {
     }
 }
 
+// alloc vec/into_iter.rs: the items left drop as one slice (a panicking drop leaves the others to
+// the slice's drop), and a guard frees the buffer, on an unwind too
 unsafe impl<#[may_dangle] T> Drop for IntoIter<T> {
     fn drop(&mut self) {
-        while self.start < self.end {
-            unsafe { im::drop_in_place(im::ptr_add_mut(self.buf.as_ptr(), self.start)) };
-            self.start += 1;
+        struct DropGuard<'a, T>(&'a mut IntoIter<T>);
+        impl<T> Drop for DropGuard<'_, T> {
+            fn drop(&mut self) {
+                if crate::mem::size_of::<T>() != 0 && self.0.cap != 0 {
+                    heap::free(self.0.buf.as_ptr() as *mut u8, Vec::<T>::current_layout(self.0.cap));
+                }
+            }
         }
-        if crate::mem::size_of::<T>() != 0 && self.cap != 0 {
-            heap::free(self.buf.as_ptr() as *mut u8, Vec::<T>::current_layout(self.cap));
-        }
+        let guard = DropGuard(self);
+        // SAFETY: start..end are the items still owned; nothing reads them after this
+        unsafe { crate::ptr::drop_in_place(crate::ptr::slice_from_raw_parts_mut(im::ptr_add_mut(guard.0.buf.as_ptr(), guard.0.start), guard.0.end - guard.0.start)) };
     }
 }
