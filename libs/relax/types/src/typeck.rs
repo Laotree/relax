@@ -3411,8 +3411,14 @@ impl<'a> Fcx<'a> {
                             let full = self.tcx.complete_args(self.prog, d, &v, regions);
                             self.write_user_type_annotation_from_args(key, d, &full, user_self_ty);
                             self.apply_fn_bounds(d, &full, self.last_lo);
+                            // the type with those regions too (rustc type_of(..).instantiate(args)): an
+                            // impl's lifetime in it (`impl S<'_, ()> { const C: Self }`) is no
+                            // early-bound region of the body that names the const (relax issue 188:
+                            // "wrong generic argument kind" when that body's own arguments replaced it)
+                            self.tcx.instantiate_ty(self.prog, d, &full, t)
+                        } else {
+                            self.tcx.tys.subst(t, &v)
                         }
-                        self.tcx.tys.subst(t, &v)
                     }
                     None => t,
                 }
