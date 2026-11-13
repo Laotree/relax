@@ -1040,7 +1040,7 @@ fn exact_to_string<T: ?Sized>(v: &T) -> Option<String> {
 mod borrow_impls {
     use super::String;
     use crate::borrow::{Borrow, BorrowMut, Cow, ToOwned};
-    use crate::ops::Add;
+    use crate::ops::{Add, AddAssign};
 
     impl Borrow<str> for String {
         fn borrow(&self) -> &str {
@@ -1137,6 +1137,45 @@ mod borrow_impls {
                 let mut s = self.into_owned();
                 s.push_str(rhs);
                 Cow::Owned(s)
+            }
+        }
+    }
+
+    // library/alloc/src/borrow.rs
+    impl<'a> Add<Cow<'a, str>> for Cow<'a, str> {
+        type Output = Cow<'a, str>;
+        fn add(mut self, rhs: Cow<'a, str>) -> Cow<'a, str> {
+            self += rhs;
+            self
+        }
+    }
+
+    impl<'a> AddAssign<&'a str> for Cow<'a, str> {
+        fn add_assign(&mut self, rhs: &'a str) {
+            if self.is_empty() {
+                *self = Cow::Borrowed(rhs)
+            } else if !rhs.is_empty() {
+                if let Cow::Borrowed(lhs) = *self {
+                    let mut s = String::with_capacity(lhs.len() + rhs.len());
+                    s.push_str(lhs);
+                    *self = Cow::Owned(s);
+                }
+                self.to_mut().push_str(rhs);
+            }
+        }
+    }
+
+    impl<'a> AddAssign<Cow<'a, str>> for Cow<'a, str> {
+        fn add_assign(&mut self, rhs: Cow<'a, str>) {
+            if self.is_empty() {
+                *self = rhs
+            } else if !rhs.is_empty() {
+                if let Cow::Borrowed(lhs) = *self {
+                    let mut s = String::with_capacity(lhs.len() + rhs.len());
+                    s.push_str(lhs);
+                    *self = Cow::Owned(s);
+                }
+                self.to_mut().push_str(&rhs);
             }
         }
     }

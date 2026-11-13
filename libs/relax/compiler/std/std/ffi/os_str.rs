@@ -536,3 +536,4 @@ impl From<OsString> for alloc::rc::Rc<OsStr> {
         alloc::rc::Rc::from(&*s)
     }
 }
+
