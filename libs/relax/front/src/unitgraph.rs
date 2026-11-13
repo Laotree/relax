@@ -58,6 +58,10 @@ pub struct RawUnit {
     /// a path package outside the sysroot (its cargo pkg_id is `path+`): its files are its source,
     /// where a registry or git package is its id and a sysroot crate is Relax's own
     pub path_source: bool,
+    /// a registry or git package (cargo's pkg_id is no `path+`; a sysroot crate's is): what a
+    /// build script's unit graph says of it (`script_units`), so the script's run sees its
+    /// third-party packages as this run does
+    pub registry: bool,
     /// the checks its profile gives the unit as a host unit, which a build script's run builds it
     /// with (`makepad test`'s profile: run.rs; a build script's run: its graph's)
     pub host_checks: Option<crate::resolve::ProfileChecks>,
@@ -159,7 +163,7 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
     let mut test_crates: Vec<usize> = Vec::new();
     // unit index of a run-custom-build unit -> its script (src_path, edition, features, build unit)
     let mut run_build: Vec<Option<(String, u16, Vec<String>, usize)>> = vec![None; n_units];
-    let mut raw: Vec<RawUnit> = vec![RawUnit { name: String::new(), src_path: String::new(), edition: 2015, features: Vec::new(), proc_macro: false, deps: Vec::new(), run_script: false, pkg: Default::default(), path_source: false, host_checks: None }; n_units];
+    let mut raw: Vec<RawUnit> = vec![RawUnit { name: String::new(), src_path: String::new(), edition: 2015, features: Vec::new(), proc_macro: false, deps: Vec::new(), run_script: false, pkg: Default::default(), path_source: false, registry: false, host_checks: None }; n_units];
     // a crate used on both sides (normal dependency and build-dependency / proc-macro side) is one
     // crate here: keep the target side for the app and the host side for the macro world.
     // Cargo reference features.md#feature-resolver-version-2 keeps their features separate;
@@ -205,7 +209,7 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
             (d, n, v)
         };
         raw[ui] = RawUnit { name: tname.clone(), src_path: src_path.clone(), edition, features: features.clone(), proc_macro: pm, deps: udeps.clone(), run_script: build && mode == "run-custom-build", pkg: (pkg_dir.clone(), pname.clone(), ver.clone()),
-            path_source: !u.sysroot && u.pkg_id.starts_with("path+"), host_checks: u.checks };
+            path_source: !u.sysroot && u.pkg_id.starts_with("path+"), registry: !u.pkg_id.starts_with("path+"), host_checks: u.checks };
         // the run unit depends on the script's compile unit, whose deps are the build-dependencies
         let build_unit = udeps.first().map(|d| d.0).unwrap_or(usize::MAX);
         run_build[ui] = if build && mode == "run-custom-build" { Some((src_path.clone(), edition, features.clone(), build_unit)) } else { None };
@@ -1238,12 +1242,21 @@ fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrit
     // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
     h = fnv(&crate::dirs::anchors_key().to_le_bytes(), h);
     let mut units: Vec<String> = Vec::new();
+    // a registry or git package's unit keeps a non-path id (its folder still in it), so the
+    // script's run sees it as third-party, as this run does (RawUnit::registry): its proc macros
+    // run confined under Policy::Sandboxed (relax-compiler pmhost.rs)
+    let source = |registry: bool| if registry { "registry" } else { "path" };
     let deps_json = |deps: &[(usize, String)]| -> String {
         deps.iter().filter_map(|(d, n)| idx(*d).map(|k| format!("{{\"index\":{},\"extern_crate_name\":{}}}", k, q(n)))).collect::<Vec<_>>().join(",")
     };
     for &i in &seen {
         let u = &raw[i];
         h = fnv(crate::dirs::anchored(&u.src_path).as_bytes(), h);
+        // (the run of a script whose units were all written as path packages ran their macros
+        // as host code: its output does not stand for one that sees them as third-party)
+        if u.registry {
+            h = fnv(b"registry", h);
+        }
         if let Ok(src) = crate::vfs::read(&u.src_path) {
             h = fnv(&src, h);
         }
@@ -1264,7 +1277,7 @@ fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrit
         let feats: Vec<String> = u.features.iter().map(|f| q(f)).collect();
         units.push(format!(
             "{{\"pkg_id\":{},\"target\":{{\"kind\":[\"{}\"],\"name\":{},\"src_path\":{},\"edition\":\"{}\"}},\"profile\":{{\"opt_level\":\"3\"{}}},\"mode\":\"{}\",\"features\":[{}],\"dependencies\":[{}]}}",
-            q(&format!("path+file://{}#{}@{}", u.pkg.0, u.pkg.1, u.pkg.2)),
+            q(&format!("{}+file://{}#{}@{}", source(u.registry), u.pkg.0, u.pkg.1, u.pkg.2)),
             kind,
             q(&name),
             q(&u.src_path),
@@ -1287,10 +1300,15 @@ fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrit
     let pkg_dir = manifest_dir_of(&bs.src_path);
     let sfeats: Vec<String> = bs.features.iter().map(|f| q(f)).collect();
     // the script's own checks: its compile unit's
-    let script_checks = checks_json(raw.iter().find(|u| u.src_path == bs.src_path && !u.run_script).and_then(|u| u.host_checks));
+    let script_compile = raw.iter().find(|u| u.src_path == bs.src_path && !u.run_script);
+    let script_checks = checks_json(script_compile.and_then(|u| u.host_checks));
+    let script_registry = script_compile.is_some_and(|u| u.registry);
+    if script_registry {
+        h = fnv(b"registry", h);
+    }
     let script_unit = |src_path: &str| format!(
         "{{\"pkg_id\":{},\"target\":{{\"kind\":[\"bin\"],\"name\":\"build-script-build\",\"src_path\":{},\"edition\":\"{}\"}},\"profile\":{{\"opt_level\":\"3\"{}}},\"mode\":\"build\",\"features\":[{}],\"dependencies\":[{}]}}",
-        q(&format!("path+file://{}#build-script-build@0.0.0", pkg_dir)),
+        q(&format!("{}+file://{}#build-script-build@0.0.0", source(script_registry), pkg_dir)),
         q(src_path),
         bs.edition,
         script_checks,
