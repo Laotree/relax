@@ -5,7 +5,9 @@
 //! of the loader by any other name (RELAX_LOADER, an installed `makepad`) runs the loader's command
 //! line as written, whatever its first word. A hard link, not a symlink or a copy: canonicalize
 //! keeps its name, the OS runs it as the loader (the same file, so the same code signature on
-//! macOS), and it takes no space beyond a directory entry while the loader file exists.
+//! macOS), and it takes no space beyond a directory entry while the loader file exists. A run dir
+//! on another volume than the loader's links a copy of the loader there instead, one per loader
+//! file (`link_loader`).
 //!
 //! The folder also holds the run's command line (`LINE`, RELAX_SELF_EXEC's value), so a launch of
 //! the link that did not come through Relax std's spawn (`sh -c "exec $EXE ..."`, a C library's
@@ -37,6 +39,9 @@ static LINK_DIR: OnceLock<PathBuf> = OnceLock::new();
 static NAME: OnceLock<String> = OnceLock::new();
 /// A process's links that runs start from (`launch_link`), in its folder: a name no link has
 const LAUNCH: &str = crate::dirs::LAUNCH_DIR;
+/// The loader's copies the links are made of where the loader is on another volume
+/// (`link_loader`), beside the processes' folders: a name no process's folder has
+const COPIES: &str = "+copy";
 
 /// Writes the loader a link in `dir` was made of beside it (dirs::RUN_LOADER): a process that
 /// runs from the link and was not told the loader (RELAX_LOADER: a program that relaunched itself
@@ -109,8 +114,45 @@ pub fn link(loader: &Path, name: &str, test: bool) -> Result<PathBuf, String> {
         record_loader(&dir, loader);
     }
     let _ = LINK_DIR.set(at);
-    std::fs::hard_link(loader, &link).map_err(|e| format!("hard link {} of {}: {e}", link.display(), loader.display()))?;
+    link_loader(loader, &link, &root.join(COPIES)).map_err(|e| format!("hard link {} of {}: {e}", link.display(), loader.display()))?;
     link.canonicalize().map_err(|e| format!("{}: {e}", link.display()))
+}
+
+/// A hard link of `loader` at `to`. Where the file system cannot hold one because the loader is
+/// on another volume (Windows' ERROR_NOT_SAME_DEVICE, Unix's EXDEV), a hard link of the loader's
+/// copy in `copies`, a folder on `to`'s volume: a copy made once per loader file (its length and
+/// modification time name it), which the links of every later run share. The copies of other
+/// loader files go (a run's link keeps the file it runs from, and Windows keeps one in use).
+/// Before, a target dir on another drive than relax.exe left the run without its own executable
+/// (relax issue 163: "hard link ... (os error 17)").
+fn link_loader(loader: &Path, to: &Path, copies: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(loader, to) {
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            let m = std::fs::metadata(loader)?;
+            let modified = m.modified()?.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+            let name = format!("{:x}-{modified:x}-{}", m.len(), loader.file_name().unwrap_or_default().to_string_lossy());
+            let copy = copies.join(&name);
+            if !copy.is_file() {
+                private_dirs(copies)?;
+                let part = copies.join(format!(".{}.{name}", std::process::id()));
+                std::fs::copy(loader, &part)?;
+                // (another run's copy of the same loader may have got there first)
+                if std::fs::rename(&part, &copy).is_err() {
+                    let _ = std::fs::remove_file(&part);
+                }
+                for e in std::fs::read_dir(copies).into_iter().flatten().flatten() {
+                    let other = e.file_name().to_string_lossy().into_owned();
+                    // a copy being made: `.<pid>.<name>` of a process that is still there
+                    let making = other.strip_prefix('.').and_then(|o| o.split('.').next()?.parse::<u32>().ok()).is_some_and(alive);
+                    if other != name && !making {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+            std::fs::hard_link(&copy, to)
+        }
+        linked => linked,
+    }
 }
 
 /// A link of `loader` named as the program `name`, in this process's `+launch` folder, for a run
@@ -141,7 +183,7 @@ pub fn launch_link(loader: &Path, name: &str) -> Option<PathBuf> {
         // (a restart may start another loader: the link is replaced whole)
         let part = dir.join(format!(".{}.part", file_name(name)));
         let _ = std::fs::remove_file(&part);
-        std::fs::hard_link(loader, &part).ok()?;
+        link_loader(loader, &part, &own.with_file_name(COPIES)).ok()?;
         std::fs::rename(&part, &path).ok()?;
     }
     Some(path)
@@ -222,7 +264,7 @@ pub fn add_bins(launchers: &[String]) {
             file.push(".exe");
             let lines = dir.join(BIN);
             if std::fs::create_dir_all(&lines).is_ok() && std::fs::write(lines.join(&file), &words).is_ok() {
-                let _ = std::fs::hard_link(&loader, dir.join(&file));
+                let _ = link_loader(&loader, &dir.join(&file), &dir.with_file_name(COPIES));
             }
             continue;
         }
@@ -337,5 +379,39 @@ fn alive(pid: u32) -> bool {
         let running = GetExitCodeProcess(h, &mut code) != 0 && code == STILL_ACTIVE;
         CloseHandle(h);
         running
+    }
+}
+
+// (Linux: /dev/shm is a volume of its own a test can write to; the Mac and the Windows node have
+// none: macOS shows its system and data volumes as one device, and the Windows node has only C:)
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// A loader on another volume than the run dir: each link is a hard link of one copy of it on
+    /// the run dir's volume, made once (relax issue 163: on Windows the hard link failed with os
+    /// error 17 and the run had no executable of its own). The two volumes: a file of ours in the
+    /// temp folder and /dev/shm (a tmpfs of its own).
+    #[test]
+    fn a_loader_on_another_volume_is_linked_from_one_copy() {
+        use std::os::unix::fs::MetadataExt;
+        let own = format!("relax-link-across-{}", std::process::id());
+        let from = std::env::temp_dir().join(&own);
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("loader"), b"the loader").unwrap();
+        let (loader, dir) = (from.join("loader"), Path::new("/dev/shm").join(&own));
+        std::fs::create_dir_all(&dir).unwrap();
+        let devices = (std::fs::metadata(&loader).unwrap().dev(), std::fs::metadata(&dir).unwrap().dev());
+        let direct = std::fs::hard_link(&loader, dir.join("direct")).map_err(|e| e.kind());
+        let (a, b, copies) = (dir.join("a"), dir.join("b"), dir.join(COPIES));
+        let linked = (link_loader(&loader, &a, &copies), link_loader(&loader, &b, &copies));
+        let made: Vec<PathBuf> = std::fs::read_dir(&copies).map(|d| d.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+        let ones = made.len() == 1 && same_file(&a, &made[0]) && same_file(&b, &made[0]);
+        let content = std::fs::read(&a).ok() == std::fs::read(&loader).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&from);
+        assert!(devices.0 != devices.1 && direct == Err(std::io::ErrorKind::CrossesDevices), "the loader and the folder are on two volumes: {devices:?} {direct:?}");
+        assert!(linked.0.is_ok() && linked.1.is_ok(), "both links were made: {linked:?}");
+        assert!(ones && content, "both are links of one copy of the loader: {made:?}");
     }
 }
