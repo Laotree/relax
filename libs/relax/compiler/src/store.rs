@@ -491,8 +491,11 @@ pub fn base_path(p: &Path) -> PathBuf {
 /// Highest generation seen per store (generation 0 path), and the folders listed for it.
 static GENS: relax_session::sync::Mutex<Option<(std::collections::HashMap<PathBuf, u32>, std::collections::HashSet<PathBuf>)>> = relax_session::sync::Mutex::new(None);
 
-/// Lists `dir` into GENS (each store's highest generation present).
+/// Lists `dir` into GENS (each store's highest generation present), in place of what was known of
+/// it: a generation deleted since (a cleared cache, a folder removed and made again) is gone from
+/// GENS too, so the store's next write is its lowest free generation, not one above the deleted.
 fn list_gens(dir: &Path, gens: &mut std::collections::HashMap<PathBuf, u32>) {
+    gens.retain(|k, _| k.parent() != Some(dir));
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let n = e.file_name();
         let Some(n) = n.to_str() else { continue };

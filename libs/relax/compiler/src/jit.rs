@@ -30958,6 +30958,9 @@ pub(crate) unsafe fn reset_statics() {
     reset(&PUB_OPT, relax_session::sync::Mutex::new(None));
     reset(&BENCH_CAPTURE, relax_session::sync::Mutex::new(Vec::new()));
     reset(&WATCH, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&HOT_VERDICTS, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&LEFT_OUTS, relax_session::sync::Mutex::new(LeftOuts { waits: Vec::new(), due: Vec::new(), made: None, failed: None, owner_built: None }));
+    reset(&LOAD_WANTED, std::sync::Mutex::new(Vec::new()));
     reset(&DEFERRED_MISSING, relax_session::sync::Mutex::new(Vec::new()));
     reset(&DEFERRED_STATICS, relax_session::sync::Mutex::new(std::collections::BTreeSet::new()));
     reset(&DEFERRED_LOADS, AtomicU64::new(0));

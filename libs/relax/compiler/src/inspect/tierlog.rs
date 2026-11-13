@@ -458,7 +458,10 @@ mod tests {
     #[test]
     fn histories_start_at_a_decision() {
         init();
-        let slot = 0x7fff_fff0;
+        // a slot of its own each time it runs: a warm rerun in this process finds the histories
+        // of the runs before
+        static RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let slot = 0x7fff_fff0 - RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         note_arm(slot, ARM_NEW, 0x1000);
         drain();
         assert!(history(slot).0.is_none());

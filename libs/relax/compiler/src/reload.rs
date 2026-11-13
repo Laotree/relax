@@ -11197,6 +11197,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&RESTART_SUPPORTED, std::sync::atomic::AtomicBool::new(false));
     reset(&LAYOUT_GROUP, std::sync::atomic::AtomicU32::new(0));
     reset(&UNIT_SUSPECT, relax_session::sync::Mutex::new(None));
+    reset(&PROGRAM_READS, relax_session::sync::Mutex::new(None));
     reset(&RESTART_REQUESTED, std::sync::atomic::AtomicBool::new(false));
     reset(&PINNED, std::sync::atomic::AtomicBool::new(false));
     reset(&CATCH_UP, std::sync::atomic::AtomicBool::new(false));
