@@ -10900,8 +10900,13 @@ mod prune_tests {
         std::fs::write(&idle_set, "").unwrap();
         let live: HashSet<PathBuf> = [mine_used.clone()].into_iter().collect();
         prune(&root, &live, &HashSet::new(), &[], Some(u64::MAX));
-        assert!(other_old.exists() && unnamed.exists() && other_running.exists() && other_stamped.exists(), "under the cap every build's stores stay");
-        assert!(idle_set.exists(), "and what names them");
+        // a store another build wrote goes at once when that build is not running, this run did not
+        // open it and it was not stamped a moment ago: the cap is not the collector for those
+        assert!(!other_old.exists(), "an idle other build's store goes, cap or not");
+        assert!(!unnamed.exists(), "a store from before headers named builds goes too");
+        assert!(other_running.exists(), "a running build's store stays");
+        assert!(other_stamped.exists(), "a store stamped a moment ago stays");
+        assert!(!idle_set.exists(), "the sets of a build whose last store went go with it");
         assert!(mine_old.exists() && mine_used.exists());
         assert!(dir.join("live").join(format!("{me:016x}")).exists(), "this process holds its build's lock");
         assert!(!ended_set.exists(), "an ended build's sets go with its last store");
@@ -10909,15 +10914,13 @@ mod prune_tests {
         assert!(!ended.exists(), "and its lock file");
         // the cap takes the least recently used first, whichever build wrote them
         let size = |p: &PathBuf| std::fs::metadata(p).unwrap().len();
-        let all = [&mine_old, &mine_used, &other_old, &unnamed, &other_running, &other_stamped].iter().map(|p| size(p)).sum::<u64>();
+        let all = [&mine_old, &mine_used, &other_running, &other_stamped].iter().map(|p| size(p)).sum::<u64>();
         prune(&root, &live, &HashSet::new(), &[], Some(all - 1));
-        assert!(!unnamed.exists(), "the oldest not running goes first");
-        assert!(other_old.exists() && mine_old.exists());
+        assert!(!mine_old.exists(), "the oldest not running goes first");
+        assert!(other_stamped.exists(), "stamped a moment ago");
         assert!(other_running.exists(), "older, but its build runs");
         // down to what is in use: this run's, another run's stamped just now, a running build's
         prune(&root, &live, &HashSet::new(), &[], Some(1));
-        assert!(!other_old.exists() && !mine_old.exists());
-        assert!(!idle_set.exists(), "the cap took that build's last store: its sets go");
         assert!(mine_used.exists() && other_stamped.exists() && other_running.exists());
         // that build's process ends: the cap may take its stores now
         drop(lock);
