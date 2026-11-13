@@ -26,6 +26,10 @@
 //! bytes still are that blob is not an edit; `reconcile_edits` brings it to the release being run.
 //! One whose bytes changed becomes an edit (recorded in `.makepad-run-edits` from that blob).
 //!
+//! The `.makepad-run-*` names stay as they are, though relax's other names say `relax`: these
+//! files hold people's edits across runs (an installed app's edits folder), and a rename would
+//! need a migration of every existing edits folder for a cosmetic gain.
+//!
 //! FOLDER MOUNTS (`mount_folder`): a virtual folder served from a disk folder, the plain map
 //! `<root>/<rel>` -> `<folder>/<rel>`: no store, ledger, whiteouts, base copies or seeding; reads,
 //! probes and writes go to the mapped disk path. The edits folder serves store mounts only.

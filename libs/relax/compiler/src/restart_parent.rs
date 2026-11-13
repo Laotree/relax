@@ -184,7 +184,7 @@ fn parent(args: &[Vec<u8>]) -> ! {
         }
     };
     let job = kill_on_close_job();
-    let file = std::env::temp_dir().join(format!("makepad-restart-{}", std::process::id()));
+    let file = std::env::temp_dir().join(format!("relax-restart-{}", std::process::id()));
     // SAFETY: args_bytes gives the encoded bytes of OsStrings
     let words = args[1..].iter().map(|a| unsafe { OsStr::from_encoded_bytes_unchecked(a) }.to_os_string()).collect();
     let dir = std::env::current_dir().map(std::path::PathBuf::into_os_string).unwrap_or_default();

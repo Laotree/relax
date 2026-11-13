@@ -907,7 +907,7 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
     let metadata = crate::json::parse(&metadata.stdout)?;
     let build = metadata.get("build_directory").map(|v| std::path::PathBuf::from(v.str()))
         .filter(|p| p != &target)
-        .map(|p| p.join("makepad-native").join(match tier { Tier::Fast => "fast", Tier::Optimized => "optimized" }).join(format!("{selection:016x}")))
+        .map(|p| p.join("relax-native").join(match tier { Tier::Fast => "fast", Tier::Optimized => "optimized" }).join(format!("{selection:016x}")))
         .unwrap_or_else(|| target.clone());
     // the program's link arguments: the wrapper writes them here, a file per binary or test
     // harness. A folder of its own per cargo run: the program's stubs depend on its name

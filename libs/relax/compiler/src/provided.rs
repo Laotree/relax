@@ -248,7 +248,7 @@ mod source_tests {
     #[test]
     fn a_dependency_only_the_loaders_shims_bring_in_is_no_change() {
         use crate::srchash::closure_manifest;
-        // relax-api's makepad-alloc-phase: optional behind host-shims (the loader's build enables
+        // relax-api's relax-api-phase: optional behind host-shims (the loader's build enables
         // it, a program never does) and a dependency on Apple's targets only
         let pkg = |name: &str, features: &[&str], deps: Vec<usize>| SrcPkg { name: name.into(), version: "1".into(), dir: format!("/.cargo/registry/{name}"),
             features: features.iter().map(|f| f.to_string()).collect(), deps, proc_macro: false };

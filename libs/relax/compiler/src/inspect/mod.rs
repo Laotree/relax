@@ -1946,7 +1946,7 @@ fn serve_program_service(endpoint: &makepad_remote::Endpoint, name: &str, versio
             let ch = opened.channel;
             let service = active.clone();
             { let _k = crate::zone_alloc::kept();
-            if let Err(e) = std::thread::Builder::new().name("makepad-remote-service".into()).spawn(move || {
+            if let Err(e) = std::thread::Builder::new().name("run-inspect-service".into()).spawn(move || {
                 while let Some(ev) = ch.recv() {
                     if matches!(ev, makepad_remote::Event::Closed(..)) {
                         break;

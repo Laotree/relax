@@ -112,9 +112,9 @@ pub fn bare() -> bool {
     crate::host().package == env!("CARGO_PKG_NAME")
 }
 
-/// The command this binary is run as, for titles, usage lines and hints.
+/// The command this binary is run as, for titles, usage lines and hints (Host.tool).
 pub fn command() -> &'static str {
-    if bare() { "relax" } else { "makepad" }
+    crate::host().tool
 }
 
 fn title(p: &mut Page, what: &str) {

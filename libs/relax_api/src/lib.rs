@@ -55,11 +55,11 @@ pub fn app_call<F: FnOnce()>(f: F) -> bool {
 }
 
 /// An op of a crate whose objects are the program's: what it allocates goes with the program's heap
-/// (`makepad_alloc_phase::run`). Only generated wrappers call this.
+/// (`relax_api_phase::run`). Only generated wrappers call this.
 #[cfg(feature = "host-shims")]
 #[inline(always)]
 pub fn run_op() -> impl Sized {
-    makepad_alloc_phase::run()
+    relax_api_phase::run()
 }
 #[cfg(not(feature = "host-shims"))]
 #[inline(always)]
@@ -70,7 +70,7 @@ pub fn run_op() {}
 #[cfg(feature = "host-shims")]
 #[inline(always)]
 pub fn host_op() -> impl Sized {
-    makepad_alloc_phase::kept()
+    relax_api_phase::kept()
 }
 #[cfg(not(feature = "host-shims"))]
 #[inline(always)]
@@ -115,7 +115,7 @@ pub mod env {
 /// be the run's and go with it, and the lock with it. These keep their state inline.
 pub mod sync {
     #[cfg(target_vendor = "apple")]
-    pub use makepad_alloc_phase::sync::{Condvar, Mutex, MutexGuard};
+    pub use relax_api_phase::sync::{Condvar, Mutex, MutexGuard};
     #[cfg(not(target_vendor = "apple"))]
     pub use std::sync::{Condvar, Mutex, MutexGuard};
 }
@@ -126,7 +126,7 @@ pub mod sync {
 #[inline(always)]
 pub fn process_heap<R>(f: impl FnOnce() -> R) -> R {
     #[cfg(feature = "host-shims")]
-    let _kept = makepad_alloc_phase::kept();
+    let _kept = relax_api_phase::kept();
     f()
 }
 
