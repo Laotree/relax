@@ -2399,8 +2399,16 @@ unsafe fn tail_enter(d: &CallDesc, fp: *mut u64, cx: *mut Cx) -> *const IFunc {
                 (*cx).n[1] += 1;
             }
             let fr = &*f;
-            // the arguments first (they are read from the frame the callee's overwrites)
-            let mut buf = [0u64; 2 * 48];
+            // the arguments first (they are read from the frame the callee's overwrites): two words
+            // at most per argument, from the heap past what the inline buffer holds
+            let mut inline = [0u64; 2 * 48];
+            let mut heap = Vec::new();
+            let buf: &mut [u64] = if 2 * d.args.len() <= inline.len() {
+                &mut inline
+            } else {
+                heap.resize(2 * d.args.len(), 0);
+                &mut heap
+            };
             let mut n = 0;
             for &(cell, cls) in &d.args {
                 if cls == Cls::V128 {
@@ -2587,7 +2595,21 @@ unsafe fn do_call(d: &CallDesc, fp: *mut u64, cx: *mut Cx) -> bool {
         eprintln!("interp: native call {:#x} args {:?}", word, d.args.iter().map(|a| *fp.add(a.0 as usize)).collect::<Vec<_>>());
     }
     let mut regs = [0u64; RB_WORDS];
-    let mut stack = [0u64; 32];
+    // the stack arguments, as many words as the call passes (at most one per argument of a Relax-ABI
+    // call; a C call's plan says how many): a call with more than the inline buffer holds takes them
+    // from the heap
+    let words = match &d.csig {
+        None => d.args.len(),
+        Some((_, plan)) => (plan.stack_bytes as usize).div_ceil(8),
+    };
+    let mut inline = [0u64; 32];
+    let mut heap = Vec::new();
+    let stack: &mut [u64] = if words <= inline.len() {
+        &mut inline
+    } else {
+        heap.resize(words, 0);
+        &mut heap
+    };
     let mut nstack = 0usize;
     match &d.csig {
         None => {
@@ -3503,18 +3525,16 @@ fn lower_inst(l: &mut Lw, i: &Inst, slots: SlotsPtr, sym_class: u64, sym_val: &d
             let csig = match callee {
                 Callee::CHost(_, s) | Callee::CIndirect(_, s) | Callee::CFn(_, s) => {
                     let plan = cabi::plan(s, s.conv.target());
-                    if plan.stack_bytes > 256 {
-                        return Err("C call with more than 256 bytes of stack arguments");
-                    }
                     Some((s.clone(), plan))
                 }
                 _ => None,
             };
+            // Relax ABI: vectors past the eighth float register are not passed on the stack here (as
+            // for parameters); any number of other arguments is
             if csig.is_none() {
                 let nf = args.iter().filter(|v| l.cls(**v) != Cls::I).count();
-                let ni = args.len() - nf;
-                if (nf > 8 && args.iter().any(|v| l.cls(*v) == Cls::V128)) || ni.saturating_sub(8) + nf.saturating_sub(8) > 32 {
-                    return Err("call with vector or over 32 stack arguments");
+                if nf > 8 && args.iter().any(|v| l.cls(*v) == Cls::V128) {
+                    return Err("call with a vector argument on the stack");
                 }
             }
             let (mut ri, mut rf) = (0, 0);

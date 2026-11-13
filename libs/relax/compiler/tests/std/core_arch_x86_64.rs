@@ -2,7 +2,6 @@
 // compares its `| ` lines with makepad test's. Relax also has core::arch::x86_64 on Arm hosts (emulated, every
 // feature present): there makepad test's lines are compared with an x86_64 host's real ones,
 // arch/x86_64_real.txt (an agree across hosts).
-// needs-native: _mm512_set_epi8's 64 arguments, more stack arguments than the interpreter's calls take
 // Each immediate's `compare` stays a function of its own (inline(never)): 256 of them inlined into
 // one loop overflowed rustc -O's stack in LLVM's known-bits/SCEV recursion.
 #![allow(non_snake_case)]
