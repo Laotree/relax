@@ -324,7 +324,7 @@ fn table_key(ident: u128, iface: u128) -> u128 {
     let mut h = Sip128::new();
     h.str("relax-check-table");
     // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-    h.u128(crate::dirs::anchors_key());
+    h.u128(crate::cache::anchors_in_key());
     h.u128(ident);
     h.u128(iface);
     h.finish128()
@@ -336,7 +336,7 @@ fn late_key(key: u128) -> u128 {
     h.str("relax-check-late");
     h.u128(key);
     // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-    h.u128(crate::dirs::anchors_key());
+    h.u128(crate::cache::anchors_in_key());
     h.finish128()
 }
 
@@ -353,7 +353,7 @@ fn verdict_keys(key: u128, late: &[(String, u8, String, u128)]) -> (u128, u128) 
     }
     let anchored = h.finish128();
     // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-    h.u128(crate::dirs::anchors_key());
+    h.u128(crate::cache::anchors_in_key());
     (h.finish128(), anchored)
 }
 
@@ -460,7 +460,7 @@ impl Reuse {
             let mut h = Sip128::new();
             h.str("relax-check-run");
             // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-            h.u128(crate::dirs::anchors_key());
+            h.u128(crate::cache::anchors_in_key());
             h.u128(set);
             let mut v = keys.clone();
             v.sort_unstable();
@@ -820,7 +820,7 @@ impl Reuse {
         h.u32(VERSION);
         h.u32(crate::check_bodies::BLOB_VERSION);
         // the worktree: the crate identities hold its absolute paths
-        h.u128(crate::dirs::anchors_key());
+        h.u128(crate::cache::anchors_in_key());
         h.u128(self.env);
         h.u128(self.set);
         h.u128(self.heads[c as usize]);
@@ -1078,7 +1078,7 @@ impl Early {
         let mut h = Sip128::new();
         h.str("relax-check-early");
         // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-        h.u128(crate::dirs::anchors_key());
+        h.u128(crate::cache::anchors_in_key());
         h.u32(VERSION);
         h.u128(env_key(prog));
         h.u32(args.len() as u32);

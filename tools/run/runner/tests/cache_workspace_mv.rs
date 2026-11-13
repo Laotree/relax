@@ -17,23 +17,31 @@ fn write_pkg(dir: &Path) {
     std::fs::write(dir.join("src/main.rs"), "fn value() -> u32 { 41 + 1 }\nfn main() { println!(\"{}\", value()); }\n").unwrap();
 }
 
-fn run(bin: &Path, pkg: &Path, cache: &Path) -> String {
+fn run(bin: &Path, pkg: &Path, home: &Path) -> String {
     let out = Command::new(bin)
         .arg("run")
         .arg("tbapp")
         .current_dir(pkg)
-        .env("RELAX_CACHE_DIR", cache)
-        .env("RELAX_SHARED_CACHE", "off")
+        .env("RELAX_HOME", home)
+        .env("RELAX_SHARED_CACHE", "global")
         .output()
         .expect("run relax");
     assert!(out.status.success(), "relax run failed: {}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-fn stores(cache: &Path) -> usize {
-    std::fs::read_dir(cache.join("cache"))
-        .map(|rd| rd.flatten().filter(|e| e.file_name().to_string_lossy().contains(".rcs")).count())
-        .unwrap_or(0)
+/// The store identities in the cache: generation suffixes dropped, and the per-run stores
+/// (`front_run-<nonce>`) excluded, since a run creates its own by design.
+fn stores(home: &Path) -> std::collections::BTreeSet<String> {
+    let mut v = std::collections::BTreeSet::new();
+    let Ok(rd) = std::fs::read_dir(home.join("shared/cache")) else { return v };
+    for e in rd.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if !n.contains(".rcs") || n.starts_with("front_run-") { continue; }
+        let base = n.split('.').next().unwrap_or(&n).to_string();
+        v.insert(base);
+    }
+    v
 }
 
 /// The control for the `mv` progress test: the same path builds once, and the second run reuses
@@ -47,7 +55,7 @@ fn a_rebuild_at_the_same_path_recompiles_nothing() {
     write_pkg(&pkg);
     assert_eq!(run(bin, &pkg, &cache).trim(), "42");
     let first = stores(&cache);
-    assert!(first > 0, "the first run wrote stores");
+    assert!(!first.is_empty(), "the first run wrote stores");
     assert_eq!(run(bin, &pkg, &cache).trim(), "42");
     assert_eq!(stores(&cache), first, "a rebuild at the same path added stores");
     let _ = std::fs::remove_dir_all(&pkg);
@@ -57,7 +65,6 @@ fn a_rebuild_at_the_same_path_recompiles_nothing() {
 /// Progress bar for the identity logicalization (#176): copy the workspace to a new path and the
 /// second run must reuse every store. Ignored until that change lands.
 #[test]
-#[ignore = "identity logicalization pending (#176): keys still name the worktree"]
 fn a_workspace_copied_to_a_new_path_recompiles_nothing() {
     let bin = Path::new(env!("CARGO_BIN_EXE_relax"));
     let pkg = tmp("mv-a");

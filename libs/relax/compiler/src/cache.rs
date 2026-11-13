@@ -249,7 +249,7 @@ pub(crate) fn with_identity_anchors<R>(on: bool, f: impl FnOnce() -> R) -> R {
 
 /// The anchor-dir hash an identity mixes in: the absolute dirs, or nothing in the path-free
 /// variant.
-fn anchors_in_key() -> u128 {
+pub(crate) fn anchors_in_key() -> u128 {
     if identity_anchors_now() { crate::dirs::anchors_key() } else { 0 }
 }
 
