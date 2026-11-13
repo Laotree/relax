@@ -2377,6 +2377,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 });
                 u.fn_id(FnKey::Inst(main_def, Vec::new()))
             };
+            crate::wasm_export::entry(u.wasm_export_id, id);
             u.entry(id)
         }
         None => 0,

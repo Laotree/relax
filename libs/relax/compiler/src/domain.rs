@@ -1563,6 +1563,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
         if crate::run::app_domain() == Some(id) { crate::layout::set_root_crate(root); }
         let main_def = crate::run::find_main(&u.prog, root).ok_or_else(|| format!("no `fn main` at the root of {}", spec.package))?;
         let fid = u.fn_id(crate::jit::FnKey::Inst(main_def, Vec::new()));
+        crate::wasm_export::entry(u.wasm_export_id, fid);
         let entry = u.entry(fid);
         let (target, arg) = crate::run::main_call(u, main_def, entry)?;
         Ok::<_, String>((target, arg, create(u)))

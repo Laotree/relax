@@ -21,7 +21,6 @@ use relax_session::sync::Mutex;
 use std::collections::{BTreeMap, HashMap};
 
 struct Captured {
-    entry: u32,
     funcs: BTreeMap<u32, Func>,
 }
 
@@ -32,8 +31,20 @@ pub fn new_unit() -> usize {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
     if enabled() { NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) } else { 0 }
 }
-/// the first captured slot: the run's entry (the test fn, main)
+/// the run's entry: its unit's `main` (MAINS), when no test fn or export is a root
 static ENTRY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+/// each unit's `main` slot (`entry`)
+static MAINS: Mutex<BTreeMap<usize, u32>> = Mutex::new(BTreeMap::new());
+
+/// Slot `id` is unit `unit`'s `main`, the function its run enters: the export's `t0` when no test
+/// fn or `--exports` symbol is a root. (Not the unit's first captured slot: a static's initializer
+/// compiles before `main`, and the module ships no initializer.)
+pub fn entry(unit: usize, id: u32) {
+    if enabled() {
+        let mut m = MAINS.lock().unwrap_or_else(|e| e.into_inner());
+        crate::zone_alloc::kept_with(|| m.insert(unit, id));
+    }
+}
 static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CLOSURE_ORIGINS: Mutex<BTreeMap<u32, &'static str>> = Mutex::new(BTreeMap::new());
 static CLOSURE_PARENTS: Mutex<BTreeMap<u32, u32>> = Mutex::new(BTreeMap::new());
@@ -441,7 +452,7 @@ pub fn capture(unit: usize, id: u32, f: &Func) {
     // process state: on the kept heap
     crate::zone_alloc::kept_with(|| {
         g.get_or_insert_with(BTreeMap::new).entry(unit)
-            .or_insert_with(|| Captured { entry: id, funcs: BTreeMap::new() })
+            .or_insert_with(|| Captured { funcs: BTreeMap::new() })
             .funcs.insert(id, f.clone());
     });
 }
@@ -664,7 +675,7 @@ pub fn finish(u: &Unit) {
     // `%p`: the process id (a run's child processes capture their own sets)
     let path = path.replace("%p", &std::process::id().to_string());
     let Some(captured) = CAPTURED.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|g| g.remove(&u.wasm_export_id)) else { return };
-    ENTRY.store(captured.entry, std::sync::atomic::Ordering::Relaxed);
+    ENTRY.store(MAINS.lock().unwrap_or_else(|e| e.into_inner()).get(&u.wasm_export_id).copied().unwrap_or(u32::MAX), std::sync::atomic::Ordering::Relaxed);
     let mut funcs = captured.funcs;
     // the trace: slots whose code was installed (called); a build made ahead of a call that
     // never came is not part of it
@@ -1992,6 +2003,7 @@ pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     reset(&CAPTURED, Mutex::new(None));
     reset(&ENTRY, std::sync::atomic::AtomicU32::new(u32::MAX));
+    reset(&MAINS, Mutex::new(BTreeMap::new()));
     reset(&FAILED, std::sync::atomic::AtomicBool::new(false));
     reset(&CLOSURE_ORIGINS, Mutex::new(BTreeMap::new()));
     reset(&CLOSURE_PARENTS, Mutex::new(BTreeMap::new()));
