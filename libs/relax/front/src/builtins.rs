@@ -1408,10 +1408,16 @@ fn env_value_inner(ctx: Option<&FileCtx>, name: &str) -> Option<String> {
     // environment
     if let Some(c) = ctx {
         if let Some(v) = crate::crates::crate_env_registered(&c.krate, name) {
+            if name == "OUT_DIR" {
+                crate::pathmarks::mark(&c.krate);
+            }
             return Some(v);
         }
         match name {
-            "CARGO_MANIFEST_DIR" => return Some(c.manifest_dir.clone()),
+            "CARGO_MANIFEST_DIR" => {
+                crate::pathmarks::mark(&c.krate);
+                return Some(c.manifest_dir.clone());
+            }
             "CARGO_PKG_NAME" => return Some(c.pkg_name.clone()),
             "CARGO_PKG_VERSION" => return Some(c.pkg_version.clone()),
             "CARGO_CRATE_NAME" => return Some(crate::crates::base_crate_name(&c.krate).to_string()),

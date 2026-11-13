@@ -32,6 +32,7 @@ macro_rules! print {
 
 pub use relax_base::*;
 
+pub mod pathmarks;
 pub mod lit;
 pub mod builtin_attrs;
 pub mod parser;
