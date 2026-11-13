@@ -783,7 +783,7 @@ pub(crate) fn resolve_package(
             // script's own child run never builds them again. A check without the flag reads the
             // script outputs of a native build already in the cache: same key, same cfgs/env/OUT_DIR.
             let triple = crate::cfg::CfgSet::host(sess, &[]).triple();
-            let native_request = std::env::var_os("RELAX_SCRIPT_DEPTH").is_none().then(|| crate::native::Request { workspace, package, cargo_flags, relax_dir: target_dir, triple, resolvable: native_resolvable });
+            let native_request = std::env::var_os("RELAX_SCRIPT_DEPTH").is_none().then(|| crate::native::Request { workspace, package, cargo_flags, relax_dir: target_dir, triple, resolvable: native_resolvable, quiet: QUIET.load(Ordering::Relaxed) });
             let native_mode = native_request.as_ref().and_then(|req| {
                 if options.allow_c {
                     Some(crate::native::Mode::Build(req))
@@ -1286,6 +1286,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         pre.push("--".to_string());
         crate::progenv::set_run_fact("RELAX_SELF_EXEC", pre.join("\u{1f}"));
         prog_args[0] = exe.display().to_string().into_bytes();
+    }
+    // started through an integration test's CARGO_BIN_EXE_<bin> (unitgraph.rs writes that wrapper):
+    // argv[0] is the path the test started, as cargo's binary's is (clap names a command by it);
+    // a spawn of that path runs the wrapper again. Not passed on to the program's own children.
+    if let Some(arg0) = std::env::var_os("RELAX_ARG0") {
+        prog_args[0] = arg0.into_encoded_bytes();
+        unsafe { std::env::remove_var("RELAX_ARG0") };
     }
     let workspace = workspace_dir();
     // everything this run writes: the workspace's <target>/relax (dirs.rs)

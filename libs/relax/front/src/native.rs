@@ -71,6 +71,9 @@ pub struct Request<'a> {
     pub relax_dir: &'a str,
     pub triple: &'a str,
     pub resolvable: Resolvable,
+    /// `--quiet` / `--silent` (a program's re-run, an integration test's CARGO_BIN_EXE child):
+    /// no status line; the stderr is the program's
+    pub quiet: bool,
 }
 
 /// What a caller allows the native path to do (`unitgraph::run_build_scripts`).
@@ -758,6 +761,9 @@ fn optimize_later(g: &Graph, req: &Request, exe: std::path::PathBuf, flags: &[&S
 
 #[allow(clippy::too_many_arguments)]
 fn run_cargo(g: &Graph, req: &Request, exe: &std::path::Path, flags: &[&String], script_pkgs: &[String], lib_pkgs: &[String], seeds: &[usize], tier: Tier) -> Result<String, String> {
+    if tier == Tier::Fast && !req.quiet {
+        eprintln!("relax run: --allow-c: building native dependencies with cargo (opt-level 0 now, optimized in the background; cached afterwards): {}", script_pkgs.iter().take(8).cloned().collect::<Vec<_>>().join(", "));
+    }
     run_cargo_with(&g.pkg, &script_table(g), req.workspace, req.package, req.relax_dir, req.triple, exe, flags, script_pkgs, lib_pkgs, seeds, tier)
 }
 
@@ -786,9 +792,6 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
         .filter(|p| p != &target)
         .map(|p| p.join("makepad-native").join(match tier { Tier::Fast => "fast", Tier::Optimized => "optimized" }).join(format!("{selection:016x}")))
         .unwrap_or_else(|| target.clone());
-    if tier == Tier::Fast {
-        eprintln!("relax run: --allow-c: building native dependencies with cargo (opt-level 0 now, optimized in the background; cached afterwards): {}", script_pkgs.iter().take(8).cloned().collect::<Vec<_>>().join(", "));
-    }
     // the program's link arguments: the wrapper writes them here, a file per binary or test
     // harness. A folder of its own per cargo run: the program's stubs depend on its name
     // (wrapper), so cargo runs them again, and they say the link arguments, even when nothing else
@@ -1655,7 +1658,7 @@ fn the_native_prune_keeps_what_the_roots_name() {
     root("00000000000000a1", &workspace, "aaaaaaaaaaaaaaaa", "1111111111111111");
     let relax_dir = dir.to_str().unwrap();
     let flags = vec!["--tests".to_string()];
-    let req = Request { workspace: workspace.to_str().unwrap(), package: "app", cargo_flags: &flags, relax_dir, triple: "x86_64-unknown-linux-gnu", resolvable: |names, _, _, _| vec![false; names.len()] };
+    let req = Request { workspace: workspace.to_str().unwrap(), package: "app", cargo_flags: &flags, relax_dir, triple: "x86_64-unknown-linux-gnu", resolvable: |names, _, _, _| vec![false; names.len()], quiet: false };
     let plan = Plan { script_pkgs: Vec::new(), lib_pkgs: Vec::new(), flags: flags.clone(), names: Vec::new(), key: 0xabababababababab, selection: 0x1111111111111111,
         dir: String::new(), messages_path: String::new(), lib_path: String::new(), fast_mark: String::new() };
     write_root(&req, &plan).unwrap();

@@ -91,6 +91,14 @@ manifest = fixture / "Cargo.toml"
 manifest.write_text(manifest.read_text().split("[patch.crates-io]")[0])
 run("lock-without-patches", ["cargo", "generate-lockfile", "--offline"])
 
+# An integration test that starts the package's binary (CARGO_BIN_EXE_<bin>) gets it as cargo builds it:
+# its argv[0] names the binary, and nothing of Relax's is on its stderr (relax issue 119: argv[0] was
+# the Relax binary's, and the child's native build printed its status line on the child's stderr)
+run("cargo-bin-exe", ["cargo", "test", "--release", "--locked", "--quiet", "--test", "bin_exe"])
+bin_exe = run("bin-exe", [binary, "test", "--allow-c", "allow-c-fixture", "--test", "bin_exe"])
+assert "test result: ok. 1 passed" in bin_exe.stdout, f"bin exe: {bin_exe.stdout}\n{bin_exe.stderr}"
+print("PASS bin exe: the integration test's CARGO_BIN_EXE child names itself, its stderr empty")
+
 # An unused function still carries an unresolved import. Neither a library nor
 # the program defines it: the native bundle is rejected before even the
 # fixture's first println runs.

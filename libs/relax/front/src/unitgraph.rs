@@ -324,16 +324,19 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
                 let (pkg_dir, pkg_name, _) = &pkg[integration_tests[0]];
                 let bin_dir = target_dir.join("relax-bin");
                 let _ = std::fs::create_dir_all(&bin_dir);
-                let td_str = target_dir.display().to_string();
+                // absolute: the wrapper runs wherever a test starts it from (its own folder, a copy)
+                let absolute = |p: &std::path::Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()).display().to_string();
+                let td_str = absolute(&target_dir);
+                let pkg_dir = &absolute(std::path::Path::new(pkg_dir));
                 let exe_str = exe.display().to_string();
                 let sh_quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
                 for bin_name in &g.bins {
                     let wrapper = bin_dir.join(if cfg!(windows) { format!("{bin_name}.cmd") } else { bin_name.clone() });
                     let script = if cfg!(windows) {
-                        format!("@echo off\r\nset RELAX_SELF_EXEC=\r\nset RELAX_SELF_EXEC_SILENT_ADDED=\r\n\"{}\" run --quiet --silent --no-live --run-dir \"{}\" --workspace-dir \"{}\" \"{}\" --bin \"{}\" -- %*\r\n",
+                        format!("@echo off\r\nset RELAX_SELF_EXEC=\r\nset RELAX_SELF_EXEC_SILENT_ADDED=\r\nset \"RELAX_ARG0=%~f0\"\r\n\"{}\" run --quiet --silent --no-live --run-dir \"{}\" --workspace-dir \"{}\" \"{}\" --bin \"{}\" -- %*\r\n",
                             exe_str, td_str, pkg_dir, pkg_name, bin_name)
                     } else {
-                        format!("#!/bin/sh\nunset RELAX_SELF_EXEC RELAX_SELF_EXEC_SILENT_ADDED\nexec {} run --quiet --silent --no-live --run-dir {} --workspace-dir {} {} --bin {} -- \"$@\"\n",
+                        format!("#!/bin/sh\nunset RELAX_SELF_EXEC RELAX_SELF_EXEC_SILENT_ADDED\nRELAX_ARG0=$0\nexport RELAX_ARG0\nexec {} run --quiet --silent --no-live --run-dir {} --workspace-dir {} {} --bin {} -- \"$@\"\n",
                             sh_quote(&exe_str), sh_quote(&td_str), sh_quote(pkg_dir), sh_quote(pkg_name), sh_quote(bin_name))
                     };
                     if std::fs::read(&wrapper).ok().as_deref() != Some(script.as_bytes()) {
