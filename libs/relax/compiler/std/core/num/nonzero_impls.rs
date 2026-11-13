@@ -21,13 +21,14 @@ impl NonZero<u8> {
     pub const fn saturating_mul(self, other: NonZero<u8>) -> NonZero<u8> { unsafe { NonZero::new_unchecked(self.get().saturating_mul(other.get())) } }
     pub const fn checked_pow(self, other: u32) -> Option<NonZero<u8>> { match self.get().checked_pow(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn saturating_pow(self, other: u32) -> NonZero<u8> { unsafe { NonZero::new_unchecked(self.get().saturating_pow(other)) } }
-    pub fn checked_add(self, other: u8) -> Option<NonZero<u8>> { match self.get().checked_add(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
-    pub fn saturating_add(self, other: u8) -> NonZero<u8> { unsafe { NonZero::new_unchecked(self.get().saturating_add(other)) } }
-    pub fn checked_next_power_of_two(self) -> Option<NonZero<u8>> { match self.get().checked_next_power_of_two() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn checked_add(self, other: u8) -> Option<NonZero<u8>> { match self.get().checked_add(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn saturating_add(self, other: u8) -> NonZero<u8> { unsafe { NonZero::new_unchecked(self.get().saturating_add(other)) } }
+    pub const fn checked_next_power_of_two(self) -> Option<NonZero<u8>> { match self.get().checked_next_power_of_two() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn ilog2(self) -> u32 { u8::BITS - 1 - self.get().leading_zeros() }
-    pub fn ilog10(self) -> u32 { self.get().ilog10() }
+    pub const fn ilog10(self) -> u32 { self.get().ilog10() }
     pub const fn is_power_of_two(self) -> bool { self.get().is_power_of_two() }
-    pub fn isqrt(self) -> NonZero<u8> { unsafe { NonZero::new_unchecked(self.get().isqrt()) } }
+    pub const fn midpoint(self, rhs: NonZero<u8>) -> NonZero<u8> { unsafe { NonZero::new_unchecked(self.get().midpoint(rhs.get())) } }
+    pub const fn isqrt(self) -> NonZero<u8> { unsafe { NonZero::new_unchecked(self.get().isqrt()) } }
 }
 impl From<NonZero<u8>> for u8 { fn from(n: NonZero<u8>) -> u8 { n.get() } }
 impl BitOr for NonZero<u8> { type Output = NonZero<u8>; fn bitor(self, rhs: NonZero<u8>) -> NonZero<u8> { unsafe { NonZero::new_unchecked(self.get() | rhs.get()) } } }
@@ -51,13 +52,14 @@ impl NonZero<u16> {
     pub const fn saturating_mul(self, other: NonZero<u16>) -> NonZero<u16> { unsafe { NonZero::new_unchecked(self.get().saturating_mul(other.get())) } }
     pub const fn checked_pow(self, other: u32) -> Option<NonZero<u16>> { match self.get().checked_pow(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn saturating_pow(self, other: u32) -> NonZero<u16> { unsafe { NonZero::new_unchecked(self.get().saturating_pow(other)) } }
-    pub fn checked_add(self, other: u16) -> Option<NonZero<u16>> { match self.get().checked_add(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
-    pub fn saturating_add(self, other: u16) -> NonZero<u16> { unsafe { NonZero::new_unchecked(self.get().saturating_add(other)) } }
-    pub fn checked_next_power_of_two(self) -> Option<NonZero<u16>> { match self.get().checked_next_power_of_two() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn checked_add(self, other: u16) -> Option<NonZero<u16>> { match self.get().checked_add(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn saturating_add(self, other: u16) -> NonZero<u16> { unsafe { NonZero::new_unchecked(self.get().saturating_add(other)) } }
+    pub const fn checked_next_power_of_two(self) -> Option<NonZero<u16>> { match self.get().checked_next_power_of_two() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn ilog2(self) -> u32 { u16::BITS - 1 - self.get().leading_zeros() }
-    pub fn ilog10(self) -> u32 { self.get().ilog10() }
+    pub const fn ilog10(self) -> u32 { self.get().ilog10() }
     pub const fn is_power_of_two(self) -> bool { self.get().is_power_of_two() }
-    pub fn isqrt(self) -> NonZero<u16> { unsafe { NonZero::new_unchecked(self.get().isqrt()) } }
+    pub const fn midpoint(self, rhs: NonZero<u16>) -> NonZero<u16> { unsafe { NonZero::new_unchecked(self.get().midpoint(rhs.get())) } }
+    pub const fn isqrt(self) -> NonZero<u16> { unsafe { NonZero::new_unchecked(self.get().isqrt()) } }
 }
 impl From<NonZero<u16>> for u16 { fn from(n: NonZero<u16>) -> u16 { n.get() } }
 impl BitOr for NonZero<u16> { type Output = NonZero<u16>; fn bitor(self, rhs: NonZero<u16>) -> NonZero<u16> { unsafe { NonZero::new_unchecked(self.get() | rhs.get()) } } }
@@ -81,13 +83,14 @@ impl NonZero<u32> {
     pub const fn saturating_mul(self, other: NonZero<u32>) -> NonZero<u32> { unsafe { NonZero::new_unchecked(self.get().saturating_mul(other.get())) } }
     pub const fn checked_pow(self, other: u32) -> Option<NonZero<u32>> { match self.get().checked_pow(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn saturating_pow(self, other: u32) -> NonZero<u32> { unsafe { NonZero::new_unchecked(self.get().saturating_pow(other)) } }
-    pub fn checked_add(self, other: u32) -> Option<NonZero<u32>> { match self.get().checked_add(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
-    pub fn saturating_add(self, other: u32) -> NonZero<u32> { unsafe { NonZero::new_unchecked(self.get().saturating_add(other)) } }
-    pub fn checked_next_power_of_two(self) -> Option<NonZero<u32>> { match self.get().checked_next_power_of_two() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn checked_add(self, other: u32) -> Option<NonZero<u32>> { match self.get().checked_add(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn saturating_add(self, other: u32) -> NonZero<u32> { unsafe { NonZero::new_unchecked(self.get().saturating_add(other)) } }
+    pub const fn checked_next_power_of_two(self) -> Option<NonZero<u32>> { match self.get().checked_next_power_of_two() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn ilog2(self) -> u32 { u32::BITS - 1 - self.get().leading_zeros() }
-    pub fn ilog10(self) -> u32 { self.get().ilog10() }
+    pub const fn ilog10(self) -> u32 { self.get().ilog10() }
     pub const fn is_power_of_two(self) -> bool { self.get().is_power_of_two() }
-    pub fn isqrt(self) -> NonZero<u32> { unsafe { NonZero::new_unchecked(self.get().isqrt()) } }
+    pub const fn midpoint(self, rhs: NonZero<u32>) -> NonZero<u32> { unsafe { NonZero::new_unchecked(self.get().midpoint(rhs.get())) } }
+    pub const fn isqrt(self) -> NonZero<u32> { unsafe { NonZero::new_unchecked(self.get().isqrt()) } }
 }
 impl From<NonZero<u32>> for u32 { fn from(n: NonZero<u32>) -> u32 { n.get() } }
 impl BitOr for NonZero<u32> { type Output = NonZero<u32>; fn bitor(self, rhs: NonZero<u32>) -> NonZero<u32> { unsafe { NonZero::new_unchecked(self.get() | rhs.get()) } } }
@@ -111,13 +114,14 @@ impl NonZero<u64> {
     pub const fn saturating_mul(self, other: NonZero<u64>) -> NonZero<u64> { unsafe { NonZero::new_unchecked(self.get().saturating_mul(other.get())) } }
     pub const fn checked_pow(self, other: u32) -> Option<NonZero<u64>> { match self.get().checked_pow(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn saturating_pow(self, other: u32) -> NonZero<u64> { unsafe { NonZero::new_unchecked(self.get().saturating_pow(other)) } }
-    pub fn checked_add(self, other: u64) -> Option<NonZero<u64>> { match self.get().checked_add(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
-    pub fn saturating_add(self, other: u64) -> NonZero<u64> { unsafe { NonZero::new_unchecked(self.get().saturating_add(other)) } }
-    pub fn checked_next_power_of_two(self) -> Option<NonZero<u64>> { match self.get().checked_next_power_of_two() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn checked_add(self, other: u64) -> Option<NonZero<u64>> { match self.get().checked_add(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn saturating_add(self, other: u64) -> NonZero<u64> { unsafe { NonZero::new_unchecked(self.get().saturating_add(other)) } }
+    pub const fn checked_next_power_of_two(self) -> Option<NonZero<u64>> { match self.get().checked_next_power_of_two() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn ilog2(self) -> u32 { u64::BITS - 1 - self.get().leading_zeros() }
-    pub fn ilog10(self) -> u32 { self.get().ilog10() }
+    pub const fn ilog10(self) -> u32 { self.get().ilog10() }
     pub const fn is_power_of_two(self) -> bool { self.get().is_power_of_two() }
-    pub fn isqrt(self) -> NonZero<u64> { unsafe { NonZero::new_unchecked(self.get().isqrt()) } }
+    pub const fn midpoint(self, rhs: NonZero<u64>) -> NonZero<u64> { unsafe { NonZero::new_unchecked(self.get().midpoint(rhs.get())) } }
+    pub const fn isqrt(self) -> NonZero<u64> { unsafe { NonZero::new_unchecked(self.get().isqrt()) } }
 }
 impl From<NonZero<u64>> for u64 { fn from(n: NonZero<u64>) -> u64 { n.get() } }
 impl BitOr for NonZero<u64> { type Output = NonZero<u64>; fn bitor(self, rhs: NonZero<u64>) -> NonZero<u64> { unsafe { NonZero::new_unchecked(self.get() | rhs.get()) } } }
@@ -141,13 +145,14 @@ impl NonZero<u128> {
     pub const fn saturating_mul(self, other: NonZero<u128>) -> NonZero<u128> { unsafe { NonZero::new_unchecked(self.get().saturating_mul(other.get())) } }
     pub const fn checked_pow(self, other: u32) -> Option<NonZero<u128>> { match self.get().checked_pow(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn saturating_pow(self, other: u32) -> NonZero<u128> { unsafe { NonZero::new_unchecked(self.get().saturating_pow(other)) } }
-    pub fn checked_add(self, other: u128) -> Option<NonZero<u128>> { match self.get().checked_add(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
-    pub fn saturating_add(self, other: u128) -> NonZero<u128> { unsafe { NonZero::new_unchecked(self.get().saturating_add(other)) } }
-    pub fn checked_next_power_of_two(self) -> Option<NonZero<u128>> { match self.get().checked_next_power_of_two() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn checked_add(self, other: u128) -> Option<NonZero<u128>> { match self.get().checked_add(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn saturating_add(self, other: u128) -> NonZero<u128> { unsafe { NonZero::new_unchecked(self.get().saturating_add(other)) } }
+    pub const fn checked_next_power_of_two(self) -> Option<NonZero<u128>> { match self.get().checked_next_power_of_two() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn ilog2(self) -> u32 { u128::BITS - 1 - self.get().leading_zeros() }
-    pub fn ilog10(self) -> u32 { self.get().ilog10() }
+    pub const fn ilog10(self) -> u32 { self.get().ilog10() }
     pub const fn is_power_of_two(self) -> bool { self.get().is_power_of_two() }
-    pub fn isqrt(self) -> NonZero<u128> { unsafe { NonZero::new_unchecked(self.get().isqrt()) } }
+    pub const fn midpoint(self, rhs: NonZero<u128>) -> NonZero<u128> { unsafe { NonZero::new_unchecked(self.get().midpoint(rhs.get())) } }
+    pub const fn isqrt(self) -> NonZero<u128> { unsafe { NonZero::new_unchecked(self.get().isqrt()) } }
 }
 impl From<NonZero<u128>> for u128 { fn from(n: NonZero<u128>) -> u128 { n.get() } }
 impl BitOr for NonZero<u128> { type Output = NonZero<u128>; fn bitor(self, rhs: NonZero<u128>) -> NonZero<u128> { unsafe { NonZero::new_unchecked(self.get() | rhs.get()) } } }
@@ -171,13 +176,14 @@ impl NonZero<usize> {
     pub const fn saturating_mul(self, other: NonZero<usize>) -> NonZero<usize> { unsafe { NonZero::new_unchecked(self.get().saturating_mul(other.get())) } }
     pub const fn checked_pow(self, other: u32) -> Option<NonZero<usize>> { match self.get().checked_pow(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn saturating_pow(self, other: u32) -> NonZero<usize> { unsafe { NonZero::new_unchecked(self.get().saturating_pow(other)) } }
-    pub fn checked_add(self, other: usize) -> Option<NonZero<usize>> { match self.get().checked_add(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
-    pub fn saturating_add(self, other: usize) -> NonZero<usize> { unsafe { NonZero::new_unchecked(self.get().saturating_add(other)) } }
-    pub fn checked_next_power_of_two(self) -> Option<NonZero<usize>> { match self.get().checked_next_power_of_two() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn checked_add(self, other: usize) -> Option<NonZero<usize>> { match self.get().checked_add(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn saturating_add(self, other: usize) -> NonZero<usize> { unsafe { NonZero::new_unchecked(self.get().saturating_add(other)) } }
+    pub const fn checked_next_power_of_two(self) -> Option<NonZero<usize>> { match self.get().checked_next_power_of_two() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn ilog2(self) -> u32 { usize::BITS - 1 - self.get().leading_zeros() }
-    pub fn ilog10(self) -> u32 { self.get().ilog10() }
+    pub const fn ilog10(self) -> u32 { self.get().ilog10() }
     pub const fn is_power_of_two(self) -> bool { self.get().is_power_of_two() }
-    pub fn isqrt(self) -> NonZero<usize> { unsafe { NonZero::new_unchecked(self.get().isqrt()) } }
+    pub const fn midpoint(self, rhs: NonZero<usize>) -> NonZero<usize> { unsafe { NonZero::new_unchecked(self.get().midpoint(rhs.get())) } }
+    pub const fn isqrt(self) -> NonZero<usize> { unsafe { NonZero::new_unchecked(self.get().isqrt()) } }
 }
 impl From<NonZero<usize>> for usize { fn from(n: NonZero<usize>) -> usize { n.get() } }
 impl BitOr for NonZero<usize> { type Output = NonZero<usize>; fn bitor(self, rhs: NonZero<usize>) -> NonZero<usize> { unsafe { NonZero::new_unchecked(self.get() | rhs.get()) } } }
@@ -201,18 +207,18 @@ impl NonZero<i8> {
     pub const fn saturating_mul(self, other: NonZero<i8>) -> NonZero<i8> { unsafe { NonZero::new_unchecked(self.get().saturating_mul(other.get())) } }
     pub const fn checked_pow(self, other: u32) -> Option<NonZero<i8>> { match self.get().checked_pow(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn saturating_pow(self, other: u32) -> NonZero<i8> { unsafe { NonZero::new_unchecked(self.get().saturating_pow(other)) } }
-    pub fn abs(self) -> NonZero<i8> { unsafe { NonZero::new_unchecked(self.get().abs()) } }
-    pub fn checked_abs(self) -> Option<NonZero<i8>> { match self.get().checked_abs() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
-    pub fn overflowing_abs(self) -> (NonZero<i8>, bool) { let (v, f) = self.get().overflowing_abs(); (unsafe { NonZero::new_unchecked(v) }, f) }
-    pub fn saturating_abs(self) -> NonZero<i8> { unsafe { NonZero::new_unchecked(self.get().saturating_abs()) } }
-    pub fn wrapping_abs(self) -> NonZero<i8> { unsafe { NonZero::new_unchecked(self.get().wrapping_abs()) } }
-    pub fn unsigned_abs(self) -> NonZero<u8> { unsafe { NonZero::new_unchecked(self.get().unsigned_abs()) } }
+    pub const fn abs(self) -> NonZero<i8> { unsafe { NonZero::new_unchecked(self.get().abs()) } }
+    pub const fn checked_abs(self) -> Option<NonZero<i8>> { match self.get().checked_abs() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn overflowing_abs(self) -> (NonZero<i8>, bool) { let (v, f) = self.get().overflowing_abs(); (unsafe { NonZero::new_unchecked(v) }, f) }
+    pub const fn saturating_abs(self) -> NonZero<i8> { unsafe { NonZero::new_unchecked(self.get().saturating_abs()) } }
+    pub const fn wrapping_abs(self) -> NonZero<i8> { unsafe { NonZero::new_unchecked(self.get().wrapping_abs()) } }
+    pub const fn unsigned_abs(self) -> NonZero<u8> { unsafe { NonZero::new_unchecked(self.get().unsigned_abs()) } }
     pub const fn is_positive(self) -> bool { self.get() > 0 }
     pub const fn is_negative(self) -> bool { self.get() < 0 }
-    pub fn checked_neg(self) -> Option<NonZero<i8>> { match self.get().checked_neg() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
-    pub fn overflowing_neg(self) -> (NonZero<i8>, bool) { let (v, f) = self.get().overflowing_neg(); (unsafe { NonZero::new_unchecked(v) }, f) }
-    pub fn wrapping_neg(self) -> NonZero<i8> { unsafe { NonZero::new_unchecked(self.get().wrapping_neg()) } }
-    pub fn saturating_neg(self) -> NonZero<i8> { unsafe { NonZero::new_unchecked(self.get().saturating_neg()) } }
+    pub const fn checked_neg(self) -> Option<NonZero<i8>> { match self.get().checked_neg() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn overflowing_neg(self) -> (NonZero<i8>, bool) { let (v, f) = self.get().overflowing_neg(); (unsafe { NonZero::new_unchecked(v) }, f) }
+    pub const fn wrapping_neg(self) -> NonZero<i8> { unsafe { NonZero::new_unchecked(self.get().wrapping_neg()) } }
+    pub const fn saturating_neg(self) -> NonZero<i8> { unsafe { NonZero::new_unchecked(self.get().saturating_neg()) } }
 }
 impl From<NonZero<i8>> for i8 { fn from(n: NonZero<i8>) -> i8 { n.get() } }
 impl BitOr for NonZero<i8> { type Output = NonZero<i8>; fn bitor(self, rhs: NonZero<i8>) -> NonZero<i8> { unsafe { NonZero::new_unchecked(self.get() | rhs.get()) } } }
@@ -238,18 +244,18 @@ impl NonZero<i16> {
     pub const fn saturating_mul(self, other: NonZero<i16>) -> NonZero<i16> { unsafe { NonZero::new_unchecked(self.get().saturating_mul(other.get())) } }
     pub const fn checked_pow(self, other: u32) -> Option<NonZero<i16>> { match self.get().checked_pow(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn saturating_pow(self, other: u32) -> NonZero<i16> { unsafe { NonZero::new_unchecked(self.get().saturating_pow(other)) } }
-    pub fn abs(self) -> NonZero<i16> { unsafe { NonZero::new_unchecked(self.get().abs()) } }
-    pub fn checked_abs(self) -> Option<NonZero<i16>> { match self.get().checked_abs() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
-    pub fn overflowing_abs(self) -> (NonZero<i16>, bool) { let (v, f) = self.get().overflowing_abs(); (unsafe { NonZero::new_unchecked(v) }, f) }
-    pub fn saturating_abs(self) -> NonZero<i16> { unsafe { NonZero::new_unchecked(self.get().saturating_abs()) } }
-    pub fn wrapping_abs(self) -> NonZero<i16> { unsafe { NonZero::new_unchecked(self.get().wrapping_abs()) } }
-    pub fn unsigned_abs(self) -> NonZero<u16> { unsafe { NonZero::new_unchecked(self.get().unsigned_abs()) } }
+    pub const fn abs(self) -> NonZero<i16> { unsafe { NonZero::new_unchecked(self.get().abs()) } }
+    pub const fn checked_abs(self) -> Option<NonZero<i16>> { match self.get().checked_abs() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn overflowing_abs(self) -> (NonZero<i16>, bool) { let (v, f) = self.get().overflowing_abs(); (unsafe { NonZero::new_unchecked(v) }, f) }
+    pub const fn saturating_abs(self) -> NonZero<i16> { unsafe { NonZero::new_unchecked(self.get().saturating_abs()) } }
+    pub const fn wrapping_abs(self) -> NonZero<i16> { unsafe { NonZero::new_unchecked(self.get().wrapping_abs()) } }
+    pub const fn unsigned_abs(self) -> NonZero<u16> { unsafe { NonZero::new_unchecked(self.get().unsigned_abs()) } }
     pub const fn is_positive(self) -> bool { self.get() > 0 }
     pub const fn is_negative(self) -> bool { self.get() < 0 }
-    pub fn checked_neg(self) -> Option<NonZero<i16>> { match self.get().checked_neg() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
-    pub fn overflowing_neg(self) -> (NonZero<i16>, bool) { let (v, f) = self.get().overflowing_neg(); (unsafe { NonZero::new_unchecked(v) }, f) }
-    pub fn wrapping_neg(self) -> NonZero<i16> { unsafe { NonZero::new_unchecked(self.get().wrapping_neg()) } }
-    pub fn saturating_neg(self) -> NonZero<i16> { unsafe { NonZero::new_unchecked(self.get().saturating_neg()) } }
+    pub const fn checked_neg(self) -> Option<NonZero<i16>> { match self.get().checked_neg() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn overflowing_neg(self) -> (NonZero<i16>, bool) { let (v, f) = self.get().overflowing_neg(); (unsafe { NonZero::new_unchecked(v) }, f) }
+    pub const fn wrapping_neg(self) -> NonZero<i16> { unsafe { NonZero::new_unchecked(self.get().wrapping_neg()) } }
+    pub const fn saturating_neg(self) -> NonZero<i16> { unsafe { NonZero::new_unchecked(self.get().saturating_neg()) } }
 }
 impl From<NonZero<i16>> for i16 { fn from(n: NonZero<i16>) -> i16 { n.get() } }
 impl BitOr for NonZero<i16> { type Output = NonZero<i16>; fn bitor(self, rhs: NonZero<i16>) -> NonZero<i16> { unsafe { NonZero::new_unchecked(self.get() | rhs.get()) } } }
@@ -275,18 +281,18 @@ impl NonZero<i32> {
     pub const fn saturating_mul(self, other: NonZero<i32>) -> NonZero<i32> { unsafe { NonZero::new_unchecked(self.get().saturating_mul(other.get())) } }
     pub const fn checked_pow(self, other: u32) -> Option<NonZero<i32>> { match self.get().checked_pow(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn saturating_pow(self, other: u32) -> NonZero<i32> { unsafe { NonZero::new_unchecked(self.get().saturating_pow(other)) } }
-    pub fn abs(self) -> NonZero<i32> { unsafe { NonZero::new_unchecked(self.get().abs()) } }
-    pub fn checked_abs(self) -> Option<NonZero<i32>> { match self.get().checked_abs() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
-    pub fn overflowing_abs(self) -> (NonZero<i32>, bool) { let (v, f) = self.get().overflowing_abs(); (unsafe { NonZero::new_unchecked(v) }, f) }
-    pub fn saturating_abs(self) -> NonZero<i32> { unsafe { NonZero::new_unchecked(self.get().saturating_abs()) } }
-    pub fn wrapping_abs(self) -> NonZero<i32> { unsafe { NonZero::new_unchecked(self.get().wrapping_abs()) } }
-    pub fn unsigned_abs(self) -> NonZero<u32> { unsafe { NonZero::new_unchecked(self.get().unsigned_abs()) } }
+    pub const fn abs(self) -> NonZero<i32> { unsafe { NonZero::new_unchecked(self.get().abs()) } }
+    pub const fn checked_abs(self) -> Option<NonZero<i32>> { match self.get().checked_abs() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn overflowing_abs(self) -> (NonZero<i32>, bool) { let (v, f) = self.get().overflowing_abs(); (unsafe { NonZero::new_unchecked(v) }, f) }
+    pub const fn saturating_abs(self) -> NonZero<i32> { unsafe { NonZero::new_unchecked(self.get().saturating_abs()) } }
+    pub const fn wrapping_abs(self) -> NonZero<i32> { unsafe { NonZero::new_unchecked(self.get().wrapping_abs()) } }
+    pub const fn unsigned_abs(self) -> NonZero<u32> { unsafe { NonZero::new_unchecked(self.get().unsigned_abs()) } }
     pub const fn is_positive(self) -> bool { self.get() > 0 }
     pub const fn is_negative(self) -> bool { self.get() < 0 }
-    pub fn checked_neg(self) -> Option<NonZero<i32>> { match self.get().checked_neg() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
-    pub fn overflowing_neg(self) -> (NonZero<i32>, bool) { let (v, f) = self.get().overflowing_neg(); (unsafe { NonZero::new_unchecked(v) }, f) }
-    pub fn wrapping_neg(self) -> NonZero<i32> { unsafe { NonZero::new_unchecked(self.get().wrapping_neg()) } }
-    pub fn saturating_neg(self) -> NonZero<i32> { unsafe { NonZero::new_unchecked(self.get().saturating_neg()) } }
+    pub const fn checked_neg(self) -> Option<NonZero<i32>> { match self.get().checked_neg() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn overflowing_neg(self) -> (NonZero<i32>, bool) { let (v, f) = self.get().overflowing_neg(); (unsafe { NonZero::new_unchecked(v) }, f) }
+    pub const fn wrapping_neg(self) -> NonZero<i32> { unsafe { NonZero::new_unchecked(self.get().wrapping_neg()) } }
+    pub const fn saturating_neg(self) -> NonZero<i32> { unsafe { NonZero::new_unchecked(self.get().saturating_neg()) } }
 }
 impl From<NonZero<i32>> for i32 { fn from(n: NonZero<i32>) -> i32 { n.get() } }
 impl BitOr for NonZero<i32> { type Output = NonZero<i32>; fn bitor(self, rhs: NonZero<i32>) -> NonZero<i32> { unsafe { NonZero::new_unchecked(self.get() | rhs.get()) } } }
@@ -312,18 +318,18 @@ impl NonZero<i64> {
     pub const fn saturating_mul(self, other: NonZero<i64>) -> NonZero<i64> { unsafe { NonZero::new_unchecked(self.get().saturating_mul(other.get())) } }
     pub const fn checked_pow(self, other: u32) -> Option<NonZero<i64>> { match self.get().checked_pow(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn saturating_pow(self, other: u32) -> NonZero<i64> { unsafe { NonZero::new_unchecked(self.get().saturating_pow(other)) } }
-    pub fn abs(self) -> NonZero<i64> { unsafe { NonZero::new_unchecked(self.get().abs()) } }
-    pub fn checked_abs(self) -> Option<NonZero<i64>> { match self.get().checked_abs() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
-    pub fn overflowing_abs(self) -> (NonZero<i64>, bool) { let (v, f) = self.get().overflowing_abs(); (unsafe { NonZero::new_unchecked(v) }, f) }
-    pub fn saturating_abs(self) -> NonZero<i64> { unsafe { NonZero::new_unchecked(self.get().saturating_abs()) } }
-    pub fn wrapping_abs(self) -> NonZero<i64> { unsafe { NonZero::new_unchecked(self.get().wrapping_abs()) } }
-    pub fn unsigned_abs(self) -> NonZero<u64> { unsafe { NonZero::new_unchecked(self.get().unsigned_abs()) } }
+    pub const fn abs(self) -> NonZero<i64> { unsafe { NonZero::new_unchecked(self.get().abs()) } }
+    pub const fn checked_abs(self) -> Option<NonZero<i64>> { match self.get().checked_abs() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn overflowing_abs(self) -> (NonZero<i64>, bool) { let (v, f) = self.get().overflowing_abs(); (unsafe { NonZero::new_unchecked(v) }, f) }
+    pub const fn saturating_abs(self) -> NonZero<i64> { unsafe { NonZero::new_unchecked(self.get().saturating_abs()) } }
+    pub const fn wrapping_abs(self) -> NonZero<i64> { unsafe { NonZero::new_unchecked(self.get().wrapping_abs()) } }
+    pub const fn unsigned_abs(self) -> NonZero<u64> { unsafe { NonZero::new_unchecked(self.get().unsigned_abs()) } }
     pub const fn is_positive(self) -> bool { self.get() > 0 }
     pub const fn is_negative(self) -> bool { self.get() < 0 }
-    pub fn checked_neg(self) -> Option<NonZero<i64>> { match self.get().checked_neg() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
-    pub fn overflowing_neg(self) -> (NonZero<i64>, bool) { let (v, f) = self.get().overflowing_neg(); (unsafe { NonZero::new_unchecked(v) }, f) }
-    pub fn wrapping_neg(self) -> NonZero<i64> { unsafe { NonZero::new_unchecked(self.get().wrapping_neg()) } }
-    pub fn saturating_neg(self) -> NonZero<i64> { unsafe { NonZero::new_unchecked(self.get().saturating_neg()) } }
+    pub const fn checked_neg(self) -> Option<NonZero<i64>> { match self.get().checked_neg() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn overflowing_neg(self) -> (NonZero<i64>, bool) { let (v, f) = self.get().overflowing_neg(); (unsafe { NonZero::new_unchecked(v) }, f) }
+    pub const fn wrapping_neg(self) -> NonZero<i64> { unsafe { NonZero::new_unchecked(self.get().wrapping_neg()) } }
+    pub const fn saturating_neg(self) -> NonZero<i64> { unsafe { NonZero::new_unchecked(self.get().saturating_neg()) } }
 }
 impl From<NonZero<i64>> for i64 { fn from(n: NonZero<i64>) -> i64 { n.get() } }
 impl BitOr for NonZero<i64> { type Output = NonZero<i64>; fn bitor(self, rhs: NonZero<i64>) -> NonZero<i64> { unsafe { NonZero::new_unchecked(self.get() | rhs.get()) } } }
@@ -349,18 +355,18 @@ impl NonZero<i128> {
     pub const fn saturating_mul(self, other: NonZero<i128>) -> NonZero<i128> { unsafe { NonZero::new_unchecked(self.get().saturating_mul(other.get())) } }
     pub const fn checked_pow(self, other: u32) -> Option<NonZero<i128>> { match self.get().checked_pow(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn saturating_pow(self, other: u32) -> NonZero<i128> { unsafe { NonZero::new_unchecked(self.get().saturating_pow(other)) } }
-    pub fn abs(self) -> NonZero<i128> { unsafe { NonZero::new_unchecked(self.get().abs()) } }
-    pub fn checked_abs(self) -> Option<NonZero<i128>> { match self.get().checked_abs() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
-    pub fn overflowing_abs(self) -> (NonZero<i128>, bool) { let (v, f) = self.get().overflowing_abs(); (unsafe { NonZero::new_unchecked(v) }, f) }
-    pub fn saturating_abs(self) -> NonZero<i128> { unsafe { NonZero::new_unchecked(self.get().saturating_abs()) } }
-    pub fn wrapping_abs(self) -> NonZero<i128> { unsafe { NonZero::new_unchecked(self.get().wrapping_abs()) } }
-    pub fn unsigned_abs(self) -> NonZero<u128> { unsafe { NonZero::new_unchecked(self.get().unsigned_abs()) } }
+    pub const fn abs(self) -> NonZero<i128> { unsafe { NonZero::new_unchecked(self.get().abs()) } }
+    pub const fn checked_abs(self) -> Option<NonZero<i128>> { match self.get().checked_abs() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn overflowing_abs(self) -> (NonZero<i128>, bool) { let (v, f) = self.get().overflowing_abs(); (unsafe { NonZero::new_unchecked(v) }, f) }
+    pub const fn saturating_abs(self) -> NonZero<i128> { unsafe { NonZero::new_unchecked(self.get().saturating_abs()) } }
+    pub const fn wrapping_abs(self) -> NonZero<i128> { unsafe { NonZero::new_unchecked(self.get().wrapping_abs()) } }
+    pub const fn unsigned_abs(self) -> NonZero<u128> { unsafe { NonZero::new_unchecked(self.get().unsigned_abs()) } }
     pub const fn is_positive(self) -> bool { self.get() > 0 }
     pub const fn is_negative(self) -> bool { self.get() < 0 }
-    pub fn checked_neg(self) -> Option<NonZero<i128>> { match self.get().checked_neg() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
-    pub fn overflowing_neg(self) -> (NonZero<i128>, bool) { let (v, f) = self.get().overflowing_neg(); (unsafe { NonZero::new_unchecked(v) }, f) }
-    pub fn wrapping_neg(self) -> NonZero<i128> { unsafe { NonZero::new_unchecked(self.get().wrapping_neg()) } }
-    pub fn saturating_neg(self) -> NonZero<i128> { unsafe { NonZero::new_unchecked(self.get().saturating_neg()) } }
+    pub const fn checked_neg(self) -> Option<NonZero<i128>> { match self.get().checked_neg() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn overflowing_neg(self) -> (NonZero<i128>, bool) { let (v, f) = self.get().overflowing_neg(); (unsafe { NonZero::new_unchecked(v) }, f) }
+    pub const fn wrapping_neg(self) -> NonZero<i128> { unsafe { NonZero::new_unchecked(self.get().wrapping_neg()) } }
+    pub const fn saturating_neg(self) -> NonZero<i128> { unsafe { NonZero::new_unchecked(self.get().saturating_neg()) } }
 }
 impl From<NonZero<i128>> for i128 { fn from(n: NonZero<i128>) -> i128 { n.get() } }
 impl BitOr for NonZero<i128> { type Output = NonZero<i128>; fn bitor(self, rhs: NonZero<i128>) -> NonZero<i128> { unsafe { NonZero::new_unchecked(self.get() | rhs.get()) } } }
@@ -386,18 +392,18 @@ impl NonZero<isize> {
     pub const fn saturating_mul(self, other: NonZero<isize>) -> NonZero<isize> { unsafe { NonZero::new_unchecked(self.get().saturating_mul(other.get())) } }
     pub const fn checked_pow(self, other: u32) -> Option<NonZero<isize>> { match self.get().checked_pow(other) { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
     pub const fn saturating_pow(self, other: u32) -> NonZero<isize> { unsafe { NonZero::new_unchecked(self.get().saturating_pow(other)) } }
-    pub fn abs(self) -> NonZero<isize> { unsafe { NonZero::new_unchecked(self.get().abs()) } }
-    pub fn checked_abs(self) -> Option<NonZero<isize>> { match self.get().checked_abs() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
-    pub fn overflowing_abs(self) -> (NonZero<isize>, bool) { let (v, f) = self.get().overflowing_abs(); (unsafe { NonZero::new_unchecked(v) }, f) }
-    pub fn saturating_abs(self) -> NonZero<isize> { unsafe { NonZero::new_unchecked(self.get().saturating_abs()) } }
-    pub fn wrapping_abs(self) -> NonZero<isize> { unsafe { NonZero::new_unchecked(self.get().wrapping_abs()) } }
-    pub fn unsigned_abs(self) -> NonZero<usize> { unsafe { NonZero::new_unchecked(self.get().unsigned_abs()) } }
+    pub const fn abs(self) -> NonZero<isize> { unsafe { NonZero::new_unchecked(self.get().abs()) } }
+    pub const fn checked_abs(self) -> Option<NonZero<isize>> { match self.get().checked_abs() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn overflowing_abs(self) -> (NonZero<isize>, bool) { let (v, f) = self.get().overflowing_abs(); (unsafe { NonZero::new_unchecked(v) }, f) }
+    pub const fn saturating_abs(self) -> NonZero<isize> { unsafe { NonZero::new_unchecked(self.get().saturating_abs()) } }
+    pub const fn wrapping_abs(self) -> NonZero<isize> { unsafe { NonZero::new_unchecked(self.get().wrapping_abs()) } }
+    pub const fn unsigned_abs(self) -> NonZero<usize> { unsafe { NonZero::new_unchecked(self.get().unsigned_abs()) } }
     pub const fn is_positive(self) -> bool { self.get() > 0 }
     pub const fn is_negative(self) -> bool { self.get() < 0 }
-    pub fn checked_neg(self) -> Option<NonZero<isize>> { match self.get().checked_neg() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
-    pub fn overflowing_neg(self) -> (NonZero<isize>, bool) { let (v, f) = self.get().overflowing_neg(); (unsafe { NonZero::new_unchecked(v) }, f) }
-    pub fn wrapping_neg(self) -> NonZero<isize> { unsafe { NonZero::new_unchecked(self.get().wrapping_neg()) } }
-    pub fn saturating_neg(self) -> NonZero<isize> { unsafe { NonZero::new_unchecked(self.get().saturating_neg()) } }
+    pub const fn checked_neg(self) -> Option<NonZero<isize>> { match self.get().checked_neg() { Some(v) => Some(unsafe { NonZero::new_unchecked(v) }), None => None } }
+    pub const fn overflowing_neg(self) -> (NonZero<isize>, bool) { let (v, f) = self.get().overflowing_neg(); (unsafe { NonZero::new_unchecked(v) }, f) }
+    pub const fn wrapping_neg(self) -> NonZero<isize> { unsafe { NonZero::new_unchecked(self.get().wrapping_neg()) } }
+    pub const fn saturating_neg(self) -> NonZero<isize> { unsafe { NonZero::new_unchecked(self.get().saturating_neg()) } }
 }
 impl From<NonZero<isize>> for isize { fn from(n: NonZero<isize>) -> isize { n.get() } }
 impl BitOr for NonZero<isize> { type Output = NonZero<isize>; fn bitor(self, rhs: NonZero<isize>) -> NonZero<isize> { unsafe { NonZero::new_unchecked(self.get() | rhs.get()) } } }
