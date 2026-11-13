@@ -544,6 +544,18 @@ impl<T> Weak<T> {
 }
 
 impl<T: ?Sized> Weak<T> {
+    /// library/alloc/src/rc.rs `Weak::into_raw`: the weak count goes with the pointer.
+    pub fn into_raw(self) -> *const T {
+        let p = self.ptr.as_ptr() as *const T;
+        crate::mem::forget(self);
+        p
+    }
+
+    /// Reclaims the weak count transferred by `into_raw`, including an empty Weak.
+    pub unsafe fn from_raw(p: *const T) -> Weak<T> {
+        Weak { ptr: unsafe { ptr::NonNull::new_unchecked(p as *mut T) } }
+    }
+
     pub fn upgrade(&self) -> Option<Rc<T>> {
         if is_dangling(self.ptr.as_ptr()) {
             return None;
