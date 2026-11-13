@@ -247,7 +247,7 @@ pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool,
         crate::run::preserve_collected_boot(u);
         u.tcx.collect_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // parsed on this thread (no parse workers for one small crate)
-        crate::preload::SINGLE.with(|s| s.set(true));
+        let single_before = crate::preload::SINGLE.with(|s| s.replace(true));
         let mut failed = None;
         for (done, nc) in new.iter().enumerate() {
             if domain.is_some() { crate::run_state::progress(domain, crate::run_state::Phase::Parse,
@@ -275,7 +275,8 @@ pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool,
                 }
             }
         }
-        crate::preload::SINGLE.with(|s| s.set(false));
+        // as it was: a world build's single-thread load may hold it (pmhost SingleLoad)
+        crate::preload::SINGLE.with(|s| s.set(single_before));
         marks.push(("parse", std::time::Instant::now()));
         if let Some(e) = failed {
             u.prog.reclaim_caches();

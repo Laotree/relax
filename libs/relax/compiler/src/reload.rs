@@ -1725,33 +1725,72 @@ fn file_includes(pf: &crate::parser::ParsedFile, path: &str) -> Vec<String> {
 /// file `path`'s text). Its whole text: what `classify` compares as the item, and the expansions
 /// of the macro calls in it (a macro's `include_str!(concat!($key, ".txt"))`: an app's demo plates;
 /// a save of such a file said "patched" and the program kept the old text).
-/// `expanded`: `expansions_include(pf)`.
-fn item_includes(pf: &crate::parser::ParsedFile, path: &str, it: &crate::ast::Item, expanded: bool) -> Vec<String> {
+/// `exp`: `ExpIncludes::of(pf)`.
+fn item_includes(pf: &crate::parser::ParsedFile, path: &str, it: &crate::ast::Item, exp: &ExpIncludes) -> Vec<String> {
     use crate::ast::ItemKind;
     if !matches!(it.kind, ItemKind::Fn(..) | ItemKind::Const(..) | ItemKind::Static(..)) { return Vec::new(); }
+    // the expansions that name an include and were made by a call in the item (directly or
+    // through the expansions their calls lie in)
+    let mine: Vec<(u32, u32)> = exp.hot.iter().filter(|(_, calls)| calls.iter().any(|&c| it.lo <= c && c < it.hi)).map(|&(region, _)| region).collect();
     // (most code includes nothing: one look for the macro name first)
-    if !expanded && !pf.bytes(it.lo, it.hi).windows(8).any(|w| w == b"include_" || w == b"include!") { return Vec::new(); }
+    if mine.is_empty() && !names_include(pf.bytes(it.lo, it.hi)) { return Vec::new(); }
     let mut texts = toks(pf, it.lo, it.hi, &[]);
-    if expanded {
-        // the expansions whose call is in the item, or in one of these
-        let mut regions: Vec<(u32, u32, u32)> = pf.exp_map.iter().collect();
-        for part in pf.parts() { regions.extend(part.exp_map.iter()); }
-        let mut inside: Vec<(u32, u32)> = vec![(it.lo, it.hi)];
-        let mut grew = true;
-        while grew {
-            grew = false;
-            for &(a, b, call) in &regions {
-                if a < b && !inside.contains(&(a, b)) && inside.iter().any(|&(lo, hi)| lo <= call && call < hi) {
-                    inside.push((a, b));
-                    grew = true;
-                }
-            }
-        }
-        for &(a, b) in &inside[1..] {
-            texts.extend(toks(pf, a, b, &[]));
-        }
+    for (a, b) in mine {
+        texts.extend(toks(pf, a, b, &[]));
     }
     crate::builtins::include_literals(&texts).iter().map(|rel| crate::builtins::include_path(Some(path), rel)).collect()
+}
+
+fn names_include(text: &[u8]) -> bool {
+    text.windows(8).any(|w| w == b"include_" || w == b"include!")
+}
+
+/// A file's expansions whose text names include!/include_str!/include_bytes!, each with the call
+/// positions of the chain of expansions that made it: its own call, the call of the expansion that
+/// call lies in, and so on. Item `it` takes such an expansion when one of those calls is in its
+/// text (`item_includes`). Built once per file: growing each item's expansions to a fixpoint over
+/// all of the file's expansions cost items x expansions² on the owner, and a native build that
+/// rewrote a large generated bindings file held a large app's owner ~20 s per watch round.
+pub(crate) struct ExpIncludes {
+    hot: Vec<((u32, u32), Vec<u32>)>,
+}
+
+impl ExpIncludes {
+    pub(crate) fn none() -> Self {
+        Self { hot: Vec::new() }
+    }
+
+    pub(crate) fn of(pf: &crate::parser::ParsedFile) -> Self {
+        if !expansions_include(pf) { return Self::none(); }
+        let mut regions: Vec<(u32, u32, u32)> = pf.exp_map.iter().collect();
+        for part in pf.parts() { regions.extend(part.exp_map.iter()); }
+        regions.retain(|&(a, b, _)| a < b);
+        let mut hot = Vec::new();
+        for (k, &(a, b, call)) in regions.iter().enumerate() {
+            if !names_include(pf.bytes(a, b)) { continue; }
+            let mut taken = vec![false; regions.len()];
+            taken[k] = true;
+            let mut calls = vec![call];
+            let mut next = 0;
+            while next < calls.len() {
+                let c = calls[next];
+                next += 1;
+                for (j, &(ra, rb, rcall)) in regions.iter().enumerate() {
+                    if !taken[j] && ra <= c && c < rb {
+                        taken[j] = true;
+                        calls.push(rcall);
+                    }
+                }
+            }
+            hot.push(((a, b), calls));
+        }
+        Self { hot }
+    }
+
+    /// Whether any of the file's expansions names an include.
+    fn any(&self) -> bool {
+        !self.hot.is_empty()
+    }
 }
 
 /// The content hashes each included file was read with by the running code (one per crate that
@@ -1773,9 +1812,9 @@ fn expansions_include(pf: &crate::parser::ParsedFile) -> bool {
 
 /// Whether item `it`'s code includes a file whose content is not what the running code read
 /// (`base`; a file it never read is no part of running code).
-fn includes_moved(pf: &crate::parser::ParsedFile, path: &str, it: &crate::ast::Item, base: &IncludeBase, expanded: bool) -> bool {
+fn includes_moved(pf: &crate::parser::ParsedFile, path: &str, it: &crate::ast::Item, base: &IncludeBase, exp: &ExpIncludes) -> bool {
     if base.is_empty() { return false; }
-    item_includes(pf, path, it, expanded).iter().any(|p| base.get(p).is_some_and(|seen| {
+    item_includes(pf, path, it, exp).iter().any(|p| base.get(p).is_some_and(|seen| {
         let now = crate::sip::late_hash(crate::vfs::read(p).ok().as_deref());
         seen.iter().any(|h| *h != now)
     }))
@@ -1791,9 +1830,10 @@ pub(crate) fn include_edits(prog: &crate::program::Program, changed: &[String], 
         if !own_source_file(prog, file) { continue; }
         let pf = &prog.files[file as usize];
         let src = &pf.src[..pf.src_len as usize];
-        let expanded = expansions_include(pf);
-        if file_includes(pf, &path).iter().any(|p| changed.contains(p))
-            || (expanded || src.windows(8).any(|w| w == b"include_" || w == b"include!")) && pf.ast.items.iter().any(|it| item_includes(pf, &path, it, expanded).iter().any(|p| changed.contains(p))) {
+        if file_includes(pf, &path).iter().any(|p| changed.contains(p)) || {
+            let exp = ExpIncludes::of(pf);
+            (exp.any() || names_include(src)) && pf.ast.items.iter().any(|it| item_includes(pf, &path, it, &exp).iter().any(|p| changed.contains(p)))
+        } {
             out.push(Edit { file, path, src: src.to_vec() });
         }
     }
@@ -1810,10 +1850,10 @@ pub(crate) fn include_unmatched(prog: &crate::program::Program, changed: &[Strin
         let pf = &prog.files[file as usize];
         let named = file_includes(pf, &path);
         left.retain(|p| !named.contains(p));
-        let expanded = expansions_include(pf);
-        if !expanded && !pf.src[..pf.src_len as usize].windows(8).any(|w| w == b"include_" || w == b"include!") { continue; }
+        let exp = ExpIncludes::of(pf);
+        if !exp.any() && !names_include(&pf.src[..pf.src_len as usize]) { continue; }
         for it in pf.ast.items.iter() {
-            let named = item_includes(pf, &path, it, expanded);
+            let named = item_includes(pf, &path, it, &exp);
             left.retain(|p| !named.contains(p));
         }
     }
@@ -1859,7 +1899,7 @@ fn classify_moving(prog: &crate::program::Program, old_file: u32, new: &crate::p
     };
     let body_span = fn_body_span;
     let (mut pairs, mut removed, mut added) = pair_items(old, new);
-    let old_expanded = !base.is_empty() && expansions_include(old);
+    let old_exp = if base.is_empty() { ExpIncludes::none() } else { ExpIncludes::of(old) };
     trace_sub("classify_pair");
     // a fn whose signature changed (M2/M4): the old fn goes and a new one with the new signature
     // comes (its own slots: frames of the old code in flight keep calling the old one), and every
@@ -2112,7 +2152,7 @@ fn classify_moving(prog: &crate::program::Program, old_file: u32, new: &crate::p
         // produces a new provider; schedule its generated bodies without lowering them here.
         // The same text whose code includes a file that changed since the running code read it
         // changed too (include_str!: its body or initializer is classified as edited below).
-        if attrs_same && same_toks(old, la, a.hi, &ha, new, lb, b.hi, &hb) && !includes_moved(old, &prog.file_paths[old_file as usize], a, base, old_expanded) {
+        if attrs_same && same_toks(old, la, a.hi, &ha, new, lb, b.hi, &hb) && !includes_moved(old, &prog.file_paths[old_file as usize], a, base, &old_exp) {
             continue;
         }
         // derive output is expansion text: an authored item is never one
@@ -10562,6 +10602,52 @@ mod vtable_name_tests {
 mod include_part_tests {
     use super::*;
 
+    /// An include a chain of macros makes (`outer!` expands to `inner!`, which expands to
+    /// `include_str!`) is the item's whose text holds the first call, and no other item's: the
+    /// lookup follows the calls up through the expansions (`ExpIncludes`).
+    #[test]
+    fn an_include_through_a_chain_of_macros_is_the_calling_items() {
+        isolated_test!(an_include_through_a_chain_of_macros_is_the_calling_items);
+        let dir = std::env::temp_dir().join(format!("relax-include-chain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plate = dir.join("plate.txt");
+        std::fs::write(&plate, "the plate").unwrap();
+        let path = dir.join("main.rs");
+        std::fs::write(&path, r#"
+macro_rules! inner {
+    ($k:literal) => { include_str!(concat!($k, ".txt")) };
+}
+macro_rules! outer {
+    ($k:literal) => { inner!($k) };
+}
+pub fn plate() -> &'static str {
+    outer!("plate")
+}
+pub fn other() -> usize {
+    1
+}
+"#).unwrap();
+        let path_text = path.to_str().unwrap();
+        let session = std::sync::Arc::new(crate::Session::default());
+        let cfg = crate::cfg::CfgSet::host(&session, &[]);
+        let mut prog = Program::new(&session);
+        prog.load_crate("include_chain", path_text, 2021, cfg, vec![]).unwrap();
+        let item_of = |name: &str| {
+            let d = (0..prog.defs.len()).map(|i| DefId(i as u32)).find(|&d| prog.name(d) == name).unwrap();
+            (prog.def(d).file, prog.def(d).item)
+        };
+        let (file, plate_item) = item_of("plate");
+        let (_, other_item) = item_of("other");
+        let pf = &prog.files[file as usize];
+        let exp = ExpIncludes::of(pf);
+        let named = item_includes(pf, path_text, pf.ast.item(plate_item), &exp);
+        assert!(named.iter().any(|p| std::path::Path::new(p) == plate), "the calling fn includes the plate: {named:?}");
+        assert_eq!(item_includes(pf, path_text, pf.ast.item(other_item), &exp), Vec::<String>::new(), "the other fn includes nothing");
+        let plate_text = plate.to_str().unwrap().to_string();
+        assert_eq!(include_unmatched(&prog, &[plate_text]), Vec::<String>::new(), "a save of the plate is the calling fn's");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A file's lazily parsed bodies are parsed together into a part whose expansions sit past the
     /// file's text (ParsedFile::part). The include lookup reads the expansions of an item's macro
     /// calls: a part's through the part. (It sliced the file's own text there: "range start index
@@ -10606,7 +10692,7 @@ pub fn reads() -> usize {
         }
         assert!(texts.contains("docs"), "the expansions' own text: {texts:?}");
         let it = pf.ast.item(prog.def(reads).item);
-        assert_eq!(item_includes(&pf, path_text, it, true), Vec::<String>::new(), "the body includes nothing");
+        assert_eq!(item_includes(&pf, path_text, it, &ExpIncludes::of(&pf)), Vec::<String>::new(), "the body includes nothing");
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -2379,35 +2379,44 @@ pub fn pre_expand_derives(krate: &str, files: &[(&str, &[u8], &[Tok])], cfg: &Cf
     let t_wall = std::time::Instant::now();
     let jobs = crate::preload::jobs();
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let results: Vec<Vec<(usize, Result<ItemOut, (u32, String)>)>> = crate::pool::scope(|sc| {
-        let mut hs = Vec::new();
-        for _ in 0..jobs.min(sites.len()) {
-            hs.push(sc.spawn(|| {
-                let mut out = Vec::new();
-                loop {
-                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if k >= sites.len() {
-                        break;
-                    }
-                    let (fi, lo, hi) = sites[k];
-                    let src = files[fi].1;
-                    let before = files[fi].2.partition_point(|t| t.lo < lo);
-                    let gap_lo = if before == 0 { 0 } else { files[fi].2[before - 1].hi.min(lo) };
-                    let span_of = |a: u32, z: u32| Span { file: 0, lo: a, hi: z, start: LineColumn { line: 1, column: 1 }, end: LineColumn { line: 1, column: 1 } };
-                    let (_, docs) = leading_docs(&src[gap_lo as usize..lo as usize], gap_lo, &span_of);
-                    out.push((k, expand_item(sess, krate, files[fi].0, &src[lo as usize..hi as usize], site_tokens(files[fi].2, lo, hi), docs, lo, crate::lexer::line_col_at(&lines[fi], src.len(), lo), Some(cfg), edition, None, None)));
-                }
-                out
-            }));
-        }
-        let mut all = Vec::new();
-        for h in hs {
-            if let Ok(v) = h.join() {
-                all.push(v);
+    let expand_sites = || {
+        let mut out = Vec::new();
+        loop {
+            let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if k >= sites.len() {
+                break;
             }
+            let (fi, lo, hi) = sites[k];
+            let src = files[fi].1;
+            let before = files[fi].2.partition_point(|t| t.lo < lo);
+            let gap_lo = if before == 0 { 0 } else { files[fi].2[before - 1].hi.min(lo) };
+            let span_of = |a: u32, z: u32| Span { file: 0, lo: a, hi: z, start: LineColumn { line: 1, column: 1 }, end: LineColumn { line: 1, column: 1 } };
+            let (_, docs) = leading_docs(&src[gap_lo as usize..lo as usize], gap_lo, &span_of);
+            out.push((k, expand_item(sess, krate, files[fi].0, &src[lo as usize..hi as usize], site_tokens(files[fi].2, lo, hi), docs, lo, crate::lexer::line_col_at(&lines[fi], src.len(), lo), Some(cfg), edition, None, None)));
         }
-        all
-    });
+        out
+    };
+    // One job runs on this thread: a single-thread load (`preload::SINGLE`) is the owner's while
+    // the program runs, where an expansion's host request runs in place; on a pool thread that
+    // request would wait for the owner, which waits here for that thread (a live edit's macro
+    // world build hung in this join).
+    let results: Vec<Vec<(usize, Result<ItemOut, (u32, String)>)>> = if jobs <= 1 {
+        vec![expand_sites()]
+    } else {
+        crate::pool::scope(|sc| {
+            let mut hs = Vec::new();
+            for _ in 0..jobs.min(sites.len()) {
+                hs.push(sc.spawn(&expand_sites));
+            }
+            let mut all = Vec::new();
+            for h in hs {
+                if let Ok(v) = h.join() {
+                    all.push(v);
+                }
+            }
+            all
+        })
+    };
     PRE.with(|m| {
         let mut m = m.borrow_mut();
         for v in results {
