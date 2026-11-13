@@ -407,13 +407,14 @@ mod unix {
         dlsym(handle, name)
     }
 
-    /// exit(): the program's atexit handlers, then the end every process takes
-    /// (`makepad_core_util::process_end::end`, a native app's too): the host's own exit work, the
-    /// flushes, `_exit`. The C library's exit handlers do not run, so neither do those a native
-    /// library registered: a GPU driver's teardown at exit joined one of its threads that never
-    /// ended (NVIDIA's Vulkan driver at a test process's exit, about 1 in 150 runs and more under
-    /// GPU load, the process hung for good). The main thread's pthread key destructors do not run
-    /// either (the program's thread locals are left as they are, as in a rustc build).
+    /// exit(): the program's atexit handlers, then the end without the C library's exit handlers
+    /// (`makepad_core_util::process_end::end_without_c_handlers`): the host's own exit work, the
+    /// flushes, the profile runtime's write in an instrumented build, `_exit`. The C library's
+    /// exit handlers do not run, so neither do those a native library registered: a GPU driver's
+    /// teardown at exit joined one of its threads that never ended (NVIDIA's Vulkan driver at a
+    /// test process's exit, about 1 in 150 runs and more under GPU load, the process hung for
+    /// good). The main thread's pthread key destructors do not run either (the program's thread
+    /// locals are left as they are, as in a rustc build).
     pub fn exit(code: i32) -> ! {
         super::run_program_atexit();
         crate::selfexe::remove();
@@ -428,7 +429,7 @@ mod unix {
             super::EMBEDDED_FAILURE.store(code, std::sync::atomic::Ordering::Release);
             loop { std::thread::park(); }
         }
-        makepad_core_util::process_end::end(code)
+        makepad_core_util::process_end::end_without_c_handlers(code)
     }
 
     pub fn last_error() -> i32 {
@@ -879,14 +880,14 @@ mod imp {
     /// run's exit work, the control endpoint's cleanup). A run that returned from main or quit
     /// through its app domain did neither: no final cache, and a discovery file left behind, which
     /// the hub reads as a crash (11-04). Then the process ends without ExitProcess
-    /// (`makepad_core_util::process_end::end`), which would run the fiber-local destructors of the
-    /// exiting thread: the program's thread locals (FlsAlloc callbacks in JIT code) would run after
-    /// Relax dropped the unit, and unix's exit() does not run the main thread's key destructors
-    /// either.
+    /// (`makepad_core_util::process_end::end_without_c_handlers`), which would run the fiber-local
+    /// destructors of the exiting thread: the program's thread locals (FlsAlloc callbacks in JIT
+    /// code) would run after Relax dropped the unit, and unix's exit() does not run the main
+    /// thread's key destructors either.
     pub fn exit(code: i32) -> ! {
         super::run_program_atexit();
         crate::selfexe::remove();
-        makepad_core_util::process_end::end(code)
+        makepad_core_util::process_end::end_without_c_handlers(code)
     }
 
     pub fn last_error() -> i32 {

@@ -146,7 +146,7 @@ pub(crate) fn request(cmd: &std::process::Command) -> String {
     let _ = unsafe { makepad_windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(ASFW_ANY) };
     // an exec does not run the program's exit handlers either; the process's own exit work does run
     // (the discovery file of this pid goes: the hub reads one left behind as a crash)
-    makepad_core_util::process_end::end(RESTART_EXIT as i32)
+    makepad_core_util::process_end::end_without_c_handlers(RESTART_EXIT as i32)
 }
 
 /// Windows, on entry of the loader with the resolved command line `args`: the run its parent started
