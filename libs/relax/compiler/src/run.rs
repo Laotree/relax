@@ -847,8 +847,19 @@ pub(crate) fn resolve_package(
             if let Some((_, took)) = &sources { eprintln!("boot-trace: provided sources hashed in {:.1} ms (beside the build scripts)", took.as_secs_f64() * 1e3); }
         }
         if let Some((checked, _)) = sources { checked?; }
-        // the package binaries the tests start take this run's native build
+        // the package binaries the tests start take this run's native build: named in the tests'
+        // environment, and beside the binaries' wrappers for a test that clears it
         if let Some(r) = scripts? {
+            for bin in g.env.iter().flatten().filter_map(|(k, _)| k.strip_prefix("CARGO_BIN_EXE_")) {
+                let file = unitgraph::bin_native(&crate::dirs::relax_dir(), bin);
+                if std::fs::read_to_string(&file).ok().as_deref() != Some(r.as_str()) {
+                    let tmp = file.with_extension(format!("native.tmp{}", std::process::id()));
+                    if std::fs::write(&tmp, &r).is_err() || std::fs::rename(&tmp, &file).is_err() {
+                        let _ = std::fs::remove_file(&tmp);
+                        eprintln!("relax test: {}: could not name this run's native build for its package binaries; one started with a cleared environment builds its own", file.display());
+                    }
+                }
+            }
             std::env::set_var(unitgraph::BIN_NATIVE_RECEIPT, r);
         }
         crate::macro_reg::set_build_outputs(sess, &g.crates, &g.cfgs, &g.env, &host_checks);
@@ -1350,8 +1361,14 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if let Some(arg0) = std::env::var_os("RELAX_ARG0") {
         prog_args[0] = arg0.into_encoded_bytes();
         unsafe { std::env::remove_var("RELAX_ARG0") };
-        // and the native build of the test's run, which the binary compiles and links with
-        if let Some(r) = std::env::var(unitgraph::BIN_NATIVE_RECEIPT).ok().filter(|r| !r.is_empty()) {
+        // and the native build of the test's run, which the binary compiles and links with: the
+        // one its environment names (empty: none), else the one beside its wrapper (a test that
+        // cleared its environment, relax issue 157)
+        let receipt = std::env::var(unitgraph::BIN_NATIVE_RECEIPT).ok().or_else(|| {
+            let bin = crate::selfexe::program_name(&cargo_flags, &package);
+            std::fs::read_to_string(unitgraph::bin_native(&crate::dirs::relax_dir(), &bin)).ok()
+        });
+        if let Some(r) = receipt.filter(|r| !r.is_empty()) {
             let _ = TESTS_NATIVE.set(r);
         }
         unsafe { std::env::remove_var(unitgraph::BIN_NATIVE_RECEIPT) };

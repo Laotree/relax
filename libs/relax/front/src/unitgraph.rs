@@ -336,6 +336,7 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
                 // cargo builds a package's bins with the features its tests are built with (one
                 // feature set per package): the run of the bin selects exactly those
                 let features = crates[integration_tests[0]].features.join(",");
+                let allow_c = std::env::var_os("RELAX_ALLOW_C").is_some_and(|v| v == "1");
                 // a file the bin's starts read, replaced whole (another run's test may be reading it)
                 let put = |path: &std::path::Path, text: &str| {
                     if std::fs::read(path).ok().as_deref() == Some(text.as_bytes()) {
@@ -354,6 +355,12 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
                 for bin_name in &g.bins {
                     // the bin's run: the loader's command line before the bin's own arguments
                     let mut words: Vec<String> = [exe_str.as_str(), "run", "--quiet", "--silent", "--no-live", "--run-dir", td_str.as_str(), "--workspace-dir", pkg_dir.as_str(), pkg_name.as_str(), "--no-default-features"].iter().map(|w| w.to_string()).collect();
+                    // the test run's native permission is the binary's, as cargo builds the binary
+                    // with the test: a test that clears its child's environment (or takes
+                    // RELAX_ALLOW_C out of it) still starts the binary (relax issue 157)
+                    if allow_c {
+                        words.push("--allow-c".to_string());
+                    }
                     if !features.is_empty() {
                         words.extend(["--features".to_string(), features.clone()]);
                     }
@@ -1528,8 +1535,18 @@ fn rerun_reason(stored: &str, now: &str, stored_env: &str, env_key: &str) -> Str
 /// The variable that hands a build script's child run its parent's native receipt.
 pub const NATIVE_RECEIPT: &str = "RELAX_NATIVE_RECEIPT";
 /// The variable that hands the package binaries an integration test starts (CARGO_BIN_EXE_<name>)
-/// its run's native receipt (`Inherit::Binary`): set in the test's environment.
+/// its run's native receipt (`Inherit::Binary`): set in the test's environment. Empty: none, the
+/// binary builds its own natives. A binary whose test cleared it from its environment (or cleared
+/// the whole environment) takes the receipt the test's run named beside its wrapper
+/// (`bin_native`).
 pub const BIN_NATIVE_RECEIPT: &str = "RELAX_BIN_NATIVE_RECEIPT";
+
+/// Beside the CARGO_BIN_EXE_<bin> wrappers of the run dir `run_dir` (`--run-dir`): the file that
+/// names the native receipt of the test run that last started `bin` (relax issue 157: a test's
+/// cleared environment held none).
+pub fn bin_native(run_dir: &std::path::Path, bin: &str) -> std::path::PathBuf {
+    run_dir.join("relax-bin").join(format!("{bin}.native"))
+}
 
 const SCRIPT_RUN_SHAPE_VARS: [&str; 4] = ["RELAX_VFS", "RELAX_EDITS", "RELAX_SCRIPT_DEPTH", "RELAX_SCRIPT_CHAIN"];
 
