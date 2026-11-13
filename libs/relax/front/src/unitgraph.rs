@@ -523,8 +523,8 @@ pub type ScriptsDone<'a> = dyn Fn(&Graph, &[usize], &[Vec<String>], &[Vec<(Strin
 ///
 /// `native_receipt`: the native build of the run that started this one (`Inherit`).
 ///
-/// Its result: in a run whose integration tests start the package's binaries (CARGO_BIN_EXE_<name>),
-/// the receipt of its native build for those binaries' runs (`BIN_NATIVE_RECEIPT`).
+/// Its result: the receipt of this run's native build for its own self-exec and the package
+/// binaries its integration tests start (`BIN_NATIVE_RECEIPT`).
 pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, target_dir: &str, native: Option<crate::native::Mode<'_>>, check_only: bool,
     native_receipt: Option<Inherit<'_>>, scripts_done: Option<&ScriptsDone<'_>>) -> Result<Option<String>, String> {
     // the packages whose scripts compile or link C (native.rs): built by cargo with `--allow-c`,
@@ -690,8 +690,8 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
         (native_job.map(|j| j.join().unwrap_or_else(|_| Err("--allow-c: the native build panicked".to_string()))), results)
     });
     root.finish();
-    // the package's binaries its integration tests start compile and link with this build
-    let launches = !check_only && !native_seeds.is_empty() && g.env.iter().flatten().any(|(k, _)| k.starts_with("CARGO_BIN_EXE_"));
+    // This program again, and the package binaries its integration tests start, take this build.
+    let launches = !check_only && !native_seeds.is_empty();
     let mut for_bins = if launches && prebuilt { receipt.clone() } else { None };
     if let Some(built) = native_built {
         let built = built?;

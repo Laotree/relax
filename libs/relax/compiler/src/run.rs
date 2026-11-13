@@ -833,7 +833,7 @@ pub(crate) fn resolve_package(
             let receipt = native_request.is_none().then(|| std::env::var(unitgraph::NATIVE_RECEIPT).ok()).flatten();
             let inherit = match (&receipt, TESTS_NATIVE.get()) {
                 (Some(r), _) => Some(unitgraph::Inherit::Script(r)),
-                (None, Some(r)) if native_request.is_some() => Some(unitgraph::Inherit::Binary(r)),
+                (None, Some(r)) if boot && native_request.is_some() => Some(unitgraph::Inherit::Binary(r)),
                 _ => None,
             };
             let scripts = unitgraph::run_build_scripts(sess, &mut g, target_dir, native_mode, check_only, inherit, hook);
@@ -852,6 +852,7 @@ pub(crate) fn resolve_package(
         // the package binaries the tests start take this run's native build: named in the tests'
         // environment, and beside the binaries' wrappers for a test that clears it
         if let Some(r) = scripts? {
+            if boot { crate::progenv::set_run_fact("RELAX_RUN_NATIVE", &r); }
             for bin in g.env.iter().flatten().filter_map(|(k, _)| k.strip_prefix("CARGO_BIN_EXE_")) {
                 let file = unitgraph::bin_native(&crate::dirs::relax_dir(), bin);
                 if std::fs::read_to_string(&file).ok().as_deref() != Some(r.as_str()) {
@@ -1392,7 +1393,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             let _ = TESTS_NATIVE.set(r);
         }
         unsafe { std::env::remove_var(unitgraph::BIN_NATIVE_RECEIPT) };
-    } else if let Some(r) = std::env::var("RELAX_RUN_NATIVE").ok().filter(|r| !r.is_empty()).and_then(|r| run_dir_receipt("RELAX_RUN_NATIVE", r, &target_dir)) {
+    } else if let Some(r) = crate::run_end::run_input("RELAX_RUN_NATIVE").and_then(|r| r.into_string().ok()).filter(|r| !r.is_empty()).and_then(|r| run_dir_receipt("RELAX_RUN_NATIVE", r, &target_dir)) {
         // this program again, of a run that took its native build from its test's run (relax
         // issue 168: it built its own then, without the test's inputs)
         let _ = TESTS_NATIVE.set(r);
@@ -5441,6 +5442,7 @@ fn mem_budget_mode() -> bool {
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     RUN_UNIT = std::ptr::null_mut();
+    reset(&TESTS_NATIVE, std::sync::OnceLock::new());
     reset(&PHASES, relax_session::sync::Mutex::new(Vec::new()));
     reset(&MAIN_START_MS, AtomicU64::new(0));
     reset(&ERRORS_SEEN, AtomicU64::new(0));
@@ -5459,6 +5461,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&HAL_RUN, AtomicBool::new(false));
     reset(&APP_DOMAIN, std::sync::atomic::AtomicU32::new(0));
     reset(&SLOT_OWNERS, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&NATIVE_BUNDLES, std::sync::Mutex::new(Vec::new()));
     reset(&SETTLE_REQUESTED, AtomicBool::new(false));
     reset(&FIRST_PRESENT_WALL, AtomicU64::new(0));
     reset(&DOMAIN_PRESENT_WALL, AtomicU64::new(0));

@@ -1,0 +1,10 @@
+[package]
+name = "self-native-host"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+relax-compiler = { path = "../../../" }
+relax-runner = { path = "../../../../../../tools/run/runner" }
+[workspace]
+[profile.release]
+lto = "off"

@@ -312,6 +312,7 @@ pub(crate) fn apply_at_boot(change: &crate::provided::ProvidedChange) -> i32 {
         // fd 2 back to the terminal before the exec (the transcript tee is a thread of this process)
         crate::tui::exit_code(0);
         crate::tui::finish(false);
+        for name in super::NATIVE_RECEIPTS { cmd.env_remove(name); }
         let e = cmd.exec();
         failed(format!("cannot start the rebuilt {tool}: {e}", tool = crate::tool_name()))
     }
@@ -937,6 +938,7 @@ fn restart(h: Handover, state: Option<&[u8]>) {
         crate::tui::finish(false);
         eprintln!("relax live: restarting: {reason}");
         super::hand_over(&mut cmd);
+        for name in super::NATIVE_RECEIPTS { cmd.env_remove(name); }
         let e = cmd.exec();
         super::hand_back();
         fail(format!("restart into the rebuilt {tool} failed: {e}; the app runs the previous code", tool = crate::tool_name()));
@@ -951,6 +953,37 @@ fn restart(h: Handover, state: Option<&[u8]>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rebuilt_loader_discards_the_prepared_native_build() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "RELAX_TEST_REBUILT_NATIVE";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            std::env::set_var("RELAX_RUN_NATIVE", "old-run");
+            std::env::set_var("RELAX_BIN_NATIVE_RECEIPT", "old-bin");
+            std::env::set_var("NATIVE_RESTART_KEEP", "keep");
+            restart(Handover { loader: PathBuf::from(dir).join("loader"), stamps: Vec::new() }, None);
+            panic!("the replacement loader did not exec");
+        }
+        let dir = (0..100).find_map(|n| {
+            let dir = std::env::temp_dir().join(format!("relax-native-restart-{}-{n}", std::process::id()));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => Some(dir),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(e) => panic!("restart fixture: {e}"),
+            }
+        }).expect("an unused restart fixture directory");
+        let loader = dir.join("loader");
+        std::fs::write(&loader, "#!/bin/sh\nprintf '%s|%s|%s\\n' \"${RELAX_RUN_NATIVE-none}\" \"${RELAX_BIN_NATIVE_RECEIPT-none}\" \"$NATIVE_RESTART_KEEP\"\n").unwrap();
+        std::fs::set_permissions(&loader, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "reload::host::tests::a_rebuilt_loader_discards_the_prepared_native_build", "--nocapture"])
+            .env(CHILD, &dir).output().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(output.stdout.ends_with(b"none|none|keep\n"), "rebuilt loader inherited a stale native receipt: {}", String::from_utf8_lossy(&output.stdout));
+    }
 
     #[cfg(unix)]
     #[test]

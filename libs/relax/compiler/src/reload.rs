@@ -7918,6 +7918,8 @@ pub(crate) fn hand_back() {
     }
 }
 
+const NATIVE_RECEIPTS: [&str; 2] = ["RELAX_RUN_NATIVE", crate::unitgraph::BIN_NATIVE_RECEIPT];
+
 /// What the next run reads (run_end::run_input; a value, or none): the recovery on its way, `state`
 /// as the app left it, when the edit behind this was saved. A process started for the next run
 /// finds it in its environment, a run started in place in the restart's hand-over.
@@ -7928,7 +7930,10 @@ pub(crate) fn next_run_env(state: Option<&[u8]>) -> Result<Vec<(&'static str, Op
         None => None,
     };
     let saved = RESTART_SAVED_MS.load(std::sync::atomic::Ordering::Relaxed).to_string();
-    Ok(vec![("MAKEPAD_JIT_RECOVERY", recovery), ("RELAX_RESTORE", restore), ("RELAX_RESTART_T0", Some(saved.into()))])
+    // An explicit rebuild takes changed native inputs, rather than this binary's build.
+    let mut next = vec![("MAKEPAD_JIT_RECOVERY", recovery), ("RELAX_RESTORE", restore), ("RELAX_RESTART_T0", Some(saved.into()))];
+    next.extend(NATIVE_RECEIPTS.map(|name| (name, None)));
+    Ok(next)
 }
 
 /// A restart that waited out the run's boot (run_end::restart) and hands no state of its own: the
