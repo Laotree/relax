@@ -62,6 +62,11 @@ pub fn cmd_clean(args: &[String]) -> i32 {
 /// The relax dir to clean, checked (None: there is none, said so). `overridden`: RELAX_CACHE_DIR
 /// is set.
 pub fn checked_dir(workspace: &str, overridden: bool) -> Result<Option<PathBuf>, String> {
+    match crate::dirs::shared_cache_mode() {
+        Ok(false) => {}
+        Ok(true) => return Err("RELAX_SHARED_CACHE=global: the run dir is shared by every workspace, and clean never deletes it (unset RELAX_SHARED_CACHE, or remove that folder yourself)".to_string()),
+        Err(e) => return Err(e),
+    }
     if overridden {
         return Err("RELAX_CACHE_DIR is set: that override is for tests and measurement only, and clean never deletes an arbitrary folder (unset it, or remove that folder yourself)".to_string());
     }
