@@ -766,7 +766,11 @@ mod unix {
         unsafe { dup2(st.out, 2); close(st.write_fd); }
         drain_now();
         pump(st, true);
-        let clean = EXIT_CODE.load(Ordering::Acquire) == 0 && !ABNORMAL.load(Ordering::Acquire);
+        // A silent run (a program re-running itself, a test's CARGO_BIN_EXE child) ends with the
+        // program's status, and its stderr is the program's as rustc's binary's is: a nonzero
+        // status of its own is its answer, not Relax's failure (an internal error keeps the log).
+        let code = EXIT_CODE.load(Ordering::Acquire);
+        let clean = !ABNORMAL.load(Ordering::Acquire) && (code == 0 || (crate::run::silent() && !KEEP_LOG.load(Ordering::Acquire)));
         if clean {
             if let Err(e) = std::fs::remove_file(&st.path) {
                 out_all(st.out, format!("relax: session log kept at {}: {e}\n", st.path.display()).as_bytes());
