@@ -423,7 +423,7 @@ fn dispatch_command(req: &Req, out: &mut Out) {
         "help" => help(req, out),
         "inputs" => {
             // `of`: the paths asked about, one per line (a live session's saves): only those are
-            // looked at; every input path cost the owner 25-40 ms an edit (Fab, 11-04)
+            // looked at; every input path cost the owner 25-40 ms an edit (an app, 11-04)
             let of: Vec<&str> = req.get("of").map_or_else(Vec::new, |v| v.lines().filter(|l| !l.is_empty()).collect());
             let keep = |p: &str| of.is_empty() || of.iter().any(|a| ends_with_rel(p, a.trim_start_matches("../")));
             match crate::reload::input_paths(&keep) {

@@ -565,7 +565,7 @@ pub struct Unit {
     /// body not there or still building): callee -> those O3 functions, built again once the
     /// callee proves hot itself -- its own O3 build installs (kept_callee_hot). A call the program
     /// rarely makes stays a call: rebuilding every such caller when the callee's body came or it
-    /// first ran made warm Sandbox runs build ~180 O3 fns again, the big ones several times.
+    /// first ran made an app's warm runs build ~180 O3 fns again, the big ones several times.
     kept_users: HashMap<u32, Vec<u32>>,
     /// O3 rebuilds per slot for that reason (bounded)
     retiers: HashMap<u32, u8>,
@@ -5459,8 +5459,8 @@ impl Unit {
     /// is queued in the background (borrow_build_enqueue). The twin is the same body built for
     /// unverified callers (no noalias, aliasing-prone calls to twins): sound for every caller. So
     /// a verified rebuild of a caller that ran calling the twin (sweep_verdicts) never sends the
-    /// hot path to lazy first compiles of the base slots under it on the program's threads (the
-    /// Sandbox's 70-560 ms frames: ~550 lazy installs in one frame). Returns the code the slot
+    /// hot path to lazy first compiles of the base slots under it on the program's threads (a
+    /// large app's 70-560 ms frames: ~550 lazy installs in one frame). Returns the code the slot
     /// runs now. Owner thread.
     pub(crate) fn borrow_twin(&mut self, id: u32) -> Option<u64> {
         let f = &self.fns[id as usize];
@@ -8907,7 +8907,7 @@ pub fn reclaim_generation() -> u64 {
 pub static CODE_CACHE_EMPTY: AtomicBool = AtomicBool::new(false);
 pub static MAIN_COMPILES: relax_session::sync::Mutex<Vec<MainCompile>> = relax_session::sync::Mutex::new(Vec::new());
 /// Whether the main thread's compiles are kept for RELAX_MAIN_COMPILE_LOG (its only reader):
-/// otherwise every lazy call on main grew MAIN_COMPILES for the whole run (Sandbox: 18 MB after
+/// otherwise every lazy call on main grew MAIN_COMPILES for the whole run (a large app: 18 MB after
 /// 2 min, pinning compiler-arena chunks across the settle rebuild).
 pub fn main_compile_log() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -9814,8 +9814,8 @@ static PENDING_RECORDS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 
 /// After the first present: a full batch of deferred cache records waits. The run monitor then
 /// drains them (`drain_records_bounded`); an install never posts a drain itself: a drain posted at
-/// a lazy compile's install ran just before that thread's next request and delayed it (Stage cold:
-/// the UI queued behind 736 of 1279 drains)
+/// a lazy compile's install ran just before that thread's next request and delayed it (a large app's
+/// cold start: the UI queued behind 736 of 1279 drains)
 pub(crate) fn records_due() -> bool {
     FIRST_PRESENT.load(Ordering::Acquire) && PENDING_RECORDS.load(Ordering::Relaxed) >= RECORD_BATCH
 }
@@ -11614,7 +11614,7 @@ unsafe fn settle_final(u: &Unit, id: u32) -> bool {
 /// Slot `id` (counting) runs code linked from the cache: its tier starts from the decision an
 /// earlier run stored for that code (Cache::tier_verdict), not one made again from this run's
 /// start -- a warm launch's faster code crossed the O3 bar where the run that stored it had not,
-/// and its counted builds parked them again (warm Fab: ~150 slots, the launch never settled).
+/// and its counted builds parked them again (a large app's warm start: ~150 slots, the launch never settled).
 /// Parked: final, its loops included (STORED_PARKED). Neither queued nor parked (it counted and
 /// never turned hot): final. Queued (and no verdict since): it counts as this run's code does,
 /// and this run's counts queue it. (Queued at link, every slot an earlier run had queued was built
@@ -12144,8 +12144,8 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done, cut: bool) {
         enqueue_uncompiled_callees(up, id, &c.relocs, false);
     }
     // an O3 build of the slot is running (queued with this one: tier1_thread's o2_hot): this install
-    // would change the slot under it, and it would be dropped and built again (cold Stage: 1.8k O3
-    // builds dropped so) -- the O2 code stays the cache entry, the O3 code runs
+    // would change the slot under it, and it would be dropped and built again (a large app's cold start:
+    // 1.8k O3 builds dropped so) -- the O2 code stays the cache entry, the O3 code runs
     let o3_building = u.fns[id as usize].compiled && TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).contains(&id);
     // (PGO: counted code runs until its O3 build: the counts are of that code)
     let counted = u.frequency_profiles.contains_key(&id);
@@ -12162,7 +12162,7 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done, cut: bool) {
                 u.arm_counter(id, a);
             } else {
                 // a slot still counting keeps counting into its O2 code (its count stub replaced
-                // by this install, a hot slot counted again ran O2 for minutes: Sandbox's
+                // by this install, a hot slot counted again ran O2 for minutes: a large app's
                 // reconcile, lane SETTLE)
                 u.rearm_counter(id, a);
                 // code linked from the cache that counted on (baseline: stored_tier_verdict) until
@@ -12670,8 +12670,8 @@ pub unsafe fn settle_drop(up: *mut Unit) -> SettleDrops {
 /// The settle sweep: what an installed slot no longer needs (its RIR, its checked body) and the
 /// unit's rebuildable memos go, in steps of at most `SETTLE_STEP` slots, each step one owner request
 /// (the run monitor's: `step` returns false until the sweep is over). A main-thread request waits for
-/// one step, not for a sweep of every slot (a cold Fab: one request held the owner 10-50 ms every
-/// 2 s while the UI dragged), and nothing is freed on the owner: what the steps take goes to the
+/// one step, not for a sweep of every slot (a large app's cold start: one request held the owner 10-50 ms
+/// every 2 s while the UI dragged), and nothing is freed on the owner: what the steps take goes to the
 /// requester (`SettleDrops::release`).
 ///
 /// The steps run as Program requests, which no pump serves: no front is open on the owner's stack
@@ -12731,7 +12731,7 @@ impl SettleSweep {
                     // (queued, counted, built at O3) and code whose decayed cost is an eighth of the
                     // threshold or more -- it is what tiers up next: O3, retier, its callers' inline
                     // snapshots. Dropped, every O3 build of the running set rebuilt that RIR on the
-                    // owner (lane SETTLE: Sandbox's O3 tail, the owner 38% in settle_drop and its
+                    // owner (lane SETTLE: an app's O3 tail, the owner 38% in settle_drop and its
                     // rebuilds while the workers waited)
                     let end = self.n.min(self.at.saturating_add(budget));
                     let tier = u.tier1.as_ref().map(|t| (t.threshold, tier_clock()));
@@ -14580,7 +14580,7 @@ static DEFERRED_STATICS: relax_session::sync::Mutex<std::collections::BTreeSet<u
 /// A static's initializer in progress. The static's address is recorded before it runs (statics
 /// may name each other cyclically), so an initializer that unwinds -- a nested owner request
 /// cancelled with OwnerBusy and posted again, a preemption -- would leave the address with no
-/// value, and the retried request would read the zeroed storage as the static (Sandbox's race
+/// value, and the retried request would read the zeroed storage as the static (a game's
 /// kit read every slice of its `static RACE_DEF` as empty). Unwinding marks it like a deferred
 /// static instead: the next static_addr runs the initializer again into the same storage.
 struct PendingInit(u32);
@@ -16944,14 +16944,14 @@ fn sampler_thread() {
     let mut period_index = 0;
     // wakes in a row in which no sampled thread was on a CPU (macOS: an idle app); past
     // IDLE_WAKES the sampler sleeps IDLE_MS between looks instead of SAMPLE_MS (a 500 Hz
-    // suspend / resume of every JIT thread of an idle Stage cost ~8% of a core). A sample's
+    // suspend / resume of every JIT thread of an idle app cost ~8% of a core). A sample's
     // weight is capped by the thread's CPU time, so the longer sleep does not over-credit it.
     const IDLE_WAKES: u32 = 50;
     const IDLE_MS: u64 = 20;
     let mut idle_wakes = 0u32;
     // Settled: no lazy compile, no O3 queue push and no O3 install for SETTLED_AFTER. The
     // samples of a settled program find nothing to promote, yet at SAMPLE_MS they suspended
-    // every JIT thread 500 times a second (an animating Stage: the sampler thread alone used
+    // every JIT thread 500 times a second (an animating app: the sampler thread alone used
     // ~25 ms of CPU per second, after the O3 queue had drained). Settled, it looks every
     // SETTLED_MS (each sample weighs the elapsed time, capped at 16 SAMPLE_MS: full credit at
     // 32 ms), so a loop that turns hot is still promoted after one or two looks, and the
@@ -16993,7 +16993,7 @@ fn sampler_thread() {
             eprintln!("sampler: t={:.1} ms, {} threads, {} pcs", t, threads, pcs.len());
         }
         // the samples go to the owner in batches, one unit call per SAMPLE_BATCH (not one per
-        // 2 ms wake: an animating Stage at idle woke the owner 500 times a second for them)
+        // 2 ms wake: an animating app at idle woke the owner 500 times a second for them)
         if !TIER_STOP.load(Ordering::SeqCst) && last_batch.elapsed() < SAMPLE_BATCH && pcs.len() < SAMPLE_BATCH_PCS && selfs.len() < SAMPLE_BATCH_PCS {
             continue;
         }
@@ -17504,7 +17504,7 @@ fn rt_loop_hot(counter: u64, fp: u64) {
             // an earlier run parked the slot's code: its loops do not decide again. (Its O2 code
             // inlined callees, their loops counted as its own; its counted code, built without
             // inlining, measured only its own work: two toolpath stages fns were counted again and
-            // parked again on every warm Fab launch, holding the first warm one ~3 s from settling)
+            // parked again on each warm launch of a large app, holding the first warm one ~3 s from settling)
             if (*rec.add(5)).load(Ordering::Relaxed) & STORED_PARKED != 0 {
                 return;
             }
@@ -18978,7 +18978,7 @@ fn ran_in_twin_code(u: &Unit, c: u32) -> bool {
 /// `relocs`, slots that have no code yet but ran inside the code it replaces (inlined there, or in
 /// twin code), or in the session that made the startup image (`ran_before`: the image's baseline
 /// code inlined tiny drop glue and core fns, and its installs link no inlining records below O3 --
-/// the SETTLE-TIER sweep's ~1300 O2 builds over running baseline slots of a warm Fab plate made
+/// the SETTLE-TIER sweep's ~1300 O2 builds over running baseline slots of a large app's warm plate made
 /// ~200 lazy compiles of them on the program's threads, each restarting the JIT's quiet), or that
 /// an O3 build kept as calls because their bodies were not there yet (`absent`: inline candidates
 /// of a warm session, whose code came from the disk cache). SPEC-V
@@ -19301,8 +19301,8 @@ pub static TIER_REVALIDATED: AtomicU64 = AtomicU64::new(0);
 /// calls or loops REVALIDATE_NS ago or earlier goes back to counting (its count stub in the slot
 /// again, its cost from nothing; its loop counter runs on) instead of being built: the cost is the
 /// evidence. Hot code is queued again within a second or two and built then (REARMED: whatever its age); startup code
-/// that was busy once (a cold Stage queued 2k slots before its first present) and lukewarm UI code
-/// never builds. The level's policy (o3_revalidate).
+/// that was busy once (a large app's cold start queued 2k slots before its first present) and lukewarm UI
+/// code never builds. The level's policy (o3_revalidate).
 /// A queue entry of slot record `rec` (queued by its calls or loops at wall time `at`) went cold
 /// waiting: queued REVALIDATE_NS ago or more, not counted again once already, and its cost now
 /// under the threshold (its loops charge the record while it waits). tier_revalidate counts it
@@ -20268,7 +20268,7 @@ static PGO_DECIDES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// final_chunk_gap_of the one before) begun at `start`: (it counts again, the run's start now).
 /// Without PGO two close chunks are enough. Under PGO the run must last PGO_WORK_NS, the window a
 /// parked slot's work is measured over: a shorter burst is over before its counted build installs,
-/// and the window then parks it again. (Warm Fab launches after the bar fix: 133 of 208 counted
+/// and the window then parks it again. (A large app's warm launches after the bar fix: 133 of 208 counted
 /// builds were final slots counted again, most parked again.)
 fn final_loop_chunk(last: u64, start: u64, now: u64, chunk: u64, pgo: bool) -> (bool, u64) {
     if now.saturating_sub(last) >= final_chunk_gap_of(chunk, pgo) {
@@ -20282,7 +20282,7 @@ fn final_loop_chunk(last: u64, start: u64, now: u64, chunk: u64, pgo: bool) -> (
 /// O3 threshold's rate, and under PGO the counted window's bar as well (PGO_MIN_WORK insts/s of its
 /// own work, WORK_PER_UNIT per back edge, as profiled_heat charges it): a loop under it would only be
 /// parked again in its counted code, after a counted build. With the threshold's rate alone (~3x
-/// under the PGO bar) a warm Fab launch counted again ~170 slots an earlier run had parked (their
+/// under the PGO bar) a large app's warm launch counted again ~170 slots an earlier run had parked (their
 /// verdicts stored and linked final), 2-4 CPU-s of counted builds, each one parked again.
 fn final_chunk_gap_of(chunk: u64, pgo: bool) -> u64 {
     let at_threshold = (COST_HALF_LIFE_NS / std::f64::consts::LN_2 / LOOP_CHUNK_DIV as f64) as u64;
@@ -20322,7 +20322,7 @@ fn pgo_poll_at(now: u64) {
             let rate = (entries as u128 * 1_000_000_000 / el.max(1) as u128).min(u64::MAX as u128) as u64;
             // the O3 queue's order for the slot: the work its counted code did per second of the
             // window, not its entries (a layer kernel entered 50 times a second whose loops run
-            // millions of instructions waited behind thousands of small fns: Fab's slicer ran
+            // millions of instructions waited behind thousands of small fns: an app's slicer ran
             // counted code for 3-5 s of a cold slice)
             let work_rate = || {
                 let work: u64 = ctr.iter().zip(e.weights).map(|(c, w)| c.load(Ordering::Relaxed).saturating_mul(*w as u64)).fold(0, u64::saturating_add);
@@ -21043,7 +21043,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // run on this thread), else a cached function would stay at O1 for good. Not while a
     // program thread has a lazy compile in flight (or had one in the last TIER1_POLL): the UI
     // goes first. Speculative and other background compiles do not hold it back: they refreshed
-    // an all-compiler quiet window for seconds after Stage's present, every O3 worker slept here
+    // an all-compiler quiet window for seconds after an app's present, every O3 worker slept here
     // with ~1.5k hot builds queued (lane SETTLE trace), hot code waiting behind guesses.
     let needs_rir = |up: *mut Unit| {
         let f = &(&*up).fns[id as usize];
@@ -21065,7 +21065,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // yet hands it back (`fronts`) instead of building it; this thread checks and lowers those
     // off the unit (typeck_ahead, lower_ahead) and asks again, one traversal level per round.
     // The owner's build then only takes the lowered RIR (O1 optimisation and the candidate's own
-    // small inline candidates stay there). Warm Stage: single snapshots of 100-680 ms on the owner.
+    // small inline candidates stay there). A large app's warm start: single snapshots of 100-680 ms
+    // on the owner.
     let prefront = !owner::is_owner() && pipelined();
     let mut fronted: std::collections::HashSet<u32> = Default::default();
     // (slot, def, args, the base of an unverified-mode twin: its body is the base's, lowered as unverified code)
@@ -21491,8 +21492,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // the fronts this round's builds asked for: the next round makes them (each slot up to
     // FRONT_TRIES times), so a candidate that gave back is tried again after them. One level of its
     // inline candidates per round, as deep as they go: a bound on the tries left the deeper ones
-    // out, the build installed incomplete and was built again when their bodies came (Sandbox
-    // warm: 277 incomplete O3 builds, the big ones built 3-5 times)
+    // out, the build installed incomplete and was built again when their bodies came (an app's
+    // warm run: 277 incomplete O3 builds, the big ones built 3-5 times)
     let progress = needs.iter().any(|s| refronted.get(s).is_none_or(|n| *n < FRONT_TRIES));
     for (c, wanted) in gave {
         let mut l = left_out.borrow_mut();
@@ -22190,7 +22191,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // The slot got other code while this build ran -- nearly always its O2 build from
                 // the relax-O2 worker, queued together with this one (tier1_thread: o2_hot) and
                 // finished first. The slot is T_QUEUED (it no longer counts calls), so a dropped
-                // build left hot code at O2 for the rest of the run (sandbox leap: 917 of 3,388 O3
+                // build left hot code at O2 for the rest of the run (a game: 917 of 3,388 O3
                 // builds dropped this way, 17% of the main thread's JIT samples in O2 code at
                 // steady state). Build it again from the new version (retier: RETIERS times at most
                 // per slot, so a slot a patch keeps changing is not chased).
@@ -22451,11 +22452,11 @@ pub extern "C" fn relax_first_present() {
 
 /// Deferred cache records encoded per publish (rule I-PUB: bounded by an item count). A publish is
 /// not interrupted, so a program thread's next request waits for the batch that is running
-/// (~10 us per record on Stage); the owner serves the program's requests between two batches.
+/// (~10 us per record on an app); the owner serves the program's requests between two batches.
 const RECORD_BATCH: usize = 8;
 
 /// Releases speculation, O1 inline candidates and O3 at the first present, never on wall
-/// time (Stage needs 40-58 s from main to present; a clock released speculation in the middle
+/// time (a large app needs 40-58 s from main to present; a clock released speculation in the middle
 /// of startup, and main then waited seconds on the unit lock behind speculative builds). A
 /// program that never presents (`presents` false: a test harness, a program without
 /// makepad-platform) tiers up from its main on as an app past its first present (past_startup,
@@ -22609,7 +22610,7 @@ pub fn bump_patch_epoch() {
 //   previous run's fns compiled on a worker (run.rs start_ahead);
 // - the O3 queue: an entry queued long ago for code that has gone cold is counted again
 //   (the common queue), so a backlog of once-busy startup code never builds unless it runs hot again.
-// Cold Stage on the old default (aot without these bounds): 27k teardown builds (85% never
+// A large app's cold start on the old default (aot without these bounds): 27k teardown builds (85% never
 // called, 4.6 s), Gandalf 4.4k app bodies (8.4 s; 13.8 s warm, 5.3k bodies), a 2k-entry O3 backlog
 // at the first present, 1.8k O3 builds dropped behind their own O2 build: 2-4 cores busy for 25 s+.
 
@@ -22872,7 +22873,7 @@ unsafe fn spec_enqueue_calls(up: *mut Unit, id: u32, func: &relax_backend::rir::
     if startup_phase() || !ahead_policy().spec_calls { return; }
     // nor in a burst of the UI thread's lazy compiles after the present: the ahead helpers check
     // and lower the callees its builds make (cheaper than whole speculative builds, of which
-    // a burst called few: 119 of 14.9k compiles in a cold Stage's first 10 s after present);
+    // a burst called few: 119 of 14.9k compiles in a large app's first 10 s after present on a cold start);
     // aot speculates them after the burst (aot_drain)
     if ui_burst() {
         if ahead_policy().aot {
@@ -23872,7 +23873,7 @@ unsafe fn o3_candidates_finish(up: *mut Unit, epoch: u64, done: Vec<Deferred>) {
 
 /// Speculative results waiting for their first call: (slot, wall ns when built). A result
 /// nobody called within RELAX_SPEC_TTL_MS (default 2000; 0 = keep forever) is dropped with its
-/// RIR (expire_spec): Stage builds ~10k slots ahead that are never called, and their code + RIR
+/// RIR (expire_spec): a large app builds ~10k slots ahead that are never called, and their code + RIR
 /// stayed resident for the whole run.
 static SPEC_BUILT: relax_session::sync::Mutex<Vec<(u32, u64)>> = relax_session::sync::Mutex::new(Vec::new());
 /// (results dropped, bytes of code + RIR freed)
@@ -23880,8 +23881,8 @@ pub static SPEC_EXPIRED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)]
 
 /// A speculative result of slot `id` is ready: it expires if not called within the TTL -- unless
 /// the slot was seeded (`spec_seed`: the previous run's post-present manifest, a live edit's
-/// pending slots): that code ran before and is kept until its call, however late (JITLOOP-B: a
-/// warm Sandbox's Play 30 s after the launch re-linked ~16k expired manifest slots on the UI
+/// pending slots): that code ran before and is kept until its call, however late (JITLOOP-B:
+/// an app's warm Play 30 s after the launch re-linked ~16k expired manifest slots on the UI
 /// thread, 0.5-0.9 s blocks).
 fn note_spec_built(options: &crate::options::Options, u: &Unit, id: u32) {
     if u.fns[id as usize].baseline_hint.load(Ordering::Relaxed) {
@@ -25153,7 +25154,7 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
                 let u = &mut *up;
                 // a seeded slot (spec_seed: the previous run's manifest -- code that ran there)
                 // is installed now, as its first call would: that call then finds it ready instead
-                // of installing it on the UI thread (JITLOOP-B: a warm Sandbox's Play installed
+                // of installing it on the UI thread (JITLOOP-B: an app's warm Play installed
                 // ~24k staged links there, 1.2 s of UI blocks)
                 if u.fns[id as usize].baseline_hint.load(Ordering::Relaxed) {
                     u.exec_note(id, crate::exec_profile::SPEC);
@@ -26710,7 +26711,7 @@ fn lower_ahead(f: &FrontShared, id: u32, own: bool) -> u8 {
         // the callees a baseline build inlines (Relax core's tiniest bodies, base_inline_wanted): their
         // slots are made now, so the helpers check and lower them ahead (slot_ahead) like any slot.
         // Made later, by the take of this body's build, they were lowered on the owner inside that
-        // build's front (20k bodies, 1 s of a cold Fab's owner fronts before the present)
+        // build's front (20k bodies, 1 s of a large app's owner fronts on a cold start before the present)
         // (makepad run's lazy compiles only: startup, and a program thread's own builds after it; not
         // a check's walk, whose order follows slot creation, nor a tier-up worker's speculative front)
         let small: Vec<FnKey> = match &r {
@@ -26797,11 +26798,11 @@ fn prefront_fail(why: u8) -> bool {
 /// its build takes the lowering only where it would lower that same source body (a selection above
 /// take_lowered_ahead -- a shim, a bridge, a provided type's fmt/hash -- leaves it untaken, never
 /// used). (Left to the owner, the provided methods
-/// of a cold Fab -- `Iterator::collect`, `PartialEq::ne`, the script hooks' defaults -- were lowered
-/// in its fronts: 2.2k bodies before the first present.) A provided crate's fn lowers ahead only
+/// of a large app on a cold start -- `Iterator::collect`, `PartialEq::ne`, the script hooks' defaults --
+/// were lowered in its fronts: 2.2k bodies before the first present.) A provided crate's fn lowers ahead only
 /// when the owner's build lowers its source body too (provided_source_body); its bridge and
 /// opaque-type forwards are the owner's. (A lowering ahead that fails a provided-crate check is
-/// deferred, never an error: the Stage incident, ScriptHeap::resolve_fields failing
+/// deferred, never an error: an app incident, ScriptHeap::resolve_fields failing
 /// check_provided_field ahead, predates that.)
 fn lowers_ahead(u: &Unit, d: DefId, body: &Body) -> bool {
     let def = u.prog.def(d);
@@ -27106,7 +27107,7 @@ enum AheadWork {
 /// looked at and never built is a check wasted (the first-present line counts them).
 const LOOK_LEVELS: u8 = 2;
 const LOOK_FANOUT: usize = 24;
-/// (a cold Fab's look-ahead ends by itself at ~82k bodies; budgets of 20k, 40k and 80k bought
+/// (a large app's cold look-ahead ends by itself at ~82k bodies; budgets of 20k, 40k and 80k bought
 /// 0.55, 0.97 and 1.5 s of its first frame)
 const LOOK_BUDGET: u64 = 80_000;
 pub(crate) static LOOK_QUEUED: AtomicU64 = AtomicU64::new(0);
@@ -29022,7 +29023,7 @@ fn exec_check_now(when: &str) {
 /// (Unit::nc_window) and gives it back when it is dropped.
 #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
 static NC_WINDOWS: relax_session::sync::Mutex<Vec<(u32, u32, usize)>> = relax_session::sync::Mutex::new(Vec::new());
-/// An auxiliary unit's window (the proc-macro world's slots; Fab's whole program had 46,000)
+/// An auxiliary unit's window (the proc-macro world's slots; a large app's whole program had 46,000)
 #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
 const NC_AUX_SLOTS: u32 = 1 << 16;
 
@@ -29377,7 +29378,7 @@ unsafe fn realtime_mark(up: *mut Unit, root: u64, data: u64, meta: u64, ticket: 
     if meta != 0 {
         crate::syms::data_thunks(u, meta, &mut roots);
     }
-    // what the roots' callers pass them (a Fab arms run's `run_until(&mut self, link: &mut dyn
+    // what the roots' callers pass them (an app's arms run's `run_until(&mut self, link: &mut dyn
     // CellLink, ..)`: the planner's `Box<dyn Route>`, the link)
     let params = realtime_root_params(u, &roots, &values);
     values.extend(params);

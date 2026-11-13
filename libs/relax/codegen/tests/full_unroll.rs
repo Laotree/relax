@@ -1,5 +1,5 @@
 //! unroll_const_loops on the loop shape of a `for` over a small array with calls in its body
-//! (sandbox reconcile's `for (shape, applied, wanted, solid) in [(..), (..)]`): the counter steps in
+//! (an app's reconcile `for (shape, applied, wanted, solid) in [(..), (..)]`): the counter steps in
 //! the block after the header test, a second test there leaves for the header's exit block (the
 //! loaded Option's tag), the body has a `continue` (two latches) and an invoked call with an unwind
 //! edge. The loop must be fully unrolled, and the RIR before and after must agree on an evaluator

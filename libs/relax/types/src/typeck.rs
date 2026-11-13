@@ -6571,7 +6571,7 @@ impl<'a> Fcx<'a> {
                 // builtin path only when neither operand is a type variable, and check_overloaded_binop
                 // records the method for `?T: PartialEq<?R>` while it is ambiguous. Typing it as a
                 // built-in comparison unified both sides and made the capture analysis of
-                // `|p| *p == path` (p: &?T) consume `path` (a false E0382 in Scope's code_graph).
+                // `|p| *p == path` (p: &?T) consume `path` (a false E0382 in an app's code_graph).
                 if !prim_ref && matches!(self.tcx.tys.kind(sa), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..) | TyKind::Param(_) | TyKind::Infer(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. })) {
                     if let Some(r) = self.check_cmp_trait(e, op, sa, b, lo, None) {
                         return r;

@@ -5,7 +5,7 @@
 //! served from the mount (the longest mount root wins: a repository mounted inside another);
 //! every other path is the disk. Paths stay plain strings everywhere else.
 //!
-//! EDITS (RELAX_EDITS=<folder>): the files a program writes into its own virtual folders (Stage's
+//! EDITS (RELAX_EDITS=<folder>): the files a program writes into its own virtual folders (an app's
 //! EDIT mode changing an app's sources) live in that disk folder, at the same path relative to
 //! the outermost mount, on top of the store: a file there is read instead of the store's. Only
 //! edited files exist there. `.makepad-run-edits` in it records, per edited file, the store blob it
@@ -1568,7 +1568,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&edits);
     }
 
-    /// Sandbox game_store (asset client cache.rs open: create_dir_all(tmp), then read_dir(tmp)): a
+    /// A game's store (asset client cache.rs open: create_dir_all(tmp), then read_dir(tmp)): a
     /// folder the run made in a virtual folder lists, empty, as the disk's new folder does; it
     /// was NotFound while it had no entries.
     #[test]

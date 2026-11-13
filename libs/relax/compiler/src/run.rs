@@ -2024,7 +2024,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         let code = if code == 0 && !foreign.is_empty() { 1 } else { code };
         // the parsed files go to the cache's front images as a run's do (one store shared with
         // `makepad run`): the next check (or run) of the package maps them instead of parsing
-        // every file again (Stage: 6 s of a warm check was parsing)
+        // every file again (a large app: 6 s of a warm check was parsing)
         let t = Instant::now();
         if !selftest { record_check_front(&mut u, options, boot_cache); }
         phase("record check front", t);
@@ -2175,7 +2175,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 // the startup links cached code (warm, or an edited start of a program that ran
                 // before: its manifest's entries are all in the cache): no speculative body checks
                 // ahead of the lazy compiles -- an edited start's slots link stored code but for the
-                // few the edit reaches, and a build checks its own body (an edited Sandbox start
+                // few the edit reaches, and a build checks its own body (an edited app's start
                 // checked 80k bodies ahead, 13 s cpu, for 31 its 8 builds took); until its lookups
                 // show it links little (cache.rs cold_linked_start)
                 u.front.linked_start.store(c.startup_manifest_valid() && c.stats.packs_rejected == 0, Ordering::Relaxed);
@@ -2348,7 +2348,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     start_monitor(runtime, options);
     // RELAX_MEM_AT_MS=n[,m..]: the memory report (RELAX_MEM_REPORT=1) n ms after main starts,
-    // without ending the run's summary (programs that never reach their exit summary: Stage)
+    // without ending the run's summary (programs that never reach their exit summary: an app)
     if let Ok(v) = std::env::var("RELAX_MEM_AT_MS") {
         let mem_at_trim = runtime.mem_at_trim;
         let at: Vec<u64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
@@ -3272,7 +3272,7 @@ fn flush_errors(block: bool) {
 
 /// Writes the disk cache's recorded entries once RELAX_CACHE_SPILL_MB (default 16; 0 = only at
 /// exit) of them are pending: taken on the owner thread (only if free now), written
-/// off the unit. A cold Stage run held ~200 MB of recorded code until the exit flush.
+/// off the unit. A large app's cold run held ~200 MB of recorded code until the exit flush.
 fn spill_cache() {
     static LIM: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let lim = *LIM.get_or_init(|| std::env::var("RELAX_CACHE_SPILL_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(16) << 20);
@@ -3391,7 +3391,7 @@ fn monitor_activity() -> [u64; 7] {
     ]
 }
 
-/// A run that goes on reaching new code a few fns at a time (a game played: the Sandbox race
+/// A run that goes on reaching new code a few fns at a time (a game being played
 /// compiled 1-2 fns a second for minutes) is settled too: at most TRICKLE_MAX first compiles in
 /// the last TRICKLE_NS. With "no compile for 1 s" alone such a run never settled, so its
 /// compiler generation was never swapped (race, 13 min: RSS 9.5 GB vs 4 GB once swapped).
@@ -3467,8 +3467,8 @@ fn try_settle(drops: &mut jit::SettleDrops, trim: bool) -> bool {
     jit::drain_records_bounded();
     // The type side is retired under a front write. In a big app the readers (type checks ahead,
     // Gandalf, the background type check, coherence) overlap without a gap, so a write that only
-    // tried never won (Fab cold: 201 settles in 90 s, every retire refused and every one trimmed,
-    // 37 s of trims): a writer waits from here on, so the readers stop at their next preemption
+    // tried never won (a large app's cold start: 201 settles in 90 s, every retire refused and every one
+    // trimmed, 37 s of trims): a writer waits from here on, so the readers stop at their next preemption
     // point, and the wait for the front to come free runs here, off the owner, which goes on
     // serving meanwhile (the main thread's requests, the questions the readers wait on).
     let _waiting = crate::preempt::WriterWaiting::new();
@@ -3526,7 +3526,7 @@ fn try_settle(drops: &mut jit::SettleDrops, trim: bool) -> bool {
 
 /// The warm record's pass (start_monitor) goes once the UI thread waited on the JIT for at most
 /// RECORD_UI_WAIT_NS in the last RECORD_UI_WINDOW_NS, and does not wait now: a page's first visit
-/// waits for seconds in a row; after it a frame reaches a new fn now and then (Fab: one or two
+/// waits for seconds in a row; after it a frame reaches a new fn now and then (a large app: one or two
 /// sub-ms waits a second, for seconds after its burst).
 const RECORD_UI_WINDOW_NS: u64 = 500_000_000;
 const RECORD_UI_WAIT_NS: u64 = 5_000_000;
@@ -3667,7 +3667,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             // The warm record's pass does not wait for 2 s without a UI wait (jit::ui_burst), only
             // for the burst's end (ui_light): its owner requests stop at their checks for a
             // waiting request, and a frame now and then reaching a new fn held it for
-            // seconds (Fab: 10 s after the present)
+            // seconds (a large app: 10 s after the present)
             if start != 0 && (record || main_ms >= 3000 && due) && (if record { ui_light } else { !jit::ui_burst() }) && !mid_busy.swap(true, Ordering::SeqCst) {
                 mid_flushed = n;
                 mid_last = main_ms;
@@ -3715,7 +3715,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 let requested = SETTLE_REQUESTED.swap(false, Ordering::AcqRel);
                 reclaim_requested |= requested;
                 // the program's own first compiles: the ahead workers' speculation goes on for
-                // minutes after the present (Scope: never 10 in 5 s) and is no reason to wait
+                // minutes after the present (an app: never 10 in 5 s) and is no reason to wait
                 let compiled = jit::demand_compiled();
                 let n = jit::reclaim_generation();
                 // Installations release their own finished bodies. Shared inline/template
@@ -3850,13 +3850,13 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             // compile (thread-kept buffers, results moved out), and a detached chunk's free slots
             // are never handed out again; every 5 s in which something was compiled, the free
             // granules around them go back (a walk of the chunk headers under each chunk's lock,
-            // a few ms; Scope cold: 450 MB that waited for a quiet trim the O3 tail never gave)
+            // a few ms; a large app's cold start: 450 MB that waited for a quiet trim the O3 tail never gave)
             // the program heaps' pass (arena.rs `densify`), once a second on every platform: it
             // starts the heaps' next trim epoch, so each thread settles its current chunks again
             // (their remote lists drained, a sparse one's free pages back) and the monitor settles
             // those of waiting threads; with transparent huge pages (Linux) dense chunks get huge
             // pages and sparse ones lose them, at most 64 collapses per heap. (It ran on Linux
-            // only: elsewhere the epoch never moved, and a Fab on macOS kept 169 MB of whole free
+            // only: elsewhere the epoch never moved, and a large app on macOS kept 169 MB of whole free
             // pages and 68 MB of other threads' frees in its threads' current chunks at rest;
             // with the pass 108 and 0 MB, footprint 2499 -> 2220 MB.)
             if densify_at.elapsed() >= std::time::Duration::from_secs(1) {
@@ -3965,7 +3965,7 @@ static EXIT_SUMMARY: std::sync::OnceLock<ExitSummary> = std::sync::OnceLock::new
 static RUN_PANIC: std::sync::OnceLock<jit::PanicInfo> = std::sync::OnceLock::new();
 /// The exit worker's cache write: not begun (0), under way (1), done (2). finish_run waits for
 /// it to begin and to end: a worker not yet scheduled when a fixed wait ran out lost the whole
-/// write (the quit's last code: Sandbox's ~4,000 teardown fns, built again by every session).
+/// write (the quit's last code: an app's ~4,000 teardown fns, built again by every session).
 static EXIT_STAGE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 /// How long the exit waits for background compiles to finish (they are abandoned
 /// at their next safe point). Not getting it means no cache write at all.

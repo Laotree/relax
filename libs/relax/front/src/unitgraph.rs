@@ -1439,7 +1439,7 @@ fn newest_mtime(p: &std::path::Path) -> u128 {
 }
 
 /// At most this many build scripts run at once (each is a whole Relax process, most of its time a
-/// cold boot of std on a few threads): half the cores, 2..=8. Four slots queued two of Stage's six
+/// cold boot of std on a few threads): half the cores, 2..=8. Four slots queued two of a large app's six
 /// scripts behind the others.
 fn script_slots() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();

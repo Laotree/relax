@@ -739,7 +739,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
         ..wasm::Options::default()
     };
     let mut single = true;
-    // off by default: under brotli the merged module is LARGER (P(DOOM), block-shaken: raw -360 KB,
+    // off by default: under brotli the merged module is LARGER (a game, block-shaken: raw -360 KB,
     // 23,345 -> 18,620 functions, br11 +5.0 KB): the compressor already shares near-identical
     // bodies, the callers' extra constants cost more. Kept as an option for raw size / compile time.
     let mut merge = false;
@@ -1515,7 +1515,7 @@ pub(crate) fn o3_cold_tiny() -> bool {
 }
 
 /// RELAX_WASM_EXPORT_INLINE (default on; `0` off): the shipping module's own inlining
-/// (module_inline) and static reachability from the entry, exports and taken addresses. P(DOOM)
+/// (module_inline) and static reachability from the entry, exports and taken addresses. A game
 /// (WASMCG runs A/B, both gated): 10.29 MB br11 with it, 10.79 without, CPU equal.
 fn module_inline_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

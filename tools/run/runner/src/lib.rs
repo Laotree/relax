@@ -9,7 +9,7 @@
 
 // macros.rs names Relax's lexer by this path
 // Diagnostics never panic: std's print macros panic when a write fails (ENOSPC on the session
-// log in a full tmpfs /tmp aborted a fleet Sandbox inside a lazy compile, 2026-10-23), so in this
+// log in a full tmpfs /tmp aborted a fleet run inside a lazy compile, 2026-10-23), so in this
 // crate every print is a write whose error is dropped. Test builds keep std's captured macros.
 #[cfg(not(test))]
 #[allow(unused_macros)]
@@ -209,11 +209,11 @@ pub fn run_with_args(args: Vec<Vec<u8>>) {
 
 /// NVIDIA's shader disk cache (GL and Vulkan) for every program this loader runs. The driver keys
 /// its files by the executable's path, and every JIT build is a new executable: each binary's first
-/// runs compiled every pipeline cold (Stage held its first frame 9 s for 109 pipelines), so they
+/// runs compiled every pipeline cold (a large app held its first frame 9 s for 109 pipelines), so they
 /// all take one name. And a folder of their own, `$XDG_CACHE_HOME/makepad/nvidia`: the driver's
 /// shared folder takes no entry once it holds its 1 GB, and every other program's per-path keys
-/// fill it (a pool box at 1025 MB: every cold Fab compiled its pipelines again, the first frame
-/// held 20.5 s for 177 pipelines; in a folder of its own 0.3 s). The driver trims neither: past
+/// fill it (a pool box at 1025 MB: each cold start of a large app compiled its pipelines again, the first
+/// frame held 20.5 s for 177 pipelines; in a folder of its own 0.3 s). The driver trims neither: past
 /// 3/4 of its cap this one is emptied, and the next runs fill it again. It is renamed away before
 /// it is removed, so a start beside this one finds the full folder or a new empty one, never one
 /// half removed, and a running program's open files go with the old one (its writes are lost, not

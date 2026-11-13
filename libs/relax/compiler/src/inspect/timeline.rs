@@ -13,7 +13,7 @@
 //! that drew nothing is an event-only beat, `beats_of`): busy and waiting time per thread, the
 //! critical path (from the frame's end back through each wait to the thread that ended it), total
 //! work vs critical path vs wall, and the waits on the path ranked. `timeline save` writes the capture as a `.mkpf`
-//! profile recording (makepad-prof-stream), the format Scope and `pf` queries read.
+//! profile recording (makepad-prof-stream), the format an app and `pf` queries read.
 //!
 //! The hitch watcher runs a frame from the first phase after the previous frame to the UI
 //! thread's next event-loop wait (idle or GPU) after a Draw. Idle waits for input that drew
@@ -1159,7 +1159,7 @@ fn ui_thread(ths: &[Thread]) -> Option<usize> {
 /// Frames: the windows on the UI thread that drew. A frame ends when its `Draw` dispatches end
 /// (Draw dispatches less than 1 ms apart, one per window or pass, close one frame) and starts at
 /// the first of the UI thread's root spans leading up to it without an idle gap over
-/// `FRAME_GAP_NS`, never before the previous frame's end: the rule `pf` and Scope frame a saved
+/// `FRAME_GAP_NS`, never before the previous frame's end: the rule `pf` and an app frame a saved
 /// capture by. A wake that draws nothing (a timer, a task, a signal) is no frame's (`beats_of`).
 /// Frames still open at the stop are left out.
 fn frames_of(ui: &Thread) -> Vec<(u64, u64)> {
@@ -1629,7 +1629,7 @@ fn frame_cmd(req: &Req, out: &mut Out) {
 }
 
 /// `timeline save`: the capture as a `.mkpf` profile recording (makepad-prof-stream; the format
-/// a live `prof` viewer receives): Scope opens it, `makepad inspect file=<x.mkpf> pf <query>`
+/// a live `prof` viewer receives): an app opens it, `makepad inspect file=<x.mkpf> pf <query>`
 /// answers on it.
 fn save_cmd(out: &mut Out) {
     use makepad_prof_stream as ps;
@@ -1801,7 +1801,7 @@ mod tests {
     /// The UI thread of an idle app with a timer, as makepad's event loop records it: each wake
     /// of the timer is a turn (idle wait, the Timer event, platform ops twice, the tasks, the
     /// submit, idle again) and draws nothing. Such turns are no frames: the capture of an idle
-    /// Stage page counted each of their root spans as one (80 "frames" in 8 s and 0 draws).
+    /// app page counted each of their root spans as one (80 "frames" in 8 s and 0 draws).
     fn timer_turn(v: &mut Vec<super::Rec>, t: u64) {
         use super::Kind::*;
         v.push(rec(t, IdleEnd, "idle", 0, ""));

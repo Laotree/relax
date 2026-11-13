@@ -625,7 +625,7 @@ impl<'a> Lcx<'a> {
     /// `std::thread::LazyKey` static). Each side has its own per-thread storage by construction
     /// (rustc's lives in its TLS, laid out by its std; Relax's in the JIT's), so JIT code compiled
     /// from a provided crate's source keeps its own: a thread-local is never shared across the
-    /// boundary, whatever its type (native_vec::LANES on Fab's model thread, 10-30).
+    /// boundary, whatever its type (native_vec::LANES on an app's model thread, 10-30).
     fn thread_local_storage(&self, d: DefId, t: TyId) -> bool {
         let prog = &self.u.prog;
         let def = prog.def(d);
@@ -655,7 +655,7 @@ impl<'a> Lcx<'a> {
     /// A provided crate's own fn compiled here (it has no shim) that calls std's raw ownership
     /// operations (Arc/Rc reference counts through raw pointers, Box/Arc/Rc::from_raw) works
     /// objects rustc allocated with Relax's std, whose layouts differ (KernelRef::clone was
-    /// Arc::increment_strong_count on rustc's ArcInner: Stage aborted), when the object's type
+    /// Arc::increment_strong_count on rustc's ArcInner: an app aborted), when the object's type
     /// crosses the boundary. Such a fn must be marked `#[relax_api]` (an op), so it runs on the
     /// compiled side.
     fn check_provided_ownership(&mut self, callee: u32) {

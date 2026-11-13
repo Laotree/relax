@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """JITPATCH: a live patch of main.rs while handlers of the replaced version are kept in a registry
-(as Fab's script_mod! design keeps its closures). The handlers run only after the patch: they are
+(as an app's script_mod! design keeps its closures). The handlers run only after the patch: they are
 the old version's closures and build closures of OTHER old-version fns (`adder`, `scaled`) whose
-bodies were never lowered in this process (warm: their code came from the disk cache). Fab's
+bodies were never lowered in this process (warm: their code came from the disk cache). An app's
 `makepad run` panicked there: "the environment of a closure of a replaced version of main.rs
 (expression N) is unknown: no body of that version was lowered in this process".
 

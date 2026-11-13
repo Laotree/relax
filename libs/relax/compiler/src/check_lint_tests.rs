@@ -529,7 +529,7 @@ fn an_allow_in_a_macros_expansion_covers_the_tokens_passed_in() {
     assert_eq!(warnings, ["unnecessary `unsafe` block -- because it's nested under this `unsafe` block [unused_unsafe]"]);
 }
 
-/// WARNZERO class 1 (fab slice live_trace.rs:253 and :277, hal vulkan/device.rs:165): a tuple
+/// WARNZERO class 1 (an app's slice live_trace.rs:253 and :277, hal vulkan/device.rs:165): a tuple
 /// field read through an overloaded deref (`self: Pin<&mut Self>`, `self: Arc<Self>`, `&Arc<S>`)
 /// is a read of that struct's field; a tuple field nothing reads still is dead.
 ///
@@ -602,7 +602,7 @@ fn io_slices_are_ffi_safe() {
 }
 
 /// WARNZERO class 2: an import of a macro is used by a module that glob-imports its module
-/// (sandbox blocks' `live_id` through `use super::*`), by a macro call by path
+/// (an app's blocks' `live_id` through `use super::*`), by a macro call by path
 /// (`crate::kit::global_instance!()`), and by a `use` that goes through it (asset data's
 /// `use crate::codec::{canon_enum, ..}` of `pub(crate) use canon_enum;`); one nothing reaches is
 /// still unused.

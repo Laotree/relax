@@ -940,7 +940,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     // (x64/arm64 base_disp fold the chain down to the first base with a location), so every base
     // of the chain must be live at the use: `v = w + 16, w = self + 0x2938` read v in a loop where
     // the split parked `self` in a copy (a hole) while w stayed live past the loop: the load used
-    // `self`'s register, which the loop counter had taken (Sandbox race x64 fault at 0x2948).
+    // `self`'s register, which the loop counter had taken (a game x64 fault at 0x2948).
     if remat.iter().any(|r| matches!(r, Remat::Offset(..))) {
         let mut ok = vec![true; nv as usize];
         let live_at = |b: u32, p: u32| ranges.of(b).iter().any(|&(a, z)| a <= p && p <= z);
@@ -1453,7 +1453,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     }
     // spill slots shared by live range: values that are never live at once take one slot.
     // Every spilled value had a slot of its own, so baseline frames carried one 8-byte cell per
-    // spill (Scope's recursive type parser: ~800 bytes of parse_type's frame)
+    // spill (a large app's recursive type parser: ~800 bytes of parse_type's frame)
     if slot_share_on(options) {
         spill_bytes = pack_spill_slots(f, &reach, &block_start, &mut loc, &ranges, &start);
     }
@@ -1671,7 +1671,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
                 // free over the defining instruction's operands and the one before it too (deferred
                 // fused compares read at the next instruction); saturating: the entry block's second
                 // instruction has a = 4 (a - 5 wrapped to u32::MAX and indexed far past the bit set:
-                // Stage's kernels, compute's x64 fuzzers)
+                // an app's kernels, compute's x64 fuzzers)
                 let a0 = if di > 0 { a.saturating_sub(5) } else { a - 1 };
                 for &c in &regs {
                     let o = &mut occ[c as usize];
@@ -4352,7 +4352,7 @@ fn split_cold_calls(f: &Func, freq: &[f32], cand: &[bool]) -> Option<Func> {
             changed = true;
         }
         // a copy pair per value per cold call: a big loop with many cold calls made
-        // thousands (Stage's video_edit store worker: 10.6k vregs -> 69k after both splits,
+        // thousands (an app's video editing store worker: 10.6k vregs -> 69k after both splits,
         // 7.4 s of allocation, 1.8 MB of code): past half again the function's values the
         // split costs more than its spills, and the first allocation stands
         if g.vregs.len() - nv0 > SPLIT_GROWTH_MAX(nv0) / 2 {

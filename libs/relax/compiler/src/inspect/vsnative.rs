@@ -558,8 +558,8 @@ mod stacks {
     /// [n=30] [tree=0] [save=1]`: the native build's stacks recorded by its own sampler (`prof raw=<file>`
     /// of a rustc-built app: macOS has no cross-process sampling without privileges), named here by its
     /// DWARF inline tree (`native=`, else the file's executable; macOS: its dSYM), against this
-    /// process's samples taken now for the same length. For deterministic work (Sandbox's SANDBOX_DET
-    /// frames) the two windows need not be simultaneous.
+    /// process's samples taken now for the same length. For deterministic work (an app's
+    /// deterministic frames) the two windows need not be simultaneous.
     pub fn run_file(req: &Req, out: &mut Out, path: &str) {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,

@@ -558,7 +558,7 @@ fn retain_load_memos<K: Clone + std::hash::Hash + Eq, V: Clone>(
 }
 
 /// Buckets (log2) of the per-(module, name) memos, `scope_cache` and `glob_cache`: a body check
-/// of a big workspace fills each with ~1M entries (sandbox: 0.88M and 0.98M), and a chain longer
+/// of a big workspace fills each with ~1M entries (a large app: 0.88M and 0.98M), and a chain longer
 /// than a node or two is a cache miss per node on every lookup. 8 MB of buckets each, in zeroed
 /// pages that stay untouched until a bucket is used.
 const NAME_MEMO_BITS: u32 = 20;
@@ -1247,7 +1247,7 @@ impl Program {
     /// root's harness crate and the plain library its dev-dependencies link are two crates of one
     /// path (M50). The last is the one `current_source_files` names. `keep` picks the paths before
     /// any is copied: a live session asking whether its few saved paths are sources had every
-    /// module's path (std's too) cloned into the map, 25-40 ms of the owner per edit (Fab, 11-04).
+    /// module's path (std's too) cloned into the map, 25-40 ms of the owner per edit (an app, 11-04).
     pub fn current_source_file_sets(&self, keep: impl Fn(&str) -> bool) -> std::collections::BTreeMap<String, Vec<u32>> {
         let mut files: std::collections::BTreeMap<String, Vec<u32>> = std::collections::BTreeMap::new();
         let mut bound = Vec::with_capacity(self.mods.len());
@@ -6491,7 +6491,7 @@ pub static PARSE_AGAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 
 /// A path's segments as (kind, symbol), `u32::MAX` for a name no file interned: held inline up
 /// to four segments. Built afresh on each call: two string-table probes per segment cost less
-/// than any memo of them (a per-occurrence one held 4M entries for sandbox and cost 8% of the
+/// than any memo of them (a per-occurrence one held 4M entries for a large app and cost 8% of the
 /// body checks walking its chains).
 pub struct PathSegs {
     len: usize,

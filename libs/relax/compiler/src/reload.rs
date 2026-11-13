@@ -878,7 +878,7 @@ fn toks<'a>(pf: &'a crate::parser::ParsedFile, lo: u32, hi: u32, holes: &[(u32, 
         }
         covered = true;
         // every split of break_and_eat keeps only the remaining token: read its consumed
-        // char too, so tokens compare like text (fab-model's `&&r.file` lost its first `&`).
+        // char too, so tokens compare like text (an app crate's `&&r.file` lost its first `&`).
         let split = t.lo > prev_hi && t.lo > 0 && matches!((pf.src.get(t.lo as usize - 1), pf.src.get(t.lo as usize)),
             (Some(b'<'), Some(b'<' | b'=' | b'-')) | (Some(b'>'), Some(b'>' | b'='))
             | (Some(b'&'), Some(b'&' | b'=')) | (Some(b'|'), Some(b'|' | b'=')) | (Some(b'+'), Some(b'=')));
@@ -1724,7 +1724,7 @@ fn file_includes(pf: &crate::parser::ParsedFile, path: &str) -> Vec<String> {
 
 /// The files fn, const or static item `it` includes with include!/include_str!/include_bytes! (`pf` is
 /// file `path`'s text). Its whole text: what `classify` compares as the item, and the expansions
-/// of the macro calls in it (a macro's `include_str!(concat!($key, ".txt"))`: Fab's demo plates;
+/// of the macro calls in it (a macro's `include_str!(concat!($key, ".txt"))`: an app's demo plates;
 /// a save of such a file said "patched" and the program kept the old text).
 /// `expanded`: `expansions_include(pf)`.
 fn item_includes(pf: &crate::parser::ParsedFile, path: &str, it: &crate::ast::Item, expanded: bool) -> Vec<String> {
@@ -2099,7 +2099,7 @@ fn classify_moving(prog: &crate::program::Program, old_file: u32, new: &crate::p
         let hb = body(b).unwrap_or_else(|| holes(new, &b.kind));
         // attributes are part of the item (cfg, derive, repr, inline)
         // normalized like signatures: an expansion region held as text in one version and as
-        // tokens in the other compares alike (a generated `#[allow(..)]` on Scope's derived
+        // tokens in the other compares alike (a generated `#[allow(..)]` on an app's derived
         // shader fns compared unequal, and the next edit of the file took the restart rung)
         fn attr_span(pf: &crate::parser::ParsedFile, t: &crate::ast::Attr) -> (u32, u32) { (pf.toks.get(t.toks.lo as usize).map_or(0, |x| x.lo), pf.toks.get(t.toks.hi.saturating_sub(1) as usize).map_or(0, |x| x.hi)) }
         fn attr_raw<'p>(pf: &'p crate::parser::ParsedFile, it: &crate::ast::Item) -> Vec<&'p [u8]> { pf.ast.list(it.attrs).iter().flat_map(|t| { let (lo, hi) = attr_span(pf, t); toks(pf, lo, hi, &[]) }).collect() }
@@ -5296,7 +5296,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // compiled stay lazy: a stored value of one runs the version that made it, lowered on its
     // first call from that version's checked body, which preserve_closure_bodies (above) has
     // made sure exists and put_body keeps in old_bodies once the new version is checked.
-    // (They were compiled here eagerly: ~1.4 s on the first edit of Scope's handle_event.)
+    // (They were compiled here eagerly: ~1.4 s on the first edit of an app's handle_event.)
     let u = &mut *up;
     trace_stage("freeze");
     // Round-32 lead design: DefIds are retargeted by commit_version. Values
@@ -7138,7 +7138,7 @@ static DOMAIN_INPUTS: relax_session::sync::Mutex<Option<Inputs>> = relax_session
 /// What the watcher watches, also readable while it waits for a live test verdict: its reload
 /// inputs and the program's own source files loaded so far (`input_paths`, inspect `inputs`).
 /// Read without the owner: asked for the loaded files, an `inputs` waited behind the program's
-/// requests (a cold Fab's first edit: 0.5 s of its ship, at the first frames, 11-04).
+/// requests (a large app's first edit on a cold start: 0.5 s of its ship, at the first frames, 11-04).
 struct WatchView {
     inputs: std::sync::Arc<Inputs>,
     loaded: std::sync::Arc<Vec<String>>,
@@ -8100,7 +8100,7 @@ fn note_restart_pending(why: &str) {
 /// `session relaunch`: applies the edits waiting for a restart (restart_in_place). Returns how.
 /// `who` asked, said in the log with every request: a click in the run window, or the inspect
 /// client's process ([`inspect_asker`]). A restart nobody could name read as the person's own
-/// click (Scope, Fab and Story restarted for a landing, 11-06).
+/// click (three apps restarted for a landing, 11-06).
 pub fn relaunch_pending(who: &str) -> Result<String, String> {
     RELAUNCH_ASKED.store(true, Ordering::SeqCst);
     let why = restart_pending().join("; ");
@@ -8867,7 +8867,7 @@ impl Virtual {
 /// One round's look at the watched files, as `stamp` gives them: a disk file's from its stat; the
 /// virtual files' from one walk of the edits folder at the round's first virtual file, matched to
 /// them by their place there. A round over thousands of virtual files costs the few edits, not a
-/// path lookup and a failing stat each (two looks on every edit took 11-29 ms on Fab's 5,500).
+/// path lookup and a failing stat each (two looks on every edit took 11-29 ms on a large app's 5,500).
 struct Look(std::cell::OnceCell<std::collections::HashMap<usize, (std::time::SystemTime, u64)>>);
 
 impl Look {
@@ -8923,7 +8923,7 @@ fn gate_note(g: u8) {
 /// The native file watch of the live set. A virtual file (a store run with an edits folder) is
 /// watched where its edit lives, when that folder exists; the edits record, which every new edit
 /// replaces, stands for the rest: its event is a whole scan and a new watch (new folders).
-/// Without this a store run fell back to polling every file (5% of a core idle on Fab).
+/// Without this a store run fell back to polling every file (5% of a core idle on an app).
 struct LiveWatch {
     watch: watch_events::Watch,
     /// watch index -> watched file index (usize::MAX: the edits record)
@@ -9325,7 +9325,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // A patch's verdict settles ahead of the gates below: they hold the watch's own work (the
         // startup scan for the UI thread's first frames, a pending restart), never the verdict
         // the person waits for. A patch sets the startup scan again when the tree holds files
-        // the program has not loaded (Fab: always), so the first edit after a cold start had its
+        // the program has not loaded (an app: always), so the first edit after a cold start had its
         // verdict held until the first-frames window closed, 10 s after the present (11-04).
         if !pending.is_empty() {
             for (o, n) in settle_verdicts(up, &mut pending, &mut undos) {
@@ -9363,10 +9363,10 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             }
             continue;
         }
-        // the startup's file scan (own_files: an owner request of 10-15 ms on Sandbox) waits until
+        // the startup's file scan (own_files: an owner request of 10-15 ms on an app) waits until
         // the UI thread's first frames after the present are done: run right at the present, the
         // UI thread's first lazy links queued behind it (36 ms of a first post-present episode).
-        // A save ends the wait: the person waits for that edit, not for the first frames (Fab's
+        // A save ends the wait: the person waits for that edit, not for the first frames (a large app's
         // first edit right after its window showed waited 7.6 s here, 11-04). The scan's round
         // looks at every file, those the taken notifications named among them.
         if startup_scan && crate::postframe::in_first_frames() {
@@ -9953,7 +9953,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             // Module additions can load files without a post-boot loader turn: a loaded file
             // the watcher does not know yet is taken in by a rescan before the next save reaches
             // it (the known ones took their indices above). Asked when any watched file was not
-            // loaded, it rescanned after every Fab patch (an owner request) and held the watch
+            // loaded, it rescanned after every app patch (an owner request) and held the watch
             // round for the first frames again.
             let known: std::collections::HashSet<&str> = files.iter().map(|f| f.0.as_str()).collect();
             if loaded.keys().any(|p| !known.contains(p.as_str()) && crate::vfs::is_file(p)) {
@@ -10304,7 +10304,7 @@ mod watch_wait_tests {
 
     /// A live edit that fails (here an internal compiler error applying it) leaves the app running
     /// its code: the restart that applies the edit is offered and waits for the person, it is not
-    /// started. (A landing reached the person's running Fab, applying it panicked, and the
+    /// started. (A landing reached the person's running app, applying it panicked, and the
     /// recovery restarted the app in place on its own.)
     #[test]
     fn a_failed_edit_offers_its_restart_and_the_run_goes_on() {

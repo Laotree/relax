@@ -47,7 +47,7 @@ impl Cache {
         // own code, or inlined into code -- with a code entry: the image places them too. Startup
         // code a later tier replaced (O2/O3 over the O1 code that inlined them) calls them as fns
         // of their own; without them in the image every such call was a lazy link on the thread
-        // that made it, the UI thread's first frames after the present (Sandbox: ~200 back to back
+        // that made it, the UI thread's first frames after the present (a large app: ~200 back to back
         // on the first warm start after a cold one, 50-90 ms: the JIT indicator).
         crate::run::yield_section("image add_called");
         self.add_called(u, &mut chosen, &pend, stop)?;
@@ -132,7 +132,7 @@ impl Cache {
         if stop() { return Err(()); }
         // the functions thunk symbols name (fn pointers in data: vtables, callbacks) are keys
         // too: the prelink makes their slots with the others, so linking a thunk is a lookup by
-        // bytes instead of a fn key decode per symbol (Stage: ~18k of 22k thunks)
+        // bytes instead of a fn key decode per symbol (a large app: ~18k of 22k thunks)
         crate::run::yield_section("image thunks");
         let mut thunk_keys = Vec::new();
         for i in 0..tab.syms.list.len() {

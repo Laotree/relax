@@ -1,4 +1,4 @@
-// Scope code_graph prepared_graph/builder.rs:1145 (resolve_type): `out`'s element type is still a type
+// An app's code_graph prepared_graph/builder.rs:1145 (resolve_type): `out`'s element type is still a type
 // variable when `*p == path` is checked, so the comparison is `<?T as PartialEq<Vec<String>>>::eq(&*p, &path)`
 // (rustc op.rs:41, check_overloaded_binop) and the inner closure borrows `path`; rustc accepts. Typing it as a
 // built-in comparison made the capture consume `path`: a false E0382 under RELAX_BORROWCK_ALL.

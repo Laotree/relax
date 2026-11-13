@@ -253,7 +253,7 @@ impl DemandPart {
 }
 
 // The alias and expansion maps are the table's own per-crate maps, shared: a
-// deferred file's capture copied them once per file (0.17 GB on a cold Stage).
+// deferred file's capture copied them once per file (0.17 GB on a large app's cold start).
 #[derive(Clone, Default)]
 pub(super) struct MacroPart {
     definitions: Vec<Arc<crate::macros::MacroDef>>,
@@ -475,7 +475,7 @@ impl DemandImage {
         let t_seal = t0.elapsed();
         if let Some(first) = parts.first_mut() {
             let value = final_names.closure_delta(&names);
-            // Both namespaces end here (planner + rebuilt, ~1 GB on a cold Stage): not held
+            // Both namespaces end here (planner + rebuilt, ~1 GB on a large app's cold start): not held
             // through the delta's encode, its shrink copy and the parts' publication.
             drop((final_names, names));
             let legacy = if profile { value.legacy_size(true) } else { 0 };

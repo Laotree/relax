@@ -361,7 +361,7 @@ fn guards_bound_out_of_tuples_drop_where_rustc_drops_them() {
 #[path = "../../base/tests/support/vfs_store.rs"]
 pub(crate) mod vfs_store;
 
-/// Sandbox game_store (asset client cache.rs fsync_dir: `File::open(dir)?.sync_all()`): a folder
+/// A game's store (asset client cache.rs fsync_dir: `File::open(dir)?.sync_all()`): a folder
 /// opens for reading as it does on the disk (open(2) of a directory O_RDONLY succeeds; its reads
 /// fail EISDIR), so a virtual one (an overlay run's sources) is fsync'd, not refused EISDIR.
 #[test]

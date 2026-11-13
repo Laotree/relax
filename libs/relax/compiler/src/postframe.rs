@@ -586,7 +586,7 @@ pub fn in_first_frames() -> bool {
 /// The startup image's window: until the first present, and then until the frame after it is
 /// presented (at most IMAGE_WINDOW_NS). The slots installed in it are the next start's image
 /// (jit.rs ORDER_PRESENT_LEN): the first frames after the present call hundreds of fns no earlier
-/// frame did (Sandbox: ~270 back to back right at the present, 50-90 ms of cached links on the
+/// frame did (a large app: ~270 back to back right at the present, 50-90 ms of cached links on the
 /// UI thread, enough for the JIT indicator), and those are prelinked at the next start instead.
 pub fn image_window_open() -> bool {
     let fp = present_ns();

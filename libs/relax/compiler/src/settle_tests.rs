@@ -558,7 +558,7 @@ fn main() {}
 
 #[test]
 fn prebuild_link_needing_initializer_bails() {
-    // Rule I-PUB (remote-XR Sandbox on a node: "O3 build of slot N panicked: initializer inside a
+    // Rule I-PUB (a remote-XR app on a node: "O3 build of slot N panicked: initializer inside a
     // publish"): an O3 replacement's prebuild_callees linked a callee's stored entry inside a
     // publish; the entry names a static whose value the cache does not hold, so the link ran its
     // initializer there. The link is a take now: it bails, and the program's own link (or a
@@ -1448,8 +1448,8 @@ fn preempted_check_under_a_front_read_gives_way() {
 }
 
 /// The run monitor's settle sweep runs in steps, one owner request each (JITOWNER: one request
-/// over every slot held the owner 10-50 ms while a cold Fab's UI dragged): a main-thread request
-/// that comes during a step is served when that step ends, while the sweep still has steps to go,
+/// over every slot held the owner 10-50 ms while a large app's UI dragged on a cold start): a main-thread
+/// request that comes during a step is served when that step ends, while the sweep still has steps to go,
 /// and the stepped sweep still ends with every eligible slot's RIR and body taken (freed by its
 /// requester, not on the owner).
 #[test]

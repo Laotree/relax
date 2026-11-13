@@ -218,7 +218,7 @@ pub fn after_wait() {
 }
 
 /// Every live domain heap returns its free pages (warm chunks, all-free granules of detached
-/// chunks; memstat::trim): a program heap is trimmed like the compiler's (Scope: 100 MB in use,
+/// chunks; memstat::trim): a program heap is trimmed like the compiler's (a large app: 100 MB in use,
 /// 226 MB resident). The heaps are leased under the registry lock and trimmed outside it.
 pub fn trim_all() {
     for h in lease().iter().flatten() {
@@ -717,7 +717,7 @@ mod tests {
 
     /// The program's `malloc_trim` trims the heap of the domain it runs in: the warm runs, and
     /// the whole free pages of the current chunks, at any fill, of the calling thread and of a
-    /// thread blocked in a wait (the trim skipped both: Fab's trims gave back 13-49 MB each).
+    /// thread blocked in a wait (the trim skipped both: a large app's trims gave back 13-49 MB each).
     #[cfg(target_os = "linux")]
     #[test]
     fn program_malloc_trim_trims_the_domain_heap() {
@@ -976,7 +976,7 @@ mod tests {
     fn ended_threads_hand_their_chunks_back() {
         // A program thread that ends inside its domain heap (no leave) gives its chunks back
         // from its thread-local destructors (DomainExitGuard). Before, each ended thread kept
-        // one 2 MB chunk per size class it had used: Sandbox's thread churn used up the heap's
+        // one 2 MB chunk per size class it had used: a large app's thread churn used up the heap's
         // reservation (exit -6 in a thread start on macOS).
         symbol(b"relax_alloc");
         let heap = DomainHeap::new().unwrap();

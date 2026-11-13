@@ -73,7 +73,7 @@ const fn capacity_overflow() -> ! {
 // Real alloc's RawVecInner: the element-independent half of a Vec's buffer (its growth, the
 // layout arithmetic and the allocator calls) is one body for every element type, the element's
 // layout passed as a value, so the `Vec<T>` instances keep only a capacity compare and a call
-// (P(DOOM)'s wasm had 694 `try_grow_to`, 88 `try_reserve`, 875 `do_reserve_and_handle` copies).
+// (a game's wasm had 694 `try_grow_to`, 88 `try_reserve`, 875 `do_reserve_and_handle` copies).
 
 /// `n` elements of `elem` (Layout::array).
 fn raw_array(elem: Layout, n: usize) -> Result<Layout, crate::collections::TryReserveError> {

@@ -1,4 +1,4 @@
-//! The `prof` service: the live profiler stream a viewer (Scope, `makepad inspect <app> pf ...`)
+//! The `prof` service: the live profiler stream a viewer (an app, `makepad inspect <app> pf ...`)
 //! opens on the app's makepad-remote endpoint. Layout and record kinds: makepad-prof-stream
 //! (local/agent_state/relax-campaign/profproto.md).
 //!

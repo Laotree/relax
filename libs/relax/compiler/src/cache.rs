@@ -1604,7 +1604,7 @@ impl Cache {
     }
 
     /// The entries recorded so far, taken out for writing during the run (on the owner thread;
-    /// the write itself, `Spill::write`, runs off the unit). Memory: a cold Stage run held ~200 MB
+    /// the write itself, `Spill::write`, runs off the unit). Memory: a large app's cold run held ~200 MB
     /// of recorded code until the exit flush. The keys stay in `pending_keys` (nothing is
     /// recorded twice); the late-input ledger written with them is this run's so far (a later
     /// write or the exit flush replaces it: newest wins per key).
@@ -1721,7 +1721,7 @@ impl Cache {
     /// A file by path and text. None (nothing written): a version a live edit committed -- its
     /// parse is eager, so its expression and block ids are not those of a boot parse of the same
     /// text, and a key naming them would mean other expressions in a run that booted from it
-    /// (a warm Scope ran cached code calling `{closure#175197}`, which was no closure there:
+    /// (an app ran cached code on a warm run, calling `{closure#175197}`, which was no closure there:
     /// SIGILL). Code that names such a file's closures, sites or types is not cached.
     fn enc_file(&self, u: &Unit, file: u32, e: &mut E) -> Option<()> {
         if u.prog.is_edit_version(file) {
@@ -2654,7 +2654,7 @@ impl Cache {
 
     /// The item graph now (deps_graph): `makepad run`'s app check beside main has it built before
     /// main, where the check before main had its first code key build it -- else main's first
-    /// compile does, half a second of a cold Fab boot on its path.
+    /// compile does, half a second of a large app's cold boot on its path.
     pub fn build_item_graph(&mut self, u: &Unit) {
         self.deps_graph(u);
     }
@@ -4734,7 +4734,7 @@ const IN_USE_BY_OTHERS: std::time::Duration = std::time::Duration::from_secs(10 
 /// itself opened; a delete that fails (open elsewhere, on Windows) is retried by the next
 /// start. Other Relax builds' stores stay for when that build runs again: store names hash the
 /// codegen identity (codegen_id.rs), so no other build ever reads them, and a box whose lanes run
-/// several builds went cold each time one of them pruned (the Windows node lost a stopped Fab's
+/// several builds went cold each time one of them pruned (the Windows node lost a stopped app's
 /// 109 code stores to a test of another build, 11-04). While `<root>/cache` holds more than the
 /// cap (RELAX_CACHE_MAX megabytes, else twice what this run uses (its live stores), at least
 /// CAP_FLOOR_MB), whole store files go, least recently used first, whichever build wrote them (a
@@ -6629,8 +6629,9 @@ impl Cache {
     }
 
     /// record_front_crates in a mid-run write: `stop` is asked before each crate still to record;
-    /// yes leaves the rest to a later write (false comes back). (A cold Fab's first mid-run write
-    /// held the owner 100-400 ms here, after its first frame: where a live session's first edits come.)
+    /// yes leaves the rest to a later write (false comes back). (A large app's first mid-run write on a
+    /// cold start held the owner 100-400 ms here, after its first frame: where a live session's first edits
+    /// come.)
     pub fn record_front_crates_until(&mut self, prog: &crate::program::Program, stop: &dyn Fn() -> bool) -> bool {
         for ci in 0..self.crate_path.len() {
             let Some(c) = prog.crates.get(ci) else { continue };
@@ -6697,10 +6698,10 @@ impl FrontRecordView {
         // each dependency as the crate its (extern alias, crate name) pair binds in c.deps --
         // the crate index the load's fingerprint (stable::loaded_crate_fingerprint) and the
         // preload's image deps use -- not the first crate of that name: a graph can hold two
-        // crates of one name (Stage: cfg-if 1.0.4 and 1.0.5), and an alias can be both std's and
+        // crates of one name (an app: cfg-if 1.0.4 and 1.0.5), and an alias can be both std's and
         // a renamed dependency's (brotli-decompressor's `alloc` = alloc-no-stdlib). Either made the
         // record's fingerprint differ from the load's every run, so no front graph certificate
-        // was ever written and every warm Stage load re-validated its 3,500 files.
+        // was ever written and each warm load of a large app re-validated its 3,500 files.
         let binds = |alias: &str, name: &str| c.deps.iter().find(|&&(a, k)| prog.syms.str(a) == alias
             && prog.crates.get(k as usize).is_some_and(|d| prog.syms.str(d.name) == name)).map(|&(_, k)| k as usize);
         let dep_fps = deps.as_ref().and_then(|deps|
@@ -6965,7 +6966,7 @@ impl ColdFront {
             // The graph itself is written now too, on that thread: every crate store it
             // certifies was joined above. Waiting for the first write after present lost it
             // to a quit soon after present (the mini's harness: SIGTERM at present + 0.5 s,
-            // KILL 5 s later; Stage's exit is busy for longer), and a relaunch without the
+            // KILL 5 s later; an app's exit is busy for longer), and a relaunch without the
             // certificate re-parsed every file although each crate's images were on disk.
             // A write that cannot record yet stays queued for the post-present or exit writer.
             if deferred {
@@ -8674,7 +8675,7 @@ mod data_tests {
     /// after it. The proc-macro world's unit, made after the program's on a warm macOS start, took
     /// over a process-wide reader: the program's O2 builds folded its loads against the world's
     /// symbol tables, so a constant slice's length (unicode-segmentation's word_cat_table) became
-    /// 0 in code the disk cache then kept -- the warm Stage panicked in its first draw.
+    /// 0 in code the disk cache then kept -- an app's warm run panicked in its first draw.
     #[test]
     fn ro_reader_reads_its_own_unit() {
         isolated_test!(ro_reader_reads_its_own_unit);
@@ -8717,7 +8718,7 @@ mod data_tests {
     /// `word_cat_table` (a `&[(char, char, WordCat)]`) has integer words that, in some runs, equal
     /// an address inside the compile domain's block: the raw word scan copied it into a writable
     /// block, word_category's cache entry named that block as tag 8 (a fresh zeroed block per
-    /// link), and every warm Stage launch then read the table's length as 0 in its first draw.
+    /// link), and each warm launch of an app then read the table's length as 0 in its first draw.
     #[test]
     fn rehome_follows_pointer_words_and_cached_copies_keep_their_value() {
         isolated_test!(rehome_follows_pointer_words_and_cached_copies_keep_their_value);

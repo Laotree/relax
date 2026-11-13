@@ -98,7 +98,7 @@ enum Priority {
     /// a live test session). On macOS at background QoS (efficiency cores, throttled I/O; cargo's
     /// rustc inherit it, and nothing can lift that clamp from a running process), never at full
     /// width beside the app the person works in: three running apps' rebuilds after a landing took
-    /// rustc to ~1080% of a core on the person's Mac while they tweaked Fab (11-03). Elsewhere,
+    /// rustc to ~1080% of a core on the person's Mac while they tweaked an app (11-03). Elsewhere,
     /// nice 10.
     Background,
     /// A boot waits for it: nice 10.

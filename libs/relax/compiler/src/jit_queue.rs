@@ -621,7 +621,7 @@ pub(super) fn ahead_found(front: &Arc<FrontShared>, work: Vec<AheadWork>) {
 /// Ahead work made since the queue's lock was last taken: whoever takes it next moves it in
 /// (`lock`). The owner makes a slot for each callee of a lazy compile, and the checks ahead find
 /// work in every body: each queued under the queue's lock, which a worker holds for every pick,
-/// met it on one push in seven (15k sleeps of the owner through a cold Fab start, the thread the
+/// met it on one push in seven (15k sleeps of the owner through a large app's cold start, the thread the
 /// UI waits behind; 130k of the workers').
 static AHEAD_INBOX: relax_session::sync::Mutex<Vec<(Arc<FrontShared>, AheadWork, u64)>> = relax_session::sync::Mutex::new(Vec::new());
 static AHEAD_PENDING: AtomicBool = AtomicBool::new(false);

@@ -6244,7 +6244,7 @@ mod tests {
     /// the compare's other select sits in the next block, after a fused `cmp; b.cond` rewrote the
     /// flags, so it must test the materialised bool again (`cmp c, #0; csel`). It used to read the
     /// branch's flags and pick the wrong side: zune-jpeg's `get_mut(..).unwrap_or(&mut tmp)`
-    /// wrote every IDCT row into `tmp` at O3, and Stage's thumbnails came out as garbage.
+    /// wrote every IDCT row into `tmp` at O3, and an app's thumbnails came out as garbage.
     #[test]
     fn a_select_after_a_fused_branch_tests_its_bool_again() {
         let options = &relax_session::Options::default();

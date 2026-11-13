@@ -5925,7 +5925,7 @@ pub fn load_key_size(k0: u64) -> i64 {
 /// result of an instruction with the same key and result class above it in the dominator tree
 /// (simplify's copy propagation then removes the copy). Constants stay: they are rematerialised
 /// and sunk to their uses. For generated code with long runs of repeated pure values: a Splash
-/// kernel's lane extracts, which LICM gathers in the element loop's preheader (Stage's largest x4
+/// kernel's lane extracts, which LICM gathers in the element loop's preheader (an app's largest x4
 /// kernel extracted each lane of one product 216 times, all live through its 14k blocks).
 /// Vector ops (VX, VX3, VFma, VSel, VShuffle) are numbered too, their constant operands by value
 /// (each use has its own constant: a table's byte indices `h * splat(0x04040404) + splat(..)` of

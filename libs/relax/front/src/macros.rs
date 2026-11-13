@@ -793,7 +793,7 @@ impl MacroTable {
         // Imports are only added here, so crate k's expansion index (its binding names and
         // their modules) and the alias answers grow in place instead of being rebuilt from all
         // of k's imports on the next lookup (one rebuild per parsed file: 1.3 GB of copies on
-        // a cold Stage).
+        // a large app's cold start).
         let crates = self.expansion_snapshot.crates.get_mut().unwrap();
         let mut index = crates.get_mut(k).map(std::sync::Arc::make_mut);
         let aliases = self.expansion_snapshot.aliases.get_mut().unwrap();

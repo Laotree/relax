@@ -4,8 +4,8 @@
 //! Why: a program that loads CEF installs Chromium's malloc shim as the default zone (it tells
 //! Relax first: jit.rs `allocator_swap`). After that every compile on every thread allocated
 //! through the shim, and with speculative workers running, the main thread's back end took ~3x
-//! the CPU for the same functions (Stage cold: codegen 3.9 us per RIR instruction with one
-//! worker vs 1.2 us compiling alone, 0.76 us without CEF): speculation made Stage's first frame
+//! the CPU for the same functions (a large app's cold start: codegen 3.9 us per RIR instruction with one
+//! worker vs 1.2 us compiling alone, 0.76 us without CEF): speculation made a large app's first frame
 //! several times slower than compiling on the caller. A zone of our own is untouched by the
 //! swap. Before the swap the default zone stays in use (its small-allocation path is faster
 //! than a created zone's: Amp/counter/runner +5% first present when everything used the zone).
