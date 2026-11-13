@@ -10040,7 +10040,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 startup_scan = true;
             }
         }
-        if o.rung == Rung::Restart {
+        // the save a restart applies: the restart rung's, or a patch's that held items back for the
+        // restart it offers (hold_back); the restarted run logs save -> back on screen from it
+        if o.rung == Rung::Restart || (o.rung == Rung::Patch && o.lines.iter().any(|l| l.starts_with(HELD))) {
             RESTART_SAVED_MS.store(saved.map_or(0.0, unix_ms) as u64, std::sync::atomic::Ordering::Relaxed);
         }
         log_edit(&what, &o, saved, seen);
