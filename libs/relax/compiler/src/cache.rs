@@ -3629,7 +3629,7 @@ impl Cache {
                 }
             };
             ptrs.sort_unstable_by_key(|(o, _)| *o);
-            let bytes = unsafe { std::slice::from_raw_parts(start as *const u8, len as usize) }.to_vec();
+            let bytes = u.anchored_payload(start).unwrap_or_else(|| unsafe { std::slice::from_raw_parts(start as *const u8, len as usize) }.to_vec());
             let mut e = E::default();
             e.u32(ENTRY_VERSION);
             e.u64(align);

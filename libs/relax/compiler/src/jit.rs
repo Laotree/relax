@@ -375,6 +375,9 @@ pub struct Unit {
     /// Short-lived jobs reuse their compile inputs until the entire unit is released.
     /// Reclaiming individual bodies there only adds rebuild work to the load path.
     pub keep_compile_state: bool,
+    /// Anchored path payloads (DataKind::AnchoredPath): symbol address -> the anchored spelling
+    /// the cache records. The memory at the address holds this run's absolute path.
+    pub(crate) anchored_payloads: std::sync::Mutex<std::collections::HashMap<u64, Vec<u8>>>,
     /// An auxiliary unit (the proc-macro world): never the runtime's unit while a program's is
     /// (`adopt_runtime_unit`).
     pub aux: bool,
@@ -5015,6 +5018,7 @@ impl Unit {
             fn_map: crate::conc::MemoMap::new_kept(17),
             fn_create: Default::default(),
             consts: Default::default(),
+            anchored_payloads: Default::default(),
             const_readers: Default::default(),
             body_deps: Default::default(),
             statics: Default::default(),
@@ -5625,12 +5629,31 @@ impl Unit {
     /// Copies bytes into the data area; returns their address. `kind` says what the bytes
     /// hold (syms.rs: whether constant loads from them may fold, and to what).
     pub fn data(&self, b: &[u8], align: u64, kind: crate::syms::DataKind) -> u64 {
+        // an anchored path keeps its spelling for the cache; the program reads this run's
+        // absolute path
+        let anchored = matches!(kind, crate::syms::DataKind::AnchoredPath).then(|| b.to_vec());
+        let owned;
+        let b = if matches!(kind, crate::syms::DataKind::AnchoredPath) {
+            let s = std::str::from_utf8(b).unwrap_or("");
+            owned = crate::dirs::resolve_anchored(s).unwrap_or_else(|| String::from_utf8_lossy(b).into_owned());
+            owned.as_bytes()
+        } else {
+            b
+        };
         // one byte more than the object: no object ends where the next begins, so a pointer one
         // past an object's end is never the next object's start (syms.rs provenance)
         let at = bump(&self.data_next, b.len() as u64 + 1, align, self.data_end, "out of data memory");
         unsafe { write_bytes(at, b) };
-        self.syms.add_data(at, b.len() as u64, align.max(1), kind, false);
+        self.syms.add_data(at, b.len() as u64, align.max(1), kind.clone(), false);
+        if let Some(a) = anchored {
+            self.anchored_payloads.lock().unwrap_or_else(|e| e.into_inner()).insert(at, a);
+        }
         at
+    }
+
+    /// The anchored spelling a data object was created from, if it is an anchored path.
+    pub(crate) fn anchored_payload(&self, start: u64) -> Option<Vec<u8>> {
+        self.anchored_payloads.lock().unwrap_or_else(|e| e.into_inner()).get(&start).cloned()
     }
 
     /// `size` bytes of data memory aligned to `align`, for objects the caller places and
