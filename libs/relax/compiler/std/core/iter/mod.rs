@@ -19,6 +19,11 @@ pub use sources::{
 use crate::cmp::Ordering;
 use crate::ops::{Add, Mul};
 
+/// advance_by's result: Ok when the whole n went, else Err(the steps left)
+pub(crate) fn remaining(n: usize) -> Result<(), usize> {
+    if n == 0 { Ok(()) } else { Err(n) }
+}
+
 #[lang = "iterator"]
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub trait Iterator {

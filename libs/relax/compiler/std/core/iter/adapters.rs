@@ -1,6 +1,6 @@
 //! Iterator adapters (general path).
 
-use super::{DoubleEndedIterator, ExactSizeIterator, FusedIterator, IntoIterator, Iterator, TrustedRandomAccess, TrustedRandomAccessNoCoerce};
+use super::{remaining, DoubleEndedIterator, ExactSizeIterator, FusedIterator, IntoIterator, Iterator, TrustedRandomAccess, TrustedRandomAccessNoCoerce};
 use crate::cmp;
 use crate::fmt;
 use crate::intrinsics_mem as im;
@@ -599,14 +599,11 @@ impl<I: Iterator> Iterator for Take<I> {
     }
     // core take.rs: at most the items left to take, in one inner advance_by
     fn advance_by(&mut self, n: usize) -> Result<(), usize> {
-        let min = if self.n < n { self.n } else { n };
-        let rem = match self.iter.advance_by(min) {
-            Ok(()) => 0,
-            Err(rem) => rem,
-        };
+        let min = cmp::min(self.n, n);
+        let rem = self.iter.advance_by(min).err().unwrap_or(0);
         let advanced = min - rem;
         self.n -= advanced;
-        if advanced < n { Err(n - advanced) } else { Ok(()) }
+        remaining(n - advanced)
     }
 }
 
@@ -670,20 +667,14 @@ impl<I: Iterator> Iterator for Skip<I> {
         let mut n = n;
         let skip_inner = self.n;
         let skip_and_advance = skip_inner.saturating_add(n);
-        let remainder = match self.iter.advance_by(skip_and_advance) {
-            Ok(()) => 0,
-            Err(r) => r,
-        };
+        let remainder = self.iter.advance_by(skip_and_advance).err().unwrap_or(0);
         let advanced_inner = skip_and_advance - remainder;
         n -= advanced_inner.saturating_sub(skip_inner);
         self.n = self.n.saturating_sub(advanced_inner);
         if remainder == 0 && n > 0 {
-            n = match self.iter.advance_by(n) {
-                Ok(()) => 0,
-                Err(r) => r,
-            };
+            n = self.iter.advance_by(n).err().unwrap_or(0);
         }
-        if n == 0 { Ok(()) } else { Err(n) }
+        remaining(n)
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         let (lower, upper) = self.iter.size_hint();
@@ -882,7 +873,7 @@ impl<A: Iterator, B: Iterator<Item = A::Item>> Iterator for Chain<A, B> {
         }
         match &mut self.b {
             Some(b) => b.advance_by(n),
-            None => if n == 0 { Ok(()) } else { Err(n) },
+            None => remaining(n),
         }
     }
     // core chain.rs: `a` advances by n in one step (O(1) on a slice), the rest goes to `b`'s nth
@@ -928,7 +919,7 @@ impl<A: DoubleEndedIterator, B: DoubleEndedIterator<Item = A::Item>> DoubleEnded
         }
         match &mut self.a {
             Some(a) => a.advance_back_by(n),
-            None => if n == 0 { Ok(()) } else { Err(n) },
+            None => remaining(n),
         }
     }
     fn nth_back(&mut self, mut n: usize) -> Option<A::Item> {
@@ -1536,7 +1527,7 @@ impl<I: Iterator> Iterator for Fuse<I> {
     fn advance_by(&mut self, n: usize) -> Result<(), usize> {
         match &mut self.iter {
             Some(it) => it.advance_by(n),
-            None => if n == 0 { Ok(()) } else { Err(n) },
+            None => remaining(n),
         }
     }
     // core fuse.rs: one nth of the inner iterator (O(1) on a slice), not n nexts

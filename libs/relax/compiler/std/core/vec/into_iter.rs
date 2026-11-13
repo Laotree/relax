@@ -31,6 +31,16 @@ impl<T> IntoIter<T> {
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         unsafe { im::slice_from_raw_mut(im::ptr_add_mut(self.buf.as_ptr(), self.start), self.end - self.start) }
     }
+    /// Takes the next k items out of the live range, then drops them as one slice (alloc: a
+    /// panicking drop leaves the rest to the slice's drop, which goes on with them).
+    fn drop_front(&mut self, k: usize) {
+        let from = self.start;
+        self.start += k;
+        if crate::mem::needs_drop::<T>() {
+            // SAFETY: from..from + k were alive and are out of the live range now: dropped once
+            unsafe { crate::ptr::drop_in_place(crate::ptr::slice_from_raw_parts_mut(im::ptr_add_mut(self.buf.as_ptr(), from), k)) };
+        }
+    }
 }
 
 impl<T> Iterator for IntoIter<T> {
@@ -51,19 +61,11 @@ impl<T> Iterator for IntoIter<T> {
     fn count(self) -> usize {
         self.end - self.start
     }
-    // alloc vec/into_iter.rs: the skipped items leave the live range first, then are dropped as
-    // one slice (a panicking drop leaves the others to the slice's drop); nth is the default's,
-    // this and a next
+    // alloc vec/into_iter.rs (the default nth: this, then a next)
     fn advance_by(&mut self, n: usize) -> Result<(), usize> {
-        let avail = self.end - self.start;
-        let k = if n < avail { n } else { avail };
-        let from = self.start;
-        self.start += k;
-        if crate::mem::needs_drop::<T>() {
-            // SAFETY: from..from + k were alive and are out of the live range now: dropped once
-            unsafe { crate::ptr::drop_in_place(crate::ptr::slice_from_raw_parts_mut(im::ptr_add_mut(self.buf.as_ptr(), from), k)) };
-        }
-        if k < n { Err(n - k) } else { Ok(()) }
+        let k = crate::cmp::min(n, self.end - self.start);
+        self.drop_front(k);
+        crate::iter::remaining(n - k)
     }
     #[doc(hidden)]
     #[inline]
@@ -114,8 +116,8 @@ impl<T> Default for IntoIter<T> {
 }
 
 unsafe impl<#[may_dangle] T> Drop for IntoIter<T> {
-    // alloc vec/into_iter.rs: the items left go as one slice (a panicking drop leaves the rest to
-    // the slice's drop, which goes on with them), and the buffer is freed by a guard, on unwind too
+    // alloc vec/into_iter.rs: the items left go as one slice, and a guard frees the buffer, on
+    // unwind too
     fn drop(&mut self) {
         struct FreeBuf<U> {
             buf: *mut U,
@@ -129,9 +131,6 @@ unsafe impl<#[may_dangle] T> Drop for IntoIter<T> {
             }
         }
         let _free = FreeBuf::<T> { buf: self.buf.as_ptr(), cap: self.cap };
-        let (from, k) = (self.start, self.end - self.start);
-        self.start = self.end;
-        // SAFETY: from..from + k are the items alive, out of the live range now: dropped once
-        unsafe { crate::ptr::drop_in_place(crate::ptr::slice_from_raw_parts_mut(im::ptr_add_mut(self.buf.as_ptr(), from), k)) };
+        self.drop_front(self.end - self.start);
     }
 }

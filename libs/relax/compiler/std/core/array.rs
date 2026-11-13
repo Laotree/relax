@@ -274,9 +274,17 @@ impl<T, const N: usize> IntoIter<T, N> {
     fn base(&self) -> *const T {
         &*self.data as *const [T; N] as *const T
     }
-    /// the items' pointer for writes and drops (from the unique borrow, as Drop's)
-    fn base_mut(&mut self) -> *mut T {
-        &mut *self.data as *mut [T; N] as *mut T
+    /// Takes the next k items out of the live range, then drops them as one slice (core: a
+    /// panicking drop leaves the rest to the slice's drop, which goes on with them). Plain data
+    /// has nothing to drop: no walk from `start` to `end` after every array iteration.
+    fn drop_front(&mut self, k: usize) {
+        let from = self.start;
+        self.start += k;
+        if crate::mem::needs_drop::<T>() {
+            let base = &mut *self.data as *mut [T; N] as *mut T;
+            // SAFETY: from..from + k were alive and are out of the live range now: dropped once
+            unsafe { crate::ptr::drop_in_place(crate::ptr::slice_from_raw_parts_mut(im::ptr_add_mut(base, from), k)) };
+        }
     }
     pub fn as_slice(&self) -> &[T] {
         unsafe { im::slice_from_raw(im::ptr_add(self.base(), self.start), self.end - self.start) }
@@ -298,18 +306,11 @@ impl<T, const N: usize> Iterator for IntoIter<T, N> {
         let n = self.end - self.start;
         (n, Some(n))
     }
-    // core array iter.rs: the skipped items leave the live range first, then are dropped as one
-    // slice (a panicking drop leaves the others to the slice's drop, which goes on with them)
+    // core array iter.rs
     fn advance_by(&mut self, n: usize) -> Result<(), usize> {
-        let len = self.end - self.start;
-        let k = if n < len { n } else { len };
-        let from = self.start;
-        self.start += k;
-        if crate::mem::needs_drop::<T>() {
-            // SAFETY: from..from + k were alive and are out of the live range now: dropped once
-            unsafe { crate::ptr::drop_in_place(crate::ptr::slice_from_raw_parts_mut(im::ptr_add_mut(self.base_mut(), from), k)) };
-        }
-        if k < n { Err(n - k) } else { Ok(()) }
+        let k = crate::cmp::min(n, self.end - self.start);
+        self.drop_front(k);
+        crate::iter::remaining(n - k)
     }
 }
 
@@ -360,15 +361,7 @@ impl<T: fmt::Debug, const N: usize> fmt::Debug for IntoIter<T, N> {
 
 impl<T, const N: usize> Drop for IntoIter<T, N> {
     fn drop(&mut self) {
-        // nothing to drop for plain data (rustc's drop_in_place of the alive slice is a no-op
-        // then): no loop walking `start` to `end` after every array iteration
-        if !crate::mem::needs_drop::<T>() {
-            return;
-        }
-        // core: the alive items as one slice (a panicking drop leaves the rest to the slice's drop)
-        let (from, k) = (self.start, self.end - self.start);
-        self.start = self.end;
-        unsafe { crate::ptr::drop_in_place(crate::ptr::slice_from_raw_parts_mut(im::ptr_add_mut(self.base_mut(), from), k)) };
+        self.drop_front(self.end - self.start);
     }
 }
 

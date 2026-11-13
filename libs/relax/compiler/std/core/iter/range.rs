@@ -1,7 +1,8 @@
 //! Range iteration through `Step` (implemented for the integer types in num/prim_traits.rs
 //! and for char here).
 
-use super::{DoubleEndedIterator, ExactSizeIterator, FusedIterator, Iterator};
+use super::{remaining, DoubleEndedIterator, ExactSizeIterator, FusedIterator, Iterator};
+use crate::cmp;
 use crate::ops::{Range, RangeFrom, RangeInclusive};
 
 pub trait Step: Clone + PartialOrd + Sized {
@@ -68,6 +69,16 @@ impl Step for char {
     }
 }
 
+/// The items a range has left (advance_by and advance_back_by move at most this far).
+fn steps_left<A: Step>(r: &Range<A>) -> usize {
+    if r.start < r.end {
+        let steps = Step::steps_between(&r.start, &r.end);
+        steps.1.unwrap_or(steps.0)
+    } else {
+        0
+    }
+}
+
 impl<A: Step> Iterator for Range<A> {
     type Item = A;
     fn next(&mut self) -> Option<A> {
@@ -88,16 +99,10 @@ impl<A: Step> Iterator for Range<A> {
     }
     // core range.rs: the items left, counted once, and start moved past at most that many
     fn advance_by(&mut self, n: usize) -> Result<(), usize> {
-        let available = if self.start < self.end {
-            let steps = Step::steps_between(&self.start, &self.end);
-            steps.1.unwrap_or(steps.0)
-        } else {
-            0
-        };
-        let taken = if available < n { available } else { n };
+        let taken = cmp::min(steps_left(self), n);
         // SAFETY: taken steps from start stay within start..=end
         self.start = unsafe { Step::forward_unchecked(self.start.clone(), taken) };
-        if taken < n { Err(n - taken) } else { Ok(()) }
+        remaining(n - taken)
     }
     fn nth(&mut self, n: usize) -> Option<A> {
         if let Some(plus_n) = Step::forward_checked(self.start.clone(), n) {
@@ -148,16 +153,10 @@ impl<A: Step> DoubleEndedIterator for Range<A> {
         }
     }
     fn advance_back_by(&mut self, n: usize) -> Result<(), usize> {
-        let available = if self.start < self.end {
-            let steps = Step::steps_between(&self.start, &self.end);
-            steps.1.unwrap_or(steps.0)
-        } else {
-            0
-        };
-        let taken = if available < n { available } else { n };
+        let taken = cmp::min(steps_left(self), n);
         // SAFETY: taken steps back from end stay within start..=end
         self.end = unsafe { Step::backward_unchecked(self.end.clone(), taken) };
-        if taken < n { Err(n - taken) } else { Ok(()) }
+        remaining(n - taken)
     }
     fn nth_back(&mut self, n: usize) -> Option<A> {
         if let Some(minus_n) = Step::backward_checked(self.end.clone(), n) {

@@ -2,7 +2,10 @@
 // iterator in one call: `Fuse`, `Chain`, `Peekable` and `StepBy` (iter/adapters), slice and
 // VecDeque iterators (advance_by in O(1)) and array::IntoIter (drops the skipped items). Relax's
 // std lacked these, so the default `nth` stepped `n` times through `next`: a `step_by` over any of
-// them cost O(step) per element instead of O(1), the shape that made `Skip` (skip_nth.rs) quadratic.
+// them cost O(step) per element instead of O(1).
+//
+// `Skip::nth` likewise hands the skip and `n` to the inner iterator as one `nth` (core
+// iter/adapters/skip.rs). Without it `step_by` over a `skip` of a slice cost O(len) per element.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -41,6 +44,52 @@ impl Iterator for Counting {
         } else {
             self.at = self.end;
             None
+        }
+    }
+}
+
+#[test]
+fn skip_and_nth_are_one_inner_nth() {
+    let (inner, nexts, nths) = counting(1000);
+    let mut it = inner.skip(100);
+    assert_eq!(it.nth(5), Some(105));
+    assert_eq!((nexts.get(), nths.get()), (0, 1));
+    // the skip is spent: the next nth is the inner one alone
+    assert_eq!(it.nth(2), Some(108));
+    assert_eq!((nexts.get(), nths.get()), (0, 2));
+    assert_eq!(it.next(), Some(109));
+}
+
+#[test]
+fn step_by_over_skip_never_steps_one_by_one() {
+    let (inner, nexts, _) = counting(1000);
+    let got: Vec<u32> = inner.skip(3).step_by(10).take(5).collect();
+    assert_eq!(got, [3, 13, 23, 33, 43]);
+    assert_eq!(nexts.get(), 0);
+}
+
+#[test]
+fn skip_nth_past_the_end() {
+    let v = [1, 2, 3];
+    assert_eq!(v.iter().skip(1).nth(1), Some(&3));
+    assert_eq!(v.iter().skip(1).nth(2), None);
+    assert_eq!(v.iter().skip(5).nth(0), None);
+    // the sum of the skip and n overflows usize
+    assert_eq!(v.iter().skip(usize::MAX).nth(usize::MAX), None);
+    assert_eq!(v.iter().skip(2).nth(usize::MAX), None);
+    let mut it = v.iter().skip(2);
+    assert_eq!(it.nth(0), Some(&3));
+    assert_eq!(it.next(), None);
+}
+
+#[test]
+fn step_by_over_skip_of_a_slice() {
+    let v: Vec<u32> = (0..20).collect();
+    for skip in 0..22 {
+        for step in 1..22 {
+            let got: Vec<u32> = v.iter().skip(skip).step_by(step).copied().collect();
+            let want: Vec<u32> = (skip as u32..20).step_by(step).collect();
+            assert_eq!(got, want, "skip({skip}).step_by({step})");
         }
     }
 }
@@ -218,18 +267,18 @@ where
 {
     let all: Vec<I::Item> = make().collect();
     let len = all.len();
+    // through Chain::nth (the front's advance_by) and Chain::nth_back (the back's advance_back_by)
+    let tail: Vec<I::Item> = all.iter().take(2).cloned().collect();
+    let mut joined = all.clone();
+    joined.extend(tail.iter().cloned());
+    let mut back_joined = tail.clone();
+    back_joined.extend(all.iter().cloned());
+    let bl = back_joined.len();
     for n in 0..len + 3 {
         assert_eq!(make().nth(n), all.get(n).cloned(), "{what}: nth({n})");
         let back = if n < len { Some(all[len - 1 - n].clone()) } else { None };
         assert_eq!(make().nth_back(n), back, "{what}: nth_back({n})");
-        // through Chain::nth (the front's advance_by) and Chain::nth_back (the back's advance_back_by)
-        let tail: Vec<I::Item> = all.iter().take(2).cloned().collect();
-        let mut joined = all.clone();
-        joined.extend(tail.iter().cloned());
         assert_eq!(make().chain(tail.iter().cloned()).nth(n), joined.get(n).cloned(), "{what}: chain nth({n})");
-        let mut back_joined = tail.clone();
-        back_joined.extend(all.iter().cloned());
-        let bl = back_joined.len();
         let want = if n < bl { Some(back_joined[bl - 1 - n].clone()) } else { None };
         assert_eq!(tail.iter().cloned().chain(make()).nth_back(n), want, "{what}: chain nth_back({n})");
         // a chain's nth runs its front on, and then the item after it
@@ -268,10 +317,7 @@ fn advance_by_and_nth_back_agree_with_a_collect() {
     same_as_collect("vec_deque", || d.iter());
     same_as_collect("chain of enumerate skip", || v.iter().skip(3).enumerate().chain(w.iter().enumerate()));
     let mut m: Vec<u32> = v.clone();
-    let mut ms: Vec<u32> = Vec::new();
-    for n in 0..30 {
-        ms.push(m.iter_mut().nth_back(n).map(|x| *x).unwrap_or(999));
-    }
+    let ms: Vec<u32> = (0..30).map(|n| m.iter_mut().nth_back(n).map(|x| *x).unwrap_or(999)).collect();
     let want: Vec<u32> = (0..30).map(|n| if n < 23 { 22 - n } else { 999 }).collect();
     assert_eq!(ms, want);
     let mut it = m.iter_mut();

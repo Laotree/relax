@@ -1,7 +1,8 @@
 //! Slice iterators (general path; Relax fuses `for x in s.iter()` chains into loops).
 
+use crate::cmp;
 use crate::fmt;
-use crate::iter::{DoubleEndedIterator, ExactSizeIterator, FusedIterator, Iterator};
+use crate::iter::{remaining, DoubleEndedIterator, ExactSizeIterator, FusedIterator, Iterator};
 
 fn take_mut<'a, T>(s: &mut &'a mut [T]) -> &'a mut [T] {
     crate::mem::replace(s, &mut [])
@@ -40,12 +41,11 @@ fn len_between<T>(p: *const T, end: *const T) -> usize {
 macro_rules! advance_by_nth {
     ($it:expr, $n:expr, $nth:ident) => {{
         let n = $n;
-        let len = $it.len_left();
-        let k = if n < len { n } else { len };
+        let k = cmp::min(n, $it.len_left());
         if k > 0 {
             $it.$nth(k - 1);
         }
-        if k < n { Err(n - k) } else { Ok(()) }
+        remaining(n - k)
     }};
 }
 
