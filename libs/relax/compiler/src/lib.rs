@@ -943,7 +943,9 @@ pub fn std_candidates(workspace: Option<&str>) -> Vec<String> {
 fn a_workspace_inside_a_checkout_takes_that_checkouts_std_before_the_one_beside_the_binary() {
     let v = std_candidates(Some("/t/lane/apps/commercial"));
     let at = |c: &str| v.iter().position(|x| x == c);
-    let mut beside = std::env::current_exe().unwrap();
+    // the binary is the loader, as std_candidates takes it: under the JIT this test's own
+    // executable (current_exe) is its run's link of the loader, in the run's folder
+    let mut beside = crate::dirs::loader_exe().unwrap();
     for _ in 0..3 {
         beside.pop();
     }
