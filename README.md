@@ -1,7 +1,7 @@
 # Relax
 
 > [!WARNING]
-> **Experimental.** Relax is for development iteration: running, testing and live-editing your program while you work on it. Build anything you release with Rust itself: `cargo build --release` with rustc.
+> **Experimental.** Relax is for development iteration: running, testing and live-editing your program while you work on it. Build anything you release with Rust itself: `cargo build --release` with rustc. So far it has been tested mostly in Makepad's own edit-run loop and only lightly on other projects, so expect rough edges elsewhere and please report them.
 
 ### Rust without the wait.
 
@@ -45,6 +45,7 @@ builds and its tests pass on Linux x86-64 and macOS arm64. Windows isn't tested.
 - **The borrow checker runs beside the program.** A run type-checks each function before it runs and
   borrow-checks in the background; `relax run --check-first` waits for the borrow checker instead.
 - **Not a release build.** Relax is for the edit-run loop. Ship what `cargo build --release` builds.
+  So far it has been tested mostly in Makepad's own edit-run loop and only lightly on other projects, so expect rough edges elsewhere and please report them.
 
 ## What you get from a JIT
 
