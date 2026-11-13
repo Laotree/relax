@@ -346,6 +346,8 @@ fn test_page(st: &Style) -> String {
     p.text("checks as the workspace's [profile.test] / [profile.dev] set them), --release the release one.");
     p.text("Build scripts see that profile's PROFILE, OPT_LEVEL and DEBUG, as under cargo.");
     p.text("A file's tests build as rustc -O --test.");
+    p.text("No rustc runs, so the target holds no rustc-format .rlib or .rmeta of the crate: a test that");
+    p.text("hands the crate's .rlib to an external rustc needs `cargo build --lib` first.");
     p.row("-- --precompile", "Build the selected tests and all they call before the first one starts (no compile inside a test's deadlines)");
     p.usage(&format!("{tool} test --live <package> [--lib | --test <name>] [-- <test args>]", tool = command()));
     p.text("Keeps one target warm (default --lib); body edits rerun tests that entered the changed functions, including inlinees.");
