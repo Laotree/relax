@@ -73,6 +73,37 @@ fn anchor_in(path: &str, anchors: &[(&'static str, String)]) -> Option<String> {
     anchor_from(path, anchors.iter().map(|(tag, dir)| (*tag, dir.as_str())))
 }
 
+/// Whether a cache payload names any anchor directory: the raw spelling, a canonical
+/// (symlink-resolved) form, or the Windows backslash form. Sharing such an entry would carry
+/// one worktree's path into another; this scan is the gate, the compile-time mark is only a
+/// fast path. Returns the tag of the anchor found.
+pub fn payload_carries_anchor(bytes: &[u8]) -> Option<&'static str> {
+    payload_carries_anchor_in(bytes, anchors())
+}
+
+fn payload_carries_anchor_in(bytes: &[u8], anchors: &[(&'static str, String)]) -> Option<&'static str> {
+    for (tag, dir) in anchors {
+        if dir.is_empty() {
+            continue;
+        }
+        let mut forms = vec![dir.clone()];
+        if let Ok(c) = std::fs::canonicalize(dir) {
+            let c = c.to_string_lossy().into_owned();
+            if c != *dir {
+                forms.push(c);
+            }
+        }
+        let back = dir.replace('/', "\\");
+        if back != *dir {
+            forms.push(back);
+        }
+        if forms.iter().any(|f| bytes.windows(f.len()).any(|w| w == f.as_bytes())) {
+            return Some(tag);
+        }
+    }
+    None
+}
+
 /// The persisted spelling of a path under its longest anchor; unrelated paths stay borrowed.
 pub fn anchored(path: &str) -> std::borrow::Cow<'_, str> {
     anchor_in(path, anchors()).map_or(std::borrow::Cow::Borrowed(path), std::borrow::Cow::Owned)
@@ -288,6 +319,17 @@ mod tests {
         assert_eq!(super::shared_mode_from(Some("global")), Ok(true));
         assert!(super::shared_mode_from(Some("on")).is_err());
         assert!(super::shared_mode_from(Some("1")).is_err());
+    }
+
+    /// The payload scan catches every anchor spelling a payload could carry.
+    #[test]
+    fn payload_scan_finds_anchor_spellings() {
+        let a = [("ws", "/w".to_string()), ("cargo", "/c".to_string())];
+        assert_eq!(super::payload_carries_anchor_in(b"prefix/w/src/lib.rs", &a), Some("ws"));
+        assert_eq!(super::payload_carries_anchor_in(b"x\\w\\src\\lib.rs", &a), Some("ws"));
+        assert_eq!(super::payload_carries_anchor_in(b"/c/registry/a.rs", &a), Some("cargo"));
+        assert_eq!(super::payload_carries_anchor_in(b"/other/a.rs", &a), None);
+        assert_eq!(super::payload_carries_anchor_in(b"", &a), None);
     }
 
     /// Nested anchors keep one spelling, ties take the fixed order, and a path under no anchor
