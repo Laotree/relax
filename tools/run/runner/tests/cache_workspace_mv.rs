@@ -82,3 +82,45 @@ fn a_workspace_copied_to_a_new_path_recompiles_nothing() {
     let _ = std::fs::remove_dir_all(&moved);
     let _ = std::fs::remove_dir_all(&cache);
 }
+
+/// The negative gate beside `mv`: the same logical path with different content must not reuse
+/// the earlier code — the key hashes the body.
+#[test]
+fn a_changed_body_at_the_same_logical_path_does_not_hit() {
+    let bin = Path::new(env!("CARGO_BIN_EXE_relax"));
+    let pkg = tmp("changed");
+    let home = tmp("changed-home");
+    write_pkg(&pkg);
+    assert_eq!(run(bin, &pkg, &home).trim(), "42");
+    std::fs::write(pkg.join("src/main.rs"), "fn main() { println!(\"{}\", 1 + 1); }\n").unwrap();
+    assert_eq!(run(bin, &pkg, &home).trim(), "2", "a changed body reused the earlier code");
+    let _ = std::fs::remove_dir_all(&pkg);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A file outside every anchor: its content is an input, so changing it must change what the
+/// program prints even though the source and the absolute include path are unchanged.
+#[test]
+fn an_outside_anchor_include_is_an_input() {
+    let bin = Path::new(env!("CARGO_BIN_EXE_relax"));
+    let pkg = tmp("ext");
+    let home = tmp("ext-home");
+    let ext = std::env::temp_dir().join(format!("relax-ext-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ext);
+    std::fs::create_dir_all(&ext).unwrap();
+    let data = ext.join("data.txt");
+    std::fs::write(&data, "one").unwrap();
+    std::fs::create_dir_all(pkg.join("src")).unwrap();
+    std::fs::write(pkg.join("Cargo.toml"), "[package]\nname = \"extapp\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    std::fs::write(pkg.join("src/main.rs"), format!("fn main() {{ print!(\"{{}}\", include_str!(\"{}\")); }}\n", data.display())).unwrap();
+    let out = Command::new(bin).arg("run").arg("extapp").current_dir(&pkg).env("RELAX_HOME", &home).env("RELAX_SHARED_CACHE", "global").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "one");
+    std::fs::write(&data, "two").unwrap();
+    let out = Command::new(bin).arg("run").arg("extapp").current_dir(&pkg).env("RELAX_HOME", &home).env("RELAX_SHARED_CACHE", "global").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "two", "the outside include's content is an input");
+    let _ = std::fs::remove_dir_all(&pkg);
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&ext);
+}
