@@ -5529,6 +5529,8 @@ pub fn vx_native(op: VX) -> bool {
 /// `compile` with measured block frequencies of `f` (0..=1 of its hottest block, per block), which
 /// the register allocator weighs uses by instead of loop depth.
 pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq: Option<&[f32]>) -> Result<Compiled, String> {
+    let aligned = crate::frame::align_slots(f)?;
+    let f = aligned.as_ref().unwrap_or(f);
     let _warm = crate::probe::backend(&f.name);
     let _cost_codegen = crate::probe::phase(5);
     crate::probe::size(f);

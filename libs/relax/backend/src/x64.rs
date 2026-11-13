@@ -6630,6 +6630,8 @@ fn imm_fits(i: &Inst) -> bool {
 pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq: Option<&[f32]>) -> Result<Compiled, String> {
     let covered = crate::passes::lower_coverage(f);
     let f = covered.as_ref().unwrap_or(f);
+    let aligned = crate::frame::align_slots(f)?;
+    let f = aligned.as_ref().unwrap_or(f);
     let _warm = crate::probe::backend(&f.name);
     let _cost_codegen = crate::probe::phase(5);
     crate::probe::size(f);

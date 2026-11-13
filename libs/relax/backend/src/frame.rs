@@ -3,6 +3,66 @@
 use crate::regalloc::{for_defs, for_uses, term_uses};
 use crate::rir::*;
 
+/// Native frames guarantee 16-byte alignment. Stronger alignments use a padded slot and an
+/// aligned address within it, leaving the frame pointer and unwind layout unchanged.
+pub fn align_slots(f: &Func) -> Result<Option<Func>, String> {
+    if !f.slots.iter().any(|slot| slot.align > 16) {
+        return Ok(None);
+    }
+    let used = crate::rir::used_slots(f);
+    if !f.slots.iter().enumerate().any(|(s, slot)| used[s] && slot.align > 16) {
+        return Ok(None);
+    }
+    let mut g = f.clone();
+    let mut aligned = vec![None; f.slots.len()];
+    let mut prefix = Vec::new();
+    for (s, slot) in f.slots.iter().enumerate() {
+        if !used[s] || slot.align <= 16 {
+            continue;
+        }
+        let storage = &mut g.slots[s];
+        storage.size = slot.size.checked_add(slot.align - 1).ok_or_else(|| format!("{}: over-aligned stack slot exceeds u32 storage size", f.name))?;
+        storage.align = 16;
+        storage.arg = false;
+        storage.born = false;
+        storage.ret = false;
+        let raw = g.vreg(Cls::I);
+        let end = g.vreg(Cls::I);
+        let address = g.vreg(Cls::I);
+        prefix.extend([
+            Inst::SlotAddr(raw, s as u32),
+            Inst::IBinI(IOp::Add, U64, end, raw, slot.align as i64 - 1),
+            Inst::IBinI(IOp::And, U64, address, end, -(slot.align as i64)),
+        ]);
+        aligned[s] = Some(address);
+    }
+    for b in &mut g.blocks {
+        for i in &mut b.insts {
+            if let Inst::SlotAddr(d, s) = *i {
+                if let Some(address) = aligned[s as usize] {
+                    *i = Inst::Mov(d, address);
+                }
+            }
+        }
+    }
+    for d in &mut g.dbg {
+        if let DbgLoc::Slot(s, off) = d.loc {
+            if let Some(address) = aligned.get(s as usize).copied().flatten() {
+                d.loc = DbgLoc::Mem(address, off);
+            }
+        }
+    }
+    let entry = &mut g.blocks[0];
+    let p = entry.pos.first().copied().unwrap_or(0);
+    let mut positions = vec![p; prefix.len()];
+    entry.pos.resize(entry.insts.len(), 0);
+    positions.append(&mut entry.pos);
+    prefix.append(&mut entry.insts);
+    entry.insts = prefix;
+    entry.pos = positions;
+    Ok(Some(g))
+}
+
 pub fn slot_colors_used(f: &Func, min: u32, addressed: &[bool]) -> Option<Vec<u32>> {
     let ns = f.slots.len();
     let nb = f.blocks.len();
