@@ -5810,6 +5810,11 @@ impl Unit {
     /// aligned enough gave one constant two symbols in one build order and one in another).
     pub fn data_dedup(&self, b: &[u8], align: u64) -> u64 {
         let align = align.max(1);
+        // a workspace path value (builtins.rs): the cache keeps the anchored spelling, the run
+        // materialises its own absolute path
+        if let Some(rest) = b.strip_prefix(&[1u8]) {
+            return self.data(rest, align, crate::syms::DataKind::AnchoredPath);
+        }
         let mut m = self.lit_data.lock().unwrap_or_else(|e| e.into_inner());
         let key = (b.to_vec(), align);
         if let Some(&a) = m.get(&key) {
