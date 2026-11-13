@@ -16,9 +16,20 @@ fn check_local(seed: u64) {
 
 #[test]
 fn local_alignment() {
-    for seed in 0..32 {
-        check_local(seed);
+    for depth in 0..8 {
+        check_depth(depth, 37);
     }
+}
+
+#[inline(never)]
+fn check_depth(depth: u32, seed: u64) {
+    let mut padding = std::hint::black_box([seed as u8; 17]);
+    if depth == 0 {
+        check_local(seed);
+    } else {
+        check_depth(depth - 1, seed);
+    }
+    assert_eq!(std::hint::black_box(&mut padding)[16], seed as u8);
 }
 
 #[test]
