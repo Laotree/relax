@@ -590,8 +590,9 @@ pub struct Program {
     /// back version is not), and per committed version the boot file it is a version of.
     edit_current: HashMap<u32, u32>,
     edit_boot: HashMap<u32, u32>,
-    /// Committed files used only during a warm checker crate recollection.
-    check_files: Option<std::collections::HashMap<String, u32>>,
+    /// Committed files used only during a warm checker crate recollection: per path, each
+    /// module path it is loaded under and that module's version.
+    check_files: Option<std::collections::HashMap<String, Vec<(String, u32)>>>,
     parse_reuse: HashMap<u32, std::sync::Arc<crate::parse_work::Reuse>>,
     /// files read and lexed by the macro prescan, consumed by load_file
     pub prelexed: HashMap<String, (Vec<u8>, Vec<crate::lexer::Tok>)>,
@@ -1257,6 +1258,34 @@ impl Program {
     /// module's path (std's too) cloned into the map, 25-40 ms of the owner per edit (an app, 11-04).
     pub fn current_source_file_sets(&self, keep: impl Fn(&str) -> bool) -> std::collections::BTreeMap<String, Vec<u32>> {
         let mut files: std::collections::BTreeMap<String, Vec<u32>> = std::collections::BTreeMap::new();
+        self.live_module_files(keep, |path, file| {
+            // the last module of a path names its crate's file and orders it
+            let krate = self.file_crate.get(file as usize);
+            let of = files.entry(path.clone()).or_default();
+            of.retain(|&f| self.file_crate.get(f as usize) != krate);
+            of.push(file);
+        });
+        files
+    }
+
+    /// `current_source_files` with every module's file of a path, in the crate it names: one
+    /// file declared as two modules (`#[path]` on both) is two versions, each parsed as its
+    /// module (relax issue 135). In module order; the last is the one `current_source_files`
+    /// names.
+    pub fn current_source_module_files(&self, keep: impl Fn(&str) -> bool) -> std::collections::BTreeMap<String, Vec<u32>> {
+        let mut files: std::collections::BTreeMap<String, Vec<u32>> = std::collections::BTreeMap::new();
+        self.live_module_files(keep, |path, file| {
+            let krate = self.file_crate.get(file as usize);
+            let of = files.entry(path.clone()).or_default();
+            // (an inline module is its file's: one entry)
+            of.retain(|&f| f != file && self.file_crate.get(f as usize) == krate);
+            of.push(file);
+        });
+        files
+    }
+
+    /// Each live module's path and file, in module order, for the paths `keep` takes.
+    fn live_module_files(&self, keep: impl Fn(&str) -> bool, mut each: impl FnMut(&String, u32)) {
         let mut bound = Vec::with_capacity(self.mods.len());
         for module in &self.mods {
             // Refused module additions keep their definitions for old compiler
@@ -1268,14 +1297,9 @@ impl Program {
             bound.push(live);
             if !live { continue; }
             if let Some(path) = self.file_paths.get(module.file as usize).filter(|p| keep(p)) {
-                // the last module of a path names its crate's file and orders it
-                let krate = self.file_crate.get(module.file as usize);
-                let of = files.entry(path.clone()).or_default();
-                of.retain(|&f| self.file_crate.get(f as usize) != krate);
-                of.push(module.file);
+                each(path, module.file);
             }
         }
-        files
     }
 
     // ------------------------------------------------------------ loading
@@ -1698,7 +1722,9 @@ impl Program {
     fn load_file(&mut self, path: &str, edition: u16, krate: u32) -> Result<u32, String> {
         crate::why::event("load", path, 0, "", None);
         let _profile = crate::load_profile::span(self.session.runtime.profile, "load-file", path);
-        if let Some(f) = self.check_files.as_ref().and_then(|m| m.get(path)) { return Ok(*f); }
+        // a check's committed version of the module being loaded (a file declared as two
+        // modules is two versions; a module new to the edit takes the path's last)
+        if let Some(&(_, f)) = self.check_files.as_ref().and_then(|m| m.get(path)).and_then(|of| of.iter().find(|(m, _)| *m == self.cur_mod_path).or(of.last())) { return Ok(f); }
         let kname = if (krate as usize) < self.crates.len() { self.syms.str(self.crates[krate as usize].name).to_string() } else { String::new() };
         let std_file = matches!(kname.as_str(), "core" | "alloc" | "std");
         if std_file && self.std_from_shared {
@@ -1972,19 +1998,29 @@ impl Program {
         self.parse_snapshot(old, path).parse(src)
     }
 
+    /// The module a file is the source of (not an inline module in it).
+    fn file_module(&self, file: u32) -> Option<u32> {
+        self.reload_files().mods.get(&file).into_iter().flatten().copied().find(|&m| self.mods[m as usize].lexical_parent.is_none())
+    }
+
+    /// The module path a file was loaded under (module_path!()): its module's, the crate's
+    /// name for a crate root.
+    fn file_module_path(&self, file: u32) -> String {
+        match self.file_module(file).map(|m| &self.mods[m as usize]) {
+            Some(m) if m.def.0 != u32::MAX && (m.def.0 as usize) < self.defs.len() && self.defs[m.def.0 as usize].kind == DefKind::Mod && self.defs[m.def.0 as usize].file != file => {
+                self.def_path(m.def)
+            }
+            _ => self.syms.str(self.crates[self.file_crate[file as usize] as usize].name).to_string(),
+        }
+    }
+
     pub fn parse_snapshot(&self, old: u32, path: &str) -> ParseSnapshot {
         let edition = self.files[old as usize].edition;
         let krate = self.file_crate[old as usize];
         let kname = self.syms.str(self.crates[krate as usize].name).to_string();
-        // the module path the file was loaded under (module_path!())
-        let own_module = self.reload_files().mods.get(&old).into_iter().flatten().copied().find(|&m| self.mods[m as usize].lexical_parent.is_none());
+        let own_module = self.file_module(old);
         let dir = own_module.map_or_else(|| dir_of(path).to_string(), |m| self.module_source_directory(m).0);
-        let mod_path = match own_module.map(|m| &self.mods[m as usize]) {
-            Some(m) if m.def.0 != u32::MAX && (m.def.0 as usize) < self.defs.len() && self.defs[m.def.0 as usize].kind == DefKind::Mod && self.defs[m.def.0 as usize].file != old => {
-                self.def_path(m.def)
-            }
-            _ => kname.clone(),
-        };
+        let mod_path = self.file_module_path(old);
         let mut macros = self.macros.clone();
         let root = self.crates[krate as usize].root_path();
         if macros.crates.get(&kname).is_some_and(|c| c.src != root) {
@@ -2609,11 +2645,16 @@ impl Program {
     /// Recollect one crate from the checker's current file versions. Other crates' ASTs
     /// and definitions stay resident. Old defs remain addressable until the caller drops
     /// their type tables and dependency edges; they are no longer bound in any namespace.
-    pub fn recollect_check_crate(&mut self, krate: u32, files: std::collections::HashMap<String, u32>) -> Result<Vec<DefId>, String> {
+    pub fn recollect_check_crate(&mut self, krate: u32, files: std::collections::HashMap<String, Vec<u32>>) -> Result<Vec<DefId>, String> {
         let root = self.crates[krate as usize].root_mod;
         let root_def = self.mods[root as usize].def;
         let path = self.crates[krate as usize].root_path.clone();
-        let file = *files.get(&path).ok_or_else(|| format!("missing committed crate root {}", path))?;
+        // each version's module path, before the recollection unbinds the crate's modules
+        let files: std::collections::HashMap<String, Vec<(String, u32)>> = files.into_iter()
+            .map(|(p, of)| { let of = of.into_iter().map(|f| (self.file_module_path(f), f)).collect(); (p, of) }).collect();
+        let kname = self.syms.str(self.crates[krate as usize].name).to_string();
+        let file = files.get(&path).and_then(|of| of.iter().find(|(m, _)| *m == kname).or(of.last())).map(|&(_, f)| f)
+            .ok_or_else(|| format!("missing committed crate root {}", path))?;
         // Imports in dependent crates may still bind an old def (including glob caches).
         for im in &self.imports {
             if let Some(name) = im.bind {
@@ -2677,7 +2718,6 @@ impl Program {
             }
         }
         self.expand_pending(krate, self.crates[krate as usize].edition);
-        let kname = self.syms.str(self.crates[krate as usize].name).to_string();
         std::sync::Arc::make_mut(&mut self.macros).seal_crate(&kname);
         let visible = self.crates_seeing_files([file].into_iter());
         self.resolve_imports_in(Some(&visible));

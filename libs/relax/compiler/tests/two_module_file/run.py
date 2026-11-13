@@ -3,18 +3,23 @@
 (without one, from a makepad checkout's workspace root: makepad's host build). Relax issue 135.
 
 src/main.rs declares shared/value.rs as `first` and as `second` (`#[path]`); the file imports a
-path dependency's exported macro, `use macro_dep::{Value, json};`, and calls `json!`. Two servers
+path dependency's exported macro, `use macro_dep::{Value, json};`, and calls `json!`. main.rs's
+`here!` is a `&str` before `mod first;` and a `u32` before `mod second;`: in the file, each module
+has its own. Two servers
 run the steps: the default one, whose edits load the package again (the loader's module walk), and
 one with RELAX_CHECK_EAGER=1, whose edits that add an item collect the crate again from a new scan
 of its modules (preload.rs check_macros; a body-only edit would not).
 1. The first check has no diagnostics.
-2. An edit of shared/value.rs that adds an item (`fn other`, called by `value`, calls `json!`): the
+2. An edit of a body of shared/value.rs, `json!(here!())`: the edit reaches each module's version,
+   and `first`'s `here!` is a `&str` where `Value` holds a `u32` (E0308, `first`'s alone; the eager
+   server parsed the file's last module only, and `first` kept the old body).
+3. An edit of shared/value.rs that adds an item (`fn other`, called by `value`, calls `json!`): the
    import is still in scope in `second` (the scan walked the file once, under `first`: "cannot
    find macro").
-3. An edit that makes shared/value.rs include itself (`#[path = "value.rs"] mod again;`, rustc's
+4. An edit that makes shared/value.rs include itself (`#[path = "value.rs"] mod again;`, rustc's
    circular-modules error): the walk stops at the repeat and the check answers (no time limit: a
    walk that does not end stalls the job, and devhub's stall report names it).
-4. The edit undone: no diagnostics again.
+5. The edit undone: no diagnostics again.
 Prints "two_module_file: ok", or fails with the step's assertion."""
 import json, os, pathlib, socket, subprocess, sys, tempfile, time
 if len(sys.argv) > 1:
@@ -27,8 +32,8 @@ FILES = {
     'Cargo.toml': '[package]\nname = "two_module_file"\nversion = "0.1.0"\nedition = "2021"\npublish = false\n\n[dependencies]\nmacro_dep = { path = "dep" }\n\n[workspace]\n',
     'dep/Cargo.toml': '[package]\nname = "macro_dep"\nversion = "0.1.0"\nedition = "2021"\npublish = false\n',
     'dep/src/lib.rs': 'pub struct Value(pub u32);\n\n#[macro_export]\nmacro_rules! json {\n    ($v:expr) => {\n        $crate::Value($v)\n    };\n}\n',
-    'src/main.rs': '#[path = "../shared/value.rs"]\nmod first;\n#[path = "../shared/value.rs"]\nmod second;\n\nfn main() {\n    let _ = (first::value(), second::value());\n}\n',
-    'shared/value.rs': 'use macro_dep::{Value, json};\n\npub fn value() -> Value {\n    json!(3)\n}\n',
+    'src/main.rs': 'macro_rules! here {\n    () => {\n        "one"\n    };\n}\n#[path = "../shared/value.rs"]\nmod first;\nmacro_rules! here {\n    () => {\n        2u32\n    };\n}\n#[path = "../shared/value.rs"]\nmod second;\n\nfn main() {\n    let _ = (first::value(), second::value(), first::label(), second::label(), here!());\n}\n',
+    'shared/value.rs': 'use macro_dep::{Value, json};\n\npub fn value() -> Value {\n    json!(3)\n}\n\npub fn label() -> impl std::fmt::Debug {\n    here!()\n}\n',
 }
 def steps(mode, extra):
     with tempfile.TemporaryDirectory(prefix='two-module-file-') as tmp:
@@ -70,6 +75,9 @@ def steps(mode, extra):
 
             assert diagnostics() == [], (mode, 'the first check', diagnostics())
             value = ws / 'shared/value.rs'
+            call('didChange', path=str(value), text=FILES['shared/value.rs'].replace('json!(3)', 'json!(here!())'))
+            got = diagnostics()
+            assert len(got) == 1 and 'E0308' in (got[0][0] or '') + (got[0][1] or ''), (mode, "an edit of a body, in each module's version", got)
             call('didChange', path=str(value), text=FILES['shared/value.rs'].replace('json!(3)', 'other()') + '\nfn other() -> Value {\n    json!(4)\n}\n')
             got = diagnostics()
             assert got == [], (mode, 'after an edit of the file both modules read', got)
