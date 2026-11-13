@@ -158,6 +158,11 @@ pub fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Resu
     fs::symlink_raw(original.as_ref(), link.as_ref())
 }
 
+/// Changes ownership, following symlinks. `None` leaves that owner or group unchanged.
+pub fn chown<P: AsRef<Path>>(path: P, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+    fs::chown_raw(path.as_ref(), uid, gid)
+}
+
 /// Positioned reads and writes (pread/pwrite), as real std's unix FileExt.
 pub trait FileExt {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;

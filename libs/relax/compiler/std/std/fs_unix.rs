@@ -1270,6 +1270,13 @@ pub fn set_permissions<P: AsRef<Path>>(path: P, perm: Permissions) -> io::Result
     })
 }
 
+pub(crate) fn chown_raw(path: &Path, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+    run_path_with_cstr(path, &|c| {
+        cvt_r(|| unsafe { sys::chown(c.as_ptr(), uid.unwrap_or(!0), gid.unwrap_or(!0)) })?;
+        Ok(())
+    })
+}
+
 /// Deprecated alias of `os::unix::fs::symlink` (rustc library/std/src/fs.rs `soft_link`).
 #[deprecated(since = "1.1.0", note = "replaced with std::os::unix::fs::symlink and std::os::windows::fs::{symlink_file, symlink_dir}")]
 pub fn soft_link<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Result<()> {
