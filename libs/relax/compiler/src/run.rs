@@ -1238,12 +1238,23 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             }
         }
     }
-    // the program's argv[0] / current_exe() is the Relax binary; spawning it again
-    // (`Command::new(env::current_exe()?)`, `Command::new(&args[0])`) runs this program again
-    // with the new arguments (std process.rs: RELAX_SELF_EXEC holds this command line up to `--`);
-    // a spawn of it whose first argument is one of the loader's commands (RELAX_SELF_EXEC_COMMANDS:
-    // `run`, `check`, `test`, ...) runs that command instead
-    if let Ok(exe) = std::env::current_exe().and_then(|e| e.canonicalize()) {
+    // the program's argv[0] / current_exe() is its own executable, a hard link of the Relax binary
+    // in this run's folder (selfexe.rs); spawning it (`Command::new(env::current_exe()?)`,
+    // `Command::new(&args[0])`) runs this program again with the new arguments (std
+    // process_unix.rs: RELAX_SELF_EXEC holds this command line up to `--`), while a spawn of the
+    // loader by its own name (RELAX_LOADER) runs the loader's command line as written. A check runs
+    // no program, and an embedder's process (the Android host) is not the loader's executable.
+    let embedded = crate::os::proc::EMBEDDED.load(std::sync::atomic::Ordering::Acquire);
+    let own = (!check && !embedded).then(|| std::env::current_exe().and_then(|e| e.canonicalize()).map_err(|e| e.to_string()).and_then(|exe| {
+        let name = cargo_flags.iter().position(|f| f == "--bin").and_then(|j| cargo_flags.get(j + 1)).cloned()
+            .or_else(|| cargo_flags.iter().find_map(|f| f.strip_prefix("--bin=").map(str::to_string)))
+            .unwrap_or_else(|| std::path::Path::new(&package).file_stem().map_or_else(|| package.clone(), |s| s.to_string_lossy().into_owned()));
+        crate::selfexe::link(&exe, &name)
+    }));
+    if let Some(Err(why)) = &own {
+        eprintln!("relax run: the program's own executable could not be made ({why}): a spawn of it runs the loader, not the program");
+    }
+    if let Some(Ok(exe)) = own {
         let mut pre: Vec<String> = crate::os::proc::args_bytes().iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
         if let Some(d) = pre.iter().position(|a| a == "--") {
             pre.truncate(d);
@@ -1287,11 +1298,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
         pre.push("--".to_string());
         crate::progenv::set_run_fact("RELAX_SELF_EXEC", pre.join("\u{1f}"));
-        // stated only when the host gave its commands: without the fact std runs every spawn of the
-        // loader as written, so an embedder without a list starts no re-run it did not mean
-        if !crate::loader_commands().is_empty() {
-            crate::progenv::set_run_fact("RELAX_SELF_EXEC_COMMANDS", crate::loader_commands().join("\u{1f}"));
-        }
         prog_args[0] = exe.display().to_string().into_bytes();
     }
     // started through an integration test's CARGO_BIN_EXE_<bin> (unitgraph.rs writes that wrapper):

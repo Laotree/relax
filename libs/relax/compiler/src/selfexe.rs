@@ -1,0 +1,86 @@
+//! The program's own executable under the JIT: a hard link of the loader in this run's own folder,
+//! `<run dir>/exe/<pid>/<name>` (`<name>.exe` on Windows), which the program's argv[0] and
+//! std::env::current_exe() name. A spawn of that path runs this program again (std
+//! process_unix.rs / process_windows.rs `self_exec_args`: RELAX_SELF_EXEC starts with it); a spawn
+//! of the loader by any other name (RELAX_LOADER, an installed `makepad`) runs the loader's command
+//! line as written, whatever its first word. A hard link, not a symlink or a copy: canonicalize
+//! keeps its name, the OS runs it as the loader (the same file, so the same code signature on
+//! macOS), and it takes no space beyond a directory entry while the loader file exists.
+//!
+//! The folder goes when the run exits (os::proc::exit); a run that did not get there (killed)
+//! leaves it, and the next run's `link` removes the folders of processes that are gone. They
+//! matter: a link keeps an old loader's blocks alive after cargo replaces the binary.
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+static OWN_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// This process's link to `loader`, named `name` (a package or binary name), made once; the
+/// reason when the run dir's file system cannot hold it (another volume than the loader's).
+pub fn link(loader: &Path, name: &str) -> Result<PathBuf, String> {
+    let root = crate::dirs::relax_dir().join("exe");
+    sweep(&root);
+    let dir = root.join(std::process::id().to_string());
+    // a folder under this pid is a gone process's (pids are reused)
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let _ = OWN_DIR.set(dir.clone());
+    let name: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect();
+    let file = if cfg!(windows) { format!("{name}.exe") } else { name };
+    let link = dir.join(file);
+    std::fs::hard_link(loader, &link).map_err(|e| format!("hard link {} of {}: {e}", link.display(), loader.display()))?;
+    link.canonicalize().map_err(|e| format!("{}: {e}", link.display()))
+}
+
+/// Removes this process's folder (os::proc::exit). On Windows the link of a re-run that still
+/// runs from it stays; the next run's sweep takes it.
+pub fn remove() {
+    if let Some(d) = OWN_DIR.get() {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// The folders of processes that are gone.
+fn sweep(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    for e in entries.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
+        if pid != std::process::id() && !alive(pid) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn alive(pid: u32) -> bool {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    const EPERM: i32 = 1;
+    let signalled = unsafe { kill(pid as i32, 0) } == 0;
+    signalled || std::io::Error::last_os_error().raw_os_error() == Some(EPERM)
+}
+
+#[cfg(windows)]
+fn alive(pid: u32) -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+        fn GetExitCodeProcess(process: *mut core::ffi::c_void, code: *mut u32) -> i32;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            // another user's process is there, only not ours to query
+            const ERROR_ACCESS_DENIED: i32 = 5;
+            return std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED);
+        }
+        let mut code = 0u32;
+        let running = GetExitCodeProcess(h, &mut code) != 0 && code == STILL_ACTIVE;
+        CloseHandle(h);
+        running
+    }
+}

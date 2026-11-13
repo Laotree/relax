@@ -407,6 +407,7 @@ mod unix {
     /// are left as they are, as in a rustc build).
     pub fn exit(code: i32) -> ! {
         super::run_program_atexit();
+        crate::selfexe::remove();
         // An embedded run (the Android host: its library handle is named) failed: exit() would run the
         // process's atexit/static destructors on this thread while the host's UI thread still locks
         // the mutexes they destroy (FORTIFY abort, no message). The host owns the process: the failure
@@ -874,6 +875,7 @@ mod imp {
     /// run the main thread's key destructors either.
     pub fn exit(code: i32) -> ! {
         super::run_program_atexit();
+        crate::selfexe::remove();
         end_process(code)
     }
 

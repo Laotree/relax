@@ -114,9 +114,6 @@ fn host() -> &'static Host {
 pub fn set_host(host: &'static Host) {
     if HOST.set(host).is_ok() {
         relax_compiler::pmhost::set_policy(host.proc_macros);
-        // what a program's spawn of this executable may start with to run it, not itself again
-        // (std process.rs `loader_command`): the runner's commands and the host's own
-        relax_compiler::set_loader_commands(help::COMMANDS.iter().copied().chain(host.commands.iter().map(|c| c.name)).collect());
         relax_compiler::reload::set_loader_package(host.package, host.manifest);
         // the entry point's ahead level, unless the environment names one; RELAX_AHEAD
         // carries it to the session (options.rs) and to every process this one starts
@@ -317,9 +314,10 @@ fn run(raw_args: Vec<Vec<u8>>) {
         return;
     }
     // every program this loader runs (and every program those start) finds it here: a program
-    // runs under the loader when its own executable is this file (std::env::current_exe), and
-    // starts other apps with `$RELAX_LOADER run ...` (std process.rs: a spawn of the loader
-    // whose first argument is one of its commands runs that command, never the program again)
+    // runs under the loader with its own hard link of this file as its executable
+    // (std::env::current_exe, relax-compiler selfexe.rs), and starts other apps with
+    // `$RELAX_LOADER run ...` (std process_unix.rs: a spawn of the loader by this name runs as
+    // written, never the program again)
     if let Some(e) = loader_exe() {
         std::env::set_var("RELAX_LOADER", e);
     }

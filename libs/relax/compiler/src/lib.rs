@@ -189,6 +189,7 @@ mod test_child {
 
 pub mod front;
 pub mod global_asm;
+pub mod selfexe;
 pub mod live;
 pub mod reload;
 pub mod modules;
