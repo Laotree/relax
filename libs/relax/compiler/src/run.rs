@@ -12,7 +12,8 @@
 //! dirs.rs) on a worker while the program runs.
 //!
 //! Options (before the package): `--units <json>` uses a saved unit graph instead of cargo;
-//! `--ahead=<level>`; `--quiet` (no compile-error stream); `--verbose` (phase timings and info).
+//! `--ahead=<level>`; `--quiet` (no progress display; compile errors still print); `--verbose`
+//! (phase timings and info).
 //! Env: RELAX_VERBOSE=1, RELAX_STD, RELAX_ERRORS=N (resolve /
 //! signature errors printed, default 20), RELAX_REPORT=<path> (JSON boot report).
 //! `--report-to <path>`: progress for a launcher (the runner app), see `report` below.
@@ -3248,10 +3249,10 @@ fn flush_errors(block: bool) {
         if u.errors.iter().skip(seen).any(|e| e.contains("internal compiler error")) {
             crate::tui::keep_log();
         }
-        if !QUIET.load(Ordering::Relaxed) {
-            for e in u.errors.iter().skip(seen) {
-                eprintln!("relax: [t={:.0} ms] {}", crate::clock::ms_since_start(), e);
-            }
+        // printed with --quiet as well: an error no call ever panics on (a constant's, which the
+        // program reads as a stand-in value) reaches the user only here
+        for e in u.errors.iter().skip(seen) {
+            eprintln!("relax: [t={:.0} ms] {}", crate::clock::ms_since_start(), e);
         }
         // the report file may be a FIFO a slow reader drains: written after the owner thread releases it
         let to_report: Vec<String> = if u.errors.len() > seen && (reporting() || crate::run_state::observed()) { u.errors.iter().skip(seen).map(|e| e.to_string()).collect() } else { Vec::new() };
