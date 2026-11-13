@@ -1185,6 +1185,19 @@ fn library_imports(lib: &str) -> Result<Vec<String>, String> {
     Ok(imports.into_iter().collect())
 }
 
+/// What a native library's C code needs from the C runtime beyond what the C compiler links by
+/// default, on `triple`: on Linux (and the other ELF systems) its math, threads and dynamic
+/// loading are libraries of their own. mingw-w64's gcc links its C runtime by default and has no
+/// libdl, so `-ldl` failed every Windows link (relax issue 155: "cannot find -ldl"); Apple's
+/// libSystem holds them all (its link never asked).
+fn c_runtime_libs(triple: &str) -> &'static [&'static str] {
+    if triple.contains("-windows") || triple.contains("-apple-") {
+        &[]
+    } else {
+        &["-lm", "-lpthread", "-ldl"]
+    }
+}
+
 fn link(lib_path: &str, out: &Outputs, triple: &str, resolvable: Resolvable) -> Result<(), String> {
     let (archives, search, fw_search, dylibs, frameworks) = (&out.archives, &out.search, &out.fw_search, &out.dylibs, &out.frameworks);
     if let Some(d) = std::path::Path::new(lib_path).parent() {
@@ -1246,8 +1259,7 @@ fn link(lib_path: &str, out: &Outputs, triple: &str, resolvable: Resolvable) -> 
             cmd.arg(&addresses_path);
         }
         cmd.args(archives);
-        // what the archives' C code needs from the C runtime
-        cmd.args(["-lm", "-lpthread", "-ldl"]);
+        cmd.args(c_runtime_libs(triple));
     }
     for d in search {
         cmd.arg(format!("-L{}", d));
@@ -1561,6 +1573,18 @@ fn a_static_library_comes_from_the_script_that_built_it() {
     let out = outputs_with(&pkg, &scripts, &[0, 1], &messages).unwrap_or_else(|e| panic!("{e}"));
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(out.archives, vec![format!("{}/libsqlite3.a", bundled.display())]);
+}
+
+#[cfg(test)]
+#[test]
+fn the_c_runtime_libraries_are_the_targets_own() {
+    for triple in ["x86_64-pc-windows-gnu", "x86_64-pc-windows-msvc", "aarch64-pc-windows-gnullvm"] {
+        assert!(c_runtime_libs(triple).is_empty(), "{triple}: Windows' C runtime has no libdl, and links its math and threads by default");
+    }
+    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-musl"] {
+        assert_eq!(c_runtime_libs(triple), ["-lm", "-lpthread", "-ldl"], "{triple}: libm, libpthread and libdl are libraries of their own");
+    }
+    assert!(c_runtime_libs("aarch64-apple-darwin").is_empty(), "macOS: libSystem holds them");
 }
 
 #[cfg(test)]
