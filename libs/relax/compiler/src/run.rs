@@ -753,6 +753,12 @@ pub(crate) fn resolve_package(
         for u in g.raw.iter_mut().filter(|u| ours(&u.pkg.0)) {
             u.host_checks = Some(p.checks(&u.pkg.0, &u.pkg.1, &u.pkg.2, !u.path_source, true));
         }
+        // and what each script is told of the profile its package builds for (PROFILE, OPT_LEVEL,
+        // DEBUG; a host-only package's: the build-override's)
+        for bs in g.build_scripts.iter_mut() {
+            let ((dir, name, version), c) = (&g.pkg[bs.krate], &g.crates[bs.krate]);
+            bs.profile = p.script(dir, name, version, c.registry, c.host_only || c.proc_macro);
+        }
     }
     {
         // The loader's provided crates are host code built for the machine: their shims bind

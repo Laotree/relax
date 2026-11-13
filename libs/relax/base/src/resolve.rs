@@ -1519,21 +1519,57 @@ impl ProfileChecks {
     }
 }
 
-/// The two settings as one profile table, or one package's override in it, sets them.
+/// What a package's build script is told of the profile it builds for, as cargo tells it
+/// (custom_build.rs): PROFILE (`release` when the profile is `release` or inherits it, else
+/// `debug`), OPT_LEVEL and DEBUG (whether debug info is on) as the package's profile sets them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ScriptProfile {
+    pub release: bool,
+    /// `0`-`3`, `s` or `z`
+    pub opt_level: char,
+    pub debuginfo: bool,
+}
+
+impl ScriptProfile {
+    /// A `relax run`'s: it builds as the release profile does (no debug assertions or overflow
+    /// checks), whatever `cargo run`'s dev profile would.
+    pub const RUN: ScriptProfile = ScriptProfile { release: true, opt_level: '3', debuginfo: false };
+
+    pub fn env(self) -> [(&'static str, String); 3] {
+        [("PROFILE", if self.release { "release" } else { "debug" }.to_string()), ("OPT_LEVEL", self.opt_level.to_string()), ("DEBUG", self.debuginfo.to_string())]
+    }
+}
+
+/// The settings as one profile table, or one package's override in it, sets them.
 #[derive(Clone, Copy, Default, Debug)]
 struct ChecksSet {
     debug_assertions: Option<bool>,
     overflow_checks: Option<bool>,
+    opt_level: Option<char>,
+    debuginfo: Option<bool>,
 }
 
 impl ChecksSet {
     /// `self`, with what it leaves unset taken from `lower`.
     fn over(self, lower: ChecksSet) -> ChecksSet {
-        ChecksSet { debug_assertions: self.debug_assertions.or(lower.debug_assertions), overflow_checks: self.overflow_checks.or(lower.overflow_checks) }
+        ChecksSet {
+            debug_assertions: self.debug_assertions.or(lower.debug_assertions),
+            overflow_checks: self.overflow_checks.or(lower.overflow_checks),
+            opt_level: self.opt_level.or(lower.opt_level),
+            debuginfo: self.debuginfo.or(lower.debuginfo),
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.debug_assertions.is_none() && self.overflow_checks.is_none() && self.opt_level.is_none() && self.debuginfo.is_none()
     }
 
     fn apply(self, to: ProfileChecks) -> ProfileChecks {
         ProfileChecks { debug_assertions: self.debug_assertions.unwrap_or(to.debug_assertions), overflow_checks: self.overflow_checks.unwrap_or(to.overflow_checks) }
+    }
+
+    fn apply_script(self, to: ScriptProfile) -> ScriptProfile {
+        ScriptProfile { release: to.release, opt_level: self.opt_level.unwrap_or(to.opt_level), debuginfo: self.debuginfo.unwrap_or(to.debuginfo) }
     }
 
     /// The settings of a profile's table (or a package's table in it) in the file `path`.
@@ -1543,7 +1579,34 @@ impl ChecksSet {
             Some(Toml::Bool(x, _)) => Ok(Some(*x)),
             Some(_) => Err(format!("{path}: {what} `{k}` is not a boolean")),
         };
-        Ok(ChecksSet { debug_assertions: flag("debug-assertions")?, overflow_checks: flag("overflow-checks")? })
+        let opt_level = match t.get("opt-level") {
+            None => None,
+            Some(Toml::Num(n, _)) if n.fract() == 0.0 && (0.0..=3.0).contains(n) => Some(char::from(b'0' + *n as u8)),
+            Some(Toml::Str(v, _)) => Some(opt_level(v).ok_or_else(|| format!("{path}: {what} `opt-level` `{v}` is none of 0-3, s, z"))?),
+            Some(_) => return Err(format!("{path}: {what} `opt-level` is none of 0-3, s, z")),
+        };
+        let debuginfo = match t.get("debug") {
+            None => None,
+            Some(Toml::Bool(x, _)) => Some(*x),
+            Some(Toml::Num(n, _)) if n.fract() == 0.0 && (0.0..=2.0).contains(n) => Some(*n != 0.0),
+            Some(Toml::Str(v, _)) => Some(debuginfo(v).ok_or_else(|| format!("{path}: {what} `debug` `{v}` is no debug info level"))?),
+            Some(_) => return Err(format!("{path}: {what} `debug` is no debug info level")),
+        };
+        Ok(ChecksSet { debug_assertions: flag("debug-assertions")?, overflow_checks: flag("overflow-checks")?, opt_level, debuginfo })
+    }
+}
+
+/// A profile's `opt-level` as written (`3`, `"s"`).
+fn opt_level(v: &str) -> Option<char> {
+    matches!(v, "0" | "1" | "2" | "3" | "s" | "z").then(|| v.chars().next()).flatten()
+}
+
+/// Whether a profile's `debug` as written turns debug info on (cargo DebugInfo::is_turned_on).
+fn debuginfo(v: &str) -> Option<bool> {
+    match v {
+        "false" | "0" | "none" => Some(false),
+        "true" | "1" | "2" | "line-directives-only" | "line-tables-only" | "limited" | "full" => Some(true),
+        _ => None,
     }
 }
 
@@ -1560,6 +1623,7 @@ impl ChecksSet {
 pub struct Profile {
     root: String,
     checks: ProfileChecks,
+    script: ScriptProfile,
     build: ChecksSet,
     any: ChecksSet,
     /// (package name, version or any, overrides)
@@ -1593,6 +1657,14 @@ pub fn profile(dir: &str, name: &str) -> Result<Profile, String> {
         Some((var, v)) => Err(format!("{var}: `{v}` is not a boolean")),
     };
     // the inherits chain, the named profile first
+    let env_value = |p: &str, key: &str, value: fn(&str) -> Option<char>| match env(p, key) {
+        None => Ok(None),
+        Some((var, v)) => value(&v).map(Some).ok_or_else(|| format!("{var}: `{v}` is none of 0-3, s, z")),
+    };
+    let env_debug = |p: &str, key: &str| match env(p, key) {
+        None => Ok(None),
+        Some((var, v)) => debuginfo(&v).map(Some).ok_or_else(|| format!("{var}: `{v}` is no debug info level")),
+    };
     let mut chain = vec![name.to_string()];
     loop {
         let p = chain[chain.len() - 1].clone();
@@ -1618,8 +1690,13 @@ pub fn profile(dir: &str, name: &str) -> Result<Profile, String> {
     let (mut level, mut build, mut any) = (ChecksSet::default(), ChecksSet::default(), ChecksSet::default());
     let mut named: Vec<(String, Option<String>, ChecksSet)> = Vec::new();
     for p in &chain {
-        let mut here = ChecksSet { debug_assertions: env_flag(p, "DEBUG_ASSERTIONS")?, overflow_checks: env_flag(p, "OVERFLOW_CHECKS")? };
-        let mut host = ChecksSet { debug_assertions: env_flag(p, "BUILD_OVERRIDE_DEBUG_ASSERTIONS")?, overflow_checks: env_flag(p, "BUILD_OVERRIDE_OVERFLOW_CHECKS")? };
+        let mut here = ChecksSet { debug_assertions: env_flag(p, "DEBUG_ASSERTIONS")?, overflow_checks: env_flag(p, "OVERFLOW_CHECKS")?, opt_level: env_value(p, "OPT_LEVEL", opt_level)?, debuginfo: env_debug(p, "DEBUG")? };
+        let mut host = ChecksSet {
+            debug_assertions: env_flag(p, "BUILD_OVERRIDE_DEBUG_ASSERTIONS")?,
+            overflow_checks: env_flag(p, "BUILD_OVERRIDE_OVERFLOW_CHECKS")?,
+            opt_level: env_value(p, "BUILD_OVERRIDE_OPT_LEVEL", opt_level)?,
+            debuginfo: env_debug(p, "BUILD_OVERRIDE_DEBUG")?,
+        };
         for (path, t) in &files {
             let Some(pt) = table(t, p) else { continue };
             here = here.over(ChecksSet::read(pt, path, &format!("[profile.{p}]"))?);
@@ -1648,7 +1725,11 @@ pub fn profile(dir: &str, name: &str) -> Result<Profile, String> {
         level = level.over(here);
         build = build.over(host);
     }
-    Ok(Profile { root, checks: level.apply(ProfileChecks { debug_assertions: on, overflow_checks: on }), build, any, named, ws: std::cell::OnceCell::new() })
+    // dev: no optimisation, debug info; release: opt-level 3, none. A host unit's build-override
+    // defaults to opt-level 0 and no debug info (cargo profiles.rs default_build_override)
+    let script = level.apply_script(if on { ScriptProfile { release: false, opt_level: '0', debuginfo: true } } else { ScriptProfile::RUN });
+    let build = build.over(ChecksSet { opt_level: Some('0'), debuginfo: Some(false), ..ChecksSet::default() });
+    Ok(Profile { root, checks: level.apply(ProfileChecks { debug_assertions: on, overflow_checks: on }), script, build, any, named, ws: std::cell::OnceCell::new() })
 }
 
 impl Profile {
@@ -1668,6 +1749,24 @@ impl Profile {
             }
         }
         c
+    }
+
+    /// What the build script of the package `name` `version` in `dir` is told of the profile
+    /// (`registry` and `host` as for `checks`: a host unit's profile is its build-override's).
+    pub fn script(&self, dir: &str, name: &str, version: &str, registry: bool, host: bool) -> ScriptProfile {
+        let mut s = self.script;
+        if host {
+            s = self.build.apply_script(s);
+        }
+        if !self.any.is_empty() && (registry || !self.member(dir)) {
+            s = self.any.apply_script(s);
+        }
+        for (n, v, set) in &self.named {
+            if n == name && v.as_deref().is_none_or(|v| v == version) {
+                s = set.apply_script(s);
+            }
+        }
+        s
     }
 
     fn member(&self, dir: &str) -> bool {

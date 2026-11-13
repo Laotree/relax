@@ -157,6 +157,23 @@ pub fn recorded_loader(exe: &std::path::Path) -> Option<PathBuf> {
     (loader.is_file() && !is_run_link(&loader)).then_some(loader)
 }
 
+/// The cargo of a build, as cargo names itself to what it builds (CARGO, an absolute path): the one
+/// this process was started with when that names a cargo by an absolute path (a run under cargo:
+/// its toolchain's), else the first `cargo` on PATH; None without one.
+pub fn cargo_exe() -> Option<String> {
+    static CARGO: OnceLock<Option<String>> = OnceLock::new();
+    CARGO
+        .get_or_init(|| {
+            let cargo = |p: &Path| p.is_absolute() && p.is_file() && p.file_stem().is_some_and(|s| s == "cargo");
+            if let Some(c) = std::env::var_os("CARGO").map(PathBuf::from).filter(|c| cargo(c)) {
+                return Some(c.display().to_string());
+            }
+            let name = if cfg!(windows) { "cargo.exe" } else { "cargo" };
+            std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(name)).find(|c| cargo(c)).map(|c| c.display().to_string())
+        })
+        .clone()
+}
+
 /// This process's relax dir: the handed-over one, else RELAX_CACHE_DIR, else the workspace's
 /// (relax_dir_for(workspace_dir())).
 pub fn relax_dir() -> PathBuf {

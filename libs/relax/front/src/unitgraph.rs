@@ -33,6 +33,9 @@ pub struct BuildScript {
     /// `links =`: cargo runs them first and gives this script their metadata as
     /// `DEP_<LINKS>_<KEY>` (the unit graph lists their runs among this run's dependencies)
     pub links_deps: Vec<usize>,
+    /// what the script is told of its profile (PROFILE, OPT_LEVEL, DEBUG): a run's builds are
+    /// release's, a test's its profile's (relax-compiler run.rs)
+    pub profile: crate::resolve::ScriptProfile,
 }
 
 impl BuildScript {
@@ -289,7 +292,7 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
                 }
                 let build_deps = raw.get(*bu).map(|r| r.deps.clone()).unwrap_or_default();
                 script_of_run.insert(*i, build_scripts.len());
-                build_scripts.push(BuildScript { krate: ci, also: Vec::new(), src_path: p.clone(), edition: *ed, features: f.clone(), build_deps, links_deps: Vec::new() });
+                build_scripts.push(BuildScript { krate: ci, also: Vec::new(), src_path: p.clone(), edition: *ed, features: f.clone(), build_deps, links_deps: Vec::new(), profile: crate::resolve::ScriptProfile::RUN });
             }
         }
         c.deps = nd;
@@ -414,12 +417,17 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
 /// cargo's per-package environment (CARGO_MANIFEST_DIR, CARGO_MANIFEST_PATH, CARGO_PKG_*): its
 /// crates' at compile time, its build script's and its targets' at run time.
 fn pkg_env(dir: &str, name: &str, ver: &str) -> Vec<(String, String)> {
-    let mut e = vec![
+    // CARGO: the cargo of the build by an absolute path, as cargo gives it to rustc (env!, proc
+    // macros that run `$CARGO metadata`) and to the program it runs (relax-compiler run.rs
+    // program_env); a build script's is the loader (run_one). None without a cargo, never a bare
+    // `cargo` looked up on PATH at each spawn
+    let mut e: Vec<(String, String)> = crate::dirs::cargo_exe().map(|c| ("CARGO".to_string(), c)).into_iter().collect();
+    e.extend([
         ("CARGO_MANIFEST_DIR".to_string(), dir.to_string()),
         ("CARGO_MANIFEST_PATH".to_string(), crate::crates::join_path(dir, "Cargo.toml")),
         ("CARGO_PKG_NAME".to_string(), name.to_string()),
         ("CARGO_PKG_VERSION".to_string(), ver.to_string()),
-    ];
+    ]);
     let (core, pre) = version_parts(ver);
     let parts: Vec<&str> = core.split('.').collect();
     for (k, key) in ["CARGO_PKG_VERSION_MAJOR", "CARGO_PKG_VERSION_MINOR", "CARGO_PKG_VERSION_PATCH"].iter().enumerate() {
@@ -1272,9 +1280,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         .env("RELAX_BUILD_SCRIPT", "1")
         .env("TARGET", target_triple(sess))
         .env("HOST", host_triple(sess))
-        .env("PROFILE", "release")
-        .env("OPT_LEVEL", "3")
-        .env("DEBUG", "false")
+        .envs(bs.profile.env())
         .env("NUM_JOBS", "4")
         .envs(pkg_env(dir, pname, ver))
         // Both tools are the loader: RUSTC probes use its target model, CARGO metadata its

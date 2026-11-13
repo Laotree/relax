@@ -1691,7 +1691,7 @@ fn native_key_follows_the_resolved_closure_and_its_path_sources() {
             host: None, proc_macro: false, bin: false, harness: false, build_script: false, version: "1.0.0".into(), registry: false, host_only: false }],
         root: 0,
         build_scripts: vec![BuildScript { krate: 0, also: Vec::new(), src_path: at("n/build.rs"), edition: 2021,
-            features: n_features.iter().map(|f| f.to_string()).collect(), build_deps: vec![(3, "h".into()), (4, "cc".into())], links_deps: Vec::new() }],
+            features: n_features.iter().map(|f| f.to_string()).collect(), build_deps: vec![(3, "h".into()), (4, "cc".into())], links_deps: Vec::new(), profile: crate::resolve::ScriptProfile::RUN }],
         pkg: vec![(at("n"), "n".into(), "1.0.0".into())],
         cfgs: vec![Vec::new()],
         env: vec![Vec::new()],

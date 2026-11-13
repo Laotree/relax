@@ -232,6 +232,12 @@ fn run_page(st: &Style) -> String {
     p.row("--relaxed[=<list>]", "Relaxed Rust for every crate (all, or a list)");
     p.row("--mount <dir>=<git-url>", "Mount another repository at a folder of the\nfirst (repeatable); an optional #ref pins it");
     p.row("--cached", "Run the newest local snapshot at once, and\nrefresh it in the background for next time");
+    p.section("Build:");
+    p.text("A run builds as cargo's release profile does (no debug assertions or");
+    p.text("overflow checks), so build scripts see PROFILE=release, OPT_LEVEL=3 and");
+    p.text("DEBUG=false; `cargo run` builds dev. env!(\"CARGO\"), proc macros and the");
+    p.text("program read CARGO as the absolute path of the cargo on PATH (or of the one");
+    p.text("that started the run), build scripts the loader (which answers `metadata`).");
     p.section("Cache:");
     p.text("A workspace run keeps its cache and build files in the workspace's");
     p.text("target/relax (like cargo). A git run has no checkout and keeps");
@@ -340,6 +346,7 @@ fn test_page(st: &Style) -> String {
     p.text("test harness.");
     p.text("A package's tests build with cargo test's profile: `test` (debug assertions and overflow");
     p.text("checks as the workspace's [profile.test] / [profile.dev] set them), --release the release one.");
+    p.text("Build scripts see that profile's PROFILE, OPT_LEVEL and DEBUG, as under cargo.");
     p.text("A file's tests build as rustc -O --test.");
     p.usage(&format!("{tool} test --live <package> [--lib | --test <name>] [-- <test args>]", tool = command()));
     p.text("Keeps one target warm (default --lib); body edits rerun tests that entered the changed functions, including inlinees.");
