@@ -93,6 +93,21 @@ pub(crate) struct KeyInputs {
     pub allocator: u128,
 }
 
+/// A set of inputs hashed order-independently: sorted and deduplicated first, so the order in
+/// which a walk discovers them never changes a key. `Sip128::str` already length-prefixes, so
+/// field boundaries inside a hash are unambiguous.
+pub(crate) fn hash_set(values: impl IntoIterator<Item = u128>) -> u128 {
+    let mut v: Vec<u128> = values.into_iter().collect();
+    v.sort_unstable();
+    v.dedup();
+    let mut h = Sip128::new();
+    h.str("input-set");
+    for x in v {
+        h.u128(x);
+    }
+    h.finish128()
+}
+
 impl KeyInputs {
     pub(crate) fn hash(&self) -> u128 {
         let KeyInputs { codegen, target, cfg, opt, panic, debug_assertions, overflow_checks, target_cpu, rustflags, env_code, include_bytes, build_outputs, deps_content, proc_macro, allocator } = self;
@@ -10943,6 +10958,21 @@ mod prune_tests {
         // the folder also holds this process's live lock (store::hold_build)
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir(&root).unwrap();
+    }
+
+    /// Field boundaries and set order are unambiguous: shifting a boundary changes the hash, and
+    /// a set hashes the same in any order.
+    #[test]
+    fn key_encoding_separates_fields_and_ignores_set_order() {
+        let mut a = Sip128::new();
+        a.str("ab");
+        a.str("c");
+        let mut b = Sip128::new();
+        b.str("a");
+        b.str("bc");
+        assert_ne!(a.finish128(), b.finish128(), "a shifted boundary kept the hash");
+        assert_eq!(hash_set([1u128, 2, 3]), hash_set([3, 1, 2, 2]));
+        assert_ne!(hash_set([1u128, 2, 3]), hash_set([1, 2, 4]));
     }
 
     /// Every input field changes the key: mutate one at a time and the hash must move.
