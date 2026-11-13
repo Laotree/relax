@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""The terminal status keeps ticking while the cold app waits for first present."""
+"""The terminal status keeps ticking while the cold app waits for first present, and an idle
+compiler reads "running", not "compiling" (a program that never presents read as compiling forever)."""
 import os
 from pathlib import Path
 import pty
@@ -46,16 +47,17 @@ fn main() {
         while time.monotonic() - start < 3:
             drain()
         text = re.sub(r"\x1b\[[0-9;]*m", "", data[begin:].decode(errors="replace"))
-        ticks = re.findall(r"compiling[^\r\n]*? · (\d+\.\d+) s", text)
+        ticks = re.findall(r"(?:compiling|running)[^\r\n]*? · (\d+\.\d+) s", text)
         assert len(ticks) >= 12 and float(ticks[-1]) - float(ticks[0]) >= 2.5, text
-        assert "queued" in text and "active" in text, text
+        # the fixture's main waits on a file: nothing compiles, and the last redraw says so
+        assert re.search(r"running +\d+ fns compiled · \d+\.\d+ s", text.rsplit("\x1b[2K", 1)[-1]), text
         (root / "done").touch()
         deadline = time.monotonic() + 30
         while p.poll() is None:
             assert time.monotonic() < deadline, data.decode(errors="replace")
             drain()
         assert p.returncode == 0, data.decode(errors="replace")
-        print("PASS progress: %d redraws over 3 seconds; elapsed, compiled, queued and active fields" % len(ticks))
+        print("PASS progress: %d redraws over 3 seconds; an idle compiler reads running" % len(ticks))
     finally:
         if p.poll() is None:
             p.kill()
