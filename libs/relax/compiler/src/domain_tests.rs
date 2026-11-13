@@ -1190,11 +1190,16 @@ fn the_next_run_finds_nothing_locked_and_its_crash_is_a_crash() {
 const HOLDS: &str = r#"
 use std::sync::atomic::{AtomicU64, Ordering};
 extern "C" fn called_after_the_end() {}
+// pthread_key_t: an unsigned long on Apple's systems, an unsigned int on the others
+#[cfg(target_vendor = "apple")]
+type Key = usize;
+#[cfg(all(unix, not(target_vendor = "apple")))]
+type Key = u32;
 #[cfg(unix)]
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn signal(sig: i32, handler: usize) -> usize;
-    fn pthread_key_create(key: *mut u32, dtor: usize) -> i32;
+    fn pthread_key_create(key: *mut Key, dtor: usize) -> i32;
     fn pthread_atfork(prepare: Option<extern "C" fn()>, parent: Option<extern "C" fn()>, child: Option<extern "C" fn()>) -> i32;
 }
 #[cfg(unix)]
@@ -1209,7 +1214,7 @@ fn platform() -> *mut u8 {
     const SIGUSR2: i32 = 31;
     unsafe {
         signal(SIGUSR2, called_after_the_end as usize);
-        let mut key = 0;
+        let mut key: Key = 0;
         pthread_key_create(&mut key, called_after_the_end as usize);
         pthread_atfork(Some(called_after_the_end), None, None);
         mmap(std::ptr::null_mut(), 1 << 20, 3, 2 | MAP_ANON, -1, 0)
