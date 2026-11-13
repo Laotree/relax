@@ -620,6 +620,116 @@ fn specv_verified_rebuild_runs_twin_code_not_lazy_compiles() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// SPEC-V: code lowered before its verdict calls twins. Once the caller's verdict is clean, its
+/// cached code may call the twins' bases (built with `noalias`) instead: when it is linked
+/// (twin_link_target) and when the startup image is written (build_image), which the next warm
+/// launch links as it is. Not when the verdict asks for a run-time disjoint-index check (Relaxed
+/// Rust D3): that code has no check, and `pair_call` passes `bump` one element twice when its
+/// indices meet. Not from a twin either: its callers may pass it aliased arguments, which it
+/// passes on. A clean caller that needs no check (`pair_locals`) does call the base.
+#[test]
+fn specv_twin_calls_reach_bases_only_from_code_that_needs_no_check() {
+    const CHILD: &str = "RELAX_SPECV_D3_LINK_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::specv_twin_calls_reach_bases_only_from_code_that_needs_no_check", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1"));
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    use std::sync::atomic::Ordering;
+    crate::jit::CHECK_FIRST.store(false, Ordering::Relaxed);
+    crate::jit::SPECV_HOLD.store(1, Ordering::Relaxed);
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-specv-d3-link-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::env::set_var("RELAX_CACHE_DIR", dir.join("cache"));
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    // io = [i, j, result]
+    let src = "#[inline(never)] pub fn bump(a: &mut usize, b: &mut usize) { *a += 10; *b += 100; }\n\
+        #[inline(never)] pub fn mid(a: &mut usize, b: &mut usize) { bump(a, b) }\n\
+        pub fn pair_call(io: &mut [usize; 3]) {\n    let (i, j) = (io[0], io[1]);\n    let mut v = [1usize, 2, 3];\n    let a = &mut v[i];\n    let b = &mut v[j];\n    bump(a, b);\n    io[2] = v[0] + v[1] + v[2];\n}\n\
+        pub fn pair_locals(io: &mut [usize; 3]) { let (mut a, mut b) = (io[0], io[1]); mid(&mut a, &mut b); io[2] = a + b; }\n";
+    std::fs::write(dir.join("app/src/lib.rs"), src).unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let mut session = crate::Session::default();
+    session.options.relaxed = Some("disjoint-index".to_string());
+    let session = Arc::new(session);
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "specv_d3_link", false).unwrap();
+    let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}}]}}"#, dir.display(), crate::diag::quote(&app));
+    let roots = crate::reload::gandalf_app_roots(&crate::unitgraph::Units::from_json(graph.as_bytes()).unwrap(), dir.join("app").to_str().unwrap());
+    let find = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let defs = [find("bump"), find("mid"), find("pair_call"), find("pair_locals")];
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    crate::borrowck::event::set_app_scope(roots);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    crate::syms::set_unit(up);
+    let ([bump, mid, pair_call, pair_locals], pair_entry, locals_entry) = crate::owner::call(crate::owner::Class::Program, || {
+        let mut cache = crate::cache::Cache::open(&u, crate::cache::Mode::ReadOnly).unwrap();
+        cache.mode = crate::cache::Mode::On;
+        u.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
+        let ids = defs.map(|d| u.fn_id(crate::jit::FnKey::Inst(d, vec![])));
+        // the bases run only as their twins until the image's compiles below: their checks queued now
+        for b in &ids[..2] { u.note_first_borrowck(*b, None); }
+        (ids, u.entry(ids[2]), u.entry(ids[3]))
+    });
+    let run = |entry: u64, i: usize, j: usize| -> usize {
+        let mut io = [i, j, 0usize];
+        unsafe { crate::jit::call_jit(up, entry, &mut io as *mut [usize; 3] as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        io[2]
+    };
+    // held verdicts: both callers run as unverified code, calling twins (twin mid calls twin bump)
+    assert_eq!(run(pair_entry, 0, 1), 116);
+    assert_eq!(run(locals_entry, 1, 2), 113);
+    let (twin_bump, twin_mid) = (u.plain_twin_of(bump).expect("bump's twin"), u.plain_twin_of(mid).expect("mid's twin"));
+    assert!(u.fns[twin_bump as usize].compiled && u.fns[twin_mid as usize].compiled && !u.fns[bump as usize].compiled && !u.fns[mid as usize].compiled,
+        "the unverified callers ran the twins, never the bases");
+    crate::jit::specv_release();
+    let t0 = std::time::Instant::now();
+    loop {
+        crate::borrowck::settle().recv().unwrap();
+        if [bump, mid, pair_call, pair_locals].iter().all(|&i| u.verdict_clean(i)) { break; }
+        let state = |i: u32| match u.verdict_state(i) {
+            crate::jit::Verdict::Clean => "clean".to_string(),
+            crate::jit::Verdict::Failed(_) => "failed".to_string(),
+            crate::jit::Verdict::Pending => "pending".to_string(),
+            crate::jit::Verdict::Unverifiable(why) => format!("unverifiable ({why})"),
+        };
+        assert!(t0.elapsed().as_secs() < 20, "no clean verdicts: bump, mid, pair_call, pair_locals {:?}", [bump, mid, pair_call, pair_locals].map(state));
+    }
+    assert!(u.disjoint_checks(pair_call).is_some(), "pair_call is accepted with a run-time disjoint-index check");
+    assert!(u.disjoint_checks(pair_locals).is_none());
+    // the lazy link of the callers' cached code (the bases' entries stored)
+    assert_eq!(u.twin_link_target(pair_call, twin_bump, |_| true), twin_bump, "code without its disjoint-index check keeps the twin");
+    assert_eq!(u.twin_link_target(twin_mid, twin_bump, |_| true), twin_bump, "a twin's calls stay twin calls");
+    assert_eq!(u.twin_link_target(pair_locals, twin_mid, |_| true), mid, "a clean caller that needs no check calls the base");
+    // the image written now: the bases' own entries, then the startup slots (the callers' unverified
+    // code); a twin call it sends to the base is one TWIN_RETARGETS
+    let retargets = crate::owner::call(crate::owner::Class::Program, || {
+        for b in [bump, mid] {
+            let (code, pc_map, relocs) = unsafe { crate::jit::compile_fn(up, b) }.unwrap();
+            let mut cache = u.cache.take().unwrap();
+            cache.record(&u, b, &code, &relocs, &pc_map);
+            u.cache = Some(cache);
+        }
+        u.flush_cache_records();
+        let before = crate::jit::TWIN_RETARGETS.load(Ordering::Relaxed);
+        let mut cache = u.cache.take().unwrap();
+        assert!(cache.record_manifest(&u, app_crate, &[pair_call, pair_locals], 2, &|| false));
+        u.cache = Some(cache);
+        crate::jit::TWIN_RETARGETS.load(Ordering::Relaxed) - before
+    });
+    assert_eq!(retargets, 1, "the image sends pair_locals' call to mid; pair_call's and twin mid's calls stay twin calls");
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// SPEC-V (lane JITLIVEO3): a twin runs in its base's place until the base's verdict is clean, so
 /// the base's own record and counters saw none of that run. The twin gets a counted build (its
 /// unverified baseline code is its code for good), and the base's O3 build takes the twin's counts,

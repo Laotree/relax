@@ -8457,12 +8457,26 @@ impl Unit {
         self.fn_map.get(&FnKey::Plain(id))
     }
 
+    /// SPEC-V: whether code of slot `caller` lowered before its verdict (its aliasing-prone calls going
+    /// to twins, no run-time disjoint-index checks) may call the twins' bases instead: the bases are
+    /// built with `noalias`, so only when that code passes them no aliased `&mut`. That holds when the
+    /// caller's verdict is clean and asks for no run-time disjoint-index checks: index borrows the
+    /// checker accepted only with such a check may overlap in code that lacks it. Never a twin: its
+    /// callers may pass it aliased arguments, which its calls pass on, so its calls stay twin calls.
+    /// (A verdict that asks for the checks is never stored: on a warm launch such a body is not clean
+    /// until this run's checker has it, and then its checks are known.)
+    /// Used where that code is linked (twin_link_target) and where the image is written (build_image).
+    pub(crate) fn unverified_code_calls_bases(&self, caller: u32) -> bool {
+        !matches!(self.fns[caller as usize].key, FnKey::Plain(_)) && self.verdict_clean(caller) && self.disjoint_checks(caller).is_none()
+    }
+
     /// SPEC-V: where linked (cached) code of slot `caller` sends its call / reference to slot `target`.
     /// A twin exists for callers whose aliasing is not known yet; cached code lowered in an earlier run
     /// before its verdict still names twins. When the caller's own body is verified clean now (a warm
-    /// launch knows the stored verdict before the first link), its calls go to the twin's base: the
-    /// verified body, sound for a caller that passes no aliased `&mut` (the image does the same when it
-    /// is written: build_image). Without it every warm launch
+    /// launch knows the stored verdict before the first link) without run-time disjoint-index checks
+    /// (unverified_code_calls_bases), its calls go to the twin's base: the verified body, sound for a
+    /// caller that passes no aliased `&mut` (the image does the same when it is written: build_image).
+    /// Without it every warm launch
     /// ran the race's draw path (draw_view .. set_uniform, find_appendable_drawcall) as twins built at
     /// O3 again in the background each launch (x64 live warm draw +10% over --check-first).
     /// RELAX_OPT=-twinlink keeps the twins (A/B).
@@ -8474,8 +8488,7 @@ impl Unit {
         let n = self.fns.len();
         if target as usize >= n || caller as usize >= n { return target }
         let FnKey::Plain(base) = self.fns[target as usize].key else { return target };
-        let body = match self.fns[caller as usize].key { FnKey::Plain(b) => b, _ => caller };
-        if (base as usize) < self.fns.len() && self.verdict_clean(body) && !matches!(self.verdict_state(base), Verdict::Failed(_))
+        if (base as usize) < self.fns.len() && self.unverified_code_calls_bases(caller) && !matches!(self.verdict_state(base), Verdict::Failed(_))
             && self.fns[base as usize].build_err.is_none()
             && (self.fns[base as usize].compiled || stored(base))
             && !relax_backend::stats::opt_off(&self.prog.session.options, "-twinlink") {

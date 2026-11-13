@@ -54,7 +54,8 @@ impl Cache {
         // SPEC-V: the image sends a verified-clean caller's calls to a twin to the twin's base when the
         // base's code is in the image too (a twin's key is its base's key behind tag 4): the code is
         // the caller's earlier (unverified) lowering, sound to call verified code once the caller's
-        // own verdict is clean. Later warm launches then never run the cold launch's twins (the race's
+        // own verdict is clean and asks for no run-time disjoint-index checks, and never from a twin
+        // (Unit::unverified_code_calls_bases). Later warm launches then never run the cold launch's twins (the race's
         // draw path: draw_view .. set_uniform), at no link cost (twin_link_target for the lazy path).
         crate::run::yield_section("image twins");
         let twinlink = !relax_backend::stats::opt_off(&u.prog.session.options, "-twinlink");
@@ -91,8 +92,7 @@ impl Cache {
             let sum = if pend.contains_key(k) { crate::store::sum64(payload) } else { let Some(s) = self.entry_sum(*k) else { continue }; s };
             let Some(bytes) = self.slot_bytes_known(*id) else { continue };
             let mut cr: Vec<u32> = crates.clone();
-            let body = match u.fns[*id as usize].key { crate::jit::FnKey::Plain(b) => b, _ => *id };
-            let clean = twinlink && u.verdict_clean(body);
+            let clean = twinlink && u.unverified_code_calls_bases(*id);
             let retarget = |t: &[u8]| -> bool { clean && t.first().copied().and_then(KeyKind::of) == Some(KeyKind::Twin) && in_image.contains(&t[1..]) };
             if image_slot(&mut tab, &mut slots, &mut blob, *k, sum, bytes, payload, &mut cr, &self.crate_by_ident, &retarget).is_some() {
                 n += 1;
