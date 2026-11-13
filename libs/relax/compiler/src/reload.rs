@@ -3965,6 +3965,15 @@ unsafe fn initializer_deps_changed(up: *mut Unit, root: u32, changed: &[DefId], 
             }
         };
         if hit { return Ok(true); }
+        // a callee that never returns (`-> !`, a panic path) was not entered by an initializer
+        // that completed: nothing it reaches is a dependency of the value (an indirect call in
+        // core's panic machinery made every edit a restart: relax issue 137). An edit of the
+        // callee itself is still one (`hit` above).
+        if let FnKey::Inst(d, _) = &u.fns[s as usize].key {
+            if u.tcx.fn_sig(&u.prog, *d).is_some_and(|sig| matches!(u.tcx.tys.kind(sig.ret), crate::types::TyKind::Never)) {
+                continue;
+            }
+        }
         if u.fns[s as usize].rir.is_none() {
             jit::build_rir(up, s).map_err(|e| format!("`{}`: {}", (&*up).fns[s as usize].name, e))?;
         }
@@ -10035,7 +10044,7 @@ mod round32_tests {
     fn enum_reload_snapshots() {
         const CHILD: &str = "RELAX_ENUM_RELOAD_CASE";
         let Ok(case) = std::env::var(CHILD) else {
-            for case in ["same", "changed", "order", "removed", "reordered", "added", "larger", "named", "executable", "callee", "named_code", "unrelated"] {
+            for case in ["same", "changed", "order", "removed", "reordered", "added", "larger", "named", "executable", "callee", "named_code", "unrelated", "unused_panic", "panic_callee"] {
                 let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "reload::round32_tests::enum_reload_snapshots", "--nocapture", "--test-threads=1"])
                     .env(CHILD, case).env("RELAX_CTFE", "0").env("RELAX_CACHE", "off").env("RELAX_GANDALF", "0"));
@@ -10064,6 +10073,13 @@ mod round32_tests {
             "named_code" => ("const fn d() -> isize { 1 } const N: isize = d(); enum E { A = N, B }", "const fn d() -> isize { 2 } const N: isize = d(); enum E { A = N, B }", false),
             // RELOAD': an edit outside the discriminant's dependencies keeps its value, unevaluated
             "unrelated" => ("const fn d() -> isize { 1 } fn g() -> isize { 5 } enum E { A = d(), B }", "const fn d() -> isize { 1 } fn g() -> isize { 6 } enum E { A = d(), B }", true),
+            // relax issue 137: a panic path the initializer did not take is no dependency (core's
+            // panic code makes an indirect call), so an unrelated edit still patches ...
+            "unused_panic" => ("const fn d(x: isize) -> isize { if x > 0 { return x; } panic!(\"no size\") } fn g() -> isize { 5 } enum E { A = d(1), B }",
+                "const fn d(x: isize) -> isize { if x > 0 { return x; } panic!(\"no size\") } fn g() -> isize { 6 } enum E { A = d(1), B }", true),
+            // ... and an edit of the code that computed the value still restarts
+            "panic_callee" => ("const fn d(x: isize) -> isize { if x > 0 { return x; } panic!(\"no size\") } enum E { A = d(1), B }",
+                "const fn d(x: isize) -> isize { if x > 0 { return x + 1; } panic!(\"no size\") } enum E { A = d(1), B }", false),
             _ => unreachable!(),
         };
         let path = std::env::temp_dir().join(format!("relax-enum-reload-{}.rs", std::process::id()));
@@ -10082,7 +10098,7 @@ mod round32_tests {
         let up = &mut *unit as *mut Unit;
         let values = |u: &Unit| u.tcx.adts[&def].discriminants(&u.tcx, &u.prog).into_iter().map(|(_, d)| d.val).collect::<Vec<_>>();
         let before = values(&unit);
-        let executable = matches!(case.as_str(), "executable" | "callee" | "named_code" | "unrelated");
+        let executable = matches!(case.as_str(), "executable" | "callee" | "named_code" | "unrelated" | "unused_panic" | "panic_callee");
         if executable { assert!(unit.stats.ctfe_code > 0, "the initializer must have run through JIT"); }
         let runs = unit.stats.ctfe_code;
         assert_eq!(before, if case == "larger" { vec![0, 1] } else { vec![1, 2] });
