@@ -97,9 +97,10 @@ pub fn disambiguate_multi_version_crates(units: &mut [CrateUnit]) {
     }
 }
 
-/// Crates Relax provides itself (std/substitutes.txt: `<name> <version prefix> <root>`):
-/// a unit of that crate at a matching version loads the provided root instead of its sources
-/// (same name; deps become core/alloc/std only; features ignored); one at another version is
+/// Crates Relax provides itself (std/substitutes.txt: `<name> <version prefix> <root> <features>`):
+/// a unit of that crate at a matching version that enables none of its features but those the
+/// root implements loads the provided root instead of its sources (same name and features; deps
+/// become core/alloc/std only); one at another version or with another feature enabled is
 /// compiled from its own source, which a --verbose load says. The rustc build keeps the real crates.
 /// Also hands the graph to the proc-macro host (macro_reg::register_and_strip); `additive`: the
 /// graph of a program started into a running one joins the registered graph.
@@ -121,8 +122,10 @@ pub fn apply_substitutes(sess: &std::sync::Arc<crate::Session>, units: &mut [Cra
     Ok(())
 }
 
-/// The table's substitutions made in `units`; returns a line for each unit of a provided crate at
-/// another version (its own source is compiled).
+/// The table's substitutions made in `units`; returns a line for each unit of a provided crate
+/// whose own source is compiled: one at another version, or one with a feature enabled that the
+/// provided root does not implement (cargo enabled it for the graph, and the root would leave out
+/// what it gates: smallvec's `serde` impls).
 fn apply_substitute_table(units: &mut [CrateUnit], std_dir: &str, table: &str) -> Vec<String> {
     let mut own = Vec::new();
     for line in table.lines() {
@@ -131,10 +134,11 @@ fn apply_substitute_table(units: &mut [CrateUnit], std_dir: &str, table: &str) -
             continue;
         }
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() != 3 {
+        if !(3..=4).contains(&parts.len()) {
             continue;
         }
         let (name, ver, root) = (parts[0], parts[1], parts[2]);
+        let implemented: Vec<&str> = parts.get(3).map_or(Vec::new(), |f| f.split(',').collect());
         for u in units.iter_mut() {
             if base_crate_name(&u.name) != name || u.proc_macro {
                 continue;
@@ -144,9 +148,13 @@ fn apply_substitute_table(units: &mut [CrateUnit], std_dir: &str, table: &str) -
                 own.push(format!("crate `{}` is version {}, substitutes.txt provides {}: its own source is compiled", name, u.version, ver));
                 continue;
             }
+            let missing: Vec<&str> = u.features.iter().map(|f| f.as_str()).filter(|f| !implemented.contains(f)).collect();
+            if !missing.is_empty() {
+                own.push(format!("crate `{}` {} enables feature `{}`, which the provided {} lacks: its own source is compiled", name, u.version, missing.join("`, `"), name));
+                continue;
+            }
             u.src_path = format!("{}/{}", std_dir, root);
             u.edition = 2021;
-            u.features.clear();
             u.deps.clear();
             u.host = None;
         }
@@ -172,12 +180,21 @@ fn a_provided_crate_at_another_version_compiles_its_own_source_and_says_so() {
         registry: true,
     };
     let mut units = vec![unit("1.13.2"), unit("0.6.14")];
-    let said = apply_substitute_table(&mut units, "/std", "# comment\nsmallvec 1 smallvec/lib.rs\n");
+    let said = apply_substitute_table(&mut units, "/std", "# comment\nsmallvec 1 smallvec/lib.rs union\n");
     assert_eq!(units[0].src_path, "/std/smallvec/lib.rs");
-    assert!(units[0].features.is_empty());
+    assert_eq!(units[0].features, ["union"], "the provided crate keeps the features it implements");
     assert_eq!(units[1].src_path, "/registry/smallvec-0.6.14/src/lib.rs");
     assert_eq!(units[1].features, ["union"]);
     assert_eq!(said, ["crate `smallvec` is version 0.6.14, substitutes.txt provides 1: its own source is compiled"]);
+    // relax issue 117: a feature the provided crate does not implement (`serde` impls) keeps the
+    // crate's own source, with its features and dependencies
+    let mut units = vec![unit("1.13.2")];
+    units[0].features.push("serde".to_string());
+    units[0].deps.push((7, "serde".to_string()));
+    let said = apply_substitute_table(&mut units, "/std", "smallvec 1 smallvec/lib.rs union,write\n");
+    assert_eq!((units[0].src_path.as_str(), units[0].deps.len()), ("/registry/smallvec-1.13.2/src/lib.rs", 1));
+    assert_eq!(units[0].features, ["union", "serde"]);
+    assert_eq!(said, ["crate `smallvec` 1.13.2 enables feature `serde`, which the provided smallvec lacks: its own source is compiled"]);
 }
 
 /// Unit indices with every crate after its dependencies.
