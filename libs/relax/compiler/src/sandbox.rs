@@ -18,7 +18,8 @@
 //!   non-generic functions; fn pointers are sandbox thunks, and an indirect call masks its
 //!   target into the sandbox thunk table; host runtime and C calls are allow-listed and the
 //!   memory ones replaced by arena-checked versions (malloc & co. allocate in the arena);
-//! - pre-optimization RIR blocks spend deterministic instruction fuel at entry.
+//! - in a domain that meters fuel (`Domain::fuel`), pre-optimization RIR blocks spend
+//!   deterministic instruction fuel at entry.
 //!
 //! Host code reaches a module only through generated wrapper functions (modules.rs) that enter
 //! the module's arena, copy reference arguments into it, call the twin and leave. Plain-data
@@ -165,17 +166,22 @@ impl State {
 /// name, address)))); None: not this domain's. Run-time modules add nothing (`MODULES`).
 pub type Allow = fn(&str) -> Option<Option<(&'static str, u64)>>;
 
-/// A confinement domain: its name and what its code may call beyond what every domain may. The
-/// name is part of its twins' cache keys: code one domain's policy made is never linked into
-/// another domain's unit (cache.rs enc_fnkey).
+/// A confinement domain: its name, what its code may call beyond what every domain may, and
+/// whether its code meters fuel. The name is part of its twins' cache keys: code one domain's
+/// policy made is never linked into another domain's unit (cache.rs enc_fnkey); `allow` and
+/// `fuel` are fixed per domain, so the name covers them.
 #[derive(Clone, Copy)]
 pub struct Domain {
     pub name: &'static str,
     pub allow: Allow,
+    /// its twins charge each block's instructions to the thread's fuel word (`add_fuel`): an
+    /// arena's per-call budget (`Arena::fuel`) can only end a call in a domain that meters
+    pub fuel: bool,
 }
 
-/// The run-time modules' domain: what every domain may call, nothing more.
-pub const MODULES: Domain = Domain { name: "modules", allow: modules_allow };
+/// The run-time modules' domain: what every domain may call, nothing more; metered (a module's
+/// arena may set a per-call budget).
+pub const MODULES: Domain = Domain { name: "modules", allow: modules_allow, fuel: true };
 
 fn modules_allow(_: &str) -> Option<Option<(&'static str, u64)>> {
     None
@@ -184,9 +190,10 @@ fn modules_allow(_: &str) -> Option<Option<(&'static str, u64)>> {
 struct Sb {
     /// the symbol TlsAddr reads the sandbox words' offset from (this unit's; the offset is TLS_OFF)
     tls_sym: Sym,
-    /// the domain's name and own C entries
+    /// the domain's name, own C entries and whether its twins meter fuel
     domain: &'static str,
     allow: Allow,
+    fuel: bool,
     sbt_base: u64,
     /// the table's bytes (a power of two: the indirect-call mask)
     sbt_span: u64,
@@ -313,6 +320,7 @@ unsafe fn sb_init(up: *mut Unit, domain: Domain) -> Result<(), String> {
         tls_sym,
         domain: domain.name,
         allow: domain.allow,
+        fuel: domain.fuel,
         sbt_base,
         sbt_span,
         sbt_n: 1,
@@ -2233,7 +2241,11 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
     f.blocks.extend(out_blocks);
     f.blocks.extend(new_blocks);
     f.slots.clear();
-    add_fuel(f, t_arena, site_fuel, panic_site, pos0, &costs);
+    // (a domain without fuel pays nothing per block: the meter's load and store of the thread's
+    // fuel word chained every block of its code through memory)
+    if with_sb(&*up, |s| s.fuel) {
+        add_fuel(f, t_arena, site_fuel, panic_site, pos0, &costs);
+    }
     with_sb(&*up, |s| s.refs.insert(twin_id, refs));
     f.verify().map_err(|e| format!("{}: sandbox transform made invalid RIR: {}", f.name, e))?;
     // the masks the transform added: common ones merged, loop-invariant ones hoisted. Only

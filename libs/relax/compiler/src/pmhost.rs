@@ -377,8 +377,9 @@ pub fn policy() -> Policy {
     if POLICY.load(std::sync::atomic::Ordering::Relaxed) == 1 { Policy::Open } else { Policy::Sandboxed }
 }
 
-/// The confined macros' domain (sandbox.rs `Domain`).
-const MACRO_DOMAIN: crate::sandbox::Domain = crate::sandbox::Domain { name: "proc-macro", allow: macro_allow };
+/// The confined macros' domain (sandbox.rs `Domain`). No fuel: the world's arena sets no budget,
+/// and a macro that never returns is the hang watchdog's (`watch_begin`).
+const MACRO_DOMAIN: crate::sandbox::Domain = crate::sandbox::Domain { name: "proc-macro", allow: macro_allow, fuel: false };
 
 /// The macro domain's own entries (sandbox.rs `Allow`): what a confined macro reaches of the
 /// host beyond memory, math and formatting.
