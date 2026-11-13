@@ -1158,7 +1158,7 @@ pub fn cmd_cache(_req: &Req, out: &mut Out) {
             for l in rows {
                 out.line(&l);
             }
-            out.always("more: pf jit  versions <fn>  why-tier <fn>");
+            out.line("more: pf jit  versions <fn>  why-tier <fn>");
         }
         None => out.err(&format!("the owner did not answer in 10 s ({})", crate::owner::serving_note())),
     }

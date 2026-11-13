@@ -206,10 +206,10 @@ pub fn cmd_requests(req: &Req, out: &mut Out) {
     let q = REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
     let lines: Vec<String> = q.iter().filter(|r| r.seq > after).map(|r| r.json.clone()).collect();
     drop(q);
-    out.always(&format!("{{\"engine_requests\":{},\"node\":{},\"now_ms\":{}}}", lines.len(), json_str(&node_name()), now_ms()));
+    out.line(&format!("{{\"engine_requests\":{},\"node\":{},\"now_ms\":{}}}", lines.len(), json_str(&node_name()), now_ms()));
     for l in lines {
         // a request is up to ~25 KB: never cut one off at the reply limit
-        out.always(&l);
+        out.line(&l);
     }
 }
 

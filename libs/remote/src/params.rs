@@ -35,13 +35,12 @@ fn field<'a>(s: &'a str, fields: &mut Vec<(&'a str, &'a str)>) {
     }
 }
 
-/// `full` belongs to the cmd envelope, which consumes it before any family dispatch.
+/// Every key of a request must be one of the schema's.
 pub fn validate<'a>(keys: impl IntoIterator<Item = &'a str>, params: &str) -> Result<(), String> {
     let properties = properties(params);
     for key in keys {
-        if key != "full" && !properties.iter().any(|(known, _)| *known == key) {
-            let mut known: Vec<_> = properties.iter().map(|(key, _)| *key).collect();
-            if !known.contains(&"full") { known.push("full"); }
+        if !properties.iter().any(|(known, _)| *known == key) {
+            let known: Vec<_> = properties.iter().map(|(key, _)| *key).collect();
             return Err(format!("unknown parameter {key:?}; known: {}", known.join(", ")));
         }
     }
@@ -143,8 +142,8 @@ mod tests {
     #[test]
     fn schemas_reject_unknown_parameters() {
         let nested = r#""value":{"anyOf":[{"type":"string"},{"type":"number"}],"description":"braces }, comma, and \"quote\""},"count":{"type":"integer"}"#;
-        assert!(validate(["value", "count", "full"], nested).is_ok());
-        assert!(validate(["type"], nested).unwrap_err().contains("known: value, count, full"));
+        assert!(validate(["value", "count"], nested).is_ok());
+        assert!(validate(["type"], nested).unwrap_err().ends_with("known: value, count"));
         for verb in ["", "find", "act", "type", "wait", "done", "present", "snap", "diff", "speak", "lint", "oscheck"] {
             let schema = ui(verb).unwrap();
             assert!(validate(["timeout_ms", "json", "w", "app", "machine"], schema).is_ok());

@@ -16,7 +16,7 @@ use crate::conn::{Channel, ChannelTx, Conn, Event, CLOSE_LINK_LOST, CLOSE_NORMAL
 use crate::endpoint::{Endpoint, Factory};
 use crate::hosts::{Host, Hosts, Via};
 use crate::lines;
-use crate::link::{Client, Error, Target};
+use crate::link::{Client, Error, LineJoin, Target};
 use crate::stream::{write_varint, TAG_DROP};
 use std::io;
 use std::path::PathBuf;
@@ -636,9 +636,10 @@ pub fn ask(client: &Client, target: &str, service: &str, args: &str, line: &str,
     let ch = client.open("route", &format!("{target} {service} {args}")).map_err(|e| e.to_string())?;
     ch.send(line.as_bytes().to_vec()).map_err(|e| e.to_string())?;
     let mut had_err = false;
+    let mut join = LineJoin::default();
     loop {
         let Some(event) = ch.recv() else { return Err("the hub connection ended".into()) };
-        if let Some(done) = answer_event(event, &mut had_err, each) {
+        if let Some(done) = answer_event(event, &mut join, &mut had_err, each) {
             return done;
         }
     }
@@ -664,9 +665,10 @@ impl Asking {
     pub fn ask(&self, line: &str, each: &mut dyn FnMut(&str)) -> Result<bool, String> {
         self.0.send(line.as_bytes().to_vec()).map_err(|e| e.to_string())?;
         let mut had_err = false;
+        let mut join = LineJoin::default();
         loop {
             let Some(event) = self.0.recv() else { return Err("the hub connection ended".into()) };
-            if let Some(done) = answer_event(event, &mut had_err, &mut |l| {
+            if let Some(done) = answer_event(event, &mut join, &mut had_err, &mut |l| {
                 each(l);
                 true
             }) {
@@ -712,6 +714,7 @@ pub fn ask_while(client: &Client, target: &str, service: &str, args: &str, line:
     let ch = client.open("route", &format!("{target} {service} {args}")).map_err(|e| e.to_string())?;
     ch.send(line.as_bytes().to_vec()).map_err(|e| e.to_string())?;
     let mut had_err = false;
+    let mut join = LineJoin::default();
     loop {
         let event = match ch.recv_timeout(Duration::from_millis(20)) {
             Ok(event) => event,
@@ -719,26 +722,28 @@ pub fn ask_while(client: &Client, target: &str, service: &str, args: &str, line:
             Err(true) => return Ok(None),
             Err(false) => return Err("the hub connection ended".into()),
         };
-        if let Some(done) = answer_event(event, &mut had_err, each) {
+        if let Some(done) = answer_event(event, &mut join, &mut had_err, each) {
             return done.map(Some);
         }
     }
 }
 
 /// One event of an answer to [`ask`]: Some once it ends the answer.
-fn answer_event(event: Event, had_err: &mut bool, each: &mut dyn FnMut(&str) -> bool) -> Option<Result<bool, String>> {
+fn answer_event(event: Event, join: &mut LineJoin, had_err: &mut bool, each: &mut dyn FnMut(&str) -> bool) -> Option<Result<bool, String>> {
     match event {
         Event::Data(d) => {
-            for l in String::from_utf8_lossy(&d).lines().filter(|l| !l.is_empty()) {
-                if l.starts_with("{\"end\":") {
-                    return Some(Ok(*had_err));
+            let mut done = None;
+            join.feed(&d, &mut |l| {
+                if !l.starts_with("{\"end\":") {
+                    *had_err |= l.starts_with("{\"err\":");
+                    if each(l) {
+                        return true;
+                    }
                 }
-                *had_err |= l.starts_with("{\"err\":");
-                if !each(l) {
-                    return Some(Ok(*had_err));
-                }
-            }
-            None
+                done = Some(Ok(*had_err));
+                false
+            });
+            done
         }
         Event::Opened(_) => None,
         Event::Closed(CLOSE_NORMAL, _) => Some(Err("the answer ended without an end line".into())),

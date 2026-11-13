@@ -276,7 +276,7 @@ impl Client {
     pub fn cmd(&self, line: &str) -> Result<Lines, Error> {
         let ch = self.open("cmd", "")?;
         ch.send(line.as_bytes().to_vec()).map_err(|e| Error::LinkLost(e.to_string()))?;
-        Ok(Lines { ch: Some(ch), pending: VecDeque::new(), end: None, deadline: self.timeout().map(|t| std::time::Instant::now() + t) })
+        Ok(Lines { ch: Some(ch), join: LineJoin::default(), pending: VecDeque::new(), end: None, deadline: self.timeout().map(|t| std::time::Instant::now() + t) })
     }
 
     /// Follows the `watch` service (events) or `stream` service (chunks).
@@ -306,16 +306,43 @@ impl Client {
     }
 }
 
+/// Cuts an answer's messages into its lines. A message can end inside a line, even inside a
+/// character (a sender flushes where its buffer fills): the rest comes with the next message.
+#[derive(Default)]
+pub(crate) struct LineJoin(Vec<u8>);
+
+impl LineJoin {
+    /// Gives `each` the lines `d` completes, empty ones left out, until it says false.
+    pub(crate) fn feed(&mut self, d: &[u8], each: &mut dyn FnMut(&str) -> bool) -> bool {
+        let Some(last) = d.iter().rposition(|b| *b == b'\n') else {
+            self.0.extend_from_slice(d);
+            return true;
+        };
+        let joined;
+        let text: &[u8] = if self.0.is_empty() {
+            &d[..last]
+        } else {
+            self.0.extend_from_slice(&d[..last]);
+            joined = std::mem::take(&mut self.0);
+            &joined
+        };
+        let go = text.split(|b| *b == b'\n').filter(|l| !l.is_empty()).all(|l| each(&String::from_utf8_lossy(l)));
+        self.0.extend_from_slice(&d[last + 1..]);
+        go
+    }
+}
+
 /// The lines of one `cmd` answer.
 pub struct Lines {
     ch: Option<Channel>,
+    join: LineJoin,
     pending: VecDeque<String>,
     end: Option<String>,
     deadline: Option<std::time::Instant>,
 }
 
 impl Lines {
-    /// The `{"end":...}` line, once the iterator has finished (it carries `truncated`).
+    /// The `{"end":...}` line, once the iterator has finished.
     pub fn end(&self) -> Option<&str> {
         self.end.as_deref()
     }
@@ -349,7 +376,13 @@ impl Iterator for Lines {
                 },
             };
             match event {
-                Some(Event::Data(d)) => self.pending.extend(String::from_utf8_lossy(&d).lines().filter(|l| !l.is_empty()).map(str::to_string)),
+                Some(Event::Data(d)) => {
+                    let pending = &mut self.pending;
+                    self.join.feed(&d, &mut |l| {
+                        pending.push_back(l.to_string());
+                        true
+                    });
+                }
                 Some(Event::Closed(code, why)) => {
                     self.ch = None;
                     return match code {

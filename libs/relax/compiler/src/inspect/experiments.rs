@@ -336,14 +336,14 @@ pub fn cmd_ab(req: &Req, out: &mut Out) {
     } else {
         format!("no difference beyond noise: {:+.1}% with spread ±{:.1}%, p={:.2}", d, noise, p)
     };
-    out.always(&format!("`{}`: {}", short(&name, 90), verdict));
+    out.line(&format!("`{}`: {}", short(&name, 90), verdict));
     out.line("");
     out.line(&format!("| variant | what | code | median {} | rounds | spread % |", unit));
     out.line("|---|---|---|---:|---|---:|");
     let fmt = |v: &[f64]| v.iter().map(|x| fmt_num(*x)).collect::<Vec<_>>().join(" ");
     out.line(&format!("| A | {} | {} {} B | {} | {} | {:.1} |", la, tiers[0], sizes[0], fmt_num(ma), fmt(&a), sa));
     out.line(&format!("| B | {} | {} {} B | {} | {} | {:.1} |", lb, tiers[1], sizes[1], fmt_num(mb), fmt(&b), sb));
-    out.always(&format!(
+    out.line(&format!(
         "note: {} rounds per variant, ABAB order, {:.1} s each after {} ms settle, metric {} ({}), permutation test over rounds; now installed: {}",
         rounds,
         secs,
@@ -353,15 +353,15 @@ pub fn cmd_ab(req: &Req, out: &mut Out) {
         if keep_b { "B" } else { "A" }
     ));
     if per_call {
-        out.always("note: per=call: each round counts the variant's build again with timed entry/exit probes (exact calls, inclusive ns per call); the probes cost the same in A and B");
+        out.line("note: per=call: each round counts the variant's build again with timed entry/exit probes (exact calls, inclusive ns per call); the probes cost the same in A and B");
     } else if !per_frame {
-        out.always("note: a rate per second of wall: right for fixed-pace work (playback, a frame-locked UI); per=frame divides by UI frames instead; a flat-out loop keeps the fn's share constant -- compare those with count <fn> time=1");
+        out.line("note: a rate per second of wall: right for fixed-pace work (playback, a frame-locked UI); per=frame divides by UI frames instead; a flat-out loop keeps the fn's share constant -- compare those with count <fn> time=1");
     }
     for n in notes {
-        out.always(&format!("note: {}", n));
+        out.line(&format!("note: {}", n));
     }
-    out.always(&format!("note: {}", super::reliability::line(true)));
-    out.always(&format!("more: asm @{} vs=rustc  remarks @{}  versions @{}", id, id, id));
+    out.line(&format!("note: {}", super::reliability::line(true)));
+    out.line(&format!("more: asm @{} vs=rustc  remarks @{}  versions @{}", id, id, id));
 }
 
 fn fmt_num(x: f64) -> String {
