@@ -582,7 +582,10 @@ impl Pool {
         let mut inputs = Vec::new();
         let mut probes = Vec::new();
         let mut stack = vec![(c.root.clone(), crate::program::dir_of(&c.root).to_string(), c.name.clone())];
+        // each file and the module it is parsed as (its first); `walked`: every (file, module),
+        // one file declared as two modules (`#[path]`) being two modules with their own imports
         let mut seen: HashMap<String, String> = HashMap::default();
+        let mut walked: crate::fxhash::HashSet<(String, String)> = Default::default();
         let mut defs = Vec::new();
         let mut aliases = Vec::new();
         let mut macro_use: Vec<String> = Vec::new();
@@ -593,15 +596,24 @@ impl Pool {
         let mut lexed: Vec<(String, Vec<u8>, Vec<Tok>)> = Vec::new();
         let replay = crate::load_profile::span(c.cfg.session.runtime.profile, "publish-replay", &c.name);
         while let Some((path, dir, mpath)) = stack.pop() {
-            if seen.contains_key(&path) {
+            if !walked.insert((path.clone(), mpath.clone())) {
                 continue;
             }
-            seen.insert(path.clone(), mpath.clone());
-            let Some(Some(s)) = scanned.remove(&(ci, path.clone(), dir, mpath)) else {
-                complete = false;
-                continue;
+            // a file met again under another module: that module's items, imports and children
+            // count; the file's input and its parse job are the first module's
+            let first = !seen.contains_key(&path);
+            if first {
+                seen.insert(path.clone(), mpath.clone());
+            }
+            let s = match scanned.remove(&(ci, path.clone(), dir, mpath)) {
+                Some(Some(s)) => s,
+                // (a file that includes itself: the scan stopped at the repeat)
+                _ if !first => continue,
+                _ => { complete = false; continue; }
             };
-            inputs.push((path.clone(), crate::crate_image::file_hash(&path, &s.src[..s.src_len])));
+            if first {
+                inputs.push((path.clone(), crate::crate_image::file_hash(&path, &s.src[..s.src_len])));
+            }
             probes.extend(s.probes);
             if path == c.root && s.recursion_limit.is_some() {
                 cmods.recursion_limit = s.recursion_limit;
@@ -643,7 +655,7 @@ impl Pool {
             }
             // Stack traversal must publish sibling definitions in source order.
             stack.extend(s.children.into_iter().rev());
-            if !self.demand_plan.as_ref().is_some_and(|p| p.skips(&c.root, c.cfg.holds("test"), &path)) {
+            if first && !self.demand_plan.as_ref().is_some_and(|p| p.skips(&c.root, c.cfg.holds("test"), &path)) {
                 lexed.push((path, s.src[..s.src_len].to_vec(), s.toks.into_vec()));
             }
         }
@@ -1677,9 +1689,21 @@ pub fn check_macros(prog: &mut crate::program::Program, krate: u32, files: &[(u3
         let mut reachable = Vec::new();
         let root = c.root_path().to_string();
         let mut todo = vec![(root.clone(), crate::program::dir_of(&root).to_string(), name.clone())];
+        // every (file, module): one file declared as two modules (`#[path]`) is two modules with
+        // their own imports; a file that includes itself (its path an enclosing module's: rustc's
+        // error) stops at the repeat
+        let mut walked: crate::fxhash::HashSet<(String, String)> = Default::default();
+        let mut file_of: HashMap<String, String> = HashMap::default();
         while let Some((path, dir, module)) = todo.pop() {
-            if reachable.contains(&path) { continue; }
-            reachable.push(path.clone());
+            let mut up = module.rsplit_once("::").map(|(m, _)| m);
+            let mut on_chain = false;
+            while let (false, Some(m)) = (on_chain, up) {
+                on_chain = file_of.get(m) == Some(&path);
+                up = m.rsplit_once("::").map(|(m, _)| m);
+            }
+            if on_chain || !walked.insert((path.clone(), module.clone())) { continue; }
+            file_of.insert(module.clone(), path.clone());
+            if !reachable.contains(&path) { reachable.push(path.clone()); }
             let text = files.iter().find(|(f, _)| prog.file_paths[*f as usize] == path).map(|(_, t)| t.clone())
                 .or_else(|| crate::vfs::read(&path).ok());
             if let Some(scan) = text.and_then(|t| scan_text(&path, &dir, &module, &name, c.edition, &c.cfg, t.into(), &c.context)) {
