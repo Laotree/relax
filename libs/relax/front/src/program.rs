@@ -279,6 +279,9 @@ pub const CLASH_TYPES: u8 = 16;
 pub const CLASH_VALUES: u8 = 32;
 /// `use a::f::{self}`: only the type namespace of `f` (a module, enum or trait) is imported
 pub const BOUND_SELF_ONLY: u8 = 64;
+/// bound by a forced step of an import fixpoint run, or after one in that run
+/// (`Program::import_fixpoint`): rustc leaves the import undetermined, or resolves it through one it does
+pub const BOUND_SETTLED: u8 = 128;
 
 pub struct Module {
     pub def: DefId,
@@ -653,6 +656,9 @@ pub struct Program {
     /// The import fixpoint stalled: an import that found one namespace while a glob it
     /// looks through is still open takes what it found (resolve_imports_passes).
     import_settle: bool,
+    /// The imports the last import fixpoint run found to fail whatever the others bind: they make
+    /// no name wait (`import_waits`).
+    import_failed: crate::fxhash::HashSet<u32>,
     load_graph: Option<LoadGraph>,
     /// module path of the file being loaded (`module_path!()`)
     pub cur_mod_path: String,
@@ -991,6 +997,7 @@ impl Program {
             glob_import: HashMap::default(),
             imports_of_module: HashMap::default(),
             import_settle: false,
+            import_failed: Default::default(),
             load_graph: None,
             cur_mod_path: String::new(),
             module_load_stack: Vec::new(),
@@ -2777,7 +2784,7 @@ impl Program {
             }
             undo.push(UseUndo { index: i, module: m, bind: Some(name), done: true, glob: false, bound, gone });
             self.imports[i].done = false;
-            self.imports[i].bound &= !(BOUND_TYPES | BOUND_VALUES);
+            self.imports[i].bound &= !(BOUND_TYPES | BOUND_VALUES | BOUND_SETTLED);
             again.push(i);
         }
         if again.is_empty() {
@@ -2785,23 +2792,12 @@ impl Program {
         }
         self.forget_bindings();
         self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
-        // strict passes while they make progress, then one that settles (resolve_imports_passes)
-        for settle in [false, true] {
-            self.import_settle = settle;
-            loop {
-                let mut progress = false;
-                for &i in &again {
-                    if !self.imports[i].done && self.try_import(i) {
-                        self.imports[i].done = true;
-                        progress = true;
-                    }
-                }
-                if !progress {
-                    break;
-                }
-            }
-        }
-        self.import_settle = false;
+        // (again is ascending: the imports in index order)
+        self.import_fixpoint(&again, &mut |p, i, _| {
+            let ok = p.try_import(i);
+            if ok { p.imports[i].done = true; }
+            ok
+        });
         self.forget_bindings();
         self.glob_cache.clear(); self.glob_amb_cache.clear(); self.glob_prec_cache.clear();
         let unresolved = again.iter().filter(|&&i| !self.imports[i].done).map(|&i| (self.imports[i].file, self.imports[i].pos, self.import_path(i))).collect();
@@ -3693,7 +3689,6 @@ impl Program {
     /// The import fixpoint's passes (no reporting).
     fn resolve_imports_passes(&mut self, i0: usize) {
         self.load_graph = None;
-        let tr = crate::preload::trace();
         if i0 == 0 {
             self.imports_of_module.clear();
         }
@@ -3701,40 +3696,203 @@ impl Program {
             let m = self.imports[j].module;
             self.imports_of_module.entry(m).or_default().push(j as u32);
         }
-        let mut passes = Vec::new();
+        let set: Vec<usize> = (i0..self.imports.len()).collect();
+        let run = self.import_fixpoint(&set, &mut |p, i, _| {
+            let ok = p.try_import(i);
+            if ok { p.imports[i].done = true; }
+            ok
+        });
+        if crate::preload::trace() {
+            eprintln!("boot-trace: resolve: {} imports ({} glob); passes (resolved/tried): {}; {} tries waited on an open import, {} failures determined, {} forced", self.imports.len(), self.imports.iter().filter(|i| i.glob).count(), run.passes.join(", "), run.waited, run.failed, run.forced);
+        }
+    }
+
+    /// One import fixpoint run over the open imports of `set` (ascending indices): strict passes
+    /// while they make progress. A strict pass without progress is followed by a settle pass, which
+    /// lifts the wait of an import found in one namespace (`open_binding_through_globs`). A settle
+    /// pass without progress is a stall: the imports that failed in it without waiting stop making
+    /// names wait (their failure is determined), and strict passes start again. A stall with no
+    /// such import ends in a forced step: the lowest open import that resolves with the
+    /// open-import wait (`import_waits`) lifted for it alone. That binding, and every one the run
+    /// makes after it, is marked BOUND_SETTLED: rustc leaves such an import undetermined, and the
+    /// import replay reports it. Then strict passes again; the run ends with a forced step that
+    /// resolves nothing. A program with skipped files forces nothing: an import may wait on a
+    /// file a later load brings (`defer_skipped_imports` defers it), and forcing would bind past
+    /// what that file binds. `step(p, i, settle)` tries import i, marks it done when it resolves
+    /// and does the caller's bookkeeping.
+    fn import_fixpoint(&mut self, set: &[usize], step: &mut dyn FnMut(&mut Program, usize, bool) -> bool) -> FixRun {
+        let tr = crate::preload::trace();
+        let mut run = FixRun::default();
+        let outer = IMPORT_RUN.with(|r| r.replace(ImportRun { active: true, block: true, current: usize::MAX, blocked: false }));
+        RUN_TABLES.with(|t| *t.borrow_mut() = RunTables::default());
+        self.import_failed.clear();
+        let mut forced = false;
         let mut settle = false;
+        // the imports of the last pass that failed without waiting on an open import
+        let mut failing = Vec::new();
         loop {
             self.import_settle = settle;
-            let mut progress = false;
             let t0 = std::time::Instant::now();
             let (mut tried, mut ok) = (0, 0);
-            for i in i0..self.imports.len() {
+            failing.clear();
+            for &i in set {
                 if self.imports[i].done {
                     continue;
                 }
                 tried += 1;
-                if self.try_import(i) {
-                    self.imports[i].done = true;
-                    progress = true;
+                if step(self, i, settle) {
+                    if forced { self.imports[i].bound |= BOUND_SETTLED; }
                     ok += 1;
+                } else if import_blocked() {
+                    run.waited += 1;
+                } else {
+                    failing.push(i);
                 }
             }
             if tr {
-                passes.push(format!("{}/{} {:.1}ms{}", ok, tried, t0.elapsed().as_secs_f64() * 1e3, if settle { " (settle)" } else { "" }));
+                run.passes.push(format!("{}/{} {:.1}ms{}", ok, tried, t0.elapsed().as_secs_f64() * 1e3, if settle { " (settle)" } else { "" }));
             }
-            // a pass without progress: one more that settles the imports waiting on open globs
-            // for their other namespace, then strict passes again while that makes progress
-            if progress {
+            if ok > 0 {
                 settle = false;
-            } else if settle {
-                break;
-            } else {
-                settle = true;
+                continue;
             }
+            if !settle {
+                settle = true;
+                continue;
+            }
+            // a stall: an import that failed without waiting fails whatever the others bind (rustc:
+            // its failure is determined) and makes nothing wait any more -- under a lazy load only
+            // one the deferral would not defer (a later file may still bring what it looks for)
+            let deferred = if self.skipped_files.is_empty() || failing.is_empty() {
+                crate::fxhash::HashSet::default()
+            } else {
+                let pending: Vec<usize> = (0..self.imports.len()).filter(|&i| !self.imports[i].done).collect();
+                self.deferred_by_stops(&self.deferral_stops(&pending))
+            };
+            let failed = failing.iter().filter(|&&i| !deferred.contains(&i) && self.import_failed.insert(i as u32)).count();
+            if failed > 0 {
+                run.failed += failed;
+                settle = false;
+                continue;
+            }
+            if !self.skipped_files.is_empty() {
+                break;
+            }
+            // the forced step: the lowest open import that resolves without the wait
+            let t0 = std::time::Instant::now();
+            let mut got = None;
+            for &i in set {
+                if self.imports[i].done {
+                    continue;
+                }
+                IMPORT_RUN.with(|r| r.set(ImportRun { block: false, ..r.get() }));
+                let ok = step(self, i, true);
+                IMPORT_RUN.with(|r| r.set(ImportRun { block: true, ..r.get() }));
+                if ok {
+                    got = Some(i);
+                    break;
+                }
+            }
+            let Some(i) = got else { break };
+            self.imports[i].bound |= BOUND_SETTLED;
+            forced = true;
+            run.forced += 1;
+            if tr {
+                run.passes.push(format!("1 forced {:.1}ms", t0.elapsed().as_secs_f64() * 1e3));
+            }
+            settle = false;
         }
         self.import_settle = false;
-        if tr {
-            eprintln!("boot-trace: resolve: {} imports ({} glob); passes (resolved/tried): {}", self.imports.len(), self.imports.iter().filter(|i| i.glob).count(), passes.join(", "));
+        IMPORT_RUN.with(|r| r.set(outer));
+        run
+    }
+
+    /// Whether this thread's import fixpoint run makes `name` in module `m` wait (`m`'s own table
+    /// missed it): an import of `m` other than the one being resolved is still open, binds that
+    /// name in this namespace and is visible from the module of the one being resolved, so what
+    /// `m`'s globs or the scopes outside it give now may be shadowed (rustc ident.rs: undetermined
+    /// while such a single import may still define the name; one the lookup cannot see -- itself, or
+    /// behind a glob on the way to `m` (`via`) -- or whose failure is determined, is skipped). Marks
+    /// the try blocked.
+    fn import_waits(&self, m: u32, name: Sym, ns_type: bool, via: &[u32]) -> bool {
+        let r = IMPORT_RUN.with(|r| r.get());
+        if !r.block {
+            return false;
+        }
+        let bit = if ns_type { BOUND_TYPES } else { BOUND_VALUES };
+        let open: Vec<u32> = RUN_TABLES.with(|t| {
+            let mut t = t.borrow_mut();
+            let names = t.open.entry(m).or_insert_with(|| {
+                let mut names: HashMap<Sym, Vec<u32>> = HashMap::default();
+                for &j in self.imports_of_module.get(&m).map_or(&[][..], |v| &v[..]) {
+                    let im = &self.imports[j as usize];
+                    if let (false, false, Some(b)) = (im.done, im.glob, im.bind) {
+                        names.entry(b).or_default().push(j);
+                    }
+                }
+                names
+            });
+            names.get(&name).map_or(Vec::new(), |v| v.iter().copied().filter(|&j| {
+                let im = &self.imports[j as usize];
+                j as usize != r.current && !im.done && im.bound & bit == 0 && (ns_type || im.bound & BOUND_SELF_ONLY == 0)
+                    && !self.import_failed.contains(&j)
+            }).collect())
+        });
+        if open.is_empty() {
+            return false;
+        }
+        let from = self.imports.get(r.current).map(|im| im.module);
+        if let Some(from) = from {
+            if !self.globs_visible(via, m, from) {
+                return false;
+            }
+        }
+        let waits = open.into_iter().any(|j| from.map_or(true, |from| self.vis_visible(self.open_import_vis(j), from)));
+        if waits {
+            IMPORT_RUN.with(|c| c.set(ImportRun { blocked: true, ..r }));
+        }
+        waits
+    }
+
+    /// Whether module `from` sees what module `m` binds through the globs a lookup followed to it
+    /// (`via`: the modules whose globs it walks, outermost first): every glob on the way is `pub` or
+    /// one of a module `from` is inside.
+    fn globs_visible(&self, via: &[u32], m: u32, from: u32) -> bool {
+        via.iter().zip(via.iter().skip(1).chain(std::iter::once(&m))).all(|(&p, &x)| {
+            let pm = &self.mods[p as usize];
+            pm.globs.iter().any(|&(g, is_pub)| {
+                let d = self.def(g);
+                d.kind == DefKind::Mod && d.sub == x && (is_pub || self.in_module(from, pm.normal))
+            })
+        })
+    }
+
+    /// The visibility of open import `j` for `import_waits`: a private one is its module's, a `pub`
+    /// one its item's (`import_vis`, kept for the run; a `pub(in path)` resolves its path, which
+    /// waits on nothing).
+    fn open_import_vis(&self, j: u32) -> BindVis {
+        let im = &self.imports[j as usize];
+        if !im.is_pub {
+            return Some(self.mods[im.module as usize].normal);
+        }
+        if let Some(v) = RUN_TABLES.with(|t| t.borrow().vis.get(&j).copied()) {
+            return v;
+        }
+        let r = IMPORT_RUN.with(|r| r.replace(ImportRun { block: false, ..r.get() }));
+        let v = self.import_vis(im);
+        IMPORT_RUN.with(|c| c.set(r));
+        RUN_TABLES.with(|t| t.borrow_mut().vis.insert(j, v));
+        v
+    }
+
+    /// The visibility of the `use` (or `extern crate`) item an import came from; private where the
+    /// item is not found.
+    pub fn import_vis(&self, im: &Import) -> BindVis {
+        let Some(f) = self.files.get(im.file as usize) else { return Some(self.mods[im.module as usize].normal) };
+        let item = f.ast.items.iter().find(|it| it.lo == im.pos && matches!(it.kind, ItemKind::Use { .. } | ItemKind::ExternCrate(_)));
+        match item {
+            Some(it) => self.vis_module(im.file, im.module, &it.vis),
+            None => Some(self.mods[im.module as usize].normal),
         }
     }
 
@@ -3753,13 +3911,27 @@ impl Program {
         let im = &self.imports[i];
         let edition = self.crates[self.mods[im.module as usize].krate as usize].edition;
         let full = if im.glob { im.segs.len() } else { im.segs.len().saturating_sub(1) };
+        // (a prefix through a name an open import may still bind stops before it, as the
+        // import's own resolution does: `import_waits`)
+        let outer = IMPORT_RUN.with(|r| r.replace(ImportRun { active: true, block: true, current: i, blocked: false }));
+        // (outside a run the tables are those of an earlier run, perhaps another program's)
+        if !outer.active {
+            RUN_TABLES.with(|t| *t.borrow_mut() = RunTables::default());
+        }
+        let mut stop = im.module;
         for k in (1..=full).rev() {
+            IMPORT_RUN.with(|r| r.set(ImportRun { blocked: false, ..r.get() }));
             if let Some(d) = self.resolve_mod_path(im.module, im.global, &im.segs[..k], edition < 2018, true) {
+                if import_blocked() {
+                    continue;
+                }
                 let def = self.def(d);
-                return if def.kind == DefKind::Mod { def.sub } else { u32::MAX };
+                stop = if def.kind == DefKind::Mod { def.sub } else { u32::MAX };
+                break;
             }
         }
-        im.module
+        IMPORT_RUN.with(|r| r.set(outer));
+        stop
     }
 
     /// Rust file selection skips modules no reached item looks into. An import
@@ -3770,18 +3942,38 @@ impl Program {
         if i0 == 0 { self.deferred_imports.clear(); }
         // a restored collected program has no plan but may still have skipped modules
         if !self.session.options.rs_lazy || (self.demand_plan.is_none() && self.skipped_files.is_empty()) { return deferred; }
-        let mut incomplete: crate::fxhash::HashSet<u32> = (0..self.mods.len() as u32).filter(|&m| self.skipped_module(m)).collect();
-        if incomplete.is_empty() { self.deferred_waits.clear(); self.deferred_binds.clear(); return deferred; }
-        // Settling can finish an import in only one namespace. Its other binding may
-        // still depend on a skipped file (for example a value found through a glob,
-        // while the explicitly re-exported type is deferred). Keep that chain in the
-        // miss graph too: rustc resolves a use independently in each namespace.
+        if !(0..self.mods.len() as u32).any(|m| self.skipped_module(m)) { self.deferred_waits.clear(); self.deferred_binds.clear(); return deferred; }
+        let stops = self.deferral_stops(pending);
+        deferred = self.deferred_by_stops(&stops);
+        for &i in &deferred {
+            self.imports[i].done = false;
+            self.deferred_imports.push((self.imports[i].module, if self.imports[i].glob { None } else { self.imports[i].bind }));
+        }
+        self.compute_deferred_waits(&stops, &deferred);
+        if i0 == 0 { self.load_graph = Some(self.load_graph_from_stops(stops)); }
+        deferred
+    }
+
+    /// The imports a deferral looks at, with their stops: `pending`, and the imports settled in one
+    /// namespace only. Settling can finish an import in only one namespace. Its other binding may
+    /// still depend on a skipped file (for example a value found through a glob, while the
+    /// explicitly re-exported type is deferred). Keep that chain in the miss graph too: rustc
+    /// resolves a use independently in each namespace.
+    fn deferral_stops(&self, pending: &[usize]) -> Vec<(usize, u32)> {
         let partial = self.imports.iter().enumerate().filter_map(|(i, im)| {
             let m = &self.mods[im.module as usize];
             (im.done && !im.glob && im.bind.is_some_and(|b| self.syms.str(b) != "_"
                 && (!m.types.contains_key(&b) || !m.values.contains_key(&b)))).then_some(i)
         });
-        let stops: Vec<(usize, u32)> = pending.iter().copied().chain(partial).map(|i| (i, self.import_stop(i))).collect();
+        pending.iter().copied().chain(partial).map(|i| (i, self.import_stop(i))).collect()
+    }
+
+    /// The imports of `stops` a lazy load defers: those that stop in an incomplete module -- a
+    /// skipped one, one with a glob of an incomplete one, the module of a deferred import.
+    fn deferred_by_stops(&self, stops: &[(usize, u32)]) -> crate::fxhash::HashSet<usize> {
+        let mut deferred = crate::fxhash::HashSet::default();
+        let mut incomplete: crate::fxhash::HashSet<u32> = (0..self.mods.len() as u32).filter(|&m| self.skipped_module(m)).collect();
+        if incomplete.is_empty() { return deferred; }
         loop {
             let mut changed = false;
             for m in 0..self.mods.len() as u32 {
@@ -3791,19 +3983,13 @@ impl Program {
                     changed = true;
                 }
             }
-            for &(i, stop) in &stops {
+            for &(i, stop) in stops {
                 if deferred.contains(&i) || !incomplete.contains(&stop) { continue; }
                 deferred.insert(i);
                 changed |= incomplete.insert(self.imports[i].module);
             }
             if !changed { break; }
         }
-        for &i in &deferred {
-            self.imports[i].done = false;
-            self.deferred_imports.push((self.imports[i].module, if self.imports[i].glob { None } else { self.imports[i].bind }));
-        }
-        self.compute_deferred_waits(&stops, &deferred);
-        if i0 == 0 { self.load_graph = Some(self.load_graph_from_stops(stops)); }
         deferred
     }
 
@@ -4119,53 +4305,39 @@ impl Program {
         let (mut retried, mut settled, mut completed) = (0usize, 0usize, 0usize);
         let mut bindings_changed = self.defs.len() != d0 || self.imports.len() != i0;
         let done_before: Vec<_> = imports.iter().map(|&i| (i, self.imports[i].done)).collect();
-        let mut settle = false;
-        loop {
-            self.import_settle = settle;
-            let mut progress = false;
-            // The cone already follows every possible completion through its
-            // importers. New glob edges end in modules in that cone, so they
-            // cannot add an outside consumer during these append-only passes.
-            for &i in &imports {
-                if self.imports[i].done {
-                    continue;
-                }
-                retried += 1;
-                settled += usize::from(settle);
-                let module = self.imports[i].module;
-                let md = &self.mods[module as usize];
-                let before = (md.types.len(), md.values.len(), md.globs.len(), md.anon_traits.len());
-                if self.try_import(i) {
-                    self.imports[i].done = true;
-                    progress = true;
-                    completed += 1;
-                }
-                let md = &self.mods[module as usize];
-                let after = (md.types.len(), md.values.len(), md.globs.len(), md.anon_traits.len());
-                if before != after || self.imports[i].done {
-                    bindings_changed |= before != after;
-                    changed.insert(module);
-                    if before.2 != after.2 {
-                        // try_import inserts in source order, possibly before an
-                        // already-resolved glob. The new edge is not always last.
-                        for &(g, _) in &md.globs {
-                            let d = self.def(g);
-                            if d.kind == DefKind::Mod {
-                                graph.globs.entry(d.sub).or_default().insert(module);
-                            }
+        // The cone already follows every possible completion through its
+        // importers. New glob edges end in modules in that cone, so they
+        // cannot add an outside consumer during these append-only passes.
+        let cone: Vec<usize> = imports.iter().copied().collect();
+        self.import_fixpoint(&cone, &mut |p, i, settle| {
+            retried += 1;
+            settled += usize::from(settle);
+            let module = p.imports[i].module;
+            let md = &p.mods[module as usize];
+            let before = (md.types.len(), md.values.len(), md.globs.len(), md.anon_traits.len());
+            let ok = p.try_import(i);
+            if ok {
+                p.imports[i].done = true;
+                completed += 1;
+            }
+            let md = &p.mods[module as usize];
+            let after = (md.types.len(), md.values.len(), md.globs.len(), md.anon_traits.len());
+            if before != after || ok {
+                bindings_changed |= before != after;
+                changed.insert(module);
+                if before.2 != after.2 {
+                    // try_import inserts in source order, possibly before an
+                    // already-resolved glob. The new edge is not always last.
+                    for &(g, _) in &md.globs {
+                        let d = p.def(g);
+                        if d.kind == DefKind::Mod {
+                            graph.globs.entry(d.sub).or_default().insert(module);
                         }
                     }
                 }
             }
-            if progress {
-                settle = false;
-            } else if settle {
-                break;
-            } else {
-                settle = true;
-            }
-        }
-        self.import_settle = false;
+            ok
+        });
         for &i in &imports {
             graph.stop(i, self.import_may_wait(i).then(|| self.import_stop(i)));
         }
@@ -4300,6 +4472,7 @@ impl Program {
     }
 
     fn try_import(&mut self, i: usize) -> bool {
+        IMPORT_RUN.with(|r| r.set(ImportRun { current: i, blocked: false, ..r.get() }));
         let module = self.imports[i].module;
         let global = self.imports[i].global;
         let glob = self.imports[i].glob;
@@ -4317,6 +4490,10 @@ impl Program {
                     None => return false,
                 }
             };
+            // (a path through a name an open import may still bind waits for it)
+            if import_blocked() {
+                return false;
+            }
             // only a module or an enum can be glob-imported (`use Alias::*` is unresolved)
             if !matches!(self.def(target).kind, DefKind::Mod | DefKind::Enum) {
                 return false;
@@ -4369,7 +4546,7 @@ impl Program {
                 if let Some(c) = self.extern_crate(module, last) {
                     tdef = Some(self.mods[self.crates[c as usize].root_mod as usize].def);
                 } else {
-                    return self.lookup_macro_in_container(root, last);
+                    return !import_blocked() && self.lookup_macro_in_container(root, last);
                 }
             }
         } else {
@@ -4408,13 +4585,18 @@ impl Program {
             }
             if tdef.is_none() && vdef.is_none() {
                 // macros only (e.g. `use crate::log;` for macro_rules) count as resolved
-                if self.imports[i].bound & BOUND_SELF_ONLY == 0 && self.lookup_macro_in_container(parent, last) {
+                if !import_blocked() && self.imports[i].bound & BOUND_SELF_ONLY == 0 && self.lookup_macro_in_container(parent, last) {
                     return true;
                 }
                 return false;
             }
         }
         if tdef.is_none() && vdef.is_none() {
+            return false;
+        }
+        // a name on the path, or the name itself, that an open import may still bind: nothing
+        // is bound until that import is done (`import_waits`)
+        if import_blocked() {
             return false;
         }
         // items of another proc-macro crate are invisible (only its macros are exported)
@@ -5006,7 +5188,7 @@ impl Program {
         match d.kind {
             DefKind::Mod => {
                 let r = self.lookup_in_module(d.sub, name, ns_type, &mut Vec::new());
-                if r.is_none() { self.note_deferred_miss(d.sub, name); }
+                if r.is_none() && !import_blocked() { self.note_deferred_miss(d.sub, name); }
                 r
             }
             DefKind::Enum => {
@@ -5057,7 +5239,7 @@ impl Program {
         // a converged answer of an earlier query: returned as it is (inserting it again would put
         // a duplicate node at the head of its chain on every repeated lookup -- MemoMap::insert
         // does not replace -- and the chains of the fixed bucket table grew without bound)
-        let cacheable = self.imports_done && !q.precise && !self.mods[m as usize].globs.is_empty()
+        let cacheable = self.imports_done && !q.precise && !import_run_active() && !self.mods[m as usize].globs.is_empty()
             && !self.mods[m as usize].values.contains_key(&name) && !self.mods[m as usize].types.contains_key(&name);
         if cacheable {
             if let Some(r) = self.glob_cache.with(&(m, name, ns_type), memo_hit).flatten() {
@@ -5095,6 +5277,9 @@ impl Program {
             if record_import_uses() && md.import_pub.contains_key(&(name, ns_type)) && !record_import_use(|u| u.import.push((m, name, ns_type))) { self.import_used.lock().unwrap_or_else(|e| e.into_inner()).insert((m, name, ns_type)); }
             return Some((d, if q.precise { self.precise_vis(m, name, ns_type, d) } else { self.binding_vis(m, name, ns_type, d) }));
         }
+        if self.import_waits(m, name, ns_type, &q.open) {
+            return None;
+        }
         if md.globs.is_empty() {
             return None;
         }
@@ -5108,7 +5293,7 @@ impl Program {
             return *r;
         }
         // through globs: converged answers of earlier queries (glob graphs are wide and deep)
-        let cacheable = self.imports_done && !q.precise;
+        let cacheable = self.imports_done && !q.precise && !import_run_active();
         if cacheable {
             if let Some(r) = self.glob_cache.with(&(m, name, ns_type), memo_hit).flatten() {
                 return r;
@@ -5308,7 +5493,7 @@ impl Program {
     }
 
     pub fn lookup_in_scope(&self, module: u32, name: Sym, ns_type: bool) -> Option<DefId> {
-        if !self.imports_done || !self.body_memos.load(std::sync::atomic::Ordering::Relaxed) {
+        if !self.imports_done || !self.body_memos.load(std::sync::atomic::Ordering::Relaxed) || import_run_active() {
             return self.lookup_in_scope_uncached(module, name, ns_type);
         }
         if let Some(r) = self.scope_cache.with(&(module, name, ns_type), memo_hit).flatten() {
@@ -5392,7 +5577,7 @@ impl Program {
             }
         }
         let r = self.lookup_in_scope_outside(module, name, ns_type);
-        if r.is_none() { self.note_scope_miss(module, name); }
+        if r.is_none() && !import_blocked() { self.note_scope_miss(module, name); }
         r
     }
 
@@ -6010,6 +6195,49 @@ impl ImportUses {
         self.ext.dedup();
     }
 }
+
+/// One import fixpoint run's counts (`Program::import_fixpoint`): its passes for the boot trace
+/// ("resolved/tried ms"), the tries that waited on an open import, the imports whose failure it
+/// determined at a stall, the forced steps.
+#[derive(Default)]
+struct FixRun {
+    passes: Vec<String>,
+    waited: usize,
+    failed: usize,
+    forced: usize,
+}
+
+/// This thread's import fixpoint run: whether one is running (`active`: no memo is read or
+/// written), whether open imports make the names they bind wait (`block`: off for a forced
+/// step's try), the import being resolved, and whether a lookup of its try waited.
+#[derive(Clone, Copy)]
+struct ImportRun {
+    active: bool,
+    block: bool,
+    current: usize,
+    blocked: bool,
+}
+
+/// This thread's import fixpoint run's tables (`Program::import_waits`): each module's open single
+/// imports by the name they bind, indexed at the module's first lookup (an import never opens again
+/// within a run: a list only goes stale by closing); the visibilities of the `pub` imports asked
+/// about.
+#[derive(Default)]
+struct RunTables {
+    open: HashMap<u32, HashMap<Sym, Vec<u32>>>,
+    vis: HashMap<u32, BindVis>,
+}
+
+thread_local! {
+    static IMPORT_RUN: std::cell::Cell<ImportRun> = const { std::cell::Cell::new(ImportRun { active: false, block: false, current: usize::MAX, blocked: false }) };
+    static RUN_TABLES: std::cell::RefCell<RunTables> = std::cell::RefCell::new(RunTables::default());
+}
+
+/// Whether a lookup of the import now being resolved waited on an open import.
+fn import_blocked() -> bool { IMPORT_RUN.with(|r| r.get().blocked) }
+
+/// Whether an import fixpoint run is going on on this thread.
+fn import_run_active() -> bool { IMPORT_RUN.with(|r| r.get().active) }
 
 thread_local! {
     /// The current scope's import uses; none leaves resolution writing the program's sets.
@@ -6814,6 +7042,10 @@ mod deferred_load_tests {
             pub mod isolated { pub use crate::fallback::*; }
             pub mod waiting { pub use crate::unrelated::Unrelated; }
             pub mod prelude { pub use crate::late::*; }
+            // `through` waits for `late` (the single import `shadow::shade` shadows the glob's)
+            pub mod fallback2 { pub mod shade { pub struct Lamp; } }
+            pub mod shadow { pub use crate::fallback2::*; pub use crate::late::shade; }
+            pub mod through { pub use crate::shadow::shade::Lamp; }
             pub fn main() {}
         "#,
         )
@@ -6827,6 +7059,7 @@ mod deferred_load_tests {
             pub trait Shared {}
             pub use crate::other::Next;
             pub mod inner { pub struct Thing; pub use crate::other::After; }
+            pub mod shade { pub struct Lamp; }
             #[path = "load_nested.rs"] pub mod nested;
         "#,
         )
