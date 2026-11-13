@@ -154,6 +154,7 @@ fn relax_main_page(st: &Style) -> String {
     p.row("-h, --help", "Print this help");
     p.section("Environment:");
     p.row("RELAX_HOME", "Where git stores live (default ~/.relax)");
+    p.row("RELAX_SHARED_CACHE", "off (default) or global: one run dir shared by every workspace");
     p.row("NO_COLOR", "Turn colour off (CLICOLOR_FORCE=1 forces it on)");
     p.footer(&format!("Run `{} help <command>` for details. What does not work yet: libs/relax/KNOWN_GAPS.md", command()));
     p.out
@@ -200,6 +201,7 @@ fn main_page(st: &Style) -> String {
     p.row("-h, --help", "Print this help");
     p.section("Environment:");
     p.row("RELAX_HOME", "Where stores and caches live (default ~/.relax)");
+    p.row("RELAX_SHARED_CACHE", "off (default) or global: one run dir shared by every workspace");
     p.row("NO_COLOR", "Turn colour off (CLICOLOR_FORCE=1 forces it on)");
     p.footer("Run `makepad help <command>` for details.");
     p.out

@@ -121,7 +121,34 @@ pub fn relax_dir() -> PathBuf {
     if let Some(d) = override_dir() {
         return d;
     }
+    if matches!(shared_cache_mode(), Ok(true)) {
+        return shared_relax_dir();
+    }
     DEFAULT.get_or_init(|| crate::zone_alloc::kept_with(|| relax_dir_for(&workspace_dir()))).clone()
+}
+
+/// `RELAX_SHARED_CACHE=off|global`: one run dir named `<relax home>/shared` by every workspace of
+/// the user. Unset or `off` keeps the workspace's own dir; any other value fails the run, so the
+/// switch never turns sharing on by accident.
+pub fn shared_cache_mode() -> Result<bool, String> {
+    match std::env::var("RELAX_SHARED_CACHE") {
+        Ok(v) => shared_mode_from(Some(&v)),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(_)) => Err("RELAX_SHARED_CACHE is not valid UTF-8".to_string()),
+    }
+}
+
+fn shared_mode_from(v: Option<&str>) -> Result<bool, String> {
+    match v {
+        None | Some("") | Some("off") => Ok(false),
+        Some("global") => Ok(true),
+        Some(other) => Err(format!("RELAX_SHARED_CACHE must be `off` or `global`, not `{other}`")),
+    }
+}
+
+/// The per-user shared run dir: `$RELAX_HOME/shared` (default `~/.relax/shared`).
+pub fn shared_relax_dir() -> PathBuf {
+    crate::gitstore::relax_home().join("shared")
 }
 
 /// A git store run's workspace before its stores are mounted (`root`: its outer mount to be, the
@@ -173,6 +200,17 @@ pub fn registry_dirs() -> [PathBuf; 2] {
 
 #[cfg(test)]
 mod tests {
+    /// RELAX_SHARED_CACHE is off unless it says global; a typo fails the run.
+    #[test]
+    fn shared_cache_mode_is_fail_closed() {
+        assert_eq!(super::shared_mode_from(None), Ok(false));
+        assert_eq!(super::shared_mode_from(Some("")), Ok(false));
+        assert_eq!(super::shared_mode_from(Some("off")), Ok(false));
+        assert_eq!(super::shared_mode_from(Some("global")), Ok(true));
+        assert!(super::shared_mode_from(Some("on")).is_err());
+        assert!(super::shared_mode_from(Some("1")).is_err());
+    }
+
     /// Anchors use normalized components, prefer nested roots and recognize Windows drives.
     #[test]
     fn paths_choose_the_longest_anchor() {
