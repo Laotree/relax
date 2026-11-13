@@ -66,6 +66,90 @@ pub use front_run::FrontSink;
 #[cfg(test)]
 use front_run::commit_runs;
 
+/// The inputs that can change compiled code, hashed as one struct. The destructuring in `hash` is
+/// exhaustive on purpose: a new field stops the build until the hash and the mutation test are
+/// updated, instead of silently missing an input.
+#[derive(Clone, Default)]
+pub(crate) struct KeyInputs {
+    pub codegen: u128,
+    pub target: String,
+    pub cfg: u128,
+    pub opt: u8,
+    pub panic: u8,
+    pub debug_assertions: bool,
+    pub overflow_checks: bool,
+    pub target_cpu: String,
+    pub rustflags: String,
+    /// env! values that reached code
+    pub env_code: u128,
+    /// include_str!/include_bytes! content
+    pub include_bytes: u128,
+    /// build script outputs, rustc-env, rustc-cfg and link arguments
+    pub build_outputs: u128,
+    /// transitive dependency content hashes
+    pub deps_content: u128,
+    /// proc-macro identities and versions
+    pub proc_macro: u128,
+    pub allocator: u128,
+}
+
+impl KeyInputs {
+    pub(crate) fn hash(&self) -> u128 {
+        let KeyInputs { codegen, target, cfg, opt, panic, debug_assertions, overflow_checks, target_cpu, rustflags, env_code, include_bytes, build_outputs, deps_content, proc_macro, allocator } = self;
+        let mut h = Sip128::new();
+        h.str("key-inputs-v1");
+        h.u128(*codegen);
+        h.str(target);
+        h.u128(*cfg);
+        h.u8(*opt);
+        h.u8(*panic);
+        h.u8(*debug_assertions as u8);
+        h.u8(*overflow_checks as u8);
+        h.str(target_cpu);
+        h.str(rustflags);
+        h.u128(*env_code);
+        h.u128(*include_bytes);
+        h.u128(*build_outputs);
+        h.u128(*deps_content);
+        h.u128(*proc_macro);
+        h.u128(*allocator);
+        h.finish128()
+    }
+}
+
+/// Which crates produce a value that embeds a workspace absolute path (`CARGO_MANIFEST_DIR`,
+/// `OUT_DIR`, an outside-anchor include, ...). The mark is a fast path; the payload scan is the
+/// truth. A crate is carrying when it is marked or when any dependency is.
+#[derive(Clone, Default)]
+pub(crate) struct PathCarrying {
+    marked: std::collections::BTreeSet<u32>,
+}
+
+impl PathCarrying {
+    pub(crate) fn mark(&mut self, krate: u32) {
+        self.marked.insert(krate);
+    }
+
+    pub(crate) fn carrying(&self, krate: u32, deps_of: impl Fn(u32) -> Vec<u32>) -> bool {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut queue = vec![krate];
+        while let Some(c) = queue.pop() {
+            if !seen.insert(c) {
+                continue;
+            }
+            if self.marked.contains(&c) {
+                return true;
+            }
+            queue.extend(deps_of(c));
+        }
+        false
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.marked.len()
+    }
+}
+
 /// What the shared-cache write path does with an entry once the payload scan has run. The
 /// lookup happens before compilation (it needs an identity) and the scan after, so a first build
 /// looks up the path-free identity, compiles, and may learn that the payload carries a path. In
@@ -10859,6 +10943,51 @@ mod prune_tests {
         // the folder also holds this process's live lock (store::hold_build)
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir(&root).unwrap();
+    }
+
+    /// Every input field changes the key: mutate one at a time and the hash must move.
+    #[test]
+    fn each_key_input_changes_the_hash() {
+        let base = KeyInputs::default();
+        let mut seen = std::collections::BTreeSet::new();
+        assert!(seen.insert(base.hash()));
+        let mut muts: Vec<KeyInputs> = Vec::new();
+        let mut m = base.clone(); m.codegen = 1; muts.push(m);
+        let mut m = base.clone(); m.target = "x".into(); muts.push(m);
+        let mut m = base.clone(); m.cfg = 1; muts.push(m);
+        let mut m = base.clone(); m.opt = 1; muts.push(m);
+        let mut m = base.clone(); m.panic = 1; muts.push(m);
+        let mut m = base.clone(); m.debug_assertions = true; muts.push(m);
+        let mut m = base.clone(); m.overflow_checks = true; muts.push(m);
+        let mut m = base.clone(); m.target_cpu = "x".into(); muts.push(m);
+        let mut m = base.clone(); m.rustflags = "x".into(); muts.push(m);
+        let mut m = base.clone(); m.env_code = 1; muts.push(m);
+        let mut m = base.clone(); m.include_bytes = 1; muts.push(m);
+        let mut m = base.clone(); m.build_outputs = 1; muts.push(m);
+        let mut m = base.clone(); m.deps_content = 1; muts.push(m);
+        let mut m = base.clone(); m.proc_macro = 1; muts.push(m);
+        let mut m = base.clone(); m.allocator = 1; muts.push(m);
+        for m in muts {
+            assert!(seen.insert(m.hash()), "a mutated input kept the hash");
+        }
+    }
+
+    /// The crate mark propagates along dependencies: a path-free crate that depends on a carrying
+    /// one is carrying itself.
+    #[test]
+    fn path_carrying_propagates_along_dependencies() {
+        let mut pc = PathCarrying::default();
+        pc.mark(1);
+        let deps = |c: u32| match c {
+            0 => vec![1],
+            1 => vec![],
+            2 => vec![],
+            _ => vec![],
+        };
+        assert!(pc.carrying(1, deps));
+        assert!(pc.carrying(0, deps));
+        assert!(!pc.carrying(2, deps));
+        assert_eq!(pc.len(), 1);
     }
 
     /// The iron rule of the shared-cache write path: a payload the scan found carrying a path
