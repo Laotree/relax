@@ -47,11 +47,25 @@ fn anchors() -> &'static [(&'static str, String)] {
     }))
 }
 
+/// Fixed precedence between anchors of the same length: the workspace first, then the run dir,
+/// then cargo. Nesting is decided by the longest containing prefix before this order, so a file
+/// under two anchors keeps one spelling in every worktree.
+fn tag_rank(tag: &str) -> u8 {
+    match tag {
+        "ws" => 3,
+        "run" => 2,
+        "cargo" => 1,
+        _ => 0,
+    }
+}
+
 /// The longest normalized containing anchor, with component-wise containment on every OS.
+/// A path under no anchor keeps its absolute spelling: its entries are keyed by that absolute
+/// path and never shared (the fallback the key format names).
 fn anchor_from<'a>(path: &str, anchors: impl Iterator<Item = (&'a str, &'a str)>) -> Option<String> {
     anchors.filter_map(|(tag, dir)| {
         crate::vfs::relative_path(path, dir).map(|rel| (crate::vfs::normalize_path(dir).len(), tag, rel))
-    }).max_by_key(|(len, _, _)| *len).map(|(_, tag, rel)| format!("\0{tag}\0{rel}"))
+    }).max_by_key(|(len, tag, _)| (*len, tag_rank(tag))).map(|(_, tag, rel)| format!("\0{tag}\0{rel}"))
 }
 
 /// Chooses an anchored spelling from an explicit list, independent of process state.
@@ -274,6 +288,19 @@ mod tests {
         assert_eq!(super::shared_mode_from(Some("global")), Ok(true));
         assert!(super::shared_mode_from(Some("on")).is_err());
         assert!(super::shared_mode_from(Some("1")).is_err());
+    }
+
+    /// Nested anchors keep one spelling, ties take the fixed order, and a path under no anchor
+    /// keeps its absolute form (never shared).
+    #[test]
+    fn anchors_choose_one_spelling_and_keep_outside_paths_absolute() {
+        let a = [("ws", "/w".to_string()), ("run", "/w/t".to_string()), ("cargo", "/c".to_string())];
+        assert_eq!(super::anchor_in("/w/t/f.rs", &a).as_deref(), Some("\0run\0f.rs"));
+        assert_eq!(super::anchor_in("/w/f.rs", &a).as_deref(), Some("\0ws\0f.rs"));
+        assert_eq!(super::anchor_in("/c/f.rs", &a).as_deref(), Some("\0cargo\0f.rs"));
+        assert_eq!(super::anchor_in("/x/f.rs", &a), None);
+        let tie = [("cargo", "/w".to_string()), ("ws", "/w".to_string())];
+        assert_eq!(super::anchor_in("/w/f.rs", &tie).as_deref(), Some("\0ws\0f.rs"));
     }
 
     /// Anchors use normalized components, prefer nested roots and recognize Windows drives.
