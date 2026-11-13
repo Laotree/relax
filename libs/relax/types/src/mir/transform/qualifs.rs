@@ -342,7 +342,7 @@ pub fn in_operand<Q: Qualif, F: FnMut(Local) -> bool>(cx: &ConstCx<'_>, in_local
 // resolver.rs: propagating qualifs between locals
 
 /// The state of the `FlowSensitiveAnalysis`: two sets of locals, packed in one bit set
-/// (`qualif` in `0..n`, `borrow` in `n..2n`).
+/// (`qualif` in `0..n`, `borrow` in `n..2n`), the domain of the dataflow engine.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
     n: usize,
@@ -372,9 +372,26 @@ impl State {
     fn remove_borrow(&mut self, local: Local) {
         self.bits.remove(self.n + local.0 as usize);
     }
-    fn join(&mut self, other: &State) -> bool {
-        self.bits.union(&other.bits)
+}
+
+/// rustc's `JoinSemiLattice for State` (resolver.rs), `||` included: when the join adds a qualif,
+/// the `borrow` sets are not joined. A block entered with new qualifs therefore keeps only the
+/// borrows it already had (none on its first visit), and a move after the block boundary clears the
+/// qualif of a local borrowed before it: rustc 1.100.0 accepts `let r = &mut x; f(); x` in a
+/// `const fn` with `x: String`, and rejects it without the call `f()`.
+fn join_packed(n: usize, state: &mut crate::mir::dataflow::BitSet, incoming: &crate::mir::dataflow::BitSet) -> bool {
+    let mut qualif_changed = false;
+    for i in incoming.iter().take_while(|&i| i < n) {
+        qualif_changed |= state.insert(i);
     }
+    if qualif_changed {
+        return true;
+    }
+    let mut borrow_changed = false;
+    for i in incoming.iter().skip_while(|&i| i < n) {
+        borrow_changed |= state.insert(i);
+    }
+    borrow_changed
 }
 
 /// A `Visitor` that propagates qualifs between locals. This defines the transfer function of the
@@ -562,6 +579,47 @@ pub fn successors(term: &Terminator) -> Vec<BasicBlock> {
     super::simplify::successors(&term.kind)
 }
 
+/// rustc's `FlowSensitiveAnalysis`: the `TransferFunction` of `Q` as a dataflow analysis over the
+/// packed `State`.
+struct FlowSensitiveAnalysis<'a, Q> {
+    ccx: &'a ConstCx<'a>,
+    n: usize,
+    _qualif: std::marker::PhantomData<Q>,
+}
+
+impl<Q: Qualif> FlowSensitiveAnalysis<'_, Q> {
+    fn transfer(&self, bits: &mut crate::mir::dataflow::BitSet, f: impl FnOnce(&mut TransferFunction<'_, Q>)) {
+        let mut state = State { n: self.n, bits: std::mem::replace(bits, crate::mir::dataflow::BitSet::new_empty(0)) };
+        f(&mut TransferFunction::<Q>::new(self.ccx, &mut state));
+        *bits = state.bits;
+    }
+}
+
+impl<Q: Qualif> crate::mir::dataflow::Analysis for FlowSensitiveAnalysis<'_, Q> {
+    fn bottom_value(&self, _body: &Body) -> crate::mir::dataflow::BitSet {
+        crate::mir::dataflow::BitSet::new_empty(2 * self.n)
+    }
+    fn initialize_start_block(&self, _body: &Body, state: &mut crate::mir::dataflow::BitSet) {
+        self.transfer(state, |t| t.initialize_state());
+    }
+    fn join(&self, state: &mut crate::mir::dataflow::BitSet, incoming: &crate::mir::dataflow::BitSet) -> bool {
+        join_packed(self.n, state, incoming)
+    }
+    fn apply_primary_statement_effect(&self, state: &mut crate::mir::dataflow::BitSet, stmt: &Statement, at: Location) {
+        self.transfer(state, |t| t.visit_statement(stmt, at));
+    }
+    fn apply_primary_terminator_effect<'t>(&self, state: &mut crate::mir::dataflow::BitSet, term: &'t Terminator, at: Location) -> crate::mir::dataflow::TerminatorEdges<'t> {
+        self.transfer(state, |t| t.visit_terminator(term, at));
+        crate::mir::dataflow::TerminatorEdges::for_terminator(term)
+    }
+    fn apply_call_return_effect(&self, state: &mut crate::mir::dataflow::BitSet, _block: BasicBlock, places: crate::mir::dataflow::CallReturnPlaces<'_>) {
+        let place = match places {
+            crate::mir::dataflow::CallReturnPlaces::Call(place) | crate::mir::dataflow::CallReturnPlaces::Yield(place) => place,
+        };
+        self.transfer(state, |t| t.apply_call_return_effect(place));
+    }
+}
+
 /// The dataflow results of one qualif over a body: the state at the entry of every reachable block.
 pub struct QualifResults<Q> {
     entry: Vec<Option<State>>,
@@ -571,55 +629,20 @@ pub struct QualifResults<Q> {
 }
 
 impl<Q: Qualif> QualifResults<Q> {
-    /// Iterates the flow-sensitive analysis of `Q` to its fixpoint (a forward may-analysis with union
-    /// joins; the transfer effects of statements and terminators are applied in rustc's order, the
-    /// effect of a call's return only on its return edge).
+    /// Iterates the flow-sensitive analysis of `Q` to its fixpoint with the dataflow engine
+    /// (rustc's `FlowSensitiveAnalysis::iterate_to_fixpoint`): blocks start at bottom and are
+    /// joined into in rustc's order, which matters because the join is not a plain union
+    /// (`join_packed`). The effect of a call's return is applied on its return edge only.
     pub fn compute(ccx: &ConstCx<'_>) -> Self {
         let body = ccx.body;
-        let n = body.local_decls.len();
-        let mut entry: Vec<Option<State>> = vec![None; body.basic_blocks.len()];
-        let mut start = State::new_empty(n);
-        TransferFunction::<Q>::new(ccx, &mut start).initialize_state();
-        entry[0] = Some(start);
-        let mut queue = std::collections::VecDeque::from([0usize]);
-        let mut queued = vec![false; body.basic_blocks.len()];
-        queued[0] = true;
-        while let Some(bb) = queue.pop_front() {
-            queued[bb] = false;
-            let block = &body.basic_blocks[bb];
-            let mut state = entry[bb].clone().expect("queued block has a state");
-            for (i, statement) in block.statements.iter().enumerate() {
-                TransferFunction::<Q>::new(ccx, &mut state).visit_statement(statement, Location { block: BasicBlock(bb as u32), statement_index: i });
-            }
-            let term = block.terminator.as_ref().expect("unfinished MIR block");
-            let at = Location { block: BasicBlock(bb as u32), statement_index: block.statements.len() };
-            TransferFunction::<Q>::new(ccx, &mut state).visit_terminator(term, at);
-            // the call's return place is assigned on the return edge only
-            let return_edge = match &term.kind {
-                TerminatorKind::Call { destination, target: Some(target), .. } => Some((*target, destination)),
-                TerminatorKind::Yield { resume_arg, resume, .. } => Some((*resume, resume_arg)),
-                _ => None,
-            };
-            for succ in successors(term) {
-                let mut edge_state = state.clone();
-                if let Some((target, place)) = return_edge {
-                    if target == succ {
-                        TransferFunction::<Q>::new(ccx, &mut edge_state).apply_call_return_effect(place);
-                    }
-                }
-                let changed = match &mut entry[succ.0 as usize] {
-                    None => {
-                        entry[succ.0 as usize] = Some(edge_state);
-                        true
-                    }
-                    Some(old) => old.join(&edge_state),
-                };
-                if changed && !queued[succ.0 as usize] {
-                    queued[succ.0 as usize] = true;
-                    queue.push_back(succ.0 as usize);
-                }
-            }
-        }
+        let analysis = FlowSensitiveAnalysis::<Q> { ccx, n: body.local_decls.len(), _qualif: std::marker::PhantomData };
+        let results = crate::mir::dataflow::iterate_to_fixpoint(body, &analysis);
+        let entry = (0..body.basic_blocks.len())
+            .map(|b| {
+                let block = BasicBlock(b as u32);
+                results.is_reachable(block).then(|| State { n: analysis.n, bits: results.entry_state(block).clone() })
+            })
+            .collect();
         QualifResults { entry, cursor: std::cell::RefCell::new(None), _qualif: std::marker::PhantomData }
     }
 

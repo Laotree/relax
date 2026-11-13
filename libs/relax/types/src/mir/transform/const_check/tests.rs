@@ -117,6 +117,35 @@ fn dropped_for(fx: &Fx) -> Body {
     ])
 }
 
+/// rustc's qualif `State` joins with `||` (resolver.rs): when a block is entered with new qualifs,
+/// the `borrow` set is not joined, so a borrow made before a block boundary (here a call) no longer
+/// keeps the borrowed local qualified once it is moved. rustc 1.100.0 accepts
+/// `let mut x = D; let r = &mut x; f(); x` in a `const fn` and rejects it without the call.
+#[test]
+fn a_borrow_before_a_block_boundary_does_not_keep_a_moved_local_qualified() {
+    let fx = Fx::new("");
+    let d = fx.adt("D");
+    let rd = fx.ref_ty(true, d);
+    let mut_borrow = || assign(local(2), borrow(BorrowKind::Mut { kind: MutBorrowKind::Default }, local(1)));
+    let make = || assign(local(1), aggregate_adt(&fx, "D", vec![]));
+    let tail = |first: u32| vec![
+        block(vec![assign(local(3), Rvalue::Use(mv(1))), assign(local(0), Rvalue::Use(int(fx.u8(), 1)))], drop_(local(1), first + 1)),
+        block(vec![], drop_(local(3), first + 2)),
+        block(vec![], TerminatorKind::Return),
+    ];
+    // borrowed, then moved in the same block: the moved-from local stays qualified (two live drops)
+    let mut blocks = vec![block(vec![make(), mut_borrow(), assign(local(3), Rvalue::Use(mv(1))), assign(local(0), Rvalue::Use(int(fx.u8(), 1)))], drop_(local(1), 1))];
+    blocks.push(block(vec![], drop_(local(3), 2)));
+    blocks.push(block(vec![], TerminatorKind::Return));
+    let c = check(&fx, &body(fx.def("cf"), K::Fn, fx.u8(), &[], &[d, rd, d, fx.u8()], blocks), &NoProvider).unwrap();
+    assert_eq!(codes(&c), ["E0493", "E0493"], "{c:?}");
+    // a call between the borrow and the move: only the moved-to local is a live drop
+    let mut blocks = vec![block(vec![make(), mut_borrow()], call(zst(fx.fn_ty("cf")), vec![], local(4), 1))];
+    blocks.extend(tail(1));
+    let c = check(&fx, &body(fx.def("cf"), K::Fn, fx.u8(), &[], &[d, rd, d, fx.u8()], blocks), &NoProvider).unwrap();
+    assert_eq!(codes(&c), ["E0493"], "{c:?}");
+}
+
 #[test]
 fn a_drop_in_a_cleanup_block_is_not_checked() {
     let fx = Fx::new("");
