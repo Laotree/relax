@@ -8808,14 +8808,15 @@ fn own_source(path: &str, std_dir: &str) -> bool {
 
 pub(crate) fn stamp(path: &str) -> Option<(std::time::SystemTime, u64)> {
     // a file of a mounted store changes only by an edit (its file in the edits folder: a device's
-    // devhub push); the store under a run never changes, and is not read to stat it
-    if crate::vfs::is_virtual(path) {
+    // devhub push); the store under a run never changes, and is not read to stat it. A folder
+    // mount's file (vfs.rs SHARE) is a disk file under another name.
+    if crate::vfs::in_store(path) {
         return Some(match crate::vfs::edited_disk_path(path).and_then(|p| std::fs::metadata(p).ok()) {
             Some(m) => (m.modified().ok()?, m.len()),
             None => (std::time::UNIX_EPOCH, 0),
         });
     }
-    let m = std::fs::metadata(path).ok()?;
+    let m = std::fs::metadata(&*crate::vfs::on_disk(path)).ok()?;
     Some((m.modified().ok()?, m.len()))
 }
 
@@ -8858,7 +8859,7 @@ struct Virtual {
 
 impl Virtual {
     fn of(files: &[(String, u32, Option<(std::time::SystemTime, u64)>)]) -> Virtual {
-        let is: Vec<bool> = files.iter().map(|f| crate::vfs::is_virtual(&f.0)).collect();
+        let is: Vec<bool> = files.iter().map(|f| crate::vfs::in_store(&f.0)).collect();
         let rels = files.iter().enumerate().filter(|&(k, _)| is[k]).filter_map(|(k, f)| Some((crate::vfs::edit_rel(&f.0)?, k))).collect();
         Virtual { is, rels }
     }
@@ -8902,7 +8903,7 @@ fn committed_by_ledger<'a>(mut paths: impl Iterator<Item = &'a str>) -> bool {
         let whole = paths.all(|p| {
             any = true;
             // an edit taken back has no file: the ledger's rewrite removed it
-            crate::vfs::is_virtual(p) && crate::vfs::edited_disk_path(p).is_none_or(|d| std::fs::metadata(d).is_ok_and(|m| changed_at(&m) <= changed_at(&ledger)))
+            crate::vfs::in_store(p) && crate::vfs::edited_disk_path(p).is_none_or(|d| std::fs::metadata(d).is_ok_and(|m| changed_at(&m) <= changed_at(&ledger)))
         });
         any && whole
     }
@@ -8936,13 +8937,14 @@ impl LiveWatch {
         let mut files = Vec::new();
         let mut any_virtual = false;
         for (i, p) in paths.enumerate() {
-            if crate::vfs::is_virtual(p) {
+            if crate::vfs::in_store(p) {
                 any_virtual = true;
                 let Some(at) = crate::vfs::edit_location(p) else { continue };
                 if !at.parent().is_some_and(|d| d.is_dir()) { continue; }
                 watched.push(at.to_string_lossy().into_owned());
             } else {
-                watched.push(p.to_string());
+                // (a folder mount's file is watched where it is on disk)
+                watched.push(crate::vfs::on_disk(p).into_owned());
             }
             files.push(i);
         }
@@ -9537,7 +9539,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 // window, 11-03). Every file is looked at below, so an event is only a wakeup; a
                 // disk save waits out the window without a look per event (a checkout's files).
                 let left = LIVE_QUIET.saturating_sub(still_since.elapsed());
-                let overlay = cfg!(unix) && changed.iter().all(|&k| crate::vfs::is_virtual(&files[k].0));
+                let overlay = cfg!(unix) && changed.iter().all(|&k| crate::vfs::in_store(&files[k].0));
                 let rewatch = match events.as_mut().filter(|_| overlay) {
                     Some(w) => {
                         waited = true;
@@ -10257,6 +10259,39 @@ mod moved_type_tests {
         assert_eq!(rung, Rung::Restart, "{lines:?}");
         assert!(lines.iter().any(|l| l.contains("names `Pic`, which this edit moves")), "{lines:?}");
         assert!(!lines.iter().any(|l| l.contains("E0412") || l.contains("E0308")), "{lines:?}");
+    }
+}
+
+#[cfg(test)]
+mod folder_mount_watch_tests {
+    use super::*;
+
+    /// A shared workspace's file (a folder mount, vfs.rs SHARE) is a disk file under another name:
+    /// a live round stamps it from the disk file as it changes, with no walk of an edits folder,
+    /// and only a store's file has an edits ledger. (Taken for a store's file, it was stamped
+    /// through a walk of the edits folder, the whole checkout with its `target/` in the first
+    /// shape of the port, and a polled round never looked at it.)
+    #[test]
+    fn a_shared_checkouts_file_is_stamped_where_it_is_on_disk() {
+        let dir = std::env::temp_dir().join(format!("relax-folder-watch-{}", std::process::id()));
+        let checkout = dir.join("checkout");
+        std::fs::create_dir_all(checkout.join("src")).unwrap();
+        let main = checkout.join("src/main.rs");
+        std::fs::write(&main, "fn main() {}").unwrap();
+        let root = crate::vfs::normalize_path(&dir.join("vfs/share/ws").to_string_lossy());
+        crate::vfs::mount_folder(&root, &checkout);
+        let path = format!("{root}/src/main.rs");
+        let disk = || std::fs::metadata(&main).ok().map(|m| (m.modified().unwrap(), m.len()));
+        let virt = Virtual::of(&[(path.clone(), 0, None)]);
+        assert_eq!(virt.is, [false], "no store file: no edits ledger");
+        let look = Look::new();
+        assert_eq!(look.stamp(&virt, 0, &path), disk());
+        assert!(look.0.get().is_none(), "no walk of an edits folder");
+        std::fs::write(&main, "fn main() { println!(); }").unwrap();
+        assert_eq!(stamp(&path), disk(), "a save moves it");
+        assert!(!committed_by_ledger(std::iter::once(path.as_str())), "a checkout's save is no ledger's edit");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(stamp(&path), None, "gone with its disk file");
     }
 }
 

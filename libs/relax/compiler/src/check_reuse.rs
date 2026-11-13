@@ -226,6 +226,9 @@ fn env_key(prog: &Program) -> u128 {
     let mut vars: Vec<(String, String)> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.to_string_lossy().into_owned())))
         .filter(|(k, _)| k.starts_with("RELAX_") && k != "RELAX_CACHE" && !k.starts_with("RELAX_CHECK_REUSE_") && !crate::run::RUN_STATE_VARS.contains(&k.as_str()) && !crate::run::RUN_LOCATING_VARS.contains(&k.as_str()))
+        // the mount table as vfs describes it for keys: a folder mount's root, not the checkout it
+        // reads (vfs.rs SHARE: a second checkout of the same text checks nothing again)
+        .map(|(k, v)| if k == "RELAX_VFS" { (k, crate::vfs::mounts_key_text()) } else { (k, v) })
         .collect();
     vars.sort();
     h.u32(vars.len() as u32);

@@ -556,10 +556,11 @@ fn auto_native(build: bool) -> Result<String, String> {
     // a git run's package is in its virtual tree: cargo cannot build what is not on disk, and a
     // log or target made there was a real folder at the virtual root, which refused every overlay
     // lease of its box after it (a Linux node, 11-06)
-    if crate::vfs::is_virtual(&dir) {
+    if crate::vfs::in_store(&dir) {
         return Err(format!("no native build of a package in a git run's virtual tree ({}): cargo builds only what is on disk; {}", dir, how));
     }
-    let mut ws = std::path::PathBuf::from(&dir);
+    // (a shared workspace's package is in its checkout on disk)
+    let mut ws = std::path::PathBuf::from(&*crate::vfs::on_disk(&dir));
     let mut cur = ws.clone();
     loop {
         if std::fs::read_to_string(cur.join("Cargo.toml")).map_or(false, |t| t.contains("[workspace]")) {

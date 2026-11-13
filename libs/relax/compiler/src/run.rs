@@ -1127,7 +1127,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // devhub store applier) asks for a live session with RELAX_STORE_LIVE=1.
     let store_live = std::env::var_os("RELAX_STORE_LIVE").is_some_and(|v| v == "1") && crate::vfs::edits_enabled();
     if live_tests || !check && !harness && !plain_test && !no_live && std::env::var_os("RELAX_SCRIPT_DEPTH").is_none() && !SILENT.load(Ordering::Relaxed)
-        && (store_live || !crate::vfs::is_virtual(&workspace_dir())) {
+        && (store_live || !crate::vfs::in_store(&workspace_dir())) {
         driver_options.live = true;
     }
     LIVE_SESSION.store(driver_options.live, Ordering::Release);
@@ -1317,7 +1317,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let _ = crate::pack::ensure_private_dir(std::path::Path::new(&target_dir));
     crate::source_context::set_output_dir(&target_dir);
     // std is the std the program runs on, unless RELAX_STD says otherwise
-    if crate::vfs::is_virtual(&workspace) {
+    if crate::vfs::in_store(&workspace) {
         crate::std_source::select(&workspace, std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/std")));
     }
     if std::env::var_os("RELAX_STD").is_none() {
@@ -1372,11 +1372,12 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     };
     // what cargo gives the process of the target it runs (set at main): its package's variables,
     // and a test's folder (cargo test runs one in its package's folder, cargo run where it was
-    // started); a virtual package (a git run) has no folder to go to. A build script's run has its
+    // started); a virtual package (a git run) has no folder to go to, a shared workspace's goes to
+    // its checkout's. A build script's run has its
     // environment from the run that started it (cargo's build-script variables of its package):
     // its own graph's package is the script's.
     let program_env = if std::env::var_os("RELAX_SCRIPT_DEPTH").is_some() { Vec::new() } else { program_env(&g, subject_ci) };
-    let program_dir = (harness || plain_test).then(|| g.pkg[subject_ci].0.clone()).filter(|d| !crate::vfs::is_virtual(d));
+    let program_dir = (harness || plain_test).then(|| g.pkg[subject_ci].0.clone()).filter(|d| !crate::vfs::in_store(d)).map(|d| crate::vfs::on_disk(&d).into_owned());
     let mut also_graph = Vec::new();
     for name in &also {
         // The original units distinguish target libs from host-only deps, even after substitution.

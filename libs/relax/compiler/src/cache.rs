@@ -4758,7 +4758,8 @@ const IN_USE_BY_OTHERS: std::time::Duration = std::time::Duration::from_secs(10 
 /// build with no store left loses its sets and its lock file. Only checked store files are ever
 /// deleted. Returns (bytes before, after).
 /// `--allow-c` build outputs (`<root>/native`) are kept by reachability, not by size: what a
-/// slot's last build uses stays (native.rs prune).
+/// slot's last build uses stays (native.rs prune). So are the outputs of the build scripts Relax
+/// runs (`<root>/build`): what a script pass's last run used stays (unitgraph.rs prune_build).
 pub fn prune_root(root: &std::path::Path) -> (u64, u64) {
     let cap = std::env::var("RELAX_CACHE_MAX").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20);
     let sizes = prune(root, &crate::store::live(), &crate::store::open_files(), &crate::store::programs(), cap);
@@ -4766,6 +4767,10 @@ pub fn prune_root(root: &std::path::Path) -> (u64, u64) {
     let native = crate::native::prune(&root.join("native"), since);
     if native > 0 && std::env::var_os("RELAX_CACHE_TRACE").is_some() {
         eprintln!("relax cache: pruned {native} native build director(ies) no root names");
+    }
+    let build = crate::unitgraph::prune_build(&root.join("build"), since);
+    if build > 0 && std::env::var_os("RELAX_CACHE_TRACE").is_some() {
+        eprintln!("relax cache: pruned {build} build script director(ies) no root names");
     }
     sizes
 }
