@@ -850,9 +850,15 @@ pub(crate) fn resolve_package(
         }
         if let Some((checked, _)) = sources { checked?; }
         // the package binaries the tests start take this run's native build: named in the tests'
-        // environment, and beside the binaries' wrappers for a test that clears it
+        // environment, and beside the binaries' wrappers for a test that clears it. And a run of
+        // this program again takes it (a program or a test harness that starts its own
+        // executable), as cargo's child is the binary built: it compiled and linked the native
+        // packages again, with a C compiler the built program need not have (relax issue 177)
         if let Some(r) = scripts? {
-            for bin in g.env.iter().flatten().filter_map(|(k, _)| k.strip_prefix("CARGO_BIN_EXE_")) {
+            crate::progenv::set_run_fact("RELAX_RUN_NATIVE", &r);
+            let mut bins = g.env.iter().flatten().filter_map(|(k, _)| k.strip_prefix("CARGO_BIN_EXE_")).peekable();
+            let launches = bins.peek().is_some();
+            for bin in bins {
                 let file = unitgraph::bin_native(&crate::dirs::relax_dir(), bin);
                 if std::fs::read_to_string(&file).ok().as_deref() != Some(r.as_str()) {
                     let tmp = file.with_extension(format!("native.tmp{}", std::process::id()));
@@ -862,7 +868,9 @@ pub(crate) fn resolve_package(
                     }
                 }
             }
-            std::env::set_var(unitgraph::BIN_NATIVE_RECEIPT, r);
+            if launches {
+                std::env::set_var(unitgraph::BIN_NATIVE_RECEIPT, r);
+            }
         }
         crate::macro_reg::set_build_outputs(sess, &g.crates, &g.cfgs, &g.env, &host_checks);
     }
@@ -5487,4 +5495,8 @@ pub(crate) unsafe fn reset_statics() {
     reset(&ONCE, AtomicBool::new(false));
     reset(&LAST, relax_session::sync::Mutex::new(""));
     reset(&FRONT_REPORTED, AtomicBool::new(false));
+    // a restart in place compiles the edited inputs: the native build this run took or named
+    // stands for no next run (it builds its own, or finds it cached under its key)
+    reset(&TESTS_NATIVE, std::sync::OnceLock::new());
+    std::env::remove_var("RELAX_RUN_NATIVE");
 }

@@ -8044,6 +8044,9 @@ fn exec_restart(state: Option<&[u8]>) -> Result<(), String> {
             }
         }
         if let Some(dir) = dir { cmd.current_dir(dir); }
+        // a restart compiles the edited inputs: no native build this run took or made stands for
+        // the next one (it builds its own, or finds it cached under the same key)
+        cmd.env_remove("RELAX_RUN_NATIVE");
         for (name, value) in next_run_env(state)? {
             match value {
                 Some(value) => { cmd.env(name, value); }

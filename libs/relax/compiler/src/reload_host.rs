@@ -927,6 +927,9 @@ fn restart(h: Handover, state: Option<&[u8]>) {
         }
         let reason = super::RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()).clone();
         cmd.env("RELAX_RESTART_T0", super::RESTART_SAVED_MS.load(std::sync::atomic::Ordering::Relaxed).to_string());
+        // the restart compiles the edited inputs: no native build this run took or made stands
+        // for the next one (reload.rs exec_restart)
+        cmd.env_remove("RELAX_RUN_NATIVE");
         super::restart_begins();
         // the run ends as at exit (exec skips the exit handlers); fd 2 goes back to the terminal
         // now (the transcript tee is a thread of this process: the new one starts its own), so
