@@ -20,9 +20,10 @@ pub fn memory(a: &mut Answer) {
     let held = f(&t, "malloc_held_free_mb");
     let tracked = node("malloc/in use/program (tracked stacks, est.)");
     // who owns the memory: the program's malloc heap, Relax's arenas and JIT code, the app
-    // domains' arenas; resident estimates (an arena's touched pages, not what it reserved)
-    let arena_res = sp("compiler_arena_touched_mb") + sp("compiler_arena_large_mb");
-    let slots_res = sp("slots_arena_touched_mb") + sp("slots_arena_large_mb");
+    // domains' arenas; each arena by its resident pages (its touched pages also count the ones it
+    // handed back to the system, its reservation is address space)
+    let arena_res = sp("compiler_arena_resident_mb");
+    let slots_res = sp("slots_arena_resident_mb");
     // a hosted app's heap is its domain's arena: malloc then holds Relax's own blocks and its
     // provided crates'
     let hosted = split.as_ref().is_some_and(|x| s(x, "program_heap").starts_with("domain"));
@@ -30,8 +31,8 @@ pub fn memory(a: &mut Answer) {
     let mut parts: Vec<(String, f64, String)> = vec![
         (heap_name.into(), in_use, if tracked > 0.0 { format!("{} tracked by `heap start`", mb(tracked)) } else if hosted { "the program allocates in its domain's arena".into() } else { "the program's live allocations (`heap start` splits them by stack)".into() }),
         ("malloc: freed, held".into(), held, held_note.into()),
-        ("relax: compiler arena".into(), arena_res, format!("touched pages; {} reserved", mb(sp("compiler_arena_committed_mb")))),
-        ("relax: slot arena".into(), slots_res, format!("touched pages; {} reserved", mb(sp("slots_arena_committed_mb")))),
+        ("relax: compiler arena".into(), arena_res, format!("resident; {} touched, {} reserved", mb(sp("compiler_arena_touched_mb") + sp("compiler_arena_large_mb")), mb(sp("compiler_arena_committed_mb")))),
+        ("relax: slot arena".into(), slots_res, format!("resident; {} touched, {} reserved", mb(sp("slots_arena_touched_mb") + sp("slots_arena_large_mb")), mb(sp("slots_arena_committed_mb")))),
         ("relax: burst arena".into(), sp("burst_arena_committed_mb"), "committed".into()),
         ("relax: JIT code + data".into(), sp("jit_code_mb") + sp("jit_ro_data_mb"), String::new()),
     ];

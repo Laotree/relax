@@ -599,7 +599,12 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
     let (cs, bs) = crate::zone_alloc::arena_states();
     out.line(&format!("{{\"arena_states\":\"compiler\",{}}}", st(&cs)));
     out.line(&format!("{{\"arena_states\":\"burst\",{}}}", st(&bs)));
-    out.line(&format!("{{\"arena_states\":\"slots\",{}}}", st(&crate::zone_alloc::slots_states())));
+    let ss = crate::zone_alloc::slots_states();
+    out.line(&format!("{{\"arena_states\":\"slots\",{}}}", st(&ss)));
+    // the Relax arenas' resident pages, as the domain arenas': touched pages include the ones a
+    // chunk handed back to the system after the compile that used them (a cold start's compiler arena:
+    // 944 MB touched, 340 MB resident)
+    let (c_resident, s_resident) = (arena_resident(&cs), arena_resident(&ss));
     let compiler = req.get("compiler") == Some("1");
     let n = req.num("n", 24) as usize;
     let mut partial = Vec::new();
@@ -631,7 +636,7 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
     // The program's malloc, the compiler's arenas and the JIT's mappings are accounted apart.
     out.line(&format!("{{\"trims\":{},\"last_trim_ms\":{}}}", crate::memstat::TRIMS.load(std::sync::atomic::Ordering::Relaxed), crate::memstat::LAST_TRIM_MS.load(std::sync::atomic::Ordering::Relaxed)));
     out.line(&format!(
-        "{{\"split\":{{\"routing\":{},\"program_heap\":{},\"program_heap_in_use_mb\":{},\"program_heap_held_free_mb\":{},\"program_heap_resident_mb\":{},\"compiler_arena_committed_mb\":{},\"compiler_arena_live_mb\":{},\"slots_arena_committed_mb\":{},\"slots_arena_live_mb\":{},\"slots_arena_touched_mb\":{},\"slots_arena_large_mb\":{},\"jit_code_mb\":{},\"jit_ro_data_mb\":{},\"program_statics_mb\":{},\"burst_arena_committed_mb\":{},\"compiler_arena_touched_mb\":{},\"compiler_arena_live_slots_mb\":{},\"compiler_arena_large_mb\":{},\"compiler_arena_chunks_listed\":{},\"compiler_arena_events\":{{\"contended_chunk\":{},\"contended_pool\":{},\"contended_warm\":{},\"contended_partial\":{},\"yields\":{},\"commits\":{},\"decommits\":{},\"pushes\":{},\"pops\":{}}},\"job_arena\":{{\"jobs\":{},\"survivor_jobs\":{},\"survivor_bytes\":{}}}}}}}",
+        "{{\"split\":{{\"routing\":{},\"program_heap\":{},\"program_heap_in_use_mb\":{},\"program_heap_held_free_mb\":{},\"program_heap_resident_mb\":{},\"compiler_arena_committed_mb\":{},\"compiler_arena_live_mb\":{},\"slots_arena_committed_mb\":{},\"slots_arena_live_mb\":{},\"slots_arena_touched_mb\":{},\"slots_arena_large_mb\":{},\"jit_code_mb\":{},\"jit_ro_data_mb\":{},\"program_statics_mb\":{},\"burst_arena_committed_mb\":{},\"compiler_arena_touched_mb\":{},\"compiler_arena_live_slots_mb\":{},\"compiler_arena_large_mb\":{},\"compiler_arena_chunks_listed\":{},\"compiler_arena_resident_mb\":{},\"slots_arena_resident_mb\":{},\"compiler_arena_events\":{{\"contended_chunk\":{},\"contended_pool\":{},\"contended_warm\":{},\"contended_partial\":{},\"yields\":{},\"commits\":{},\"decommits\":{},\"pushes\":{},\"pops\":{}}},\"job_arena\":{{\"jobs\":{},\"survivor_jobs\":{},\"survivor_bytes\":{}}}}}}}",
         json_str(if crate::zone_alloc::compiler_arena_enabled() { "compiler arena" } else { "off (RELAX_COMPILER_ARENA=0)" }),
         json_str(&program),
         mb(p_inuse),
@@ -651,6 +656,8 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
         mb(snap.get("relax/compiler arena/small live slots")),
         mb(snap.get("relax/compiler arena/large blocks")),
         snap.get("relax/compiler arena/chunks listed for reuse"),
+        mb(c_resident as u64),
+        mb(s_resident as u64),
         ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], ev[8],
         jobs.0, jobs.1, jobs.2,
     ));

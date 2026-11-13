@@ -182,7 +182,7 @@ fn a_hosted_apps_heap_is_its_domain_arena_by_resident_pages() {
 {"measured":"memory now","at_ms":1,"source":"x","partial":[]}
 {"rss_mb":2271.8,"peak_rss_mb":5398.2,"footprint_mb":1690.2,"peak_footprint_mb":4218.0,"compressed_mb":0.0,"malloc_in_use_mb":372.3,"malloc_held_free_mb":103.6}
 {"trims":57,"last_trim_ms":221295}
-{"split":{"routing":"compiler arena","program_heap":"domain 1 arena","program_heap_in_use_mb":291.4,"program_heap_held_free_mb":0.0,"program_heap_resident_mb":288.9,"compiler_arena_committed_mb":1929.8,"compiler_arena_touched_mb":927.6,"compiler_arena_large_mb":191.8,"slots_arena_committed_mb":271.7,"slots_arena_touched_mb":98.1,"slots_arena_large_mb":61.7,"jit_code_mb":47.4,"jit_ro_data_mb":4.5,"burst_arena_committed_mb":24.0}}
+{"split":{"routing":"compiler arena","program_heap":"domain 1 arena","program_heap_in_use_mb":291.4,"program_heap_held_free_mb":0.0,"program_heap_resident_mb":288.9,"compiler_arena_committed_mb":1929.8,"compiler_arena_touched_mb":927.6,"compiler_arena_large_mb":191.8,"slots_arena_committed_mb":271.7,"slots_arena_touched_mb":98.1,"slots_arena_large_mb":61.7,"jit_code_mb":47.4,"jit_ro_data_mb":4.5,"burst_arena_committed_mb":24.0,"compiler_arena_resident_mb":350.0,"slots_arena_resident_mb":120.0}}
 {"findings":[],"more":[]}"#),
     );
     assert!(r.contains("Program heap (domain 1 arena) 289 MB resident, 291 MB in use"), "{}", r);
@@ -190,4 +190,7 @@ fn a_hosted_apps_heap_is_its_domain_arena_by_resident_pages() {
     assert!(r.contains("resident; 291 MB in use, 1.16 GB committed address space, 19 threads"), "{}", r);
     assert!(r.contains("| malloc (Relax, provided crates), in use | 372 |"), "{}", r);
     assert!(!r.contains("program heap (malloc"), "{}", r);
+    // a Relax arena by its resident pages too: its touched pages include the ones it handed back
+    assert!(r.contains("| relax: compiler arena | 350 |"), "{}", r);
+    assert!(r.contains("| resident; 1.09 GB touched, 1.88 GB reserved |"), "{}", r);
 }
