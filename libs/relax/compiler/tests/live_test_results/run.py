@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """A live test session answers each test's outcome, not only counts and failing names: run.py
-[/path/to/makepad] (without one, from the workspace root: `cargo run --profile host` of makepad).
+[/path/to/relax] (without one, from the workspace root: `cargo run --profile host` of relax).
 Relax issue 131 (ported from makepad/relax PR 134).
 
 `makepad test --live live-test-results --lib -- --skip filtered`, found with `inspect list`:
@@ -24,7 +24,7 @@ import time
 if len(sys.argv) > 1:
     jit = [str(Path(sys.argv[1]).resolve())]
 else:
-    jit = ["cargo", "run", "--profile", "host", "-q", "--manifest-path", str(Path.cwd() / "Cargo.toml"), "-p", "makepad-run", "--bin", "makepad", "--"]
+    jit = ["cargo", "run", "--profile", "host", "-q", "--manifest-path", str(Path.cwd() / "Cargo.toml"), "-p", "relax-runner", "--bin", "relax", "--"]
 here = Path(__file__).resolve().parent
 
 

@@ -1,3 +1,0 @@
-[workspace]
-members = ["reject", "paths"]
-resolver = "2"

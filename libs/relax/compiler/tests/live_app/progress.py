@@ -14,7 +14,7 @@ binary = str(Path(sys.argv[1]).resolve())
 with tempfile.TemporaryDirectory(prefix="relax-progress-") as tmp:
     root = Path(tmp)
     (root / "src").mkdir()
-    (root / "Cargo.toml").write_text('[package]\nname="makepad-platform"\nversion="0.0.0"\nedition="2021"\n[workspace]\n')
+    (root / "Cargo.toml").write_text('[package]\nname="presents-progress"\nversion="0.0.0"\nedition="2021"\n[package.metadata.relax]\npresents = true\n[workspace]\n')
     (root / "src/main.rs").write_text('''
 fn main() {
     eprintln!("progress fixture ready");
@@ -27,7 +27,7 @@ fn main() {
     env = dict(os.environ, RELAX_CACHE="off")
     for key in ["NO_COLOR", "RELAX_REPORT_TO", "RELAX_SCRIPT_DEPTH"]:
         env.pop(key, None)
-    p = subprocess.Popen([binary, "run", "makepad-platform"], cwd=root, env=env, stdout=slave, stderr=slave)
+    p = subprocess.Popen([binary, "run", "presents-progress"], cwd=root, env=env, stdout=slave, stderr=slave)
     os.close(slave)
     data = bytearray()
     def drain():
