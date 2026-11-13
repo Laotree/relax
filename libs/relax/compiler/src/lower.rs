@@ -6869,8 +6869,10 @@ impl<'a> Lcx<'a> {
         let ast = self.ast();
         let ex = ast.expr(e);
         // Two-word integer operations need both halves of every operand, an operand that is a
-        // reference to one too (`&a + &b` on i128: built in, with both operands loaded)
-        let wide = match &ex.kind {
+        // reference to one too (`&a + &b` on i128: built in, with both operands loaded). An
+        // overloaded operator is the trait call whatever its operands' width (`w += 5u128` on a
+        // Wrapping<u128>, `x * 3i128` with `impl Mul<i128> for X`).
+        let wide = !self.b.binops.contains_key(&e.0) && match &ex.kind {
             ExprKind::Binary(_, a, b) | ExprKind::AssignOp(_, a, b) => self.is_wide(self.prim_peeled(self.body_ty(*a))) || self.is_wide(self.prim_peeled(self.body_ty(*b))),
             ExprKind::Unary(UnOp::Neg | UnOp::Not, x) | ExprKind::Cast(x, _) => self.is_wide(self.body_ty(*x)) || self.is_wide(t),
             _ => false,

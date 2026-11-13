@@ -63,17 +63,13 @@ macro_rules! binop_forms {
             let mut x = a;
             x $op_assign &b;
             assert_eq!(x, want);
-            // `x op= int` by value: through the trait method as well, and for the 128-bit words
-            // only so (the JIT miscompiles operator syntax with a by-value u128/i128 right-hand
-            // side on a struct, whatever the impl)
+            // `x op= int` by value, as the operator and through the trait method
             let mut x = a;
             $tra::<$t>::$ma(&mut x, b.0);
             assert_eq!(x, want);
-            if std::mem::size_of::<$t>() <= 8 {
-                let mut x = a;
-                x $op_assign b.0;
-                assert_eq!(x, want, "{} {} {} {}", stringify!($t), a, stringify!($op_assign), b);
-            }
+            let mut x = a;
+            x $op_assign b.0;
+            assert_eq!(x, want, "{} {} {} {}", stringify!($t), a, stringify!($op_assign), b);
             let mut x = a;
             x $op_assign &b.0;
             assert_eq!(x, want, "{} {} {} &{}", stringify!($t), a, stringify!($op_assign), b);
