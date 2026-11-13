@@ -2366,8 +2366,9 @@ thread_local! {
     /// fault handler at every point of the thread's life)
     static END_CTX: std::cell::UnsafeCell<[u64; 2]> = const { std::cell::UnsafeCell::new([0; 2]) };
     /// The return addresses between the fault that ended the run on this thread and the recovery
-    /// point it went to (written in the handler, read at that point: `note_abandoned_frames`).
-    static END_WALK: std::cell::UnsafeCell<([u64; 16], usize)> = const { std::cell::UnsafeCell::new(([0; 16], 0)) };
+    /// point it went to (written in the handler, read at that point: `note_abandoned_frames`), and
+    /// whether the walk came up to the entry glue: then its last one is the return into the glue.
+    static END_WALK: std::cell::UnsafeCell<([u64; 16], usize, bool)> = const { std::cell::UnsafeCell::new(([0; 16], 0, false)) };
 }
 
 /// Host functions a run's end left without returning: a frame of native code between JIT frames.
@@ -2380,10 +2381,15 @@ pub(crate) fn abandoned_frames() -> Vec<(String, u32)> {
 }
 
 /// The run ended under this thread (back at a recovery point, in normal context): names any native
-/// frame the fault's walk found among the ones left behind. `app_call`: the frames next to its
-/// recovery point are its own, on the way to the callback.
+/// frame the fault's walk found among the ones left behind. The return into the entry glue is none:
+/// the glue is code of the ended run (`Unit::end_code`) that keeps running. `app_call`: the frames
+/// next to the glue are its own, on the way to the callback (`app_call_body` and the caller's
+/// thunk, frames of their own where a build makes no tail calls of them: relax issue 180).
 fn note_abandoned_frames(app_call: bool) {
-    let (raw, mut n) = END_WALK.with(|w| unsafe { let w = &mut *w.get(); let v = (w.0, w.1); w.1 = 0; v });
+    let (raw, mut n, glue) = END_WALK.with(|w| unsafe { let w = &mut *w.get(); let v = (w.0, w.1, w.2); w.1 = 0; w.2 = false; v });
+    if glue {
+        n -= 1;
+    }
     while app_call && n > 0 && !crate::stale::in_ended_run(raw[n - 1]) {
         n -= 1;
     }
@@ -2632,6 +2638,8 @@ unsafe fn end_on_fault(f: &os::fault::Fault) -> os::fault::Action {
             fp = next;
         }
         w.1 = n;
+        // `enter` keeps its frame record ENTER_FRAME above the recovery point it saves
+        w.2 = n > 1 && fp == limit + x64::ENTER_FRAME as u64;
     });
     os::fault::Action::Resume { pc: ENDED_LEAVE.load(Ordering::Acquire), a0: target as u64, a1: LEAVE_RUN_ENDED }
 }

@@ -1061,6 +1061,9 @@ fn a_run_ends_with_native_frames_in_it_and_no_host_lock_stays_held() {
     extern "C" fn thunk(p: *mut u8) {
         let f: extern "C" fn() = unsafe { std::mem::transmute(p) };
         f();
+        // (no tail call: a frame of its own where the build keeps frame records, as a native
+        // caller's function has)
+        std::hint::black_box(p);
     }
     // a native thread with a lock of its own, in a callback that waits
     static CALLER_LOCK: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
