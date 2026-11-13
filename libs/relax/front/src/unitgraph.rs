@@ -1283,11 +1283,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         .envs(bs.profile.env())
         .env("NUM_JOBS", "4")
         .envs(pkg_env(dir, pname, ver))
-        // Both tools are the loader: RUSTC probes use its target model, CARGO metadata its
-        // resolver and VFS. The runner consumes `build-script` on entry, then marks tool calls.
         // RUSTDOC too (the `built` crate requires it); nothing documents here
-        .env("RUSTC", &exe)
-        .env("CARGO", &exe)
         .env("RUSTDOC", "rustdoc")
         .env("RELAX_AS_RUSTC", "build-script")
         .env("RELAX_SCRIPT_DEPTH", depth.to_string())
@@ -1311,6 +1307,11 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     for (k, v) in cenv {
         cmd.env(k, v);
     }
+    // Both tools are the loader: RUSTC probes use its target model, CARGO metadata its resolver
+    // and VFS (a virtual or shared workspace's manifests are not on the disk a cargo reads). Set
+    // after the crate's environment, whose CARGO is the build's cargo (pkg_env). The runner
+    // consumes `build-script` on entry, then marks tool calls.
+    cmd.env("RUSTC", &exe).env("CARGO", &exe);
     cmd.env("CARGO_ENCODED_RUSTFLAGS", "");
     for f in &bs.features {
         cmd.env(format!("CARGO_FEATURE_{}", f.to_uppercase().replace('-', "_")), "1");
