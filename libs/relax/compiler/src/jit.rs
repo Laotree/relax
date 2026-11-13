@@ -24604,6 +24604,7 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         // Relax std: the program's view of the environment, and the host's values for its plumbing
         b"__relax_env_snapshot" => Some(relax_base::progenv::env_snapshot as *const () as usize),
         b"__relax_spawn_env" => Some(relax_base::progenv::spawn_env as *const () as usize),
+        b"__relax_prepared_bin" => Some(relax_base::progenv::prepared_bin as *const () as usize),
         #[cfg(unix)]
         b"__relax_host_getenv" => Some(relax_base::progenv::host_getenv as *const () as usize),
         #[cfg(windows)]

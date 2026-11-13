@@ -252,9 +252,10 @@ const BIN: &str = crate::dirs::BIN_LINES;
 /// Windows the launcher is a `.cmd`, and no `.exe` by the binary's name was there, which is
 /// where cargo has it (relax PR 153: NotFound): there the binary is `<name>.exe`, a link of the
 /// loader, and its run's words (unitgraph.rs, beside the `.cmd`) go in the folder's `+bin`
-/// under that name, which the loader started by it takes (`bin_start`).
-pub fn add_bins(launchers: &[String]) {
-    let Some(dir) = OWN_DIR.get() else { return };
+/// under that name, which the loader started by it takes (`bin_start`). Returns where each one is.
+pub fn add_bins(launchers: &[String]) -> Vec<PathBuf> {
+    let mut placed = Vec::new();
+    let Some(dir) = OWN_DIR.get() else { return placed };
     for l in launchers {
         let from = Path::new(l);
         if cfg!(windows) {
@@ -265,6 +266,7 @@ pub fn add_bins(launchers: &[String]) {
             let lines = dir.join(BIN);
             if std::fs::create_dir_all(&lines).is_ok() && std::fs::write(lines.join(&file), &words).is_ok() {
                 let _ = link_loader(&loader, &dir.join(&file), &dir.with_file_name(COPIES));
+                placed.push(dir.join(&file));
             }
             continue;
         }
@@ -273,7 +275,9 @@ pub fn add_bins(launchers: &[String]) {
         if !to.exists() && std::fs::hard_link(from, &to).is_err() {
             let _ = std::fs::copy(from, &to);
         }
+        placed.push(to);
     }
+    placed
 }
 
 /// Whether `exe` is a run's own executable (its command line beside it), a link a run was

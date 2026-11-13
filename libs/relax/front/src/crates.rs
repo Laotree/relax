@@ -659,6 +659,31 @@ pub fn set_program_env(env: &[(String, String)], dir: Option<&str>) {
     }
 }
 
+/// Puts the program's environment outside the `RELAX_` namespace in this process (`start`, name and
+/// value bytes as the process was started: relax-base progenv `program_start`), in place of the
+/// build environment its host built with: each other such variable goes, each of `start` is set.
+/// Each one's previous state is kept as set_program_env keeps it. Call it with no program thread
+/// running.
+pub fn set_program_start_env(start: &[(Vec<u8>, Vec<u8>)]) {
+    let _k = crate::zone_alloc::kept();
+    let os = |b: &[u8]| unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(b) }.to_os_string();
+    let mut p = PROGRAM_PROCESS.lock().unwrap();
+    let keep = |p: &mut ProgramProcess, k: &str| {
+        if !p.env.iter().any(|(n, _)| n == k) { p.env.push((k.to_string(), std::env::var_os(k))); }
+    };
+    for (k, _) in std::env::vars_os() {
+        let Some(name) = k.to_str() else { continue };
+        if name.starts_with("RELAX_") || start.iter().any(|(s, _)| s.as_slice() == name.as_bytes()) { continue; }
+        keep(&mut p, name);
+        unsafe { std::env::remove_var(name) };
+    }
+    for (k, v) in start {
+        let Ok(name) = std::str::from_utf8(k) else { continue };
+        keep(&mut p, name);
+        unsafe { std::env::set_var(name, os(v)) };
+    }
+}
+
 /// Some(the value before the run set it for its program) for a variable set_program_env set.
 fn program_env_before(key: &str) -> Option<Option<std::ffi::OsString>> {
     PROGRAM_PROCESS.lock().unwrap().env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())

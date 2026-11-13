@@ -571,6 +571,24 @@ fn write_beside(path: &str, data: &[u8]) -> Result<(), String> {
     })
 }
 
+/// Whether `path` names a receipt as a run wrote it into the run dir `dir` (`write_receipt`): in
+/// that folder, named by its content. A receipt named by the environment is taken only so (relax
+/// issue 168); which native packages it covers is matched after (`inherited_scripts`).
+pub fn receipt_in(path: &str, dir: &str) -> Result<(), String> {
+    let p = std::path::Path::new(path);
+    let (Some(Ok(at)), Ok(run_dir)) = (p.parent().map(std::path::Path::canonicalize), std::path::Path::new(dir).canonicalize()) else {
+        return Err(format!("{path} is not in the run dir {dir}"));
+    };
+    if at != run_dir {
+        return Err(format!("{path} is not in the run dir {dir}"));
+    }
+    let text = std::fs::read(p).map_err(|e| format!("{path}: {e}"))?;
+    if p.file_name().and_then(|n| n.to_str()) != Some(format!("native-scripts-{:016x}.json", fnv(&text, 0xcbf29ce484222325)).as_str()) {
+        return Err(format!("{path} is not a receipt as a run wrote it"));
+    }
+    Ok(())
+}
+
 /// A script receipt (`write_receipt`), or None when there is none to use: unreadable, or naming an
 /// OUT_DIR or a library that is gone.
 pub fn read_receipt(path: &str) -> Option<Receipt> {

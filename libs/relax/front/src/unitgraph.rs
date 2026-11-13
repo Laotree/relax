@@ -367,11 +367,6 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
                     if !features.is_empty() {
                         words.extend(["--features".to_string(), features.clone()]);
                     }
-                    // the test's run's `--allow-c` is its binary's too (the package the person
-                    // granted; a program's child does not inherit it, progenv ALLOW_C)
-                    if allow_c {
-                        words.push("--allow-c".to_string());
-                    }
                     words.extend(["--bin".to_string(), bin_name.clone(), "--".to_string()]);
                     let wrapper = bin_dir.join(if cfg!(windows) { format!("{bin_name}.cmd") } else { bin_name.clone() });
                     if cfg!(windows) {
@@ -551,12 +546,19 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
     let seeds: Vec<usize> = native_scripts.iter().map(|(i, _)| *i).collect();
     // the native build's outputs: cached under this run's key, or the receipt of the run that
     // started this one, matched by the scripts' paths (a build script's own child run builds
-    // nothing; a binary its test started builds only what its test's build lacks)
+    // nothing; a binary its test started builds only what its test's build lacks). A binary takes
+    // one only in a run with `--allow-c`: a receipt grants no native library (relax issue 168).
     let inherited = match native_receipt {
         Some(Inherit::Script(r)) => Some((r, false)),
-        Some(Inherit::Binary(r)) if !seeds.is_empty() => Some((r, true)),
+        Some(Inherit::Binary(r)) if !seeds.is_empty() && builds => Some((r, true)),
         _ => None,
-    }.and_then(|(r, binary)| crate::native::read_receipt(r).and_then(|r| Some((inherited_scripts(g, &seeds, &r.scripts, binary)?, r.lib))));
+    }.and_then(|(r, binary)| {
+        let taken = crate::native::read_receipt(r).and_then(|rc| Some((inherited_scripts(g, &seeds, &rc.scripts, binary)?, rc.lib)));
+        if binary && taken.is_none() {
+            eprintln!("relax run: the native build {r} does not cover this build's native packages; this run builds its own");
+        }
+        taken
+    });
     let native = match native_receipt {
         Some(Inherit::Binary(_)) if inherited.is_some() => None,
         _ => native,

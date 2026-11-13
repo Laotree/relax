@@ -447,6 +447,12 @@ impl Command {
         if self_exec {
             flags |= 2;
         }
+        // a package binary this run prepared (a test's CARGO_BIN_EXE_<name>): its host builds as
+        // this run did (relax-base progenv.rs, relax issue 168)
+        let program = self.program.as_encoded_bytes();
+        if unsafe { __relax_prepared_bin(program.as_ptr(), program.len()) } != 0 {
+            flags |= 16;
+        }
         match dir {
             ChildDir::Same => {}
             ChildDir::Virtual(workspace, vfs) => {
@@ -955,6 +961,8 @@ fn wire_push(out: &mut Vec<u8>, k: &[u8], v: Option<&[u8]>) {
 
 extern "C" {
     fn __relax_spawn_env(edits: *const u8, edits_len: usize, host: *const u8, host_len: usize, flags: u32, out: *mut *const u8, out_len: *mut usize);
+    /// relax-base progenv.rs prepared_bin: 1 for a package binary this run prepared
+    fn __relax_prepared_bin(path: *const u8, len: usize) -> i32;
 }
 
 /// Iterator over a Command's arguments (Command::get_args).

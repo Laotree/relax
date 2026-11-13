@@ -1386,10 +1386,16 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             let bin = crate::selfexe::program_name(&cargo_flags, &package);
             std::fs::read_to_string(unitgraph::bin_native(&crate::dirs::relax_dir(), &bin)).ok()
         });
-        if let Some(r) = receipt.filter(|r| !r.is_empty()) {
+        if let Some(r) = receipt.filter(|r| !r.is_empty()).and_then(|r| run_dir_receipt("RELAX_BIN_NATIVE_RECEIPT", r, &target_dir)) {
+            // and a run of the binary again (it starts its own executable) takes it too
+            crate::progenv::set_run_fact("RELAX_RUN_NATIVE", &r);
             let _ = TESTS_NATIVE.set(r);
         }
         unsafe { std::env::remove_var(unitgraph::BIN_NATIVE_RECEIPT) };
+    } else if let Some(r) = std::env::var("RELAX_RUN_NATIVE").ok().filter(|r| !r.is_empty()).and_then(|r| run_dir_receipt("RELAX_RUN_NATIVE", r, &target_dir)) {
+        // this program again, of a run that took its native build from its test's run (relax
+        // issue 168: it built its own then, without the test's inputs)
+        let _ = TESTS_NATIVE.set(r);
     }
     let workspace = workspace_dir();
     // everything this run writes: the workspace's <target>/relax (dirs.rs), made private above
@@ -1428,7 +1434,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         let mut launchers: Vec<String> = g.env.iter().flatten().filter(|(k, _)| k.starts_with("CARGO_BIN_EXE_")).map(|(_, v)| v.clone()).collect();
         launchers.sort();
         launchers.dedup();
-        crate::selfexe::add_bins(&launchers);
+        let mut prepared: Vec<std::path::PathBuf> = launchers.iter().map(std::path::PathBuf::from).collect();
+        prepared.extend(crate::selfexe::add_bins(&launchers));
+        // a run of one the test starts builds as this run did (relax-base progenv.rs BUILD_ENV)
+        crate::progenv::set_prepared(&prepared);
     }
     // a test process's target (test_subjects): its --subject in a graph of several test targets
     // (test_pkg.rs), else the graph's one (the lib's unit tests); the graph's other targets are
@@ -1461,7 +1470,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // its checkout's. A build script's run has its
     // environment from the run that started it (cargo's build-script variables of its package):
     // its own graph's package is the script's.
-    let program_env = if std::env::var_os("RELAX_SCRIPT_DEPTH").is_some() { Vec::new() } else { program_env(&g, subject_ci) };
+    // A run of a binary the run prepared (a test's CARGO_BIN_EXE) or of this program again: cargo
+    // execs that binary and gives it nothing, so its program has the environment it was started
+    // with (progenv program_start, relax issue 168), not the package's variables and `[env]`.
+    let program_env = if std::env::var_os("RELAX_SCRIPT_DEPTH").is_some() || crate::progenv::program_start().is_some() { Vec::new() } else { program_env(&g, subject_ci) };
     let program_dir = (harness || plain_test).then(|| g.pkg[subject_ci].0.clone()).filter(|d| !crate::vfs::in_store(d)).map(|d| crate::vfs::on_disk(&d).into_owned());
     let mut also_graph = Vec::new();
     for name in &also {
@@ -2558,6 +2570,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // cargo's run-time environment of the target (program_env), and a test's folder; a test's
     // later look for its workspace still finds the one it was started in
     if program_dir.is_some() { crate::dirs::set_workspace_dir(workspace.clone()); }
+    // a run whose host built with a handed build environment (a test's package binary, this
+    // program again): the program gets the environment it was started with, in this process's
+    // environment, so a C library's getenv and a shell it starts read that one (relax-base
+    // progenv.rs BUILD_ENV, relax issue 168)
+    if let Some(start) = crate::progenv::program_start() {
+        crate::crates::set_program_start_env(start);
+    }
     crate::crates::set_program_env(&program_env, program_dir.as_deref());
     unsafe {
         std::env::set_var("RELAX_STARTUP_T0", crate::clock::process_start_epoch().to_string());
@@ -3141,7 +3160,20 @@ pub(crate) fn check_test_subjects(u: &mut Unit, root: u32, subjects: &[u32], har
 /// test's run of its own binary, a `makepad check` it starts); they steer no check
 /// (check_reuse.rs env_key). With the per-run link in the key, a test's second run of its own
 /// binary found no verdict the first stored (check_reuse_tests: 11 reds after the link landed).
-pub(crate) const RUN_STATE_VARS: [&str; 7] = ["RELAX_STARTUP_T0", "RELAX_MAIN_MS", "RELAX_CACHE_STATE", "RELAX_LIVE_LOG", "RELAX_REPORT_TO", "RELAX_SELF_EXEC", "RELAX_SELF_EXEC_SILENT_ADDED"];
+/// A native build named by the environment (`name`), taken when it is a receipt of this run dir as
+/// a run wrote it (native.rs receipt_in); else this run builds its own, said in one line. It
+/// grants nothing: only a run with `--allow-c` uses it (relax issue 168).
+fn run_dir_receipt(name: &str, receipt: String, run_dir: &str) -> Option<String> {
+    match crate::native::receipt_in(&receipt, run_dir) {
+        Ok(()) => Some(receipt),
+        Err(why) => {
+            eprintln!("relax run: {name} is not taken ({why}); this run builds its own native packages");
+            None
+        }
+    }
+}
+
+pub(crate) const RUN_STATE_VARS: [&str; 8] = ["RELAX_STARTUP_T0", "RELAX_MAIN_MS", "RELAX_CACHE_STATE", "RELAX_LIVE_LOG", "RELAX_REPORT_TO", "RELAX_SELF_EXEC", "RELAX_SELF_EXEC_SILENT_ADDED", "RELAX_RUN_NATIVE"];
 
 /// Locations only: anchors_key covers workspace, run and std dirs, VFS content hashes cover
 /// edits, and the read log changes no checked input. Their spellings can leave env_key.
