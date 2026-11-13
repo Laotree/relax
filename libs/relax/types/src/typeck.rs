@@ -5935,9 +5935,12 @@ impl<'a> Fcx<'a> {
                             // only a usize (or a still-open integer) and the std range structs
                             // index builtin; every other index type selects `Index` (rustc
                             // lookup_indexing), std's `(Bound<usize>, Bound<usize>)` included
+                            // (rustc try_index_step: an open index type -- a closure parameter its call
+                            // types later -- selects `Index<?I>` too, its output a projection that type
+                            // settles: `|range| &stamp[range]` called with `2..5usize`, relax issue 200)
                             let std_range = match self.tcx.tys.kind(tis) {
                                 TyKind::Adt(..) => idx_is_range,
-                                TyKind::Int(_) | TyKind::IntVar(_) | TyKind::Infer(_) | TyKind::Never | TyKind::Error => true,
+                                TyKind::Int(_) | TyKind::IntVar(_) | TyKind::Never | TyKind::Error => true,
                                 _ => false,
                             };
                             if !std_range {
