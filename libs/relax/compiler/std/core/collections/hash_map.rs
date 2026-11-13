@@ -798,7 +798,8 @@ impl<K: Eq + Hash, V, const N: usize> From<[(K, V); N]> for HashMap<K, V, Random
 // same position, as IterMut and IntoIter do (slotmap's SparseSecondaryMap iterators are
 // `#[derive(Debug)]` wrappers around all three).
 impl<'a, K, V> Drain<'a, K, V> {
-    fn iter(&self) -> Iter<'_, K, V> {
+    /// (hash_set's Drain lists its keys through it)
+    pub(super) fn iter(&self) -> Iter<'_, K, V> {
         Iter { table: &*self.table, pos: self.pos, remaining: self.remaining }
     }
 }
