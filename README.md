@@ -84,6 +84,9 @@ cd hello
 Run `relax` in the package's folder and give it the package's name, not a path. It reads Relax's std
 from the checkout it was built in, so keep the `relax` folder where it is.
 
+`relax test` runs no rustc, so the target holds no rustc-format `.rlib` or `.rmeta` of the crate: a test
+that hands the crate's `.rlib` to an external rustc needs `cargo build --lib` first.
+
 Measured from a fresh clone: building `relax` took 53 s on a 16-core x86-64 Linux box and 78 s on a
 10-core arm64 Mac with cargo held to 4 jobs. The first `relax run` of `hello` took 0.24 s and 0.97 s,
 the next ones 0.01 to 0.07 s. Relax keeps what it compiles in the package's `target/relax`
