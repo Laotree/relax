@@ -6524,9 +6524,10 @@ impl<'a> Lcx<'a> {
                     }
                     used[fi] = true;
                     let ea = self.addr_add(base, (fi as u32 * stride) as i32);
-                    // an array element is not a tracked field path: a leaf that would move a
-                    // droppable element out of a place is rejected by the move checker (E0508)
-                    self.assign_parts(*x, &Place::Mem(ea, 0), et, src.as_ref().map(|_| None));
+                    // an element of a fixed-length array is its own move path (rustc: a constant
+                    // index), as in a `let [..]` pattern: a leaf that moves it out clears its drop
+                    // flag, and the source drops only the elements left in it
+                    self.assign_parts(*x, &Place::Mem(ea, 0), et, sub(&src, ARRAY_STEP, fi as u32));
                 }
                 for fi in 0..m {
                     if temp && !used[fi] && self.needs_drop_glue(et) {
