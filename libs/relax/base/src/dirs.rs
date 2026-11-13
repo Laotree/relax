@@ -342,7 +342,12 @@ fn shared_mode_from(v: Option<&str>) -> Result<bool, String> {
 /// feature silently do nothing.
 fn notice_non_ascii_anchor() {
     static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    if anchors().iter().any(|(_, d)| !d.is_ascii()) {
+    // The anchor dirs are computed here without `anchors()`: that calls `relax_dir()`, and this
+    // runs inside it.
+    let run = crate::gitstore::relax_home();
+    let cargo = crate::git::cargo::home();
+    let ws = crate::resolve::find_root(&workspace_dir()).ok().map(std::path::PathBuf::from);
+    if [Some(run), Some(cargo), ws].into_iter().flatten().any(|d| !d.to_string_lossy().is_ascii()) {
         SAID.get_or_init(|| {
             eprintln!("relax: RELAX_SHARED_CACHE=global: an anchor directory contains non-ASCII characters; entries under it are not shared");
         });
