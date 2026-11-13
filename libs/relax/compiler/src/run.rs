@@ -826,9 +826,15 @@ pub(crate) fn resolve_package(
             };
             let hook: Option<&unitgraph::ScriptsDone<'_>> = (boot && !check_only).then_some(&early_world);
             // a build script's own child run (no native request of its own) compiles the native
-            // packages its parent built, from the receipt the parent handed it
+            // packages its parent built, from the receipt the parent handed it; a binary its test
+            // started, those its test's run built
             let receipt = native_request.is_none().then(|| std::env::var(unitgraph::NATIVE_RECEIPT).ok()).flatten();
-            let scripts = unitgraph::run_build_scripts(sess, &mut g, target_dir, native_mode, check_only, receipt.as_deref(), hook);
+            let inherit = match (&receipt, TESTS_NATIVE.get()) {
+                (Some(r), _) => Some(unitgraph::Inherit::Script(r)),
+                (None, Some(r)) if native_request.is_some() => Some(unitgraph::Inherit::Binary(r)),
+                _ => None,
+            };
+            let scripts = unitgraph::run_build_scripts(sess, &mut g, target_dir, native_mode, check_only, inherit, hook);
             let scripts_ms = t_scripts.elapsed().as_secs_f64() * 1e3;
             let t_wait = Instant::now();
             (sources.map(|h| h.join().expect("provided source check")), scripts, scripts_ms, t_wait.elapsed().as_secs_f64() * 1e3)
@@ -841,7 +847,10 @@ pub(crate) fn resolve_package(
             if let Some((_, took)) = &sources { eprintln!("boot-trace: provided sources hashed in {:.1} ms (beside the build scripts)", took.as_secs_f64() * 1e3); }
         }
         if let Some((checked, _)) = sources { checked?; }
-        scripts?;
+        // the package binaries the tests start take this run's native build
+        if let Some(r) = scripts? {
+            std::env::set_var(unitgraph::BIN_NATIVE_RECEIPT, r);
+        }
         crate::macro_reg::set_build_outputs(sess, &g.crates, &g.cfgs, &g.env, &host_checks);
     }
     if crate::preload::trace() {
@@ -1341,6 +1350,11 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if let Some(arg0) = std::env::var_os("RELAX_ARG0") {
         prog_args[0] = arg0.into_encoded_bytes();
         unsafe { std::env::remove_var("RELAX_ARG0") };
+        // and the native build of the test's run, which the binary compiles and links with
+        if let Some(r) = std::env::var(unitgraph::BIN_NATIVE_RECEIPT).ok().filter(|r| !r.is_empty()) {
+            let _ = TESTS_NATIVE.set(r);
+        }
+        unsafe { std::env::remove_var(unitgraph::BIN_NATIVE_RECEIPT) };
     }
     let workspace = workspace_dir();
     // everything this run writes: the workspace's <target>/relax (dirs.rs)
@@ -3008,6 +3022,10 @@ static HARNESS_RUN: AtomicBool = AtomicBool::new(false);
 /// overflow checks the program's crates build with, as cargo test builds them (relax issue 141).
 /// None: a run, built as cargo's release profile leaves the code (no checks).
 static TEST_PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// A package binary its integration test started (CARGO_BIN_EXE_<name>): the receipt of the native
+/// build the test's run made (unitgraph `Inherit::Binary`, relax issue 151).
+static TESTS_NATIVE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// `makepad run --harness` over targets that link different global allocators: each test or bin
 /// target of the graph again in a run of its own (this command line with that one target

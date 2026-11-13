@@ -498,11 +498,12 @@ pub type ScriptsDone<'a> = dyn Fn(&Graph, &[usize], &[Vec<String>], &[Vec<(Strin
 /// crates' cfgs and env so far (the native packages' outputs missing). The boot starts the
 /// proc-macro world from it, beside the C compile. What it returns is kept until cargo is done.
 ///
-/// `native_receipt`: in a build script's own child run, the receipt its parent wrote of the native
-/// build's outputs (`native::write_receipt`): the native packages its build-dependencies reach
-/// compile with those outputs and call into that library.
+/// `native_receipt`: the native build of the run that started this one (`Inherit`).
+///
+/// Its result: in a run whose integration tests start the package's binaries (CARGO_BIN_EXE_<name>),
+/// the receipt of its native build for those binaries' runs (`BIN_NATIVE_RECEIPT`).
 pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, target_dir: &str, native: Option<crate::native::Mode<'_>>, check_only: bool,
-    native_receipt: Option<&str>, scripts_done: Option<&ScriptsDone<'_>>) -> Result<(), String> {
+    native_receipt: Option<Inherit<'_>>, scripts_done: Option<&ScriptsDone<'_>>) -> Result<Option<String>, String> {
     // the packages whose scripts compile or link C (native.rs): built by cargo with `--allow-c`,
     // an error naming the flag without it; Relax runs the other scripts. A check without the flag
     // reads the cfgs, env and OUT_DIR a native build already in the cache produced, so it needs
@@ -520,12 +521,22 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
         crate::native::native_reason(g, bs).map(|reason| (i, reason))
     }).collect();
     let seeds: Vec<usize> = native_scripts.iter().map(|(i, _)| *i).collect();
-    // the native build's outputs: cached under this run's key, or (a build script's own child
-    // run, which builds nothing) the receipt its parent wrote, matched by the scripts' paths
+    // the native build's outputs: cached under this run's key, or the receipt of the run that
+    // started this one, matched by the scripts' paths (a build script's own child run builds
+    // nothing; a binary its test started builds only what its test's build lacks)
+    let inherited = match native_receipt {
+        Some(Inherit::Script(r)) => Some((r, false)),
+        Some(Inherit::Binary(r)) if !seeds.is_empty() => Some((r, true)),
+        _ => None,
+    }.and_then(|(r, binary)| crate::native::read_receipt(r).and_then(|r| Some((inherited_scripts(g, &seeds, &r.scripts, binary)?, r.lib))));
+    let native = match native_receipt {
+        Some(Inherit::Binary(_)) if inherited.is_some() => None,
+        _ => native,
+    };
     let pre = match native {
         Some(m) if !m.builds() && !seeds.is_empty() => crate::native::cached_outputs(g, &seeds, m.request()),
         Some(_) => None,
-        None => native_receipt.and_then(crate::native::read_receipt).and_then(|r| Some((inherited_scripts(g, &seeds, &r.scripts)?, r.lib))),
+        None => inherited,
     };
     // what this run compiles the native packages with: a check's cached build links nothing and
     // loads no library; a child run calls into its parent's
@@ -641,15 +652,37 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
         (native_job.map(|j| j.join().unwrap_or_else(|_| Err("--allow-c: the native build panicked".to_string()))), results)
     });
     root.finish();
+    // the package's binaries its integration tests start compile and link with this build
+    let launches = !check_only && !native_seeds.is_empty() && g.env.iter().flatten().any(|(k, _)| k.starts_with("CARGO_BIN_EXE_"));
+    let mut for_bins = if launches && prebuilt { receipt.clone() } else { None };
     if let Some(built) = native_built {
-        apply_built(g, &native_krates, built?)?;
+        let built = built?;
+        if launches {
+            for_bins = Some(crate::native::write_receipt(g, &native_seeds, &built.scripts, built.lib.as_ref(), target_dir)?);
+        }
+        apply_built(g, &native_krates, built)?;
     } else if let Some((scripts, lib)) = cached {
         // a check's cached build (no lib), or a child run's receipt: the same outputs cargo
         // would have produced, no cargo
         g.native = lib;
         apply_native_scripts(g, scripts);
     }
-    apply_script_results(g, results, check_only)
+    apply_script_results(g, results, check_only)?;
+    Ok(for_bins)
+}
+
+/// The native build a run takes from the run that started it, by the receipt that run wrote
+/// (`native::write_receipt`), instead of a build of its own.
+#[derive(Clone, Copy)]
+pub enum Inherit<'a> {
+    /// A build script's own child run (`NATIVE_RECEIPT`): the native packages its
+    /// build-dependencies reach, compiled for its host, which is its target.
+    Script(&'a str),
+    /// A package binary its integration test started (`BIN_NATIVE_RECEIPT`): cargo test builds the
+    /// binary in the test's build, so the test's run built its native packages. The binary needs
+    /// no cargo and no C compiler where it runs, with the PATH the test gave it (relax issue 151).
+    /// A binary with a native package the test's build lacks builds its own, as any run.
+    Binary(&'a str),
 }
 
 /// A `--allow-c` build into the graph: every native package's script ran under cargo (cargo sets
@@ -688,14 +721,22 @@ fn reaches_native(g: &Graph, bs: &BuildScript, native_krates: &[usize]) -> bool 
 
 /// The native outputs a child run's receipt names, onto this graph's native scripts by their
 /// paths (`native::write_receipt`). None unless every one is covered: a partial receipt is none.
-/// A package the parent built with a separate host feature set has two entries; the child's
-/// copy is a build-dependency's, the host one.
-fn inherited_scripts(g: &Graph, seeds: &[usize], records: &[crate::native::ReceiptScript]) -> Option<Vec<crate::native::ScriptOut>> {
+/// A package the parent built with a separate host feature set has two entries: a build script's
+/// child run takes the host one (its copy is a build-dependency's), a binary its test started
+/// (`binary`) the target one, and the host one for its own host units.
+fn inherited_scripts(g: &Graph, seeds: &[usize], records: &[crate::native::ReceiptScript], binary: bool) -> Option<Vec<crate::native::ScriptOut>> {
     let mut out = Vec::new();
     for &s in seeds {
         let bs = &g.build_scripts[s];
-        let r = records.iter().filter(|r| r.path == bs.src_path).max_by_key(|r| r.host)?;
-        out.push(crate::native::ScriptOut { krate: bs.krate, host: false, cfgs: r.cfgs.clone(), env: r.env.clone(), out_dir: r.out_dir.clone(), system: r.system.clone() });
+        let of = |r: &crate::native::ReceiptScript, host: bool| crate::native::ScriptOut { krate: bs.krate, host, cfgs: r.cfgs.clone(), env: r.env.clone(), out_dir: r.out_dir.clone(), system: r.system.clone() };
+        let mine = records.iter().filter(|r| r.path == bs.src_path);
+        if binary {
+            // the test's target build, and its host build where its build had one
+            out.push(of(mine.clone().find(|r| !r.host)?, false));
+            out.extend(mine.filter(|r| r.host).map(|r| of(r, true)));
+        } else {
+            out.push(of(mine.max_by_key(|r| r.host)?, false));
+        }
     }
     Some(out)
 }
@@ -1478,6 +1519,9 @@ fn rerun_reason(stored: &str, now: &str, stored_env: &str, env_key: &str) -> Str
 /// build-dependency there) keeps one output (relax issue 69). No cargo script can read them.
 /// The variable that hands a build script's child run its parent's native receipt.
 pub const NATIVE_RECEIPT: &str = "RELAX_NATIVE_RECEIPT";
+/// The variable that hands the package binaries an integration test starts (CARGO_BIN_EXE_<name>)
+/// its run's native receipt (`Inherit::Binary`): set in the test's environment.
+pub const BIN_NATIVE_RECEIPT: &str = "RELAX_BIN_NATIVE_RECEIPT";
 
 const SCRIPT_RUN_SHAPE_VARS: [&str; 4] = ["RELAX_VFS", "RELAX_EDITS", "RELAX_SCRIPT_DEPTH", "RELAX_SCRIPT_CHAIN"];
 
