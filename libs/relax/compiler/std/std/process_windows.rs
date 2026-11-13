@@ -140,6 +140,8 @@ enum StdioKind {
     Null,
     Piped,
     Handle(OwnedHandle),
+    /// this process's own stdout or stderr (real std's InheritSpecific): its STD_*_HANDLE id
+    InheritSpecific(u32),
 }
 
 pub struct Stdio(StdioKind);
@@ -159,6 +161,17 @@ impl Stdio {
 impl From<File> for Stdio {
     fn from(f: File) -> Stdio {
         Stdio(StdioKind::Handle(OwnedHandle::from(f)))
+    }
+}
+
+impl From<io::Stdout> for Stdio {
+    fn from(_: io::Stdout) -> Stdio {
+        Stdio(StdioKind::InheritSpecific(win::STD_OUTPUT_HANDLE))
+    }
+}
+impl From<io::Stderr> for Stdio {
+    fn from(_: io::Stderr) -> Stdio {
+        Stdio(StdioKind::InheritSpecific(win::STD_ERROR_HANDLE))
     }
 }
 
@@ -813,7 +826,8 @@ fn dup_inheritable(h: HANDLE) -> io::Result<OwnedHandle> {
 /// pipe).
 fn to_handle(kind: &StdioKind, stdio_id: u32) -> io::Result<(Option<OwnedHandle>, Option<OwnedHandle>)> {
     match kind {
-        StdioKind::Inherit => {
+        StdioKind::Inherit | StdioKind::InheritSpecific(_) => {
+            let stdio_id = if let StdioKind::InheritSpecific(from) = kind { *from } else { stdio_id };
             let h = unsafe { win::GetStdHandle(stdio_id) };
             if h.is_null() || h == win::INVALID_HANDLE_VALUE {
                 // no stdio handle: the child gets null too

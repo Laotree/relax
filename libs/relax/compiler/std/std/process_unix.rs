@@ -32,6 +32,8 @@ enum StdioKind {
     Null,
     Piped,
     Fd(OwnedFd),
+    /// this process's own stdout or stderr (real std's StaticFd): the child's stream goes where it goes
+    Static(RawFd),
 }
 
 pub struct Stdio(StdioKind);
@@ -51,6 +53,17 @@ impl Stdio {
 impl From<File> for Stdio {
     fn from(f: File) -> Stdio {
         Stdio(StdioKind::Fd(OwnedFd::from(f)))
+    }
+}
+
+impl From<io::Stdout> for Stdio {
+    fn from(_: io::Stdout) -> Stdio {
+        Stdio(StdioKind::Static(1))
+    }
+}
+impl From<io::Stderr> for Stdio {
+    fn from(_: io::Stderr) -> Stdio {
+        Stdio(StdioKind::Static(2))
     }
 }
 
@@ -1037,6 +1050,8 @@ fn setup_stdio(cfg: Option<Stdio>, default_piped: bool, readable_by_child: bool)
     match kind {
         StdioKind::Inherit => Ok((None, None)),
         StdioKind::Fd(fd) => Ok((Some(fd), None)),
+        // (a copy of the descriptor as it is at the spawn; the child's slot gets it)
+        StdioKind::Static(fd) => Ok((Some(unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?), None)),
         StdioKind::Null => {
             let mut opts = crate::fs::OpenOptions::new();
             opts.read(readable_by_child).write(!readable_by_child);
