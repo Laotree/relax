@@ -1416,7 +1416,7 @@ unsafe extern "C" fn h_fma<const D: bool>(pc: *const u64, fp: *mut u64, cx: *mut
         if fl & 2 != 0 {
             z = -z;
         }
-        f64::put(c(fp, w, 0), a.mul_add(b, z));
+        f64::put(c(fp, w, 0), f64::from_bits(fused_f64(a, b, z)));
     } else {
         let (mut a, b, mut z) = (f32::get(c(fp, w, 1)), f32::get(c(fp, w, 2)), f32::get(c(fp, w, 3)));
         if fl & 1 != 0 {
@@ -1425,7 +1425,7 @@ unsafe extern "C" fn h_fma<const D: bool>(pc: *const u64, fp: *mut u64, cx: *mut
         if fl & 2 != 0 {
             z = -z;
         }
-        f32::put(c(fp, w, 0), a.mul_add(b, z));
+        f32::put(c(fp, w, 0), f32::from_bits(fused_f32(a, b, z)));
     }
     next!(pc.add(3), fp, cx)
 }
@@ -2070,6 +2070,17 @@ unsafe extern "C" fn h_vsel(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
     vput(c(fp, w, 0), r);
     next!(pc.add(2), fp, cx)
 }
+/// x * y + z, one rounding; a NaN result is the native back ends' (rir::fma_nan_f32), not the
+/// host mul_add's, whose factors the host compiler may swap and so change which NaN passes on.
+fn fused_f32(x: f32, y: f32, z: f32) -> u32 {
+    let r = x.mul_add(y, z);
+    if r.is_nan() { fma_nan_f32(x, y, z).unwrap_or(r.to_bits()) } else { r.to_bits() }
+}
+/// [`fused_f32`] for f64 (rir::fma_nan_f64).
+fn fused_f64(x: f64, y: f64, z: f64) -> u64 {
+    let r = x.mul_add(y, z);
+    if r.is_nan() { fma_nan_f64(x, y, z).unwrap_or(r.to_bits()) } else { r.to_bits() }
+}
 /// [h, d|a|b|c, flags: 1 neg_prod, 2 neg_add, 4 keep_nan, 8 f64 lanes]
 unsafe extern "C" fn h_vfma(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
     let w = *pc.add(1);
@@ -2088,7 +2099,7 @@ unsafe extern "C" fn h_vfma(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
             if fl_ & 2 != 0 && !(keep && y.is_nan()) {
                 y = -y;
             }
-            let v = x.mul_add(dl(&b, i), y).to_bits();
+            let v = fused_f64(x, dl(&b, i), y);
             r[2 * i] = v as u32;
             r[2 * i + 1] = (v >> 32) as u32;
         }
@@ -2104,7 +2115,7 @@ unsafe extern "C" fn h_vfma(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
         if fl_ & 2 != 0 && !(keep && y.is_nan()) {
             y = -y;
         }
-        r[i] = x.mul_add(fl(b[i]), y).to_bits();
+        r[i] = fused_f32(x, fl(b[i]), y);
     }
     vput(c(fp, w, 0), r);
     next!(pc.add(3), fp, cx)
