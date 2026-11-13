@@ -10571,7 +10571,7 @@ impl<'a> Lcx<'a> {
         let rl = self.layout(ret);
         let sandbox_result = matches!(self.kind_ref(ret), TyKind::Array(..) | TyKind::Tuple(..) | TyKind::Adt(..))
             && !matches!(self.kind_ref(ret), TyKind::Tuple(v) if v.is_empty())
-            && crate::sandbox::is_wrapper_crate(self.u.prog.def(self.b.def).krate)
+            && crate::sandbox::is_wrapper_crate(self.u, self.u.prog.def(self.b.def).krate)
             && matches!(&callee, Callee::Fn(id) if crate::sandbox::is_sandboxed_slot(self.u, *id))
             && crate::modules::boundary_result(self.u, ret);
         let arena_result = if sandbox_result { Some(self.sandbox_result_slot(rl.size, rl.align)) } else { None };

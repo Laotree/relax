@@ -4197,8 +4197,8 @@ unsafe fn compile_reachable_in(up: *mut Unit, roots: Vec<u32>, seeds: Vec<u32>, 
         }
         for (id, r) in built {
             if matches!((&*up).fns[id as usize].key, FnKey::Sandbox(_)) {
-                frontier.extend(crate::sandbox::extra_refs(id));
-                frontier.extend(crate::sandbox::extra_refs(u32::MAX));
+                frontier.extend(crate::sandbox::extra_refs(&*up, id));
+                frontier.extend(crate::sandbox::extra_refs(&*up, u32::MAX));
             }
             // a module's load stops at the program functions its code calls
             let follow = module.map_or(true, |own| own(&*up, id));
@@ -4230,7 +4230,7 @@ pub(crate) fn module_own(u: &Unit, id: u32) -> bool {
 fn under_lock(u: &Unit, id: u32) -> bool {
     match &u.fns[id as usize].key {
         FnKey::Sandbox(_) => true,
-        FnKey::Inst(d, _) => crate::sandbox::is_wrapper_crate(u.prog.def(*d).krate),
+        FnKey::Inst(d, _) => crate::sandbox::is_wrapper_crate(u, u.prog.def(*d).krate),
         _ => false,
     }
 }
@@ -5266,7 +5266,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     while let Some(s) = work.pop() {
         let inl = u.fns[s as usize].history().inlined_into.len();
         let mut deps = u.fns[s as usize].history().inlined_into.clone();
-        deps.extend(crate::sandbox::twin_of(s));
+        deps.extend(crate::sandbox::twin_of(u, s));
         for (k, d) in deps.into_iter().enumerate() {
             if k >= inl && flagged.contains(&s) && !flagged.contains(&d) {
                 flagged.push(d);
@@ -6102,7 +6102,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
         let mut twins: Vec<(u32, u32)> = Vec::new();
         for &(s, t) in &retarget {
-            if crate::sandbox::twin_of(s).is_some() {
+            if crate::sandbox::twin_of(u, s).is_some() {
                 errs.push(format!("`{}` has sandboxed code, which does not take a forwarder -- restart the app", u.fns[s as usize].name));
                 as_restart = true;
             }
@@ -6165,7 +6165,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         while let Some(s) = work.pop() {
             let inl = u.fns[s as usize].history().inlined_into.len();
             let mut deps = u.fns[s as usize].history().inlined_into.clone();
-            deps.extend(crate::sandbox::twin_of(s));
+            deps.extend(crate::sandbox::twin_of(u, s));
             for (k, d) in deps.into_iter().enumerate() {
                 if k >= inl && marked.contains(&s) && marked.insert(d) { flagged.push(d); }
                 if !seen.insert(d) { continue; }
@@ -6246,10 +6246,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         let mut checked = Vec::new();
         for &file in &olds {
             let krate = u.prog.file_crate[file as usize];
-            if !checked.contains(&krate) && crate::sandbox::is_sandboxed_crate_key(&u.prog, &FnKey::Closure(file, 0, 0)) {
+            if !checked.contains(&krate) && crate::sandbox::is_sandboxed_crate_key(&u.sandbox, &u.prog, &FnKey::Closure(file, 0, 0)) {
                 checked.push(krate);
                 let bodies: Vec<_> = checked_bodies.iter().filter(|b| u.prog.file_crate[b.file as usize] == krate
-                    && crate::sandbox::is_sandboxed_crate_key(&u.prog, &FnKey::Inst(b.def, b.args.to_vec()))).collect();
+                    && crate::sandbox::is_sandboxed_crate_key(&u.sandbox, &u.prog, &FnKey::Inst(b.def, b.args.to_vec()))).collect();
                 let e = crate::modules::sandbox_check(&u.prog, &u.tcx, krate, &bodies);
                 real.extend(e.iter().cloned());
                 errs.extend(e);
@@ -6406,7 +6406,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
         for &(id, _) in &staged {
             if matches!((&*up).fns[id as usize].key, FnKey::Sandbox(_)) {
-                roots.extend(crate::sandbox::extra_refs(id));
+                roots.extend(crate::sandbox::extra_refs(&*up, id));
             }
         }
         let u = &*up;
@@ -6434,8 +6434,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                         referenced_slots(&c.2, &mut pending_ahead);
                     }
                     if matches!(u.fns[*id as usize].key, FnKey::Sandbox(_)) {
-                        pending_ahead.extend(crate::sandbox::extra_refs(*id));
-                        pending_ahead.extend(crate::sandbox::extra_refs(u32::MAX));
+                        pending_ahead.extend(crate::sandbox::extra_refs(u, *id));
+                        pending_ahead.extend(crate::sandbox::extra_refs(u, u32::MAX));
                     }
                 }
                 pending_ahead.extend((n0..u.fns.len()).map(|k| k as u32));

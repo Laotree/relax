@@ -167,7 +167,7 @@ fn refuse(up: *mut Unit) -> Option<String> {
     if crate::reload::program_edits() != 0 {
         return Some("a live edit was applied (the collected image no longer describes the program)".into());
     }
-    if crate::sandbox::any_live() {
+    if crate::sandbox::any_live(unsafe { &*up }) {
         return Some("a sandbox module exists".into());
     }
     if BOOT.lock().unwrap_or_else(|e| e.into_inner()).is_none() {

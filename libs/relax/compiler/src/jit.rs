@@ -554,6 +554,9 @@ pub struct Unit {
     pub(crate) closure_owners: ClosureOwners,
     /// the end of this unit's last variable in the per-thread block (`tls_alloc`)
     pub tls_next: u32,
+    /// the sandbox of the code this unit runs confined (sandbox.rs): its twins, thunk table,
+    /// data image and arenas
+    pub sandbox: crate::sandbox::State,
     /// panicking stand-ins for foreign fns this host lacks, by symbol
     missing_stubs: relax_session::sync::Mutex<HashMap<String, u64>>,
     /// the program's global_asm!, placed on the first foreign lookup: the symbols it defines,
@@ -5053,6 +5056,7 @@ impl Unit {
             closure_owners: Default::default(),
             // slot 0 of the block: the thread's domain static block (domain.rs)
             tls_next: TLS_FIRST_FREE,
+            sandbox: Default::default(),
             missing_stubs: Default::default(),
             global_asm: std::sync::OnceLock::new(),
             tier1: {
@@ -9730,7 +9734,7 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
         // result is dropped when it finds the slot compiled
     }
     let is_foreign = match &u.fns[id as usize].key {
-        FnKey::Inst(d, _) => u.prog.def(*d).kind == DefKind::ForeignFn || crate::sandbox::is_wrapper_crate(u.prog.def(*d).krate),
+        FnKey::Inst(d, _) => u.prog.def(*d).kind == DefKind::ForeignFn || crate::sandbox::is_wrapper_crate(u, u.prog.def(*d).krate),
         // twins (and wrappers) take the plain path: their code is made from other slots' RIR
         FnKey::Sandbox(_) => true,
         _ => false,
@@ -10633,10 +10637,10 @@ fn awaited_attrs(u: &Unit, c: u32, attrs: Result<u8, &'static str>, tier: usize,
 /// `into_unverified`: the build is unverified code itself (an O3 build of an unverified body or of
 /// a twin: never cached, rebuilt once verified): it may take in unverified callees too, and then
 /// stays unverified (O3Assembled::unverified_in). A verified build never holds unverified code.
-fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &crate::conc::AppendVec<FnEntry>, core_crate: u32, c: u32, inline_all: bool, core_hint: bool, into_unverified: bool) -> Result<u8, &'static str> {
+fn callee_attrs(sb: &crate::sandbox::State, prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &crate::conc::AppendVec<FnEntry>, core_crate: u32, c: u32, inline_all: bool, core_hint: bool, into_unverified: bool) -> Result<u8, &'static str> {
     let options = &prog.session.clone().options;
     // a sandboxed module's code is never inlined into host code (it runs only as twins)
-    if crate::sandbox::is_sandboxed_crate_key(prog, &fns[c as usize].key) {
+    if crate::sandbox::is_sandboxed_crate_key(sb, prog, &fns[c as usize].key) {
         return Err("not inlinable: sandboxed");
     }
     // SPEC-V: unverified code is inlined only into unverified code
@@ -10698,7 +10702,7 @@ fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &cra
         // its base would (rustc inlines the callee there: `set_material`'s 15 `set_uniform` calls).
         // The build holds it as unverified code (O3Assembled::unverified_in): a failed verdict of
         // the base builds it again. Never into verified code (which never calls twins).
-        FnKey::Plain(b) if into_unverified => return callee_attrs(prog, tcx, fns, core_crate, *b, inline_all, core_hint, true),
+        FnKey::Plain(b) if into_unverified => return callee_attrs(sb, prog, tcx, fns, core_crate, *b, inline_all, core_hint, true),
         // sandbox twins are never inlined into anything (their callers are twins built from RIR)
         FnKey::Sandbox(_) | FnKey::Plain(_) => return Err("not inlinable: twin"),
     })
@@ -13212,7 +13216,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     // copy. O3 and callers inlining this wrapper must also call the twins; base
     // slots of module functions are RIR sources, not patchable host implementations.
     if let FnKey::Inst(d, _) = &(&*up).fns[id as usize].key {
-        if crate::sandbox::is_wrapper_crate((&*up).prog.def(*d).krate) {
+        if crate::sandbox::is_wrapper_crate(&*up, (&*up).prog.def(*d).krate) {
             crate::sandbox::redirect_wrapper(up, &mut func);
         }
     }
@@ -13352,7 +13356,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             }
             // refused callees (#[inline(never)], sandboxed, user code without inline_all,
             // RELAX_NOINL) are not built for inlining: decided before the build, not after
-            let attrs = callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false);
+            let attrs = callee_attrs(&u.sandbox, &u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false);
             let source_wanted = baseline && matches!(u.fns[*c as usize].key, FnKey::Glue(..)) || inline_source_wanted(u, *c, full);
             if source_wanted && attrs == Err(NOT_INLINABLE_UNVERIFIED) && verdict_awaited(u, *c) {
                 inline_state(tier, INLINE_LEFT_OUT);
@@ -13428,7 +13432,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                     if let Ok(Front::Opt(p, _)) = r {
                         let u = &*up;
                         // built (its RIR is stored) but not inlined when it calls this fn back
-                        let attrs = if inline_cycle(u, id, *c, full) { None } else { awaited_attrs(u, *c, callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false), tier, &mut left) };
+                        let attrs = if inline_cycle(u, id, *c, full) { None } else { awaited_attrs(u, *c, callee_attrs(&u.sandbox, &u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false), tier, &mut left) };
                         if attrs.is_none() && sig_dir().is_some() && inline_cycle(u, id, *c, full) {
                             skipped.push((*c, "cycle"));
                         }
@@ -13451,7 +13455,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                     // (off the owner); its RIR replaces the baseline RIR at the finish
                     if let Some(Some(p)) = collect_fronts(&mut needs, || if fresh { split_normal(up, *c) } else { split_upgrade(up, *c) }) {
                         let u = &*up;
-                        let attrs = if inline_cycle(u, id, *c, full) { None } else { awaited_attrs(u, *c, callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false), tier, &mut left) };
+                        let attrs = if inline_cycle(u, id, *c, full) { None } else { awaited_attrs(u, *c, callee_attrs(&u.sandbox, &u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false), tier, &mut left) };
                         if attrs.is_some() { inline_state(tier, INLINE_BUILT_HERE); }
                         deferred.push((*c, attrs, p));
                     }
@@ -13473,7 +13477,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             if !wanted.contains(&c) || deferred.iter().any(|x| x.0 == c) {
                 continue;
             }
-            let Some(attrs) = awaited_attrs(u, c, callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, c, inline_all, core_hint, false), tier, &mut left) else {
+            let Some(attrs) = awaited_attrs(u, c, callee_attrs(&u.sandbox, &u.prog, &u.tcx, &u.fns, u.core_crate, c, inline_all, core_hint, false), tier, &mut left) else {
                 continue;
             };
             if let Some(p) = noinl_callee {
@@ -17164,6 +17168,7 @@ impl Drop for Unit {
                 }
             }
             os::mem::free(self.syms.classes, crate::syms::SYM_CAP);
+            self.sandbox.release();
             // the slot segments: stubs first, then the table words and tier records (the thunks
             // went with the code area)
             for seg in 0..relax_backend::rir::SLOT_SEGS {
@@ -21964,7 +21969,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                             notes.push((c, "not inlinable: build error"));
                             continue;
                         }
-                        if let Err(why) = callee_attrs(&u.prog, &u.tcx, &u.fns, core, c, inline_all, true, root_unverified) {
+                        if let Err(why) = callee_attrs(&u.sandbox, &u.prog, &u.tcx, &u.fns, core, c, inline_all, true, root_unverified) {
                             notes.push((c, why));
                             continue;
                         }
@@ -23514,7 +23519,7 @@ unsafe fn o3_next_level(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &
             // Cost-model admissions also expose calls in never-run bodies.
             let never_run = !v.ran && v.uninlined;
             let cost_admits = !relax_backend::stats::opt_off(options, "-costmodel")
-                && callee_attrs(prog, tcx, fns, core, c, inline_all, true, unverified_root(fns, id))
+                && callee_attrs(&*std::ptr::addr_of!((*up).sandbox), prog, tcx, fns, core, c, inline_all, true, unverified_root(fns, id))
                     .map_or(false, |attrs| relax_codegen::opt::rustc_inline_cost(r, c) <= relax_codegen::opt::rustc_inline_threshold(r, attrs));
             if never_run && relax_codegen::opt::inst_count(r) > relax_codegen::opt::INLINE_FREE_INSTS && !cost_admits {
                 continue;
@@ -23595,7 +23600,7 @@ unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), id: u32, rir
             if trace { eprintln!("inline-trace-snap {}: out fn#{} {} (no view)", fns[id as usize].name, c, fns[c as usize].name); }
             continue;
         };
-        let attrs = match callee_attrs(prog, tcx, fns, core, c, inline_all, true, root_unverified) {
+        let attrs = match callee_attrs(&*std::ptr::addr_of!((*up).sandbox), prog, tcx, fns, core, c, inline_all, true, root_unverified) {
             Ok(a) if xcrate_unavailable(prog, fns, core, id, c) => (a & !relax_codegen::opt::ATTR_HINT) | relax_codegen::opt::ATTR_XCRATE,
             Ok(a) => a,
             Err(why) => {
@@ -26909,7 +26914,7 @@ fn prefront_fail(why: u8) -> bool {
 fn lowers_ahead(u: &Unit, d: DefId, body: &Body) -> bool {
     let def = u.prog.def(d);
     !(!matches!(def.kind, DefKind::Fn | DefKind::AssocFn)
-        || crate::sandbox::is_wrapper_crate(def.krate)
+        || crate::sandbox::is_wrapper_crate(u, def.krate)
         || !provided_source_body(u, d)
         || !statics_ready(u, body))
 }

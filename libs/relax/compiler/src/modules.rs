@@ -688,7 +688,7 @@ pub(crate) fn plain_result(u: &Unit, t: crate::types::TyId) -> bool {
         if depth > 16 { return false; }
         match u.tcx.tys.kind(t).clone() {
             TyKind::Adt(d, args, _) => {
-                !crate::sandbox::is_sandboxed_crate_key(&u.prog, &FnKey::Inst(d, Vec::new()))
+                !crate::sandbox::is_sandboxed_crate_key(&u.sandbox, &u.prog, &FnKey::Inst(d, Vec::new()))
                     && u.tcx.tys.list(args).iter().all(|a| host_types(u, *a, depth + 1))
                     && u.tcx.adts.get(&d).map_or(false, |a| a.variants.iter().enumerate().all(|(vi, v)| (0..v.fields.len()).all(|fi| host_types(u, u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, u.tcx.tys.list(args)), depth + 1))))
             }
@@ -868,7 +868,7 @@ unsafe fn load_sandboxed(up: *mut Unit, idx: u32, name: &str, path: &str, deps: 
     }
     let mem: u64 = runtime.module_mem_mb << 20;
     let fuel: i64 = runtime.module_fuel;
-    let arena = match crate::sandbox::new_arena(idx, name, mem, fuel) {
+    let arena = match crate::sandbox::new_arena(up, idx, name, mem, fuel) {
         Ok(a) => a,
         Err(e) => return Err(fail(up, &defs, vec![e])),
     };
@@ -877,7 +877,7 @@ unsafe fn load_sandboxed(up: *mut Unit, idx: u32, name: &str, path: &str, deps: 
     let _ = std::fs::create_dir_all(&dir);
     let wpath = dir.join(format!("__sbw_{}_{}.rs", name, idx));
     if let Err(e) = std::fs::write(&wpath, &src) {
-        crate::sandbox::free_arena(&arena);
+        crate::sandbox::free_arena(&*up, &arena);
         return Err(fail(up, &defs, vec![format!("cannot write the module wrapper: {}", e)]));
     }
     let wname = format!("__sbw_{}_{}", name, idx);
@@ -887,13 +887,13 @@ unsafe fn load_sandboxed(up: *mut Unit, idx: u32, name: &str, path: &str, deps: 
     let (wk, _, wdefs) = match front(up, &wname, &wpath.to_string_lossy(), &wdeps, false) {
         Ok(x) => x,
         Err(e) => {
-            crate::sandbox::free_arena(&arena);
+            crate::sandbox::free_arena(&*up, &arena);
             let mut e = e;
             e.insert(0, format!("{}: the generated wrapper did not compile (Relax bug, report it):", path));
             return Err(fail(up, &defs, e));
         }
     };
-    crate::sandbox::add_wrapper_crate(wk);
+    crate::sandbox::add_wrapper_crate(&*up, wk);
     let t_wrap = t1.elapsed();
     let t2 = std::time::Instant::now();
     let u = &mut *up;
@@ -901,7 +901,7 @@ unsafe fn load_sandboxed(up: *mut Unit, idx: u32, name: &str, path: &str, deps: 
     let fns0 = u.fns.len();
     if let Err(e) = compile_all(up, roots, &|_, _| true, &|u, id| crate::reload::module_own(u, id)) {
         drop_defs(up, &wdefs);
-        crate::sandbox::free_arena(&arena);
+        crate::sandbox::free_arena(&*up, &arena);
         return Err(fail(up, &defs, e));
     }
     // RELAX_MODULE_TRACE=1: where a load's time goes
@@ -963,7 +963,7 @@ unsafe fn ensure_export(up: *mut Unit, idx: usize, m: &mut Module, name: &str) -
     let mut deps = vec![m.name.clone()];
     deps.extend(u.prog.crates[m.krate as usize].deps.iter().map(|(n, _)| u.prog.syms.str(*n).to_string()));
     let (wk, _, defs) = front(up, &wname, &path.to_string_lossy(), &deps, false).map_err(|e| e.join("\n"))?;
-    crate::sandbox::add_wrapper_crate(wk);
+    crate::sandbox::add_wrapper_crate(&*up, wk);
     let u = &mut *up;
     let roots = root_fns(u, &defs).into_iter().map(|d| u.fn_id(FnKey::Inst(d, Vec::new()))).collect();
     if let Err(e) = compile_all(up, roots, &|_, _| true, &|u, id| crate::reload::module_own(u, id)) {
@@ -1187,7 +1187,7 @@ pub extern "C" fn __relax_module_unload(h: u64) {
                 m.alive = false;
                 m.gen += 1;
                 if let Some(a) = m.arena.take() {
-                    crate::sandbox::free_arena(&a);
+                    crate::sandbox::free_arena(unsafe { &*jit::current_unit() }, &a);
                 }
                 std::mem::take(&mut m.defs)
             }
@@ -1370,7 +1370,8 @@ pub fn guard_reset(m: GuardMark) {
 /// every version stays), image ro bytes, image rw bytes, arenas live, unloaded modules' windows
 /// (reserved, inaccessible, never reused)].
 pub extern "C" fn __relax_sb_stats(out: *mut [u64; 5]) {
-    let (ro, rw, n) = crate::sandbox::stats();
+    let up = jit::current_unit();
+    let (ro, rw, n) = if up.is_null() { (0, 0, 0) } else { crate::sandbox::stats(unsafe { &*up }) };
     unsafe { *out = [crate::sandbox::twin_code_bytes(), ro as u64, rw as u64, n as u64, crate::sandbox::dead_arenas() as u64] };
 }
 
