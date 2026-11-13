@@ -54,6 +54,14 @@ pub struct CStr {
     inner: [c_char],
 }
 
+/// The empty C string (core: `impl Default for &CStr`).
+impl crate::default::Default for &CStr {
+    fn default() -> Self {
+        // SAFETY: one nul byte is a valid C string with no interior nul
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"\0") }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FromBytesWithNulError {
     InteriorNul { position: usize },
