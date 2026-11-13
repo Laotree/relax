@@ -995,15 +995,34 @@ mod tests {
         assert!(stdout.contains("loader got [] [] [kept]"), "the rebuilt loader got a native build of the run, or lost the rest of its environment: {stdout}");
     }
 
+    /// The gate's locks are flock locks, which a forked process holds with its parent until its
+    /// exec or exit. Among the suite's tests, another test's child forked while the low build held
+    /// the turn kept it held past mark_low, and the person's build found it taken ("the low build
+    /// gave the turn up", once under the full suite's load). So the gate runs in a child of this
+    /// test binary that runs this test alone: its only forks are its own children, whose spawn
+    /// returns after their exec closed the gate's files (opened close-on-exec).
     #[cfg(unix)]
     #[test]
     fn the_person_s_build_ends_the_low_ones_and_goes_first() {
         use std::os::unix::process::{CommandExt, ExitStatusExt};
+        const CHILD: &str = "RELAX_TEST_GATE_ALONE";
+        if std::env::var_os(CHILD).is_none() {
+            let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "reload::host::tests::the_person_s_build_ends_the_low_ones_and_goes_first", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1"));
+            let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert!(out.status.success() && stdout.contains(" 1 passed;"), "the gate's run alone: {stdout}\n{stderr}");
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("relax-gate-test-{}", std::process::id()));
-        let sleep = || std::process::Command::new("sleep").arg("30").process_group(0).spawn().unwrap();
+        // a process that lives until it is ended (`cat` on a pipe this test keeps open), not for a
+        // time: a `sleep 30` could end on its own under load before the checks below
+        let sleep = || std::process::Command::new("cat").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).process_group(0).spawn().unwrap();
         // a low-priority build, marked, and a marker a crashed makepad left behind
         let mut low = Gate::enter(&dir, false, || panic!("nothing holds the turn")).unwrap();
         let mut running = sleep();
+        // (held here: `wait` would close it, and the build must end by the person's signal alone)
+        let _running_input = running.stdin.take();
         low.mark_low(running.id()).unwrap();
         let mut unrelated = sleep();
         std::fs::write(dir.join(format!("low.{}", unrelated.id())), "").unwrap();
