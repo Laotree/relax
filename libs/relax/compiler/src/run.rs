@@ -2141,6 +2141,22 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 None => foreign.push((name, n)),
             }
         }
+        // A check for another target (RELAX_CHECK_TARGET) type-checks Relax's std as that target
+        // reads it too: no JIT on this machine compiles that code (std's process_windows.rs on
+        // Linux), so a type error there waited for the first run on that platform. Its bodies are
+        // checked as a run's app check checks the app's (a clean crate's verdict is stored, so an
+        // unchanged std costs nothing the next time); std is not linted.
+        if options.check_target != crate::options::CheckTarget::Host && !selftest {
+            let t = Instant::now();
+            let std_crates = crate::check::std_crates(&u.prog);
+            let errors = crate::check::run_check_crates(&mut *u, &std_crates);
+            for e in &errors {
+                if crate::diag::enabled() { crate::diag::emit(&crate::diag::from_legacy(e, "typeck")); } else { eprintln!("{e}"); }
+            }
+            if !errors.is_empty() { foreign.push(("std".to_string(), errors.len())); }
+            phase("std check", t);
+            verbose!("relax check: std for the target: {} crates, {} body owners checked, {} errors", std_crates.len(), crate::check::RUN_CHECK[1].load(Ordering::Relaxed), errors.len());
+        }
         for (name, n) in &foreign {
             eprintln!("error: could not compile `{name}` due to {n} previous error{}", if *n == 1 { "" } else { "s" });
             if crate::check::published_crate(&u.prog, name) {
@@ -2154,7 +2170,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         let t = Instant::now();
         if !selftest { record_check_front(&mut u, options, boot_cache); }
         phase("record check front", t);
-        if let (Some(r), Some((pre, graph))) = (reuse.as_ref().filter(|r| r.complete()), early_next.as_ref()) {
+        // (a failed check records nothing for the next: its std errors, say, are no app crate's
+        // verdict, and the next check would replay a pass)
+        if let (0, Some(r), Some((pre, graph))) = (code, reuse.as_ref().filter(|r| r.complete()), early_next.as_ref()) {
             let t = Instant::now();
             record_early(&u.prog, r, pre, *graph, args);
             phase("record early", t);

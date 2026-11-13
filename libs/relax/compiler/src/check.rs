@@ -108,6 +108,14 @@ pub fn app_crates(prog: &crate::program::Program, root: u32) -> Vec<u32> {
     (0..prog.crates.len() as u32).filter(|&k| k == root || crate::borrowck::event::app_crate(prog, k)).collect()
 }
 
+/// The crates of Relax's std the program reads for its target (core, alloc, std and what the std
+/// folder provides), proc_macro aside: the proc-macro world is this machine's.
+pub fn std_crates(prog: &crate::program::Program) -> Vec<u32> {
+    (0..prog.crates.len() as u32)
+        .filter(|&k| std_crate(prog, k) && !prog.crates[k as usize].proc_macro && prog.syms.str(prog.crates[k as usize].name) != "proc_macro")
+        .collect()
+}
+
 /// One selection for declaration validation, diagnostics and body checks.
 pub fn checked_crates(prog: &crate::program::Program, root: u32, root_only: bool, workspace: bool, also: &[u32]) -> Vec<u32> {
     let mut crates = if root_only { vec![root] } else if workspace { workspace_crates(prog, root) } else { app_crates(prog, root) };

@@ -463,6 +463,11 @@ pub fn check(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     let json = args.iter().any(|a|a=="--json");
     let rest: Vec<_> = args.iter().filter(|a| !matches!(a.as_str(),"--serve"|"--no-serve"|"--json")).collect();
     if start && never { eprintln!("relax: --serve and --no-serve conflict"); return 2; }
+    // the check server reads the program for the target it was started with: a check for
+    // another one (RELAX_CHECK_TARGET, which also checks std's bodies for it) runs here
+    let cross = sess.options.check_target != crate::options::CheckTarget::Host;
+    if start && cross { eprintln!("relax: --serve checks this machine's target; a RELAX_CHECK_TARGET check runs in-process (--no-serve)"); return 2; }
+    let never = never || cross;
     if !never && rest.len() == 1 && !rest[0].starts_with('-') {
         let response = connect(start).and_then(|dir|request(&dir,"check",&format!("{{\"pkg\":{}}}",quote(rest[0]))));
         match response {
