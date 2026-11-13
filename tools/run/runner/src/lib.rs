@@ -135,7 +135,15 @@ pub(crate) fn loader_exe() -> Option<std::path::PathBuf> {
     static EXE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     EXE.get_or_init(|| {
         let _kept = relax_compiler::zone_alloc::kept();
-        Some(plain(std::env::current_exe().and_then(|e| e.canonicalize()).ok()?))
+        let exe = plain(std::env::current_exe().and_then(|e| e.canonicalize()).ok()?);
+        // a run's own executable (a test's run of itself, a shell's launch of it): a spawn of it
+        // runs that run's program, so this loader goes by the one its starter named
+        if relax_compiler::selfexe::is_link(&exe) {
+            if let Some(l) = std::env::var_os("RELAX_LOADER").map(std::path::PathBuf::from).filter(|l| l.is_file()) {
+                return Some(l);
+            }
+        }
+        Some(exe)
     })
     .clone()
 }

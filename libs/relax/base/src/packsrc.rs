@@ -197,7 +197,7 @@ pub fn run(opts: Options) -> Result<(), String> {
     }
     std::fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
     let log = work.join("reads.log");
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = crate::dirs::loader_exe().map_err(|e| e.to_string())?;
     let work_s = crate::vfs::normalize_path(&work.canonicalize().map_err(|e| e.to_string())?.to_string_lossy());
     let work_plain = crate::vfs::normalize_path(&work.to_string_lossy());
     let t0 = std::time::Instant::now();

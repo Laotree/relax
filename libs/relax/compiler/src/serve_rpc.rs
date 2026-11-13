@@ -365,7 +365,7 @@ fn connect(start: bool) -> Result<PathBuf, String> {
     eprintln!("relax: starting the check server...");
     let log_path = dir.join("serve.log");
     let log = if log_path.exists() { std::fs::OpenOptions::new().append(true).open(&log_path) } else { crate::os::proc::create_private(&log_path) }.map_err(|e|e.to_string())?;
-    let mut cmd = std::process::Command::new(std::env::current_exe().map_err(|e|e.to_string())?);
+    let mut cmd = std::process::Command::new(crate::dirs::loader_exe().map_err(|e|e.to_string())?);
     cmd.arg("serve").arg("--workspace").arg(&root).stdin(std::process::Stdio::null()).stdout(log.try_clone().map_err(|e|e.to_string())?).stderr(log);
     serve_os::detach(&mut cmd);
     // the check server outlives what started it: not one of a devhub lease's processes
@@ -406,7 +406,7 @@ fn check_packages(args: &[String]) -> Result<Vec<String>, i32> {
         out.extend(packages);
         return Ok(out);
     }
-    let exe = std::env::current_exe().map_err(|e| {
+    let exe = crate::dirs::loader_exe().map_err(|e| {
         eprintln!("relax check: the loader's own path: {e}");
         2
     })?;

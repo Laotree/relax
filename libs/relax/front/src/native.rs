@@ -440,7 +440,7 @@ fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
 /// Builds the native packages `seeds` (indices into `g.build_scripts`) with cargo, or finds the
 /// cached build, and links them. The error names what failed.
 pub fn build(g: &Graph, seeds: &[usize], req: &Request) -> Result<Built, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("this executable: {e}"))?;
+    let exe = crate::dirs::loader_exe().map_err(|e| format!("this executable: {e}"))?;
     let plan = plan(g, seeds, req);
     // named before anything is read or built under it: a prune from now on keeps it
     write_root(req, &plan)?;

@@ -96,6 +96,12 @@ pub fn add_bins(launchers: &[String]) {
     }
 }
 
+/// Whether `exe` is a run's own executable (its command line beside it): a launch of it runs that
+/// run's program, so the loader running from one spawns itself by RELAX_LOADER (dirs::loader_exe).
+pub fn is_link(exe: &Path) -> bool {
+    exe.parent().is_some_and(|d| d.join(LINE).is_file())
+}
+
 /// A launch of a run's link whose arguments do not start with the run's command line (Relax std's
 /// spawn and exec put it after argv[0], an exec without the `--silent` at its index 2): `args`
 /// with that line after argv[0], as std's spawn gives them. None for any other launch of the

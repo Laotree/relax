@@ -1090,8 +1090,8 @@ fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrit
 
 static SELF_EXE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
-/// The program a build script runs as: Relax running itself again. It is this process's
-/// executable unless the host names another one ([`set_self_exe`]): in an Android app this
+/// The program a build script runs as: Relax running itself again. It is the loader
+/// (dirs::loader_exe) unless the host names another one ([`set_self_exe`]): in an Android app this
 /// process is `app_process64`, and Relax's own executable is the PIE the APK carries next to the
 /// host library.
 pub fn set_self_exe(exe: std::path::PathBuf) {
@@ -1101,7 +1101,7 @@ pub fn set_self_exe(exe: std::path::PathBuf) {
 fn self_exe() -> std::io::Result<std::path::PathBuf> {
     match SELF_EXE.get() {
         Some(e) => Ok(e.clone()),
-        None => std::env::current_exe(),
+        None => crate::dirs::loader_exe(),
     }
 }
 

@@ -242,7 +242,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         }
     }
     if live && (runs.len() != 1 || runs[0].as_ref().is_some_and(|r| r.1)) { return live_usage(); }
-    let exe = match std::env::current_exe() {
+    let exe = match crate::dirs::loader_exe() {
         Ok(e) => e,
         Err(e) => {
             eprintln!("relax test: the loader's own path: {e}");

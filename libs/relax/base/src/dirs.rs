@@ -99,6 +99,19 @@ pub fn workspace_dir() -> String {
     std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".to_string())
 }
 
+/// The loader's executable, for a spawn of the loader by itself (a build script's run, cargo's
+/// wrapper, a check, the check server, a test target's run): RELAX_LOADER, which the runner sets at
+/// its start, else this process's executable. Never a run's own executable (relax-compiler
+/// selfexe.rs): a launch of that is its program again, so a run started from one (a test's run of
+/// itself) ran its build scripts as its test program, which waited for the build script lock its
+/// parent held (11-13).
+pub fn loader_exe() -> std::io::Result<PathBuf> {
+    match std::env::var_os("RELAX_LOADER") {
+        Some(p) if !p.is_empty() => Ok(PathBuf::from(p)),
+        _ => std::env::current_exe(),
+    }
+}
+
 /// This process's relax dir: the handed-over one, else RELAX_CACHE_DIR, else the workspace's
 /// (relax_dir_for(workspace_dir())).
 pub fn relax_dir() -> PathBuf {
