@@ -693,8 +693,13 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
         apply_built(g, &native_krates, built)?;
     } else if let Some((scripts, lib)) = cached {
         // a check's cached build (no lib), or a child run's receipt: the same outputs cargo
-        // would have produced, no cargo
-        g.native = lib;
+        // would have produced, no cargo. A receipt's library can hold packages this program does
+        // not link (a build script's run takes its parent's): their C's callbacks are not its own.
+        let own: Vec<String> = native_krates.iter().map(|&k| format!("{} {}", g.pkg[k].1, g.pkg[k].2)).collect();
+        g.native = lib.map(|mut l| {
+            l.partial = l.crates.iter().any(|c| !own.contains(c));
+            l
+        });
         apply_native_scripts(g, scripts);
     }
     apply_script_results(g, results, check_only)?;

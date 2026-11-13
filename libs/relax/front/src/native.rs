@@ -132,6 +132,10 @@ pub struct NativeLib {
     pub statics: Vec<String>,
     /// the native packages ("name version")
     pub crates: Vec<String>,
+    /// the program links only some of `crates` (it took the library of the run that started it,
+    /// linked for more packages): C of the others may call a `#[no_mangle]` fn it lacks, which
+    /// stays unbound (native_stub.rs, relax issue 174)
+    pub partial: bool,
 }
 
 pub struct Built {
@@ -475,7 +479,7 @@ pub fn build(g: &Graph, seeds: &[usize], req: &Request) -> Result<Built, String>
     if std::path::Path::new(&plan.fast_mark).is_file() {
         optimize_later(g, req, exe, &flags, plan.script_pkgs, plan.lib_pkgs, seeds, &out, plan.lib_path.clone(), plan.fast_mark);
     }
-    Ok(Built { scripts: out.scripts, lib: Some(NativeLib { path: plan.lib_path, statics: out.statics, crates: plan.names }) })
+    Ok(Built { scripts: out.scripts, lib: Some(NativeLib { path: plan.lib_path, statics: out.statics, crates: plan.names, partial: false }) })
 }
 
 /// The script outputs of the native build already cached under `req`'s key (no cargo, no link):
@@ -500,7 +504,7 @@ pub fn cached_outputs(g: &Graph, seeds: &[usize], req: &Request) -> Option<(Vec<
         }
     }
     let links = !(out.archives.is_empty() && out.dylibs.is_empty() && out.frameworks.is_empty());
-    let lib = links.then(|| NativeLib { path: plan.lib_path.clone(), statics: out.statics.clone(), crates: plan.names.clone() });
+    let lib = links.then(|| NativeLib { path: plan.lib_path.clone(), statics: out.statics.clone(), crates: plan.names.clone(), partial: false });
     Some((out.scripts, lib))
 }
 
@@ -619,7 +623,7 @@ pub fn read_receipt(path: &str) -> Option<Receipt> {
             if !std::path::Path::new(&path).is_file() {
                 return None;
             }
-            Some(NativeLib { path, statics: strs(l.get("statics")), crates: strs(l.get("crates")) })
+            Some(NativeLib { path, statics: strs(l.get("statics")), crates: strs(l.get("crates")), partial: false })
         }
         None => None,
     };

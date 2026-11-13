@@ -2926,7 +2926,9 @@ pub(crate) fn native_definition(name: &str) -> Option<u64> {
 
 /// The stubs of the library `handle`, each matched to the program's fn of its name (one of the
 /// loader's crates, `crates`: a domain's own, None: any); a symbol no fn defines is the error a
-/// linker would report.
+/// linker would report, except in a program that links only some of the library's packages
+/// (`partial`): there the C that calls it is a package's the program does not link, and its slot
+/// stays unbound (relax issue 174).
 fn native_callbacks(prog: &crate::program::Program, n: &crate::native::NativeLib, handle: usize, crates: Option<&std::collections::HashSet<u32>>) -> Result<NativeCallbacks, String> {
     let names = crate::os::proc::symbol_in(handle, crate::native_stub::NAMES);
     let slots = crate::os::proc::symbol_in(handle, crate::native_stub::SLOTS);
@@ -2936,16 +2938,20 @@ fn native_callbacks(prog: &crate::program::Program, n: &crate::native::NativeLib
     let exports = crate::global_asm::exported_fns_of(prog, |k| crates.is_none_or(|c| c.contains(&k)));
     let mut out = Vec::new();
     let mut at = names as *const std::ffi::c_char;
+    let mut slot = slots;
     loop {
         let name = unsafe { std::ffi::CStr::from_ptr(at) }.to_string_lossy().into_owned();
         if name.is_empty() {
             break;
         }
-        let Some(&d) = exports.get(&name) else {
-            return Err(format!("cannot load {} (--allow-c native library of {}): its C code calls `{}`, which no library and no `#[no_mangle]` fn of the program defines", n.path, n.crates.join(", "), name));
-        };
         at = unsafe { at.add(name.len() + 1) };
-        out.push((slots + 8 * out.len(), d, name));
+        let here = slot;
+        slot += 8;
+        match exports.get(&name) {
+            Some(&d) => out.push((here, d, name)),
+            None if n.partial => {}
+            None => return Err(format!("cannot load {} (--allow-c native library of {}): its C code calls `{}`, which no library and no `#[no_mangle]` fn of the program defines", n.path, n.crates.join(", "), name)),
+        }
     }
     Ok(NativeCallbacks { lib: n.path.clone(), crates: n.crates.join(", "), slots: out })
 }
