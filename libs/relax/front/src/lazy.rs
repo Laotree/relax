@@ -903,6 +903,8 @@ impl Plan {
             for (ci, part) in parts.iter_mut().enumerate() {
                 let _profile = crate::load_profile::span(profile, "rust-demand-certify-part", &crates[ci].root);
                 let mut own = part.scans.iter().filter_map(|(p, _, hash, ..)| hash.map(|h| (p.clone(), h))).collect::<BTreeMap<_, _>>();
+                // the files the scanned ones `include!` are inputs too (relax issue 173)
+                own.extend(part.scans.iter().filter_map(|(_, _, _, scan, ..)| scan.as_ref()).flat_map(|s| s.included.iter().cloned()));
                 let mut probes = part.scans.iter().filter_map(|(_, _, _, scan, ..)| scan.as_ref())
                     .flat_map(|s| s.probes.iter().cloned()).collect::<BTreeSet<_>>();
                 // Retain validated schema reads even when restored outlines did

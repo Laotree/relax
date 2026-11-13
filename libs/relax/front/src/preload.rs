@@ -613,6 +613,7 @@ impl Pool {
             };
             if first {
                 inputs.push((path.clone(), crate::crate_image::file_hash(&path, &s.src[..s.src_len])));
+                inputs.extend(s.included);
             }
             probes.extend(s.probes);
             if path == c.root && s.recursion_limit.is_some() {
@@ -974,6 +975,38 @@ struct Scanned {
     inner_macro_use: Vec<String>,
     /// `#![recursion_limit = ".."]` in the file's leading inner attributes
     pub(crate) recursion_limit: Option<u32>,
+    /// the files `include!`d at item position, with their content hashes: inputs of the scan
+    included: Vec<(String, u128)>,
+}
+
+/// The text of a plain string literal token (`"a/b.rs"`, `r"a/b.rs"`, `r#"a/b.rs"#`); None for one
+/// with escapes or a byte or C string.
+fn plain_str(lit: &[u8]) -> Option<String> {
+    let lit = std::str::from_utf8(lit).ok()?;
+    let raw = lit.strip_prefix('r').map(|r| r.trim_matches('#'));
+    let body = raw.unwrap_or(lit).strip_prefix('"')?.strip_suffix('"')?;
+    (raw.is_some() || !body.contains('\\')).then(|| body.to_string())
+}
+
+std::thread_local! {
+    /// the files an `include!` scan is inside of on this thread (a file that includes itself, a
+    /// rustc error, stops at the repeat)
+    static INCLUDING: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The scan of a file `include!`d into module `mpath`, and its content hash. Its `mod x;` resolve
+/// in its own folder, in any module (rustc's expand_include sets the module's directory to the
+/// included file's and owns it).
+fn scan_included(path: &str, mpath: &str, krate: &str, edition: u16, cfg: &CfgSet, context: &crate::source_context::Context, surface: ScanSurface) -> Option<(u128, Scanned)> {
+    if INCLUDING.with(|c| c.borrow().iter().any(|p| p == path)) { return None; }
+    let src = context.read_source(path).ok()?.src.to_vec();
+    let hash = crate::crate_image::file_hash(path, &src);
+    let mut toks = Vec::with_capacity(src.len() / 4);
+    crate::lexer::lex(&src, edition, &mut toks).ok()?;
+    INCLUDING.with(|c| c.borrow_mut().push(path.to_string()));
+    let s = scan_tokens(path, crate::program::dir_of(path), mpath, krate, edition, cfg, src.len(), src.into(), toks, context, surface);
+    INCLUDING.with(|c| { c.borrow_mut().pop(); });
+    Some((hash, s?))
 }
 
 /// The bindings of a `use` tree in tokens `lo..hi` (after `use`, before `;`) under `prefix`.
@@ -1232,13 +1265,14 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
     let mut children = Vec::new();
     let mut probes = Vec::new();
     let mut aliases = Vec::new();
+    let mut included: Vec<(String, u128)> = Vec::new();
     let mut macro_use = Vec::new();
     let mut uses: Vec<crate::macros::UseItem> = Vec::new();
     let mut mods: Vec<String> = vec![mpath.to_string()];
     let mut mod_items: Vec<(String, crate::macros::ModItem)> = Vec::new();
     if !file_cfg_active(&src, &toks, cfg) {
         // `#![cfg(false)]` file: removed with its module; nothing in it counts
-        return Some(Scanned { src_len, src, toks: toks.into(), defs, children, probes, aliases, macro_use, uses, mods: Vec::new(), mod_items: Vec::new(), inner_macro_use: Vec::new(), recursion_limit: None });
+        return Some(Scanned { src_len, src, toks: toks.into(), defs, children, probes, aliases, macro_use, uses, mods: Vec::new(), mod_items: Vec::new(), inner_macro_use: Vec::new(), recursion_limit: None, included: Vec::new() });
     }
     let mut inner_macro_uses = Vec::new();
     if inner_macro_use(&src, &toks, cfg) { inner_macro_uses.push(mpath.to_string()); }
@@ -1418,6 +1452,45 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
                         dirs.push((depth + 1, child_dir, child_path, cur_active && active));
                     }
                 }
+                // `include!("file.rs");` at item position (rustc_builtin_macros source_util.rs
+                // expand_include): the file's items are this module's, so its `use`s and `mod`
+                // declarations are scanned as the module's, and its `mod x;` resolve in the
+                // included file's folder. Its macro definitions come from the parse, as before.
+                // (A module the included file declares got no imports: relax issue 173.)
+                T::Ident
+                    if text(i) == b"include"
+                        && i + 4 < toks.len()
+                        && toks[i + 1].kind == T::Not
+                        && toks[i + 2].kind == T::OpenParen
+                        && toks[i + 3].kind == T::Str
+                        && toks[i + 4].kind == T::CloseParen
+                        && dirs.last().map_or(false, |l| l.0 == depth && l.3) =>
+                {
+                    if let Some(name) = decl_attrs(&src, &toks, i, cfg).active.then(|| plain_str(text(i + 3))).flatten() {
+                        let inc = crate::crates::join_path(&fdir, &name);
+                        let module = dirs.last().unwrap().2.clone();
+                        let inc_surface = if surface == ScanSurface::Macros { ScanSurface::Imports } else { surface };
+                        match scan_included(&inc, &module, krate, edition, cfg, context, inc_surface) {
+                            Some((hash, s)) => {
+                                probes.push((inc.clone(), true));
+                                included.push((inc, hash));
+                                included.extend(s.included);
+                                probes.extend(s.probes);
+                                children.extend(s.children);
+                                aliases.extend(s.aliases);
+                                macro_use.extend(s.macro_use);
+                                uses.extend(s.uses);
+                                for m in s.mods {
+                                    if !mods.contains(&m) { mods.push(m); }
+                                }
+                                mod_items.extend(s.mod_items);
+                            }
+                            None => probes.push((inc, false)),
+                        }
+                    }
+                    i += 5;
+                    continue;
+                }
                 T::Ident
                     if i + 2 < toks.len()
                         && toks[i + 1].kind == T::Not
@@ -1484,7 +1557,7 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
             i += 1;
         }
     }
-    Some(Scanned { src_len, src, toks: toks.into(), defs, children, probes, aliases, macro_use, uses, mods, mod_items, inner_macro_use: inner_macro_uses, recursion_limit })
+    Some(Scanned { src_len, src, toks: toks.into(), defs, children, probes, aliases, macro_use, uses, mods, mod_items, inner_macro_use: inner_macro_uses, recursion_limit, included })
 }
 
 /// Starts the pipeline for `crates` (load order): scans (all crates at once, earliest crate

@@ -3197,13 +3197,14 @@ impl Program {
                         ItemKind::Mod(Opt::Some(items)) => Some(self.files[file as usize].ast.list(*items).to_vec()),
                         _ => None,
                     };
-                    // rustc_builtin_macros source_util.rs `include!`: the items of an included file
-                    // resolve their `mod x;` in that file's folder (the module's relative
-                    // ownership is kept)
+                    // rustc_builtin_macros source_util.rs `include!` (expand_include): the items of
+                    // an included file resolve their `mod x;` in that file's folder, from a mod.rs
+                    // or a non-mod.rs file alike (rustc 1.99.1: `mod deep;` in a file client.rs
+                    // includes is src/deep.rs, not src/client/deep.rs; relax issue 173)
                     let included;
                     let dir = match self.files[file as usize].authored_path(self.files[file as usize].ast.item(iid).lo) {
                         Some(p) if p != self.file_paths[file as usize] => {
-                            included = if mod_rs { dir_of(&p).to_string() } else { format!("{}/{}", dir_of(&p), dir.rsplit('/').next().unwrap_or("")) };
+                            included = dir_of(&p).to_string();
                             included.as_str()
                         }
                         _ => dir,

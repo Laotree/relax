@@ -46,7 +46,7 @@ impl Codec for DemandPart {
         Some(Self { key: Codec::get(r)?, ..Self::default() })
     }
 }
-const PART_VERSION: u32 = 12;
+const PART_VERSION: u32 = 13;
 const PART_DOMAIN: &str = "demand-part-v12";
 
 type Resolve<'a> = dyn FnMut(&str, u128) -> Option<&'static [u8]> + 'a;
@@ -111,7 +111,7 @@ impl DemandPart {
                 put_surface(path, (*hash)?, &scan.src, &scan.toks, &mut w, images)?;
                 put_defs(scan.defs.iter(), &mut w, images)?;
                 scan.children.put(&mut w); scan.aliases.put(&mut w); scan.macro_use.put(&mut w);
-                scan.uses.put(&mut w); scan.mods.put(&mut w); scan.mod_items.put(&mut w); scan.inner_macro_use.put(&mut w); scan.recursion_limit.put(&mut w);
+                scan.uses.put(&mut w); scan.mods.put(&mut w); scan.mod_items.put(&mut w); scan.inner_macro_use.put(&mut w); scan.recursion_limit.put(&mut w); scan.included.put(&mut w);
             }
             parameters.put(&mut w); positions.put(&mut w);
         }
@@ -221,7 +221,7 @@ impl DemandPart {
                 if source_path != path || Some(source_hash) != hash { return None; }
                 Some(Arc::new(Scanned { src_len, probes, src, toks,
                     defs: get_defs(&mut r, &store, images, &mut definitions)?.into_iter().map(|def| (*def).clone()).collect(), children: Codec::get(&mut r)?,
-                    aliases: Codec::get(&mut r)?, macro_use: Codec::get(&mut r)?, uses: Codec::get(&mut r)?, mods: Codec::get(&mut r)?, mod_items: Codec::get(&mut r)?, inner_macro_use: Codec::get(&mut r)?, recursion_limit: Codec::get(&mut r)? }))
+                    aliases: Codec::get(&mut r)?, macro_use: Codec::get(&mut r)?, uses: Codec::get(&mut r)?, mods: Codec::get(&mut r)?, mod_items: Codec::get(&mut r)?, inner_macro_use: Codec::get(&mut r)?, recursion_limit: Codec::get(&mut r)?, included: Codec::get(&mut r)? }))
             } else { None };
             part.scans.push((path, module, hash, scan, Codec::get(&mut r)?, Codec::get(&mut r)?));
         }
