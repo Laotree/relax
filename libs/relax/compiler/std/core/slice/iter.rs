@@ -417,6 +417,70 @@ unsafe impl<'a, T> crate::iter::TrustedRandomAccessNoCoerce for Windows<'a, T> {
 }
 impl<'a, T> FusedIterator for Windows<'a, T> {}
 
+// ---------------------------------------------------------------- ArrayWindows
+
+/// `<[T]>::array_windows::<N>()` (core slice/iter.rs, stable 1.94): the overlapping windows of
+/// `N` elements as `&[T; N]`. `v` is what is left (core's one field: its Debug shows it), and a
+/// step past either end leaves it as core does.
+pub struct ArrayWindows<'a, T, const N: usize> {
+    v: &'a [T],
+}
+
+pub const fn array_windows<T, const N: usize>(v: &[T]) -> ArrayWindows<'_, T, N> {
+    const { assert!(N != 0, "window size must be non-zero") }
+    ArrayWindows { v }
+}
+impl<'a, T, const N: usize> Clone for ArrayWindows<'a, T, N> {
+    fn clone(&self) -> Self {
+        ArrayWindows { v: self.v }
+    }
+}
+impl<'a, T: fmt::Debug, const N: usize> fmt::Debug for ArrayWindows<'a, T, N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ArrayWindows").field("v", &self.v).finish()
+    }
+}
+impl<'a, T, const N: usize> Iterator for ArrayWindows<'a, T, N> {
+    type Item = &'a [T; N];
+    fn next(&mut self) -> Option<&'a [T; N]> {
+        let r = self.v.first_chunk::<N>();
+        if r.is_some() {
+            self.v = &self.v[1..];
+        }
+        r
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.v.len().saturating_sub(N - 1);
+        (n, Some(n))
+    }
+    fn count(self) -> usize {
+        self.len()
+    }
+    fn nth(&mut self, n: usize) -> Option<&'a [T; N]> {
+        let at = if n < self.v.len() { n } else { self.v.len() };
+        self.v = &self.v[at..];
+        self.next()
+    }
+    fn last(self) -> Option<&'a [T; N]> {
+        self.v.last_chunk::<N>()
+    }
+}
+impl<'a, T, const N: usize> DoubleEndedIterator for ArrayWindows<'a, T, N> {
+    fn next_back(&mut self) -> Option<&'a [T; N]> {
+        let r = self.v.last_chunk::<N>();
+        if r.is_some() {
+            self.v = &self.v[..self.v.len() - 1];
+        }
+        r
+    }
+    fn nth_back(&mut self, n: usize) -> Option<&'a [T; N]> {
+        self.v = &self.v[..self.v.len().saturating_sub(n)];
+        self.next_back()
+    }
+}
+impl<'a, T, const N: usize> ExactSizeIterator for ArrayWindows<'a, T, N> {}
+impl<'a, T, const N: usize> FusedIterator for ArrayWindows<'a, T, N> {}
+
 // ---------------------------------------------------------------- Chunks
 // Keep mutable remaining slices disjoint from every yielded slice. Taking the
 // remaining reference before splitting makes this invariant explicit without

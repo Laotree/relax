@@ -2,7 +2,7 @@
 //! The `impl<T> [T]` methods are in inherent.rs and forward to the free functions here.
 
 pub mod memchr;
-mod index;
+pub(crate) mod index;
 mod inherent;
 mod iter;
 mod join;
@@ -10,7 +10,7 @@ pub mod sort;
 
 pub use index::SliceIndex;
 pub use iter::{
-    ChunkBy, ChunkByMut, Chunks, ChunksExact, ChunksExactMut, ChunksMut, Iter, IterMut,
+    ArrayWindows, ChunkBy, ChunkByMut, Chunks, ChunksExact, ChunksExactMut, ChunksMut, Iter, IterMut,
     RChunks, RChunksExact, RChunksExactMut, RChunksMut, RSplit, RSplitMut, RSplitN, RSplitNMut,
     Split, SplitInclusive, SplitInclusiveMut, SplitMut, SplitN, SplitNMut, Windows,
 };

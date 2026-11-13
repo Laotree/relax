@@ -54,6 +54,14 @@ pub struct CStr {
     inner: [c_char],
 }
 
+/// The empty C string (core ffi/c_str.rs).
+impl Default for &CStr {
+    fn default() -> Self {
+        // one nul: a C string with no bytes before it
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"\0") }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FromBytesWithNulError {
     InteriorNul { position: usize },

@@ -401,6 +401,25 @@ impl StrIndex for RangeToInclusive<usize> {
     }
 }
 
+// core str/traits.rs: `(Bound<usize>, Bound<usize>)` (stable 1.53) is the range it names, found as
+// a slice's pair is, and a pair that names none panics with the slice's message
+impl StrIndex for (crate::ops::Bound<usize>, crate::ops::Bound<usize>) {
+    fn get_str(self, s: &str) -> Option<&str> {
+        crate::slice::index::try_into_slice_range(s.len(), self).ok()?.get_str(s)
+    }
+    fn get_str_mut(self, s: &mut str) -> Option<&mut str> {
+        crate::slice::index::try_into_slice_range(s.len(), self).ok()?.get_str_mut(s)
+    }
+    #[track_caller]
+    fn index_str(self, s: &str) -> &str {
+        crate::slice::index::into_slice_range(s.len(), self).index_str(s)
+    }
+    #[track_caller]
+    fn index_str_mut(self, s: &mut str) -> &mut str {
+        crate::slice::index::into_slice_range(s.len(), self).index_str_mut(s)
+    }
+}
+
 pub fn get<I: StrIndex>(s: &str, i: I) -> Option<&str> {
     i.get_str(s)
 }

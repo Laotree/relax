@@ -544,6 +544,18 @@ impl<T> Weak<T> {
 }
 
 impl<T: ?Sized> Weak<T> {
+    /// The value's pointer, with this Weak's count (alloc rc.rs; sync::Weak's twin): from_raw
+    /// takes both back. An empty Weak gives its dangling sentinel, which stays empty.
+    pub fn into_raw(self) -> *const T {
+        let p = self.ptr.as_ptr() as *const T;
+        crate::mem::forget(self);
+        p
+    }
+
+    pub unsafe fn from_raw(p: *const T) -> Weak<T> {
+        Weak { ptr: unsafe { ptr::NonNull::new_unchecked(p as *mut T) } }
+    }
+
     pub fn upgrade(&self) -> Option<Rc<T>> {
         if is_dangling(self.ptr.as_ptr()) {
             return None;

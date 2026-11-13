@@ -46,7 +46,7 @@ pub mod rc {
 
 pub mod slice {
     pub use core::slice::{
-        from_mut, from_raw_parts, from_raw_parts_mut, from_ref, Chunks, ChunksExact, ChunksExactMut, ChunksMut, Concat, Iter,
+        from_mut, from_raw_parts, from_raw_parts_mut, from_ref, ArrayWindows, Chunks, ChunksExact, ChunksExactMut, ChunksMut, Concat, Iter,
         IterMut, Join, RChunks, RSplit, RSplitN, SliceIndex, Split, SplitInclusive, SplitMut, SplitN, Windows,
     };
 }

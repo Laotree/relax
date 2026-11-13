@@ -26,7 +26,7 @@ pub const fn forget<T>(t: T) {
 #[rustc_diagnostic_item = "mem_drop"]
 pub fn drop<T>(_x: T) {}
 
-pub fn replace<T>(dest: &mut T, src: T) -> T {
+pub const fn replace<T>(dest: &mut T, src: T) -> T {
     unsafe {
         let p = dest as *mut T;
         let old = im::ptr_read(p as *const T);

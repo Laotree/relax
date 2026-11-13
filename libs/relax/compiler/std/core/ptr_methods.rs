@@ -51,6 +51,14 @@ impl<T: crate::marker::PointeeSized> *const T {
     pub const fn byte_offset(self, count: isize) -> *const T {
         self.wrapping_byte_add(count as usize)
     }
+    /// Distance in bytes to `origin`, which may point to another type; both into the same
+    /// allocation (core const_ptr.rs: the `u8` casts' offset_from).
+    pub const unsafe fn byte_offset_from<U: crate::marker::PointeeSized>(self, origin: *const U) -> isize {
+        unsafe { self.cast::<u8>().offset_from(origin.cast::<u8>()) }
+    }
+    pub const unsafe fn byte_offset_from_unsigned<U: crate::marker::PointeeSized>(self, origin: *const U) -> usize {
+        unsafe { self.cast::<u8>().offset_from_unsigned(origin.cast::<u8>()) }
+    }
     // (core: `self.cast::<u8>().wrapping_add(count).with_metadata_of(self)`: the address word moves
     // with its provenance, the metadata stays)
     pub const fn wrapping_byte_add(self, count: usize) -> *const T {
@@ -216,6 +224,13 @@ impl<T: crate::marker::PointeeSized> *mut T {
     }
     pub const fn byte_offset(self, count: isize) -> *mut T {
         self.wrapping_byte_add(count as usize)
+    }
+    // (core mut_ptr.rs: the unsigned form takes a `*mut U`, the signed one a `*const U`)
+    pub const unsafe fn byte_offset_from<U: crate::marker::PointeeSized>(self, origin: *const U) -> isize {
+        unsafe { (self as *const T).byte_offset_from(origin) }
+    }
+    pub const unsafe fn byte_offset_from_unsigned<U: crate::marker::PointeeSized>(self, origin: *mut U) -> usize {
+        unsafe { (self as *const T).byte_offset_from_unsigned(origin as *const U) }
     }
     // (core: `self.cast::<u8>().wrapping_add(count).with_metadata_of(self)`: the address word moves
     // with its provenance, the metadata stays)

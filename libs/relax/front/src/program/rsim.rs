@@ -1979,6 +1979,29 @@ mod tests {
     }
 
     #[test]
+    fn a_glob_trait_binding_is_shadowed_by_its_binding_name_only() {
+        // a module whose glob brings traits and which has items named like them: an `as _` import
+        // (no name) and `use T as Ext` (shadowed by an `Ext`, not by a `T`) keep their traits'
+        // methods in scope; a binding of the trait's own name is shadowed
+        let src = concat!(
+            "mod traits { pub trait Stream { fn timeout(&self) {} } pub trait Renamed { fn renamed(&self) {} } pub trait Named { fn named(&self) {} } }\n",
+            "mod prelude { pub use crate::traits::Stream as _; pub use crate::traits::Renamed as Ext; pub use crate::traits::Named; }\n",
+            "mod imp { use crate::prelude::*; pub struct Stream; pub struct Renamed; pub struct Named; }\n",
+            "mod ext { use crate::prelude::*; pub struct Ext; }\nfn main() {}\n",
+        );
+        let (p, _, d) = replayed(src, 2018);
+        assert!(d.is_empty(), "{d:?}");
+        for (m, want) in [("imp", ["traits::Stream", "traits::Renamed"]), ("ext", ["traits::Stream", "traits::Named"])] {
+            let m = (0..p.mods.len()).find(|&x| p.def_path(p.mods[x].def) == format!("rsim_test::{m}")).unwrap();
+            let mut got: Vec<String> = p.traits_in_scope(m as u32).iter().map(|&t| p.def_path(t)).collect();
+            got.sort();
+            let mut want: Vec<String> = want.iter().map(|t| format!("rsim_test::{t}")).collect();
+            want.sort();
+            assert_eq!(got, want, "the traits in scope of {}", p.def_path(p.mods[m].def));
+        }
+    }
+
+    #[test]
     fn two_globs_of_different_items_are_an_ambiguity_lint() {
         let d = replay("mod b { pub fn x() {} }\nmod c { pub fn x() {} }\nmod a { pub use super::b::*; pub use super::c::*; }\nmod user { use super::a::*; pub fn f() { x(); } }\nfn main() {}\n", 2018);
         // (the use site is judged by the checks that read `sim_ambiguity`; the replay itself has no complaint)

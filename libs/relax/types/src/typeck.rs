@@ -6588,7 +6588,11 @@ impl<'a> Fcx<'a> {
                 // records the method for `?T: PartialEq<?R>` while it is ambiguous. Typing it as a
                 // built-in comparison unified both sides and made the capture analysis of
                 // `|p| *p == path` (p: &?T) consume `path` (a false E0382 in an app's code_graph).
-                if !prim_ref && matches!(self.tcx.tys.kind(sa), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..) | TyKind::Param(_) | TyKind::Infer(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. })) {
+                // Every alias is one too, an opaque type (`impl PartialEq` another fn returns)
+                // included, whatever its hidden type: a built-in comparison of an aggregate hidden
+                // type found two different values equal (an app's `structure(&a) != structure(&b)`
+                // over a tuple of maps, relax PR 152)
+                if !prim_ref && matches!(self.tcx.tys.kind(sa), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..) | TyKind::Param(_) | TyKind::Infer(_) | TyKind::Alias(..)) {
                     if let Some(r) = self.check_cmp_trait(e, op, sa, b, lo, None) {
                         return r;
                     }
@@ -7416,7 +7420,7 @@ impl<'a> Fcx<'a> {
         // lifetimes are fresh.
         let mut full = self.infer_item_args(item, &gargs);
         full[..impl_full.len()].copy_from_slice(&impl_full);
-        self.write_method_user_type(e.0, item, &full);
+        self.write_method_user_type(e.0, item, &full, &tf);
         let (ps, ret) = self.instantiate_call_signature(item, &full, &sig);
         // method/confirm.rs:150-160 (add_obligations): registered once with the
         // instantiated args, before the arguments are checked.
@@ -7778,7 +7782,7 @@ impl<'a> Fcx<'a> {
                 if matches!(known, crate::consts::GenericArg::Lifetime(_)) { *arg = known; }
             }
         }
-        self.write_method_user_type(e.0, item, &full);
+        self.write_method_user_type(e.0, item, &full, &tf);
         let (ps, r) = self.instantiate_call_signature(item, &full, &sig);
         // A probe only establishes that the trait may hold, even when it found
         // one impl. Confirm the pick by retaining its trait obligation (nightly
