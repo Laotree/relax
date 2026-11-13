@@ -727,6 +727,43 @@ mod lazy_tests {
     use super::*;
 
     #[test]
+    fn reused_module_imports_survive_a_root_edit() {
+        isolated_test!(reused_module_imports_survive_a_root_edit);
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+        let dir = std::env::temp_dir().join(format!("relax-reused-modules-{}-{}", std::process::id(), crate::clock::wall_ns()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("shared")).unwrap();
+        let root = dir.join("src/lib.rs").to_string_lossy().into_owned();
+        let dep = dir.join("dep.rs").to_string_lossy().into_owned();
+        let source = include_str!("../tests/reused_module_imports/src/lib.rs");
+        std::fs::write(&root, source).unwrap();
+        std::fs::write(&dep, include_str!("../tests/reused_module_imports/dep/src/lib.rs")).unwrap();
+        std::fs::write(dir.join("shared/value.rs"), include_str!("../tests/reused_module_imports/shared/value.rs")).unwrap();
+        let mut options = crate::Session::default();
+        options.options.source_eager = true;
+        let session = std::sync::Arc::new(options);
+        let mut prog = crate::program::Program::new(&session);
+        let (core, std_deps) = crate::load_std_crates(&session, &mut prog).unwrap();
+        let cfg = crate::cfg::CfgSet::host(&session, &[]);
+        let dependency = prog.load_crate("macro_dep", &dep, 2021, cfg.clone(), std_deps.clone()).unwrap();
+        let mut deps = std_deps;
+        deps.push((prog.syms.intern("macro_dep"), dependency));
+        let krate = prog.load_crate("reused_module_imports", &root, 2021, cfg, deps).unwrap();
+        prog.prelude_crate = Some(core);
+        prog.resolve_imports();
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        let mut warm = Session::new(Unit::new(prog, tcx, core), krate, Vec::new());
+        warm.check();
+        assert!(warm.diagnostics().is_empty(), "before edit: {:?}", warm.diagnostics());
+        warm.did_change(root.clone(), format!("{source}\npub fn added() {{}}\n"));
+        assert!(warm.diagnostics().is_empty(), "after root edit: {:?}", warm.diagnostics());
+        assert!(warm.unit.prog.defs.iter().any(|d| d.krate == krate && warm.unit.prog.syms.str(d.name) == "added"));
+        drop(warm);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn warm_indexes_queries_and_appearing_files_follow_the_current_sources() {
         isolated_test!(warm_indexes_queries_and_appearing_files_follow_the_current_sources);
         let dir = std::env::temp_dir().join(format!("relax-warm-context-{}-{}", std::process::id(), crate::clock::wall_ns()));
