@@ -125,12 +125,17 @@ enum ParentNamed {
     /// a module-level impl: its header text (`impl<T> Trait for Type<T>`), whitespace dropped,
     /// and its ordinal among the file's impls with that header (identical twins differ)
     Impl(Vec<u8>),
-    /// an associated item or a variant: its parent's identity names it with its own path
+    /// an associated item or a variant, an anonymous constant or an opaque type: its parent's
+    /// identity names it with its own path
     Item(DefId),
 }
 
 /// Whether `d` is named without its position: a module-level impl by its header, an item of
-/// an impl, trait or enum so named by that parent (def_path does not tell impls apart).
+/// an impl, trait or enum so named by that parent (def_path does not tell impls apart), an
+/// anonymous constant or opaque type by its parent and its name, which holds its ordinal among
+/// the parent's (`{constant#1}`), as rustc's DefPath has it. Two impls of one trait for
+/// `[u8; FOUR]` and `[u8; TWO]` have one def_path and one place each: their lengths' constants
+/// had one identity, so a warm run's cache gave both one value, and their impls one key.
 fn parent_names(prog: &Program, d: DefId) -> Option<ParentNamed> {
     use crate::program::DefKind;
     let def = prog.def(d);
@@ -149,6 +154,7 @@ fn parent_names(prog: &Program, d: DefId) -> Option<ParentNamed> {
             let named = path_names(prog, p) || matches!(parent_names(prog, p), Some(ParentNamed::Impl(_)));
             (named && matches!(prog.def(p).kind, DefKind::Impl | DefKind::Trait | DefKind::Enum)).then_some(ParentNamed::Item(p))
         }
+        DefKind::AnonConst | DefKind::OpaqueTy => (def.parent != NO_DEF).then_some(ParentNamed::Item(def.parent)),
         _ => None,
     }
 }
