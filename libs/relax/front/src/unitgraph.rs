@@ -330,14 +330,22 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
                 let pkg_dir = &absolute(std::path::Path::new(pkg_dir));
                 let exe_str = exe.display().to_string();
                 let sh_quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+                // cargo builds a package's bins with the features its tests are built with (one
+                // feature set per package): the run of the bin selects exactly those
+                let features = crates[integration_tests[0]].features.join(",");
+                let (sh_features, cmd_features) = if features.is_empty() {
+                    ("--no-default-features".to_string(), "--no-default-features".to_string())
+                } else {
+                    (format!("--no-default-features --features {}", sh_quote(&features)), format!("--no-default-features --features \"{features}\""))
+                };
                 for bin_name in &g.bins {
                     let wrapper = bin_dir.join(if cfg!(windows) { format!("{bin_name}.cmd") } else { bin_name.clone() });
                     let script = if cfg!(windows) {
-                        format!("@echo off\r\nset RELAX_SELF_EXEC=\r\nset RELAX_SELF_EXEC_SILENT_ADDED=\r\nset \"RELAX_ARG0=%~f0\"\r\n\"{}\" run --quiet --silent --no-live --run-dir \"{}\" --workspace-dir \"{}\" \"{}\" --bin \"{}\" -- %*\r\n",
-                            exe_str, td_str, pkg_dir, pkg_name, bin_name)
+                        format!("@echo off\r\nset RELAX_SELF_EXEC=\r\nset RELAX_SELF_EXEC_SILENT_ADDED=\r\nset \"RELAX_ARG0=%~f0\"\r\n\"{}\" run --quiet --silent --no-live --run-dir \"{}\" --workspace-dir \"{}\" \"{}\" {} --bin \"{}\" -- %*\r\n",
+                            exe_str, td_str, pkg_dir, pkg_name, cmd_features, bin_name)
                     } else {
-                        format!("#!/bin/sh\nunset RELAX_SELF_EXEC RELAX_SELF_EXEC_SILENT_ADDED\nRELAX_ARG0=$0\nexport RELAX_ARG0\nexec {} run --quiet --silent --no-live --run-dir {} --workspace-dir {} {} --bin {} -- \"$@\"\n",
-                            sh_quote(&exe_str), sh_quote(&td_str), sh_quote(pkg_dir), sh_quote(pkg_name), sh_quote(bin_name))
+                        format!("#!/bin/sh\nunset RELAX_SELF_EXEC RELAX_SELF_EXEC_SILENT_ADDED\nRELAX_ARG0=$0\nexport RELAX_ARG0\nexec {} run --quiet --silent --no-live --run-dir {} --workspace-dir {} {} {} --bin {} -- \"$@\"\n",
+                            sh_quote(&exe_str), sh_quote(&td_str), sh_quote(pkg_dir), sh_quote(pkg_name), sh_features, sh_quote(bin_name))
                     };
                     if std::fs::read(&wrapper).ok().as_deref() != Some(script.as_bytes()) {
                         let tmp = bin_dir.join(format!(".{}.tmp{}", bin_name, std::process::id()));
