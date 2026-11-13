@@ -45,12 +45,12 @@ static PHASES: relax_session::sync::Mutex<Vec<(String, f64)>> = relax_session::s
 static MAIN_START_MS: AtomicU64 = AtomicU64::new(0);
 static ERRORS_SEEN: AtomicU64 = AtomicU64::new(0);
 static QUIET: AtomicBool = AtomicBool::new(false);
-static SILENT: AtomicBool = AtomicBool::new(false);
 
 /// `--silent`: nothing of Relax's own on stderr but errors (a program re-running itself, a
-/// binary's wrapper script).
+/// binary's wrapper script). The switch is relax-base's (`progress::silent`), which every layer
+/// reads.
 pub(crate) fn silent() -> bool {
-    SILENT.load(Ordering::Relaxed)
+    crate::progress::silent()
 }
 /// This run is a live session (watcher and hot reload: a failed build is fixed by an edit).
 pub(crate) static LIVE_SESSION: AtomicBool = AtomicBool::new(false);
@@ -79,7 +79,7 @@ fn phase(name: &str, t: Instant) {
 }
 
 fn phase_ms(name: &str, ms: f64) {
-    if !SILENT.load(Ordering::Relaxed) {
+    if !silent() {
         verbose!("relax: {:<28} {:>9.1} ms   (t={:.0} ms)", name, ms, crate::clock::ms_since_start());
     }
     // the phase's name without its counts: "build scripts (12)" -> "build scripts"
@@ -872,7 +872,7 @@ pub(crate) fn resolve_package(
     if boot {
         // the scripts that still run (as Relax programs) that the source is to lose (unitgraph::script_role)
         let mut l = unitgraph::TO_REMOVE.lock().unwrap().clone();
-        if !l.is_empty() && !SILENT.load(Ordering::Relaxed) {
+        if !l.is_empty() && !silent() {
             l.sort();
             let names: Vec<String> = l.iter().map(|(p, src)| format!("{} ({})", p, src)).collect();
             verbose!("relax: build scripts to remove ({}; only makepad-platform keeps one): {}", l.len(), names.join(", "));
@@ -1096,7 +1096,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             // nothing of Relax's own on stderr but errors (a program re-running itself)
             "--silent" => {
                 QUIET.store(true, Ordering::Relaxed);
-                SILENT.store(true, Ordering::Relaxed);
+                crate::progress::set_silent();
             }
             // type/borrow check (`--deep` also compiles), run nothing
             "--check" => check = true,
@@ -1121,7 +1121,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             "--deep" => deep = true,
             "--json" if crate::diag::enabled() => {
                 QUIET.store(true, Ordering::Relaxed);
-                SILENT.store(true, Ordering::Relaxed);
+                crate::progress::set_silent();
             },
             // relaxed Rust for every crate of this session (relaxed.rs): all features, or a list
             "--relaxed" => driver_options.relaxed = Some("all".to_string()),
@@ -1147,7 +1147,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if also_requested && (!check || watch || root_only || selftest || session.is_some()) { return usage(); }
     // a profile is a test's: `makepad run` builds as the release profile does
     if TEST_PROFILE.get().is_some() && !harness && !plain_test { return usage(); }
-    driver_options.verbose &= !SILENT.load(Ordering::Relaxed);
+    driver_options.verbose &= !silent();
     VERBOSE.store(driver_options.verbose, Ordering::Relaxed);
     if driver_options.verbose { crate::tui::track_for_verbose(); }
     // the boot progress line (tui.rs): a terminal run of a program, with nothing asking for plain output
@@ -1171,6 +1171,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // front of it held lines back for up to a minute and lost a crashing run's last lines
     if !check && !watch && session.is_none() && !hosted && !cfg!(target_os = "android") {
         crate::tui::start(!driver_options.verbose && !QUIET.load(Ordering::Relaxed) && !crate::diag::enabled());
+        // a line of the layers below for the session log alone (progress::say in a silent run)
+        crate::progress::set_log_only(crate::tui::log_only);
     }
     crate::memstat::start_sampler();
     // `makepad run` of a working tree is a live session (watcher + hot reload); sources served from
@@ -1179,7 +1181,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // A store run whose embedder writes pushed sources into its edits folder (the Android host's
     // devhub store applier) asks for a live session with RELAX_STORE_LIVE=1.
     let store_live = std::env::var_os("RELAX_STORE_LIVE").is_some_and(|v| v == "1") && crate::vfs::edits_enabled();
-    if live_tests || !check && !harness && !plain_test && !no_live && std::env::var_os("RELAX_SCRIPT_DEPTH").is_none() && !SILENT.load(Ordering::Relaxed)
+    if live_tests || !check && !harness && !plain_test && !no_live && std::env::var_os("RELAX_SCRIPT_DEPTH").is_none() && !silent()
         && (store_live || !crate::vfs::in_store(&workspace_dir())) {
         driver_options.live = true;
     }
@@ -1396,7 +1398,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
     }
     let std_dir = crate::std_dir();
-    if !SILENT.load(Ordering::Relaxed) {
+    if !silent() {
         verbose!("relax: package {} ({}), std {}", package, if cargo_flags.is_empty() { "default features".to_string() } else { cargo_flags.join(" ") }, std_dir);
     }
 
@@ -2552,13 +2554,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     unsafe {
         std::env::set_var("RELAX_STARTUP_T0", crate::clock::process_start_epoch().to_string());
         std::env::set_var("RELAX_MAIN_MS", crate::clock::ms_since_process_start().to_string());
-        if SILENT.load(Ordering::Relaxed) && !live_tests {
+        if silent() && !live_tests {
             std::env::remove_var("RELAX_PACKAGE");
         } else {
             std::env::set_var("RELAX_PACKAGE", &package);
         }
     }
-    if !SILENT.load(Ordering::Relaxed) {
+    if !silent() {
         verbose!("relax: boot done, calling main (t={:.0} ms)", main_ms);
     }
     report("main", "");
@@ -4837,7 +4839,7 @@ fn summary_inner(why: &str) {
     // safe point (jit::quiesce); a holder still busy after EXIT_QUIESCE_MS costs this run's
     // summary + cache pack
     let preamble = |got: bool| -> bool {
-        if got && holder != "idle" && t_wait.elapsed().as_micros() > 100 && !SILENT.load(Ordering::Relaxed) {
+        if got && holder != "idle" && t_wait.elapsed().as_micros() > 100 && !silent() {
             verbose!("relax: {}: waited {:.1} ms for the owner thread (serving {})", why, t_wait.elapsed().as_secs_f64() * 1e3, holder);
         }
         if why != "stats" { exit_mark("quiesce"); jit::tier1_stats_report(); }
@@ -4965,7 +4967,7 @@ fn summary_inner(why: &str) {
         }
         let s = &u.stats;
         let now = crate::clock::ms_since_start();
-        if !SILENT.load(Ordering::Relaxed) {
+        if !silent() {
         verbose!(
             "relax: {} at t={:.0} ms (main from t={} ms): compiled {} fns, {} KB code, {} compile errors; cpu typeck {:.0} ms, lower {:.0} ms, opt {:.0} ms, codegen {:.0} ms",
             why,
@@ -5010,7 +5012,7 @@ fn summary_inner(why: &str) {
                 );
             }
         }
-        if !SILENT.load(Ordering::Relaxed) {
+        if !silent() {
             let h = |i: usize| crate::owner::BUSY_NS[i].load(Ordering::Relaxed) as f64 / 1e6;
             verbose!("relax: owner thread busy: job {:.0} ms, publish {:.0} ms, program {:.0} ms (t={:.0} ms)", h(0), h(1), h(2), crate::clock::ms_since_start());
             let b = |i: usize| crate::owner::BAILS[i].load(Ordering::Relaxed);
@@ -5030,7 +5032,7 @@ fn summary_inner(why: &str) {
             verbose!("relax: O3 install records on the owner: {}x {:.0} ms", jit::O3_INSTALL_REC[0].load(std::sync::atomic::Ordering::Relaxed), jit::O3_INSTALL_REC[1].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6);
             verbose!("relax: O3 owner cpu by part: {}", jit::o3_owner_summary());
         }
-        if !SILENT.load(Ordering::Relaxed) {
+        if !silent() {
             let b = |i: usize| crate::owner::PURE_BAILS[i].load(Ordering::Relaxed);
             let p = |i: usize| crate::owner::PURE_AT_PRESENT[i].load(Ordering::Relaxed);
             use crate::owner::{PURE_AHEAD_BAIL, PURE_BG_EVAL, PURE_BG_FRONT, PURE_BG_JIT, PURE_BG_JOB};
@@ -5038,14 +5040,14 @@ fn summary_inner(why: &str) {
                 b(PURE_BG_FRONT), p(PURE_BG_FRONT), b(PURE_BG_EVAL), p(PURE_BG_EVAL), b(PURE_BG_JIT), p(PURE_BG_JIT), b(PURE_BG_JOB), p(PURE_BG_JOB), b(PURE_AHEAD_BAIL), p(PURE_AHEAD_BAIL));
         }
         let ah = |i: usize| jit::AHEAD_STATS[i].load(Ordering::Relaxed);
-        if ah(0) + ah(2) > 0 && !SILENT.load(Ordering::Relaxed) {
+        if ah(0) + ah(2) > 0 && !silent() {
             verbose!("relax: type checks ahead (off the lock): {} bodies ({} taken by builds, {} with errors), cpu callers {:.0} ms, workers {:.0} ms", ah(0), ah(1), ah(2), ah(3) as f64 / 1e6, ah(4) as f64 / 1e6);
         }
-        if ah(0) > 0 && !SILENT.load(Ordering::Relaxed) {
+        if ah(0) > 0 && !silent() {
             let p = |i: usize| jit::AHEAD_AT_PRESENT[i].load(Ordering::Relaxed);
             verbose!("relax: ahead until the first present: {} bodies checked, workers cpu {:.0} ms; {} lowered ({} taken by builds), cpu {:.0} ms", p(0), p(4) as f64 / 1e6, p(5), p(6), p(7) as f64 / 1e6);
         }
-        if s.ctfe_data + s.ctfe_code > 0 && !SILENT.load(Ordering::Relaxed) {
+        if s.ctfe_data + s.ctfe_code > 0 && !silent() {
             verbose!("relax: constant initializers: {} evaluated to data, {} compiled and run; evaluation cpu {:.1} ms", s.ctfe_data, s.ctfe_code, s.ctfe_ns as f64 / 1e6);
         }
         // RELAX_MAIN_COMPILE_LOG=<path>: the main thread's compiles, ms since main started: app
@@ -5143,13 +5145,13 @@ fn summary_inner(why: &str) {
                 tl.push_str(&format!(" {}s:{}fns/{}ms", i as f64 / 10.0, n, w / 1_000_000));
             }
         }
-    if !SILENT.load(Ordering::Relaxed) {     verbose!("relax: compile timeline (100 ms buckets):{}", tl); }
+    if !silent() {     verbose!("relax: compile timeline (100 ms buckets):{}", tl); }
         if std::env::var("RELAX_PASS_TIMES").is_ok() {
             let mut passes = String::new();
             for i in 0..relax_backend::stats::PASS_NAMES.len() {
                 passes.push_str(&format!("{} {:.0}  ", relax_backend::stats::PASS_NAMES[i], relax_backend::stats::PASS_NS[i].load(Ordering::Relaxed) as f64 / 1e6));
             }
-    if !SILENT.load(Ordering::Relaxed) {         verbose!("relax: opt passes (cpu ms): {}", passes); }
+    if !silent() {         verbose!("relax: opt passes (cpu ms): {}", passes); }
             verbose!("relax: invokes {} seen, {} made plain calls", relax_codegen::opt::INVOKES_SEEN.load(Ordering::Relaxed), relax_codegen::opt::INVOKES_DEMOTED.load(Ordering::Relaxed));
         }
         if relax_backend::dbgloc::stats_on() {

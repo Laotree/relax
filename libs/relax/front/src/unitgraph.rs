@@ -1385,7 +1385,8 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     let claim_path = format!("{}/relax-claim", base_dir);
     let claim = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&claim_path).ok();
     if let Some(claim) = claim.as_ref().filter(|claim| claim.try_lock().is_err()) {
-        eprintln!("relax build-script: {} waits for its claim {}: {}", pname, claim_path, claim_holder(&claim_path));
+        // (a silent run's stderr is its program's: the line goes to the session log alone)
+        crate::progress::say(&format!("relax build-script: {} waits for its claim {}: {}", pname, claim_path, claim_holder(&claim_path)));
         let _ = claim.lock();
         // (the wait can be long: the checkout's files are read again)
         if let Some(content) = &shared {
