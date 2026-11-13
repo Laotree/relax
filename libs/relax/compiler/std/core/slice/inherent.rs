@@ -195,6 +195,10 @@ impl<T> [T] {
         it::windows(self, size)
     }
     #[track_caller]
+    pub const fn array_windows<const N: usize>(&self) -> it::ArrayWindows<'_, T, N> {
+        it::array_windows(self)
+    }
+    #[track_caller]
     pub const fn chunks(&self, chunk_size: usize) -> Chunks<'_, T> {
         it::chunks(self, chunk_size)
     }
