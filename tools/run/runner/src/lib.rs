@@ -164,6 +164,7 @@ pub fn main(host: &'static Host) {
     relax_compiler::progenv::init();
     set_host(host);
     relax_compiler::set_tool_name(help::command());
+    relax_compiler::set_loader_commands(help::COMMANDS);
     warn_legacy_env();
     relax_compiler::wasm_export::startup();
     run(relax_compiler::os::proc::args_bytes())
@@ -188,6 +189,7 @@ fn warn_legacy_env() {
 /// executable, which build scripts and `RELAX_LOADER` programs run as.
 pub fn init_embedded(exe: &std::path::Path, host: &'static Host) {
     set_host(host);
+    relax_compiler::set_loader_commands(help::COMMANDS);
     relax_compiler::unitgraph::set_self_exe(exe.to_path_buf());
     // the program's argv[0] / current_exe: the embedder has no command line of its own
     relax_compiler::os::proc::set_args(vec![exe.as_os_str().as_encoded_bytes().to_vec()]);
@@ -316,7 +318,7 @@ fn run(raw_args: Vec<Vec<u8>>) {
     // every program this loader runs (and every program those start) finds it here: a program
     // runs under the loader when its own executable is this file (std::env::current_exe), and
     // starts other apps with `$RELAX_LOADER run ...` (std process.rs: a spawn of the loader
-    // with `run` arguments is a launch, never a re-run of the program)
+    // whose first argument is one of its commands runs that command, never the program again)
     if let Some(e) = loader_exe() {
         std::env::set_var("RELAX_LOADER", e);
     }

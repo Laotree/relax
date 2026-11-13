@@ -1240,7 +1240,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // the program's argv[0] / current_exe() is the Relax binary; spawning it again
     // (`Command::new(env::current_exe()?)`, `Command::new(&args[0])`) runs this program again
     // with the new arguments (std process.rs: RELAX_SELF_EXEC holds this command line up to `--`);
-    // a spawn of it with `run` as the first argument launches another program instead
+    // a spawn of it whose first argument is one of the loader's commands (RELAX_SELF_EXEC_COMMANDS:
+    // `run`, `check`, `test`, ...) runs that command instead
     if let Ok(exe) = std::env::current_exe().and_then(|e| e.canonicalize()) {
         let mut pre: Vec<String> = crate::os::proc::args_bytes().iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
         if let Some(d) = pre.iter().position(|a| a == "--") {
@@ -1285,6 +1286,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
         pre.push("--".to_string());
         crate::progenv::set_run_fact("RELAX_SELF_EXEC", pre.join("\u{1f}"));
+        crate::progenv::set_run_fact("RELAX_SELF_EXEC_COMMANDS", crate::loader_commands().join("\u{1f}"));
         prog_args[0] = exe.display().to_string().into_bytes();
     }
     // started through an integration test's CARGO_BIN_EXE_<bin> (unitgraph.rs writes that wrapper):

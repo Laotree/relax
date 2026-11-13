@@ -46,8 +46,10 @@ pub const EDITS: &[u8] = b"RELAX_EDITS";
 pub const MOUNT: [&[u8]; 3] = [WORKSPACE, VFS, EDITS];
 /// Run facts: what the host says of this run, for this run again (a self-exec child) and nothing
 /// else; the mount also for a child in this process's folder or in the mount. The self-exec
-/// command line (Relax std's spawn of this program) and whether the run added its `--silent`.
-pub const RUN_FACTS: [&[u8]; 5] = [b"RELAX_SELF_EXEC", b"RELAX_SELF_EXEC_SILENT_ADDED", WORKSPACE, VFS, EDITS];
+/// command line (Relax std's spawn of this program), whether the run added its `--silent`, and the
+/// loader's commands (a spawn of the loader starting with one runs it, not this program again).
+pub const RUN_FACTS: [&[u8]; 6] =
+    [b"RELAX_SELF_EXEC", b"RELAX_SELF_EXEC_SILENT_ADDED", b"RELAX_SELF_EXEC_COMMANDS", WORKSPACE, VFS, EDITS];
 
 pub fn run_fact(name: &[u8]) -> bool {
     RUN_FACTS.iter().any(|n| same_name(n, name))

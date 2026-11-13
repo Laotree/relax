@@ -476,13 +476,12 @@ impl Command {
 
     /// Under `makepad run` the program's executable is Relax itself: spawning it runs this
     /// program again (Relax's command line up to `--`, then the new arguments). A spawn of the
-    /// loader whose first argument is `run` or `app` is a launcher starting another program
-    /// through it (`$RELAX_LOADER run [flags] <package> ...`, `... app <id>`: a launch
-    /// record), and one whose first argument is `export` asks the loader for a source tree (the
-    /// runner's Install natively): those run as written.
+    /// loader whose first argument is one of its commands (`$RELAX_LOADER run [flags] <package>`,
+    /// `... app <id>`, `... export`, `... check <dir>`, `... test`: process.rs `loader_command`)
+    /// runs that command as written.
     fn self_exec_args(&self) -> Option<Vec<OsString>> {
         let pre = crate::env::host_var_os("RELAX_SELF_EXEC")?.into_string().ok()?;
-        if self.args.get(1).is_some_and(|a| matches!(a.as_encoded_bytes(), b"run" | b"app" | b"export")) {
+        if self.args.get(1).is_some_and(|a| super::loader_command(a)) {
             return None;
         }
         // inside a build script (RELAX_AS_RUSTC): its spawns of this executable are RUSTC
