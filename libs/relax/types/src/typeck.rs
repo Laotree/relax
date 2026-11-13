@@ -7401,10 +7401,16 @@ impl<'a> Fcx<'a> {
             }
         }
         let item_indices = self.tcx.generic_indices_of(self.prog, item);
+        // The method's own type and const parameters (their positions in the full args) with the
+        // argument the call writes for them, if any: rustc's confirm instantiates them from the
+        // turbofish or with fresh variables, and builds the user type annotation from those.
+        let mut own_user = Vec::new();
         for i in 0..own as usize {
-            let arg = pick.args[item_indices.types_consts[gargs.len()] as usize];
+            let position = item_indices.types_consts[gargs.len()] as usize;
+            let arg = pick.args[position];
             let ty = match arg { crate::consts::GenericArg::Type(t) => t, crate::consts::GenericArg::Const(c) => self.tcx.tys.intern(TyKind::Const(c)), _ => unreachable!() };
             if let Some(&explicit) = tf.get(i) { self.eq(ty, explicit); }
+            own_user.push((position, tf.get(i).copied()));
             gargs.push(ty);
         }
         let autoref = self.forced_autoref.take().unwrap_or(match sig.self_kind { 2 => 1, 3 => 2, _ => 0 });
@@ -7419,7 +7425,7 @@ impl<'a> Fcx<'a> {
         // lifetimes are fresh.
         let mut full = self.infer_item_args(item, &gargs);
         full[..impl_full.len()].copy_from_slice(&impl_full);
-        self.write_method_user_type(e.0, item, &full);
+        self.write_method_user_type(e.0, item, &full, &own_user);
         let (ps, ret) = self.instantiate_call_signature(item, &full, &sig);
         // method/confirm.rs:150-160 (add_obligations): registered once with the
         // instantiated args, before the arguments are checked.
@@ -7781,7 +7787,11 @@ impl<'a> Fcx<'a> {
                 if matches!(known, crate::consts::GenericArg::Lifetime(_)) { *arg = known; }
             }
         }
-        self.write_method_user_type(e.0, item, &full);
+        // the method's own type and const parameters with their written arguments (see
+        // check_method_sym)
+        let own_user: Vec<(usize, Option<TyId>)> = self.tcx.generic_indices_of(self.prog, item).types_consts.iter()
+            .skip(sig.n_parent_generics as usize).enumerate().map(|(i, &position)| (position as usize, tf.get(i).copied())).collect();
+        self.write_method_user_type(e.0, item, &full, &own_user);
         let (ps, r) = self.instantiate_call_signature(item, &full, &sig);
         // A probe only establishes that the trait may hold, even when it found
         // one impl. Confirm the pick by retaining its trait obligation (nightly

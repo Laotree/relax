@@ -107,7 +107,12 @@ impl Fcx<'_> {
 
     /// method/confirm.rs:496-536. The receiver's parameters are inferred, not written: replace the
     /// parent prefix with fresh variables (under a probe) and keep the method's own arguments.
-    pub(super) fn write_method_user_type(&mut self, call: u32, def: DefId, args: &[GenericArg]) {
+    /// `own` lists the method's own type and const parameters (their positions in `args`) with the
+    /// argument the call writes for each: rustc's confirm instantiates them from the turbofish or
+    /// with fresh variables before it builds the annotation, so the annotation holds the written
+    /// type, or a fresh variable, not what method probing has already inferred for them
+    /// (`arr.concat()` must not pin `Item` to the type of the first element of `arr`).
+    pub(super) fn write_method_user_type(&mut self, call: u32, def: DefId, args: &[GenericArg], own: &[(usize, Option<TyId>)]) {
         let parent = self.tcx.generic_indices_of(self.prog, self.prog.def(def).parent);
         let parent_count = parent.lifetimes.len() + parent.types_consts.len();
         // `!args.is_empty() && !generics.is_own_empty()`
@@ -120,6 +125,19 @@ impl Fcx<'_> {
                 GenericArg::Lifetime(_) => GenericArg::Lifetime(self.infcx.next_region_var()),
                 GenericArg::Const(_) => GenericArg::Const(self.infcx.next_const_var()),
             };
+        }
+        for &(position, written) in own {
+            if let Some(arg) = user_args.get_mut(position) {
+                *arg = match (*arg, written) {
+                    (GenericArg::Const(_), Some(ty)) => match *self.tcx.tys.kind(ty) {
+                        TyKind::Const(c) => GenericArg::Const(c),
+                        _ => GenericArg::Const(self.infcx.next_const_var()),
+                    },
+                    (_, Some(ty)) => GenericArg::Type(ty),
+                    (GenericArg::Const(_), None) => GenericArg::Const(self.infcx.next_const_var()),
+                    (_, None) => GenericArg::Type(self.infcx.next_ty_var()),
+                };
+            }
         }
         let user = UserType::new(UserTypeKind::TypeOf(def, UserArgs { args: user_args, user_self_ty: None }));
         let canonical = canonicalize_user_type(&self.infcx, &user);
