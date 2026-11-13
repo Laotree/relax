@@ -192,6 +192,10 @@ pub struct Parser<'a> {
     foreign_abi: Option<Option<Ident>>,
     /// inside a cfg'd-out item (parse_cfg_out): nothing is generated
     cfg_out: u32,
+    /// the file's literal errors rustc reports where it lowers a literal (a suffix, an integer's
+    /// size: lexer validate_file), by position; a cfg-stripped construct drops those inside it
+    /// (lift_lit_errs), and the first one left is the file's error once it parsed (relax issue 125)
+    lit_errs: Vec<(u32, String)>,
     /// the statement macro whose expansion is being parsed was called with a `;` after it: its
     /// last statement gets that `;` (rustc add_trailing_semicolon), so it is not a trailing macro
     expansion_semi: bool,
@@ -278,6 +282,7 @@ impl<'a> Parser<'a> {
             include_as_expr: false,
             foreign_abi: None,
             cfg_out: 0,
+            lit_errs: Vec::new(),
             expansion_semi: false,
             list_elem_at: (u32::MAX, ELEM_LIST),
             expn_attrs_ungated: false,
@@ -649,6 +654,9 @@ impl<'a> Parser<'a> {
                         // just as when delim_tt scanned a second time after it.
                         return match mismatched {
                             Some(pos) => BodyOutline::Mismatched(pos),
+                            // (a literal error in it is reported unless a cfg-stripped part of
+                            // it holds it: that takes its parse)
+                            None if self.lit_err_in(self.lo(), self.toks.at(i).lo) => BodyOutline::Eager(8),
                             None => BodyOutline::Deferred(TokRange { lo: self.pos as u32 + 1, hi: i as u32 }),
                         };
                     }
@@ -1301,6 +1309,7 @@ impl<'a> Parser<'a> {
         // config.rs): nothing in it is parsed or expanded
         if !self.cfg_active(&attrs) {
             self.ast.root_attrs = attrs.into();
+            self.lit_errs.clear();
             return Ok(());
         }
         self.ast.root_attrs = attrs.into();
@@ -2290,7 +2299,9 @@ impl<'a> Parser<'a> {
         let flags = (self.next_scope, self.no_prelude, self.in_assoc, self.in_trait, self.stmt_ctx, self.range_dots, self.include_as_expr, self.foreign_abi, self.cfg_out, self.expansion_semi, self.exp_depth, self.list_elem_at, self.expn_attrs_ungated);
         let (pending_inner, cfg_select_rest) = (self.pending_inner.clone(), self.cfg_select_rest.borrow().clone());
         let macro_scope_miss = self.macro_scope_miss.get();
+        let lit_errs = (!self.lit_errs.is_empty()).then(|| self.lit_errs.clone());
         let r = f(self);
+        if let Some(v) = lit_errs { self.lit_errs = v; }
         self.pos = pos;
         // the `>>` / `>=` it split are whole again
         while self.tok_undo.len() > undo {
@@ -2331,7 +2342,7 @@ impl<'a> Parser<'a> {
             pm_editions, tok_undo, frag_groups, empty_vis, ty_frags, path_frags, meta_frags, block_frags, stmt_frags, synth_parens,
             mod_stack, scope_stack, no_prelude, range_dots, next_scope, rule_scopes, foreign_rules, interp, extra_items,
             extra_assoc_items, pending_inner, in_assoc, in_trait, stmt_ctx, cfg_select_rest,
-            include_as_expr, foreign_abi, cfg_out, expansion_semi, list_elem_at, expn_attrs_ungated, pending_shape, macro_scope_miss,
+            include_as_expr, foreign_abi, cfg_out, lit_errs, expansion_semi, list_elem_at, expn_attrs_ungated, pending_shape, macro_scope_miss,
         } = self;
         fn sorted<T: Ord>(mut v: Vec<T>) -> Vec<T> { v.sort(); v }
         let toks: Vec<Tok> = (0..toks.len()).map(|i| toks.at(i)).collect();
@@ -2344,7 +2355,7 @@ impl<'a> Parser<'a> {
             tables {tables:?} token_input {token_input} exp_depth {exp_depth} tok_undo {tok_undo:?} frags {frags:?} interp {interp:?}\n\
             mods {mod_stack:?} scopes {scope_stack:?} {next_scope} {rule_scopes:?} no_prelude {no_prelude} range_dots {range_dots}\n\
             items {item_start:?} {extra_items:?} {extra_assoc_items:?} {pending_inner:?} {in_assoc} {in_trait} {foreign_abi:?}\n\
-            stmt {stmt_ctx} {include_as_expr} {expansion_semi} {list_elem_at:?} {expn_attrs_ungated} cfg {cfg_out} {:?} shapes {shapes:?} macro_scope_miss {}\nast {ast:?}",
+            stmt {stmt_ctx} {include_as_expr} {expansion_semi} {list_elem_at:?} {expn_attrs_ungated} cfg {cfg_out} {:?} {lit_errs:?} shapes {shapes:?} macro_scope_miss {}\nast {ast:?}",
             macros.is_some(), cfg_select_rest.borrow(), macro_scope_miss.get())
     }
 
@@ -2705,14 +2716,73 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Where a cfg-stripped construct that starts at the current token begins: the attributes and
+    /// doc comments right before it (`#[..]`, `#![..]`) go with it.
+    fn stripped_from(&self) -> u32 {
+        if self.lit_errs.is_empty() {
+            return 0;
+        }
+        let mut i = self.pos;
+        loop {
+            if i > 0 && self.toks.kind_at(i - 1) == T::DocComment {
+                i -= 1;
+                continue;
+            }
+            if i > 0 && self.toks.kind_at(i - 1) == T::CloseBracket {
+                let mut depth = 0i32;
+                let mut j = i - 1;
+                let open = loop {
+                    match self.toks.kind_at(j) {
+                        T::CloseParen | T::CloseBracket | T::CloseBrace => depth += 1,
+                        T::OpenParen | T::OpenBracket | T::OpenBrace => depth -= 1,
+                        _ => {}
+                    }
+                    if depth == 0 { break Some(j); }
+                    if j == 0 { break None; }
+                    j -= 1;
+                };
+                if let Some(j) = open {
+                    if j >= 1 && self.toks.kind_at(j - 1) == T::Pound {
+                        i = j - 1;
+                        continue;
+                    }
+                    if j >= 2 && self.toks.kind_at(j - 1) == T::Not && self.toks.kind_at(j - 2) == T::Pound {
+                        i = j - 2;
+                        continue;
+                    }
+                }
+            }
+            return self.toks.at(i).lo;
+        }
+    }
+
+    /// A cfg-stripped construct, from `from` to the current token, is never lowered: rustc reports
+    /// none of its literals' suffix or size errors (lit_errs; `#[cfg(any())] compile_error!("a "b"
+    /// c")` holds the string `"a "b` with the suffix `b`, relax issue 125).
+    fn lift_lit_errs(&mut self, from: u32) {
+        if self.lit_errs.is_empty() {
+            return;
+        }
+        let to = self.lo();
+        self.lit_errs.retain(|e| e.0 < from || e.0 >= to);
+    }
+
+    /// Whether a literal error of lit_errs stands in [lo, hi).
+    fn lit_err_in(&self, lo: u32, hi: u32) -> bool {
+        let k = self.lit_errs.partition_point(|e| e.0 < lo);
+        self.lit_errs.get(k).is_some_and(|e| e.0 < hi)
+    }
+
     fn with_cfg_active<R>(&mut self, active: bool, pend0: usize, f: impl FnOnce(&mut Self) -> PResult<R>) -> PResult<R> {
         if active {
             return f(self);
         }
+        let from = self.stripped_from();
         let macros = self.macros.take();
         self.cfg_out += 1;
         let r = f(self);
         self.cfg_out -= 1;
+        self.lift_lit_errs(from);
         self.macros = macros;
         self.pending_shape.truncate(pend0);
         r
@@ -2723,10 +2793,12 @@ impl<'a> Parser<'a> {
     fn parse_stripped<R>(&mut self, parse: impl FnOnce(&mut Self) -> PResult<R>) -> PResult<R> {
         let lens = (self.ast.exprs.len(), self.ast.pats.len(), self.ast.tys.len(), self.ast.items.len(), self.ast.blocks.len(), self.ast.mac_args.len(), self.extra_items.len());
         let ends = self.ast.ends();
+        let from = self.stripped_from();
         let macros = self.macros.take();
         self.cfg_out += 1;
         let r = parse(self);
         self.cfg_out -= 1;
+        self.lift_lit_errs(from);
         self.macros = macros;
         self.ast.exprs.truncate(lens.0);
         self.ast.pats.truncate(lens.1);
@@ -3108,6 +3180,7 @@ impl<'a> Parser<'a> {
                     let mut inner = Vec::new();
                     self.inner_attrs(&mut inner)?;
                     let active = self.cfg_active(&inner);
+                    let from = self.stripped_from();
                     let macros = if !active {
                         self.cfg_out += 1;
                         self.macros.take()
@@ -3132,6 +3205,7 @@ impl<'a> Parser<'a> {
                     self.mod_stack.pop();
                     if !active {
                         self.cfg_out -= 1;
+                        self.lift_lit_errs(from);
                         self.macros = macros;
                     }
                     let items = items?;
@@ -3336,7 +3410,8 @@ impl<'a> Parser<'a> {
         let mut lazy_body = None;
         let body = if self.eat(T::Semi) {
             None
-        } else if self.lazy_bodies && self.kind() == T::OpenBrace {
+        } else if self.lazy_bodies && self.kind() == T::OpenBrace && !self.lit_err_in(self.lo(), u32::MAX) {
+            // (with a literal error ahead the bodies parse: a cfg-stripped part of one may hold it)
             let (_, r) = self.delim_tt()?;
             lazy_body = Some(r);
             None
@@ -3369,6 +3444,7 @@ impl<'a> Parser<'a> {
                     4 => "parse-body-array-length",
                     5 => "parse-body-fragment",
                     6 => "parse-body-other-macro",
+                    8 => "parse-body-literal-error",
                     _ => "parse-body-no-scope",
                 };
                 let _profile = crate::load_profile::span(profile, phase, self.bctx.as_ref().map_or("", |c| c.path.as_str()));
@@ -4208,8 +4284,8 @@ impl<'a> Parser<'a> {
             _ => return self.err("expected literal"),
         };
         // a literal of an expansion was not cooked by the file's token validation (it was a macro
-        // argument): rustc reports its suffix when the parser consumes it
-        if self.exp_depth > 0 {
+        // argument): rustc reports its suffix where it lowers it, which cfg-stripped code is not
+        if self.exp_depth > 0 && self.cfg_out == 0 {
             let t = self.tok();
             let cooked = match k {
                 LitKind::Int | LitKind::Float => crate::lexer::validate_number(self.tok_text(t), k == LitKind::Float),
@@ -5976,10 +6052,14 @@ pub fn parse_source<'a>(sess: &'a std::sync::Arc<crate::Session>, src: &'a [u8],
 pub fn parse_source_mode<'a>(sess: &'a std::sync::Arc<crate::Session>, src: &'a [u8], edition: u16, lazy: bool) -> Result<Parser<'a>, (u32, String)> {
     let mut toks = Vec::with_capacity(src.len() / 4);
     crate::lexer::lex(src, edition, &mut toks).map_err(|e| (e.pos, e.msg.to_string()))?;
-    crate::lexer::validate_file(src, &toks, edition).map_err(|e| (e.pos, e.msg.to_string()))?;
+    let lowers = crate::lexer::validate_file(src, &toks, edition).map_err(|e| (e.pos, e.msg.to_string()))?;
     let mut p = Parser::new(sess, src, toks, edition);
+    p.lit_errs = lowers.into_iter().map(|e| (e.pos, e.msg.into_owned())).collect();
     p.lazy_bodies = lazy;
     p.parse_file().map_err(|e| (e.pos, e.msg))?;
+    if let Some((pos, msg)) = p.lit_errs.first() {
+        return Err((*pos, msg.clone()));
+    }
     Ok(p)
 }
 
@@ -6876,10 +6956,11 @@ pub(crate) fn parse_owned_input(sess: &std::sync::Arc<crate::Session>, mut src: 
                 toks
             }
         }};
-        if !token_input {
-            crate::lexer::validate_file(&src, &toks, edition).map_err(|e| (SourceSpan { file: 0, lo: e.pos, hi: e.pos }, e.msg.to_string()))?;
-        }
+        let lowers = if token_input { Vec::new() } else {
+            crate::lexer::validate_file(&src, &toks, edition).map_err(|e| (SourceSpan { file: 0, lo: e.pos, hi: e.pos }, e.msg.to_string()))?
+        };
         let mut p = Parser::new(sess, &src, toks, edition);
+        p.lit_errs = lowers.into_iter().map(|e| (e.pos, e.msg.into_owned())).collect();
         if let Some(input) = input {
             p.ext = input.text.into_bytes().into();
             p.toks = input.toks.into_iter().map(|t| Tok { kind: t.kind, lo: t.lo + src_len, hi: t.hi + src_len }).collect::<Vec<_>>().into();
@@ -6916,6 +6997,9 @@ pub(crate) fn parse_owned_input(sess: &std::sync::Arc<crate::Session>, mut src: 
             }
             return Err((SourceSpan { file: 0, lo: pos, hi: pos }, e.msg));
         }
+        if let Some(&(pos, ref msg)) = p.lit_errs.first() {
+            return Err((SourceSpan { file: 0, lo: pos, hi: pos }, msg.clone()));
+        }
         let s2_fmt = p.macros.as_ref().map_or(false, |m| m.table.s2_fmt);
         let skipped = p.ast.items.iter().any(|it| matches!(&it.kind, ItemKind::Fn(sig, body, _) if body.is_none() && p.ast.fn_sig(*sig).lazy_body.is_some()));
         let lazy = match lazy_ctx {
@@ -6933,13 +7017,13 @@ pub(crate) fn parse_owned_input(sess: &std::sync::Arc<crate::Session>, mut src: 
 
 /// RELAX_LAZY_STATS=1 (measurement): per fn body parsed, whether a lazy parse could skip it;
 /// [n, arena bytes, nested bytes] for skippable bodies, then for the others
-pub static LAZY_STATS: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+pub static LAZY_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
 /// RELAX_LAZY_STATS: the macros that kept bodies eager (`other macro`), by name
 pub static LAZY_MACROS: relax_session::sync::Mutex<std::collections::BTreeMap<String, u64>> = relax_session::sync::Mutex::new(std::collections::BTreeMap::new());
 /// RELAX_LAZY_STATS: what made a file's skipped bodies parse (type-check origin, thread)
 pub static LAZY_WHY_PARSED: relax_session::sync::Mutex<std::collections::BTreeMap<String, u64>> = relax_session::sync::Mutex::new(std::collections::BTreeMap::new());
 /// why a body is parsed at load (Parser::body_outline)
-pub const LAZY_WHY: [&str; 8] = ["skippable", "macro output", "item inside", "macro_rules call", "array length", "fragment", "other macro", "no macro scope"];
+pub const LAZY_WHY: [&str; 9] = ["skippable", "macro output", "item inside", "macro_rules call", "array length", "fragment", "other macro", "no macro scope", "literal error"];
 
 fn lazy_stats_on() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -7214,7 +7298,7 @@ mod diagnostic_tests {
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
-    reset(&LAZY_STATS, [const { std::sync::atomic::AtomicU64::new(0) }; 16]);
+    reset(&LAZY_STATS, [const { std::sync::atomic::AtomicU64::new(0) }; 18]);
     reset(&LAZY_MACROS, relax_session::sync::Mutex::new(std::collections::BTreeMap::new()));
     reset(&LAZY_WHY_PARSED, relax_session::sync::Mutex::new(std::collections::BTreeMap::new()));
     reset(&LAZY_AUTO, std::sync::atomic::AtomicBool::new(false));
