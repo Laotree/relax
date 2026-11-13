@@ -192,7 +192,7 @@ pub fn jit(cmd: &str, sub: &str) -> Option<&'static str> {
         ("mem", _) => "",
         ("diff", _) => params!("n": "integer"),
         ("heap", "start") => params!("host": "integer", "life": "integer", "rate": "integer", "ttl_s": "integer"),
-        ("heap", "top") => params!("host": "integer", "by": "string", "n": "integer", "depth": "integer", "zone": "string", "group": "string"),
+        ("heap", "top") => params!("host": "integer", "by": "string", "n": "integer", "depth": "integer", "zone": "string", "group": "string", "tag": "string"),
         ("heap", "frame" | "rate") => params!("host": "integer", "s": "number", "n": "integer"),
         ("heap", "life") => params!("host": "integer", "n": "integer", "ms": "integer", "file": "string"),
         ("heap", "diff") => params!("host": "integer", "n": "integer", "depth": "integer"),
