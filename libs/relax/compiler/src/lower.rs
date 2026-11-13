@@ -10854,8 +10854,12 @@ impl<'a> Lcx<'a> {
                 let once = matches!(self.u.tcx.lang_items.by_def.get(&selected.trait_def), Some(LangItem::FnOnce | LangItem::AsyncFnOnce));
                 let mutable = matches!(self.u.tcx.lang_items.by_def.get(&selected.trait_def), Some(LangItem::FnMut | LangItem::AsyncFnMut));
                 let (recv, recv_ty) = if once && selected.derefs == 0 { (self.lower_expr(f), ft) } else {
+                    // an FnMut callee is borrowed mutably: its overloaded derefs and indices are
+                    // `deref_mut` / `index_mut` (typeck place_op.rs made them so), a Fn one's stay shared
+                    let saved = std::mem::replace(&mut self.want_mut, mutable);
                     let (mut place, mut pt) = self.lower_place(f);
                     for k in 0..selected.derefs { (place, pt) = self.deref_place(e.0, k, place, pt); }
+                    self.want_mut = saved;
                     if once { (self.read_place(&place, pt), pt) } else {
                         let receiver = if self.unsized_ty(pt) {
                             match place { Place::Regs(regs) => Val::L(regs), _ => panic!("unsized callable metadata") }
