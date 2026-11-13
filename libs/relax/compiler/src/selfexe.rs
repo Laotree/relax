@@ -1,16 +1,9 @@
-//! The program's own executable under the JIT: a hard link of the loader in this run's own folder,
-//! `<run dir>/exe/<pid>/<name>` (`<name>.exe` on Windows), which the program's argv[0] and
-//! std::env::current_exe() name. A spawn of that path runs this program again (std
-//! process_unix.rs / process_windows.rs `self_exec_args`: RELAX_SELF_EXEC starts with it); a spawn
-//! of the loader by any other name (RELAX_LOADER, an installed `makepad`) runs the loader's command
-//! line as written, whatever its first word. A hard link, not a symlink or a copy: canonicalize
-//! keeps its name, the OS runs it as the loader (the same file, so the same code signature on
-//! macOS), and it takes no space beyond a directory entry while the loader file exists.
-//!
-//! The folder also holds the run's command line (`LINE`, RELAX_SELF_EXEC's value), so a launch of
-//! the link that did not come through Relax std's spawn (`sh -c "exec $EXE ..."`, a C library's
-//! exec) runs this program again too: the loader started by that path finds the line beside
-//! itself (`relaunched`), as std's spawn would have put it before the arguments.
+//! The program's executable under the JIT: a hard link of the loader in this run's own folder,
+//! `<run dir>/exe/<pid>/<name>` (tests in `deps/`, `.exe` on Windows). argv[0] and current_exe()
+//! name it. Its `.relax-exec` file holds the real loader's command line: an external launcher
+//! can run it without std's self-exec rewrite. A spawn of RELAX_LOADER still runs the loader's
+//! command line as written. Hard links survive canonicalize, keep the loader's code signature
+//! on macOS, and take no space beyond a directory entry while the loader file exists.
 //!
 //! The folder goes when the run exits (os::proc::exit); a run that did not get there (killed)
 //! leaves it, and the next run's `link` removes the folders of processes that are gone. They
@@ -20,61 +13,91 @@ use std::sync::OnceLock;
 
 static OWN_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+pub enum Kind { Program, Test }
+
+pub struct Executable {
+    pub program: PathBuf,
+    pub loader: PathBuf,
+}
+
 /// This process's link to `loader`, named `name` (a package or binary name), made once; the
 /// reason when the run dir's file system cannot hold it (another volume than the loader's).
-pub fn link(loader: &Path, name: &str) -> Result<PathBuf, String> {
+pub fn link(loader: &Path, name: &str, kind: Kind) -> Result<Executable, String> {
     let root = crate::dirs::relax_dir().join("exe");
     sweep(&root);
     let dir = root.join(std::process::id().to_string());
-    // an exec of the program's own executable is this process going on (its pid) in a new image,
-    // which runs from the link in this folder: that link is its own executable still (removing
-    // the folder took the file it runs from, the new link found no loader, and a spawn of
-    // current_exe() failed: not found, 11-13)
-    if dir.canonicalize().is_ok_and(|d| loader.starts_with(d)) {
-        let _ = OWN_DIR.set(dir);
-        return Ok(loader.to_path_buf());
+    let raw = dir.join(format!(".loader{}", std::env::consts::EXE_SUFFIX));
+    let reexec = raw.canonicalize().ok().as_deref() == Some(loader);
+    if reexec {
+        // exec keeps the pid: this loader's directory is still live.
+        (|| -> std::io::Result<()> {
+            for entry in std::fs::read_dir(&dir)? {
+                let entry = entry?;
+                if entry.path() == raw { continue; }
+                if entry.file_type()?.is_dir() { std::fs::remove_dir_all(entry.path())?; }
+                else { std::fs::remove_file(entry.path())?; }
+            }
+            Ok(())
+        })().map_err(|e| format!("{}: {e}", dir.display()))?;
+    } else {
+        // a folder under this pid is a gone process's (pids are reused)
+        let _ = std::fs::remove_dir_all(&dir);
     }
-    // a folder under this pid is a gone process's (pids are reused)
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let _ = OWN_DIR.set(dir.clone());
+    let artifacts = match kind { Kind::Program => dir.clone(), Kind::Test => dir.join("deps") };
+    std::fs::create_dir_all(&artifacts).map_err(|e| format!("{}: {e}", artifacts.display()))?;
     let name: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect();
     let file = if cfg!(windows) { format!("{name}.exe") } else { name };
-    let link = dir.join(file);
+    let link = artifacts.join(file);
     std::fs::hard_link(loader, &link).map_err(|e| format!("hard link {} of {}: {e}", link.display(), loader.display()))?;
-    link.canonicalize().map_err(|e| format!("{}: {e}", link.display()))
+    if !reexec {
+        std::fs::hard_link(loader, &raw).map_err(|e| format!("hard link {} of {}: {e}", raw.display(), loader.display()))?;
+    }
+    let executable = Executable {
+        program: link.canonicalize().map_err(|e| format!("{}: {e}", link.display()))?,
+        loader: raw.canonicalize().map_err(|e| format!("{}: {e}", raw.display()))?,
+    };
+    let _ = OWN_DIR.set(dir);
+    Ok(executable)
 }
 
-/// The command line beside the link: a name no link has (`link` keeps a name's letters, digits,
-/// `-`, `_` and `.`).
-const LINE: &str = "+self-exec";
-
-/// Writes this run's command line (RELAX_SELF_EXEC's words, up to and with `--`) beside its link.
-pub fn set_line(words: &[String]) -> Result<(), String> {
-    let dir = OWN_DIR.get().ok_or("no link was made")?;
-    std::fs::write(dir.join(LINE), words.join("\u{1f}")).map_err(|e| format!("{}: {e}", dir.join(LINE).display()))
+fn command_file(exe: &Path) -> PathBuf {
+    let mut name = exe.as_os_str().to_os_string();
+    name.push(".relax-exec");
+    PathBuf::from(name)
 }
 
-/// A launch of a run's link whose arguments do not start with the run's command line (Relax std's
-/// spawn and exec put it after argv[0], an exec without the `--silent` at its index 2): `args`
-/// with that line after argv[0], as std's spawn gives them. None for any other launch of the
-/// loader. (The arguments, not RELAX_SELF_EXEC, tell: a C library's exec passes this process's
-/// own environment, which names it, with the program's arguments alone.)
-pub fn relaunched(args: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
-    let exe = std::env::current_exe().ok()?;
-    let line = std::fs::read(exe.parent()?.join(LINE)).ok()?;
-    let mut out: Vec<Vec<u8>> = line.split(|&b| b == 0x1f).map(<[u8]>::to_vec).collect();
-    let rest = args.get(1..).unwrap_or_default();
-    let mut unsilenced = out[1..].to_vec();
-    if unsilenced.get(1).is_some_and(|w| w == b"--silent") {
-        unsilenced.remove(1);
+/// The real loader and its command line, before the program's arguments. External launchers
+/// cannot use std's self-exec rewrite, so the executable carries the same replay on disk.
+pub fn save(exe: &Path, args: &[String]) -> std::io::Result<()> {
+    std::fs::write(command_file(exe), args.join("\0"))
+}
+
+/// A hard link's replay, if this is a program executable rather than the loader itself.
+pub fn command(exe: &Path) -> std::io::Result<Option<Vec<String>>> {
+    match std::fs::read_to_string(command_file(exe)) {
+        Ok(text) => Ok(Some(text.split('\0').map(str::to_string).collect())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
-    if rest.starts_with(&out[1..]) || rest.starts_with(&unsilenced) {
-        return None;
+}
+
+/// Cargo's package binaries beside deps/, for tests that discover them from current_exe().
+pub fn bins(env: &[(String, String)], package_dir: &str, package: &str) -> std::io::Result<()> {
+    let Some(dir) = OWN_DIR.get() else { return Ok(()) };
+    let loader = dir.join(format!(".loader{}", std::env::consts::EXE_SUFFIX));
+    let run_dir = std::path::absolute(crate::dirs::relax_dir())?;
+    for (key, _) in env {
+        let Some(name) = key.strip_prefix("CARGO_BIN_EXE_") else { continue };
+        let exe = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        std::fs::hard_link(&loader, &exe)?;
+        save(&exe, &[
+            loader.display().to_string(), "run".into(), "--quiet".into(), "--silent".into(),
+            "--no-live".into(), "--run-dir".into(), run_dir.display().to_string(),
+            "--workspace-dir".into(), package_dir.into(), package.into(),
+            "--bin".into(), name.into(), "--".into(),
+        ])?;
     }
-    out[0] = args.first()?.clone();
-    out.extend(rest.iter().cloned());
-    Some(out)
+    Ok(())
 }
 
 /// Removes this process's folder (os::proc::exit). On Windows the link of a re-run that still

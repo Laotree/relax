@@ -1249,12 +1249,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         let name = cargo_flags.iter().position(|f| f == "--bin").and_then(|j| cargo_flags.get(j + 1)).cloned()
             .or_else(|| cargo_flags.iter().find_map(|f| f.strip_prefix("--bin=").map(str::to_string)))
             .unwrap_or_else(|| std::path::Path::new(&package).file_stem().map_or_else(|| package.clone(), |s| s.to_string_lossy().into_owned()));
-        crate::selfexe::link(&exe, &name)
+        let kind = if harness || plain_test { crate::selfexe::Kind::Test } else { crate::selfexe::Kind::Program };
+        crate::selfexe::link(&exe, &name, kind)
     }));
     if let Some(Err(why)) = &own {
         eprintln!("relax run: the program's own executable could not be made ({why}): a spawn of it runs the loader, not the program");
     }
-    if let Some(Ok(exe)) = own {
+    if let Some(Ok(crate::selfexe::Executable { program: exe, loader })) = own {
         let mut pre: Vec<String> = crate::os::proc::args_bytes().iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
         if let Some(d) = pre.iter().position(|a| a == "--") {
             pre.truncate(d);
@@ -1297,10 +1298,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             pre.insert(at, "--self-exec".to_string());
         }
         pre.push("--".to_string());
-        // (a launch of the link by another way than std's spawn finds the line there)
-        if let Err(why) = crate::selfexe::set_line(&pre) {
-            eprintln!("relax run: the program's command line could not be kept beside its executable ({why}): a launch of it by a shell runs the loader");
+        let mut replay = pre.clone();
+        replay[0] = loader.display().to_string();
+        if let Err(e) = crate::selfexe::save(&exe, &replay) {
+            eprintln!("relax run: writing the program's executable command: {e}");
+            return 1;
         }
+        crate::progenv::set_run_fact("RELAX_SELF_LOADER", loader.display().to_string());
         crate::progenv::set_run_fact("RELAX_SELF_EXEC", pre.join("\u{1f}"));
         prog_args[0] = exe.display().to_string().into_bytes();
     }
@@ -1381,6 +1385,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // environment from the run that started it (cargo's build-script variables of its package):
     // its own graph's package is the script's.
     let program_env = if std::env::var_os("RELAX_SCRIPT_DEPTH").is_some() { Vec::new() } else { program_env(&g, subject_ci) };
+    if let Err(e) = crate::selfexe::bins(&program_env, &g.pkg[subject_ci].0, &g.pkg[subject_ci].1) {
+        eprintln!("relax run: making the package's executables beside the test artifacts: {e}");
+        return 1;
+    }
     let program_dir = (harness || plain_test).then(|| g.pkg[subject_ci].0.clone()).filter(|d| !crate::vfs::in_store(d)).map(|d| crate::vfs::on_disk(&d).into_owned());
     let mut also_graph = Vec::new();
     for name in &also {

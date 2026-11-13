@@ -384,6 +384,8 @@ enum Arg {
     Raw(OsString),
 }
 
+enum SelfExecutable { Link, Copy }
+
 impl Arg {
     fn as_os_str(&self) -> &OsStr {
         match self {
@@ -572,8 +574,8 @@ impl Command {
     /// (Relax's command line up to `--`, then the new arguments), whatever they are. A spawn of
     /// the loader by its own name (`$RELAX_LOADER run <package>`, `... test`) is not this path, and
     /// runs as written. `program` is the resolved executable (NUL-terminated UTF-16, with its
-    /// `.exe`); the result is the argument list after argv[0] to run instead of this command's.
-    fn self_exec_args(&self, program: &[u16]) -> Option<Vec<Arg>> {
+    /// `.exe`); the result is the argument list after argv[0] and whether this is the link or a copy.
+    fn self_exec_args(&self, program: &[u16]) -> Option<(Vec<Arg>, SelfExecutable)> {
         let pre = crate::env::host_var_os("RELAX_SELF_EXEC")?.into_string().ok()?;
         // inside a build script (RELAX_AS_RUSTC): its spawns of this executable are RUSTC
         // questions, answered as written (relax_as_rustc); re-running the script would recurse
@@ -587,9 +589,9 @@ impl Command {
         // the program's own executable, or a copy of it (makepad-cef re-execs the program from a
         // copy of its executable inside a synthetic app bundle): the copy runs this program. The
         // loader by another name has the same contents but is the same file as the link, not a copy.
-        if p.as_path() != exe && !(same_file_contents(p.as_path(), exe) && !same_file(p.as_path(), exe)) {
-            return None;
-        }
+        let kind = if p.as_path() == exe { SelfExecutable::Link }
+            else if same_file_contents(p.as_path(), exe) && !same_file(p.as_path(), exe) { SelfExecutable::Copy }
+            else { return None };
         let mut out: Vec<Arg> = Vec::new();
         for x in parts.iter().skip(1) {
             out.push(Arg::Regular(OsString::from(*x)));
@@ -597,7 +599,7 @@ impl Command {
         for a in &self.args {
             out.push(a.clone());
         }
-        Some(out)
+        Some((out, kind))
     }
 
     /// A child started in a virtual folder of a git run (Relax's VFS) cannot get it as its
@@ -629,13 +631,17 @@ impl Command {
         let child_paths = self.env.iter().find(|(k, _)| env_key_eq(k, OsStr::new("PATH"))).and_then(|(_, v)| v.as_deref());
         let program = resolve_exe(&self.program, child_paths)?;
         let self_exec = self.self_exec_args(&program);
+        let program = match &self_exec {
+            Some((_, SelfExecutable::Link)) => resolve_exe(&crate::env::host_var_os("RELAX_SELF_LOADER").ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "the program's loader"))?, child_paths)?,
+            Some((_, SelfExecutable::Copy)) | None => program,
+        };
         // the program again: what this process compiled goes to the disk cache first, so the new
         // process starts from it (Relax run.rs relax_self_spawn)
         if self_exec.is_some() {
             unsafe { __relax_self_spawn() };
         }
         let args: &[Arg] = match &self_exec {
-            Some(v) => v,
+            Some((v, _)) => v,
             None => &self.args,
         };
         let is_batch_file = if is_verbatim(&program) {

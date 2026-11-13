@@ -162,15 +162,35 @@ pub fn main(host: &'static Host) {
     // a self-exec child: the program values its parent passed, before anything reads the
     // environment (relax-base progenv.rs)
     relax_compiler::progenv::init();
-    // a run's own executable launched by a shell or a C library: that run's program again
-    if let Some(args) = relax_compiler::selfexe::relaunched(&relax_compiler::os::proc::args_bytes()) {
-        relax_compiler::os::proc::set_args(args);
-    }
+    replay_executable();
     set_host(host);
     relax_compiler::set_tool_name(help::command());
     warn_legacy_env();
     relax_compiler::wasm_export::startup();
     run(relax_compiler::os::proc::args_bytes())
+}
+
+fn replay_executable() {
+    let result = (|| -> std::io::Result<()> {
+        // Ordinary loader commands do not require executable discovery (for example without /proc).
+        let Some(exe) = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok()) else { return Ok(()) };
+        let Some(args) = relax_compiler::selfexe::command(&exe)? else { return Ok(()) };
+        let mut command = std::process::Command::new(&args[0]);
+        command.args(&args[1..]).args(std::env::args_os().skip(1));
+        command.env("RELAX_ARG0", std::env::args_os().next().unwrap_or_else(|| exe.into_os_string()));
+        command.env_remove("RELAX_SELF_EXEC").env_remove("RELAX_SELF_EXEC_SILENT_ADDED").env_remove("RELAX_SELF_LOADER");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            return Err(command.exec());
+        }
+        #[cfg(not(unix))]
+        std::process::exit(command.status()?.code().unwrap_or(1));
+    })();
+    if let Err(e) = result {
+        eprintln!("relax: replaying the program executable: {e}");
+        std::process::exit(1);
+    }
 }
 
 /// Warn about legacy environment names still carried in people's notes.

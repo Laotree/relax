@@ -54,7 +54,7 @@ pub const SHARE: &[u8] = b"RELAX_SHARE";
 /// else; the mount also for a child in this process's folder or in the mount. The self-exec
 /// command line (Relax std's spawn of this program; its first word is the program's own
 /// executable, relax-compiler selfexe.rs) and whether the run added its `--silent`.
-pub const RUN_FACTS: [&[u8]; 6] = [b"RELAX_SELF_EXEC", b"RELAX_SELF_EXEC_SILENT_ADDED", WORKSPACE, VFS, EDITS, SHARE];
+pub const RUN_FACTS: [&[u8]; 7] = [b"RELAX_SELF_EXEC", b"RELAX_SELF_EXEC_SILENT_ADDED", b"RELAX_SELF_LOADER", WORKSPACE, VFS, EDITS, SHARE];
 
 pub fn run_fact(name: &[u8]) -> bool {
     RUN_FACTS.iter().any(|n| same_name(n, name))

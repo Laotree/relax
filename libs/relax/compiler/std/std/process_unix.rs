@@ -494,7 +494,7 @@ impl Command {
             return None;
         }
         let mut out: Vec<OsString> = parts.iter().map(|x| OsString::from(*x)).collect();
-        out[0] = self.program.clone();
+        out[0] = crate::env::host_var_os("RELAX_SELF_LOADER")?;
         for a in self.args.iter().skip(1) {
             out.push(a.clone());
         }
