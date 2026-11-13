@@ -1582,7 +1582,7 @@ fn native_key_follows_the_resolved_closure_and_its_path_sources() {
     };
     let flags: Vec<String> = Vec::new();
     let relax_dir = dir.join("relax");
-    let req = Request { workspace: ws.to_str().unwrap(), package: "app", cargo_flags: &flags, relax_dir: relax_dir.to_str().unwrap(), triple: "x86_64-unknown-linux-gnu", resolvable: |names, _, _, _| vec![false; names.len()] };
+    let req = Request { workspace: ws.to_str().unwrap(), package: "app", cargo_flags: &flags, relax_dir: relax_dir.to_str().unwrap(), triple: "x86_64-unknown-linux-gnu", resolvable: |names, _, _, _| vec![false; names.len()], quiet: false };
     let key = |g: &Graph| plan(g, &[0], &req).key;
     let k = key(&graph("app", &["std"], &["a"]));
     assert_eq!(k, key(&graph("second", &["std"], &["a"])), "another package with the same native closure must share the build");
