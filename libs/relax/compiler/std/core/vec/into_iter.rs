@@ -114,13 +114,24 @@ impl<T> Default for IntoIter<T> {
 }
 
 unsafe impl<#[may_dangle] T> Drop for IntoIter<T> {
+    // alloc vec/into_iter.rs: the items left go as one slice (a panicking drop leaves the rest to
+    // the slice's drop, which goes on with them), and the buffer is freed by a guard, on unwind too
     fn drop(&mut self) {
-        while self.start < self.end {
-            unsafe { im::drop_in_place(im::ptr_add_mut(self.buf.as_ptr(), self.start)) };
-            self.start += 1;
+        struct FreeBuf<U> {
+            buf: *mut U,
+            cap: usize,
         }
-        if crate::mem::size_of::<T>() != 0 && self.cap != 0 {
-            heap::free(self.buf.as_ptr() as *mut u8, Vec::<T>::current_layout(self.cap));
+        impl<U> Drop for FreeBuf<U> {
+            fn drop(&mut self) {
+                if crate::mem::size_of::<U>() != 0 && self.cap != 0 {
+                    heap::free(self.buf as *mut u8, Vec::<U>::current_layout(self.cap));
+                }
+            }
         }
+        let _free = FreeBuf::<T> { buf: self.buf.as_ptr(), cap: self.cap };
+        let (from, k) = (self.start, self.end - self.start);
+        self.start = self.end;
+        // SAFETY: from..from + k are the items alive, out of the live range now: dropped once
+        unsafe { crate::ptr::drop_in_place(crate::ptr::slice_from_raw_parts_mut(im::ptr_add_mut(self.buf.as_ptr(), from), k)) };
     }
 }
