@@ -677,8 +677,9 @@ pub fn init() {
 }
 
 /// `init` of a run's own executable that a shell or a C library launched (selfexe.rs
-/// `relaunched`): `beside` is the build environment that run left beside its command line, which a
-/// spawn by Relax std hands in `BUILD_ENV` (relax issue 172). A hand-off in the environment stands
+/// `relaunched`): `beside` is the build environment that run handed a launch of its link
+/// (selfexe.rs `relaunch_build`), which a spawn by Relax std hands in `BUILD_ENV` (relax issue
+/// 172). A hand-off in the environment stands
 /// over it, and either goes through `take_build`: neither grants anything. One that does not parse
 /// is not taken, said in one line.
 pub fn init_handed(beside: Option<Vec<u8>>) {
@@ -697,7 +698,7 @@ pub fn init_handed(beside: Option<Vec<u8>>) {
         None => beside.filter(|b| !cfg!(windows) || std::str::from_utf8(b).is_ok()).and_then(|b| match parse(&b) {
             Ok(own) => Some(set(own)),
             Err(e) => {
-                eprintln!("relax: the build environment beside this run's executable is not taken ({e}); it builds with its own");
+                eprintln!("relax: the build environment the run of this executable handed is not taken ({e}); it builds with its own");
                 None
             }
         }),
@@ -731,7 +732,7 @@ pub fn init_handed(beside: Option<Vec<u8>>) {
 static BUILD: std::sync::OnceLock<Env> = std::sync::OnceLock::new();
 
 /// This run's build environment in the wire form (`encode`): what a run of its program again
-/// builds with (`spawn_env`, and beside the run's command line for a launch by a shell).
+/// builds with (`spawn_env`, and selfexe.rs `hand_build` for a launch of its link by a shell).
 pub fn build_wire() -> Vec<u8> {
     let build: Own = BUILD.get().cloned().unwrap_or_else(|| build_part(&real())).into_iter().map(|(k, v)| (k, Some(v))).collect();
     encode(&build)

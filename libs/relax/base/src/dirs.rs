@@ -129,9 +129,10 @@ pub fn loader_exe() -> std::io::Result<PathBuf> {
 
 /// The files beside a run's own executable (relax-compiler selfexe.rs): names no link has (a link
 /// keeps a name's letters, digits, `-`, `_` and `.`). The run's command line (RELAX_SELF_EXEC's
-/// words) and build environment (progenv `build_wire`, which a launch of the link by a shell
-/// builds with), the loader the link was made of, the folder of the links a process starts runs
-/// from, and on Windows the command lines of a test's package binaries.
+/// words), where a launch of the link by a shell finds the run's build environment (progenv
+/// `build_wire`; on Unix the descriptor of a file without a name, never the environment itself),
+/// the loader the link was made of, the folder of the links a process starts runs from, and on
+/// Windows the command lines of a test's package binaries.
 pub const RUN_LINE: &str = "+self-exec";
 pub const RUN_BUILD: &str = "+build";
 pub const RUN_LOADER: &str = "+loader";

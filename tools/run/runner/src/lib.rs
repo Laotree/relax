@@ -213,7 +213,7 @@ pub fn main(host: &'static Host) {
     // would give it, before anything reads the environment
     let bin = relax_compiler::selfexe::bin_start(&relax_compiler::os::proc::args_bytes());
     // a run's own executable launched by a shell or a C library: that run's program again, built
-    // with the build environment that run left beside its link (selfexe.rs)
+    // with the build environment that run handed a launch of its link (selfexe.rs)
     let relaunch = if bin.is_none() { relax_compiler::selfexe::relaunched(&relax_compiler::os::proc::args_bytes()) } else { None };
     // a self-exec child: the program values its parent passed, before anything reads the
     // environment (relax-base progenv.rs); a provided crate's read of the program's environment

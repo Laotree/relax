@@ -13,9 +13,12 @@
 //! the link that did not come through Relax std's spawn (`sh -c "exec $EXE ..."`, a C library's
 //! exec) runs this program again too: the loader started by that path finds the line beside
 //! itself (`relaunched`), as std's spawn would have put it before the arguments. And the run's
-//! build environment (`BUILD`), which std's spawn hands such a run (progenv `BUILD_ENV`): that
-//! launch builds with it too, whatever environment the shell gave it, so it is this run's build
-//! and its program has the shell's environment (`relaunch_build`, relax issue 172).
+//! build environment, which std's spawn hands such a run (progenv `BUILD_ENV`): that launch builds
+//! with it too, whatever environment the shell gave it, so it is this run's build and its program
+//! has the shell's environment (`relaunch_build`, relax issue 172). The environment is never in a
+//! file: it holds the person's tokens, and a run that is killed leaves its folder. On Unix the run
+//! keeps it in a file that has no name, by a descriptor an exec keeps, and `BUILD` says which
+//! (`hand_build`); on Windows `BUILD` is that file, which goes with the run's last handle.
 //!
 //! The folder is laid out as cargo lays out target/<profile>: a test's executable sits in its
 //! `deps/` folder and the package's binaries (their CARGO_BIN_EXE_<name> launchers) in the folder
@@ -179,7 +182,8 @@ pub fn launch_link(loader: &Path, name: &str) -> Option<PathBuf> {
         }
     });
     let dir = own.join(LAUNCH);
-    std::fs::create_dir_all(&dir).ok()?;
+    // owner-only from its mkdir, as `link`'s folder is
+    private_dirs(&dir).ok()?;
     record_loader(&dir, loader);
     let path = dir.join(file_name(name));
     if !same_file(&path, loader) {
@@ -240,21 +244,135 @@ pub fn name_process(link: &Path) {
 /// `-`, `_` and `.`).
 const LINE: &str = crate::dirs::RUN_LINE;
 
-/// The run's build environment beside the link: a name no link has.
+/// Where a launch of the link finds the run's build environment (`hand_build`): a name no link
+/// has.
 const BUILD: &str = crate::dirs::RUN_BUILD;
 
-/// Writes this run's command line (RELAX_SELF_EXEC's words, up to and with `--`) and its build
-/// environment beside its link. The folder is the owner's alone (`private_dirs`), as the process's
-/// own environment is.
+/// Writes this run's command line (RELAX_SELF_EXEC's words, up to and with `--`) beside its link,
+/// and hands its build environment to a launch of the link (`hand_build`). The folder is the
+/// owner's alone (`private_dirs`), as the process's own environment is.
 pub fn set_line(words: &[String]) -> Result<(), String> {
     let dir = LINK_DIR.get().ok_or("no link was made")?;
-    std::fs::write(dir.join(BUILD), crate::progenv::build_wire()).map_err(|e| format!("{}: {e}", dir.join(BUILD).display()))?;
+    hand_build(dir).map_err(|e| format!("{}: {e}", dir.join(BUILD).display()))?;
     std::fs::write(dir.join(LINE), words.join("\u{1f}")).map_err(|e| format!("{}: {e}", dir.join(LINE).display()))
 }
 
+/// The run's build environment as a launch of its link takes it (`hand_build`).
+static HANDED: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+
+#[cfg(unix)]
+extern "C" {
+    fn dup(fd: i32) -> i32;
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+}
+
+/// The build environment (progenv `build_wire`, the person's whole environment as the run started,
+/// tokens included) goes to a launch of the link in a file without a name: made in the owner-only
+/// folder and unlinked before anything is written to it, held open by a descriptor without
+/// close-on-exec, which a shell's or a C library's exec of the link keeps. `BUILD` names that
+/// descriptor: this process, its number and the file's device and inode, never a variable. When
+/// the run ends, killed or not, the file goes with its last descriptor, so no run leaves the
+/// environment on disk. A run that starts again in place (an exec of this process) closes the one
+/// its image before held.
+#[cfg(unix)]
+fn hand_build(dir: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut held = HANDED.lock().unwrap_or_else(|e| e.into_inner());
+    if held.take().is_none() {
+        if let Some((pid, fd, dev, ino)) = std::fs::read(dir.join(BUILD)).ok().as_deref().and_then(handed_at) {
+            if pid == std::process::id() {
+                drop(open_handed(fd, dev, ino));
+            }
+        }
+    }
+    let part = dir.join(format!("{BUILD}.part"));
+    let _ = std::fs::remove_file(&part);
+    let made = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&part)?;
+    std::fs::remove_file(&part)?;
+    (&made).write_all(&crate::progenv::build_wire())?;
+    // (dup's descriptor has no close-on-exec: std opens every file with it)
+    let fd = unsafe { dup(made.as_raw_fd()) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let kept = unsafe { std::fs::File::from_raw_fd(fd) };
+    let m = kept.metadata()?;
+    std::fs::write(dir.join(BUILD), format!("{} {} {} {}", std::process::id(), fd, m.dev(), m.ino()))?;
+    *held = Some(kept);
+    Ok(())
+}
+
+/// On Windows (no exec) `BUILD` is the file, made to be deleted when its last handle closes: the
+/// run holds it open, so it goes when the run ends, killed or not.
+#[cfg(windows)]
+fn hand_build(dir: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+    let mut held = HANDED.lock().unwrap_or_else(|e| e.into_inner());
+    // (the run before in this process: its file goes with its handle)
+    drop(held.take());
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).custom_flags(FILE_FLAG_DELETE_ON_CLOSE).open(dir.join(BUILD))?;
+    f.write_all(&crate::progenv::build_wire())?;
+    *held = Some(f);
+    Ok(())
+}
+
+/// `BUILD`'s words: the process that hands the environment, its descriptor, the file's device and
+/// inode.
+#[cfg(unix)]
+fn handed_at(words: &[u8]) -> Option<(u32, i32, u64, u64)> {
+    let words = std::str::from_utf8(words).ok()?;
+    let mut w = words.split(' ');
+    let r = (w.next()?.parse().ok()?, w.next()?.parse::<i32>().ok().filter(|&fd| fd >= 0)?, w.next()?.parse().ok()?, w.next()?.parse().ok()?);
+    w.next().is_none().then_some(r)
+}
+
+/// Descriptor `fd` of this process when it is open on the file `dev`/`ino`, to own (and close).
+#[cfg(unix)]
+fn open_handed(fd: i32, dev: u64, ino: u64) -> Option<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::MetadataExt;
+    const F_GETFD: i32 = 1;
+    if unsafe { fcntl(fd, F_GETFD) } < 0 {
+        return None;
+    }
+    // not closed unless it is the file named: another descriptor of that number is someone else's
+    let f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+    f.metadata().is_ok_and(|m| m.dev() == dev && m.ino() == ino).then(|| std::mem::ManuallyDrop::into_inner(f))
+}
+
 /// The build environment of the run whose link this process was launched from (`relaunched`),
-/// beside it: what the loader builds with before anything reads the environment (progenv
-/// `init_handed`).
+/// which it handed (`hand_build`): what the loader builds with before anything reads the
+/// environment (progenv `init_handed`). Its descriptor, which the exec kept, is read and closed;
+/// on Linux, where a launcher closed it on the way, that run's own is read through /proc. None,
+/// said in one line, when neither is there.
+#[cfg(unix)]
+pub fn relaunch_build() -> Option<Vec<u8>> {
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    let (pid, fd, dev, ino) = handed_at(&std::fs::read(std::env::current_exe().ok()?.parent()?.join(BUILD)).ok()?)?;
+    let read = |f: &std::fs::File| -> Option<Vec<u8>> {
+        let mut b = vec![0; f.metadata().ok()?.len() as usize];
+        f.read_exact_at(&mut b, 0).ok()?;
+        Some(b)
+    };
+    if let Some(f) = open_handed(fd, dev, ino) {
+        return read(&f);
+    }
+    #[cfg(target_os = "linux")]
+    if let Ok(f) = std::fs::File::open(format!("/proc/{pid}/fd/{fd}")) {
+        if f.metadata().is_ok_and(|m| m.dev() == dev && m.ino() == ino) {
+            return read(&f);
+        }
+    }
+    let _ = pid;
+    eprintln!("relax: the build environment of the run whose executable this is did not reach this process (its descriptor was closed on the way); it builds with its own");
+    None
+}
+
+#[cfg(windows)]
 pub fn relaunch_build() -> Option<Vec<u8>> {
     std::fs::read(std::env::current_exe().ok()?.parent()?.join(BUILD)).ok()
 }
