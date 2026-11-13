@@ -5397,8 +5397,12 @@ impl<'a> Fcx<'a> {
                     st = self.never_scrutinee(*x, st);
                 }
                 // arms coerce to a known expected type (rustc _match.rs check_match:
-                // CoerceMany starts from `ExpectHasType(ety)` unless it is `()`)
+                // CoerceMany starts from `ExpectHasType(ety)` unless it is `()`). A hint is no
+                // such type: for a match that is itself an arm of an outer match the hint is the
+                // outer match's earlier arms' type, and the two meet in the outer CoerceMany,
+                // which may coerce those arms to this one's type (`&String` arms to `&str`).
                 let target = match expected {
+                    Some(_) if soft => None,
                     Some(et) => {
                         let s = self.shallow(et);
                         if matches!(self.tcx.tys.kind(s), TyKind::Infer(_) | TyKind::Error) || s == unit || self.is_unsized_ty(s) {
@@ -5804,7 +5808,9 @@ impl<'a> Fcx<'a> {
                         TyKind::Adt(d, args, regions) => {
                             let adt = self.tcx.adts.get(&d);
                             if let Some(adt) = adt {
-                                if !adt.is_enum {
+                                // only a tuple struct has fields named by position: `owned.0` on a
+                                // struct with named fields is a field of its Deref target
+                                if !adt.is_enum && adt.variants[0].shape == 1 {
                                     if let Some(f) = adt.variants[0].fields.get(*idx as usize) {
                                         if self.field_visible(d, f) {
                                             self.b.field_idx.insert(e.0, (derefs as u32, *idx));
@@ -6142,15 +6148,6 @@ impl<'a> Fcx<'a> {
                 adt_ty
             }
             ExprKind::Range(a, b, incl) => {
-                let elem = self.fresh(0);
-                if let Some(a) = a.get() {
-                    let t = self.check_expr(a, Some(elem));
-                    self.eq(t, elem);
-                }
-                if let Some(b) = b.get() {
-                    let t = self.check_expr(b, Some(elem));
-                    self.eq(t, elem);
-                }
                 let name = match (a.is_some(), b.is_some(), *incl) {
                     (true, true, false) => "Range",
                     (true, true, true) => "RangeInclusive",
@@ -6159,7 +6156,26 @@ impl<'a> Fcx<'a> {
                     (false, true, true) => "RangeToInclusive",
                     (false, false, _) => "RangeFull",
                 };
-                match self.lang_item(&["ops", name]) {
+                let range = self.lang_item(&["ops", name]);
+                let elem = self.fresh(0);
+                // rustc lowers a range to a struct literal (`a..=b` to `RangeInclusive::new(a, b)`):
+                // an expected type of the same range gives the bounds their type (expr.rs
+                // check_expr_struct_fields adt_ty_hint), and each bound is a coercion site
+                // (`*mut u8` bounds for a `Range<*const u8>` parameter)
+                if let (Some(x), Some(d)) = (expected, range) {
+                    let x = self.shallow(x);
+                    if let TyKind::Adt(xd, args, _) = self.tcx.tys.kind(x).clone() {
+                        if xd == d {
+                            if let [arg] = *self.tcx.tys.list(args) { self.eq(elem, arg); }
+                        }
+                    }
+                }
+                for bound in [a.get(), b.get()].into_iter().flatten() {
+                    let t = self.check_expr(bound, Some(elem));
+                    let pos = self.ast().expr(bound).lo;
+                    self.coerce_or_unify(t, elem, Some(bound), pos);
+                }
+                match range {
                     Some(d) => {
                         let n = self.tcx.adts.get(&d).map_or(0, |a| a.n_generics);
                         let args = if n == 0 { Vec::new() } else { vec![elem] };
@@ -6571,7 +6587,7 @@ impl<'a> Fcx<'a> {
                 // builtin path only when neither operand is a type variable, and check_overloaded_binop
                 // records the method for `?T: PartialEq<?R>` while it is ambiguous. Typing it as a
                 // built-in comparison unified both sides and made the capture analysis of
-                // `|p| *p == path` (p: &?T) consume `path` (a false E0382 in Scope's code_graph).
+                // `|p| *p == path` (p: &?T) consume `path` (a false E0382 in an app's code_graph).
                 if !prim_ref && matches!(self.tcx.tys.kind(sa), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..) | TyKind::Param(_) | TyKind::Infer(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. })) {
                     if let Some(r) = self.check_cmp_trait(e, op, sa, b, lo, None) {
                         return r;

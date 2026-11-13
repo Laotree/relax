@@ -66,7 +66,7 @@ pub fn checked_dir(workspace: &str, overridden: bool) -> Result<Option<PathBuf>,
         return Err("RELAX_CACHE_DIR is set: that override is for tests and measurement only, and clean never deletes an arbitrary folder (unset it, or remove that folder yourself)".to_string());
     }
     if crate::vfs::is_virtual(workspace) {
-        return Err(format!("{workspace} is a git repository run's virtual workspace: no target folder to clean"));
+        return Err(format!("{workspace} is a virtual workspace (a git repository run's, or a shared one: RELAX_SHARE): no target folder to clean"));
     }
     let target = crate::resolve::target_dir(workspace)?;
     let default = format!("{}/target", crate::resolve::find_root(workspace)?);

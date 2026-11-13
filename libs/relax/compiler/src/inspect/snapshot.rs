@@ -30,7 +30,7 @@ fn dispatch(req: &Req, out: &mut Out) {
 
 fn answer(command: &str) -> String {
     let _kept = crate::zone_alloc::kept();
-    let (bytes, _) = makepad_remote::cmd::answer(dispatch, &format!("{command} full=1"));
+    let bytes = makepad_remote::cmd::answer(dispatch, command);
     if bytes.is_empty() && command.starts_with("hal ") {
         return "(host provider did not answer)\n".into();
     }

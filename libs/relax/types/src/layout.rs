@@ -650,6 +650,7 @@ impl Layouts {
                     tcx.dcx.report(crate::next_solver::fulfill::ObligationCause { body_id: *d, span: lcx.prog.files[def.file as usize].ast.item(def.item).lo },
                         format!("E0391: cycle detected when computing layout of `{}`", lcx.prog.def_path(*d)));
                 }
+                crate::cycle::note_stand_in();
                 return Box::leak(Box::new(plain(0, 1, None)));
             }
         };
@@ -1390,6 +1391,7 @@ impl Layouts {
                     tcx.dcx.report(crate::next_solver::fulfill::ObligationCause { body_id: *d, span: lcx.prog.files[def.file as usize].ast.item(def.item).lo },
                         format!("E0391: cycle detected when computing layout of `{}`", lcx.prog.def_path(*d)));
                 }
+                crate::cycle::note_stand_in();
                 return false;
             }
         };

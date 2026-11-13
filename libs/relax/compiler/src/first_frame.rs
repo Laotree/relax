@@ -157,7 +157,7 @@ pub(crate) fn presented() {
 /// a batch program, whose main goes quiet without either. A batch program draws no frame: no
 /// deadline, no load screen. Should it start an app after all, the app has its deadline (and makes
 /// its own window). A program that presented is never taken for one: an app whose own main skipped
-/// `app_started` lost the window it drew in when its compiles went quiet (Scope, 11-06).
+/// `app_started` lost the window it drew in when its compiles went quiet (an app, 11-06).
 fn watch_app() -> f64 {
     let mut batch = false;
     loop {
@@ -390,7 +390,7 @@ mod tests {
 
     /// An app whose own entry never says it is one (no `app_main!`, so no `app_started`) but has
     /// presented is an app when its main goes quiet: never a batch program, whose run lets the
-    /// window go. Scope wrote its entry out by hand, and the run closed the window it drew in once
+    /// window go. An app wrote its entry out by hand, and the run closed the window it drew in once
     /// its compiles went quiet (28-109 s after each start, 11-06).
     #[test]
     fn a_program_that_presented_is_never_a_batch_program() {

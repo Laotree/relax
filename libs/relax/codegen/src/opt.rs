@@ -531,7 +531,7 @@ impl InlineStats {
 /// vs small limits, .NET's profile-boosted size tolerance): a caller the sampler found hot
 /// (its block frequencies are sampled) gets max(4x, +8000) instructions -- bottom-up inlining
 /// made that room usable, max(2x, +4000) refused html_parse's and maps' hot sites for budget
-/// (html 0.66, maps 0.97) --; every other caller max(2x, +4000): Stage's lukewarm UI functions
+/// (html 0.66, maps 0.97) --; every other caller max(2x, +4000): an app's lukewarm UI functions
 /// grew 3x in code with the big room and its O3 compile CPU went up 4x.
 /// The inlining room a single-caller body of `size` instructions brings when it moves into its
 /// caller: what its own (cold) growth ceiling allowed it compiled alone (RELAX_OPT=-singleroom:
@@ -725,7 +725,7 @@ fn site_rule(options: &relax_session::Options, callee: &Func, id: u32, nargs: us
     // before samples exist, preventing structural builds from spending their
     // growth allowance on large peripheral helpers. A site in a loop is no peripheral helper:
     // rustc inlines an #[inline] body there by its cost alone (LLVM's inline-hint threshold), and
-    // which loop block the samples or counts call hot varies from build to build (sandbox
+    // which loop block the samples or counts call hot varies from build to build (an app's
     // reconcile's derived `MirrorEntry::clone`, 138 insts, in the per-entity loop: inlined in one
     // O3 build, a call in the next; GAPB).
     let mut lim = *lim;
@@ -964,7 +964,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
             let free = size <= INLINE_FREE_INSTS && size <= free_budget;
             // A tiny body (no bigger than the call's own argument/return moves, or within the free
             // size) is admitted whatever the caller has grown to: refusing it keeps a call that costs
-            // more than the body (sandbox leap, a pool node: encode_cascades left core::mem::drop x130,
+            // more than the body (a game on a pool node: encode_cascades left core::mem::drop x130,
             // rc::header_of x140, slice::iter::next x26 as calls -- "budget" -- once big chains had
             // filled the growth ceiling). Only the raw free allowance is charged for it.
             let tiny = size <= INLINE_FREE_INSTS;
@@ -1060,7 +1060,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
             // had compiled alone (its size and its own room), so the calls around it (Vec::push
             // in the absorbed loop) and in it (an absorbed VM handler's #[inline] stack pops)
             // still fit -- moving a body in never shrinks the inlining it would have got on its
-            // own (P(DOOM)'s run_core: 25 single-caller opcode handlers moved in with their
+            // own (a game's run_core: 25 single-caller opcode handlers moved in with their
             // sizes only, and 47 pop_stack_resolved calls stayed calls on the growth ceiling)
             RULE_SINGLE => growth_limit = growth_limit.saturating_add(growth).saturating_add(single_room(options, size)),
             _ if no_growth => {}
@@ -4016,7 +4016,7 @@ pub fn forward_slot_dests(f: &mut Func) -> bool {
 /// Stack slot sharing ("stack coloring"), as the backends lay out the frame (`slot_layout`):
 /// slots whose lifetimes cannot overlap share storage. Lowering gives every temporary, call
 /// result buffer and by-value argument copy a slot of its own, and inlining gives each inlined
-/// body its own slots, so without sharing a frame is the sum of them all (Scope's recursive
+/// body its own slots, so without sharing a frame is the sum of them all (a large app's recursive
 /// type parser: 8 KB per parse_type frame, rustc 0.5 KB; Amp: 0.9 MB O3 frames on 2 MB kernel
 /// worker stacks; rustc's stack colouring overlaps them). A slot's lifetime is approximated by
 /// the blocks between its accesses: live where some access can reach and some access can be
@@ -9810,7 +9810,7 @@ pub fn coalesce_slot_copies(f: &mut Func, prefix: bool) -> bool {
 /// Field-wise copies become one `Copy`: in one block, loads from one base whose values only go
 /// to stores at the same distance from another base, covering a contiguous byte range of at least
 /// 16 bytes, are one copy of that range at the last store (LLVM gets there with the SLP
-/// vectorizer and memcpyopt). A derived `Clone` of a struct of `Copy` fields (sandbox reconcile's
+/// vectorizer and memcpyopt). A derived `Clone` of a struct of `Copy` fields (an app's reconcile
 /// `MirrorEntry`, 208 bytes: 49 scalar stores and as many loads) is copied in 16-byte moves, and
 /// the copy is what slot forwarding and coalescing join along. Kept apart: ranges that may
 /// overlap each other, a write in between that may touch either range, a read in between that

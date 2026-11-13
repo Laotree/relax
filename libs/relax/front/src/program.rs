@@ -558,7 +558,7 @@ fn retain_load_memos<K: Clone + std::hash::Hash + Eq, V: Clone>(
 }
 
 /// Buckets (log2) of the per-(module, name) memos, `scope_cache` and `glob_cache`: a body check
-/// of a big workspace fills each with ~1M entries (sandbox: 0.88M and 0.98M), and a chain longer
+/// of a big workspace fills each with ~1M entries (a large app: 0.88M and 0.98M), and a chain longer
 /// than a node or two is a cache miss per node on every lookup. 8 MB of buckets each, in zeroed
 /// pages that stay untouched until a bucket is used.
 const NAME_MEMO_BITS: u32 = 20;
@@ -1247,7 +1247,7 @@ impl Program {
     /// root's harness crate and the plain library its dev-dependencies link are two crates of one
     /// path (M50). The last is the one `current_source_files` names. `keep` picks the paths before
     /// any is copied: a live session asking whether its few saved paths are sources had every
-    /// module's path (std's too) cloned into the map, 25-40 ms of the owner per edit (Fab, 11-04).
+    /// module's path (std's too) cloned into the map, 25-40 ms of the owner per edit (an app, 11-04).
     pub fn current_source_file_sets(&self, keep: impl Fn(&str) -> bool) -> std::collections::BTreeMap<String, Vec<u32>> {
         let mut files: std::collections::BTreeMap<String, Vec<u32>> = std::collections::BTreeMap::new();
         let mut bound = Vec::with_capacity(self.mods.len());
@@ -1806,10 +1806,16 @@ impl Program {
         while !self.cur_image {
             // (a name the crate defines already is one its textual scope does not reach here, one
             // a `use .. as` of the crate binds resolves through that import, and a built-in's is
-            // no macro_rules!: no outline changes those, and the load does not wait for the plan)
+            // no macro_rules!: no outline changes those, and the load does not wait for the plan.
+            // An import the scan kept under its own name because its first segment could be a
+            // crate, `pub use other::{Subtag, subtag};` beside `mod other;`, is none of another
+            // crate's when that segment names no crate: the name is still the outline's to find)
+            let through_import = |n: &String| parse_table.aliases.get(&kname).and_then(|a| a.get(n)).is_some_and(|(first, orig)| {
+                orig != n || parse_table.crates.contains_key(first) || parse_table.crates.get(&kname).is_some_and(|c| c.externs.contains_key(first))
+            });
             let mut missing = used.failed_lookups();
             missing.retain(|n| !parse_table.defs.get(n).is_some_and(|defs| defs.iter().any(|d| d.krate == kname)) && !used.local.iter().any(|d| &d.name == n)
-                && !parse_table.aliases.get(&kname).is_some_and(|a| a.contains_key(n))
+                && !through_import(n)
                 && !BUILTIN_MACROS.contains(&n.as_str()) && crate::builtins::macro_def_for(&kname, n).is_none());
             if missing.is_empty() { break; }
             let defs = outline.get_or_insert_with(|| self.pool.as_ref().and_then(|p| p.outline_macros(self.cur_ahead)));
@@ -1821,6 +1827,29 @@ impl Program {
             for d in defs.iter().filter(|d| missing.contains(&d.name) && d.def_file != path) {
                 if !next.defs.get(&d.name).is_some_and(|known| known.iter().any(|k| k.krate == d.krate && k.def_file == d.def_file && k.def_pos == d.def_pos)) {
                     next.push(d.clone());
+                    added = true;
+                }
+            }
+            // A missing name may be one an expansion of another file binds: `pub use internal as
+            // name;` written beside the `macro_rules! internal` it generates (icu_locale_core's
+            // impl_tinystr_subtag!: `subtag!`, called in modules declared before `subtags`). The
+            // outline has those imports as well: take the ones of the missing names, and the
+            // definitions they name.
+            if let Some(uses) = self.pool.as_ref().and_then(|p| p.outline_expansions(self.cur_ahead)) {
+                let known = next.exp_uses.get(&kname).cloned().unwrap_or_default();
+                let renames: Vec<((String, String), Vec<String>)> = uses.iter()
+                    .filter(|(key, to)| missing.contains(&key.1) && known.get(*key) != Some(*to))
+                    .map(|(key, to)| (key.clone(), to.clone())).collect();
+                for (_, to) in &renames {
+                    let Some(target) = to.last() else { continue };
+                    for d in defs.iter().filter(|d| &d.name == target && d.def_file != path) {
+                        if !next.defs.get(&d.name).is_some_and(|known| known.iter().any(|k| k.krate == d.krate && k.def_file == d.def_file && k.def_pos == d.def_pos)) {
+                            next.push(d.clone());
+                        }
+                    }
+                }
+                if !renames.is_empty() {
+                    next.add_exp_uses(&kname, renames);
                     added = true;
                 }
             }
@@ -6491,7 +6520,7 @@ pub static PARSE_AGAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 
 /// A path's segments as (kind, symbol), `u32::MAX` for a name no file interned: held inline up
 /// to four segments. Built afresh on each call: two string-table probes per segment cost less
-/// than any memo of them (a per-occurrence one held 4M entries for sandbox and cost 8% of the
+/// than any memo of them (a per-occurrence one held 4M entries for a large app and cost 8% of the
 /// body checks walking its chains).
 pub struct PathSegs {
     len: usize,

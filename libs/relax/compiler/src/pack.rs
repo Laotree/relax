@@ -52,7 +52,7 @@ impl Bytes {
 
 /// `len` bytes of `file` at `off` (a multiple of `view_align`), mapped read-only until `unmap_view`.
 /// Shared, not private: a private file mapping costs ~1.9 ms to set up on macOS (an M4, while the
-/// file is being appended to), and a cold Stage maps ~3.5k images on the load thread (6.5 s);
+/// file is being appended to), and a large app's cold start maps ~3.5k images on the load thread (6.5 s);
 /// read-only, both read the page cache's bytes, and an appended payload never changes.
 #[cfg(unix)]
 fn map_view(file: &std::fs::File, off: u64, len: usize) -> Option<*const u8> {

@@ -536,7 +536,7 @@ pub fn footprint() -> Option<u64> {
 
 /// The process's resident size in bytes, cheaply: no allocator statistics (process_rss's
 /// mallinfo2 walks every malloc arena -- Linux, the monitor thread's 500 ms growth check spent
-/// ~0.4 of a core in it under the sandbox game leap; macOS's malloc_zone_statistics walks the
+/// ~0.4 of a core in it under a game; macOS's malloc_zone_statistics walks the
 /// zones likewise). For checks that only compare sizes.
 pub fn resident() -> u64 {
     #[cfg(target_os = "linux")]

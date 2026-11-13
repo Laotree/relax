@@ -129,6 +129,11 @@ fn requests_in_a_row_on_one_channel_take_one_route() {
         assert!(reply.len() == 1 && reply[0].starts_with("{\"pong\":1"), "{reply:?}");
         assert_eq!(hub.routes(), 1);
     }
+    // a reply far past the 16 KiB it was once cut at comes through the hub whole, the line a
+    // message boundary cut inside a character joined again
+    let mut big = Vec::new();
+    assert_eq!(asking.ask("big", &mut |l| big.push(l.to_string())), Ok(false));
+    assert!(big == crate::tests::big_lines(), "the big reply arrives whole through the hub");
     drop(asking);
     let t = std::time::Instant::now();
     while hub.routes() > 0 {

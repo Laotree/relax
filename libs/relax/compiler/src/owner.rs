@@ -54,7 +54,7 @@ impl Class {
     /// every running job, so these are the classes the owner serves for any thread while the jobs
     /// are paused: one predicate for both sides, so a swap never waits for a job whose request
     /// the pause holds back (an O2/speculation/O3 finish queued as a background finish during a
-    /// CEF-load swap hung Stage: "jobs active 1").
+    /// CEF-load swap hung an app: "jobs active 1").
     pub fn keeps_job(self) -> bool {
         self == Class::Job || self.is_finish()
     }
@@ -83,8 +83,8 @@ const RELEASED: u8 = 3;
 const REQUESTER_SPIN_US: u32 = 60;
 const OWNER_SPIN_US: u32 = 60;
 /// The owner's spin after a request of the main thread: a lazy compile on the UI thread asks again
-/// once its back end has built a fn (a cold Fab's first drag: 60-140 UI round trips in a frame,
-/// each paying the owner's futex wake, 0.15-0.3 ms on a busy box)
+/// once its back end has built a fn (a large app's first drag on a cold start: 60-140 UI round trips
+/// in a frame, each paying the owner's futex wake, 0.15-0.3 ms on a busy box)
 const OWNER_MAIN_SPIN_US: u32 = 1000;
 /// spin iterations per microsecond (0: not measured yet, nobody spins)
 static SPIN_PER_US: AtomicU32 = AtomicU32::new(0);
@@ -904,6 +904,12 @@ pub fn serving_note() -> String {
     }
 }
 
+/// How long the owner thread has served its current request (0: idle).
+pub fn serving_ns() -> u64 {
+    if NOW_CLASS.load(Ordering::Relaxed) == u8::MAX { return 0; }
+    crate::jit::wall_ns().saturating_sub(NOW_T0.load(Ordering::Relaxed))
+}
+
 /// `serving_note` with the site of the request served (atomics only: an abort's report, which
 /// names what kept the owner from its lookups).
 pub fn serving_detail() -> String {
@@ -1345,8 +1351,8 @@ fn wait(req: &Req, deadline: Option<std::time::Instant>) -> bool {
     drop(done);
     // The owner's last touch follows its unlock. The unlock's wake can put this thread on the
     // owner's CPU and preempt it right there, before that store: spinning then holds the CPU the
-    // owner needs to make it (Linux, cold Stage: 8 s of the app thread's CPU in this loop, most of
-    // it after the wait). A few spins, then yield.
+    // owner needs to make it (Linux, a large app's cold start: 8 s of the app thread's CPU in this loop,
+    // most of it after the wait). A few spins, then yield.
     let mut spins = 0u32;
     while req.state.load(Ordering::Acquire) != RELEASED {
         if spins < 64 {
@@ -1378,8 +1384,8 @@ fn pick(q: &mut Queue, mode: Mode) -> Option<usize> {
     let helper = EXIT_HELPER.load(Ordering::Acquire);
     // The UI (main) thread's own requests go first, ahead of every other program thread's and every
     // background publish: it waits with no frame meanwhile, and its lazy compile's finish is a
-    // publish that queued behind the O2/O3 workers' takes (a cold Fab: seconds of UI waits behind
-    // background work). A pump serves only its publish (Class::keeps_job), as for any requester.
+    // publish that queued behind the O2/O3 workers' takes (a large app's cold start: seconds of UI waits
+    // behind background work). A pump serves only its publish (Class::keeps_job), as for any requester.
     if only == 0 && MAIN_QUEUED.load(Ordering::Relaxed) + MAIN_PUBLISH.load(Ordering::Relaxed) > 0 {
         for c in [Class::Program as usize, Class::Publish as usize] {
             if mode == Mode::Pump && !CLASS_OF[c].keeps_job() {
@@ -1396,7 +1402,7 @@ fn pick(q: &mut Queue, mode: Mode) -> Option<usize> {
     for c in SERVICE_ORDER {
         // a pump serves only what the awaited thread may be waiting for: a job's request, a
         // publish. Never a program thread's request: it opens builds of its own on top of the
-        // request that pumps -- which holds its own state open meanwhile (Sandbox's race game hung
+        // request that pumps -- which holds its own state open meanwhile (a game hung
         // on a speculative build served inside a main-thread request's pump, 2026-10-21; builds
         // are no publishes since rule I-PUB)
         if mode == Mode::Pump && !CLASS_OF[c].keeps_job() {
@@ -1724,7 +1730,7 @@ fn pump_wait_at(site: &'static std::panic::Location<'static>, row: (crate::waits
 /// The same holds for a query whose runner waits for a request open on the owner's stack, directly
 /// or through the queries it waits for in turn (`stack_blocks`): served nested inside an earlier
 /// request's wait, a type check's constant (a Job) waited for a constant an ahead checker ran, whose
-/// own constant request was that earlier request (makepad-fab-slice's tests with the dependency check
+/// own constant request was that earlier request (a slicer crate's tests with the dependency check
 /// beside them hung 650 s, 2026-11-03).
 ///
 /// That chain is the nested request's alone. It is read from the wait registry, whose rows lag: a
@@ -1732,7 +1738,7 @@ fn pump_wait_at(site: &'static std::panic::Location<'static>, row: (crate::waits
 /// on can look as if it waited for the owner. Served nested, a chain read wrongly costs a retry.
 /// Outermost there is nothing lower to cancel and nothing the query engine does not see (the
 /// requester's queries are the request's context: a cycle through them is the engine's cycle
-/// error), so there only the owner's own query is a cycle; a chain is waited out (four cold Fab,
+/// error), so there only the owner's own query is a cycle; a chain is waited out (four large app cold starts,
 /// synth and arm-lab starts at once stopped on an internal compiler error, 2026-11-03).
 fn pump_latch(runner: u64, done: &dyn Fn() -> bool) {
     if runner == 0 {
@@ -1933,7 +1939,7 @@ pub fn fork_child() {
 mod tests {
     use super::*;
 
-    /// The Sandbox race-game hang (2026-10-21): the owner, serving a main-thread request, pumped
+    /// A game's hang (2026-10-21): the owner, serving a main-thread request, pumped
     /// inside it (a query latch) and took a queued background request -- a speculative build --
     /// which reached the slot lock the outer request held. A pump serves Job and Publish requests
     /// only; a program thread's request waits for the top of the owner loop.
@@ -2127,7 +2133,7 @@ mod tests {
         assert!(call(Class::Program, || enter(Kind::Layout, 7, 2).is_ok()));
     }
 
-    /// makepad-fab-slice's tests with the dependency check beside them (2026-11-03): an ahead
+    /// a slicer crate's tests with the dependency check beside them (2026-11-03): an ahead
     /// checker's constant (a Job) pumped on the owner, which served a dependency check's constant
     /// (a Job) inside it; that one waited for a query the ahead checker ran -- whose runner waited for
     /// the Job lower on the owner's stack. 650 s, every thread waiting. The nested Job is cancelled
@@ -2195,7 +2201,7 @@ mod tests {
 
     /// The owner-wait table's rows: a wait outside every request (the owner loop draining constants)
     /// has a row of its own, found again (a row named no request site spun forever on its second use
-    /// and hung the owner: a cold Fab drew no frame).
+    /// and hung the owner: a large app's cold start drew no frame).
     #[test]
     fn owner_wait_rows_outside_requests() {
         let a = std::panic::Location::caller();
@@ -2223,7 +2229,7 @@ mod tests {
         nested_wait_on_the_stack(true);
     }
 
-    /// Four cold starts at once (Fab, synth, arm-lab; 2026-11-03): the owner, serving an outermost
+    /// Four cold starts at once (a large app, synth, arm-lab; 2026-11-03): the owner, serving an outermost
     /// request, waited for a query a type-check thread ran, and that thread's wait-registry row still
     /// named a query the owner (or the request's requester) had finished: the waiter had not run
     /// since its latch completed. The chain read "the runner waits for the owner's stack", an

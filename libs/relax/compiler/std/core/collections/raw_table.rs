@@ -300,7 +300,7 @@ pub(crate) fn next_full(ctrl: &[u8], from: usize) -> usize {
 
 // hashbrown's RawTableInner: the element-independent table. Growth and rehashing are one body
 // for every element type, the bucket's size and alignment passed as values and the hasher as a
-// `&dyn Fn` of (table, bucket) -- P(DOOM)'s wasm had 355 copies each of reserve, resize_to and
+// `&dyn Fn` of (table, bucket) -- a game's wasm had 355 copies each of reserve, resize_to and
 // rehash_in_place (0.47 MB). `RawTable<T>` keeps the typed accessors and the fast paths.
 struct RawInner {
     ctrl: *mut u8,

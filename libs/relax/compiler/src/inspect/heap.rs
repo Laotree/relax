@@ -1274,7 +1274,7 @@ pub fn cmd_heap(req: &Req, out: &mut Out) {
             d.sort_by(|x, y| y.2.cmp(&x.2).then(x.0.cmp(&y.0)));
             let (tb, tn): (i64, i64) = d.iter().fold((0, 0), |s, x| (s.0 + x.1, s.1 + x.2));
             let per = |v: i64| if frames > 0 { format!("{:.1}", v as f64 / frames as f64) } else { "-".into() };
-            out.always(&format!(
+            out.line(&format!(
                 "{} allocations ({:.1} KB) in {:.1} s, {} frames: {} allocs/frame, {:.0} allocs/s (estimates from 1-in-{}-bytes sampling)",
                 tn, tb as f64 / 1024.0, took, frames, per(tn), tn as f64 / took.max(0.01), t.rate
             ));
@@ -1302,12 +1302,12 @@ pub fn cmd_heap(req: &Req, out: &mut Out) {
                 out.line(&format!("+{} more sites", d.len() - n));
             }
             if frames == 0 {
-                out.always("note: no UI frames in the window (not a makepad UI app, or nothing redrew): per-second rates only");
+                out.line("note: no UI frames in the window (not a makepad UI app, or nothing redrew): per-second rates only");
             }
             for p in partial {
-                out.always(&format!("note: {}", p));
+                out.line(&format!("note: {}", p));
             }
-            out.always("more: path H<n>  heap snap a; heap diff a now (leak candidates)  memory (fragmentation: malloc in use vs held free)");
+            out.line("more: path H<n>  heap snap a; heap diff a now (leak candidates)  memory (fragmentation: malloc in use vs held free)");
         }
         "life" => {
             // lifetime mode's answer (STACKALLOC.MEASURE): per allocating stack, how its blocks died

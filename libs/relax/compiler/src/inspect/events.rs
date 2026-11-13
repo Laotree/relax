@@ -212,8 +212,7 @@ pub fn cmd_watch(req: &Req, out: &mut Out) {
 }
 
 /// `events [since=<seq>] [follow=1] [on=..]`: the kept events after `since` (default: the last
-/// 20, the newest of them when the reply limit cuts it), then with follow=1 each new one as it
-/// comes, until the client goes away.
+/// 20), then with follow=1 each new one as it comes, until the client goes away.
 pub fn cmd_events(req: &Req, out: &mut Out) {
     let on = kinds(req);
     let follow = req.get("follow") == Some("1");
@@ -221,24 +220,15 @@ pub fn cmd_events(req: &Req, out: &mut Out) {
     let mut since = asked.unwrap_or_else(|| SEQ.load(SeqCst).saturating_sub(20));
     out.measured("events", "event queue", &[]);
     if follow {
-        // a stream is unbounded by design
-        out.limit = usize::MAX;
         WATCHERS.fetch_add(1, SeqCst);
         super::timeline::set_frame_watch(true);
         retry_update();
     }
     loop {
-        let mut batch: Vec<(u64, std::sync::Arc<str>)> = {
+        let batch: Vec<(u64, std::sync::Arc<str>)> = {
             let q = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
             q.iter().filter(|e| e.seq > since && wanted(&on, e.kind)).map(|e| (e.seq, e.json.clone())).collect()
         };
-        if asked.is_none() {
-            // The recent events end at the newest: a few hitch lines filled the reply before, and
-            // devhub took a 30 s old verdict for the edit it had just shipped (11-04).
-            let mut room = out.remaining();
-            let fit = batch.iter().rev().take_while(|(_, j)| room.checked_sub(j.len() + 1).map(|r| room = r).is_some()).count();
-            batch.drain(..batch.len() - fit);
-        }
         for (seq, j) in &batch {
             out.line(j);
             since = *seq;
@@ -563,9 +553,15 @@ pub fn on_panic(info: &crate::jit::PanicInfo, regs: *const u64) {
 }
 
 /// Somebody could answer a parked stop now: the Run panel, an inspect watcher, an agent, devhub.
-/// A terminal alone cannot justify a stale access's park, which has no timeout.
+/// A terminal alone cannot justify a stale access's park, which has no timeout. A test run's stop
+/// is the test's, as its panics are (`makepad test`: a fixture that asserts its child dies parked
+/// under devhub's observer and paused the whole job, J13263, 11-13), and an unattended run has
+/// nobody by definition: both end with the report.
 pub fn can_decide() -> bool {
-    super::STARTED.load(Relaxed) && (WATCHERS.load(SeqCst) > 0 || super::AGENT.load(Relaxed) || OBSERVERS.load(SeqCst) > 0 || RUN_STATE_AVAILABLE.load(SeqCst))
+    super::STARTED.load(Relaxed)
+        && !super::TEST_RUN.load(Relaxed)
+        && !UNATTENDED.load(Relaxed)
+        && (WATCHERS.load(SeqCst) > 0 || super::AGENT.load(Relaxed) || OBSERVERS.load(SeqCst) > 0 || RUN_STATE_AVAILABLE.load(SeqCst))
 }
 
 /// What the user decided for a parked stale access.
@@ -929,17 +925,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_recent_events_end_at_the_newest_when_the_reply_is_cut() {
-        // twelve 3 KB events: the 16 KB reply holds about five
+    fn the_recent_events_end_at_the_newest_and_arrive_whole() {
+        // twelve 3 KB events: more than the 16 KB a reply was once cut at (it kept the oldest,
+        // and devhub took a 30 s old verdict for the edit it had just shipped, 11-04)
         let pad = "x".repeat(3 << 10);
         let seqs: Vec<u64> = (0..12).map(|n| emit("cuttest", &format!("cut{n}"), &format!("\"pad\":\"{pad}\""))).collect();
-        let mut buf = Vec::new();
-        cmd_events(&Req::parse("events on=cuttest"), &mut Out::new(&mut buf, 16 << 10));
-        let text = String::from_utf8(buf).unwrap();
-        let shown: Vec<u64> = text.lines().filter_map(|l| l.split("\"seq\":").nth(1)?.split(',').next()?.parse().ok()).collect();
-        assert!(!shown.is_empty() && shown.len() < seqs.len(), "{shown:?}");
-        assert_eq!(shown.last(), seqs.last(), "the newest event was cut from the reply");
-        assert!(shown.windows(2).all(|w| w[0] < w[1]), "{shown:?}");
+        let shown = |line: &str| -> Vec<u64> {
+            let mut buf = Vec::new();
+            cmd_events(&Req::parse(line), &mut Out::new(&mut buf));
+            let text = String::from_utf8(buf).unwrap();
+            text.lines().filter_map(|l| l.split("\"seq\":").nth(1)?.split(',').next()?.parse().ok()).collect()
+        };
+        let recent = shown("events on=cuttest");
+        assert_eq!(recent.last(), seqs.last(), "the recent events end at the newest");
+        assert!(recent.windows(2).all(|w| w[0] < w[1]), "{recent:?}");
+        assert_eq!(shown(&format!("events on=cuttest since={}", seqs[0] - 1)), seqs, "every event arrives");
     }
 
     /// A call the live update could not build (an internal compiler error at a call after a live
@@ -970,7 +970,7 @@ mod tests {
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(!caller.is_finished(), "it waits for the person's choice");
-        let resume = |words: &str| { let mut buf = Vec::new(); cmd_resume(&Req::parse(words), &mut Out::new(&mut buf, 4096)); String::from_utf8(buf).unwrap() };
+        let resume = |words: &str| { let mut buf = Vec::new(); cmd_resume(&Req::parse(words), &mut Out::new(&mut buf)); String::from_utf8(buf).unwrap() };
         assert!(resume(&format!("resume P{id} panic")).contains("could not build"), "its thread cannot go on: no unwind into the app");
         assert!(resume(&format!("resume P{id} restart")).contains("\"as\":\"restart\""));
         assert_eq!(caller.join().unwrap(), UpdateParked::Restart, "the restart is its thread's to start");

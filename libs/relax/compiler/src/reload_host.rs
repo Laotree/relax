@@ -3,7 +3,9 @@
 //! cannot absorb restarts in place without a rebuild: reload.rs restart_in_place). A running app
 //! offers the update ([`offer`]): each landing built makepad in every app on the person's machine,
 //! whether or not they meant to restart (96 min of builds in 13 h, 11-04). The person's restart,
-//! or the next `cargo run`, builds it. A live test session and a dock app's sync build at once.
+//! or the next `cargo run`, builds it; a dock app's sync is offered too, devhub's deploy having built
+//! it already (sync/build.rs prebuild), so that cargo finds makepad current. A live test session
+//! builds at once.
 //! The loader is rebuilt with cargo while the app keeps running the code it has (at low priority
 //! when nobody waits for it, at the person's when they asked for the restart: [`Priority`], and
 //! their build goes before the low ones: [`Gate`]), then the process truly restarts: the rebuilt binary replaces it (exec) with the same command line, and an app that
@@ -96,7 +98,7 @@ enum Priority {
     /// a live test session). On macOS at background QoS (efficiency cores, throttled I/O; cargo's
     /// rustc inherit it, and nothing can lift that clamp from a running process), never at full
     /// width beside the app the person works in: three running apps' rebuilds after a landing took
-    /// rustc to ~1080% of a core on the person's Mac while they tweaked Fab (11-03). Elsewhere,
+    /// rustc to ~1080% of a core on the person's Mac while they tweaked an app (11-03). Elsewhere,
     /// nice 10.
     Background,
     /// A boot waits for it: nice 10.

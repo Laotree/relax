@@ -625,7 +625,7 @@ impl<'a> Lcx<'a> {
     /// `std::thread::LazyKey` static). Each side has its own per-thread storage by construction
     /// (rustc's lives in its TLS, laid out by its std; Relax's in the JIT's), so JIT code compiled
     /// from a provided crate's source keeps its own: a thread-local is never shared across the
-    /// boundary, whatever its type (native_vec::LANES on Fab's model thread, 10-30).
+    /// boundary, whatever its type (native_vec::LANES on an app's model thread, 10-30).
     fn thread_local_storage(&self, d: DefId, t: TyId) -> bool {
         let prog = &self.u.prog;
         let def = prog.def(d);
@@ -655,7 +655,7 @@ impl<'a> Lcx<'a> {
     /// A provided crate's own fn compiled here (it has no shim) that calls std's raw ownership
     /// operations (Arc/Rc reference counts through raw pointers, Box/Arc/Rc::from_raw) works
     /// objects rustc allocated with Relax's std, whose layouts differ (KernelRef::clone was
-    /// Arc::increment_strong_count on rustc's ArcInner: Stage aborted), when the object's type
+    /// Arc::increment_strong_count on rustc's ArcInner: an app aborted), when the object's type
     /// crosses the boundary. Such a fn must be marked `#[relax_api]` (an op), so it runs on the
     /// compiled side.
     fn check_provided_ownership(&mut self, callee: u32) {
@@ -1083,6 +1083,7 @@ impl<'a> Lcx<'a> {
             None => {
                 let erased = u.tcx.tys.erase_regions(t);
                 let l = u.layout_of(erased);
+                self.check_explicit_discriminants(t);
                 let too_big = u.lay.is_too_big(erased);
                 if !too_big { self.layouts.insert(t, l); }
                 (l, too_big)
@@ -1202,6 +1203,9 @@ impl<'a> Lcx<'a> {
             }
             _ => false,
         }
+    }
+    fn is_prim_int(&self, t: TyId) -> bool {
+        matches!(self.u.tcx.tys.kind(t), TyKind::Int(_))
     }
     fn is_wide(&self, t: TyId) -> bool {
         matches!(self.u.tcx.tys.kind(t), TyKind::Int(Prim::I128) | TyKind::Int(Prim::U128))
@@ -6865,12 +6869,28 @@ impl<'a> Lcx<'a> {
         let ast = self.ast();
         let ex = ast.expr(e);
         // Two-word integer operations need both halves of every operand, an operand that is a
-        // reference to one too (`&a + &b` on i128: built in, with both operands loaded)
-        let wide = match &ex.kind {
+        // reference to one too (`&a + &b` on i128: built in, with both operands loaded). An
+        // overloaded operator is the trait call whatever its operands' width (`w += 5u128` on a
+        // Wrapping<u128>, `x * 3i128` with `impl Mul<i128> for X`).
+        let wide = !self.b.binops.contains_key(&e.0) && match &ex.kind {
             ExprKind::Binary(_, a, b) | ExprKind::AssignOp(_, a, b) => self.is_wide(self.prim_peeled(self.body_ty(*a))) || self.is_wide(self.prim_peeled(self.body_ty(*b))),
             ExprKind::Unary(UnOp::Neg | UnOp::Not, x) | ExprKind::Cast(x, _) => self.is_wide(self.body_ty(*x)) || self.is_wide(t),
             _ => false,
         };
+        // An operator the checker resolved to its trait's method is the built-in operation only
+        // between integers, which may be behind references (`T + T`, `&T + &T` at u128). With a
+        // struct for an operand (`W(a) + b`, `u128 == W(a)`, `-small` giving an i128) it is the
+        // call below, not the two-word arithmetic, which read the struct's words as an integer's
+        // halves.
+        let wide = wide
+            && !(self.b.binops.contains_key(&e.0)
+                && match &ex.kind {
+                    ExprKind::Binary(_, a, b) | ExprKind::AssignOp(_, a, b) => {
+                        !(self.is_prim_int(self.prim_peeled(self.body_ty(*a))) && self.is_prim_int(self.prim_peeled(self.body_ty(*b))))
+                    }
+                    ExprKind::Unary(_, x) => !self.is_prim_int(self.prim_peeled(self.body_ty(*x))),
+                    _ => false,
+                });
         if wide {
             return self.lower_wide(e, t);
         }
@@ -7438,15 +7458,16 @@ impl<'a> Lcx<'a> {
             ExprKind::MethodCall(recv, row) => self.lower_method(e, *recv, ast.list(ast.row(*row).args), t),
             ExprKind::Struct(row) => { let crate::ast::StructRow { fields, base, rest, .. } = ast.row(*row); self.lower_struct_lit(e, ast.list(*fields), base.get(), *rest, t) }
             ExprKind::Range(a, b, _) => {
-                // Range { start, end } as a plain struct value
+                // Range { start, end } as a plain struct value; each bound is a coercion site
+                // (`&a..&b` for a `Range<&[u8]>`)
                 let mut vals = Vec::new();
                 let tys = self.range_field_tys(t);
                 if let Some(a) = &a.get() {
-                    vals.push((self.lower_expr(*a), tys[0]));
+                    vals.push((self.lower_expr_coerced(*a, tys[0]), tys[0]));
                 }
                 if let Some(b) = &b.get() {
                     let ft = if tys.len() > 1 { tys[1] } else { tys[0] };
-                    vals.push((self.lower_expr(*b), ft));
+                    vals.push((self.lower_expr_coerced(*b, ft), ft));
                 }
                 // RangeInclusive has an extra `exhausted: bool` field
                 if let TyKind::Adt(d, _, _) = self.kind(t) {
@@ -9428,6 +9449,27 @@ impl<'a> Lcx<'a> {
             self.emit(Inst::Call(Callee::Host(rt), vec![s], Vec::new()));
             self.term(Term::Unreachable);
             self.switch(ok2);
+        }
+    }
+
+    /// An enum one of whose explicit discriminants has no value (its evaluation failed, or met a
+    /// cycle) has no code: its layout and tags would hold a stand-in, a value rustc never builds a
+    /// program with. The body that needs the enum's layout fails as a use of that constant does.
+    fn check_explicit_discriminants(&mut self, t: TyId) {
+        let u = self.u;
+        let TyKind::Adt(ad, _, _) = *u.tcx.tys.kind(t) else { return };
+        let Some(adt) = u.tcx.adts.get(&ad) else { return };
+        if !adt.is_enum {
+            return;
+        }
+        for v in &adt.variants {
+            if let crate::tcx::VariantDiscr::Explicit(c) = v.discr {
+                if adt.eval_explicit_discr(&u.tcx, &u.prog, c).is_err() {
+                    let e = self.const_use_error(c, &[]);
+                    self.err(self.pos, e);
+                    return;
+                }
+            }
         }
     }
 

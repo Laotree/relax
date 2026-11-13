@@ -263,6 +263,103 @@ fn settle_rebuild_covers_a_crate_added_at_run_time() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A coroutine is still one after a settle rebuild. The slots keep their keys across the replace
+/// (the new interner is topped up from the live one, so a key's types keep their ids), but which
+/// closure types are coroutines is not in the collected image: Tcx::coroutines is filled by the
+/// type check of the body that holds the async block and by a decoded cache key (dec_ty 28), and
+/// neither comes again for a slot that exists. The restored context had no marks, so every such
+/// type became a plain closure with no `Future` impl: an instance over it built after the
+/// rebuild (a first call, a tier-up, the poll function lowered again for a coroutine's layout)
+/// stopped with "failed to normalize body for codegen: NoSolution", and the slot's cache key
+/// changed (enc_ty wrote 17 for 28), so its stored code was not found either.
+#[test]
+fn settle_rebuild_keeps_coroutines() {
+    isolated_test!(settle_rebuild_keeps_coroutines);
+    use crate::types::{ClosureArgs, FnHeader, List, RegionArgsId};
+    std::env::set_var("RELAX_CACHE", "on");
+    crate::borrowck::lazy::disable_gandalf();
+    let dir = std::env::temp_dir().join(format!("relax-settle-coroutines-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::dirs::set_relax_dir(dir.join("run"));
+    let path = dir.join("lib.rs");
+    std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"settle_coroutines\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"lib.rs\"\n").unwrap();
+    std::fs::write(&path, "#![no_std]\nfn method<T>() {}\nfn owner() { let _ = || 1u32; let _ = async { 2u32 }; }\n").unwrap();
+    let mut session = crate::Session::default();
+    session.options.ctfe = crate::options::Ctfe::Off;
+    let session = std::sync::Arc::new(session);
+    let cfg = crate::cfg::CfgSet::host(&session, &[]);
+    let root = path.to_string_lossy().into_owned();
+    let pre = vec![crate::preload::PreCrate {
+        name: "settle_coroutines".into(), root: root.clone(), edition: 2021,
+        cfg: cfg.clone(), deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![],
+    }];
+    settle_rebuild::remember_boot(&pre);
+    let _compiler = crate::zone_alloc::compiler();
+    let mut prog = Program::new(&session);
+    prog.record_front = true;
+    prog.front_sink = Some(crate::cache::FrontSink::for_dir(&crate::dirs::cache_dir()));
+    prog.preload(pre.clone());
+    prog.load_crate("settle_coroutines", &root, 2021, cfg, vec![]).unwrap();
+    prog.resolve_imports();
+    assert!(prog.errors.is_empty(), "{:?}", prog.errors);
+    crate::cache::ColdFront::default().finish_in(&mut prog, crate::dirs::cache_dir());
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, 0);
+    let up = &mut *u as *mut Unit;
+    let named = |u: &Unit, name: &str| (0..u.prog.defs.len()).map(|d| DefId(d as u32)).find(|&d| u.prog.name(d) == name).unwrap();
+    let (method, owner) = (named(&u, "method"), named(&u, "owner"));
+    let file = u.prog.def(owner).file;
+    // the two types as the type check of `owner` makes them
+    let closure_ty = |tcx: &Tcx, expr: u32| {
+        let tys = &tcx.tys;
+        let sig = tys.intern(TyKind::FnPtr(List::EMPTY, tys.u32_, FnHeader::RUST, 0));
+        let parent = tys.intern(TyKind::FnDef(owner, List::EMPTY, RegionArgsId::EMPTY));
+        tys.intern(TyKind::Closure(file, expr, ClosureArgs {
+            parent_args: parent, closure_kind_ty: tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: tys.unit,
+        }))
+    };
+    let (exprs, types, slots) = crate::owner::call(crate::owner::Class::Program, || {
+        let cache = crate::cache::Cache::open(&u, crate::cache::Mode::On).unwrap();
+        u.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
+        let exprs = crate::program::closure_exprs(&u.prog, owner);
+        assert_eq!(exprs.len(), 2, "the closure, then the async block");
+        // ... the async block's marked a coroutine, as that type check (typeck coroutine_type) and
+        // a decoded cache key (dec_ty 28) do
+        u.tcx.coroutines.insert((file, exprs[1]), ());
+        let types = [closure_ty(&u.tcx, exprs[0]), closure_ty(&u.tcx, exprs[1])];
+        // an instance over each, made before the rebuild and not built yet: its slot outlives the
+        // context that knew what its type argument is
+        let slots = types.map(|ty| u.fn_id(FnKey::Inst(method, vec![ty])));
+        assert!(!u.tcx.is_coroutine(types[0]) && u.tcx.is_coroutine(types[1]));
+        (exprs, types, slots)
+    });
+    FIRST_PRESENT.store(true, Ordering::Release);
+    // the first rebuild records the image and restores it; the second restores the stored one (a
+    // warm launch's rebuild): each replaces the type context
+    for round in ["first", "second"] {
+        match settle_rebuild::run(up, false) {
+            settle_rebuild::Outcome::Done => {}
+            settle_rebuild::Outcome::Retry(why) | settle_rebuild::Outcome::Refused(why) => panic!("the {round} settle rebuild did not replace: {why}"),
+        }
+        crate::owner::call(crate::owner::Class::Program, || {
+            let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
+            for ((&ty, &slot), coroutine) in types.iter().zip(&slots).zip([false, true]) {
+                assert_eq!(u.fns[slot as usize].key, FnKey::Inst(method, vec![ty]), "the slot keeps its key");
+                assert_eq!(ty, closure_ty(&u.tcx, exprs[coroutine as usize]), "the key's type keeps its id in the new interner");
+                assert_eq!(u.tcx.is_coroutine(ty), coroutine, "after the {round} rebuild: the {} type of a slot made before it", if coroutine { "coroutine's" } else { "closure's" });
+                // a query that asks (Tcx::needs_drop: a coroutine always has its state to drop)
+                assert_eq!(u.tcx.needs_drop(&u.prog, env, ty), coroutine, "after the {round} rebuild");
+            }
+        });
+    }
+    assert_eq!(settle_rebuild::rebuilds(), 2);
+    // The isolated process owns the runtime globals; no workers survive the child.
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 // Rounds 49-50: restarting leaves the running solver answers and native code intact.
 #[test]
 fn round47_const_fn_body_invalidates_solver_answer() {
@@ -556,9 +653,84 @@ fn main() {}
     std::mem::forget(u);
 }
 
+/// A quit write's pass stays valid on its own: the exit's write may be skipped (the owner thread
+/// held past its wait, a harness's kill after the quit), and the next launch links what the pass
+/// wrote rather than build it again.
+#[test]
+fn the_next_launch_links_what_a_quit_writes_pass_stored_without_the_exits_write() {
+    const CHILD: &str = "RELAX_QUIT_PASS_TEST";
+    const DIR: &str = "RELAX_QUIT_PASS_TEST_DIR";
+    let Ok(phase) = std::env::var(CHILD) else {
+        let dir = std::env::temp_dir().join(format!("relax-quit-pass-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("input.rs"), r#"
+pub fn hot(out: &mut u32) {
+    let mut i = 0u32;
+    let mut sum = 0u32;
+    while i < 200 { sum = sum.wrapping_add(i); i += 1; }
+    *out = sum;
+}
+fn main() {}
+"#).unwrap();
+        for phase in ["quit", "next"] {
+            let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "jit::settle_tests::the_next_launch_links_what_a_quit_writes_pass_stored_without_the_exits_write", "--nocapture", "--test-threads=1"])
+                .env(CHILD, phase).env(DIR, &dir).env("RELAX_SPEC", "0"));
+            assert!(output.status.success(), "{phase}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        return;
+    };
+    crate::borrowck::lazy::disable_gandalf();
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::path::PathBuf::from(std::env::var_os(DIR).unwrap());
+    std::env::set_var("RELAX_CACHE_DIR", dir.join("cache"));
+    let session = std::sync::Arc::new(crate::Session::default());
+    let (prog, core, krate) = crate::load_with_std(&session, dir.join("input.rs").to_str().unwrap(), "quit_pass", false).unwrap();
+    let def = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = DefId(i as u32);
+        (d.krate == krate && prog.name(id) == "hot").then_some(id)
+    }).unwrap();
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    let (id, entry) = crate::owner::call(crate::owner::Class::Program, || {
+        let id = u.fn_id(FnKey::Inst(def, Vec::new()));
+        let mut cache = crate::cache::Cache::open(&u, crate::cache::Mode::ReadOnly).unwrap();
+        cache.mode = crate::cache::Mode::On;
+        u.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
+        if phase == "quit" {
+            let built = unsafe { compile_fn(up, id) }.unwrap();
+            let entry = u.install(id, &built.0, &built.2, built.1.clone(), 0).unwrap();
+            let mut cache = u.cache.take().unwrap();
+            cache.record_o2(&u, id, &built.0, &built.2, &built.1);
+            u.cache = Some(cache);
+            (id, entry)
+        } else {
+            let entry = unsafe { ready_code_locked(up, id) }.expect("the next launch links the quit write's code");
+            assert!(u.cache.as_ref().unwrap().stats.hits >= 1, "the code came from the quit write's store, not a build");
+            (id, entry)
+        }
+    });
+    if phase == "quit" {
+        // the quit write's pass, and no exit write after it (the process ends here)
+        let written = unsafe { crate::run::quit_write_pass(up) };
+        assert!(matches!(written, Some((n, _)) if n > 0), "the quit write's pass stored nothing: {written:?}");
+    }
+    let _ = id;
+    let mut result = 0u32;
+    unsafe { call_jit(up, entry, &mut result as *mut u32 as u64) }
+        .unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+    assert_eq!(result, 19900);
+    // As in the settling fixture, process exit owns the runtime's teardown.
+    std::mem::forget(u);
+}
+
 #[test]
 fn prebuild_link_needing_initializer_bails() {
-    // Rule I-PUB (remote-XR Sandbox on a node: "O3 build of slot N panicked: initializer inside a
+    // Rule I-PUB (a remote-XR app on a node: "O3 build of slot N panicked: initializer inside a
     // publish"): an O3 replacement's prebuild_callees linked a callee's stored entry inside a
     // publish; the entry names a static whose value the cache does not hold, so the link ran its
     // initializer there. The link is a take now: it bails, and the program's own link (or a
@@ -1448,8 +1620,8 @@ fn preempted_check_under_a_front_read_gives_way() {
 }
 
 /// The run monitor's settle sweep runs in steps, one owner request each (JITOWNER: one request
-/// over every slot held the owner 10-50 ms while a cold Fab's UI dragged): a main-thread request
-/// that comes during a step is served when that step ends, while the sweep still has steps to go,
+/// over every slot held the owner 10-50 ms while a large app's UI dragged on a cold start): a main-thread
+/// request that comes during a step is served when that step ends, while the sweep still has steps to go,
 /// and the stepped sweep still ends with every eligible slot's RIR and body taken (freed by its
 /// requester, not on the owner).
 #[test]

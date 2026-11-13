@@ -22,7 +22,9 @@
 //! the child host takes out of its environment into the child program's overlay at its start. Any
 //! other child gets the program's view as plain variables, without the run facts (`RUN_FACTS`: what
 //! the host says of this run) the program did not write; of those only the mount crosses, into a
-//! child in this process's folder or in the mount.
+//! child in this process's folder or in the mount. A shared workspace's run (vfs.rs SHARE) has a
+//! real folder, its checkout: a child in this process's folder runs there with no mount, as it does
+//! under cargo, and only a child started in a folder of the mount gets it, with the share's name.
 //!
 //! JIT-run code reaches the overlay through the loader's symbols (relax-compiler jit.rs
 //! `loader_symbol`): its `getenv` / `setenv` / `unsetenv` / `putenv` are `program_getenv` and the
@@ -44,10 +46,15 @@ pub const WORKSPACE: &[u8] = b"RELAX_WORKSPACE";
 pub const VFS: &[u8] = b"RELAX_VFS";
 pub const EDITS: &[u8] = b"RELAX_EDITS";
 pub const MOUNT: [&[u8]; 3] = [WORKSPACE, VFS, EDITS];
+/// A shared workspace's name (vfs.rs SHARE): what makes the mount a checkout's. It says how this
+/// run reads its own folder, so it is a run fact: a runner the program starts somewhere else never
+/// finds it and mounts its own folder under this run's name.
+pub const SHARE: &[u8] = b"RELAX_SHARE";
 /// Run facts: what the host says of this run, for this run again (a self-exec child) and nothing
 /// else; the mount also for a child in this process's folder or in the mount. The self-exec
-/// command line (Relax std's spawn of this program) and whether the run added its `--silent`.
-pub const RUN_FACTS: [&[u8]; 5] = [b"RELAX_SELF_EXEC", b"RELAX_SELF_EXEC_SILENT_ADDED", WORKSPACE, VFS, EDITS];
+/// command line (Relax std's spawn of this program; its first word is the program's own
+/// executable, relax-compiler selfexe.rs) and whether the run added its `--silent`.
+pub const RUN_FACTS: [&[u8]; 6] = [b"RELAX_SELF_EXEC", b"RELAX_SELF_EXEC_SILENT_ADDED", WORKSPACE, VFS, EDITS, SHARE];
 
 pub fn run_fact(name: &[u8]) -> bool {
     RUN_FACTS.iter().any(|n| same_name(n, name))
@@ -141,7 +148,8 @@ pub fn program_view(real: &[(Vec<u8>, Vec<u8>)], own: &[(Vec<u8>, Option<Vec<u8>
 /// program's view differs. Any other child: the program's view without the run facts the program
 /// did not write. The mount follows the child's folder: this process's keeps it, a virtual one
 /// names that folder, a real one names none (a self-exec child keeps the mount table its
-/// `--workspace-dir` reads).
+/// `--workspace-dir` reads). A shared workspace's (`SHARE` in `real`) is on disk: this process's
+/// folder is a real one there and keeps no mount, and a virtual one gets the share's name too.
 pub fn child_env(real: &[(Vec<u8>, Vec<u8>)], own: &[(Vec<u8>, Option<Vec<u8>>)], spawn: &Spawn) -> Env {
     let mut view = if spawn.clear { Env::new() } else { program_view(real, own) };
     for (k, v) in spawn.edits {
@@ -171,7 +179,7 @@ pub fn child_env(real: &[(Vec<u8>, Vec<u8>)], own: &[(Vec<u8>, Option<Vec<u8>>)]
     } else {
         let mut env = view;
         env.retain(|(k, _)| !run_fact(k) || wrote(k.as_slice()));
-        if matches!(spawn.dir, ChildDir::Same) && !spawn.clear {
+        if matches!(spawn.dir, ChildDir::Same) && !spawn.clear && host_value(SHARE).is_none() {
             for n in MOUNT {
                 if let Some(v) = host_value(n).filter(|_| !wrote(n)) {
                     set(&mut env, n, Some(v.as_slice()));
@@ -185,9 +193,12 @@ pub fn child_env(real: &[(Vec<u8>, Vec<u8>)], own: &[(Vec<u8>, Option<Vec<u8>>)]
         ChildDir::Virtual { workspace, vfs } => {
             set(&mut env, WORKSPACE, Some(workspace));
             set(&mut env, VFS, Some(vfs));
-            if !spawn.self_exec && !wrote(EDITS) {
-                if let Some(v) = host_value(EDITS) {
-                    set(&mut env, EDITS, Some(v.as_slice()));
+            if !spawn.self_exec {
+                // the edits folder over the mount and, of a shared workspace, its name
+                for n in [EDITS, SHARE] {
+                    if let Some(v) = host_value(n).filter(|_| !wrote(n)) {
+                        set(&mut env, n, Some(v.as_slice()));
+                    }
                 }
             }
         }
@@ -703,6 +714,21 @@ mod tests {
         assert_eq!(get(&launched, "RELAX_EDITS"), Some(&b"/app/edits"[..]), "a run fact the program gives its child is the child's");
         let cleared_foreign = child_env(&real, &own, &Spawn { edits: &[], clear: true, self_exec: false, dir: ChildDir::Same, host: &[] });
         assert_eq!(mount(&cleared_foreign), [None, None, None], "env_clear clears the mount of a foreign child in this process's folder");
+        // a shared workspace's run (vfs.rs SHARE): the same environment with its name
+        let mut shared = real.clone();
+        shared.push((b("RELAX_SHARE"), b("ws")));
+        let share = |env: &Env| get(env, "RELAX_SHARE").map(<[u8]>::to_vec);
+        let shared_same = child_env(&shared, &own, &Spawn { self_exec: false, ..spawn });
+        assert_eq!((mount(&shared_same), share(&shared_same)), ([None, None, None], None), "a shared workspace's foreign child in this process's folder runs on the checkout: no mount, no name");
+        let shared_real = child_env(&shared, &own, &Spawn { self_exec: false, dir: ChildDir::Real, ..spawn });
+        assert_eq!((mount(&shared_real), share(&shared_real)), ([None, None, None], None), "a shared workspace's foreign child in another real folder mounts nothing under this run's name");
+        let shared_virt = child_env(&shared, &own, &Spawn { self_exec: false, dir: ChildDir::Virtual { workspace: b"/ws/sub", vfs: b"mounts" }, ..spawn });
+        assert_eq!((mount(&shared_virt), share(&shared_virt)), ([Some(b("/ws/sub")), Some(b("mounts")), Some(b("/edits"))], Some(b("ws"))), "a shared workspace's mount crosses, with its name, into a foreign child in a folder of the mount");
+        let shared_self = child_env(&shared, &own, &spawn);
+        assert_eq!((mount(&shared_self), share(&shared_self)), (all.clone(), Some(b("ws"))), "a self-exec child of a shared workspace's run is that run again");
+        let named = vec![(b("RELAX_SHARE"), Some(b("other")))];
+        let shared_named = child_env(&shared, &own, &Spawn { edits: &named, self_exec: false, dir: ChildDir::Real, ..spawn });
+        assert_eq!(share(&shared_named), Some(b("other")), "a share name the program gives its child is the child's");
         let origin = vec![(b("RELAX_EXEC_ORIGIN_EPOCH"), b("12.5"))];
         let exec = child_env(&real, &own, &Spawn { host: &origin, ..spawn });
         assert_eq!(get(&exec, "RELAX_EXEC_ORIGIN_EPOCH"), Some(&b"12.5"[..]), "std's plumbing values reach the child's host");

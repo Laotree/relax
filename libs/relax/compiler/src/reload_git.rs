@@ -25,8 +25,10 @@ pub(super) struct Snapshot {
 impl Repositories {
     pub fn include<'a>(&mut self, paths: impl Iterator<Item = &'a str>) {
         for path in paths {
-            if crate::vfs::is_virtual(path) { continue; }
-            let mut at = Path::new(path).parent();
+            // (a store's file is in no repository on disk; a folder mount's is in its checkout's)
+            if crate::vfs::in_store(path) { continue; }
+            let disk = crate::vfs::on_disk(path);
+            let mut at = Path::new(&*disk).parent();
             let mut visited = Vec::new();
             let mut found = None;
             while let Some(dir) = at {

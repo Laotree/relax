@@ -824,8 +824,10 @@ impl Tcx {
         }
         match (Providers { tcx: self, prog }).const_eval_resolve(ConstEvalKey { typing_env, def, args: args.into() }) {
             Ok(value) => value,
-            // a constant that needs its own value: E0391 (rustc report_cycle)
+            // a constant that needs its own value: E0391 (rustc report_cycle); the caller goes on
+            // with a recovery value
             Err(QueryError::Cycle(_)) => {
+                crate::cycle::note_stand_in();
                 let d = prog.def(def);
                 self.dcx.report(crate::next_solver::fulfill::ObligationCause {
                     body_id: def, span: prog.files[d.file as usize].ast.item(d.item).lo,

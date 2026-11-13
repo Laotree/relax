@@ -37,7 +37,7 @@ pub struct Options {
     pub builtins: bool,
     pub launch: Vec<String>,
     /// A capability passed with every call (`caller=` of the `app` request): the app that
-    /// issued it (Scope, per agent lane) decides what the caller may do.
+    /// issued it (an app, per agent lane) decides what the caller may do.
     pub caller: Option<String>,
 }
 

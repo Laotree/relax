@@ -64,7 +64,7 @@ pub(crate) fn const_copy(u: &Unit, addr: u64) -> u64 {
 /// static initializer that runs as code fills its promoted temporaries (`&CONST` /
 /// `&[..]` borrows lowered as a per-domain block written by the initializer, lower.rs
 /// promote_rvalue) in the compile domain only; without their images every other domain's copy
-/// of the static pointed at zeroed blocks (Sandbox's race kit read each event payload's
+/// of the static pointed at zeroed blocks (a game's kit read each event payload's
 /// FieldDefs as zeros: no names). `rehome` does the same for constants.
 pub(crate) fn capture_static(u: &Unit, sym: Sym) {
     crate::sandbox::capture_initial_data(u, sym);
@@ -1858,7 +1858,7 @@ unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize]
             record_loaded(idents[ci], added.crates[b], &g.crates[ci], &cfgs[ci]);
         }
         // provided crates (rustc-built into the loader) that only this app brings, like the
-        // compute crate for Stage, bind their ops now, as the booted program's do
+        // compute crate for an app, bind their ops now, as the booted program's do
         { let _fw = crate::jit::front_write(); u.bind_added_provided(&added.crates); }
     }
     if cancelled(id) { return Err(vec!["domain compilation cancelled".into()]); }

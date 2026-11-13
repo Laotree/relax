@@ -295,7 +295,7 @@ pub fn run(opts: Options) -> Result<(), String> {
     // APK builder packages per crate (cargo makepad android): the archive holds the sources
     let assets_in_apk = opts.target.as_deref().is_some_and(|t| t.contains("android"));
     // ... except the packed apps' own `resources/`: an app reads its data there by path
-    // (CARGO_MANIFEST_DIR/resources: Sandbox's bundled games), which APK assets cannot serve (no
+    // (CARGO_MANIFEST_DIR/resources: an app's bundled games), which APK assets cannot serve (no
     // folder listing)
     let apps: BTreeSet<&str> = opts.packages.iter().map(|(name, _)| name.as_str()).collect();
     let is_app = |dir: &str| {
@@ -311,7 +311,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         walk(&root, &res, &mut files)?;
     }
     // data a crate reads by a path outside its own folder, declared in its manifest:
-    // `[package.metadata.relax] data = ["../../../engine/resources/kits"]` (Sandbox's game
+    // `[package.metadata.relax] data = ["../../../engine/resources/kits"]` (an app's game
     // script reads the engine's kits so; without them a store run's games fail to load)
     for p in graph.iter() {
         let manifest = if p.is_empty() { "Cargo.toml".to_string() } else { format!("{p}/Cargo.toml") };

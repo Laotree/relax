@@ -531,7 +531,7 @@ fn specv_aliased_call_from_unverified_body() {
 /// SPEC-V (lane SPECHITCH): a caller that ran as unverified code (its aliasing-prone calls went to
 /// the callees' twins) and is rebuilt as verified code once its verdict is clean calls the base
 /// slots, which never had code. Before: its next call compiled them lazily on the calling thread
-/// (the Sandbox's frame path: ~550 lazy installs in one 70-560 ms frame). Now they run their twins'
+/// (a large app's frame path: ~550 lazy installs in one 70-560 ms frame). Now they run their twins'
 /// code until their own builds (background) are installed: no lazy compile on the program thread.
 /// The verdicts are held (SPECV_HOLD) so the first run is unverified whatever the checker's speed;
 #[test]
@@ -1353,9 +1353,9 @@ fn restored_images_take_live_edits() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// std::relax::realtime for arming a machine (the Fab arms experiment): `compiled` is the strict ready (the whole
-/// reach compiled, never "the wait ran out"), `lazy` counts what would still compile on a call, and
-/// an armed root freezes live edits of real-time code (refused "frozen", applied at the disarm)
+/// std::relax::realtime for arming a machine (an app's arms experiment): `compiled` is the strict ready
+/// (the whole reach compiled, never "the wait ran out"), `lazy` counts what would still compile on a call,
+/// and an armed root freezes live edits of real-time code (refused "frozen", applied at the disarm)
 /// while edits of other code patch as usual.
 #[test]
 fn realtime_strict_ready_lazy_and_patch_freeze() {
@@ -1447,7 +1447,7 @@ fn realtime_thread_marks_the_calling_thread() {
     assert!(!std::thread::spawn(crate::jit::is_realtime_thread).join().unwrap(), "another thread is not marked");
 }
 
-/// A Fab arms run's hole: the marked root calls through `dyn Route` (its value holds no trait object),
+/// An app's arms run's hole: the marked root calls through `dyn Route` (its value holds no trait object),
 /// and other code makes the first `Box<Ded> -> Box<dyn Route>` after the mark, and a second type's
 /// after the reach is done. The root's lowering names the trait object it calls through, so the
 /// reach follows its vtables: the strict ready is false the moment a new one is made (polled
@@ -1515,7 +1515,7 @@ fn realtime_reach_follows_vtables_made_after_the_mark() {
         id.is_some_and(|id| u.fns[id as usize].compiled)
     });
     let compiled = |t| crate::jit::__relax_realtime_compiled(t);
-    // the mark, then at once the first unsizing (a Fab arms run's order), polled right after it ran
+    // the mark, then at once the first unsizing (an app's arms run's order), polled right after it ran
     let ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![root]) });
     call(start_e);
     assert!(!compiled(ticket) || next_built(), "compiled right after the first `Box<Ded> -> Box<dyn Route>`, with `<Ded as Route>::next` lazy");
@@ -1597,7 +1597,7 @@ fn realtime_reach_follows_trait_objects_held_deep_in_the_roots_value() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// The fast bucket's red Sandbox present (`<ScriptErrorRecord as Debug>` built ahead, not provided):
+/// An app's red present in the fast bucket (`<ScriptErrorRecord as Debug>` built ahead, not provided):
 /// the reach followed every vtable of every trait-object type real-time code calls through, and
 /// std's own are the whole program (a formatter's `dyn Write`, derived Debug's `dyn Debug`, a
 /// `Once`'s `dyn FnMut`, a table's hasher, a thread's `dyn FnOnce`). Here the root passes its own
@@ -1668,7 +1668,7 @@ fn realtime_reach_skips_trait_objects_it_only_makes_itself() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// A Fab run's misses on a node (24 lazy compiles on the real-time thread, drop glue of generic
+/// An app run's misses on a node (24 lazy compiles on the real-time thread, drop glue of generic
 /// containers and core::fmt's float path): code ran before the mark (the planner's simulation), so
 /// the reach found slots compiled already whose RIR was dropped after their install. A drop glue's
 /// references were never read again (only fns' RIR was rebuilt), and with a disk cache a lookup
@@ -1750,7 +1750,7 @@ fn wait_realtime_compiled(ticket: u64) {
     }
 }
 
-/// What a Fab run's misses on a node were, on a cold store: the marked root formats floats
+/// What an app run's misses on a node were, on a cold store: the marked root formats floats
 /// (core::fmt's float path is reached through the formatter fn pointer an `Argument` holds, data the
 /// reach reads) and drops containers (`Vec`, `vec::IntoIter`, `array::IntoIter`, `Weak`: drop glue
 /// of generic types). Nothing else ran before the mark: the reach alone compiles them, and the
@@ -1826,7 +1826,7 @@ fn realtime_reach_covers_float_formatting_and_container_drops() {
 /// compiled before the new code is installed, the old code running meanwhile, so the real-time
 /// thread meets no lazy compile. An install whose references were not walked before it is a hole
 /// the install says and counts (realtime_holes), so a pass never rests on the walk after it
-/// winning the race against the real-time thread. (Fab's arm lab met such compiles of thread-local
+/// winning the race against the real-time thread. (An app's arm lab met such compiles of thread-local
 /// accessors in its armed loop.)
 #[test]
 fn realtime_tier_up_compiles_new_callees_before_its_install() {
@@ -1929,7 +1929,7 @@ fn realtime_tier_up_compiles_new_callees_before_its_install() {
 /// of it. An earlier run stored `run`'s O2 code (the generic `twice` inlined, `more` called); this
 /// run installs baseline code for it, which calls `twice` (code built before its key's entry was
 /// there, or placed from a startup image older than the entry). The walk must follow the installed
-/// code's calls: the fab arm lab's loop met lazy compiles of closures that only the code it ran
+/// code's calls: an app's arm lab's loop met lazy compiles of closures that only the code it ran
 /// called (11-11).
 #[test]
 fn realtime_reach_reads_the_installed_code() {
@@ -2043,7 +2043,7 @@ fn realtime_reach_reads_the_installed_code() {
     std::mem::forget(u);
 }
 
-/// Calls the root's code makes through data other code filled: a trait object in a static (Fab's
+/// Calls the root's code makes through data other code filled: a trait object in a static (an app's
 /// slicer `FAN_OUT`, set by the app, read on the cell's loop), filled after the mark, and a fn
 /// pointer in the root's value, filled before it. Neither target is named by code the reach
 /// walks; the static's type (the code names the static) and the fn pointer's signature (every
@@ -2126,7 +2126,7 @@ fn realtime_reach_follows_calls_through_statics_and_fn_pointers() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// Fab's live edit on a node (ICEs "key in collected table", "variance declaration"): a new module
+/// An app's live edit on a node (ICEs "key in collected table", "variance declaration"): a new module
 /// file whose structs (a `#[cfg(relax)]` field of a std type among them) an existing struct holds
 /// in `Option` fields, filled through `get_or_insert_with`. The edit patches, the new code runs.
 #[test]
@@ -2238,7 +2238,7 @@ impl RtPath {
 }
 
 /// A live edit that renames a struct field finds the fns using it from the field uses typeck
-/// resolved. A generic fn whose body names the old field's name (`window`'s local `plans`, fab
+/// resolved. A generic fn whose body names the old field's name (`window`'s local `plans`, an app's
 /// slice's `FieldPlans::window`) is read as typeck left it: instantiating it at its own
 /// parameters for codegen has no answer (`<impl IntoIterator as IntoIterator>::IntoIter`), and
 /// the edit failed as an internal compiler error (NoSolution).

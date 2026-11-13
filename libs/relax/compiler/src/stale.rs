@@ -9,7 +9,8 @@
 //!   panel shows like a parked panic), pauses the program's threads so the state stays inspectable,
 //!   and waits for a decision: `restart` (the process starts again) or `stop` (the process ends by
 //!   the fault's signal). With nobody who could decide (no Run panel, no inspect
-//!   watcher or agent; RELAX_STALE_PARK=1 forces the park) the report is followed by `stop`.
+//!   watcher or agent; a test run's or an unattended run's is its own: events::can_decide;
+//!   RELAX_STALE_PARK=1 forces the park) the report is followed by `stop`.
 //!   A quit (a signal, the app's own quit) ends the wait as its domain's stop does: the program
 //!   goes on so its quit runs to the end (inspect::events::quit_releases).
 //!
@@ -302,7 +303,8 @@ fn wait() {
     std::thread::sleep(std::time::Duration::from_millis(250));
 }
 
-/// Somebody can answer a parked stale access: the Run panel, an inspect watcher or agent.
+/// Somebody can answer a parked stale access: the Run panel, an inspect watcher or agent, devhub
+/// (not for a test run or an unattended run).
 fn decidable() -> bool {
     std::env::var_os("RELAX_STALE_PARK").is_some_and(|v| v != "0") || crate::inspect::events::can_decide()
 }
@@ -412,9 +414,12 @@ fn handle(rec: &Rec) {
         None
     };
     let frames = crate::jit::stale_frames(pc, &raw);
+    // decided once: what the lines say is what happens
+    let parks = decidable();
+    let fate = if parks { "the thread is parked, nothing unwound" } else { "the process ends, nothing unwound" };
     let message = match &how {
-        Some(_) => format!("stale access into the {} `{}` at {:#x}: code that never runs again (it was invalidated: {}); the thread is parked, nothing unwound", r.kind, r.name, addr, r.reason),
-        None => format!("stale access into the {} `{}` at {:#x}: its memory is never reused (a stale pointer); the thread is parked, nothing unwound", r.kind, r.name, addr),
+        Some(_) => format!("stale access into the {} `{}` at {:#x}: code that never runs again (it was invalidated: {}); {fate}", r.kind, r.name, addr, r.reason),
+        None => format!("stale access into the {} `{}` at {:#x}: its memory is never reused (a stale pointer); {fate}", r.kind, r.name, addr),
     };
     let report = crate::jit::stale_report(&message, &frames, addr);
     eprintln!("relax: {}\n  report: {}", message, report);
@@ -426,13 +431,15 @@ fn handle(rec: &Rec) {
     let thread = crate::inspect::threads::list().into_iter().find(|t| t.os_id == os_id).map(|t| t.name.clone()).unwrap_or_else(|| os_id.to_string());
     let into = where_in(r, addr);
     let age_ms = crate::clock::wall_ns().saturating_sub(r.retired_ns) / 1_000_000;
+    let site = site_of(&frames);
+    let then = if parks { "its thread is parked, the app paused" } else { "the process ends" };
     let verdict = match &how {
         Some(how) => format!(
-            "stale access: thread `{}` (tid {}) ran code at {:#x} = {} `{}` v{} + {:#x} ({}), invalidated {} ms before ({}; flightrec stale.retire at {} ns). HOW: {}. Its thread is parked, the app paused",
+            "stale access: thread `{}` (tid {}) ran code at {:#x} = {} `{}` v{} + {:#x} ({}) in {site}, invalidated {} ms before ({}; flightrec stale.retire at {} ns). HOW: {}; {then}",
             thread, os_id, pc, r.kind, r.name, r.version, pc - r.lo, into, age_ms, r.reason, r.retired_ns, how
         ),
         None => format!(
-            "stale access: thread `{}` (tid {}) read/wrote {:#x} = {} `{}` v{} + {:#x} ({}), retired {} ms before ({}; flightrec stale.retire at {} ns); the faulting frame is the first of the report's backtrace (fn, tier, code version); its thread is parked, the app paused",
+            "stale access: thread `{}` (tid {}) read/wrote {:#x} = {} `{}` v{} + {:#x} ({}) in {site}, retired {} ms before ({}; flightrec stale.retire at {} ns); the faulting frame is the first of the report's backtrace (fn, tier, code version); {then}",
             thread, os_id, addr, r.kind, r.name, r.version, addr - r.lo, into, age_ms, r.reason, r.retired_ns
         ),
     };
@@ -440,8 +447,11 @@ fn handle(rec: &Rec) {
         eprintln!("relax: stale access: {}", h);
     }
     crate::zone_alloc::kept_with(|| ANSWERS.lock().unwrap_or_else(|e| e.into_inner()).push((verdict.clone(), report.clone())));
-    if !decidable() {
-        eprintln!("relax: nobody can decide on the stale access (no Run panel, inspect watcher or agent; RELAX_STALE_PARK=1 parks): the process ends");
+    if !parks {
+        // (nobody asks `stale` or `stacks` after this: the module, its version, what was touched
+        // and the access site are all on this line)
+        eprintln!("relax: {verdict}");
+        eprintln!("relax: nobody can decide on the stale access (no Run panel, inspect watcher or agent, or a test or unattended run; RELAX_STALE_PARK=1 parks): the process ends");
         crate::os::fault::die_by(sig);
     }
     // (a paused process must answer: `makepad test` and hosted runs may not have started inspect)
@@ -450,6 +460,18 @@ fn handle(rec: &Rec) {
     eprintln!("relax: the app is paused ({} threads held) -- decide: {tool} inspect {} resume <id> restart | stop (the Run panel offers both)", paused, std::process::id(), tool = crate::tool_name());
     let decision = crate::inspect::events::park_stale(rec.os_id.load(Ordering::Relaxed), domain, &message, &frames);
     decided(decision, sig, "stale access");
+}
+
+/// Where a stale access happened: its first frame, "`fn` at file:line:col".
+fn site_of(frames: &[u64]) -> String {
+    let Some(&pc) = frames.first() else { return "an unknown frame".to_string() };
+    let mut partial = Vec::new();
+    let first = crate::zone_alloc::kept_with(|| crate::inspect::symbolise_within(&[vec![pc]], &mut partial, 500)).into_iter().next().and_then(|f| f.into_iter().next());
+    match first {
+        Some(f) if !f.at.is_empty() => format!("`{}` at {}", f.name, f.at),
+        Some(f) if !f.name.is_empty() => format!("`{}` ({:#x})", f.name, pc),
+        _ => format!("an unnamed frame ({:#x})", pc),
+    }
 }
 
 /// What the watcher told, for `makepad inspect <pid> stale`: (verdict line, report JSON).

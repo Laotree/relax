@@ -89,8 +89,8 @@ fn server_thread_exit() {
     SERVER_TIDS.lock().unwrap().retain(|t| *t != me);
 }
 
-/// A test harness's endpoint: there to answer when the run hangs. A test's panic is the test's
-/// (nothing parks), and its output says nothing about the endpoint.
+/// A test harness's endpoint: there to answer when the run hangs. A test's panic and stale access
+/// are the test's (nothing parks), and its output says nothing about the endpoint.
 static TEST_RUN: AtomicBool = AtomicBool::new(false);
 
 /// [`start`] for a test run.
@@ -105,7 +105,7 @@ pub fn say_why_hung(what: &str) {
         hang::why_hung(req, out);
     }
     let _k = crate::zone_alloc::kept();
-    let (bytes, _) = makepad_remote::cmd::answer(answer, "why-hung");
+    let bytes = makepad_remote::cmd::answer(answer, "why-hung");
     eprintln!("relax: {what}: where the threads wait:\n{}", String::from_utf8_lossy(&bytes));
 }
 
@@ -276,11 +276,11 @@ fn dispatch(req: &Req, out: &mut Out) {
     let _act = activity::begin(req);
     dispatch_command(req, out);
     if crate::run_threads::ending() {
-        out.always("{\"run_ended\":true,\"why\":\"the run this answers about ended while it was asked\"}");
+        out.line("{\"run_ended\":true,\"why\":\"the run this answers about ended while it was asked\"}");
     }
     // SPEC-V: the client prints the answer's rows, not its end line (which says `verified` too)
     if !crate::reload::observations_verified() && !matches!(req.cmd.as_str(), "help" | "ping" | "events" | "watch") {
-        out.always("{\"verified\":false,\"why\":\"a patched fn runs before its borrow-check verdict; a failed verdict reverts it and the patchreverted event lists the observations it invalidates\"}");
+        out.line("{\"verified\":false,\"why\":\"a patched fn runs before its borrow-check verdict; a failed verdict reverts it and the patchreverted event lists the observations it invalidates\"}");
     }
 }
 
@@ -424,23 +424,23 @@ fn dispatch_command(req: &Req, out: &mut Out) {
         "help" => help(req, out),
         "inputs" => {
             // `of`: the paths asked about, one per line (a live session's saves): only those are
-            // looked at; every input path cost the owner 25-40 ms an edit (Fab, 11-04)
+            // looked at; every input path cost the owner 25-40 ms an edit (an app, 11-04)
             let of: Vec<&str> = req.get("of").map_or_else(Vec::new, |v| v.lines().filter(|l| !l.is_empty()).collect());
             let keep = |p: &str| of.is_empty() || of.iter().any(|a| ends_with_rel(p, a.trim_start_matches("../")));
             match crate::reload::input_paths(&keep) {
                 Ok(paths) => {
                     let paths: Vec<_> = paths.into_iter().filter(|p| (of.is_empty() || of.contains(&p.as_str())) && p.contains(req.get("match").unwrap_or(""))).collect();
                     // Callers use absence to skip a patch wait: never truncate this source list.
-                    out.always(&format!("{{\"count\":{}}}", paths.len()));
+                    out.line(&format!("{{\"count\":{}}}", paths.len()));
                     for path in crate::reload::outside_packages(of.iter().copied().filter(|a| !paths.iter().any(|p| p == a))) {
-                        out.always(&format!("{{\"outside\":{}}}", json_str(path)));
+                        out.line(&format!("{{\"outside\":{}}}", json_str(path)));
                     }
                     for path in crate::reload::read_by_program(of.iter().copied().filter(|a| !paths.iter().any(|p| p == a)), &ends_with_rel) {
-                        out.always(&format!("{{\"read\":{}}}", json_str(path)));
+                        out.line(&format!("{{\"read\":{}}}", json_str(path)));
                     }
                     for path in paths {
                         if out.cancelled() { break; }
-                        out.always(&format!("{{\"path\":{}}}", json_str(&path)));
+                        out.line(&format!("{{\"path\":{}}}", json_str(&path)));
                     }
                 }
                 Err(e) => out.err(&e),
@@ -613,7 +613,7 @@ fn with_by(req: &Req) -> Req {
 fn help(req: &Req, out: &mut Out) {
     if req.pos.first().map(String::as_str) == Some("schema") {
         // one line longer than a reply's byte limit (`line` would drop it whole): always written
-        out.always(&schema());
+        out.line(&schema());
         return;
     }
     out.measured("commands", "static", &[]);
@@ -1733,7 +1733,7 @@ pub fn host_file_query(path: &str, words: &[String]) -> Option<i32> {
             out.err("no provider answered");
         }
     }
-    let (bytes, _) = makepad_remote::cmd::answer(dispatch, &line);
+    let bytes = makepad_remote::cmd::answer(dispatch, &line);
     let text = String::from_utf8_lossy(&bytes);
     print!("{text}");
     Some(if text.lines().any(|l| l.starts_with("{\"err\":")) { 1 } else { 0 })
@@ -1756,11 +1756,10 @@ fn cmd_host_provided(req: &Req, out: &mut Out) -> bool {
 }
 
 /// A command the running program answers itself: `query(line, sink, ctx)` gets the request as the
-/// host received it (one flat JSON object), applies the request's own size rule (`full=1`) and
-/// writes the reply's JSON lines through `sink` as it produces them (chunks, not lines; called
-/// from the inspect thread, the program's code does its own thread hand-over). Returns whether
-/// it cut the reply at the limit.
-pub type ProgramQuery = extern "C" fn(line: *const u8, len: usize, sink: extern "C" fn(*const u8, usize, *mut std::ffi::c_void), ctx: *mut std::ffi::c_void) -> bool;
+/// host received it (one flat JSON object) and writes the reply's JSON lines through `sink` as it
+/// produces them (chunks, not lines; called from the inspect thread, the program's code does its
+/// own thread hand-over).
+pub type ProgramQuery = extern "C" fn(line: *const u8, len: usize, sink: extern "C" fn(*const u8, usize, *mut std::ffi::c_void), ctx: *mut std::ffi::c_void);
 
 static PROVIDERS: relax_session::sync::Mutex<Vec<(String, ProgramQuery, crate::domain::Callback)>> = relax_session::sync::Mutex::new(Vec::new());
 
@@ -1811,21 +1810,17 @@ fn cmd_provided(req: &Req, out: &mut Out) {
         reply.pending.extend_from_slice(unsafe { std::slice::from_raw_parts(p, len) });
         while let Some(nl) = reply.pending.iter().position(|b| *b == b'\n') {
             let l: Vec<u8> = reply.pending.drain(..=nl).collect();
-            // the program applied the size rule itself: not metered again here
-            reply.out.always(String::from_utf8_lossy(&l[..nl]).as_ref());
+            reply.out.line(String::from_utf8_lossy(&l[..nl]).as_ref());
         }
     }
     let mut reply = ProvidedReply { out, pending: Vec::new() };
-    let Some(truncated) = scope.call(|| query(line.as_ptr(), line.len(), sink, &mut reply as *mut ProvidedReply as *mut std::ffi::c_void)) else {
+    let Some(()) = scope.call(|| query(line.as_ptr(), line.len(), sink, &mut reply as *mut ProvidedReply as *mut std::ffi::c_void)) else {
         reply.out.err("the app domain is not running (or its run ended while it answered)");
         return;
     };
     if !reply.pending.is_empty() {
         let rest = String::from_utf8_lossy(&reply.pending).into_owned();
-        reply.out.always(&rest);
-    }
-    if truncated {
-        reply.out.truncated = true;
+        reply.out.line(&rest);
     }
 }
 
@@ -2045,16 +2040,16 @@ mod tests {
         assert!(error.contains("unknown parameter") && error.contains("known:") && error.contains("sort"), "{error}");
         assert!(super::pf::split(&["frames".into(), "n=1".into(), "s=1".into()]).is_ok());
         for command in ["session", "timeline start", "timeline stop", "timeline frames", "timeline waits", "heap start", "heap top", "heap life", "jit", "jit queue", "prof", "watch", "mem timeline", "eval", "probe add", "src", "vm roots", "verbs on", "sprobe add"] {
-            let (bytes, _) = makepad_remote::cmd::answer(super::dispatch_command, &format!("{command} typo=1"));
+            let bytes = makepad_remote::cmd::answer(super::dispatch_command, &format!("{command} typo=1"));
             let answer = String::from_utf8(bytes).unwrap();
             assert!(answer.contains("unknown parameter") && answer.contains("typo") && answer.contains("known:"), "{command}: {answer}");
         }
-        let (bytes, _) = makepad_remote::cmd::answer(super::dispatch_command, "frobnicate");
+        let bytes = makepad_remote::cmd::answer(super::dispatch_command, "frobnicate");
         let unknown = String::from_utf8(bytes).unwrap();
         assert!(unknown.contains("unknown command `frobnicate`: ") && unknown.contains("why-hung, ") && unknown.contains("(`help` describes each)"), "an unknown command names the known ones: {unknown}");
         assert_eq!(unknown.matches(" session,").count(), 1, "each command's first word once: {unknown}");
         for command in ["timeline stop n=2", "jit queue ms=1", "heap stop rate=1", "vm roots depth=1"] {
-            let (bytes, _) = makepad_remote::cmd::answer(super::dispatch_command, command);
+            let bytes = makepad_remote::cmd::answer(super::dispatch_command, command);
             let answer = String::from_utf8(bytes).unwrap();
             assert!(answer.contains("unknown parameter"), "{command}: {answer}");
         }
@@ -2080,7 +2075,7 @@ mod tests {
         std::env::set_var("MAKEPAD_HOME", &home);
         std::env::set_var("RELAX_LIVE_LOG", home.join("live.jsonl"));
         super::run_view::publish("\"over_app\":false,\"patch_failed\":false,\"patch_notice\":null".into());
-        let view = || String::from_utf8(makepad_remote::cmd::answer(super::dispatch_command, "session view").0).unwrap();
+        let view = || String::from_utf8(makepad_remote::cmd::answer(super::dispatch_command, "session view")).unwrap();
         assert!(view().contains("\"restart_waiting\":[]"), "{}", view());
         let why = "src/chat.rs: struct `Sent` changed: its layout changed; live values would be read with the old field offsets (live migration is not built yet) -- restart the app";
         crate::reload::offer_restart(why);

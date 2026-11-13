@@ -567,18 +567,14 @@ impl Command {
         make_envp(map)
     }
 
-    /// Under `makepad run` the program's executable is Relax itself: spawning it runs this
-    /// program again (Relax's command line up to `--`, then the new arguments). A spawn of the
-    /// loader whose first argument is `run` or `app` is a launcher starting another program through
-    /// it (`$RELAX_LOADER run [flags] <package> ...`, `... app <id>`), and one whose first argument is
-    /// `export` asks the loader for a source tree (the runner's Install natively): those run as written. `program` is the
-    /// resolved executable (NUL-terminated UTF-16, with its `.exe`); the result is the argument
-    /// list after argv[0] to run instead of this command's.
+    /// Under `makepad run` the program's executable is its own hard link of Relax (Relax
+    /// selfexe.rs, the first word of RELAX_SELF_EXEC): spawning it runs this program again
+    /// (Relax's command line up to `--`, then the new arguments), whatever they are. A spawn of
+    /// the loader by its own name (`$RELAX_LOADER run <package>`, `... test`) is not this path, and
+    /// runs as written. `program` is the resolved executable (NUL-terminated UTF-16, with its
+    /// `.exe`); the result is the argument list after argv[0] to run instead of this command's.
     fn self_exec_args(&self, program: &[u16]) -> Option<Vec<Arg>> {
         let pre = crate::env::host_var_os("RELAX_SELF_EXEC")?.into_string().ok()?;
-        if self.args.first().is_some_and(|a| matches!(a.as_os_str().as_encoded_bytes(), b"run" | b"app" | b"export")) {
-            return None;
-        }
         // inside a build script (RELAX_AS_RUSTC): its spawns of this executable are RUSTC
         // questions, answered as written (relax_as_rustc); re-running the script would recurse
         if crate::env::host_var_os("RELAX_AS_RUSTC").is_some() {
@@ -588,9 +584,10 @@ impl Command {
         let exe = Path::new(parts[0]);
         let resolved = OsString::from_wide(strip_nul(program));
         let p = crate::fs::canonicalize(Path::new(&resolved)).ok()?;
-        // the Relax executable itself, or a copy of it (makepad-cef re-execs the program from a
-        // copy of its executable inside a synthetic app bundle): the copy runs this program
-        if p.as_path() != exe && !same_file_contents(p.as_path(), exe) {
+        // the program's own executable, or a copy of it (makepad-cef re-execs the program from a
+        // copy of its executable inside a synthetic app bundle): the copy runs this program. The
+        // loader by another name has the same contents but is the same file as the link, not a copy.
+        if p.as_path() != exe && !(same_file_contents(p.as_path(), exe) && !same_file(p.as_path(), exe)) {
             return None;
         }
         let mut out: Vec<Arg> = Vec::new();
@@ -1346,6 +1343,16 @@ fn env_map_set(map: &mut Vec<(OsString, OsString)>, k: OsString, v: Option<OsStr
 }
 
 /// Whether two files have the same bytes (a copy of an executable).
+/// Whether `a` and `b` name one file (one volume, one file index: two names of a hard link).
+fn same_file(a: &Path, b: &Path) -> bool {
+    use crate::os::windows::fs::MetadataExt;
+    let id = |p: &Path| {
+        let m = File::open(p).and_then(|f| f.metadata()).ok()?;
+        Some((m.volume_serial_number()?, m.file_index()?))
+    };
+    matches!((id(a), id(b)), (Some(x), Some(y)) if x == y)
+}
+
 fn same_file_contents(a: &Path, b: &Path) -> bool {
     match (crate::fs::metadata(a), crate::fs::metadata(b)) {
         (Ok(x), Ok(y)) if x.len() == y.len() => {}

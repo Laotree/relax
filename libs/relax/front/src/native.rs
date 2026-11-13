@@ -160,6 +160,10 @@ const C_FREE_WITH_FEATURE: [(&str, &str); 1] = [("blake3", "pure")];
 pub enum NativeReason {
     /// a build-dependency on one of [`BUILD_DEPS`] (its extern name)
     CompilesC(String),
+    /// the script links a static archive it builds itself with another toolchain (a `swiftc`
+    /// or `ar` it runs directly, no `cc` crate): a run cannot load an archive, so cargo builds
+    /// the package like a `cc` one and the archive joins the native library
+    StaticArchive,
     /// `links =` in the manifest
     Links,
     /// the script reads another package's `DEP_*` metadata
@@ -170,13 +174,14 @@ impl NativeReason {
     /// The script runs a C compiler (or a native build tool): it cannot run without one, so
     /// without `--allow-c` a run refuses it and a check skips it.
     pub fn compiles_c(&self) -> bool {
-        matches!(self, NativeReason::CompilesC(_))
+        matches!(self, NativeReason::CompilesC(_) | NativeReason::StaticArchive)
     }
 
     /// `<package>: <reason>`, as the C gate's messages print it.
     pub fn describe(&self, pkg: &str) -> String {
         match self {
             NativeReason::CompilesC(dep) => format!("{}: build-dependency {}", pkg, dep),
+            NativeReason::StaticArchive => format!("{}: links a static archive its script builds", pkg),
             NativeReason::Links => format!("{}: links =", pkg),
             NativeReason::DepMetadata => format!("{}: reads DEP_ metadata", pkg),
         }
@@ -192,6 +197,9 @@ pub fn native_reason(g: &Graph, bs: &BuildScript) -> Option<NativeReason> {
             return Some(NativeReason::CompilesC(ext.clone()));
         }
     }
+    if links_static_archive(&crate::vfs::read_to_string(&bs.src_path).unwrap_or_default()) {
+        return Some(NativeReason::StaticArchive);
+    }
     let manifest = crate::vfs::read_to_string(format!("{}/Cargo.toml", dir)).unwrap_or_default();
     let links = manifest.lines().any(|l| {
         let l = l.trim();
@@ -206,6 +214,29 @@ pub fn native_reason(g: &Graph, bs: &BuildScript) -> Option<NativeReason> {
     None
 }
 
+/// Whether a build script's source prints a plain `rustc-link-lib=static=` (or `static:+mods=`)
+/// directive. A `-bundle` static link names a library the toolchain already has (a compiler
+/// runtime), not one the script built.
+fn links_static_archive(src: &str) -> bool {
+    src.match_indices("rustc-link-lib=static").any(|(i, m)| {
+        let rest = &src[i + m.len()..];
+        rest.starts_with('=') || (rest.starts_with(':') && !rest[1..].starts_with("-bundle"))
+    })
+}
+
+#[cfg(test)]
+mod static_archive_tests {
+    use super::links_static_archive;
+
+    #[test]
+    fn a_script_built_archive_is_native_and_a_toolchain_runtime_is_not() {
+        assert!(links_static_archive(r#"println!("cargo:rustc-link-lib=static=speech_bridge");"#));
+        assert!(links_static_archive(r#"println!("cargo::rustc-link-lib=static:+whole-archive=foo");"#));
+        assert!(!links_static_archive(r#"println!("cargo:rustc-link-lib=static:-bundle={rt}");"#));
+        assert!(!links_static_archive(r#"println!("cargo:rustc-link-lib=framework=Speech");"#));
+    }
+}
+
 /// Whether a build script reads `DEP_*` metadata (its source names such a variable).
 pub fn reads_dep_metadata(bs: &BuildScript) -> bool {
     crate::vfs::read_to_string(&bs.src_path).unwrap_or_default().contains("DEP_")
@@ -217,6 +248,12 @@ fn fnv(data: &[u8], mut h: u64) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+/// A path package's files, by the package's directory as the graph names it: a shared
+/// workspace's (vfs.rs SHARE) is a folder mount's virtual path, on no disk, read in its checkout.
+fn hash_package_dir(dir: &str, h: &mut u64) {
+    hash_dir(std::path::Path::new(&*crate::vfs::on_disk(dir)), h);
 }
 
 fn hash_dir(dir: &std::path::Path, h: &mut u64) {
@@ -353,7 +390,8 @@ fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
             || (k.starts_with("CARGO_TARGET_") && (k.ends_with("_RUSTFLAGS") || k.ends_with("_LINKER")))
     }).collect();
     for (_, file) in crate::resolve::cargo_config_files(req.workspace) {
-        native_env.push((file.clone(), std::fs::read_to_string(&file).unwrap_or_default()));
+        // (vfs: a shared workspace's config is a folder mount's file)
+        native_env.push((file.clone(), crate::vfs::read_to_string(&file).unwrap_or_default()));
     }
     native_env.sort();
     for (k, v) in native_env {
@@ -380,14 +418,14 @@ fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
         // a registry or git package's source is its id (the resolved packages above); a path
         // package's is its files
         if !registry {
-            hash_dir(std::path::Path::new(&dir), &mut h);
+            hash_package_dir(&dir, &mut h);
         }
     }
     // and the closure's other path packages, by their files: a workspace crate the native scripts
     // build-depend on is compiled into them (a registry or git package is its id, above)
     let native_dirs: Vec<&str> = seeds.iter().map(|&s| g.pkg[g.build_scripts[s].krate].0.as_str()).collect();
     for dir in closure_path_dirs(&g.raw, &script_pkgs, &native_dirs) {
-        hash_dir(std::path::Path::new(&dir), &mut h);
+        hash_package_dir(&dir, &mut h);
     }
     names.sort();
     names.dedup();
@@ -781,7 +819,7 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
     // reuse stubs or nightly cfgs from a different native selection.
     let metadata = Command::new("cargo")
         .args(["metadata", "--format-version", "1", "--no-deps"])
-        .current_dir(workspace)
+        .current_dir(&*crate::vfs::on_disk(workspace))
         .env("CARGO_TARGET_DIR", &target)
         .output().map_err(|e| format!("native build directory: {e}"))?;
     if !metadata.status.success() {
@@ -814,7 +852,8 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
     if !cargo_flags.iter().any(|f| f == "--target" || f.starts_with("--target=")) {
         cmd.args(["--target", triple]);
     }
-    cmd.current_dir(workspace)
+    // (a shared workspace's folder is a folder mount, vfs.rs: cargo builds in its checkout)
+    cmd.current_dir(&*crate::vfs::on_disk(workspace))
         .args(cargo_flags)
         .env("CARGO_TARGET_DIR", &target)
         .env("CARGO_BUILD_BUILD_DIR", &build)
@@ -988,17 +1027,19 @@ fn native_lock(native: &std::path::Path, wait: bool) -> Option<std::fs::File> {
 
 /// Names `plan`'s build as the one its slot (module doc: roots) uses now. Under the native lock:
 /// a prune either saw the root or was over before it was written, and then the build makes what
-/// it needs again.
+/// it needs again. A shared workspace's (a folder mount, vfs.rs) is its checkout's on disk: each
+/// checkout has its slot, and `prune` finds the folder.
 fn write_root(req: &Request, plan: &Plan) -> Result<(), String> {
     let native = std::path::Path::new(req.relax_dir).join("native");
     let roots = native.join("roots");
+    let workspace = crate::vfs::on_disk(req.workspace);
     let mut slot = fnv(b"native-root-v1", 0xcbf29ce484222325);
-    for part in [req.workspace, req.package, req.triple].into_iter().chain(plan.flags.iter().map(String::as_str)) {
+    for part in [&*workspace, req.package, req.triple].into_iter().chain(plan.flags.iter().map(String::as_str)) {
         slot = fnv(part.as_bytes(), slot);
         slot = fnv(b"\0", slot);
     }
     let path = roots.join(format!("{slot:016x}"));
-    let text = format!("{}\n{:016x}\n{:016x}\n", req.workspace, plan.key, plan.selection);
+    let text = format!("{}\n{:016x}\n{:016x}\n", workspace, plan.key, plan.selection);
     if std::fs::read_to_string(&path).is_ok_and(|t| t == text) {
         return Ok(());
     }
@@ -1690,6 +1731,45 @@ fn the_native_prune_keeps_what_the_roots_name() {
     assert!(fresh.is_dir());
     drop(held);
     assert_eq!(prune(&native, later), 1);
+    // a shared workspace's run (RELAX_SHARE: its workspace is a folder mount's virtual path, on no
+    // disk) names the checkout on disk: the slot of a run in the checkout itself, which the prune
+    // finds and keeps with its build
+    let shared = format!("{}/vfs/share/native-prune", dir.display());
+    crate::vfs::mount_folder(&shared, &workspace);
+    let req = Request { workspace: &shared, ..req };
+    let plan = Plan { key: 0xdddddddddddddddd, selection: 0x5555555555555555, ..plan };
+    write_root(&req, &plan).unwrap();
+    let texts: Vec<String> = std::fs::read_dir(native.join("roots")).unwrap().flatten().map(|e| std::fs::read_to_string(e.path()).unwrap()).collect();
+    assert_eq!(texts.len(), 2, "the checkout's slot, replaced: {texts:?}");
+    assert!(texts.contains(&format!("{}\ndddddddddddddddd\n5555555555555555\n", workspace.display())), "{texts:?}");
+    let built = [unit("dddddddddddddddd"), unit("cargo-target/5555555555555555")];
+    assert_eq!(prune(&native, later), 1, "the build the replaced root named");
+    for p in &built { assert!(p.join("blob").is_file(), "the shared run's root names {}", p.display()); }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A path package of a shared workspace (RELAX_SHARE) is a folder mount's virtual path, on no
+/// disk: the native key hashes its files in the checkout, so an edit in it builds again (read as
+/// a disk path, it hashed nothing).
+#[cfg(test)]
+#[test]
+fn a_shared_path_packages_files_are_hashed_in_its_checkout() {
+    let dir = std::env::temp_dir().join(format!("relax-native-shared-hash-{}", std::process::id()));
+    let pkg = dir.join("checkout/h");
+    std::fs::create_dir_all(pkg.join("src")).unwrap();
+    std::fs::write(pkg.join("src/lib.rs"), "pub const LEVEL: u8 = 1;\n").unwrap();
+    let shared = format!("{}/vfs/share/native-hash", dir.display());
+    crate::vfs::mount_folder(&shared, &dir.join("checkout"));
+    let hash = |p: &str| {
+        let mut h = 0xcbf29ce484222325;
+        hash_package_dir(p, &mut h);
+        h
+    };
+    let virtual_dir = format!("{shared}/h");
+    let one = hash(&virtual_dir);
+    assert_eq!(one, hash(pkg.to_str().unwrap()), "the virtual path hashes the checkout's files");
+    std::fs::write(pkg.join("src/lib.rs"), "pub const LEVEL: u8 = 2;\n").unwrap();
+    assert_ne!(one, hash(&virtual_dir), "an edit in the shared package changes its hash");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

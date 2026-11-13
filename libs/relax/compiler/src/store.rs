@@ -892,7 +892,7 @@ pub fn profiling() -> bool {
 
 /// Makes the bytes written to `f` so far reach the disk before anything written after: an
 /// ordering barrier, not a durability flush. macOS: `F_BARRIERFSYNC` -- std's `sync_data` is
-/// `F_FULLFSYNC` there, a full flush of the drive's cache per call (a cold Stage launch made ~3.7k
+/// `F_FULLFSYNC` there, a full flush of the drive's cache per call (a large app's cold launch made ~3.7k
 /// of them); elsewhere (and where the barrier is refused) `sync_data`.
 fn order_writes(f: &std::fs::File) -> std::io::Result<()> {
     #[cfg(target_vendor = "apple")]

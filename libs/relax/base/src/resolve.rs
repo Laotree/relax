@@ -491,7 +491,7 @@ impl Workspace {
     /// Is `dir` a member? Cargo's members are the listed ones plus every path dependency of a
     /// member that lies inside the workspace root and is not excluded, transitively, through any
     /// dependency table (normal, dev, build, `[target.*]`; `workspace = true` entries by the
-    /// workspace's own path): apps/commercial names Stage's and Sandbox's crates that way.
+    /// workspace's own path): apps/commercial names two apps' crates that way.
     fn has_member(&self, dir: &str) -> bool {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut todo = self.member_dirs();
@@ -3076,7 +3076,7 @@ required-features = ["b", "manual"]
                 ("solo/Cargo.toml", "[package]\nname = \"solo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
                 ("solo/src/main.rs", "fn main() {}\n"),
                 // a members package naming a crate only as a never-built path dependency (apps/commercial
-                // and Sandbox): cargo makes that crate a member, so the workspace's inherited deps apply
+                // and an app): cargo makes that crate a member, so the workspace's inherited deps apply
                 ("hub/Cargo.toml", "[package]\nname = \"hub\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[target.'cfg(any())'.dependencies]\ngame = { path = \"game\" }\n"),
                 ("hub/src/lib.rs", ""),
                 ("hub/game/Cargo.toml", "[package]\nname = \"game\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nlib = { workspace = true }\n"),

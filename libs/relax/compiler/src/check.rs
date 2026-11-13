@@ -403,7 +403,7 @@ fn check_prepared(up: *mut Unit, p: AppCheck, beside: Option<&crate::options::Ru
 /// waiter's class once something waits for them (`waited`: the app's first window frame, the run's
 /// exit). Each job takes the next item until its slice is used, then queues itself again: its
 /// worker goes back to the queue's order every few milliseconds. (On threads of its own a test's
-/// dependency check took every core beside a cold Fab start, first frame 27.5 s; on two of them
+/// dependency check took every core beside a large app's cold start, first frame 27.5 s; on two of them
 /// the start drew at 14.8 s, but the check ended 66 s after the tests.)
 pub(crate) struct CheckBatch {
     ctx: std::sync::Arc<BodyCheck>,
@@ -1203,7 +1203,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     // the checked crates' definitions only (the program's other bodies are never looked at)
     for owner in (0..u.prog.defs.len()).filter(|&i| own[u.prog.defs[i].krate as usize]).map(|i| crate::program::DefId(i as u32)).filter_map(|d| crate::borrowck::body::CheckedBody::item(&u.prog, d)) {
         let d = u.prog.def(owner.owner);
-        // the app check needs no seeds: no signature is asked here (each costs a query; Stage's
+        // the app check needs no seeds: no signature is asked here (each costs a query; a large app's
         // 9,200 took 3.4 s on one thread), the body's own args are used as they are
         if !compile {
             fns.push((owner, true));
@@ -1350,7 +1350,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let Some((owner, generic)) = fns.get(i) else { break };
                         local.push((i, check_one(owner, *generic, true)));
-                        // return the allocator's free pages as the check goes (Stage held 4.6 GB)
+                        // return the allocator's free pages as the check goes (a large app held 4.6 GB)
                         if i % 20_000 == 19_999 { crate::memstat::trim(); }
                     }
                     results.lock().unwrap().extend(local);
@@ -1546,7 +1546,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     let unit_stage = |e: &str| if mono_only { Stage::new(Phase::Post, 0) } else { unit_stage(e) };
     st.mark("mono_check");
     let t_front = t_check.elapsed();
-    // the type/borrow check's freed memory goes back before the compile starts (Stage: 4.6 GB
+    // the type/borrow check's freed memory goes back before the compile starts (a large app: 4.6 GB
     // of malloc free pages held after it)
     if compile { unsafe {
         let _job = jit::compile_job();
@@ -1747,8 +1747,8 @@ unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u3
     // the run's reclamation (jit::settle_drop: RIR, checked bodies, templates of compiled
     // slots) once the process grew SETTLE_GROWTH since the last one (looked at every 2,000
     // compiled slots), so a whole-program check keeps the working set of a run, not every body
-    // it ever built (Stage went past 18 GB without it). Dropped RIR is rebuilt for inlining:
-    // settling every 20,000 slots made Scope's compile 4x slower.
+    // it ever built (a large app went past 18 GB without it). Dropped RIR is rebuilt for inlining:
+    // settling every 20,000 slots made a large app's compile 4x slower.
     const SETTLE_GROWTH: u64 = 3 << 30;
     let compiled = AtomicUsize::new(0);
     let settled_at = AtomicUsize::new(0);

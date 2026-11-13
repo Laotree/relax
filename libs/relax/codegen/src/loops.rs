@@ -1639,7 +1639,7 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         members.sort_unstable();
         // The size that runs: a counted build's blocks the counts never saw run (the rare arms of
         // a loop body, inlined) are copied but cost no time; the copies' code is O3 tier growth,
-        // capped by `all` (sandbox reconcile's loop over two borrowed shape fields: 330 insts with
+        // capped by `all` (an app's reconcile loop over two borrowed shape fields: 330 insts with
         // its never-taken create/destroy arms, about 100 that run; GAPB)
         let all: usize = members.iter().map(|b| f.blocks[*b as usize].insts.len() + 1).sum();
         let run_only = !relax_backend::stats::opt_off(options, "-unrollrun");

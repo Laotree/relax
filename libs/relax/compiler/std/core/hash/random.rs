@@ -12,7 +12,7 @@ use crate::cell::Cell;
 // no per-thread k0 + 1. A wasm export's trace runs the program natively, where its code can run on
 // more than one OS thread (each with its own count of RandomStates made) and the host can make maps
 // the page never makes; any difference in those counts gave a later map other keys on the page
-// than in the trace, and so another iteration order (P(DOOM) nodegate a1 with fixed base keys:
+// than in the trace, and so another iteration order (a game's nodegate a1 with fixed base keys:
 // first difference still the freed texture order at frame 16727). Iteration orders then depend
 // on each map's contents and history only, the same in the trace and on the page.
 #[cfg(all(not(relax_check), relax_web))]

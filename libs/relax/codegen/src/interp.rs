@@ -45,7 +45,7 @@ pub type H = unsafe extern "C" fn(*const u64, *mut u64, *mut Cx);
 /// Number of entry thunks in the pool (each 8 bytes of code, in the binary's text; the `.rept`
 /// count of the glue below): one per interpreted function the process installs, which no-codegen
 /// mode bounds by the precompiled slot pools anyway (compiler static_glue.rs SLOTS, the same
-/// count). 32,768 ran out in Fab's boot (41,573 functions).
+/// count). 32,768 ran out in a large app's boot (41,573 functions).
 pub const POOL: usize = 1 << 18;
 
 /// Per-thread interpreter state; its address is the third handler argument.

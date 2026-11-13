@@ -1,4 +1,4 @@
-// rustc accepts (Scope code_view prepared_lod.rs, agent_activity compact_history, bytemuck
+// rustc accepts (an app's code_view prepared_lod.rs, agent_activity compact_history, bytemuck
 // checked.rs): a reference to a projection (`&S::File`, `&<T as Tr>::Bits`) is Copy -- in a
 // polymorphic body the projection is rigid and `&'a T: Copy` binds T to it (the solver related
 // the variable and the rigid alias as a new alias-relate goal, again and again, until overflow:

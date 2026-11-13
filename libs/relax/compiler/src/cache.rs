@@ -238,7 +238,8 @@ const LEDGER_KEY: u128 = 0;
 // its ordinal there (stable::block_place), not its offset. 35: a glue kind is a u32 (jit.rs
 // FnKey::Glue): one byte below 0xFF, else 0xFF and a u32; that byte used to be a constructor's
 // kind (GLUE_CTOR + variant 239), so an older entry is dropped rather than misread.
-const ENTRY_VERSION: u32 = 35;
+// 36: a coroutine's closure type has tags of its own (enc_ty 29 for 17's form, 30 for 28's).
+const ENTRY_VERSION: u32 = 36;
 /// the level of a code entry's code (its tier byte)
 const TIER_O1: u8 = 0;
 const TIER_O3: u8 = 1;
@@ -1604,7 +1605,7 @@ impl Cache {
     }
 
     /// The entries recorded so far, taken out for writing during the run (on the owner thread;
-    /// the write itself, `Spill::write`, runs off the unit). Memory: a cold Stage run held ~200 MB
+    /// the write itself, `Spill::write`, runs off the unit). Memory: a large app's cold run held ~200 MB
     /// of recorded code until the exit flush. The keys stay in `pending_keys` (nothing is
     /// recorded twice); the late-input ledger written with them is this run's so far (a later
     /// write or the exit flush replaces it: newest wins per key).
@@ -1721,7 +1722,7 @@ impl Cache {
     /// A file by path and text. None (nothing written): a version a live edit committed -- its
     /// parse is eager, so its expression and block ids are not those of a boot parse of the same
     /// text, and a key naming them would mean other expressions in a run that booted from it
-    /// (a warm Scope ran cached code calling `{closure#175197}`, which was no closure there:
+    /// (an app ran cached code on a warm run, calling `{closure#175197}`, which was no closure there:
     /// SIGILL). Code that names such a file's closures, sites or types is not cached.
     fn enc_file(&self, u: &Unit, file: u32, e: &mut E) -> Option<()> {
         if u.prog.is_edit_version(file) {
@@ -1962,11 +1963,16 @@ impl Cache {
                 return self.enc_tys(u, u.tcx.tys.list(args), e, crates, depth);
             }
             TyKind::Closure(file, expr, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: state }) => {
+                // A coroutine's closure type (an async block's, an async fn body's) takes its own tag in
+                // either form (30 for 28, 29 for 17). The type itself does not say so: Tcx::coroutines
+                // does, filled by the type check of the body that holds the block. A run that takes that
+                // body's code from here never checks it, so the key carries the fact to dec_ty.
+                let coroutine = u.tcx.coroutines.contains(&(file, expr));
                 // its owner's closure ordinal (closure_ordinal): the owner's type first, which
                 // names the item the ordinal counts in
                 let def = match u.tcx.tys.kind(owner) { TyKind::FnDef(d, ..) => Some(*d), _ => None };
                 if let Some((ord, fp)) = def.filter(|_| !u.prog.is_edit_version(file)).and_then(|d| self.closure_ordinal(u, d, file, expr)) {
-                    e.u8(28);
+                    e.u8(if coroutine { 30 } else { 28 });
                     crates.push(u.prog.file_crate.get(file as usize).copied().unwrap_or(0));
                     self.enc_ty(u, owner, e, crates, depth + 1)?;
                     e.u32(ord);
@@ -1974,7 +1980,7 @@ impl Cache {
                     self.enc_ty(u, closure_kind_ty, e, crates, depth + 1)?; self.enc_ty(u, sig, e, crates, depth + 1)?;
                     return self.enc_ty(u, state, e, crates, depth + 1);
                 }
-                e.u8(17);
+                e.u8(if coroutine { 29 } else { 17 });
                 crates.push(u.prog.file_crate.get(file as usize).copied().unwrap_or(0));
                 self.enc_file(u, file, e)?;
                 e.u32(expr);
@@ -2192,7 +2198,7 @@ impl Cache {
                 let regions = self.dec_regions(u, d)?;
                 TyKind::FnDef(def, u.tcx.tys.mk_list(&self.dec_tys(u, d, depth)?), regions)
             }
-            17 => {
+            tag @ (17 | 29) => {
                 let file = self.dec_file(u, d)?;
                 let expr = d.u32()?;
                 if !self.closure_fp_agrees(u, file, expr, d.u64()?) { return None; }
@@ -2200,14 +2206,22 @@ impl Cache {
                 let sig = self.dec_ty(u, d, depth + 1)?;
                 let state = self.dec_ty(u, d, depth + 1)?;
                 let owner = self.dec_ty(u, d, depth + 1)?;
+                // A coroutine is known as one before its type exists here: the body that defines it
+                // may never be type-checked in this run (its code is cached), and without the mark
+                // the type is a plain closure to the solver, with no `Future` impl: an instance whose
+                // body names `<F as Future>::Output` over it fails to normalize.
+                // (Looked up first: an insert adds a node each time, and many keys name one coroutine.)
+                if tag == 29 && !u.tcx.coroutines.contains(&(file, expr)) { u.tcx.coroutines.insert((file, expr), ()); }
                 TyKind::Closure(file, expr, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: kind, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: state })
             }
-            28 => {
+            tag @ (28 | 30) => {
                 let owner = self.dec_ty(u, d, depth + 1)?;
                 let ord = d.u32()?;
                 let fp = d.u64()?;
                 let TyKind::FnDef(def, ..) = *u.tcx.tys.kind(owner) else { return None };
                 let (file, expr) = self.closure_at(u, def, ord, fp)?;
+                // 30: a coroutine's, marked before its type is interned (as 29 above)
+                if tag == 30 && !u.tcx.coroutines.contains(&(file, expr)) { u.tcx.coroutines.insert((file, expr), ()); }
                 let kind = self.dec_ty(u, d, depth + 1)?;
                 let sig = self.dec_ty(u, d, depth + 1)?;
                 let state = self.dec_ty(u, d, depth + 1)?;
@@ -2654,7 +2668,7 @@ impl Cache {
 
     /// The item graph now (deps_graph): `makepad run`'s app check beside main has it built before
     /// main, where the check before main had its first code key build it -- else main's first
-    /// compile does, half a second of a cold Fab boot on its path.
+    /// compile does, half a second of a large app's cold boot on its path.
     pub fn build_item_graph(&mut self, u: &Unit) {
         self.deps_graph(u);
     }
@@ -4734,7 +4748,7 @@ const IN_USE_BY_OTHERS: std::time::Duration = std::time::Duration::from_secs(10 
 /// itself opened; a delete that fails (open elsewhere, on Windows) is retried by the next
 /// start. Other Relax builds' stores stay for when that build runs again: store names hash the
 /// codegen identity (codegen_id.rs), so no other build ever reads them, and a box whose lanes run
-/// several builds went cold each time one of them pruned (the Windows node lost a stopped Fab's
+/// several builds went cold each time one of them pruned (the Windows node lost a stopped app's
 /// 109 code stores to a test of another build, 11-04). While `<root>/cache` holds more than the
 /// cap (RELAX_CACHE_MAX megabytes, else twice what this run uses (its live stores), at least
 /// CAP_FLOOR_MB), whole store files go, least recently used first, whichever build wrote them (a
@@ -4744,7 +4758,8 @@ const IN_USE_BY_OTHERS: std::time::Duration = std::time::Duration::from_secs(10 
 /// build with no store left loses its sets and its lock file. Only checked store files are ever
 /// deleted. Returns (bytes before, after).
 /// `--allow-c` build outputs (`<root>/native`) are kept by reachability, not by size: what a
-/// slot's last build uses stays (native.rs prune).
+/// slot's last build uses stays (native.rs prune). So are the outputs of the build scripts Relax
+/// runs (`<root>/build`): what a script pass's last run used stays (unitgraph.rs prune_build).
 pub fn prune_root(root: &std::path::Path) -> (u64, u64) {
     let cap = std::env::var("RELAX_CACHE_MAX").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20);
     let sizes = prune(root, &crate::store::live(), &crate::store::open_files(), &crate::store::programs(), cap);
@@ -4752,6 +4767,10 @@ pub fn prune_root(root: &std::path::Path) -> (u64, u64) {
     let native = crate::native::prune(&root.join("native"), since);
     if native > 0 && std::env::var_os("RELAX_CACHE_TRACE").is_some() {
         eprintln!("relax cache: pruned {native} native build director(ies) no root names");
+    }
+    let build = crate::unitgraph::prune_build(&root.join("build"), since);
+    if build > 0 && std::env::var_os("RELAX_CACHE_TRACE").is_some() {
+        eprintln!("relax cache: pruned {build} build script director(ies) no root names");
     }
     sizes
 }
@@ -6629,8 +6648,9 @@ impl Cache {
     }
 
     /// record_front_crates in a mid-run write: `stop` is asked before each crate still to record;
-    /// yes leaves the rest to a later write (false comes back). (A cold Fab's first mid-run write
-    /// held the owner 100-400 ms here, after its first frame: where a live session's first edits come.)
+    /// yes leaves the rest to a later write (false comes back). (A large app's first mid-run write on a
+    /// cold start held the owner 100-400 ms here, after its first frame: where a live session's first edits
+    /// come.)
     pub fn record_front_crates_until(&mut self, prog: &crate::program::Program, stop: &dyn Fn() -> bool) -> bool {
         for ci in 0..self.crate_path.len() {
             let Some(c) = prog.crates.get(ci) else { continue };
@@ -6697,10 +6717,10 @@ impl FrontRecordView {
         // each dependency as the crate its (extern alias, crate name) pair binds in c.deps --
         // the crate index the load's fingerprint (stable::loaded_crate_fingerprint) and the
         // preload's image deps use -- not the first crate of that name: a graph can hold two
-        // crates of one name (Stage: cfg-if 1.0.4 and 1.0.5), and an alias can be both std's and
+        // crates of one name (an app: cfg-if 1.0.4 and 1.0.5), and an alias can be both std's and
         // a renamed dependency's (brotli-decompressor's `alloc` = alloc-no-stdlib). Either made the
         // record's fingerprint differ from the load's every run, so no front graph certificate
-        // was ever written and every warm Stage load re-validated its 3,500 files.
+        // was ever written and each warm load of a large app re-validated its 3,500 files.
         let binds = |alias: &str, name: &str| c.deps.iter().find(|&&(a, k)| prog.syms.str(a) == alias
             && prog.crates.get(k as usize).is_some_and(|d| prog.syms.str(d.name) == name)).map(|&(_, k)| k as usize);
         let dep_fps = deps.as_ref().and_then(|deps|
@@ -6965,7 +6985,7 @@ impl ColdFront {
             // The graph itself is written now too, on that thread: every crate store it
             // certifies was joined above. Waiting for the first write after present lost it
             // to a quit soon after present (the mini's harness: SIGTERM at present + 0.5 s,
-            // KILL 5 s later; Stage's exit is busy for longer), and a relaunch without the
+            // KILL 5 s later; an app's exit is busy for longer), and a relaunch without the
             // certificate re-parsed every file although each crate's images were on disk.
             // A write that cannot record yet stays queued for the post-present or exit writer.
             if deferred {
@@ -7971,6 +7991,75 @@ mod data_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A warm start: a key names a coroutine's type, and the body that defines the coroutine is
+    /// never type-checked (its code is cached). The decoded type is a coroutine all the same: the
+    /// key says so (enc_ty 29 or 30), where Tcx::coroutines was filled by that type check alone and an
+    /// instance over the type failed to normalize (`<F as Future>::Output`: no solution).
+    #[test]
+    fn coroutine_type_key_marks_its_coroutine() {
+        isolated_test!(coroutine_type_key_marks_its_coroutine);
+        use crate::types::{ClosureArgs, FnHeader, List, RegionArgsId};
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = crate::Session::default();
+        session.options.tier1 = false; session.options.tyck_ahead = false;
+        let session = std::sync::Arc::new(session);
+        let root = std::env::temp_dir().join(format!("relax-coroutine-key-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("lib.rs");
+        std::fs::write(&source, "#![no_std] fn method<T>() {} fn owner() { let _ = || 1u32; let _ = async { 2u32 }; }").unwrap();
+        let mut prog = crate::program::Program::new(&session);
+        prog.load_crate("coroutine_key", source.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+        let mut tcx = crate::tcx::Tcx::new(); tcx.collect(&prog);
+        let mut u = Unit::new(prog, tcx, 0);
+        let named = |name| u.prog.defs.iter().enumerate().find_map(|(i, _)| (u.prog.name(DefId(i as u32)) == name).then_some(DefId(i as u32))).unwrap();
+        let (method, owner) = (named("method"), named("owner"));
+        let file = u.prog.def(owner).file;
+        let exprs = crate::program::closure_exprs(&u.prog, owner);
+        assert_eq!(exprs.len(), 2, "the closure, then the async block");
+        // the two types as the type check of `owner` makes them, the async block's marked a coroutine
+        let closure_ty = |tcx: &crate::tcx::Tcx, expr: u32| {
+            let tys = &tcx.tys;
+            let sig = tys.intern(TyKind::FnPtr(List::EMPTY, tys.u32_, FnHeader::RUST, 0));
+            let parent = tys.intern(TyKind::FnDef(owner, List::EMPTY, RegionArgsId::EMPTY));
+            tys.intern(TyKind::Closure(file, expr, ClosureArgs {
+                parent_args: parent, closure_kind_ty: tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: tys.unit,
+            }))
+        };
+        u.tcx.coroutines.insert((file, exprs[1]), ());
+        let mut cache = open_test_cache(&u, &root.join("cache"));
+        let mut keys = Vec::new();
+        for expr in &exprs {
+            let ty = closure_ty(&u.tcx, *expr);
+            let mut e = E::default();
+            assert!(cache.enc_fnkey(&u, &FnKey::Inst(method, vec![ty]), &mut e, &mut vec![], 0).is_some());
+            keys.push(e.0);
+        }
+        assert_ne!(keys[0][..], keys[1][..]);
+        // the next run: declarations collected, no body checked
+        let mut fresh = crate::tcx::Tcx::new(); fresh.collect(&u.prog);
+        u.tcx = fresh;
+        assert!(!u.tcx.coroutines.contains(&(file, exprs[1])));
+        let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
+        for (bytes, coroutine) in keys.iter().zip([false, true]) {
+            let mut d = D { b: bytes, p: 0 };
+            let key = unsafe { Linker::new(&mut cache).dec_fnkey(&mut u, &mut d, 0) }.unwrap();
+            assert_eq!(d.p, bytes.len());
+            let FnKey::Inst(_, args) = &key else { panic!("an instance key") };
+            assert_eq!(args[..], [closure_ty(&u.tcx, exprs[coroutine as usize])]);
+            assert_eq!(u.tcx.is_coroutine(args[0]), coroutine, "a decoded {} type", if coroutine { "coroutine's" } else { "closure's" });
+            // a query that asks (Tcx::needs_drop: a coroutine always has its state to drop)
+            assert_eq!(u.tcx.needs_drop(&u.prog, env, args[0]), coroutine);
+            // the image's skip walks the bytes the encoder wrote, and this run writes the same key
+            let mut skipped = D { b: bytes, p: 0 };
+            assert!(image::skip_fnkey(&mut skipped, 0, &mut image::no_atoms).is_some() && skipped.p == bytes.len(), "skip_fnkey stopped at {} of {}", skipped.p, bytes.len());
+            let mut again = E::default();
+            assert!(cache.enc_fnkey(&u, &key, &mut again, &mut vec![], 0).is_some());
+            assert_eq!(*bytes, again.0);
+        }
+        drop(cache);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn round27_cached_native_const_array_pointer_words() {
         isolated_test!(round27_cached_native_const_array_pointer_words);
@@ -8674,7 +8763,7 @@ mod data_tests {
     /// after it. The proc-macro world's unit, made after the program's on a warm macOS start, took
     /// over a process-wide reader: the program's O2 builds folded its loads against the world's
     /// symbol tables, so a constant slice's length (unicode-segmentation's word_cat_table) became
-    /// 0 in code the disk cache then kept -- the warm Stage panicked in its first draw.
+    /// 0 in code the disk cache then kept -- an app's warm run panicked in its first draw.
     #[test]
     fn ro_reader_reads_its_own_unit() {
         isolated_test!(ro_reader_reads_its_own_unit);
@@ -8717,7 +8806,7 @@ mod data_tests {
     /// `word_cat_table` (a `&[(char, char, WordCat)]`) has integer words that, in some runs, equal
     /// an address inside the compile domain's block: the raw word scan copied it into a writable
     /// block, word_category's cache entry named that block as tag 8 (a fresh zeroed block per
-    /// link), and every warm Stage launch then read the table's length as 0 in its first draw.
+    /// link), and each warm launch of an app then read the table's length as 0 in its first draw.
     #[test]
     fn rehome_follows_pointer_words_and_cached_copies_keep_their_value() {
         isolated_test!(rehome_follows_pointer_words_and_cached_copies_keep_their_value);

@@ -474,17 +474,13 @@ impl Command {
         Ok(out)
     }
 
-    /// Under `makepad run` the program's executable is Relax itself: spawning it runs this
-    /// program again (Relax's command line up to `--`, then the new arguments). A spawn of the
-    /// loader whose first argument is `run` or `app` is a launcher starting another program
-    /// through it (`$RELAX_LOADER run [flags] <package> ...`, `... app <id>`: a launch
-    /// record), and one whose first argument is `export` asks the loader for a source tree (the
-    /// runner's Install natively): those run as written.
+    /// Under `makepad run` the program's executable is its own hard link of Relax (Relax
+    /// selfexe.rs, the first word of RELAX_SELF_EXEC): spawning it runs this program again
+    /// (Relax's command line up to `--`, then the new arguments), whatever they are. A spawn of
+    /// the loader by its own name (`$RELAX_LOADER run <package>`, `... test`) is not this path, and
+    /// runs as written.
     fn self_exec_args(&self) -> Option<Vec<OsString>> {
         let pre = crate::env::host_var_os("RELAX_SELF_EXEC")?.into_string().ok()?;
-        if self.args.get(1).is_some_and(|a| matches!(a.as_encoded_bytes(), b"run" | b"app" | b"export")) {
-            return None;
-        }
         // inside a build script (RELAX_AS_RUSTC): its spawns of this executable are RUSTC
         // questions, answered as written (relax_as_rustc); re-running the script would recurse
         if crate::env::host_var_os("RELAX_AS_RUSTC").is_some() {
@@ -493,7 +489,7 @@ impl Command {
         let parts: Vec<&str> = pre.split('\u{1f}').collect();
         let exe = crate::path::Path::new(parts[0]);
         let p = crate::fs::canonicalize(crate::path::Path::new(&self.program)).ok()?;
-        // the Relax executable itself runs this program
+        // the program's own executable runs this program
         if p.as_path() != exe {
             return None;
         }
