@@ -28,7 +28,6 @@ exclude = [
 [workspace.dependencies]
 makepad-cpu-budget = { path = "platform/cpu_budget", version = "1.0.0" }
 relax-lex = { path = "libs/relax/lex", version = "0.1.0" }
-relax-attr = { path = "libs/relax/attr", version = "1.0.0" }
 relax-base = { path = "libs/relax/base", version = "0.1.0" }
 relax-backend = { path = "libs/relax/backend", version = "0.1.0" }
 relax-codegen = { path = "libs/relax/codegen", version = "0.1.0" }
@@ -38,7 +37,6 @@ relax-light-http = { path = "tools/run/light_http", version = "0.1.0" }
 relax-native-macros = { path = "libs/relax/native_macros", version = "0.1.0" }
 relax-session = { path = "libs/relax/session", version = "0.1.0" }
 relax-types = { path = "libs/relax/types", version = "0.1.0" }
-makepad-live-id = { path = "libs/live_id", version = "1.0.0" }
 makepad-remote = { path = "libs/remote", version = "0.1.0" }
 makepad-strict-json = { path = "libs/strict_json", version = "0.1.0" }
 makepad-gpu-trace = { path = "libs/gpu_trace", version = "1.0.0" }
