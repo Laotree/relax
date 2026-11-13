@@ -719,6 +719,41 @@ impl<I: Iterator> Iterator for StepBy<I> {
             (f(lower), upper.map(f))
         }
     }
+    // core step_by.rs spec_nth: the n steps go to the inner iterator as one nth (O(1) on a slice),
+    // split into several when n x step overflows
+    fn nth(&mut self, mut n: usize) -> Option<I::Item> {
+        if self.first_take {
+            self.first_take = false;
+            let first = self.iter.next();
+            if n == 0 {
+                return first;
+            }
+            n -= 1;
+        }
+        let mut step = self.step_minus_one + 1;
+        if n == usize::MAX {
+            self.iter.nth(step - 1);
+        } else {
+            n += 1;
+        }
+        loop {
+            if let Some(m) = n.checked_mul(step) {
+                return self.iter.nth(m - 1);
+            }
+            let div_n = usize::MAX / n;
+            let div_step = usize::MAX / step;
+            let nth_n = div_n * n;
+            let nth_step = div_step * step;
+            let nth = if nth_n > nth_step {
+                step -= div_n;
+                nth_n
+            } else {
+                n -= div_step;
+                nth_step
+            };
+            self.iter.nth(nth - 1);
+        }
+    }
 }
 
 impl<I: ExactSizeIterator> ExactSizeIterator for StepBy<I> {}
@@ -791,6 +826,23 @@ impl<A: Iterator, B: Iterator<Item = A::Item>> Iterator for Chain<A, B> {
             _ => None,
         };
         (lower, upper)
+    }
+    // core chain.rs: `a` advances by n in one step (O(1) on a slice), the rest goes to `b`'s nth
+    fn nth(&mut self, mut n: usize) -> Option<A::Item> {
+        if let Some(a) = &mut self.a {
+            n = match a.advance_by(n) {
+                Ok(()) => match a.next() {
+                    None => 0,
+                    x => return x,
+                },
+                Err(k) => k,
+            };
+            self.a = None;
+        }
+        match &mut self.b {
+            Some(b) => b.nth(n),
+            None => None,
+        }
     }
 }
 
@@ -981,6 +1033,15 @@ impl<I: Iterator> Iterator for Peekable<I> {
             Some(None) => 0,
             Some(Some(_)) => 1 + self.iter.count(),
             None => self.iter.count(),
+        }
+    }
+    // core peekable.rs: the peeked item counts as the first, the rest is one nth of the inner
+    fn nth(&mut self, n: usize) -> Option<I::Item> {
+        match self.peeked.take() {
+            Some(None) => None,
+            Some(v @ Some(_)) if n == 0 => v,
+            Some(Some(_)) => self.iter.nth(n - 1),
+            None => self.iter.nth(n),
         }
     }
     fn last(self) -> Option<I::Item> {
@@ -1375,6 +1436,19 @@ impl<I: Iterator> Iterator for Fuse<I> {
         match &self.iter {
             Some(it) => it.size_hint(),
             None => (0, Some(0)),
+        }
+    }
+    // core fuse.rs: one nth of the inner iterator (O(1) on a slice), not n nexts
+    fn nth(&mut self, n: usize) -> Option<I::Item> {
+        match &mut self.iter {
+            Some(it) => match it.nth(n) {
+                None => {
+                    self.iter = None;
+                    None
+                }
+                item => item,
+            },
+            None => None,
         }
     }
     #[doc(hidden)]

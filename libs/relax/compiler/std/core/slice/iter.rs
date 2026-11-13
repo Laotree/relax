@@ -107,6 +107,16 @@ impl<'a, T> Iterator for Iter<'a, T> {
     fn count(self) -> usize {
         self.len_left()
     }
+    // core slice iter macros: advance_by moves the pointer in O(1) (Chain::nth and VecDeque's
+    // iterators lean on it)
+    fn advance_by(&mut self, n: usize) -> Result<(), usize> {
+        let len = self.len_left();
+        let k = if n < len { n } else { len };
+        if k > 0 {
+            self.nth(k - 1);
+        }
+        if k < n { Err(n - k) } else { Ok(()) }
+    }
     fn nth(&mut self, n: usize) -> Option<&'a T> {
         if n >= self.len_left() {
             if zst::<T>() {
@@ -261,6 +271,16 @@ impl<'a, T> Iterator for IterMut<'a, T> {
     }
     fn count(self) -> usize {
         self.len_left()
+    }
+    // core slice iter macros: advance_by moves the pointer in O(1) (Chain::nth and VecDeque's
+    // iterators lean on it)
+    fn advance_by(&mut self, n: usize) -> Result<(), usize> {
+        let len = self.len_left();
+        let k = if n < len { n } else { len };
+        if k > 0 {
+            self.nth(k - 1);
+        }
+        if k < n { Err(n - k) } else { Ok(()) }
     }
     fn nth(&mut self, n: usize) -> Option<&'a mut T> {
         if n >= self.len_left() {

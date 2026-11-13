@@ -294,6 +294,19 @@ impl<T, const N: usize> Iterator for IntoIter<T, N> {
         let n = self.end - self.start;
         (n, Some(n))
     }
+    // core array iter.rs: the skipped items leave the live range first, then are dropped
+    fn advance_by(&mut self, n: usize) -> Result<(), usize> {
+        let len = self.end - self.start;
+        let k = if n < len { n } else { len };
+        let from = self.start;
+        self.start += k;
+        let mut i = 0;
+        while i < k {
+            unsafe { im::drop_in_place(im::ptr_add_mut(self.base() as *mut T, from + i)) };
+            i += 1;
+        }
+        if k < n { Err(n - k) } else { Ok(()) }
+    }
 }
 
 impl<T, const N: usize> DoubleEndedIterator for IntoIter<T, N> {

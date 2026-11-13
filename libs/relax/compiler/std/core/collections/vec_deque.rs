@@ -857,6 +857,16 @@ impl<'a, T> Iterator for Iter<'a, T> {
         let n = self.a.len() + self.b.len();
         (n, Some(n))
     }
+    // core vec_deque iter.rs: the first half, then the rest of n in the second, each in O(1)
+    fn advance_by(&mut self, n: usize) -> Result<(), usize> {
+        match self.a.advance_by(n) {
+            Ok(()) => Ok(()),
+            Err(k) => {
+                crate::mem::swap(&mut self.a, &mut self.b);
+                self.a.advance_by(k)
+            }
+        }
+    }
     #[doc(hidden)]
     #[inline]
     unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> &'a T {
@@ -917,6 +927,16 @@ impl<'a, T> Iterator for IterMut<'a, T> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         let n = self.a.len() + self.b.len();
         (n, Some(n))
+    }
+    // core vec_deque iter.rs: the first half, then the rest of n in the second, each in O(1)
+    fn advance_by(&mut self, n: usize) -> Result<(), usize> {
+        match self.a.advance_by(n) {
+            Ok(()) => Ok(()),
+            Err(k) => {
+                crate::mem::swap(&mut self.a, &mut self.b);
+                self.a.advance_by(k)
+            }
+        }
     }
     #[doc(hidden)]
     #[inline]
