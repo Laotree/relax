@@ -87,15 +87,22 @@ fn emit_record(kind: &'static str, key: &str, fields: &str) -> (u64, std::sync::
     }
     let seq = SEQ.fetch_add(1, SeqCst) + 1;
     let verified = crate::reload::observations_verified();
+    // a test that crashes or parks this process on purpose says why (RELAX_EXPECTED_CRASH): its
+    // panic is the test's, and whoever follows the run (devhub) does not stop for it
+    let expected = match std::env::var("RELAX_EXPECTED_CRASH") {
+        Ok(why) if kind == "panic" => format!(",\"expected\":{}", json_str(if why.is_empty() { "yes" } else { &why })),
+        _ => String::new(),
+    };
     let json = format!(
-        "{{\"event\":\"{}\",\"seq\":{},\"pid\":{},\"app\":{},\"at_ms\":{},\"verified\":{},{}}}",
+        "{{\"event\":\"{}\",\"seq\":{},\"pid\":{},\"app\":{},\"at_ms\":{},\"verified\":{},{}{}}}",
         kind,
         seq,
         std::process::id(),
         json_str(&super::APP.lock().unwrap_or_else(|e| e.into_inner())),
         now_ms(),
         verified,
-        fields
+        fields,
+        expected
     );
     if super::AGENT.load(Relaxed) {
         eprintln!("relax event: {}", json);

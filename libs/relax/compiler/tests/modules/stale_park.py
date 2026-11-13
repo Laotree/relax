@@ -8,7 +8,7 @@ import time
 
 mk = os.path.abspath(sys.argv[1])
 root = os.path.dirname(os.path.abspath(__file__))
-env = dict(os.environ, RELAX_STALE_PARK="1", SAFE2_UNLOAD_CRASH="parked")
+env = dict(os.environ, RELAX_STALE_PARK="1", SAFE2_UNLOAD_CRASH="parked", RELAX_EXPECTED_CRASH="stale_park.py parks a stale access and decides it")
 p = subprocess.Popen([mk, "test", os.path.join(root, "unload_inside.rs")], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 err = []
 pid = None
