@@ -7890,6 +7890,18 @@ impl<'a> Lcx<'a> {
             }
             LitKind::Str | LitKind::RawStr => {
                 let s = unescape_str(&text);
+                // a value from env!/OUT_DIR naming a workspace path: the cache keeps the anchored
+                // spelling, the run reads its own absolute path
+                if relax_front::pathmarks::is_marked_literal(&s) {
+                    let a = crate::dirs::anchored(&s);
+                    if a.starts_with('\0') {
+                        let addr = self.u.lit_sym_anchored(a.as_bytes());
+                        let p = self.f.vreg(Cls::I);
+                        self.emit(Inst::Addr(p, addr));
+                        let l = self.iconst(a.len() as i64);
+                        return Val::L(vec![p, l]);
+                    }
+                }
                 let addr = self.u.lit_sym(s.as_bytes());
                 let p = self.f.vreg(Cls::I);
                 self.emit(Inst::Addr(p, addr));

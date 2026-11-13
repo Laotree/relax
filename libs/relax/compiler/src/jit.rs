@@ -5777,6 +5777,12 @@ impl Unit {
         self.data_sym(a)
     }
 
+    /// An anchored path literal: the cache keeps the spelling, the run reads its own path.
+    pub fn lit_sym_anchored(&self, b: &[u8]) -> relax_backend::rir::Sym {
+        let a = self.data(b, 1, crate::syms::DataKind::AnchoredPath);
+        self.data_sym(a)
+    }
+
     /// A panic site as a symbol (its value is the site's index).
     pub fn site_sym(&self, file: u32, pos: u32, msg: &str) -> relax_backend::rir::Sym {
         let i = self.site(file, pos, msg);

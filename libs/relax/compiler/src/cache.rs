@@ -11217,7 +11217,7 @@ mod prune_tests {
         let want: std::collections::BTreeSet<String> = [
             "lookup", "front_key", "front_part_key", "code_key_bytes", "deps_key", "coherence_key",
             "crate_check_key", "dep_check_key", "data_entry", "manifest_key", "front_store_name_with",
-            "code_store_name", "front_crate_key", "front_graph_key", "front_order_key", "const_key",
+            "front_crate_key", "front_graph_key", "front_order_key", "const_key", "open_from", "rt_set_key",
         ].iter().map(|s| s.to_string()).collect();
         assert_eq!(fns, want, "a cache identity hashes the absolute anchor dirs");
     }
