@@ -1178,7 +1178,7 @@ impl<'a> Res<'a> {
             }
         }
         let mut seen = Seen::new();
-        let found = self.glob_find(k, k, m, n, &mut seen, None);
+        let found = self.glob_find(k, k, m, n, &mut seen, None, true);
         let mut deps: Vec<(String, u64)> = Vec::new();
         seen.each(|c, _| {
             if !deps.iter().any(|d| d.0 == c) {
@@ -1197,14 +1197,18 @@ impl<'a> Res<'a> {
     where
         'a: 'b,
     {
-        self.glob_find(from, k, m, n, seen, partial).map(|(_, _, t)| (t.0.as_str(), t.1.as_str()))
+        self.glob_find(from, k, m, n, seen, partial, true).map(|(_, _, t)| (t.0.as_str(), t.1.as_str()))
     }
 
     /// `type_in_seen`, with the (crate, module) whose non-glob bindings had the name. `from`: the
     /// crate asking; a module of another crate, reached through a glob, gives only what that
     /// crate exports (rustc: a glob imports the bindings visible to the importer), so its private
-    /// `mod serde_json` neither binds the name nor hides the extern crate of that name.
-    fn glob_find<'b>(&self, from: &str, k: &'b str, m: &'b str, n: &str, seen: &mut Seen<'b>, partial: Option<(&str, &'b CrateScope)>) -> Option<(&'b str, &'b str, &'b (String, String))>
+    /// `mod serde_json` neither binds the name nor hides the extern crate of that name. In the
+    /// crate being computed, a miss of the module's own bindings waits while a single import of
+    /// the module may still bind the name (`scope_waits`); `vis`: the importing module sees the
+    /// module through the globs followed to it (a private glob of a module it is not inside
+    /// hides the module's imports from it).
+    fn glob_find<'b>(&self, from: &str, k: &'b str, m: &'b str, n: &str, seen: &mut Seen<'b>, partial: Option<(&str, &'b CrateScope)>, vis: bool) -> Option<(&'b str, &'b str, &'b (String, String))>
     where
         'a: 'b,
     {
@@ -1221,9 +1225,14 @@ impl<'a> Res<'a> {
             if foreign && sc.tpriv.get(m).is_some_and(|p| p.contains(n)) { return None; }
             return Some((k, m, t));
         }
+        let computing = partial.is_some_and(|(pk, _)| pk == k);
+        if computing && vis && scope_waits(k, m, n, true) {
+            return None;
+        }
         for (k2, m2, is_pub) in sc.tglobs.get(m).map_or(&[][..], |v| &v[..]) {
             if foreign && !is_pub { continue; }
-            if let Some(t) = self.glob_find(from, k2, m2, n, seen, partial) {
+            let vis = vis && (*is_pub || !computing || scope_asker_inside(m));
+            if let Some(t) = self.glob_find(from, k2, m2, n, seen, partial, vis) {
                 return Some(t);
             }
         }
@@ -1351,21 +1360,31 @@ impl CrateScope {
         let mut copied: HashMap<(String, usize), usize> = HashMap::default();
         // imports whose answer is final (found, or resolved into another crate's finished scope)
         let mut settled: crate::fxhash::HashSet<(String, usize)> = crate::fxhash::HashSet::default();
+        // rustc's fixpoint: a name a glob gives is undetermined while a single import of the module
+        // may still bind it (ScopeRun). A stall makes the imports that failed without waiting stop
+        // making names wait; one with none of those lifts the waits until the next binding
+        let outer = SCOPE_RUN.with(|c| c.replace(Some(ScopeRun::new(table, k, &mods, cm))));
+        let mut force = false;
+        let (mut waits, mut determined, mut forced) = (0usize, 0usize, 0usize);
         loop {
             let mut changed = false;
+            let mut waited = false;
+            // the single imports of this pass that failed without waiting
+            let mut failing: Vec<(usize, usize)> = Vec::new();
             passes += 1;
-            for m in &mods {
+            for (mi, m) in mods.iter().enumerate() {
                 for (ui, u) in cm.uses.get(m).unwrap_or(&empty).iter().enumerate() {
                     if settled.contains(&(m.clone(), ui)) {
                         continue;
                     }
+                    if force && changed {
+                        force = false;
+                        forced += 1;
+                    }
+                    scope_try(mi, ui, !force);
                     match &u.bind {
                         Some(b) => {
-                            let last = u.path.last().map_or("", |x| x.as_str());
-                            // only a name some module / crate has can bind one; only a macro name
-                            // (or a rename) can bind a macro
-                            let may_type = table.mod_names.contains(last) || last == "self" || last == "super" || last == "crate";
-                            let may_macro = table.defs.contains_key(last) || table.renames.contains(last);
+                            let (may_type, may_macro) = use_may_bind(table, u);
                             if !may_type && !may_macro {
                                 settled.insert((m.clone(), ui));
                                 continue;
@@ -1377,19 +1396,29 @@ impl CrateScope {
                                 }
                                 _ => None,
                             };
+                            if scope_take_wait() {
+                                waited = true;
+                                waits += 1;
+                                continue;
+                            }
                             if prefix_crate.map_or(false, |c| c != k) {
+                                // (its answer is final: what it does not bind now, it never binds)
                                 settled.insert((m.clone(), ui));
+                                scope_final();
                             }
                             // a module / crate under that name
+                            let mut type_waited = false;
                             if may_type && !sc.tnon.get(m).map_or(false, |t| t.contains_key(b)) {
                                 let t = resolve_path(&r, k, m, &u.path, &|kk, mm, n| sc.lookup_type(&r, k, kk, mm, n)).map(|(a, b)| (a.to_string(), b.to_string()));
-                                if let Some(t) = t {
+                                type_waited = scope_take_wait();
+                                if let Some(t) = t.filter(|_| !type_waited) {
                                     sc.tnon.entry(m.clone()).or_default().insert(b.clone(), t);
                                     if !u.is_pub { sc.tpriv.entry(m.clone()).or_default().insert(b.clone()); }
                                     changed = true;
                                 }
                             }
                             // a macro under that name
+                            let mut macro_waited = false;
                             if may_macro && !sc.mnon.get(m).map_or(false, |t| t.contains_key(b)) {
                                 let d = match u.path.split_last() {
                                     Some((last, prefix)) if prefix.is_empty() || (prefix.len() == 1 && prefix[0].is_empty()) => {
@@ -1404,14 +1433,26 @@ impl CrateScope {
                                     }
                                     None => None,
                                 };
-                                if let Some(d) = d {
+                                macro_waited = scope_take_wait();
+                                if let Some(d) = d.filter(|_| !macro_waited) {
                                     sc.mnon.entry(m.clone()).or_default().insert(b.clone(), d);
                                     changed = true;
                                 }
                             }
+                            if type_waited || macro_waited {
+                                waited = true;
+                                waits += 1;
+                            } else {
+                                failing.push((mi, ui));
+                            }
                         }
                         None => {
                             let t = resolve_path(&r, k, m, &u.path, &|kk, mm, n| sc.lookup_type(&r, k, kk, mm, n)).map(|(a, b)| (a.to_string(), b.to_string()));
+                            if scope_take_wait() {
+                                waited = true;
+                                waits += 1;
+                                continue;
+                            }
                             let Some((k2, m2)) = t else { continue };
                             if (k2.as_str(), m2.as_str()) == (k, m.as_str()) {
                                 continue;
@@ -1424,7 +1465,6 @@ impl CrateScope {
                             if copied.get(&(m.clone(), ui)) == Some(&size) {
                                 continue;
                             }
-                            copied.insert((m.clone(), ui), size);
                             // the source's modules: searched through it on demand
                             let srcs = sc.tglobs.entry(m.clone()).or_default();
                             match srcs.iter_mut().find(|x| x.0 == k2 && x.1 == m2) {
@@ -1435,8 +1475,14 @@ impl CrateScope {
                                     changed = true;
                                 }
                             }
-                            // its macros, under the names it has
+                            // its macros, under the names it has (copied again next pass while some wait)
                             let macros = sc.all_macros_of(&r, k, &k2, &m2);
+                            if scope_take_wait() {
+                                waited = true;
+                                waits += 1;
+                            } else {
+                                copied.insert((m.clone(), ui), size);
+                            }
                             copies += macros.len();
                             for (n, v) in macros {
                                 let has = sc.mnon.get(m).map_or(false, |t| t.contains_key(&n)) || sc.mglob.get(m).map_or(false, |t| t.contains_key(&n));
@@ -1449,12 +1495,31 @@ impl CrateScope {
                     }
                 }
             }
-            if !changed {
+            if changed {
+                if force {
+                    force = false;
+                    forced += 1;
+                }
+                continue;
+            }
+            // (a stall where nothing waited is the end)
+            if force || !waited {
                 break;
             }
+            let failed = SCOPE_RUN.with(|c| {
+                let mut c = c.borrow_mut();
+                let run = c.as_mut().expect("the scope run of this compute");
+                failing.iter().filter(|&&x| run.failed.insert(x)).count()
+            });
+            if failed > 0 {
+                determined += failed;
+                continue;
+            }
+            force = true;
         }
+        SCOPE_RUN.with(|c| c.replace(outer));
         if crate::preload::trace() {
-            eprintln!("boot-trace-mscope-detail: {} exported {:.2} ms, {} passes, {} copied, {} mods, {} uses", k, t_exp, passes, copies, mods.len(), cm.uses.values().map(|v| v.len()).sum::<usize>());
+            eprintln!("boot-trace-mscope-detail: {} exported {:.2} ms, {} passes, {} copied, {} mods, {} uses; {} tries waited, {} failures determined, {} forced", k, t_exp, passes, copies, mods.len(), cm.uses.values().map(|v| v.len()).sum::<usize>(), waits, determined, forced);
         }
         sc
     }
@@ -1470,7 +1535,13 @@ impl CrateScope {
 
     fn lookup_macro(&self, r: &Res, k: &str, kk: &str, mm: &str, n: &str) -> Option<MacroRef> {
         if kk == k {
-            return self.mnon.get(mm).and_then(|t| t.get(n)).or_else(|| self.mglob.get(mm).and_then(|t| t.get(n))).cloned();
+            if let Some(d) = self.mnon.get(mm).and_then(|t| t.get(n)) {
+                return Some(d.clone());
+            }
+            if scope_waits(k, mm, n, false) {
+                return None;
+            }
+            return self.mglob.get(mm).and_then(|t| t.get(n)).cloned();
         }
         r.macro_in(kk, mm, n)
     }
@@ -1488,7 +1559,8 @@ impl CrateScope {
         sc.mnon.get(mm).map_or(0, |t| t.len()) + sc.mglob.get(mm).map_or(0, |t| t.len())
     }
 
-    /// Every macro name module `mm` of crate `kk` has (for a glob import).
+    /// Every macro name module `mm` of crate `kk` has (for a glob import); in the crate being
+    /// computed, not the glob-given names a single import of `mm` may still bind (`scope_waits`).
     fn all_macros_of(&self, r: &Res, k: &str, kk: &str, mm: &str) -> Vec<(String, MacroRef)> {
         let sc: &CrateScope = if kk == k {
             self
@@ -1499,13 +1571,124 @@ impl CrateScope {
             }
         };
         let mut macros = Vec::new();
-        for t in [sc.mnon.get(mm), sc.mglob.get(mm)].into_iter().flatten() {
-            for (n, v) in t {
+        for (glob, t) in [(false, sc.mnon.get(mm)), (true, sc.mglob.get(mm))] {
+            for (n, v) in t.into_iter().flatten() {
+                if glob && kk == k && !sc.mnon.get(mm).is_some_and(|t| t.contains_key(n)) && scope_waits(k, mm, n, false) {
+                    continue;
+                }
                 macros.push((n.clone(), v.clone()));
             }
         }
         macros
     }
+}
+
+/// Whether `use` item `u` may bind a module / crate, and a macro: only a name some module / crate
+/// has can bind one; only a macro name (or a rename) can bind a macro.
+fn use_may_bind(table: &MacroTable, u: &UseItem) -> (bool, bool) {
+    let last = u.path.last().map_or("", |x| x.as_str());
+    (table.mod_names.contains(last) || last == "self" || last == "super" || last == "crate", table.defs.contains_key(last) || table.renames.contains(last))
+}
+
+/// This thread's CrateScope::compute (a dependency's scope, computed on demand inside one, runs
+/// in its place and hands it back): the crate's single imports by module and the name they bind,
+/// the import being resolved, the imports found to fail whatever the others bind, whether the
+/// lookups wait (`block`: off for a forced step) and whether one of the import's did.
+struct ScopeRun {
+    krate: String,
+    mods: Vec<String>,
+    /// name -> the single imports binding it: (module index, use index, may bind a module, may bind
+    /// a macro, `pub`)
+    single: HashMap<String, Vec<(usize, usize, bool, bool, bool)>>,
+    current: (usize, usize),
+    block: bool,
+    waited: bool,
+    failed: crate::fxhash::HashSet<(usize, usize)>,
+}
+
+impl ScopeRun {
+    fn new(table: &MacroTable, k: &str, mods: &[String], cm: &CrateMods) -> ScopeRun {
+        let mut single: HashMap<String, Vec<(usize, usize, bool, bool, bool)>> = HashMap::default();
+        for (mi, m) in mods.iter().enumerate() {
+            for (ui, u) in cm.uses.get(m).map_or(&[][..], |v| &v[..]).iter().enumerate() {
+                let Some(b) = &u.bind else { continue };
+                let (may_type, may_macro) = use_may_bind(table, u);
+                if may_type || may_macro {
+                    single.entry(b.clone()).or_default().push((mi, ui, may_type, may_macro, u.is_pub));
+                }
+            }
+        }
+        ScopeRun { krate: k.to_string(), mods: mods.to_vec(), single, current: (usize::MAX, 0), block: true, waited: false, failed: Default::default() }
+    }
+}
+
+thread_local! {
+    static SCOPE_RUN: std::cell::RefCell<Option<ScopeRun>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The scope run tries import `ui` of module `mi`; `block`: its lookups wait.
+fn scope_try(mi: usize, ui: usize, block: bool) {
+    SCOPE_RUN.with(|c| {
+        if let Some(run) = c.borrow_mut().as_mut() {
+            run.current = (mi, ui);
+            run.block = block;
+            run.waited = false;
+        }
+    });
+}
+
+/// The import being tried has its final answer: it makes no name wait any more.
+fn scope_final() {
+    SCOPE_RUN.with(|c| {
+        if let Some(run) = c.borrow_mut().as_mut() {
+            let cur = run.current;
+            run.failed.insert(cur);
+        }
+    });
+}
+
+/// Whether a lookup of the import being tried waited since the last ask (and clears it).
+fn scope_take_wait() -> bool {
+    SCOPE_RUN.with(|c| c.borrow_mut().as_mut().is_some_and(|run| std::mem::take(&mut run.waited)))
+}
+
+/// Whether the module of the import being tried is module `m` or inside it.
+fn scope_asker_inside(m: &str) -> bool {
+    SCOPE_RUN.with(|c| {
+        c.borrow().as_ref().map_or(true, |run| {
+            let asker = run.mods.get(run.current.0).map_or("", |x| x.as_str());
+            asker == m || asker.strip_prefix(m).is_some_and(|r| r.starts_with("::"))
+        })
+    })
+}
+
+/// Whether name `n` of module `m` of crate `k`, missed by the module's own bindings of that
+/// namespace (`type_ns`: modules and crates, else macros), waits: crate `k`'s scope is being
+/// computed and a single import of `m` other than the one being tried may still bind it -- one
+/// visible from the module of the one being tried (`pub`, or that module is inside `m`) whose
+/// failure is not determined (rustc ident.rs: undetermined while such an import may still define
+/// the name). Marks the try waited.
+fn scope_waits(k: &str, m: &str, n: &str, type_ns: bool) -> bool {
+    SCOPE_RUN.with(|c| {
+        let mut c = c.borrow_mut();
+        let Some(run) = c.as_mut() else { return false };
+        if !run.block {
+            return false;
+        }
+        let Some(v) = run.single.get(n) else { return false };
+        if run.krate != k {
+            return false;
+        }
+        let asker = run.mods.get(run.current.0).map_or("", |x| x.as_str());
+        let inside = asker == m || asker.strip_prefix(m).is_some_and(|r| r.starts_with("::"));
+        let waits = v.iter().any(|&(mi, ui, may_type, may_macro, is_pub)| {
+            run.mods[mi] == m && (mi, ui) != run.current && (if type_ns { may_type } else { may_macro }) && (is_pub || inside) && !run.failed.contains(&(mi, ui))
+        });
+        if waits {
+            run.waited = true;
+        }
+        waits
+    })
 }
 
 /// The macros one parse sees: the table as the parse started (shared, read-only; files of a

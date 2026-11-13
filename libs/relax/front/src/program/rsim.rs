@@ -1953,6 +1953,32 @@ mod tests {
     }
 
     #[test]
+    fn a_macro_name_a_single_import_may_still_define_waits_for_it() {
+        // the macro scopes (macros.rs CrateScope) resolve like the items: every order of the imports
+        // expands the macro of `b`
+        let ab = "mod a { macro_rules! ma { () => { pub fn from_a() {} } } pub(crate) use ma as m; }\nmod b { macro_rules! mb { () => { pub fn from_b() {} } } pub(crate) use mb as m; }\n";
+        let abt = "mod a { pub mod t { macro_rules! mc { () => { pub fn from_a() {} } } pub(crate) use mc; } }\nmod b { pub mod t { macro_rules! mc { () => { pub fn from_b() {} } } pub(crate) use mc; } }\n";
+        let cases = [
+            // a macro name a glob gives and a single import shadows
+            (ab, "use a::*;\nuse self::m as n;\nuse b::m;\nn!();\n"),
+            (ab, "use a::*;\nuse b::m;\nuse self::m as n;\nn!();\n"),
+            (ab, "use self::m as n;\nuse a::*;\nuse b::m;\nn!();\n"),
+            (ab, "use a::*;\nuse b::m;\nm!();\n"),
+            (ab, "use b::m;\nuse a::*;\nm!();\n"),
+            // a path to a macro through a module name a glob gives and a single import shadows
+            (abt, "use a::*;\nuse t::mc as n;\nuse b::t;\nn!();\n"),
+            (abt, "use a::*;\nuse b::t;\nuse t::mc as n;\nn!();\n"),
+        ];
+        for (items, uses) in cases {
+            let src = format!("{items}{uses}fn main() {{}}\n");
+            let (p, root, d) = replayed(&src, 2018);
+            let has = |n: &str| p.syms.get(n).is_some_and(|s| p.mods[root as usize].values.contains_key(&s));
+            assert!(has("from_b") && !has("from_a"), "{src}: from_a {} from_b {}", has("from_a"), has("from_b"));
+            assert!(d.is_empty() && p.errors.is_empty(), "{src}: {d:?} {:?}", p.errors);
+        }
+    }
+
+    #[test]
     fn two_globs_of_different_items_are_an_ambiguity_lint() {
         let d = replay("mod b { pub fn x() {} }\nmod c { pub fn x() {} }\nmod a { pub use super::b::*; pub use super::c::*; }\nmod user { use super::a::*; pub fn f() { x(); } }\nfn main() {}\n", 2018);
         // (the use site is judged by the checks that read `sim_ambiguity`; the replay itself has no complaint)
