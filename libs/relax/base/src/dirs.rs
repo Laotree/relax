@@ -171,10 +171,15 @@ pub fn anchors_key() -> u128 {
     key_of(anchors())
 }
 
+/// The anchor dirs as one key input. A different `CARGO_HOME` (or run dir, or workspace) gives a
+/// different key: their absolute locations stay inputs until the payload paths are indirect.
 fn key_of(anchors: &[(&'static str, String)]) -> u128 {
     let mut h = crate::sip::Sip128::new();
     h.str("relax-anchors");
-    for (tag, dir) in anchors { h.str(tag); h.str(dir); }
+    for (tag, dir) in anchors {
+        h.str(tag);
+        h.str(dir);
+    }
     h.finish128()
 }
 
@@ -435,6 +440,17 @@ mod tests {
         assert_eq!(super::shared_mode_from(Some("global")), Ok(true));
         assert!(super::shared_mode_from(Some("on")).is_err());
         assert!(super::shared_mode_from(Some("1")).is_err());
+    }
+
+    /// The anchor directories are a key input: moving the cargo home, the run dir or the
+    /// workspace must change the hash.
+    #[test]
+    fn anchor_dirs_are_a_key_input() {
+        let a = [("run", "/r".to_string()), ("cargo", "/c".to_string()), ("ws", "/w".to_string())];
+        let mut moved = a.clone();
+        moved[1].1 = "/c2".to_string();
+        assert_ne!(super::key_of(&a), super::key_of(&moved));
+        assert_eq!(super::key_of(&a), super::key_of(&a));
     }
 
     /// Only ws blocks sharing: run/cargo paths are machine-wide, a lookalike prefix stays
