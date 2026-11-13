@@ -3278,6 +3278,8 @@ fn frag_desc(f: Frag) -> &'static str {
 impl<'a> Parser<'a> {
     fn mtok_eq(&self, i: usize, m: &MTok) -> bool {
         let t = self.toks.at(i);
+        // A forwarded statement is one opaque nonterminal, not its first literal token.
+        if self.stmt_frags.contains(&{ t.lo }) { return false; }
         if t.kind != m.kind {
             return false;
         }
@@ -3314,6 +3316,11 @@ impl<'a> Parser<'a> {
             return expected();
         }
         let k = if i < end { self.toks.at(i).kind } else { T::Eof };
+        if f == Frag::Stmt && i < end && self.forwarded_kind(self.toks.at(i).lo) == Some(Frag::Stmt) {
+            let hi = self.frag_groups[&{ self.toks.at(i).lo }];
+            return (i..end).find(|&j| self.toks.at(j).hi == hi)
+                .map(|j| (j + 1, None, false)).ok_or_else(|| format!("expected {}", frag_desc(f)));
+        }
         match f {
             Frag::Ident => {
                 if i < end && (matches!(k, T::Ident | T::RawIdent) || (T::KwAs as u8..=T::KwTry as u8).contains(&(k as u8))) && self.tok_text(self.toks.at(i)) != b"_" {
@@ -3448,6 +3455,10 @@ impl<'a> Parser<'a> {
     /// whatever its first token; None for written tokens and the kinds that forward as their
     /// tokens (ident, lifetime, tt).
     fn forwarded_kind(&self, lo: u32) -> Option<Frag> {
+        // An outer statement stays a statement even when it contains a captured expression.
+        if self.stmt_frags.contains(&lo) {
+            return Some(Frag::Stmt);
+        }
         if self.synth_parens.contains(&lo) {
             return Some(Frag::Expr);
         }
@@ -3477,6 +3488,7 @@ impl<'a> Parser<'a> {
             return false;
         }
         if let Some(fk) = self.forwarded_kind(t.lo) {
+            if fk == Frag::Stmt { return matches!(f, Frag::Stmt | Frag::Tt); }
             return match f {
                 Frag::Tt | Frag::Item | Frag::Stmt | Frag::Vis => true,
                 Frag::Ident | Frag::Lifetime => false,
