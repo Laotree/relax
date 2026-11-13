@@ -593,10 +593,10 @@ impl Pool {
         let mut lexed: Vec<(String, Vec<u8>, Vec<Tok>)> = Vec::new();
         let replay = crate::load_profile::span(c.cfg.session.runtime.profile, "publish-replay", &c.name);
         while let Some((path, dir, mpath)) = stack.pop() {
-            if seen.contains_key(&path) {
-                continue;
+            let first_file = !seen.contains_key(&path);
+            if first_file {
+                seen.insert(path.clone(), mpath.clone());
             }
-            seen.insert(path.clone(), mpath.clone());
             let Some(Some(s)) = scanned.remove(&(ci, path.clone(), dir, mpath)) else {
                 complete = false;
                 continue;
@@ -643,7 +643,7 @@ impl Pool {
             }
             // Stack traversal must publish sibling definitions in source order.
             stack.extend(s.children.into_iter().rev());
-            if !self.demand_plan.as_ref().is_some_and(|p| p.skips(&c.root, c.cfg.holds("test"), &path)) {
+            if first_file && !self.demand_plan.as_ref().is_some_and(|p| p.skips(&c.root, c.cfg.holds("test"), &path)) {
                 lexed.push((path, s.src[..s.src_len].to_vec(), s.toks.into_vec()));
             }
         }
