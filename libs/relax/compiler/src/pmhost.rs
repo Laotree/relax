@@ -758,6 +758,11 @@ thread_local! {
     static SLOT_ENDS: Cell<Option<SlotEnds>> = const { Cell::new(None) };
 }
 
+/// Hosted macro calls running now, on any thread (the settle rebuild's replace checks there are none).
+pub fn calls_in_flight() -> usize {
+    WATCH.lock().map_or(0, |v| v.iter().filter(|s| s.start.load(std::sync::atomic::Ordering::Acquire) != 0).count())
+}
+
 fn watch_begin() -> &'static WatchSlot {
     let slot = MY_SLOT.with(|m| match m.get() {
         Some(s) => s,
@@ -1032,6 +1037,12 @@ pub(crate) unsafe fn reset_statics() {
         }
         !ended
     });
+}
+
+/// Tests: a world is alive (a stand-in that is no world: a call through it fails).
+#[cfg(test)]
+pub(crate) fn stand_in_world() {
+    *WORLD.lock().unwrap() = Some(std::sync::Arc::new(Err("stand-in".into())));
 }
 
 #[cfg(test)]

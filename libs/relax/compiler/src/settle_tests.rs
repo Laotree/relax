@@ -252,12 +252,16 @@ fn settle_rebuild_covers_a_crate_added_at_run_time() {
         // the added crate's code compiles from the rebuilt program
         unsafe { compile_fn(up, slot) }.expect("the added crate's fn compiles after the rebuild");
     });
-    // the same program again: the store holds the image of it, added crate included
+    // the same program again: the store holds the image of it, added crate included. A proc-macro
+    // world is alive now (a run whose hosted macros ran after the load): the rebuild does not wait
+    // for it, which it did for the rest of such a run ("the proc-macro world is alive")
+    crate::pmhost::stand_in_world();
     match settle_rebuild::run(up, false) {
         settle_rebuild::Outcome::Done => {}
         settle_rebuild::Outcome::Retry(why) | settle_rebuild::Outcome::Refused(why) => panic!("the second settle rebuild did not replace: {why}"),
     }
     assert_eq!(settle_rebuild::encodes(), encodes + 1, "a rebuild of a program the store holds encodes nothing");
+    assert!(crate::pmhost::world_alive(), "the rebuild leaves the world alive");
     // The isolated process owns the runtime globals; no workers survive the child.
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();

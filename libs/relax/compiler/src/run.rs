@@ -3985,14 +3985,23 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                     let _s = crate::inspect::timeline::span("run-monitor settle rebuild");
                     match jit::settle_rebuild::run(up, settle_stress.is_none() && rebuild_tries <= jit::settle_rebuild::TAIL_WAIT) {
                         jit::settle_rebuild::Outcome::Done => rebuild_done = true,
-                        jit::settle_rebuild::Outcome::Refused(why) => { verbose!("relax settle rebuild refused: {why}"); rebuild_over = true; }
+                        jit::settle_rebuild::Outcome::Refused(why) => {
+                            crate::inspect::flightrec::event("settle.refused", &why, rebuild_tries as u64, 0);
+                            verbose!("relax settle rebuild refused: {why}");
+                            rebuild_over = true;
+                        }
                         jit::settle_rebuild::Outcome::Retry(why) => {
                             rebuild_next = Instant::now() + std::time::Duration::from_secs(1);
                             if rebuild_tries >= jit::settle_rebuild::TAIL_WAIT + 40 {
                                 rebuild_done = true;
                                 settle_gave_up(rebuild_tries, &why);
                             }
-                            if why != rebuild_said { verbose!("relax settle rebuild deferred (try {rebuild_tries}): {why}"); rebuild_said = why; }
+                            if why != rebuild_said {
+                                // each new reason once: why a run's rebuild waits shows without --verbose
+                                crate::inspect::flightrec::event("settle.deferred", &why, rebuild_tries as u64, 0);
+                                verbose!("relax settle rebuild deferred (try {rebuild_tries}): {why}");
+                                rebuild_said = why;
+                            }
                         }
                     }
                 }

@@ -190,9 +190,6 @@ fn not_now() -> Option<String> {
     if RELOADING.load(Ordering::Acquire) > 0 {
         return Some("a reload is in progress".into());
     }
-    if crate::pmhost::world_alive() {
-        return Some("the proc-macro world is alive".into());
-    }
     None
 }
 
@@ -328,7 +325,7 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
         let r = front_read("settle rebuild encode");
         let (prog, tcx) = r.unit(up);
         let before = Counts::of(prog, tcx);
-        trace(&format!("the program {before:?}, the stored image {stored:?}"));
+        trace(&format!("the program {before:?}, the stored image {stored:?}, proc-macro world {}", if crate::pmhost::world_alive() { "alive" } else { "none" }));
         let stop = || crate::preempt::writer_waiting() || crate::preempt::is_stopped();
         // crates added at run time (app domains) are in the image too, listed after the boot's
         let pre = with_added(prog, &boot);
@@ -510,6 +507,15 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
         return Err(if owner::program_waiting() && !quitting() { gave_way("front write", t_r) } else { "a front reader held on for 1 s".into() });
     };
     lap("front write", &mut laps);
+    // The proc-macro world stays alive through the rebuild: it is its own unit, program, type
+    // context and cache, and nothing of the state replaced here is reachable from it. A hosted
+    // call runs as one whole program request, as this replace does, so none is in flight now. One
+    // that is breaks that rule: the rebuild waits for it, and the flight recorder says so.
+    let calls = crate::pmhost::calls_in_flight();
+    if calls != 0 {
+        crate::inspect::flightrec::event("settle.hosted-call", &format!("{calls} hosted macro call(s) in flight at the replace"), calls as u64, 0);
+        return Err(format!("{calls} hosted macro call(s) in flight"));
+    }
     let _f = crate::zone_alloc::compiler_fresh();
     let u = &mut *up;
     let now = Counts::of(&u.prog, &u.tcx);
