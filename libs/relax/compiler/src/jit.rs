@@ -4933,7 +4933,7 @@ impl Unit {
                     exec_check();
                 }
                 static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| os::proc::host_atexit(at_exit_check));
+                ONCE.call_once(|| makepad_core_util::process_end::at_exit(at_exit_check));
             }
         }
         // the wasm32 web target's program: the unit lives in the linear memory's window (web32.rs)

@@ -599,7 +599,7 @@ mod unix {
         // the hook lives as long as the process: the program's heap
         // the message reaches the transcript and the terminal before an abort can follow the hook
         { let _k = crate::zone_alloc::kept(); std::panic::set_hook(Box::new(move |info| { abnormal(); previous(info); fatal_drain(b""); })); }
-        crate::os::proc::host_atexit(at_exit);
+        makepad_core_util::process_end::at_exit(at_exit);
         { let _k = crate::zone_alloc::kept();
         if let Err(e) = std::thread::Builder::new().name("run-log-tee".into()).spawn(tee) {
             unsafe { dup2(out, 2) };

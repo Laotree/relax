@@ -444,18 +444,8 @@ fn refuse(why: &str, name: &str) {
     }
 }
 
-/// RELAX_INTERP_STATS: the stats print once at exit, from the C library's atexit or from the JIT's
-/// exit, which ends the process without the C library's handlers (compiler os/proc.rs).
-static STATS_AT_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Prints the stats if they are on and not printed yet: the JIT's exit calls it.
-pub fn exit_stats() {
-    if STATS_AT_EXIT.swap(false, Ordering::AcqRel) {
-        print_stats();
-    }
-}
-
-fn print_stats() {
+/// RELAX_INTERP_STATS: the stats, printed once as the process ends (its exit work).
+extern "C" fn print_stats() {
     let g = REFUSALS.lock().unwrap_or_else(|e| e.into_inner());
     let mut v: Vec<_> = g.clone();
     v.sort_by(|a, b| b.1.cmp(&a.1));
@@ -543,16 +533,7 @@ fn selection() -> Option<&'static Sel> {
         let split = |s: &str| s.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect::<Vec<_>>();
         let skip = std::env::var("RELAX_INTERP_SKIP").map(|s| split(&s)).unwrap_or_default();
         if interp_stats() {
-            extern "C" {
-                fn atexit(f: extern "C" fn()) -> i32;
-            }
-            extern "C" fn stats_at_exit() {
-                exit_stats();
-            }
-            STATS_AT_EXIT.store(true, Ordering::Release);
-            unsafe {
-                atexit(stats_at_exit);
-            }
+            makepad_core_util::process_end::at_exit(print_stats);
         }
         TRACE.store(std::env::var_os("RELAX_INTERP_TRACE").is_some(), Ordering::Relaxed);
         if std::env::var_os("RELAX_INTERP_TRACE").is_some() || std::env::var_os("RELAX_INTERP_POOL").is_some() {

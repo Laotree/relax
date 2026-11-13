@@ -346,30 +346,6 @@ pub fn run_program_atexit() {
     }
 }
 
-/// The host's own exit work (the run's exit summary and cache write, the terminal's restore and
-/// transcript, the wasm export's write), in the order it was registered. Each handler also goes
-/// to the C library's atexit, for a process that ends through the C library's exit; on unix,
-/// [`exit`] runs this list itself and ends the process with `_exit`, so the C library's list,
-/// and with it every exit handler a native library registered, never runs there.
-static HOST_ATEXIT: std::sync::Mutex<Vec<extern "C" fn()>> = std::sync::Mutex::new(Vec::new());
-
-/// Registers the host's exit work `f`: in place of the C library's `atexit` ([`HOST_ATEXIT`]).
-pub fn host_atexit(f: extern "C" fn()) {
-    extern "C" {
-        fn atexit(f: extern "C" fn()) -> i32;
-    }
-    HOST_ATEXIT.lock().unwrap_or_else(|e| e.into_inner()).push(f);
-    unsafe { atexit(f) };
-}
-
-/// Runs (and empties) the host's exit work, last registered first, as the C library's exit would.
-#[cfg(unix)]
-fn run_host_atexit() {
-    while let Some(f) = { let mut g = HOST_ATEXIT.lock().unwrap_or_else(|e| e.into_inner()); g.pop() } {
-        f();
-    }
-}
-
 #[cfg(unix)]
 mod unix {
     use std::path::Path;
@@ -431,12 +407,12 @@ mod unix {
         dlsym(handle, name)
     }
 
-    /// exit(): the program's atexit handlers, the host's own exit work, then the end of the
-    /// process with `_exit`. The C library's exit handlers do not run, so neither do those a native
+    /// exit(): the program's atexit handlers, then the end every process takes
+    /// (`makepad_core_util::process_end::end`, a native app's too): the host's own exit work, the
+    /// flushes, `_exit`. The C library's exit handlers do not run, so neither do those a native
     /// library registered: a GPU driver's teardown at exit joined one of its threads that never
     /// ended (NVIDIA's Vulkan driver at a test process's exit, about 1 in 150 runs and more under
-    /// GPU load, the process hung for good). The kernel releases what the process held as its
-    /// files close, as for a killed process. The main thread's pthread key destructors do not run
+    /// GPU load, the process hung for good). The main thread's pthread key destructors do not run
     /// either (the program's thread locals are left as they are, as in a rustc build).
     pub fn exit(code: i32) -> ! {
         super::run_program_atexit();
@@ -452,26 +428,7 @@ mod unix {
             super::EMBEDDED_FAILURE.store(code, std::sync::atomic::Ordering::Release);
             loop { std::thread::park(); }
         }
-        end_process(code)
-    }
-
-    /// Ends the process after the host's exit work, its endpoint's withdrawal and the flushes of
-    /// Rust's and C's standard streams, without the C library's exit handlers ([`exit`]).
-    fn end_process(code: i32) -> ! {
-        use std::io::Write;
-        extern "C" {
-            fn fflush(stream: *mut core::ffi::c_void) -> i32;
-            fn _exit(code: i32) -> !;
-        }
-        super::run_host_atexit();
-        relax_codegen::interp::exit_stats();
-        makepad_remote::carrier::unix::withdraw();
-        let _ = std::io::stdout().flush();
-        let _ = std::io::stderr().flush();
-        unsafe {
-            fflush(std::ptr::null_mut());
-            _exit(code)
-        }
+        makepad_core_util::process_end::end(code)
     }
 
     pub fn last_error() -> i32 {
@@ -921,30 +878,15 @@ mod imp {
     /// What unix's exit() does: the program's atexit handlers, then the process's (`_cexit`: the
     /// run's exit work, the control endpoint's cleanup). A run that returned from main or quit
     /// through its app domain did neither: no final cache, and a discovery file left behind, which
-    /// the hub reads as a crash (11-04). Then the process ends without ExitProcess, which would run
-    /// the fiber-local destructors of the exiting thread: the program's thread locals (FlsAlloc
-    /// callbacks in JIT code) would run after Relax dropped the unit, and unix's exit() does not
-    /// run the main thread's key destructors either.
+    /// the hub reads as a crash (11-04). Then the process ends without ExitProcess
+    /// (`makepad_core_util::process_end::end`), which would run the fiber-local destructors of the
+    /// exiting thread: the program's thread locals (FlsAlloc callbacks in JIT code) would run after
+    /// Relax dropped the unit, and unix's exit() does not run the main thread's key destructors
+    /// either.
     pub fn exit(code: i32) -> ! {
         super::run_program_atexit();
         crate::selfexe::remove();
-        end_process(code)
-    }
-
-    /// The process's own exit work and its end, without the program's handlers (a restart, which
-    /// stands in for an exec: restart_parent.rs).
-    pub fn end_process(code: i32) -> ! {
-        use std::io::Write;
-        extern "C" {
-            fn _cexit();
-        }
-        unsafe { _cexit() };
-        let _ = std::io::stdout().flush();
-        let _ = std::io::stderr().flush();
-        unsafe {
-            TerminateProcess(GetCurrentProcess(), code as u32);
-        }
-        std::process::exit(code)
+        makepad_core_util::process_end::end(code)
     }
 
     pub fn last_error() -> i32 {

@@ -19,6 +19,7 @@ path = "src/lib.rs"
 
 [dependencies]
 makepad-cpu-budget = { workspace = true }
+makepad-core-util = { path = "../../core_util", version = "0.1.0" }
 # the git store's deflate/inflate (src/inflate), the manifests' TOML (src/toml) and the
 # proc-macro token model (makepad's libs/relax/lex) need no registry dependencies.
 relax-backend = { workspace = true }

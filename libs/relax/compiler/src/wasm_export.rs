@@ -444,7 +444,7 @@ pub fn capture(unit: usize, id: u32, f: &Func) {
                 }
             }
         }
-        crate::os::proc::host_atexit(at_exit);
+        makepad_core_util::process_end::at_exit(at_exit);
     }
     // process state: on the kept heap
     crate::zone_alloc::kept_with(|| {

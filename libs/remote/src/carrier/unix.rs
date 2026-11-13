@@ -254,10 +254,7 @@ mod imp {
                 let _ = C_PATHS.set((s, d));
             }
         }
-        extern "C" {
-            fn atexit(f: extern "C" fn()) -> i32;
-        }
-        unsafe { atexit(cleanup) };
+        makepad_core_util::process_end::at_exit(cleanup);
         served.map(|()| sock)
     }
 
@@ -386,10 +383,7 @@ mod imp {
         );
         std::fs::write(paths(pid).1, info)?;
         ep.set_discovery(paths(pid).1);
-        extern "C" {
-            fn atexit(f: extern "C" fn()) -> i32;
-        }
-        unsafe { atexit(cleanup) };
+        makepad_core_util::process_end::at_exit(cleanup);
         Ok(PathBuf::from(socket))
     }
     /// Serves `ep` at a fixed address such as the hub's: loopback TCP behind a fresh token, both

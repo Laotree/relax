@@ -2459,7 +2459,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     {
         // (once in a process, whatever number of runs it has)
         static AT_EXIT: std::sync::Once = std::sync::Once::new();
-        AT_EXIT.call_once(|| crate::os::proc::host_atexit(at_exit));
+        AT_EXIT.call_once(|| makepad_core_util::process_end::at_exit(at_exit));
     }
     // RELAX_TEST_BOOT_PANIC=1: the boot panics here, its unit published and the exit's
     // work registered (fixture/boot_panic.sh: the run's end and the exit's cache write meet the
