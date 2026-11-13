@@ -556,9 +556,9 @@ pub struct Unit {
     pub tls_next: u32,
     /// panicking stand-ins for foreign fns this host lacks, by symbol
     missing_stubs: relax_session::sync::Mutex<HashMap<String, u64>>,
-    /// the symbols the program's global_asm! defines, placed on the first foreign lookup
-    /// (global_asm.rs)
-    pub(crate) global_asm: std::sync::OnceLock<HashMap<String, u64>>,
+    /// the program's global_asm!, placed on the first foreign lookup: the symbols it defines,
+    /// and why a left-out crate's are not (global_asm.rs)
+    pub(crate) global_asm: std::sync::OnceLock<crate::global_asm::Placed>,
     /// tier-up policy (None: O1 only) and its per-slot records / hot glue
     pub tier1: Option<Tier1Cfg>,
     /// O3 code that kept a call to a callee it could not or would not inline (never ran yet, its
@@ -7113,7 +7113,7 @@ impl Unit {
         if let Some(a) = lookup_interposer(&link) {
             return Some(a);
         }
-        if let Some(&a) = self.global_asm.get().and_then(|m| m.get(&link)) {
+        if let Some(&a) = self.global_asm.get().and_then(|p| p.symbols.get(&link)) {
             return Some(a);
         }
         if let Some(a) = loader_symbol(link.as_bytes()) {
@@ -7199,9 +7199,10 @@ impl Unit {
         None
     }
 
-    /// Code that panics with "foreign function `x` is not available on this host" (one per
-    /// symbol): loads its site into the first argument and tail-jumps to the panic
-    /// trampoline, so the report names the JIT caller.
+    /// Code that panics with "foreign function `x` is not available on this host", or why a
+    /// left-out crate's global_asm! leaves it undefined (one per symbol): loads its site into
+    /// the first argument and tail-jumps to the panic trampoline, so the report names the JIT
+    /// caller.
     fn missing_foreign_stub(&self, d: DefId) -> u64 {
         let name = self.link_name(d);
         let mut m = self.missing_stubs.lock().unwrap_or_else(|e| e.into_inner());
@@ -7213,6 +7214,8 @@ impl Unit {
         // std's own runtime calls: nothing to cfg out or link, this JIT and std are of different trees
         let why = if name.starts_with("__relax_") {
             format!("this JIT has no `{}`, which the std at {} calls: they come from different trees", name, crate::std_dir())
+        } else if let Some(why) = crate::global_asm::missing_reason(self, &name) {
+            why.to_string()
         } else {
             format!("foreign function `{}` is not available on this host -- cfg the call out or link its library", name)
         };
