@@ -4361,9 +4361,10 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, sources: &[Edit], partial:
             let edits: Vec<Edit> = {
                 let prog = &(*up).prog;
                 let current = (!module).then(|| prog.current_source_file_sets(|p| edits.iter().any(|e| prog.file_paths[e.file as usize] == p)));
-                // every crate's copy of the file takes the edit: a --lib test root's harness crate
-                // and the plain library its dev-dependencies link (M50). The other copies follow
-                // the edits as given, whose outcome files stay at their positions.
+                // every version of the file takes the edit: each crate's copy (a --lib test root's
+                // harness crate and the plain library its dev-dependencies link, M50) and each
+                // module's (one file declared as two modules, relax issue 135). The other versions
+                // follow the edits as given, whose outcome files stay at their positions.
                 let mut twins = Vec::new();
                 let mut out: Vec<Edit> = edits.into_iter().map(|mut e| {
                     if let Some((&last, others)) = current.as_ref().and_then(|c| c.get(&prog.file_paths[e.file as usize])).and_then(|f| f.split_last()) {

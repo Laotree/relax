@@ -1251,36 +1251,33 @@ impl Program {
         self.current_source_file_sets(keep).into_iter().filter_map(|(path, files)| Some((path, *files.last()?))).collect()
     }
 
-    /// `current_source_files` with every crate's file of a path, one per crate: a `--lib` test
-    /// root's harness crate and the plain library its dev-dependencies link are two crates of one
-    /// path (M50). The last is the one `current_source_files` names. `keep` picks the paths before
-    /// any is copied: a live session asking whether its few saved paths are sources had every
-    /// module's path (std's too) cloned into the map, 25-40 ms of the owner per edit (an app, 11-04).
+    /// `current_source_files` with every version of a path: one per crate and module. A `--lib`
+    /// test root's harness crate and the plain library its dev-dependencies link are two crates
+    /// of one path (M50); one file declared as two modules (`#[path]` on both) is two versions,
+    /// each parsed as its module (relax issue 135). In module order; the last is the one
+    /// `current_source_files` names. `keep` picks the paths before any is copied: a live session
+    /// asking whether its few saved paths are sources had every module's path (std's too) cloned
+    /// into the map, 25-40 ms of the owner per edit (an app, 11-04).
     pub fn current_source_file_sets(&self, keep: impl Fn(&str) -> bool) -> std::collections::BTreeMap<String, Vec<u32>> {
         let mut files: std::collections::BTreeMap<String, Vec<u32>> = std::collections::BTreeMap::new();
         self.live_module_files(keep, |path, file| {
-            // the last module of a path names its crate's file and orders it
-            let krate = self.file_crate.get(file as usize);
+            // the last module of a path orders its file last (an inline module is its file's:
+            // one entry)
             let of = files.entry(path.clone()).or_default();
-            of.retain(|&f| self.file_crate.get(f as usize) != krate);
+            of.retain(|&f| f != file);
             of.push(file);
         });
         files
     }
 
-    /// `current_source_files` with every module's file of a path, in the crate it names: one
-    /// file declared as two modules (`#[path]` on both) is two versions, each parsed as its
-    /// module (relax issue 135). In module order; the last is the one `current_source_files`
-    /// names.
+    /// `current_source_file_sets` in the crate `current_source_files` names: each module's
+    /// version of a path there (the check server's files).
     pub fn current_source_module_files(&self, keep: impl Fn(&str) -> bool) -> std::collections::BTreeMap<String, Vec<u32>> {
-        let mut files: std::collections::BTreeMap<String, Vec<u32>> = std::collections::BTreeMap::new();
-        self.live_module_files(keep, |path, file| {
-            let krate = self.file_crate.get(file as usize);
-            let of = files.entry(path.clone()).or_default();
-            // (an inline module is its file's: one entry)
-            of.retain(|&f| f != file && self.file_crate.get(f as usize) == krate);
-            of.push(file);
-        });
+        let mut files = self.current_source_file_sets(keep);
+        for of in files.values_mut() {
+            let krate = of.last().and_then(|&f| self.file_crate.get(f as usize)).copied();
+            of.retain(|&f| self.file_crate.get(f as usize).copied() == krate);
+        }
         files
     }
 
