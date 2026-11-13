@@ -344,7 +344,8 @@ fn test_page(st: &Style) -> String {
     p.text("test harness.");
     p.text("A package's tests build with cargo test's profile: `test` (debug assertions and overflow");
     p.text("checks as the workspace's [profile.test] / [profile.dev] set them), --release the release one.");
-    p.text("Build scripts see that profile's PROFILE, OPT_LEVEL and DEBUG, as under cargo.");
+    p.text("Build scripts see that profile's PROFILE, OPT_LEVEL and DEBUG, as under cargo, and the");
+    p.text("package binaries an integration test starts (CARGO_BIN_EXE_<name>) build with it too.");
     p.text("A file's tests build as rustc -O --test.");
     p.text("No rustc runs, so the target holds no rustc-format .rlib or .rmeta of the crate: a test that");
     p.text("hands the crate's .rlib to an external rustc needs `cargo build --lib` first.");

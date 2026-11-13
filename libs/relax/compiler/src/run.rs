@@ -743,7 +743,7 @@ pub(crate) fn resolve_package(
     // checks as cargo test builds it, its host units (build scripts, proc macros and what they use)
     // with the profile's build-override. Relax's std crates (the sysroot's proc_macro too) keep
     // their own.
-    let profile = TEST_PROFILE.get().map(|p| crate::resolve::profile(workspace, p)).transpose()?;
+    let profile = unitgraph::test_profile().map(|p| crate::resolve::profile(workspace, p)).transpose()?;
     let ours = |dir: &str| crate::vfs::relative_path(dir, std_dir).is_none();
     let host_checks: Vec<Vec<String>> = g.pkg.iter().zip(&g.crates).map(|((dir, name, version), c)| match &profile {
         Some(p) if ours(dir) => p.checks(dir, name, version, c.registry, true).cfgs().map(str::to_string).collect(),
@@ -1031,7 +1031,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             }
             "--self-exec" => self_exec = true,
             "--profile" if i + 1 < args.len() => {
-                let _ = TEST_PROFILE.set(args[i + 1].clone());
+                unitgraph::set_test_profile(args[i + 1].clone());
                 i += 1;
             }
             "--live" => live_tests = true,
@@ -1159,8 +1159,12 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         return usage();
     }
     if also_requested && (!check || watch || root_only || selftest || session.is_some()) { return usage(); }
-    // a profile is a test's: `makepad run` builds as the release profile does
-    if TEST_PROFILE.get().is_some() && !harness && !plain_test { return usage(); }
+    // a profile is a test's: `makepad run` builds as the release profile does. A test's start of
+    // its package's binary (CARGO_BIN_EXE_<name>, which names it in RELAX_ARG0) has the test's, as
+    // cargo builds the binary with the test (relax issue 207), and so has that binary's run of
+    // itself again (from its run's link)
+    let test_binary = || std::env::var_os("RELAX_ARG0").is_some() || std::env::current_exe().and_then(|e| e.canonicalize()).is_ok_and(|e| crate::selfexe::is_link(&e));
+    if unitgraph::test_profile().is_some() && !harness && !plain_test && !test_binary() { return usage(); }
     driver_options.verbose &= !silent();
     VERBOSE.store(driver_options.verbose, Ordering::Relaxed);
     if driver_options.verbose { crate::tui::track_for_verbose(); }
@@ -3154,11 +3158,6 @@ pub(crate) fn host_thread() -> u64 {
 }
 /// `makepad run --harness` (`makepad test`): the program is a test harness.
 static HARNESS_RUN: AtomicBool = AtomicBool::new(false);
-
-/// `makepad test`'s cargo profile (`--profile <name>`, test_pkg.rs): the debug assertions and
-/// overflow checks the program's crates build with, as cargo test builds them (relax issue 141).
-/// None: a run, built as cargo's release profile leaves the code (no checks).
-static TEST_PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// A package binary its integration test started (CARGO_BIN_EXE_<name>): the receipt of the native
 /// build the test's run made (unitgraph `Inherit::Binary`, relax issue 151).

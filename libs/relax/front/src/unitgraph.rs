@@ -364,7 +364,14 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
                     // run no one attends, as the test's own: a panic unwinds and a compile error
                     // ends it at once, as a rustc build's binary ends, however the test run is
                     // watched (a devhub-observed run parked a panic 600 s)
-                    let mut words: Vec<String> = [exe_str.as_str(), "run", "--quiet", "--silent", "--no-live", "--unattended", "--run-dir", td_str.as_str(), "--workspace-dir", pkg_dir.as_str(), pkg_name.as_str(), "--no-default-features"].iter().map(|w| w.to_string()).collect();
+                    let mut words: Vec<String> = [exe_str.as_str(), "run", "--quiet", "--silent", "--no-live", "--unattended", "--run-dir", td_str.as_str(), "--workspace-dir", pkg_dir.as_str()].iter().map(|w| w.to_string()).collect();
+                    // the test's profile, as cargo builds the binary with the test: its debug
+                    // assertions and overflow checks (before, the binary built as a run, without
+                    // them, relax issue 207)
+                    if let Some(p) = test_profile() {
+                        words.extend(["--profile".to_string(), p.to_string()]);
+                    }
+                    words.extend([pkg_name.clone(), "--no-default-features".to_string()]);
                     // the test run's native permission is the binary's, as cargo builds the binary
                     // with the test: a test that clears its child's environment (or takes
                     // RELAX_ALLOW_C out of it) still starts the binary (relax issue 157)
@@ -1336,6 +1343,23 @@ fn checks_json(c: Option<crate::resolve::ProfileChecks>) -> String {
 }
 
 static SELF_EXE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// `makepad test`'s cargo profile (`--profile <name>`, test_pkg.rs): the debug assertions and
+/// overflow checks the program's crates build with, as cargo test builds them (relax issue 141),
+/// and the package binaries its integration tests start (CARGO_BIN_EXE_<name>), which cargo builds
+/// with the test (relax issue 207). None: a run, built as cargo's release profile leaves the code
+/// (no checks).
+static TEST_PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Sets [`test_profile`] (the run's `--profile <name>`), once.
+pub fn set_test_profile(name: String) {
+    let _ = TEST_PROFILE.set(name);
+}
+
+/// The run's cargo profile: `makepad test`'s, None for a plain run.
+pub fn test_profile() -> Option<&'static str> {
+    TEST_PROFILE.get().map(String::as_str)
+}
 
 /// The program a build script runs as: Relax running itself again. It is the loader
 /// (dirs::loader_exe) unless the host names another one ([`set_self_exe`]): in an Android app this

@@ -568,7 +568,7 @@ impl<'a> Lcx<'a> {
             field_moved: HashMap::default(),
             want_mut: false,
             const_init: false,
-            // the crate's profile (cfg(overflow_checks): `makepad test`'s, run.rs TEST_PROFILE);
+            // the crate's profile (cfg(overflow_checks): `makepad test`'s, unitgraph.rs TEST_PROFILE);
             // a run's crates, and Relax's std, build without checks
             overflow_checks: u.prog.file_crate.get(b.file as usize).and_then(|&k| u.prog.crates.get(k as usize)).is_some_and(|c| c.cfg.holds("overflow_checks")),
             foreign: vec![false; n],
