@@ -253,6 +253,14 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
     let mut code = 0;
     // a filter no target matched is no pass (a target exits NO_TESTS_EXIT when it matched none)
     let (mut matched, mut unmatched) = (false, false);
+    // the links the runs start from go when this command ends (selfexe.rs launch_link)
+    struct Launches;
+    impl Drop for Launches {
+        fn drop(&mut self) {
+            crate::selfexe::remove_launch();
+        }
+    }
+    let _launches = Launches;
     for run in runs {
         let mut a: Vec<String> = vec!["run".to_string()];
         match &run {
@@ -273,7 +281,11 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         }
         a.push("--".to_string());
         a.extend(prog.iter().cloned());
-        let mut cmd = std::process::Command::new(&exe);
+        // started from a link named as its program: its process has the program's name, as cargo's
+        // test executable's has (selfexe.rs launch_link)
+        let dd = a.iter().position(|w| w == "--").unwrap_or(a.len());
+        let launch = crate::selfexe::launch_link(&exe, &crate::selfexe::program_name(&a[..dd], &package));
+        let mut cmd = std::process::Command::new(launch.as_deref().unwrap_or(&exe));
         cmd.args(&a).env(makepad_remote::hot::TEST_PACKAGE_ENV, "1");
         // the run leads a process group of its own, which a signal to this command ends (`stop`)
         #[cfg(unix)]

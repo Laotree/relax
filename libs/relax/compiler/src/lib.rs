@@ -921,7 +921,8 @@ pub fn std_dir() -> String {
 /// under <dir>/src, and the tree the binary was built from. The workspace's tree comes first: a
 /// lease's binary matches the lease's tree, and the tree beside it may have moved on since.
 pub fn std_candidates(workspace: Option<&str>) -> Vec<String> {
-    let mut d = std::env::current_exe().unwrap_or_default();
+    // the loader's own path, not a run's link of it (selfexe.rs)
+    let mut d = crate::dirs::loader_exe().unwrap_or_default();
     for _ in 0..3 {
         d.pop();
     }

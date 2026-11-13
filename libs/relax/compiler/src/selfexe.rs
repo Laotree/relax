@@ -17,6 +17,12 @@
 //! itself (`add_bins`), so a test that finds a binary at `current_exe()/../../<name>`, as under
 //! cargo, finds it (relax issue 139's second case).
 //!
+//! A process gets its program's name from the file it starts from (Linux's comm, macOS's p_comm:
+//! what ps, top and a parent lookup show), as a cargo-built program has its own. So whoever starts
+//! a run starts it from a link of the loader named as the program (`launch_link`, in the starter's
+//! `+launch` folder): `makepad test` its targets' runs, a restart in place the run again. The run
+//! started still makes its own link.
+//!
 //! The folder goes when the run exits (os::proc::exit); a run that did not get there (killed)
 //! leaves it, and the next run's `link` removes the folders of processes that are gone. They
 //! matter: a link keeps an old loader's blocks alive after cargo replaces the binary.
@@ -26,6 +32,25 @@ use std::sync::OnceLock;
 static OWN_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// The folder of the link: OWN_DIR, a test's `deps/` in it
 static LINK_DIR: OnceLock<PathBuf> = OnceLock::new();
+/// The file name of this run's link
+static NAME: OnceLock<String> = OnceLock::new();
+/// A process's links that runs start from (`launch_link`), in its folder: a name no link has
+const LAUNCH: &str = "+launch";
+
+/// The file name of a program's link: its name's letters, digits, `-`, `_` and `.` (`.exe` added
+/// on Windows).
+fn file_name(name: &str) -> String {
+    let name: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect();
+    if cfg!(windows) { format!("{name}.exe") } else { name }
+}
+
+/// The name of a run's program, as cargo names its executable: the binary `--bin` names in the
+/// run's `flags`, else the package's.
+pub fn program_name(flags: &[String], package: &str) -> String {
+    flags.iter().position(|f| f == "--bin").and_then(|j| flags.get(j + 1)).cloned()
+        .or_else(|| flags.iter().find_map(|f| f.strip_prefix("--bin=").map(str::to_string)))
+        .unwrap_or_else(|| Path::new(package).file_stem().map_or_else(|| package.to_string(), |s| s.to_string_lossy().into_owned()))
+}
 
 /// This process's link to `loader`, named `name` (a package or binary name), made once; the
 /// reason when the run dir's file system cannot hold it (another volume than the loader's).
@@ -34,6 +59,15 @@ pub fn link(loader: &Path, name: &str, test: bool) -> Result<PathBuf, String> {
     let root = crate::dirs::relax_dir().join("exe");
     sweep(&root);
     let dir = root.join(std::process::id().to_string());
+    let at = if test { dir.join("deps") } else { dir.clone() };
+    let link = at.join(file_name(name));
+    let _ = NAME.set(file_name(name));
+    // a restart in place: this process again from its launch link, its run's link still there
+    if dir.canonicalize().is_ok_and(|d| loader.starts_with(d.join(LAUNCH))) && link.is_file() {
+        let _ = OWN_DIR.set(dir);
+        let _ = LINK_DIR.set(at);
+        return link.canonicalize().map_err(|e| format!("{}: {e}", link.display()));
+    }
     // an exec of the program's own executable is this process going on (its pid) in a new image,
     // which runs from the link in this folder: that link is its own executable still (removing
     // the folder took the file it runs from, the new link found no loader, and a spawn of
@@ -45,22 +79,74 @@ pub fn link(loader: &Path, name: &str, test: bool) -> Result<PathBuf, String> {
     }
     // a folder under this pid is a gone process's (pids are reused)
     let _ = std::fs::remove_dir_all(&dir);
-    let at = if test { dir.join("deps") } else { dir.clone() };
     std::fs::create_dir_all(&at).map_err(|e| format!("{}: {e}", at.display()))?;
     let _ = OWN_DIR.set(dir.clone());
-    let name: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect();
-    let file = if cfg!(windows) { format!("{name}.exe") } else { name };
-    let link = at.join(file);
     let _ = LINK_DIR.set(at);
     std::fs::hard_link(loader, &link).map_err(|e| format!("hard link {} of {}: {e}", link.display(), loader.display()))?;
     link.canonicalize().map_err(|e| format!("{}: {e}", link.display()))
 }
 
+/// A link of `loader` named as the program `name`, in this process's `+launch` folder, for a run
+/// this process starts (or execs, a restart in place) to start from, so its process has the
+/// program's name from its start. None where it cannot be made (another volume, Windows, whose
+/// processes are not named by an exec): the caller starts `loader`.
+#[cfg(unix)]
+pub fn launch_link(loader: &Path, name: &str) -> Option<PathBuf> {
+    static FRESH: std::sync::Once = std::sync::Once::new();
+    let own = crate::dirs::relax_dir().join("exe").join(std::process::id().to_string());
+    // a folder under this pid that holds no run of this process is a gone process's
+    FRESH.call_once(|| {
+        if OWN_DIR.get().is_none() {
+            let _ = std::fs::remove_dir_all(&own);
+        }
+    });
+    let dir = own.join(LAUNCH);
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(file_name(name));
+    if !same_file(&path, loader) {
+        // (a restart may start another loader: the link is replaced whole)
+        let part = dir.join(format!(".{}.part", file_name(name)));
+        let _ = std::fs::remove_file(&part);
+        std::fs::hard_link(loader, &part).ok()?;
+        std::fs::rename(&part, &path).ok()?;
+    }
+    Some(path)
+}
+
+#[cfg(not(unix))]
+pub fn launch_link(_loader: &Path, _name: &str) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// What a restart in place execs: `loader` by the run's launch link, so the process keeps its
+/// program's name.
+pub fn restart_exe(loader: PathBuf) -> PathBuf {
+    NAME.get().and_then(|n| launch_link(&loader, n)).unwrap_or(loader)
+}
+
+/// Removes this process's `+launch` folder (`makepad test` at its end), with its folder when no
+/// run of this process is in it.
+pub fn remove_launch() {
+    let own = crate::dirs::relax_dir().join("exe").join(std::process::id().to_string());
+    let _ = std::fs::remove_dir_all(if OWN_DIR.get().is_some() { own.join(LAUNCH) } else { own });
+}
+
 /// The kernel's name of this process becomes its own executable's file name, as an exec of that
 /// file names a process (`/proc/<pid>/comm`, cut to 15 bytes: what ps, top and a parent lookup
-/// show). It was the loader's (`makepad.jit-…`) while argv[0] and current_exe() named the link,
-/// where under cargo all three name the program (makepad-remote's process test, 11-13). macOS has
-/// no call that renames a process: there it stays the loader's.
+/// show), for a run started from the loader itself (a terminal's `makepad run`); one started from
+/// a launch link has it already. It was the loader's (`makepad.jit-…`) while argv[0] and
+/// current_exe() named the link, where under cargo all three name the program (makepad-remote's
+/// process test, 11-13). macOS has no call that renames a process: there such a run keeps the
+/// loader's name.
 pub fn name_process(link: &Path) {
     #[cfg(target_os = "linux")]
     if let Some(name) = link.file_name() {
@@ -96,10 +182,12 @@ pub fn add_bins(launchers: &[String]) {
     }
 }
 
-/// Whether `exe` is a run's own executable (its command line beside it): a launch of it runs that
-/// run's program, so the loader running from one spawns itself by RELAX_LOADER (dirs::loader_exe).
+/// Whether `exe` is a run's own executable (its command line beside it), or a link a run was
+/// started from (`launch_link`): neither is the loader's own path (a launch of a run's link runs
+/// that run's program; a launch link goes with its folder), so the loader running from one spawns
+/// itself by RELAX_LOADER (dirs::loader_exe).
 pub fn is_link(exe: &Path) -> bool {
-    exe.parent().is_some_and(|d| d.join(LINE).is_file())
+    exe.parent().is_some_and(|d| d.join(LINE).is_file() || d.file_name().is_some_and(|n| n == LAUNCH))
 }
 
 /// A launch of a run's link whose arguments do not start with the run's command line (Relax std's

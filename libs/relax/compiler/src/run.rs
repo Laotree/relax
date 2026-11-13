@@ -1246,10 +1246,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // no program, and an embedder's process (the Android host) is not the loader's executable.
     let embedded = crate::os::proc::EMBEDDED.load(std::sync::atomic::Ordering::Acquire);
     let own = (!check && !embedded).then(|| std::env::current_exe().and_then(|e| e.canonicalize()).map_err(|e| e.to_string()).and_then(|exe| {
-        let name = cargo_flags.iter().position(|f| f == "--bin").and_then(|j| cargo_flags.get(j + 1)).cloned()
-            .or_else(|| cargo_flags.iter().find_map(|f| f.strip_prefix("--bin=").map(str::to_string)))
-            .unwrap_or_else(|| std::path::Path::new(&package).file_stem().map_or_else(|| package.clone(), |s| s.to_string_lossy().into_owned()));
-        crate::selfexe::link(&exe, &name, harness || plain_test)
+        crate::selfexe::link(&exe, &crate::selfexe::program_name(&cargo_flags, &package), harness || plain_test)
     }));
     if let Some(Err(why)) = &own {
         eprintln!("relax run: the program's own executable could not be made ({why}): a spawn of it runs the loader, not the program");

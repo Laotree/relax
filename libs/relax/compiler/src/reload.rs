@@ -8030,7 +8030,8 @@ fn exec_restart(state: Option<&[u8]>) -> Result<(), String> {
     #[cfg(any(unix, windows))]
     {
         let exe = host::loader().ok_or_else(|| format!("the {tool} binary's path is unknown", tool = crate::tool_name()))?;
-        let mut cmd = std::process::Command::new(exe);
+        // by the run's launch link: the process keeps its program's name (selfexe.rs)
+        let mut cmd = std::process::Command::new(crate::selfexe::restart_exe(exe));
         cmd.args(crate::harness::live::restart_args(std::env::args_os().skip(1).collect()));
         // the process as this run was started: what it set for its program (its target's cargo
         // variables, a test's folder) goes back, and the next run sets it again
