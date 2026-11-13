@@ -83,17 +83,40 @@ rustc's `try_evaluate_const` (traits/mod.rs) evaluates in the post-analysis envi
 the solver's mode; Relax's `evaluate_const` (types/src/next_solver/goals.rs) passes the solver's
 own mode (Coherence in the overlap check) for every constant but a repeat count.
 
-## 7. A provided crate does not see its program's run-env values
+## 7. A provided crate's `std::env` does not see its program's run-env values
 
-A package's `[package.metadata.relax.run-env]` values are its program's alone (base/src/progenv.rs
-`set_run_env`): JIT-run code reads them through the program's environment layer, and the loader,
-its options and the tools it runs never do. A provided crate (built by rustc into the loader, such
-as Makepad's platform crates) reads the environment through rustc's std, which is libc's `environ`,
-so it does not see them either: one program, two environments.
+A package's `[package.metadata.relax.run-env]` values are read only by the program: its JIT-run
+code, and platform code reading a setting that only tunes or reports that program's own run. They
+never reach a reader that decides what the process loads, executes or opens, what the person's
+invocation decided, or what the loader hands the next image (base/src/progenv.rs `set_run_env`).
+
+A provided crate (built by rustc into the loader, such as Makepad's platform crates) has two
+reads. `relax_api::env::var` / `var_os` is the program's environment: under the loader progenv's
+program view (`program_var_os`: the program's values, then the process environment), without
+one `std::env`. `std::env` is the loader process's. Makepad's HAL reads its logs, traces,
+profilers, tuning settings and test hooks through the first; its backend, devices, paths,
+drivers, window visibility and focus, app identity, session facts and handovers through the
+second.
 
 - cargo: no run-env (Relax's own table); every crate of the program reads one environment.
-- Relax: `std::env::var("APP_MODE")` gives the run-env's value in JIT-run code and `NotPresent` in a
-  provided crate.
+- Relax: `relax_api::env::var("APP_MODE")` gives the run-env's value in JIT-run code and in a
+  provided crate's rustc code; `std::env::var("APP_MODE")` gives it in JIT-run code and
+  `NotPresent` in a provided crate's rustc code (tools/run/fixture/modules_harness.rs
+  `a_packages_run_env_is_its_programs_and_grants_nothing`).
 
-Start in compiler/src/provided.rs (what crosses between a provided crate's rustc code and JIT-run
-code): its environment reads need to go through progenv's program view, as JIT-run code's do.
+What stays out of reach:
+- A C library in the process (the Vulkan loader, libva, GStreamer) and a third-party dependency of
+  a provided crate read libc's environment, so run-env values never reach them. That is the
+  protection: a value that names a library or a path stays the person's.
+- HAL source that JIT-run code reaches compiles from source, where `std::env` is the program's
+  environment: the app's event loop calls `OpenReq::from_env`, so a run-env's
+  `MAKEPAD_HAL_BACKEND` or `MAKEPAD_HIDE_WINDOWS` picks how the app's own window opens, as the
+  program's own `set_var` does (under cargo too). It grants nothing the program could not ask for
+  itself; the host's window, devices and paths are read by the host's code.
+- A run from the stores (`makepad run <git url>`, runner/src/lib.rs `run_spec`) starts the host
+  before it has the package's manifest, so a setting the host reads once at its start (the HAL's
+  log switch, `MAKEPAD_GPU_PROF`) is read before the run-env is applied. A run from a checkout
+  applies the run-env first.
+
+Start in libs/relax_api/src/lib.rs (`env`) for the read, and in tools/run/runner/src/lib.rs
+`run_spec` for a store run's order.
