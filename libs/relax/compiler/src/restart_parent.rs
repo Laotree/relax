@@ -245,7 +245,7 @@ fn kill_on_close_job() -> Option<makepad_windows_sys::Win32::Foundation::HANDLE>
 #[cfg(windows)]
 fn next_failed(next: &Next, why: &str) -> ! {
     eprintln!("relax live: restart failed: {why}");
-    if let Some((_, path)) = next.envs.iter().find(|(k, _)| k == "MAKEPAD_JIT_RECOVERY") {
+    if let Some((_, path)) = next.envs.iter().find(|(k, _)| k == "RELAX_JIT_RECOVERY") {
         crate::hot_failure::next_run_failed(std::path::Path::new(path), why);
     }
     std::process::exit(1)

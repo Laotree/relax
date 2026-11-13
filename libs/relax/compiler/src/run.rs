@@ -590,7 +590,7 @@ fn offer_boot_update(package: &str, change: crate::provided::ProvidedChange) -> 
         crate::first_frame::no_window(package, &e);
         return 1;
     }
-    let seen = HAL_RUN.load(Ordering::Acquire) && live_session() && std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_none();
+    let seen = HAL_RUN.load(Ordering::Acquire) && live_session() && !crate::progenv::unseen_run();
     if !seen {
         return crate::reload::host::apply_at_boot(&change);
     }
@@ -954,7 +954,7 @@ fn warm_front(images: &crate::cache::FrontImages, sess: &std::sync::Arc<crate::S
 
 fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session: Option<&mut Option<crate::serve::Session>>) -> i32 {
     // Restore before resolution so a failed replacement compile is a JIT verdict too.
-    if crate::run_end::run_input("MAKEPAD_JIT_RECOVERY").is_some() {
+    if crate::run_end::run_input("RELAX_JIT_RECOVERY").is_some() {
         crate::hot_failure::enable();
         crate::hot_failure::restore();
     }

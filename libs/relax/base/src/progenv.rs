@@ -105,6 +105,39 @@ pub fn scrub_run_facts(cmd: &mut std::process::Command) {
     }
 }
 
+/// The program's own variables that Relax only passes on, probes or drops, as its host names
+/// them (relax-runner Host.env). Relax reads only `RELAX_*` names; these are the program's. The
+/// bare runner names none.
+#[derive(Clone, Copy)]
+pub struct HostEnv {
+    /// what a child gets when no person should see or hear it (a replay that is not shown); the
+    /// first, set alone, says a run is not seen (its window hidden)
+    pub unseen: &'static [(&'static str, &'static str)],
+    /// what a child gets beside `RELAX_OFFLINE` (a package check run offline)
+    pub offline: &'static [(&'static str, &'static str)],
+    /// what a process that outlives its starter (the check server) must not carry
+    pub detached_remove: &'static [&'static str],
+    /// the prefixes of the variables a flight recording keeps of how its run started, for a
+    /// replay to start it the same way
+    pub recorded: &'static [&'static str],
+}
+
+static HOST_ENV: std::sync::OnceLock<HostEnv> = std::sync::OnceLock::new();
+
+/// The host's table, once, before anything reads it (relax-runner set_host).
+pub fn set_host_env(env: HostEnv) {
+    let _ = HOST_ENV.set(env);
+}
+
+pub fn host_env() -> HostEnv {
+    HOST_ENV.get().copied().unwrap_or(HostEnv { unseen: &[], offline: &[], detached_remove: &[], recorded: &[] })
+}
+
+/// Nobody sees this run: the host's first `unseen` variable is set.
+pub fn unseen_run() -> bool {
+    host_env().unseen.first().is_some_and(|(k, _)| std::env::var_os(k).is_some())
+}
+
 pub fn reserved(name: &[u8]) -> bool {
     name.get(..PREFIX.len()).is_some_and(|n| same_name(n, PREFIX))
 }

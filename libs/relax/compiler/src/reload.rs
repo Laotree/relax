@@ -7993,7 +7993,7 @@ pub(crate) fn next_run_env(state: Option<&[u8]>) -> Result<Vec<(&'static str, Op
         None => None,
     };
     let saved = RESTART_SAVED_MS.load(std::sync::atomic::Ordering::Relaxed).to_string();
-    let mut next = vec![("MAKEPAD_JIT_RECOVERY", recovery), ("RELAX_RESTORE", restore), ("RELAX_RESTART_T0", Some(saved.into()))];
+    let mut next = vec![("RELAX_JIT_RECOVERY", recovery), ("RELAX_RESTORE", restore), ("RELAX_RESTART_T0", Some(saved.into()))];
     next.extend(NATIVE_RECEIPTS.map(|name| (name, None)));
     Ok(next)
 }
@@ -8079,7 +8079,7 @@ fn a_restarts_state_file_is_made_new_never_through_a_link() {
 fn a_run_ended_in_its_boot_hands_on_the_state_it_was_started_with() {
     isolated_test!(a_run_ended_in_its_boot_hands_on_the_state_it_was_started_with);
     *DOMAIN_RESTORED.lock().unwrap_or_else(|e| e.into_inner()) = Some("tick 41".into());
-    let mut next = vec![("MAKEPAD_JIT_RECOVERY", None), ("RELAX_RESTORE", None)];
+    let mut next = vec![("RELAX_JIT_RECOVERY", None), ("RELAX_RESTORE", None)];
     carry_restore(&mut next);
     let carried = next[1].1.clone().expect("the state the run was started with goes on");
     assert_eq!(std::fs::read_to_string(&carried).unwrap(), "tick 41");

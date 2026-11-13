@@ -215,7 +215,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         cmd.env("RELAX_READ_LOG", &log);
         crate::progenv::scrub_run_facts(&mut cmd);
         cmd.env_remove("RELAX_CHECK_TARGET");
-        cmd.env("RELAX_OFFLINE", "1").env("MAKEPAD_CEF_OFFLINE", "1");
+        cmd.env("RELAX_OFFLINE", "1").envs(crate::progenv::host_env().offline.iter().copied());
         if let Some(t) = &opts.target {
             cmd.env("RELAX_CHECK_TARGET", t);
         }

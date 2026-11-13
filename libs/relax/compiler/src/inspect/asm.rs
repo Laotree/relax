@@ -534,7 +534,7 @@ fn native_path(req: &Req) -> Result<String, String> {
     if !p.is_empty() {
         return Ok(p);
     }
-    if let Ok(p) = std::env::var("MAKEPAD_INSPECT_NATIVE") {
+    if let Ok(p) = std::env::var("RELAX_INSPECT_NATIVE") {
         if !p.is_empty() {
             return Ok(p);
         }
@@ -549,7 +549,7 @@ static BUILDING: relax_session::sync::Mutex<Option<(std::process::Child, String)
 /// added: the same machine code), in `<workspace>/target/relax-native`; started in the background
 /// when there is none yet (`build=0`: never).
 fn auto_native(build: bool) -> Result<String, String> {
-    let how = "pass native=<binary> (kept for later asks) or set MAKEPAD_INSPECT_NATIVE";
+    let how = "pass native=<binary> (kept for later asks) or set RELAX_INSPECT_NATIVE";
     let Some((krate, dir)) = crate::run::root_package() else {
         return Err(format!("no native build to compare with (the program's package is unknown); {}", how));
     };
@@ -624,7 +624,7 @@ fn auto_native(build: bool) -> Result<String, String> {
     Err(format!("building the native baseline of `{}` now (cargo build --release, line tables only, -j4, nice; pid {}, log {}); ask again when it is done", krate, pid, log))
 }
 
-/// The native build to compare with (native=, the last one named, MAKEPAD_INSPECT_NATIVE, else
+/// The native build to compare with (native=, the last one named, RELAX_INSPECT_NATIVE, else
 /// the package's own release build, started in the background when missing).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn native_for(req: &Req) -> Result<String, String> {

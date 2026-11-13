@@ -1522,9 +1522,9 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     // The script slot (this process's) comes first: a run holding the claim and waiting for a slot
     // could wait on a slot whose script's nested run waits for this claim (a package that is
     // both a dependency here and a build-dependency of another script).
-    // The run that holds it names itself in it (its pid and its devhub lease, `claim_holder`):
+    // The run that holds it names itself in it (its pid and its owner, `claim_holder`):
     // a waiter says whom it waits on, and a hang names its holder. A relax-runner test sat 26 min
-    // on its build-script claim, held by a hung run in another lease (11-13).
+    // on its build-script claim, held by a hung run of another owner (11-13).
     let _slot = script_slot();
     let claim_path = format!("{}/relax-claim", base_dir);
     let claim = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&claim_path).ok();
@@ -2260,28 +2260,28 @@ fn self_stamp_text(dir: &str, pkg: &str, features: &[String]) -> Result<String, 
 
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The lease a devhub runs this process in (`MAKEPAD_DEVHUB_LEASE`: its ledger dir and the
-/// lease), else `none`.
-fn devhub_lease() -> String {
-    std::env::var("MAKEPAD_DEVHUB_LEASE").ok().and_then(|mark| mark.rsplit('/').next().filter(|id| !id.is_empty()).map(str::to_string)).unwrap_or_else(|| "none".to_string())
+/// Who this run works for, as whatever started it names it (`RELAX_RUN_OWNER`: a build farm's
+/// job or lease), else `none`.
+fn run_owner() -> String {
+    std::env::var("RELAX_RUN_OWNER").ok().filter(|o| !o.is_empty() && !o.contains(char::is_whitespace)).unwrap_or_else(|| "none".to_string())
 }
 
-/// A build script's run that took its `relax-claim` writes in it who holds it: `<pid> <lease>`.
+/// A build script's run that took its `relax-claim` writes in it who holds it: `<pid> <owner>`.
 fn name_claim(claim: &std::fs::File) {
     use std::io::{Seek, Write};
     let mut f = claim;
     let _ = f.set_len(0);
     let _ = f.seek(std::io::SeekFrom::Start(0));
-    let _ = writeln!(f, "{} {}", std::process::id(), devhub_lease());
+    let _ = writeln!(f, "{} {}", std::process::id(), run_owner());
 }
 
-/// Who holds the claim at `path`, said: "held by pid N (lease L...)", from what its holder wrote in
+/// Who holds the claim at `path`, said: "held by pid N (owner O...)", from what its holder wrote in
 /// it ([`name_claim`]), and on Linux the kernel's lock table, which names a holder that wrote
 /// nothing (a run of an older relax).
 fn claim_holder(path: &str) -> String {
     let named = std::fs::read_to_string(path).unwrap_or_default();
     let mut words = named.split_whitespace();
-    let (pid, lease) = (words.next().and_then(|p| p.parse::<u32>().ok()), words.next().map(str::to_string));
+    let (pid, owner) = (words.next().and_then(|p| p.parse::<u32>().ok()), words.next().map(str::to_string));
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::MetadataExt;
@@ -2293,12 +2293,12 @@ fn claim_holder(path: &str) -> String {
             })
         });
         if let Some(holder) = locked.filter(|holder| Some(*holder) != pid) {
-            return format!("held by pid {holder} (lease unknown: it named none)");
+            return format!("held by pid {holder} (owner unknown: it named none)");
         }
     }
-    match (pid, lease) {
-        (Some(pid), Some(lease)) => format!("held by pid {pid} (lease {lease})"),
-        _ => "held by a run that has not named itself (lease unknown)".to_string(),
+    match (pid, owner) {
+        (Some(pid), Some(owner)) => format!("held by pid {pid} (owner {owner})"),
+        _ => "held by a run that has not named itself (owner unknown)".to_string(),
     }
 }
 
@@ -2316,20 +2316,20 @@ mod script_error_tests {
         assert_eq!(super::script_error_cause("one\ntwo\nthree\nfour\n"), "two | three | four", "else its last lines");
     }
 
-    /// A build script's claim names its holder to whoever waits on it: the pid and devhub lease
+    /// A build script's claim names its holder to whoever waits on it: the pid and the owner
     /// its holder wrote in it, the kernel's lock holder on Linux, else that it named none.
     #[test]
     fn a_claims_waiter_hears_who_holds_it() {
         let path = std::env::temp_dir().join(format!("relax-claim-holder-{}", std::process::id()));
         let path_s = path.to_string_lossy().to_string();
         std::fs::write(&path, "4242 L7\n").unwrap();
-        assert_eq!(super::claim_holder(&path_s), "held by pid 4242 (lease L7)", "what its holder wrote");
+        assert_eq!(super::claim_holder(&path_s), "held by pid 4242 (owner L7)", "what its holder wrote");
         std::fs::write(&path, "").unwrap();
-        assert_eq!(super::claim_holder(&path_s), "held by a run that has not named itself (lease unknown)");
+        assert_eq!(super::claim_holder(&path_s), "held by a run that has not named itself (owner unknown)");
         let claim = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         claim.lock().unwrap();
         super::name_claim(&claim);
-        assert_eq!(super::claim_holder(&path_s), format!("held by pid {} (lease {})", std::process::id(), super::devhub_lease()), "the run that took it named itself");
+        assert_eq!(super::claim_holder(&path_s), format!("held by pid {} (owner {})", std::process::id(), super::run_owner()), "the run that took it named itself");
         drop(claim);
         let _ = std::fs::remove_file(&path);
     }
