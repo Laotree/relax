@@ -1,4 +1,4 @@
-//! Domain-local statics (local/agent_state/fast-rust/android/DESIGN-domains.md §2).
+//! Domain-local statics.
 //!
 //! Several apps ("domains") may run in one process on the same compiled code, so each needs its
 //! own copy of every static. A domain symbol (`SymClass::Domain`: a static, a writable block

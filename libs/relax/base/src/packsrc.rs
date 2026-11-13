@@ -1,5 +1,5 @@
 //! `makepad pack-src <out.store> <package>...`: the packed source archive `makepad run --src` runs from
-//! (local/agent_state/fast-rust/android/ANDROID.md section 3). There is no archive format of its
+//! (on a device with no checkout of the sources, such as a phone). There is no archive format of its
 //! own: the output is a git store (gitstore.rs) holding ONE synthetic commit, mounted by the VFS
 //! (vfs.rs) as the workspace root.
 //!

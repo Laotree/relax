@@ -1,4 +1,4 @@
-//! Provided crates (local/plans/loader-core.md section 8): a crate rustc built into the binary
+//! Provided crates: a crate rustc built into the binary
 //! that runs Relax (the `makepad` loader builds makepad-script into itself). Relax still loads
 //! its source (types, signatures, generic and inline bodies) but binds the fns the crate marks
 //! `#[relax_api]` (relax-api) to the compiled code: each gets a bridge body

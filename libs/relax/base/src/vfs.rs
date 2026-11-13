@@ -1,4 +1,4 @@
-//! Every file the front end reads goes through here (local/plans/run-from-git.md). Two backends
+//! Every file the front end reads goes through here (`makepad run <git url>`: gitstore.rs). Two backends
 //! behind one interface: the plain filesystem (today's std::fs calls; with nothing mounted it is
 //! exactly that, one relaxed load in front) and git mounts: a virtual folder (never created on
 //! disk) whose files come from a repository store (store.rs) at a commit. A path under a mount is

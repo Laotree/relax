@@ -1,7 +1,6 @@
 //! Gandalf, Relax's lazy borrow checker (scheduling). Named by Kevin Boos.
 //!
-//! Hot reload: an edit of one or more source files applied as ONE all-or-nothing transaction
-//! (local/plans/hotreload.md §9: M1 transaction, M3 classifier).
+//! Hot reload: an edit of one or more source files applied as ONE all-or-nothing transaction.
 //!
 //! 1. Parse every edited file as a new version (nothing the running program reads changes).
 //! 2. Classify each item against the running version: body edits (class B), const value

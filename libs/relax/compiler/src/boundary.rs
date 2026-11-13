@@ -1,5 +1,5 @@
 //! Boundary audit: what code compiled by Relax reaches inside a set of crates that would be
-//! built by rustc into the embedder ("provided crates", local/plans/loader-core.md section 8).
+//! built by rustc into the embedder ("provided crates": provided.rs).
 //!
 //! `makepad check --boundary <crate>[,<crate>..]|all <package>` lowers every non-generic fn of the
 //! crates that depend on them, then every generic instance those reach (to a fixpoint), and

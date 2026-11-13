@@ -1,5 +1,5 @@
-//! Sandboxed run-time modules: memory confinement (local/plans/hotreload.md §12.3, option B
-//! "one shared sandbox": MAIN 2026-10-05).
+//! Sandboxed run-time modules: memory confinement, every module in one shared sandbox (one set of
+//! twins and one data image for all of them, each module's memory in its own arena window).
 //!
 //! Every function a sandboxed module runs is a *twin* (`FnKey::Sandbox(base)`): the base slot's
 //! RIR (built as usual, shared by all modules) rewritten by `transform` before code generation:

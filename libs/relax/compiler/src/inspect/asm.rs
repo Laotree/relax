@@ -3,8 +3,8 @@
 //! what each instruction costs here (CPU samples, PGO block counts) and a short diff summary
 //! first: the excess instructions, where they are (hot loops, lines), and what they are (spill
 //! traffic, kept bounds checks, calls rustc inlined, loops rustc vectorised). AI agents that
-//! optimise the JIT read this; the answer follows local/agent_state/relax-campaign/profproto.md §5
-//! (answer first, markdown tables, drill-down handles at the end).
+//! optimise the JIT read this, so the answer is shaped for them (answer first, markdown tables,
+//! drill-down handles at the end).
 //!
 //! Both sides are decoded by the same decoder (relax_backend::asm::dis), so they are spelled and
 //! classified alike. Ours: the slot's code bodies from the code tables (installed first), its pc

@@ -1,7 +1,7 @@
-//! makepad inspect: a running program answers questions about itself (local/agent_state/fast-rust/
-//! inspect/DESIGN.md). One thread per `makepad run` listens on a Unix socket next to a discovery file
-//! in the temp dir; a client (`makepad inspect <pid|app|all> <command>`, or any agent speaking the
-//! line protocol) sends one request per line and reads JSON lines back, ending with an `end` line.
+//! makepad inspect: a running program answers questions about itself. One thread per `makepad run`
+//! listens on a Unix socket next to a discovery file in the temp dir; a client (`makepad inspect
+//! <pid|app|all> <command>`, or any agent speaking the line protocol) sends one request per line
+//! and reads JSON lines back, ending with an `end` line.
 //!
 //! The basics never need the owner thread: thread lists and stacks come from the OS and the code
 //! tables, waits from the lock-free wait registry, events from this module's own queue. Only names

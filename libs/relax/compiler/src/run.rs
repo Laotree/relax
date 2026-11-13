@@ -5457,7 +5457,10 @@ mod settle_tests {
     }
 }
 
-/// The memory-throttled compile mode (mobile; local/plans/memory-use.md): RELAX_MEM_BUDGET_MB set.
+/// The memory-throttled compile mode, for devices with little memory (phones): RELAX_MEM_BUDGET_MB
+/// set. The cold preload then scans and parses at most one crate past the one the load has taken
+/// (preload's `through`), so the front ends written to their images and mapped one by one bound
+/// the peak.
 /// Desktop default: unset, full parallelism -- the cold preload then runs ahead over all crates
 /// and write-then-map only frees each crate's front end after its load.
 fn mem_budget_mode() -> bool {

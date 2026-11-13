@@ -1,4 +1,4 @@
-//! Relax-only: run-time modules (local/plans/hotreload.md §11). A program running under Relax
+//! Relax-only: run-time modules. A program running under Relax
 //! (`cfg(relax)`) loads a Rust source file as a module, takes typed fn pointers to its
 //! exports, edits it live and unloads it. A failed load or edit changes nothing and returns
 //! the compiler's one-line errors.
