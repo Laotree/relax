@@ -1270,6 +1270,26 @@ pub fn set_permissions<P: AsRef<Path>>(path: P, perm: Permissions) -> io::Result
     })
 }
 
+// chown(2), lchown(2) and fchown(2), as real std's sys fs: `u32::MAX` (-1) leaves that id as it is.
+pub(crate) fn chown_raw(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
+    run_path_with_cstr(path, &|c| {
+        cvt(unsafe { sys::chown(c.as_ptr(), uid as sys::uid_t, gid as sys::gid_t) })?;
+        Ok(())
+    })
+}
+
+pub(crate) fn lchown_raw(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
+    run_path_with_cstr(path, &|c| {
+        cvt(unsafe { sys::lchown(c.as_ptr(), uid as sys::uid_t, gid as sys::gid_t) })?;
+        Ok(())
+    })
+}
+
+pub(crate) fn fchown_raw(fd: RawFd, uid: u32, gid: u32) -> io::Result<()> {
+    cvt(unsafe { sys::fchown(fd, uid as sys::uid_t, gid as sys::gid_t) })?;
+    Ok(())
+}
+
 /// Deprecated alias of `os::unix::fs::symlink` (rustc library/std/src/fs.rs `soft_link`).
 #[deprecated(since = "1.1.0", note = "replaced with std::os::unix::fs::symlink and std::os::windows::fs::{symlink_file, symlink_dir}")]
 pub fn soft_link<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Result<()> {
