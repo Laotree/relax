@@ -1,0 +1,9 @@
+[package]
+name = "reused-module-imports"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+macro-dep = { path = "dep" }
+
+[workspace]
