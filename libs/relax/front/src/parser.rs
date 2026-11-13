@@ -1439,6 +1439,16 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// Whether the prescan read this file: its module is in its crate's tree (CrateMods::mods),
+    /// which holds the file's `use` items. A module a macro declares (`decl!(leaf)` expanding to
+    /// `mod leaf;`) is not, and its file's imports reach a macro lookup only as this parse
+    /// records them (relax issue 183: `use crate::macros::h3;` in such a file, then `h3!()`: "macro
+    /// `h3!` is not supported"). A crate the prescan has no tree of is taken as read.
+    fn file_prescanned(&self) -> bool {
+        let (Some(m), Some(c)) = (self.macros.as_ref(), self.bctx.as_ref()) else { return true };
+        m.table.crates.get(&self.krate).is_none_or(|t| t.mods.contains(&c.module_path))
+    }
+
     /// A `use` item's bindings for macro lookups in this parse (MacroScope::add_use).
     fn record_use(&self, global: bool, tree: &UseTree) {
         let Some(m) = self.macros.as_ref() else { return };
@@ -3080,8 +3090,9 @@ impl<'a> Parser<'a> {
                 let global = self.eat(T::PathSep) || self.at_dollar_crate();
                 let tree = self.use_tree()?;
                 self.expect(T::Semi)?;
-                // imports a macro expansion wrote (the file's own are in the prescan's tree)
-                if self.macros.is_some() && use_lo as usize >= self.src.len() {
+                // imports a macro expansion wrote, and those of a file the prescan did not read
+                // (the file's own are in the prescan's tree otherwise)
+                if self.macros.is_some() && (use_lo as usize >= self.src.len() || !self.file_prescanned()) {
                     self.record_use(global, &tree);
                 }
                 ItemKind::Use(self.ast.push_row(UseItem { global, tree }))
