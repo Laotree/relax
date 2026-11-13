@@ -1072,7 +1072,15 @@ fn load_std_crates_inner(sess: &std::sync::Arc<crate::Session>, prog: &mut progr
     Ok((core, deps))
 }
 
+/// One file's crate with Relax's std; `test`: built `--test`. Its cfg is a release build's, as
+/// `makepad test <file.rs>` builds it (`rustc -O --test`).
 pub fn load_with_std(sess: &std::sync::Arc<crate::Session>, root: &str, name: &str, test: bool) -> Result<(program::Program, u32, u32), Vec<String>> {
+    load_with_std_checks(sess, root, name, test, crate::resolve::ProfileChecks { debug_assertions: false, overflow_checks: false })
+}
+
+/// `load_with_std` with the file's crate under a cargo profile's checks: its cfg has them, as
+/// run.rs gives a test's crates the profile's (`makepad test <package>`); Relax's std keeps its own.
+pub fn load_with_std_checks(sess: &std::sync::Arc<crate::Session>, root: &str, name: &str, test: bool, checks: crate::resolve::ProfileChecks) -> Result<(program::Program, u32, u32), Vec<String>> {
     pmhost::install();
     let mut prog = program::Program::new(sess);
     prog.std_simd = std_simd_wanted([root]);
@@ -1081,6 +1089,7 @@ pub fn load_with_std(sess: &std::sync::Arc<crate::Session>, root: &str, name: &s
     if test {
         cfgset.set.push("test".to_string());
     }
+    cfgset.set.extend(checks.cfgs().map(str::to_string));
     // a single file is edition 2021 unless its header says otherwise (`//@ edition: 2024`,
     // the compiletest directive; rustc takes it as --edition)
     let edition = crate::vfs::read_to_string(root).ok().and_then(|src| {

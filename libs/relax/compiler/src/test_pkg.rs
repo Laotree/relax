@@ -11,6 +11,10 @@
 //! A `harness = false` target runs as a plain program (`makepad run --plain-test --subject ..`),
 //! as cargo runs it: its exit status is its verdict.
 //! `--live` keeps one harness target (default: the lib, else the package's only harness target) running across source edits.
+//! Every run builds with the cargo profile `cargo test` takes: `test` (debug assertions and
+//! overflow checks as the workspace's `[profile.test]` / `[profile.dev]` set them, both on by
+//! default), `release` with `--release`, another with `--profile <name>` (run.rs `--profile`,
+//! resolve.rs `profile`). Before, every test ran release (relax issue 141).
 
 pub fn cmd_test_package(args: &[String]) -> i32 {
     stop::install();
@@ -20,10 +24,32 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
     let mut flags: Vec<String> = Vec::new();
     let mut feature_flags: Vec<String> = Vec::new();
     let mut live = false;
+    // `--release` / `--profile <name>`: the cargo profile (cargo test's `test` without either)
+    let mut release = false;
+    let mut profile: Option<String> = None;
     while i < args.len() && args[i].starts_with('-') && args[i] != "-p" && args[i] != "--package" {
         if args[i] == "--live" {
             live = true;
             i += 1;
+            continue;
+        }
+        if args[i] == "--release" {
+            release = true;
+            i += 1;
+            continue;
+        }
+        if let Some(p) = args[i].strip_prefix("--profile=") {
+            profile = Some(p.to_string());
+            i += 1;
+            continue;
+        }
+        if args[i] == "--profile" {
+            let Some(p) = args.get(i + 1) else {
+                eprintln!("relax test: --profile needs a profile name");
+                return 2;
+            };
+            profile = Some(p.clone());
+            i += 2;
             continue;
         }
         if is_feature_flag(&args[i]) {
@@ -111,7 +137,15 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
             },
             // every target runs anyway: one failing says nothing about the next
             "--no-fail-fast" => {}
-            "--release" => {}
+            "--release" => release = true,
+            "--profile" => match words.next() {
+                Some(p) => profile = Some(p.clone()),
+                None => {
+                    eprintln!("relax test: --profile needs a profile name");
+                    return 2;
+                }
+            },
+            s if s.starts_with("--profile=") => profile = Some(s[10..].to_string()),
             "--features" | "-F" => {
                 let Some(v) = words.next() else {
                     eprintln!("relax test: {w} needs a value");
@@ -156,6 +190,19 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
             return live_usage();
         }
         pre.push("--live".to_string());
+    }
+    let profile = match (release, profile) {
+        (true, Some(p)) if p != "release" => {
+            eprintln!("error: conflicting usage of --profile={p} and --release");
+            return 101;
+        }
+        (true, _) => "release".to_string(),
+        (false, p) => p.unwrap_or_else(|| "test".to_string()),
+    };
+    // a profile the workspace does not define (or cannot resolve) is the command's error, once
+    if let Err(e) = crate::resolve::profile(&crate::run::workspace_dir(), &profile) {
+        eprintln!("relax test: {e}");
+        return 101;
     }
     let sess = std::sync::Arc::new(crate::Session::default());
     let live_default = live && !lib && bins.is_none() && tests.is_none();
@@ -272,6 +319,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
             Some((path, false)) => a.extend(["--harness".to_string(), "--subject".to_string(), path.clone()]),
             None => a.push("--harness".to_string()),
         }
+        a.extend(["--profile".to_string(), profile.clone()]);
         a.extend(pre.iter().cloned());
         a.push(package.clone());
         a.extend(flags.iter().cloned());

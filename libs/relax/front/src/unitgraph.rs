@@ -56,6 +56,9 @@ pub struct RawUnit {
     /// a path package outside the sysroot (its cargo pkg_id is `path+`): its files are its source,
     /// where a registry or git package is its id and a sysroot crate is Relax's own
     pub path_source: bool,
+    /// the checks its profile gives the unit as a host unit, which a build script's run builds it
+    /// with (`makepad test`'s profile: run.rs; a build script's run: its graph's)
+    pub host_checks: Option<crate::resolve::ProfileChecks>,
 }
 
 pub struct Graph {
@@ -153,7 +156,7 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
     let mut test_crates: Vec<usize> = Vec::new();
     // unit index of a run-custom-build unit -> its script (src_path, edition, features, build unit)
     let mut run_build: Vec<Option<(String, u16, Vec<String>, usize)>> = vec![None; n_units];
-    let mut raw: Vec<RawUnit> = vec![RawUnit { name: String::new(), src_path: String::new(), edition: 2015, features: Vec::new(), proc_macro: false, deps: Vec::new(), run_script: false, pkg: Default::default(), path_source: false }; n_units];
+    let mut raw: Vec<RawUnit> = vec![RawUnit { name: String::new(), src_path: String::new(), edition: 2015, features: Vec::new(), proc_macro: false, deps: Vec::new(), run_script: false, pkg: Default::default(), path_source: false, host_checks: None }; n_units];
     // a crate used on both sides (normal dependency and build-dependency / proc-macro side) is one
     // crate here: keep the target side for the app and the host side for the macro world.
     // Cargo reference features.md#feature-resolver-version-2 keeps their features separate;
@@ -199,7 +202,7 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
             (d, n, v)
         };
         raw[ui] = RawUnit { name: tname.clone(), src_path: src_path.clone(), edition, features: features.clone(), proc_macro: pm, deps: udeps.clone(), run_script: build && mode == "run-custom-build", pkg: (pkg_dir.clone(), pname.clone(), ver.clone()),
-            path_source: !u.sysroot && u.pkg_id.starts_with("path+") };
+            path_source: !u.sysroot && u.pkg_id.starts_with("path+"), host_checks: u.checks };
         // the run unit depends on the script's compile unit, whose deps are the build-dependencies
         let build_unit = udeps.first().map(|d| d.0).unwrap_or(usize::MAX);
         run_build[ui] = if build && mode == "run-custom-build" { Some((src_path.clone(), edition, features.clone(), build_unit)) } else { None };
@@ -370,6 +373,16 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
     let mut cfgs = vec![Vec::new(); n];
     for &ci in &test_crates {
         cfgs[ci].push("test".to_string());
+    }
+    // a build script's run: the checks its parent's profile gives these host units (script_units)
+    for (ui, u) in units.iter().enumerate() {
+        if let (Some(c), Some(cs)) = (u.checks, map.get(ui).and_then(|&k| cfgs.get_mut(k))) {
+            for x in c.cfgs() {
+                if !cs.iter().any(|y| y == x) {
+                    cs.push(x.to_string());
+                }
+            }
+        }
     }
     // a single integration test is the graph's only test root: it is listed like several
     if bins.is_empty() && test_crates.contains(&root) && crates[root].bin {
@@ -1052,12 +1065,13 @@ fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrit
         let edition = u.edition.to_string();
         let feats: Vec<String> = u.features.iter().map(|f| q(f)).collect();
         units.push(format!(
-            "{{\"pkg_id\":{},\"target\":{{\"kind\":[\"{}\"],\"name\":{},\"src_path\":{},\"edition\":\"{}\"}},\"profile\":{{\"opt_level\":\"3\"}},\"mode\":\"{}\",\"features\":[{}],\"dependencies\":[{}]}}",
+            "{{\"pkg_id\":{},\"target\":{{\"kind\":[\"{}\"],\"name\":{},\"src_path\":{},\"edition\":\"{}\"}},\"profile\":{{\"opt_level\":\"3\"{}}},\"mode\":\"{}\",\"features\":[{}],\"dependencies\":[{}]}}",
             q(&format!("path+file://{}#{}@{}", u.pkg.0, u.pkg.1, u.pkg.2)),
             kind,
             q(&name),
             q(&u.src_path),
             edition,
+            checks_json(u.host_checks),
             mode,
             feats.join(","),
             deps_json(&u.deps)
@@ -1074,11 +1088,14 @@ fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrit
     // the script: a bin of its package
     let pkg_dir = manifest_dir_of(&bs.src_path);
     let sfeats: Vec<String> = bs.features.iter().map(|f| q(f)).collect();
+    // the script's own checks: its compile unit's
+    let script_checks = checks_json(raw.iter().find(|u| u.src_path == bs.src_path && !u.run_script).and_then(|u| u.host_checks));
     let script_unit = |src_path: &str| format!(
-        "{{\"pkg_id\":{},\"target\":{{\"kind\":[\"bin\"],\"name\":\"build-script-build\",\"src_path\":{},\"edition\":\"{}\"}},\"profile\":{{\"opt_level\":\"3\"}},\"mode\":\"build\",\"features\":[{}],\"dependencies\":[{}]}}",
+        "{{\"pkg_id\":{},\"target\":{{\"kind\":[\"bin\"],\"name\":\"build-script-build\",\"src_path\":{},\"edition\":\"{}\"}},\"profile\":{{\"opt_level\":\"3\"{}}},\"mode\":\"build\",\"features\":[{}],\"dependencies\":[{}]}}",
         q(&format!("path+file://{}#build-script-build@0.0.0", pkg_dir)),
         q(src_path),
         bs.edition,
+        script_checks,
         sfeats.join(","),
         deps_json(&build_deps)
     );
@@ -1094,6 +1111,12 @@ fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrit
         json = encode(&units);
     }
     (json, h)
+}
+
+/// A unit's checks in a build script's unit graph (its `profile`), which the script's run builds
+/// it with (resolve.rs GraphUnit `checks`): part of the rerun key, as the graph's text is.
+fn checks_json(c: Option<crate::resolve::ProfileChecks>) -> String {
+    c.map_or_else(String::new, |c| format!(",\"debug_assertions\":{},\"overflow_checks\":{}", c.debug_assertions, c.overflow_checks))
 }
 
 static SELF_EXE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();

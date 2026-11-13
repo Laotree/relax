@@ -334,10 +334,13 @@ fn test_page(st: &Style) -> String {
     title(&mut p, "run tests");
     p.blank();
     p.usage(&format!("{tool} test <file.rs> [filter]", tool = command()));
-    p.usage(&format!("{tool} test <package> [--lib|--bins|--tests] [-- test arguments]", tool = command()));
+    p.usage(&format!("{tool} test <package> [--release | --profile <name>] [--lib|--bins|--tests] [-- test arguments]", tool = command()));
     p.blank();
     p.text("Runs the crate's tests in-process; the optional filter is passed to the");
     p.text("test harness.");
+    p.text("A package's tests build with cargo test's profile: `test` (debug assertions and overflow");
+    p.text("checks as the workspace's [profile.test] / [profile.dev] set them), --release the release one.");
+    p.text("A file's tests build as rustc -O --test.");
     p.usage(&format!("{tool} test --live <package> [--lib | --test <name>] [-- <test args>]", tool = command()));
     p.text("Keeps one target warm (default --lib); body edits rerun tests that entered the changed functions, including inlinees.");
     p.text("Non-body edits, unknown reach or changed unattributed code rerun all; the verdict says why.");

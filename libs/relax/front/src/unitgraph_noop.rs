@@ -228,7 +228,7 @@ mod tests {
             let src_path = self.dir.join(format!("{name}.rs")).display().to_string();
             std::fs::write(&src_path, "// fixture\n").unwrap();
             RawUnit { name: name.into(), src_path, edition: 2021, features: Vec::new(), proc_macro: false, deps,
-                run_script: false, pkg: (self.dir.join(name).display().to_string(), name.into(), "0.0.0".into()), path_source: true }
+                run_script: false, pkg: (self.dir.join(name).display().to_string(), name.into(), "0.0.0".into()), path_source: true, host_checks: None }
         }
     }
 

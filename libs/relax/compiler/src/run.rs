@@ -648,7 +648,7 @@ fn with_sysroot_proc_macro(mut units: unitgraph::Units, std_dir: &str) -> unitgr
     units.units.push(unitgraph::GraphUnit {
         pkg_id: format!("path+file://{}/proc_macro#proc_macro@0.0.0", std_dir),
         kind: vec!["lib".to_string()], name: "proc_macro".to_string(), src_path: pm_root, edition: "2021".to_string(),
-        host: false, mode: "build".to_string(), harness: false, sysroot: true, features: Vec::new(), deps: Vec::new(),
+        host: false, checks: None, mode: "build".to_string(), harness: false, sysroot: true, features: Vec::new(), deps: Vec::new(),
     });
     for r in roots { units.units[r].deps.push((pm, "proc_macro".to_string())); }
     units
@@ -742,6 +742,22 @@ pub(crate) fn resolve_package(
     // Validate native macros before any overlapping provided-crate identity error.
     crate::crates::apply_substitutes(sess, &mut g.crates, std_dir, !boot).map_err(|e| format!("crate substitution: {e}"))?;
     let t_subst_done = Instant::now();
+    // a test's cargo profile (relax issue 141): each package's debug assertions and overflow
+    // checks as cargo test builds it, its host units (build scripts, proc macros and what they use)
+    // with the profile's build-override. Relax's std crates (the sysroot's proc_macro too) keep
+    // their own.
+    let profile = TEST_PROFILE.get().map(|p| crate::resolve::profile(workspace, p)).transpose()?;
+    let ours = |dir: &str| crate::vfs::relative_path(dir, std_dir).is_none();
+    let host_checks: Vec<Vec<String>> = g.pkg.iter().zip(&g.crates).map(|((dir, name, version), c)| match &profile {
+        Some(p) if ours(dir) => p.checks(dir, name, version, c.registry, true).cfgs().map(str::to_string).collect(),
+        _ => Vec::new(),
+    }).collect();
+    if let Some(p) = &profile {
+        // what a build script's run builds them with (unitgraph.rs script_units)
+        for u in g.raw.iter_mut().filter(|u| ours(&u.pkg.0)) {
+            u.host_checks = Some(p.checks(&u.pkg.0, &u.pkg.1, &u.pkg.2, !u.path_source, true));
+        }
+    }
     {
         // The loader's provided crates are host code built for the machine: their shims bind
         // only where the program is read for the machine too. A program read for another target
@@ -802,7 +818,7 @@ pub(crate) fn resolve_package(
             let early_world = |g: &unitgraph::Graph, native: &[usize], cfgs: &[Vec<String>], env: &[Vec<(String, String)>]| -> Option<Box<dyn std::any::Any>> {
                 let names: Vec<&str> = native.iter().map(|&k| g.crates[k].name.as_str()).collect();
                 if crate::macro_reg::macro_closure_reaches(&names) { return None; }
-                crate::macro_reg::set_build_outputs(sess, &g.crates, cfgs, env);
+                crate::macro_reg::set_build_outputs(sess, &g.crates, cfgs, env, &host_checks);
                 let alone = crate::program::WorldWait::begin();
                 crate::macro_reg::prewarm(sess).ok()?;
                 verbose!("relax: proc-macro world started beside the native build");
@@ -826,7 +842,7 @@ pub(crate) fn resolve_package(
         }
         if let Some((checked, _)) = sources { checked?; }
         scripts?;
-        crate::macro_reg::set_build_outputs(sess, &g.crates, &g.cfgs, &g.env);
+        crate::macro_reg::set_build_outputs(sess, &g.crates, &g.cfgs, &g.env, &host_checks);
     }
     if crate::preload::trace() {
         eprintln!("boot-trace: unit graph (resolve) {:.1} ms, graph {:.1} ms (load {:.1}, watch inputs {:.1}, substitutes {:.1})", (t_load - t).as_secs_f64() * 1e3, t_load.elapsed().as_secs_f64() * 1e3,
@@ -860,10 +876,21 @@ pub(crate) fn resolve_package(
         first
     };
     let mut cfgs: Vec<crate::cfg::CfgSet> = Vec::with_capacity(g.crates.len());
+    // the profile's checks as each crate's cfg (relax issue 141: every test ran release,
+    // cfg(debug_assertions) off); a crate only the host builds (a proc macro, what only macros and
+    // build scripts use) has its host checks
     for (ci, c) in g.crates.iter().enumerate() {
         let mut cs = crate::program_cfg(sess, &c.features);
         for x in &g.cfgs[ci] {
             cs.set.push(x.replace('"', ""));
+        }
+        let (dir, name, version) = &g.pkg[ci];
+        if let Some(p) = profile.as_ref().filter(|_| ours(dir)) {
+            for x in p.checks(dir, name, version, c.registry, c.host_only || c.proc_macro).cfgs() {
+                if !cs.set.iter().any(|y| y == x) {
+                    cs.set.push(x.to_string());
+                }
+            }
         }
         cfgs.push(cs);
     }
@@ -969,6 +996,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 jit::COMPILE_ERRORS_FATAL.store(false, Ordering::Relaxed);
             }
             "--self-exec" => self_exec = true,
+            "--profile" if i + 1 < args.len() => {
+                let _ = TEST_PROFILE.set(args[i + 1].clone());
+                i += 1;
+            }
             "--live" => live_tests = true,
             "--harness-restart" if i + 1 < args.len() => {
                 i += 1;
@@ -1094,6 +1125,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         return usage();
     }
     if also_requested && (!check || watch || root_only || selftest || session.is_some()) { return usage(); }
+    // a profile is a test's: `makepad run` builds as the release profile does
+    if TEST_PROFILE.get().is_some() && !harness && !plain_test { return usage(); }
     driver_options.verbose &= !SILENT.load(Ordering::Relaxed);
     VERBOSE.store(driver_options.verbose, Ordering::Relaxed);
     if driver_options.verbose { crate::tui::track_for_verbose(); }
@@ -2970,6 +3003,11 @@ pub(crate) fn host_thread() -> u64 {
 }
 /// `makepad run --harness` (`makepad test`): the program is a test harness.
 static HARNESS_RUN: AtomicBool = AtomicBool::new(false);
+
+/// `makepad test`'s cargo profile (`--profile <name>`, test_pkg.rs): the debug assertions and
+/// overflow checks the program's crates build with, as cargo test builds them (relax issue 141).
+/// None: a run, built as cargo's release profile leaves the code (no checks).
+static TEST_PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// `makepad run --harness` over targets that link different global allocators: each test or bin
 /// target of the graph again in a run of its own (this command line with that one target

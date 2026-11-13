@@ -1584,7 +1584,7 @@ fn script_selection_follows_every_unit_of_a_package() {
     let unit = |name: &str, deps: &[usize]| crate::unitgraph::RawUnit {
         name: name.to_string(), src_path: String::new(), edition: 2021, features: Vec::new(), proc_macro: false,
         deps: deps.iter().map(|&d| (d, String::new())).collect(), run_script: false,
-        pkg: (String::new(), name.to_string(), "1.0.0".to_string()), path_source: false,
+        pkg: (String::new(), name.to_string(), "1.0.0".to_string()), path_source: false, host_checks: None,
     };
     let raw = [unit("a", &[1]), unit("b", &[]), unit("a", &[3]), unit("c", &[]), unit("d", &[])];
     assert_eq!(dependency_packages(&raw, vec![0]), ["a", "b", "c"]);
@@ -1602,7 +1602,7 @@ fn native_key_uses_sorted_resolved_packages() {
         name: name.into(), src_path: String::new(), edition: 2021,
         features: features.iter().map(|f| f.to_string()).collect(), proc_macro: false,
         deps: Vec::new(), run_script: false,
-        pkg: (format!("packages/{name}"), name.into(), version.into()), path_source: false,
+        pkg: (format!("packages/{name}"), name.into(), version.into()), path_source: false, host_checks: None,
     };
     let a = unit("a", "1.0.0", &["fast", "std"]);
     let b = unit("b", "2.0.0", &[]);
@@ -1636,7 +1636,7 @@ fn native_key_follows_the_resolved_closure_and_its_path_sources() {
     let unit = |name: &str, dir: String, features: &[&str], deps: &[usize], path_source: bool| crate::unitgraph::RawUnit {
         name: name.into(), src_path: String::new(), edition: 2021, features: features.iter().map(|f| f.to_string()).collect(),
         proc_macro: false, deps: deps.iter().map(|&d| (d, String::new())).collect(), run_script: false,
-        pkg: (dir, name.into(), "1.0.0".into()), path_source,
+        pkg: (dir, name.into(), "1.0.0".into()), path_source, host_checks: None,
     };
     // the package a run is for (`root`), the native package n (its lib, and its script, which
     // build-depends on the workspace crate h and the registry crate cc), and x outside the closure

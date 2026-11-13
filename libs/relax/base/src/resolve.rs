@@ -1483,6 +1483,180 @@ pub fn cargo_env(dir: &str) -> Result<Vec<(String, String)>, String> {
     Ok(out)
 }
 
+/// What a cargo profile sets that changes what a program's code does: `debug-assertions`
+/// (cfg(debug_assertions): `debug_assert!`, and the items and tests under the cfg) and
+/// `overflow-checks` (cfg(overflow_checks), and the overflow panics of arithmetic, shifts and
+/// negation). rustc sets each cfg when its check is on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ProfileChecks {
+    pub debug_assertions: bool,
+    pub overflow_checks: bool,
+}
+
+impl ProfileChecks {
+    /// The cfg names these settings turn on (rustc_session config.rs default_configuration).
+    pub fn cfgs(self) -> impl Iterator<Item = &'static str> {
+        [(self.debug_assertions, "debug_assertions"), (self.overflow_checks, "overflow_checks")].into_iter().filter_map(|(on, name)| on.then_some(name))
+    }
+}
+
+/// The two settings as one profile table, or one package's override in it, sets them.
+#[derive(Clone, Copy, Default, Debug)]
+struct ChecksSet {
+    debug_assertions: Option<bool>,
+    overflow_checks: Option<bool>,
+}
+
+impl ChecksSet {
+    /// `self`, with what it leaves unset taken from `lower`.
+    fn over(self, lower: ChecksSet) -> ChecksSet {
+        ChecksSet { debug_assertions: self.debug_assertions.or(lower.debug_assertions), overflow_checks: self.overflow_checks.or(lower.overflow_checks) }
+    }
+
+    fn apply(self, to: ProfileChecks) -> ProfileChecks {
+        ProfileChecks { debug_assertions: self.debug_assertions.unwrap_or(to.debug_assertions), overflow_checks: self.overflow_checks.unwrap_or(to.overflow_checks) }
+    }
+
+    /// The settings of a profile's table (or a package's table in it) in the file `path`.
+    fn read(t: &TomlTable, path: &str, what: &str) -> Result<ChecksSet, String> {
+        let flag = |k: &str| match t.get(k) {
+            None => Ok(None),
+            Some(Toml::Bool(x, _)) => Ok(Some(*x)),
+            Some(_) => Err(format!("{path}: {what} `{k}` is not a boolean")),
+        };
+        Ok(ChecksSet { debug_assertions: flag("debug-assertions")?, overflow_checks: flag("overflow-checks")? })
+    }
+}
+
+/// A cargo profile's checks for the packages of a workspace, as cargo resolves the profile
+/// (core/profiles.rs): the root profile's own values (dev: both checks on; release: both off),
+/// under each profile of the `inherits` chain up to the named one (`test` and `doc` inherit
+/// `dev`, `bench` `release`, another profile names its parent), the profile nearer the named one
+/// first. A profile's value is CARGO_PROFILE_<NAME>_<KEY>'s, else the first cargo config file's
+/// `[profile.<name>]` that sets it (the nearest first), else the workspace root manifest's. A
+/// host unit (a build script, a proc macro and what they depend on) then takes the chain's
+/// `build-override` (CARGO_PROFILE_<NAME>_BUILD_OVERRIDE_<KEY> first), a package the chain's
+/// `package."*"` overrides when it is no workspace member, then its own `package.<name>` (or
+/// `<name>@<version>`) ones.
+pub struct Profile {
+    root: String,
+    checks: ProfileChecks,
+    build: ChecksSet,
+    any: ChecksSet,
+    /// (package name, version or any, overrides)
+    named: Vec<(String, Option<String>, ChecksSet)>,
+    /// the workspace, for whether a package is a member (`package."*"`): read when first asked
+    ws: std::cell::OnceCell<Option<Workspace>>,
+}
+
+/// The profile `name` of the workspace that the start folder `dir` belongs to (find_root).
+pub fn profile(dir: &str, name: &str) -> Result<Profile, String> {
+    let root = find_root(dir)?;
+    let manifest = format!("{}/Cargo.toml", root);
+    // the `[profile]` tables, the highest precedence first: the config files', then the manifest's
+    let mut files: Vec<(String, TomlTable)> = Vec::new();
+    for (_, path) in cargo_config_files(dir) {
+        if let Some(p) = table(&read_toml(&path)?, "profile") {
+            files.push((path, p.clone()));
+        }
+    }
+    if let Some(p) = table(&read_toml(&manifest)?, "profile") {
+        files.push((manifest, p.clone()));
+    }
+    let env = |p: &str, key: &str| {
+        let var = format!("CARGO_PROFILE_{}_{}", p.to_uppercase().replace('-', "_"), key);
+        std::env::var(&var).ok().map(|v| (var, v))
+    };
+    let env_flag = |p: &str, key: &str| match env(p, key) {
+        None => Ok(None),
+        Some((_, v)) if v == "true" => Ok(Some(true)),
+        Some((_, v)) if v == "false" => Ok(Some(false)),
+        Some((var, v)) => Err(format!("{var}: `{v}` is not a boolean")),
+    };
+    // the inherits chain, the named profile first
+    let mut chain = vec![name.to_string()];
+    loop {
+        let p = chain[chain.len() - 1].clone();
+        if p == "dev" || p == "release" {
+            break;
+        }
+        let set = env(&p, "INHERITS").map(|(_, v)| v).or_else(|| files.iter().find_map(|(_, t)| table(t, &p).and_then(|t| s(t, "inherits"))));
+        let parent = match (set, p.as_str()) {
+            (Some(parent), _) => parent,
+            (None, "test" | "doc") => "dev".to_string(),
+            (None, "bench") => "release".to_string(),
+            (None, _) if files.iter().any(|(_, t)| t.contains_key(&p)) => {
+                return Err(format!("profile `{p}` is missing an `inherits` directive (`inherits` is required for all profiles except `dev` or `release`)"));
+            }
+            (None, _) => return Err(format!("profile `{p}` is not defined")),
+        };
+        if chain.contains(&parent) {
+            return Err(format!("profile inheritance loop detected with profile `{p}` inheriting `{parent}`"));
+        }
+        chain.push(parent);
+    }
+    let on = chain[chain.len() - 1] == "dev";
+    let (mut level, mut build, mut any) = (ChecksSet::default(), ChecksSet::default(), ChecksSet::default());
+    let mut named: Vec<(String, Option<String>, ChecksSet)> = Vec::new();
+    for p in &chain {
+        let mut here = ChecksSet { debug_assertions: env_flag(p, "DEBUG_ASSERTIONS")?, overflow_checks: env_flag(p, "OVERFLOW_CHECKS")? };
+        let mut host = ChecksSet { debug_assertions: env_flag(p, "BUILD_OVERRIDE_DEBUG_ASSERTIONS")?, overflow_checks: env_flag(p, "BUILD_OVERRIDE_OVERFLOW_CHECKS")? };
+        for (path, t) in &files {
+            let Some(pt) = table(t, p) else { continue };
+            here = here.over(ChecksSet::read(pt, path, &format!("[profile.{p}]"))?);
+            if let Some(b) = table(pt, "build-override") {
+                host = host.over(ChecksSet::read(b, path, &format!("[profile.{p}.build-override]"))?);
+            }
+            for (spec, v) in table(pt, "package").into_iter().flatten() {
+                let Some(v) = v.as_table() else { continue };
+                let set = ChecksSet::read(v, path, &format!("[profile.{p}.package.\"{spec}\"]"))?;
+                if spec == "*" {
+                    any = any.over(set);
+                    continue;
+                }
+                // `<name>`, `<name>@<version>`, or a source URL's `#<name>@<version>`
+                let spec = spec.rsplit('#').next().unwrap_or(spec);
+                let (n, v) = match spec.split_once('@') {
+                    Some((n, v)) => (n.to_string(), Some(v.to_string())),
+                    None => (spec.to_string(), None),
+                };
+                match named.iter_mut().find(|x| x.0 == n && x.1 == v) {
+                    Some(x) => x.2 = x.2.over(set),
+                    None => named.push((n, v, set)),
+                }
+            }
+        }
+        level = level.over(here);
+        build = build.over(host);
+    }
+    Ok(Profile { root, checks: level.apply(ProfileChecks { debug_assertions: on, overflow_checks: on }), build, any, named, ws: std::cell::OnceCell::new() })
+}
+
+impl Profile {
+    /// The checks of the package `name` `version` in the folder `dir`; `registry`: a registry or
+    /// git package (never a member); `host`: its unit for the host (build-override).
+    pub fn checks(&self, dir: &str, name: &str, version: &str, registry: bool, host: bool) -> ProfileChecks {
+        let mut c = self.checks;
+        if host {
+            c = self.build.apply(c);
+        }
+        if (self.any.debug_assertions.is_some() || self.any.overflow_checks.is_some()) && (registry || !self.member(dir)) {
+            c = self.any.apply(c);
+        }
+        for (n, v, set) in &self.named {
+            if n == name && v.as_deref().is_none_or(|v| v == version) {
+                c = set.apply(c);
+            }
+        }
+        c
+    }
+
+    fn member(&self, dir: &str) -> bool {
+        let dir = normalize(dir);
+        self.ws.get_or_init(|| Workspace::load(&self.root).ok()).as_ref().is_some_and(|ws| ws.has_member(&dir) && !ws.excluded(&dir))
+    }
+}
+
 /// What `file!()` names a source file relative to, as cargo decides it (`path_args`): a file of a
 /// path package under the workspace root of the run is named relative to that root; a file of a
 /// registry, git or vendored package, or of a path package outside the root, as given. The
@@ -2031,6 +2205,10 @@ pub struct GraphUnit {
     pub edition: String,
     /// a host-side unit (build-dependency / proc-macro side)
     pub host: bool,
+    /// the profile's checks the unit is built with, when its graph names them (`profile`'s
+    /// `debug_assertions` and `overflow_checks`: a build script's run, which its parent gives its
+    /// host checks, front unitgraph.rs script_units); else the run's profile decides (run.rs)
+    pub checks: Option<ProfileChecks>,
     /// build | run-custom-build
     pub mode: String,
     /// built with rustc's `--test`: libtest's generated main replaces the crate's own
@@ -2073,6 +2251,10 @@ impl Units {
                     src_path: s(t.and_then(|t| t.get("src_path"))),
                     edition: s(t.and_then(|t| t.get("edition"))),
                     host: matches!(u.get("relax_host"), Some(crate::json::Json::Bool(true))),
+                    checks: u.get("profile").and_then(|p| match (p.get("debug_assertions"), p.get("overflow_checks")) {
+                        (Some(crate::json::Json::Bool(d)), Some(crate::json::Json::Bool(o))) => Some(ProfileChecks { debug_assertions: *d, overflow_checks: *o }),
+                        _ => None,
+                    }),
                     mode: s(u.get("mode")),
                     harness: u.get("mode").is_some_and(|m| m.str() == "test"),
                     sysroot: false,
@@ -2688,6 +2870,7 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
             src_path: if cfg!(windows) { path.replace('/', "\\") } else { path },
             edition,
             host,
+            checks: None,
             mode: mode.to_string(),
             harness: match u {
                 UKind::LibTest | UKind::BinTest(_) => true,
