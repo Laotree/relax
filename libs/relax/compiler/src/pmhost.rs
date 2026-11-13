@@ -251,6 +251,7 @@ fn world_inner(sess: &std::sync::Arc<crate::Session>, prewarm: bool) -> Option<s
         set_in_world(true);
         crate::macro_reg::set_world_builder(true);
         let _in_world = InWorld;
+        let _single = SingleLoad::when(single_world_load());
         std::sync::Arc::new(build_world(sess))
     };
     tl_set_once(1, crate::clock::ms_since_start());
@@ -266,6 +267,32 @@ fn world_inner(sess: &std::sync::Arc<crate::Session>, prewarm: bool) -> Option<s
     tl_add(4, 1.0);
     tl_add(5, t.elapsed().as_secs_f64() * 1e3);
     Some(w)
+}
+
+/// Does this world build load its crates on its own thread, with no parse workers? Yes on the
+/// owner while the program runs: a worker's expansion with a stage world is then an owner
+/// request (`call`), and the owner is the thread waiting in the load for that worker's scan
+/// (a live edit's first derive since a warm boot built the world inside the patch's request:
+/// Mitaxu's reload hung with the owner in `Pool::take_ahead`, 2026-11-13). On the owner a
+/// request runs in place, so the loads expand their macros there as an added crate's do
+/// (`modules::add_crates`).
+fn single_world_load() -> bool {
+    crate::owner::is_owner() && !crate::run::running_unit().is_null()
+}
+
+/// Sets the thread's single-thread load (`preload::SINGLE`) while it lives, then restores it.
+struct SingleLoad(Option<bool>);
+impl SingleLoad {
+    fn when(single: bool) -> Self {
+        Self(single.then(|| crate::preload::SINGLE.with(|s| s.replace(true))))
+    }
+}
+impl Drop for SingleLoad {
+    fn drop(&mut self) {
+        if let Some(before) = self.0 {
+            crate::preload::SINGLE.with(|s| s.set(before));
+        }
+    }
 }
 
 /// After the program's files are loaded: the macro world goes (its Program, type context and
@@ -940,6 +967,25 @@ pub(crate) unsafe fn reset_statics() {
 
 #[cfg(test)]
 mod tests {
+    /// Off the owner (no running program) a world build keeps its parse workers; the single-thread
+    /// load it sets on the owner is the thread's own and goes back to what it was.
+    #[test]
+    fn a_single_world_load_is_the_owners_and_restores_the_thread() {
+        assert!(!super::single_world_load(), "a test thread is not the owner");
+        let single = || crate::preload::SINGLE.with(|s| s.get());
+        {
+            let _off = super::SingleLoad::when(false);
+            assert!(!single());
+            let _on = super::SingleLoad::when(true);
+            assert!(single());
+        }
+        assert!(!single(), "restored");
+        crate::preload::SINGLE.with(|s| s.set(true));
+        drop(super::SingleLoad::when(true));
+        assert!(single(), "an outer single load stays");
+        crate::preload::SINGLE.with(|s| s.set(false));
+    }
+
     /// The worlds stay while a world is being built (BUILDING held by its builder): the build's
     /// crates expand a stage's macros there. A free after the build takes them.
     #[test]
