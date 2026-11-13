@@ -73,6 +73,40 @@ pub fn host_op() -> impl Sized {
 #[inline(always)]
 pub fn host_op() {}
 
+/// The program's environment, for a provided crate's code. Under the loader a provided crate's
+/// bound ops run rustc's code in the loader's process, where `std::env` is the host's environment;
+/// the program's own (a package's run-env, the program's writes) is the loader's to answer. Read a
+/// setting that only tunes or reports the program's own run (a log, a trace, a tuning knob) here;
+/// one that decides what the process loads, runs or opens, a choice of the person's invocation, or
+/// a variable a C library reads too stays a `std::env` read.
+pub mod env {
+    use std::ffi::{OsStr, OsString};
+
+    static PROGRAM_READ: std::sync::OnceLock<fn(&OsStr) -> Option<OsString>> = std::sync::OnceLock::new();
+
+    /// The loader's read of the program's environment (relax-base progenv `program_var_os`), once per
+    /// process. Without one, and in JIT-compiled code, the program's environment is `std::env`.
+    pub fn set_program_read(read: fn(&OsStr) -> Option<OsString>) {
+        let _ = PROGRAM_READ.set(read);
+    }
+
+    /// `std::env::var_os` of the program's environment.
+    pub fn var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
+        match PROGRAM_READ.get() {
+            Some(read) => read(key.as_ref()),
+            None => std::env::var_os(key),
+        }
+    }
+
+    /// `std::env::var` of the program's environment.
+    pub fn var<K: AsRef<OsStr>>(key: K) -> Result<String, std::env::VarError> {
+        match var_os(key) {
+            Some(v) => v.into_string().map_err(std::env::VarError::NotUnicode),
+            None => Err(std::env::VarError::NotPresent),
+        }
+    }
+}
+
 /// The locks a provided crate's process-lifetime data uses. On macOS std's lock allocates a block
 /// at its first use, on whatever thread and in whatever phase that is: in an op, that block would
 /// be the run's and go with it, and the lock with it. These keep their state inline.

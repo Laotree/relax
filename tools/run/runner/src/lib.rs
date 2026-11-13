@@ -203,8 +203,10 @@ pub fn main(host: &'static Host) {
     // would give it, before anything reads the environment
     let bin = relax_compiler::selfexe::bin_start(&relax_compiler::os::proc::args_bytes());
     // a self-exec child: the program values its parent passed, before anything reads the
-    // environment (relax-base progenv.rs)
+    // environment (relax-base progenv.rs); a provided crate's read of the program's environment
+    // (relax-api env) answers with them
     relax_compiler::progenv::init();
+    relax_api::env::set_program_read(relax_compiler::progenv::program_var_os);
     // a run's own executable launched by a shell or a C library: that run's program again
     if let Some(args) = bin.or_else(|| relax_compiler::selfexe::relaunched(&relax_compiler::os::proc::args_bytes())) {
         relax_compiler::os::proc::set_args(args);
@@ -247,6 +249,7 @@ pub fn init_embedded(exe: &std::path::Path, host: &'static Host) {
 /// own; this names them for everything that reads them (relax_compiler::os::proc::args_bytes).
 pub fn run_with_args(args: Vec<Vec<u8>>) {
     relax_compiler::progenv::init();
+    relax_api::env::set_program_read(relax_compiler::progenv::program_var_os);
     relax_compiler::os::proc::set_args(args.clone());
     run(args)
 }

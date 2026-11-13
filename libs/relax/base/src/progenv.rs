@@ -17,7 +17,9 @@
 //!   and crosses a spawn as the child program's value.
 //! - A package's run-env (`set_run_env`) is a program value of any name: the overlay holds it, so
 //!   the host, its options and the tools it runs (cargo, the C compiler, build scripts) never read
-//!   it, and a self-exec child's host does not either.
+//!   it, and a self-exec child's host does not either. A provided crate's rustc code reads the
+//!   program's environment through relax-api's `env` (`program_var_os`), for a setting that only
+//!   tunes or reports the program's own run; its `std::env` stays the host's (KNOWN_GAPS 7).
 //!
 //! The policy is the pure function `child_env`: what each child gets. A self-exec child (this
 //! program again, `makepad run ... --`) gets every reserved name from this process's environment
@@ -307,6 +309,28 @@ fn write(name: &[u8], value: Option<&[u8]>) {
             Err(h) => head = h,
         }
     }
+}
+
+/// What the program reads of `name`, as its JIT-run code's `getenv` answers (`program_getenv`): its
+/// own value, else the process environment's. The read rustc-built code makes on the program's
+/// behalf (relax-api `env::var_os`, which the loader points here: a provided crate's bound op).
+pub fn program_var_os(name: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    #[cfg(any(unix, windows))]
+    if let Some(v) = lookup(name.as_encoded_bytes()) {
+        return v.map(|c| {
+            #[cfg(windows)]
+            {
+                use std::os::windows::ffi::OsStringExt;
+                std::ffi::OsString::from_wide(&wide(c.to_bytes()))
+            }
+            #[cfg(not(windows))]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                std::ffi::OsStr::from_bytes(c.to_bytes()).to_os_string()
+            }
+        });
+    }
+    std::env::var_os(name)
 }
 
 /// The program's value of `name`: Some(Some) set, Some(None) removed, None: not one of its own.
