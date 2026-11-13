@@ -284,6 +284,9 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
     }
     // the recipe, the session, the images: process state
     let _k = crate::zone_alloc::kept();
+    // what the rebuild keeps is the program's state loaded from its images: charged to cache-load
+    // (untagged, it was most of the "other" category after a rebuild)
+    let _mem = crate::memstat::tag(crate::memstat::Tag::CacheLoad);
     RUNNING.store(true, Ordering::Relaxed);
     let _running = Running;
     let t_all = Instant::now();
@@ -495,6 +498,7 @@ pub(crate) fn replaced_fronts_alive() -> Vec<std::sync::Arc<FrontShared>> {
 /// back to be dropped elsewhere.
 unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: crate::cache::Mode, fresh: Fresh, before: Counts) -> Result<Old, String> {
     let t_r = Instant::now();
+    let _mem = crate::memstat::tag(crate::memstat::Tag::CacheLoad);
     let mut laps: Vec<(&str, f64)> = Vec::new();
     let lap = |w: &'static str, laps: &mut Vec<(&'static str, f64)>| laps.push((w, t_r.elapsed().as_secs_f64() * 1e3));
     // (the steps up to the swap give way to a waiting request: the rebuild is tried again later.
@@ -576,11 +580,15 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
     // the old front state names the old program: no reader may reach it after the replace (a
     // reader checks `alive` under its front read, and this runs under the front write)
     queue::retire_front(&u.front);
+    // a slot's RIR goes, and what is kept beside it, read only while that RIR is set: a baseline
+    // body's own lowering and a full body's normal RIR. All of it was built from the old program,
+    // between its blocks: kept, it held the cold chunks resident (a large app: 20 MB of RIR in
+    // 600 old chunks, 194 MB resident). A build after the rebuild lowers again from the new one.
     let mut rir = Vec::new();
     for e in u.fns.iter_mut() {
-        if let Some(r) = e.rir.take() {
-            rir.push(r);
-        }
+        rir.extend(e.rir.take());
+        rir.extend(e.lowering.take());
+        rir.extend(e.normal_rir.take());
         e.build_err = None;
     }
     let old = Old {
