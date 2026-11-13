@@ -400,15 +400,17 @@ fn clean_page(st: &Style) -> String {
     let mut p = Page::new(st, 28);
     title(&mut p, "remove cached build files");
     p.blank();
-    p.usage(&format!("{tool} clean [-p <package>]", tool = command()));
+    p.usage(&format!("{tool} clean [-p <package>] [--shared]", tool = command()));
     p.blank();
     p.text("Removes the workspace's <target>/relax folder: the code cache, unit");
     p.text("graphs and build script outputs of every app.");
     p.section("Options:");
     p.row("-p, --package <name>", "Only that app's files: its startup manifest\nand stores. Stores shared with other apps,\nregistry packages and build script outputs\nstay.");
+    p.row("--shared", "Remove the whole shared run dir (RELAX_SHARED_CACHE=global):\nevery workspace's cached files in it.");
     p.section("Notes:");
     p.text("A git run's virtual workspace has no target folder to clean. Its files");
     p.text("are in $RELAX_HOME/target/<hash>. RELAX_CACHE_DIR makes clean refuse.");
+    p.text("With RELAX_SHARED_CACHE=global, clean refuses the shared dir; --shared removes it.");
     p.out
 }
 

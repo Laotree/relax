@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 pub fn cmd_clean(args: &[String]) -> i32 {
     let mut package = None;
+    let mut shared = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -30,12 +31,28 @@ pub fn cmd_clean(args: &[String]) -> i32 {
                 package = Some(args[i + 1].clone());
                 i += 1;
             }
+            "--shared" => shared = true,
             _ => {
-                eprintln!("usage: {tool} clean [-p <package>]", tool = crate::tool_name());
+                eprintln!("usage: {tool} clean [-p <package>] [--shared]", tool = crate::tool_name());
                 return 2;
             }
         }
         i += 1;
+    }
+    if shared {
+        if package.is_some() {
+            eprintln!("relax clean: --shared removes the whole shared run dir; it takes no -p");
+            return 2;
+        }
+        let dir = crate::dirs::shared_relax_dir();
+        if std::fs::symlink_metadata(&dir).is_err() {
+            println!("relax clean: {} does not exist: nothing to remove", dir.display());
+            return 0;
+        }
+        let mut r = Removal::default();
+        r.tree(&dir);
+        r.report(&dir, None);
+        return 0;
     }
     let dir = match checked_dir(&crate::dirs::workspace_dir(), crate::dirs::override_dir().is_some()) {
         Ok(Some(d)) => d,
@@ -64,7 +81,7 @@ pub fn cmd_clean(args: &[String]) -> i32 {
 pub fn checked_dir(workspace: &str, overridden: bool) -> Result<Option<PathBuf>, String> {
     match crate::dirs::shared_cache_mode() {
         Ok(false) => {}
-        Ok(true) => return Err("RELAX_SHARED_CACHE=global: the run dir is shared by every workspace, and clean never deletes it (unset RELAX_SHARED_CACHE, or remove that folder yourself)".to_string()),
+        Ok(true) => return Err("RELAX_SHARED_CACHE=global: the run dir is shared by every workspace; `relax clean --shared` removes it explicitly".to_string()),
         Err(e) => return Err(e),
     }
     if overridden {
