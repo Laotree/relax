@@ -90,7 +90,6 @@ fn validate_package(reg: &Reg, unit: usize, overlays: &std::collections::HashMap
     if crate::vfs::exists(root.join("build.rs")) && !files.iter().any(|(p, _)| *p == "build.rs") {
         return Err(error(root.join("build.rs").display().to_string(), "build script was added".into()));
     }
-    let expected = package.deps;
     // A graph that also links relax-native-macros as a library (relax-compiler's) holds
     // micro_proc_macro once, with the target side's `relax-tokens` (unitgraph: host and target
     // copies are one crate). The proc-macro side of that graph is the accepted one plus that
@@ -99,20 +98,31 @@ fn validate_package(reg: &Reg, unit: usize, overlays: &std::collections::HashMap
     // the sysroot's proc_macro (run.rs with_sysroot_proc_macro) is no Cargo dependency
     let sysroot = |dep: usize, alias: &str| alias == "proc_macro" && reg.units[dep].name == "proc_macro";
     let deps: Vec<&(usize, String)> = u.deps.iter().filter(|(dep, alias)| !optional(alias) && !sysroot(*dep, alias)).collect();
-    if deps.len() != expected.len() {
-        return Err(error(root.join("Cargo.toml").display().to_string(), "dependency count differs".into()));
-    }
-    for name in expected {
-        let (dep, _) = deps.iter().copied().find(|(_, alias)| alias == name)
-            .ok_or_else(|| error(root.join("Cargo.toml").display().to_string(), format!("missing dependency alias {name}")))?;
-        if reg.units[*dep].name != *name {
-            return Err(error(root.join("Cargo.toml").display().to_string(), format!("dependency {name} resolves to {}", reg.units[*dep].name)));
-        }
-        if !required(&reg.units[*dep].name) {
-            return Err(error(root.join("Cargo.toml").display().to_string(), format!("dependency {name} is not built into {tool}", tool = crate::tool_name())));
-        }
-    }
+    check_deps(reg, &deps, package.deps).map_err(|reason| error(root.join("Cargo.toml").display().to_string(), reason))?;
+    Ok(())
+}
 
+/// A package's graph dependencies against its manifest's (relax_native_macros `Package::deps`,
+/// whose bytes the graph's manifest equals): each one is a dependency the manifest declares,
+/// resolves to the crate of its name and is built in; an unconditional one is in every graph, an
+/// optional or target-specific one in the graphs whose features and target select it.
+fn check_deps(reg: &Reg, deps: &[&(usize, String)], manifest: &[(&str, bool)]) -> Result<(), String> {
+    for (dep, alias) in deps.iter().copied() {
+        if !manifest.iter().any(|(name, _)| name == alias) {
+            return Err(format!("dependency alias {alias} is not in the manifest built into {tool}", tool = crate::tool_name()));
+        }
+        if reg.units[*dep].name != *alias {
+            return Err(format!("dependency {alias} resolves to {}", reg.units[*dep].name));
+        }
+        if !required(alias) {
+            return Err(format!("dependency {alias} is not built into {tool}", tool = crate::tool_name()));
+        }
+    }
+    for (name, _) in manifest.iter().filter(|(_, conditional)| !conditional) {
+        if !deps.iter().any(|(_, alias)| alias == name) {
+            return Err(format!("missing dependency alias {name}"));
+        }
+    }
     Ok(())
 }
 
@@ -295,6 +305,18 @@ mod tests {
         }
         reg.units[2].deps.push((0, "makepad_micro_proc_macro".into()));
         assert!(checked(&reg).is_ok());
+        // The dependencies are the manifests' (gen.rs): an optional one is conditional, a plain one not.
+        assert_eq!(packages()["makepad_micro_proc_macro"].deps, &[("relax_lex", true)], "an optional manifest dependency");
+        assert_eq!(packages()["makepad_micro_serde_derive"].deps, &[("makepad_micro_proc_macro", false), ("makepad_micro_serde_derive_impl", false)], "plain manifest dependencies");
+        // A graph whose features or target leave out a conditional dependency passes; one without an
+        // unconditional dependency, or with one the manifest lacks, does not.
+        let manifest = [("makepad_micro_proc_macro", false), ("makepad_micro_serde_derive_impl", true)];
+        let deps = |units: &[usize]| units.iter().map(|&unit| (unit, reg.units[unit].name.clone())).collect::<Vec<_>>();
+        let check = |graph: &[(usize, String)]| check_deps(&reg, &graph.iter().collect::<Vec<_>>(), &manifest);
+        assert_eq!(check(&deps(&[0, 1])), Ok(()), "the conditional dependency selected");
+        assert_eq!(check(&deps(&[0])), Ok(()), "the conditional dependency left out");
+        assert_eq!(check(&deps(&[1])).unwrap_err(), "missing dependency alias makepad_micro_proc_macro", "an unconditional dependency left out");
+        assert!(check(&deps(&[0, 2])).unwrap_err().contains("dependency alias makepad_micro_serde_derive is not in the manifest"), "a dependency the manifest lacks");
         let before = SOURCE_READS.load(std::sync::atomic::Ordering::Relaxed);
         let mut graph = Graph::new(reg.clone());
         assert_eq!(SOURCE_READS.load(std::sync::atomic::Ordering::Relaxed) - before, 11);

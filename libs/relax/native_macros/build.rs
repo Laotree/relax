@@ -11,22 +11,22 @@ mod self_stamp;
 use gen::Row;
 
 const ROWS: &[Row] = &[
-    Row { name: "makepad_micro_proc_macro", dir: "../../micro_proc_macro", module: None, deps: &[],
+    Row { name: "makepad_micro_proc_macro", dir: "../../micro_proc_macro", module: None,
         // the target side's feature of a graph that links relax-native-macros (compiler
         // native_macros.rs `optional`)
         features: &["relax-tokens"] },
     // (the loader's own graph, `makepad check makepad-run`, asks for the build it links)
-    Row { name: "makepad_live_id", dir: "../../live_id", module: None, deps: &["makepad_live_id_macros", "relax_api"], features: &["default", "host-shims"] },
-    Row { name: "makepad_live_id_macros", dir: "../../live_id/id_macros", module: Some("id"), deps: &["makepad_live_id_macros_impl"], features: &[] },
-    Row { name: "makepad_live_id_macros_impl", dir: "../../live_id/id_macros_impl", module: None, deps: &["makepad_micro_proc_macro"], features: &[] },
-    Row { name: "makepad_micro_serde_derive", dir: "../../micro_serde/derive", module: Some("serde"), deps: &["makepad_micro_serde_derive_impl", "makepad_micro_proc_macro"], features: &[] },
-    Row { name: "makepad_micro_serde_derive_impl", dir: "../../micro_serde/derive_impl", module: None, deps: &["makepad_micro_proc_macro"], features: &[] },
-    Row { name: "makepad_alloc_phase", dir: "../../relax_api/phase", module: None, deps: &[], features: &[] },
+    Row { name: "makepad_live_id", dir: "../../live_id", module: None, features: &["default", "host-shims"] },
+    Row { name: "makepad_live_id_macros", dir: "../../live_id/id_macros", module: Some("id"), features: &[] },
+    Row { name: "makepad_live_id_macros_impl", dir: "../../live_id/id_macros_impl", module: None, features: &[] },
+    Row { name: "makepad_micro_serde_derive", dir: "../../micro_serde/derive", module: Some("serde"), features: &[] },
+    Row { name: "makepad_micro_serde_derive_impl", dir: "../../micro_serde/derive_impl", module: None, features: &[] },
+    Row { name: "makepad_alloc_phase", dir: "../../relax_api/phase", module: None, features: &[] },
     // the loader's copy is built with host-shims (the loader links makepad-hal, which enables it):
     // a graph that links makepad-hal (its own tests) asks for that build
-    Row { name: "relax_api", dir: "../../relax_api", module: None, deps: &["makepad_alloc_phase", "relax_api_macro"], features: &["host-shims"] },
-    Row { name: "relax_api_macro", dir: "../../relax_api/macro", module: Some("relax_api"), deps: &["relax_api_macro_impl"], features: &[] },
-    Row { name: "relax_api_macro_impl", dir: "../../relax_api/macro_impl", module: None, deps: &["makepad_micro_proc_macro"], features: &[] },
+    Row { name: "relax_api", dir: "../../relax_api", module: None, features: &["host-shims"] },
+    Row { name: "relax_api_macro", dir: "../../relax_api/macro", module: Some("relax_api"), features: &[] },
+    Row { name: "relax_api_macro_impl", dir: "../../relax_api/macro_impl", module: None, features: &[] },
 ];
 
 fn main() {

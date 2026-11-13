@@ -8,7 +8,8 @@
 //! `Function` in scope:
 //! - `sources.rs`: `pub static PACKAGES: &[Package]`, each package's manifest, build script and
 //!   source files as the build read them (the compiler checks the graph's against them, compiler
-//!   native_macros.rs), its dependencies and the features a graph may ask of it;
+//!   native_macros.rs), its dependencies as its manifest declares them and the features a graph
+//!   may ask of it;
 //! - `bindings.rs`: the proc-macro wrappers of the packages that have a `module`, adapted from those
 //!   same sources, and `pub static ENTRIES: &[Entry]`;
 //! - `src_stamp.rs`: the providing crate's source stamp, over its own files, the embedded ones and
@@ -20,6 +21,9 @@ use std::path::PathBuf;
 mod build_sources;
 #[path = "src/native_cfg.rs"]
 mod native_cfg;
+#[path = "../base/src/toml/parser.rs"]
+#[allow(dead_code)]
+mod toml;
 
 /// A package of a set.
 pub struct Row {
@@ -29,11 +33,45 @@ pub struct Row {
     pub dir: &'static str,
     /// a proc-macro crate: the module its wrappers become
     pub module: Option<&'static str>,
-    /// the crate names it depends on (its proc-macro build's graph; the optional relax-tokens
-    /// dependency of makepad_micro_proc_macro is not one)
-    pub deps: &'static [&'static str],
     /// the features a graph may build it with
     pub features: &'static [&'static str],
+}
+
+/// A package's dependencies as its manifest declares them (dev- and build-dependencies aside): each
+/// crate name, and whether a graph may resolve without it (optional, or for some targets only).
+fn manifest_deps(package: &str, manifest: &[u8]) -> Vec<(String, bool)> {
+    let text = std::str::from_utf8(manifest).unwrap_or_else(|_| panic!("native macro package {package}: Cargo.toml is not UTF-8"));
+    let doc = toml::parse_toml(text).unwrap_or_else(|e| panic!("native macro package {package}: Cargo.toml: {e}"));
+    let mut deps: Vec<(String, bool)> = Vec::new();
+    let mut add = |table: &toml::TomlTable, for_target: bool| {
+        for (key, spec) in table {
+            let optional = match spec {
+                toml::Toml::Str(..) => false,
+                toml::Toml::Table(spec) => {
+                    // the compiler matches a dependency's alias with the crate it resolves to
+                    assert!(!spec.contains_key("package"), "native macro package {package}: dependency {key} is renamed");
+                    spec.get("optional").and_then(|o| o.as_bool()).unwrap_or(false)
+                }
+                _ => panic!("native macro package {package}: dependency {key} is neither a version nor a table"),
+            };
+            let name = key.replace('-', "_");
+            let conditional = for_target || optional;
+            match deps.iter_mut().find(|(n, _)| *n == name) {
+                Some(dep) => dep.1 &= conditional,
+                None => deps.push((name, conditional)),
+            }
+        }
+    };
+    if let Some(table) = doc.root.get("dependencies").and_then(|d| d.as_table()) {
+        add(table, false);
+    }
+    for target in doc.root.get("target").and_then(|t| t.as_table()).into_iter().flat_map(|t| t.values()) {
+        if let Some(table) = target.as_table().and_then(|t| t.get("dependencies")).and_then(|d| d.as_table()) {
+            add(table, true);
+        }
+    }
+    deps.sort();
+    deps
 }
 
 fn ident(token: Option<&TokenTree>, name: &str) -> bool {
@@ -98,11 +136,14 @@ pub fn generate(rows: &[Row]) {
         ("gen.rs", &include_bytes!("gen.rs")[..]),
         ("build_sources.rs", &include_bytes!("../build_sources.rs")[..]),
         ("native_cfg.rs", &include_bytes!("src/native_cfg.rs")[..]),
+        ("toml_parser.rs", &include_bytes!("../base/src/toml/parser.rs")[..]),
     ].iter().map(|(name, bytes)| (format!("relax-native-macros/{name}"), bytes.to_vec())).collect();
     for row in rows {
         let root = manifest.join(row.dir).canonicalize().unwrap_or_else(|e| panic!("native macro package {} at {}: {e}", row.name, row.dir));
-        packages.push_str(&format!("Package {{ name: {:?}, deps: &{:?}, features: &{:?}, files: &[\n", row.name, row.deps, row.features));
         let files = build_sources::package(&root);
+        let cargo_toml = files.iter().find(|(path, _)| path == "Cargo.toml").unwrap_or_else(|| panic!("native macro package {} has no Cargo.toml", row.name));
+        let deps = manifest_deps(row.name, &cargo_toml.1);
+        packages.push_str(&format!("Package {{ name: {:?}, deps: &{:?}, features: &{:?}, files: &[\n", row.name, deps, row.features));
         divergent.extend(native_cfg::check_package(row.name, &files));
         for (path, data) in files {
             stamped.push((format!("{}/{path}", row.name), data.clone()));

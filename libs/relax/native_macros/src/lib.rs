@@ -42,12 +42,13 @@ impl Entry {
     }
 }
 
-/// A package a set runs natively (its proc macros, or a library of theirs): its crate name, the
-/// crate names it depends on, the features a graph may build it with, and its files as the set's
-/// build read them (path in the package, bytes).
+/// A package a set runs natively (its proc macros, or a library of theirs): its crate name, its
+/// dependencies as its manifest declares them (crate name, and whether a graph may resolve without
+/// it: optional, or for some targets only), the features a graph may build it with, and its files
+/// as the set's build read them (path in the package, bytes).
 pub struct Package {
     pub name: &'static str,
-    pub deps: &'static [&'static str],
+    pub deps: &'static [(&'static str, bool)],
     pub features: &'static [&'static str],
     pub files: &'static [(&'static str, &'static [u8])],
 }
