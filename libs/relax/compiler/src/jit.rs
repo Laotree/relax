@@ -2148,6 +2148,9 @@ pub(crate) fn install_ice_hook() {
         }
         // a build on this thread: the panic becomes its compile error (the report carries the position)
         if ICE_SCOPE.try_with(|c| c.get()).unwrap_or(0) > 0 {
+            if std::env::var_os("RELAX_ICE_BT").is_some() {
+                eprintln!("relax ICE in build: {}\n{}", info, std::backtrace::Backtrace::force_capture());
+            }
             return;
         }
         if owner::is_owner() && owner::serving_request() {
@@ -17217,7 +17220,17 @@ pub unsafe fn retire_unit(up: *mut Unit) {
         }
         // its queued ids, also when speculation is on another unit: a unit allocated at its
         // address later must not take them
-        queue::retain(|job| !matches!(job, queue::Job::Spec(unit, _) if *unit == up as usize));
+        let mut jobs = 0;
+        queue::retain(|job| {
+            let keep = !matches!(job, queue::Job::Spec(unit, _) | queue::Job::O2(unit, _, _) if *unit == up as usize);
+            jobs += usize::from(!keep);
+            keep
+        });
+        let slots = forget_unit_slots(up as usize);
+        // RELAX_ICE_BT=1: which unit retired, and what of its own it left behind
+        if std::env::var_os("RELAX_ICE_BT").is_some() {
+            eprintln!("relax retire unit {:#x}: {} queued jobs and {} slot entries forgotten", up as usize, jobs, slots);
+        }
         if UNIT == up {
             UNIT = std::ptr::null_mut();
         }
@@ -17228,6 +17241,60 @@ pub unsafe fn retire_unit(up: *mut Unit) {
         }
     });
     resume_compile_jobs(false);
+}
+
+/// A retiring unit's slots in the process-wide build state, keyed by the unit's address: gone. A
+/// unit allocated at that address later (the program's, after a build script's or the proc-macro
+/// world's unit) read them as its own slots: `complete_provisional` and the O2 and O3 builds
+/// indexed its `fns` with the other unit's ids ("AppendVec index out of bounds").
+/// Returns how many entries went.
+fn forget_unit_slots(unit: usize) -> usize {
+    fn lock<T>(m: &relax_session::sync::Mutex<T>) -> relax_session::sync::MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    let mut gone = 0;
+    let mut mine = |k: usize| { let it = k == unit; gone += usize::from(it); !it };
+    lock(&PROVISIONAL).retain(|e| mine(e.0));
+    lock(&O2_LATER).retain(|e| mine(e.0));
+    lock(&O1V_HELD).retain(|e| mine(e.0));
+    lock(&TWIN_O3_BASES).retain(|e| mine(e.0));
+    lock(&TWIN_AWAIT).retain(|e| mine(e.0));
+    lock(&UNVERIFIED_LEFT).retain(|e| mine(e.0));
+    lock(&UNVERIFIED_IN).retain(|e| mine(e.0));
+    for set in [&COMPLETING, &O2_SEEN, &O1V_SEEN, &O1V_STANDALONE] {
+        if let Some(s) = lock(set).as_mut() { s.retain(|e| mine(e.0)); }
+    }
+    if let Some(m) = lock(&LINKED_PROVISIONAL).as_mut() { m.retain(|k, _| mine(k.0)); }
+    if let Some(s) = OFFERED.get() { lock(s).retain(|e| mine(e.0)); }
+    lock(&TWIN_USERS).retain(|k, _| mine(k.0));
+    lock(&O3_BUILD_NOTES).retain(|k, _| mine(k.0));
+    gone
+}
+
+#[cfg(test)]
+mod forget_unit_slots_tests {
+    use super::*;
+
+    #[test]
+    fn a_retired_units_slots_leave_the_build_state_and_anothers_stay() {
+        // addresses no real unit has (the lib suite's units may be live in other tests)
+        let (gone, kept) = (usize::MAX - 64, usize::MAX - 128);
+        PROVISIONAL.lock().unwrap().extend([(gone, 2461, vec![1]), (kept, 7, vec![])]);
+        O2_LATER.lock().unwrap().extend([(gone, 2665), (kept, 8)]);
+        UNVERIFIED_IN.lock().unwrap().extend([(gone, 1, 2), (kept, 3, 4)]);
+        COMPLETING.lock().unwrap().get_or_insert_with(Default::default).extend([(gone, 3695), (kept, 9)]);
+        LINKED_PROVISIONAL.lock().unwrap().get_or_insert_with(Default::default).extend([((gone, 54074), 2), ((kept, 10), 1)]);
+        TWIN_USERS.lock().unwrap().extend([((gone, 5), vec![6]), ((kept, 11), vec![])]);
+        assert_eq!(forget_unit_slots(gone), 6);
+        let mine = |k: usize| k == gone || k == kept;
+        assert!(PROVISIONAL.lock().unwrap().iter().filter(|e| mine(e.0)).map(|e| (e.0, e.1)).eq([(kept, 7)]));
+        assert!(O2_LATER.lock().unwrap().iter().filter(|e| mine(e.0)).copied().eq([(kept, 8)]));
+        assert!(UNVERIFIED_IN.lock().unwrap().iter().filter(|e| mine(e.0)).copied().eq([(kept, 3, 4)]));
+        assert!(COMPLETING.lock().unwrap().as_ref().unwrap().iter().filter(|e| mine(e.0)).copied().eq([(kept, 9)]));
+        assert!(LINKED_PROVISIONAL.lock().unwrap().as_ref().unwrap().keys().filter(|k| mine(k.0)).copied().eq([(kept, 10)]));
+        assert!(TWIN_USERS.lock().unwrap().keys().filter(|k| mine(k.0)).copied().eq([(kept, 11)]));
+        forget_unit_slots(kept);
+    }
 }
 
 /// RELAX_O3_TRACE: why and when the build in flight for a slot was queued
