@@ -4742,6 +4742,165 @@ pub fn vmovl_u32(a: uint32x2_t) -> uint64x2_t {
     uint64x2_t(r)
 }
 
+// ---------------------------------------------------------------- the rest of what relax-codegen's NEON interpreter (interp/vx.rs) calls:
+// the high-half widening moves, pairwise widening adds, the u8 / u64 sums across, the u32 rounding
+// halving add, the u8 absolute difference, round to nearest with ties away, and f64 <-> f32 conversions
+
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vmovl_high_u8(a: uint8x16_t) -> uint16x8_t {
+    let mut r = [0; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = a.0[8 + i] as u16;
+        i += 1;
+    }
+    uint16x8_t(r)
+}
+
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vmovl_high_s8(a: int8x16_t) -> int16x8_t {
+    let mut r = [0; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = a.0[8 + i] as i16;
+        i += 1;
+    }
+    int16x8_t(r)
+}
+
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vmovl_high_u16(a: uint16x8_t) -> uint32x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = a.0[4 + i] as u32;
+        i += 1;
+    }
+    uint32x4_t(r)
+}
+
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vmovl_high_s16(a: int16x8_t) -> int32x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = a.0[4 + i] as i32;
+        i += 1;
+    }
+    int32x4_t(r)
+}
+
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vmovl_high_u32(a: uint32x4_t) -> uint64x2_t {
+    let mut r = [0; 2];
+    let mut i = 0;
+    while i < 2 {
+        r[i] = a.0[2 + i] as u64;
+        i += 1;
+    }
+    uint64x2_t(r)
+}
+
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vmovl_high_s32(a: int32x4_t) -> int64x2_t {
+    let mut r = [0; 2];
+    let mut i = 0;
+    while i < 2 {
+        r[i] = a.0[2 + i] as i64;
+        i += 1;
+    }
+    int64x2_t(r)
+}
+
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vpaddlq_u16(a: uint16x8_t) -> uint32x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = a.0[i * 2] as u32 + a.0[i * 2 + 1] as u32;
+        i += 1;
+    }
+    uint32x4_t(r)
+}
+
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vpaddlq_u32(a: uint32x4_t) -> uint64x2_t {
+    uint64x2_t([a.0[0] as u64 + a.0[1] as u64, a.0[2] as u64 + a.0[3] as u64])
+}
+
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vaddvq_u8(a: uint8x16_t) -> u8 {
+    let mut r = 0u8;
+    let mut i = 0;
+    while i < 16 {
+        r = r.wrapping_add(a.0[i]);
+        i += 1;
+    }
+    r
+}
+
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vaddvq_u64(a: uint64x2_t) -> u64 {
+    a.0[0].wrapping_add(a.0[1])
+}
+
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vrhaddq_u32(a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = ((a.0[i] as u64 + b.0[i] as u64 + 1) >> 1) as u32;
+        i += 1;
+    }
+    uint32x4_t(r)
+}
+
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vabdq_u8(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
+    let mut r = [0; 16];
+    let mut i = 0;
+    while i < 16 {
+        r[i] = a.0[i].abs_diff(b.0[i]);
+        i += 1;
+    }
+    uint8x16_t(r)
+}
+
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vrndaq_f32(a: float32x4_t) -> float32x4_t {
+    let mut r = [0.0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = neon_result_f32(a.0[i], a.0[i], a.0[i].round());
+        i += 1;
+    }
+    float32x4_t(r)
+}
+
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vrndaq_f64(a: float64x2_t) -> float64x2_t {
+    let mut r = [0.0; 2];
+    let mut i = 0;
+    while i < 2 {
+        r[i] = neon_result_f64(a.0[i], a.0[i], a.0[i].round());
+        i += 1;
+    }
+    float64x2_t(r)
+}
+
+/// FCVTN: each f64 lane rounded to f32 (nearest, ties to even); a NaN keeps its sign and the top
+/// of its payload, quieted.
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vcvt_f32_f64(a: float64x2_t) -> float32x2_t {
+    float32x2_t([a.0[0] as f32, a.0[1] as f32])
+}
+
+/// FCVTL: each f32 lane widened exactly; a NaN keeps its sign and payload, quieted.
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+pub fn vcvt_f64_f32(a: float32x2_t) -> float64x2_t {
+    float64x2_t([a.0[0] as f64, a.0[1] as f64])
+}
+
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 pub fn vcgeq_u8(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
     let mut r = [0; 16];
