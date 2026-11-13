@@ -1359,7 +1359,9 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     // Ok: the output in `build_dir`, which stands; Err: why the script runs again
     let previous = |build_dir: &str| match (std::fs::read_to_string(format!("{}/output", build_dir)), std::fs::read_to_string(format!("{}/relax-rerun", build_dir))) {
         (Ok(old), Ok(key)) => {
-            let now = rerun_key(&old, dir, &env_key, shared.as_ref()).unwrap_or_default();
+            let own = std::path::Path::new(&format!("{}/{}", build_dir, CHECKOUT_MARK)).is_file();
+            let keyed = if own { format!("{CHECKOUT_LINE}\n{old}") } else { old.clone() };
+            let now = rerun_key(&keyed, dir, &env_key, shared.as_ref()).unwrap_or_default();
             if now == key { Ok(old) } else { Err(rerun_reason(&key, &now, &std::fs::read_to_string(format!("{}/relax-rerun-env", build_dir)).unwrap_or_default(), &env_key)) }
         }
         _ => Err("no previous output".to_string()),
@@ -1438,7 +1440,16 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         Ok(o) if o.status.success() => {
             let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
             let stdout = if shared.is_some() { shared_output(&stdout) } else { stdout };
-            if let Some(key) = rerun_key(&stdout, dir, &env_key, shared.as_ref()) {
+            // an output that names its checkout stands for that checkout alone (`names_checkout`)
+            let own = shared.is_some() && names_checkout(&stdout, &out_dir);
+            let mark = format!("{}/{}", build_dir, CHECKOUT_MARK);
+            if own {
+                let _ = std::fs::write(&mark, crate::vfs::folder_disks().join("\n"));
+            } else {
+                let _ = std::fs::remove_file(&mark);
+            }
+            let keyed = if own { format!("{CHECKOUT_LINE}\n{stdout}") } else { stdout.clone() };
+            if let Some(key) = rerun_key(&keyed, dir, &env_key, shared.as_ref()) {
                 let _ = std::fs::write(&output_path, &stdout);
                 let _ = std::fs::write(&key_path, key);
                 let _ = std::fs::write(&env_path, &env_key);
@@ -1447,7 +1458,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
             }
             // what the script declared names the place of its next output (`shared_build_dir`)
             if shared.is_some() {
-                let declared = declared_inputs(&stdout);
+                let declared = declared_inputs(&keyed);
                 if std::fs::read_to_string(&declared_path).ok().as_deref() != Some(declared.as_str()) {
                     let _ = std::fs::write(&declared_path, &declared);
                 }
@@ -1585,6 +1596,11 @@ fn rerun_key(output: &str, pkg_dir: &str, env_key: &str, shared: Option<&SharedC
     let mut key = format!("{:016x}\n", fnv(env_key.as_bytes(), 0xcbf29ce484222325));
     let mut any = false;
     for line in output.lines() {
+        if line == CHECKOUT_LINE {
+            // (an output kept per checkout: this run's checkout, on disk)
+            key.push_str(&format!("k {}\n", crate::vfs::folder_disks().join(" ")));
+            continue;
+        }
         let rest = match line.strip_prefix("cargo::").or_else(|| line.strip_prefix("cargo:")) {
             Some(r) => r,
             None => continue,
@@ -1684,6 +1700,75 @@ fn shared_content(shared: Option<&SharedContent>, path: &str, pkg: bool) -> Opti
     Some(c)
 }
 
+/// The first line of a rerun key's text (and of `declared`) for a script output kept per checkout
+/// (`names_checkout`): its key holds the checkout's folder on disk. `CHECKOUT_MARK`, beside such
+/// an output, says so.
+const CHECKOUT_LINE: &str = "relax:per-checkout";
+const CHECKOUT_MARK: &str = "relax-checkout";
+
+/// Whether a shared workspace's script output (vfs.rs SHARE) is its checkout's own: its stdout
+/// (rerun-if-changed paths already the mount's) or a file it left in its OUT_DIR names the
+/// checkout's folder on disk (a `rustc-env` of the source root, generated code holding its paths),
+/// or it declares an input in the repository's git metadata (`rerun-if-changed=.git/HEAD`: the
+/// same text in every clone, while the commit and the files are each checkout's). Cargo never
+/// shares an OUT_DIR between checkouts; such an output stands for its own checkout alone, else
+/// another checkout's run took the first one's paths and commit (relax review B-M8).
+fn names_checkout(stdout: &str, out_dir: &str) -> bool {
+    // each folder as mounted and as the script's current folder gives it (links resolved: a temp
+    // folder under /var is /private/var on macOS)
+    let mut disks = crate::vfs::folder_disks();
+    for d in disks.clone() {
+        if let Ok(c) = std::fs::canonicalize(&d) {
+            disks.push(crate::vfs::normalize_path(&c.to_string_lossy()));
+        }
+    }
+    disks.sort();
+    disks.dedup();
+    if disks.iter().any(|d| stdout.contains(d.as_str())) {
+        return true;
+    }
+    let git = stdout.lines().filter_map(|l| l.strip_prefix("cargo::").or_else(|| l.strip_prefix("cargo:"))?.strip_prefix("rerun-if-changed="))
+        .any(|p| p.split(['/', '\\']).any(|c| c == ".git"));
+    git || (!disks.is_empty() && folder_mentions(std::path::Path::new(out_dir), &disks))
+}
+
+/// Whether a file under `dir` (links not followed) holds one of `needles`.
+fn folder_mentions(dir: &std::path::Path, needles: &[String]) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+    for e in entries.flatten() {
+        let Ok(t) = e.file_type() else { continue };
+        if t.is_dir() {
+            if folder_mentions(&e.path(), needles) {
+                return true;
+            }
+        } else if t.is_file() {
+            let Ok(bytes) = std::fs::read(e.path()) else { continue };
+            if needles.iter().any(|n| holds(&bytes, n.as_bytes())) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether `hay` holds `needle` (a scan for its first byte, then a compare).
+fn holds(hay: &[u8], needle: &[u8]) -> bool {
+    let Some((&first, _)) = needle.split_first() else { return true };
+    let mut at = 0;
+    while at + needle.len() <= hay.len() {
+        match hay[at..hay.len() - needle.len() + 1].iter().position(|&b| b == first) {
+            Some(i) => {
+                if &hay[at + i..at + i + needle.len()] == needle {
+                    return true;
+                }
+                at += i + 1;
+            }
+            None => return false,
+        }
+    }
+    false
+}
+
 /// A shared workspace's script output as it is kept and keyed (vfs.rs SHARE): each
 /// `rerun-if-changed` path the script gave under its checkout on disk (its current folder) as the
 /// folder mount's (`vfs::virtual_of`), so the run of another checkout evaluates its own file there,
@@ -1705,6 +1790,9 @@ fn shared_output(output: &str) -> String {
 /// The inputs a script's output declares (its `rerun-if` lines, sorted, once each).
 fn declared_inputs(output: &str) -> String {
     let mut lines: Vec<&str> = output.lines().filter(|l| {
+        if *l == CHECKOUT_LINE {
+            return true;
+        }
         let rest = l.strip_prefix("cargo::").or_else(|| l.strip_prefix("cargo:")).unwrap_or("");
         rest.starts_with("rerun-if-changed=") || rest.starts_with("rerun-if-env-changed=")
     }).collect();

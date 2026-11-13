@@ -238,6 +238,16 @@ pub fn folder_mounted() -> bool {
     ANY_FOLDER.load(Ordering::Acquire)
 }
 
+/// The disk folders of the folder mounts (a shared workspace's checkout, SHARE), sorted.
+pub fn folder_disks() -> Vec<String> {
+    if !ANY_FOLDER.load(Ordering::Acquire) {
+        return Vec::new();
+    }
+    let mut disks: Vec<String> = FOLDER_MOUNTS.read().unwrap().iter().map(|(_, d)| normalize_path(&d.to_string_lossy())).collect();
+    disks.sort();
+    disks
+}
+
 /// `text` with each folder mount's virtual paths as the disk's (`roots`: (root, disk folder)
 /// pairs): a root matches only at a path boundary, followed by `/` or by a byte that cannot continue
 /// a name (`<root>2` is another folder).
