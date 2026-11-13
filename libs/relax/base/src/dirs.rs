@@ -89,13 +89,22 @@ fn payload_carries_anchor_in(bytes: &[u8], anchors: &[(&'static str, String)]) -
 /// or None when it cannot be read. A None, and any failure to produce a spelling, counts as
 /// carried (fail closed): the scan never shares what it could not check, and tests can inject the
 /// failure a real file system will not produce on demand.
+/// ASCII case-insensitive prefix (macOS and Windows default file systems are case-insensitive).
+fn starts_with_ci(hay: &[u8], needle: &[u8]) -> bool {
+    hay.len() >= needle.len()
+        && hay[..needle.len()].iter().zip(needle).all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
 fn payload_carries_anchor_with(bytes: &[u8], anchors: &[(&'static str, String)], resolve: &dyn Fn(&str) -> Option<String>) -> Option<&'static str> {
     // No anchor list means the scan cannot decide: carried, never shared.
     if anchors.is_empty() {
         return Some("no-anchor");
     }
-    // Prefix matching is intentional and conservative: a directory that starts with an anchor's
-    // spelling counts as under it, so a false positive only costs a missing hit.
+    // Every spelling of every anchor, with the anchor directory's length for the longest-prefix
+    // rule: at one hit position, the longest anchor wins. `run` and `cargo` are machine-wide in
+    // shared mode, so only `ws` (or an unknown tag) blocks sharing. Prefix matching is
+    // deliberately conservative: a false positive costs a missing hit.
+    let mut forms: Vec<(&'static str, usize, Vec<u8>)> = Vec::new();
     for (tag, dir) in anchors {
         if dir.is_empty() {
             continue;
@@ -105,32 +114,41 @@ fn payload_carries_anchor_with(bytes: &[u8], anchors: &[(&'static str, String)],
             // tables the scan cannot match both, so such an anchor never shares.
             return Some(tag);
         }
-        let mut spellings = vec![dir.clone()];
-        match resolve(dir) {
-            Some(c) => {
-                if c != *dir {
-                    spellings.push(c);
-                }
-            }
+        let canon = match resolve(dir) {
+            Some(c) => c,
             None => return Some(tag),
+        };
+        let mut spellings = vec![dir.clone()];
+        if canon != *dir {
+            spellings.push(canon);
         }
         let back: Vec<String> = spellings.iter().map(|d| d.replace('/', "\\")).collect();
-        spellings.extend(back.iter().cloned());
-        // Windows' extended-length prefix and its forward-slash form (pairs with the backslash
-        // spellings above).
-        spellings.extend(back.iter().map(|d| format!("\\\\?\\{d}")));
-        let mut forms: Vec<Vec<u8>> = spellings.iter().map(|d| d.as_bytes().to_vec()).collect();
-        // Wide strings in Windows data (debug info, symbol names).
-        for d in &spellings {
-            forms.push(d.encode_utf16().flat_map(u16::to_le_bytes).collect());
+        let extended: Vec<String> = back.iter().map(|d| format!("\\\\?\\{d}")).collect();
+        spellings.extend(back);
+        spellings.extend(extended);
+        for sp in spellings {
+            forms.push((tag, dir.len(), sp.as_bytes().to_vec()));
+            forms.push((tag, dir.len(), sp.encode_utf16().flat_map(u16::to_le_bytes).collect()));
         }
-        if forms.iter().any(|f| contains(bytes, f, true)) {
-            return Some(tag);
+    }
+    for i in 0..bytes.len() {
+        let mut best: Option<(&'static str, usize)> = None;
+        for (tag, dlen, f) in &forms {
+            if starts_with_ci(&bytes[i..], f) && best.is_none_or(|(_, bl)| *dlen > bl) {
+                best = Some((tag, *dlen));
+            }
+        }
+        if let Some((tag, _)) = best {
+            match tag {
+                // machine-wide in shared mode
+                "run" | "cargo" => continue,
+                // ws, and any tag we do not know: fail closed
+                _ => return Some(tag),
+            }
         }
     }
     None
 }
-
 /// `needle` in `bytes`, ASCII case-insensitively when `ci` (the default file systems of macOS
 /// and Windows are case-insensitive; folding more than ASCII would need a table, and a missing
 /// hit is the safe side).
@@ -419,14 +437,28 @@ mod tests {
         assert!(super::shared_mode_from(Some("1")).is_err());
     }
 
+    /// Only ws blocks sharing: run/cargo paths are machine-wide, a lookalike prefix stays
+    /// conservative, and a run dir outside the workspace behaves the same.
+    #[test]
+    fn tag_aware_scan_blocks_only_ws() {
+        let ok = |d: &str| Some(d.to_string());
+        let a = [("ws", "/w".to_string()), ("run", "/w/target/relax".to_string())];
+        assert_eq!(super::payload_carries_anchor_with(b"/w2/src/lib.rs", &a, &ok), Some("ws"));
+        let b = [("ws", "/proj".to_string()), ("run", "/elsewhere/relax".to_string())];
+        assert_eq!(super::payload_carries_anchor_with(b"/elsewhere/relax/build/x", &b, &ok), None);
+        assert_eq!(super::payload_carries_anchor_with(b"/proj/src/lib.rs", &b, &ok), Some("ws"));
+        assert_eq!(super::payload_carries_anchor_with(b"/elsewhere/relax/x /proj/y", &b, &ok), Some("ws"));
+    }
+
     /// The payload scan catches every anchor spelling a payload could carry.
     #[test]
     fn payload_scan_finds_anchor_spellings() {
-        let a = [("ws", "/w".to_string()), ("cargo", "/c".to_string())];
+        let a = [("ws", "/w".to_string()), ("cargo", "/c".to_string()), ("run", "/w/target/relax".to_string())];
         let ok = |d: &str| Some(d.to_string());
         assert_eq!(super::payload_carries_anchor_with(b"prefix/w/src/lib.rs", &a, &ok), Some("ws"));
-        assert_eq!(super::payload_carries_anchor_with(b"x\\w\\src\\lib.rs", &a, &ok), Some("ws"));
-        assert_eq!(super::payload_carries_anchor_with(b"/c/registry/a.rs", &a, &ok), Some("cargo"));
+        // a path under the longer run anchor is machine-wide: not carrying
+        assert_eq!(super::payload_carries_anchor_with(b"/w/target/relax/build/x", &a, &ok), None);
+        assert_eq!(super::payload_carries_anchor_with(b"/c/registry/a.rs", &a, &ok), None);
         assert_eq!(super::payload_carries_anchor_with(b"/other/a.rs", &a, &ok), None);
         assert_eq!(super::payload_carries_anchor_with(b"", &a, &ok), None);
         // case-insensitive (macOS/Windows file systems)
