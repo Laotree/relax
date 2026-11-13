@@ -166,10 +166,6 @@ pub(crate) fn reporting() -> bool {
     REPORT_FILE.lock().unwrap().is_some()
 }
 
-extern "C" {
-    fn atexit(f: extern "C" fn()) -> i32;
-}
-
 fn usage() -> i32 {
     eprintln!("usage: {tool} run [--units <unit-graph.json>] [--ahead=minimal|balanced|aot-max|aot-min] [--quiet] [--verbose] [--no-asm] [--allow-c] [--no-live] [--unattended] <package> [cargo flags] [-- program args]", tool = crate::tool_name());
     2
@@ -2419,9 +2415,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     {
         // (once in a process, whatever number of runs it has)
         static AT_EXIT: std::sync::Once = std::sync::Once::new();
-        AT_EXIT.call_once(|| unsafe {
-            atexit(at_exit);
-        });
+        AT_EXIT.call_once(|| crate::os::proc::host_atexit(at_exit));
     }
     // RELAX_TEST_BOOT_PANIC=1: the boot panics here, its unit published and the exit's
     // work registered (fixture/boot_panic.sh: the run's end and the exit's cache write meet the

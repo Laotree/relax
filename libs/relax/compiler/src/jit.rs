@@ -4914,13 +4914,8 @@ impl Unit {
                 extern "C" fn at_exit_check() {
                     exec_check();
                 }
-                extern "C" {
-                    fn atexit(f: extern "C" fn()) -> i32;
-                }
                 static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| unsafe {
-                    atexit(at_exit_check);
-                });
+                ONCE.call_once(|| os::proc::host_atexit(at_exit_check));
             }
         }
         // the wasm32 web target's program: the unit lives in the linear memory's window (web32.rs)

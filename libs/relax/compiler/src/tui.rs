@@ -265,7 +265,6 @@ mod unix {
         fn close(fd: i32) -> i32;
         fn read(fd: i32, buf: *mut core::ffi::c_void, n: usize) -> isize;
         fn write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
-        fn atexit(f: extern "C" fn()) -> i32;
         fn pipe(fds: *mut i32) -> i32;
         fn fcntl(fd: i32, cmd: i32, ...) -> i32;
         fn poll(fds: *mut PollFd, nfds: NfdsT, timeout: i32) -> i32;
@@ -600,7 +599,7 @@ mod unix {
         // the hook lives as long as the process: the program's heap
         // the message reaches the transcript and the terminal before an abort can follow the hook
         { let _k = crate::zone_alloc::kept(); std::panic::set_hook(Box::new(move |info| { abnormal(); previous(info); fatal_drain(b""); })); }
-        unsafe { atexit(at_exit) };
+        crate::os::proc::host_atexit(at_exit);
         { let _k = crate::zone_alloc::kept();
         if let Err(e) = std::thread::Builder::new().name("run-log-tee".into()).spawn(tee) {
             unsafe { dup2(out, 2) };

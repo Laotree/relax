@@ -444,10 +444,7 @@ pub fn capture(unit: usize, id: u32, f: &Func) {
                 }
             }
         }
-        extern "C" {
-            fn atexit(f: extern "C" fn()) -> i32;
-        }
-        unsafe { atexit(at_exit) };
+        crate::os::proc::host_atexit(at_exit);
     }
     // process state: on the kept heap
     crate::zone_alloc::kept_with(|| {

@@ -342,6 +342,30 @@ pub fn run_program_atexit() {
     }
 }
 
+/// The host's own exit work (the run's exit summary and cache write, the terminal's restore and
+/// transcript, the wasm export's write), in the order it was registered. Each handler also goes
+/// to the C library's atexit, for a process that ends through the C library's exit; on unix,
+/// [`exit`] runs this list itself and ends the process with `_exit`, so the C library's list,
+/// and with it every exit handler a native library registered, never runs there.
+static HOST_ATEXIT: std::sync::Mutex<Vec<extern "C" fn()>> = std::sync::Mutex::new(Vec::new());
+
+/// Registers the host's exit work `f`: in place of the C library's `atexit` ([`HOST_ATEXIT`]).
+pub fn host_atexit(f: extern "C" fn()) {
+    extern "C" {
+        fn atexit(f: extern "C" fn()) -> i32;
+    }
+    HOST_ATEXIT.lock().unwrap_or_else(|e| e.into_inner()).push(f);
+    unsafe { atexit(f) };
+}
+
+/// Runs (and empties) the host's exit work, last registered first, as the C library's exit would.
+#[cfg(unix)]
+fn run_host_atexit() {
+    while let Some(f) = { let mut g = HOST_ATEXIT.lock().unwrap_or_else(|e| e.into_inner()); g.pop() } {
+        f();
+    }
+}
+
 #[cfg(unix)]
 mod unix {
     use std::path::Path;
@@ -403,8 +427,13 @@ mod unix {
         dlsym(handle, name)
     }
 
-    /// exit(): the main thread's pthread key destructors do not run (the program's thread locals
-    /// are left as they are, as in a rustc build).
+    /// exit(): the program's atexit handlers, the host's own exit work, then the end of the
+    /// process with `_exit`. The C library's exit handlers do not run, so neither do those a native
+    /// library registered: a GPU driver's teardown at exit joined one of its threads that never
+    /// ended (NVIDIA's Vulkan driver at a test process's exit, about 1 in 150 runs and more under
+    /// GPU load, the process hung for good). The kernel releases what the process held as its
+    /// files close, as for a killed process. The main thread's pthread key destructors do not run
+    /// either (the program's thread locals are left as they are, as in a rustc build).
     pub fn exit(code: i32) -> ! {
         super::run_program_atexit();
         crate::selfexe::remove();
@@ -419,7 +448,26 @@ mod unix {
             super::EMBEDDED_FAILURE.store(code, std::sync::atomic::Ordering::Release);
             loop { std::thread::park(); }
         }
-        std::process::exit(code)
+        end_process(code)
+    }
+
+    /// Ends the process after the host's exit work, its endpoint's withdrawal and the flushes of
+    /// Rust's and C's standard streams, without the C library's exit handlers ([`exit`]).
+    fn end_process(code: i32) -> ! {
+        use std::io::Write;
+        extern "C" {
+            fn fflush(stream: *mut core::ffi::c_void) -> i32;
+            fn _exit(code: i32) -> !;
+        }
+        super::run_host_atexit();
+        relax_codegen::interp::exit_stats();
+        makepad_remote::carrier::unix::withdraw();
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        unsafe {
+            fflush(std::ptr::null_mut());
+            _exit(code)
+        }
     }
 
     pub fn last_error() -> i32 {
