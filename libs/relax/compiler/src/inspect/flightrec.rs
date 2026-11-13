@@ -60,9 +60,15 @@ pub fn init() {
         super::pstream::set_elide_us(us);
     }
     let _k = crate::zone_alloc::kept();
-    let args: Vec<String> = std::env::args().collect();
+    // launch arguments and environment values need not be Unicode (the program gets them as they
+    // are): the recording names them lossily
+    let args: Vec<String> = crate::os::proc::args_bytes().iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
     let cwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
-    let env: Vec<String> = std::env::vars().filter(|(k, _)| k.starts_with("MAKEPAD") || k.starts_with("SANDBOX_")).map(|(k, v)| format!("{k}={v}")).collect();
+    let env: Vec<String> = std::env::vars_os()
+        .map(|(k, v)| (k.to_string_lossy().into_owned(), v))
+        .filter(|(k, _)| k.starts_with("MAKEPAD") || k.starts_with("SANDBOX_"))
+        .map(|(k, v)| format!("{k}={}", v.to_string_lossy()))
+        .collect();
     *RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some((args.join("\u{1f}"), cwd, env.join("\u{1f}")));
     // the rings exist before the first record (no allocation on a recording thread later)
     let _ = (events(), app_events(), inputs(), jits(), frames());

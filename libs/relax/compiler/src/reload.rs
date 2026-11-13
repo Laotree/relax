@@ -9732,7 +9732,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 // provided crates and std are built into this binary: cargo rebuilds it on the way
                 let restart = if inputs.host_restart_required(changed.iter().map(|&k| files[k].0.as_str())) {
                     host::note_cannot_build();
-                    format!("needs a JIT rebuild: restart it through cargo (which rebuilds {tool}): {}", crate::srchash::rebuild_command(&std::env::args().skip(1).collect::<Vec<_>>()), tool = crate::tool_name())
+                    format!("needs a JIT rebuild: restart it through cargo (which rebuilds {tool}): {}", crate::srchash::rebuild_command(&crate::srchash::args_lossy()), tool = crate::tool_name())
                 } else {
                     format!("restart `{tool} run {package}`", tool = crate::tool_name())
                 };

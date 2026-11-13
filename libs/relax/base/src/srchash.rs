@@ -400,8 +400,12 @@ pub fn diff_message(name: &str, built: &Manifest, current: &Manifest, tool: &str
 /// How to fix a `makepad` binary older than the checkout's provided crates: run it through cargo,
 /// which rebuilds it first, with this process's own arguments.
 pub fn rebuild_hint(tool: &str) -> String {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    format!("rebuild {tool} by starting it through cargo: {}", rebuild_command(&args))
+    format!("rebuild {tool} by starting it through cargo: {}", rebuild_command(&args_lossy()))
+}
+
+/// This process's arguments after its executable, for a message (they need not be Unicode).
+pub fn args_lossy() -> Vec<String> {
+    std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect()
 }
 
 /// `cargo run --release -p makepad-run --bin makepad -- <args>` (arguments with spaces or quotes

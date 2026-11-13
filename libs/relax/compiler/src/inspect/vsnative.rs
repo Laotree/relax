@@ -170,10 +170,11 @@ mod imp {
             Err(e) => return out.err(&e),
         };
         // the program's own arguments (after `--` on makepad run's command line), unless args= says
-        let args: Vec<String> = match req.get("args") {
-            Some(a) => a.split(',').map(|s| s.to_string()).filter(|s| !s.is_empty()).collect(),
+        // (as the OS gave them: they need not be Unicode)
+        let args: Vec<std::ffi::OsString> = match req.get("args") {
+            Some(a) => a.split(',').filter(|s| !s.is_empty()).map(std::ffi::OsString::from).collect(),
             None => {
-                let all: Vec<String> = std::env::args().collect();
+                let all: Vec<std::ffi::OsString> = std::env::args_os().collect();
                 all.iter().position(|a| a == "--").map(|k| all[k + 1..].to_vec()).unwrap_or_default()
             }
         };
@@ -326,7 +327,7 @@ mod imp {
         if rows.len() > n {
             out.line(&format!("+{} fns with smaller differences", rows.len() - n));
         }
-        out.line(&format!("note: native = {} {} (pid {}, warmed {} ms, log {}); {} of its samples outside its own code (libc, vdso: not named)", native, args.join(" "), pid, warm, log.display(), pct(unnamed, nat_total)));
+        out.line(&format!("note: native = {} {} (pid {}, warmed {} ms, log {}); {} of its samples outside its own code (libc, vdso: not named)", native, args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "), pid, warm, log.display(), pct(unnamed, nat_total)));
         out.line("note: both at once on this machine, same event and rate; per second of wall fits fixed-pace work -- flat-out loops: compare the % columns (shares)");
         for p in partial.iter().chain(run.notes.iter()) {
             out.line(&format!("note: {}", p));

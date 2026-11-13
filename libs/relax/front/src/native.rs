@@ -384,20 +384,21 @@ fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
     h = fnv(&resolved_packages_key(g.raw.iter().filter(|u| script_pkgs.binary_search(&u.pkg.1).is_ok())).to_le_bytes(), h);
     // and the program's rustc flags, wherever cargo takes them from: the native library is linked
     // with the program's link arguments (`link_args`)
-    let mut native_env: Vec<_> = std::env::vars().filter(|(k, _)| {
+    // (values as the OS holds them: the environment need not be Unicode)
+    let mut native_env: Vec<(String, Vec<u8>)> = std::env::vars_os().map(|(k, v)| (k.to_string_lossy().into_owned(), v.into_encoded_bytes())).filter(|(k, _)| {
         ["CC", "CXX", "AR", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS", "PKG_CONFIG", "RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"]
             .iter().any(|prefix| k == prefix || k.starts_with(&format!("{prefix}_")))
             || (k.starts_with("CARGO_TARGET_") && (k.ends_with("_RUSTFLAGS") || k.ends_with("_LINKER")))
     }).collect();
     for (_, file) in crate::resolve::cargo_config_files(req.workspace) {
         // (vfs: a shared workspace's config is a folder mount's file)
-        native_env.push((file.clone(), crate::vfs::read_to_string(&file).unwrap_or_default()));
+        native_env.push((file.clone(), crate::vfs::read_to_string(&file).unwrap_or_default().into_bytes()));
     }
     native_env.sort();
     for (k, v) in native_env {
         h = fnv(k.as_bytes(), h);
         h = fnv(b"\0", h);
-        h = fnv(v.as_bytes(), h);
+        h = fnv(&v, h);
         h = fnv(b"\0", h);
     }
     let cc_version = Command::new(cc()).arg("--version").output().map(|o| o.stdout).unwrap_or_default();
@@ -1423,9 +1424,12 @@ pub fn is_target_rustc_probe(args: &[String]) -> bool {
 /// build script. Returns the exit code when it acted, None when this is an ordinary start.
 pub fn wrapper() -> Option<i32> {
     let scripts = std::env::var("RELAX_NATIVE_SCRIPTS").ok()?;
-    let args: Vec<String> = std::env::args().collect();
+    // cargo's arguments carry paths, which need not be Unicode: rustc gets them as they are, and
+    // a stub reads its flags from a lossy copy (its files go where the paths say, as given)
+    let os_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let args: Vec<String> = os_args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
     // a build script stub (cargo runs what the wrapper left as the script): nothing to do
-    let stem = std::path::Path::new(&args[0]).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let stem = std::path::Path::new(&os_args[0]).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     if std::env::var_os("OUT_DIR").is_some() && (stem.starts_with("build_script_") || stem.starts_with("build-script-")) {
         return Some(0);
     }
@@ -1433,14 +1437,16 @@ pub fn wrapper() -> Option<i32> {
     if args.len() < 2 || std::env::var_os("RUSTC_WRAPPER").is_none() && std::env::var_os("CARGO_PKG_NAME").is_none() {
         return None;
     }
-    let native_rustc = std::env::var("RELAX_NATIVE_RUSTC").ok();
-    let direct = native_rustc.is_some() && std::env::var("RUSTC").is_ok_and(|rustc| args[1] != rustc);
-    let rustc = native_rustc.as_ref().unwrap_or(&args[1]);
-    let rest = if direct { &args[1..] } else { &args[2..] };
+    let native_rustc = std::env::var_os("RELAX_NATIVE_RUSTC");
+    let direct = native_rustc.is_some() && std::env::var_os("RUSTC").is_some_and(|rustc| os_args[1] != rustc);
+    let rustc = native_rustc.unwrap_or_else(|| os_args[1].clone());
+    let rustc_name = rustc.to_string_lossy().into_owned();
+    let from = if direct { 1 } else { 2 };
+    let (rest, os_rest) = (&args[from..], &os_args[from..]);
     if direct {
-        return Some(match Command::new(rustc).args(rest).status() {
+        return Some(match Command::new(&rustc).args(os_rest).status() {
             Ok(s) => s.code().unwrap_or(1),
-            Err(e) => { eprintln!("relax run: native compiler probe: {}: {}", rustc, e); 1 }
+            Err(e) => { eprintln!("relax run: native compiler probe: {}: {}", rustc_name, e); 1 }
         });
     }
     let value = |flag: &str| -> Option<String> {
@@ -1468,17 +1474,21 @@ pub fn wrapper() -> Option<i32> {
         }
     };
     if real {
-        return Some(match Command::new(rustc).args(rest).status() {
+        return Some(match Command::new(&rustc).args(os_rest).status() {
             Ok(s) => s.code().unwrap_or(1),
             Err(e) => {
-                eprintln!("relax run: native wrapper: cannot run {}: {}", rustc, e);
+                eprintln!("relax run: native wrapper: cannot run {}: {}", rustc_name, e);
                 1
             }
         });
     }
     // a stub: the files cargo expects, empty
     let name = name.unwrap();
-    let out_dir = value("--out-dir").unwrap_or_else(|| ".".to_string());
+    // (cargo passes `--out-dir <path>`: that path as given)
+    let out_dir = match rest.iter().position(|a| a == "--out-dir").and_then(|i| os_rest.get(i + 1)) {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => std::path::PathBuf::from(value("--out-dir").unwrap_or_else(|| ".".to_string())),
+    };
     let mut extra = String::new();
     let mut i = 0;
     while i < rest.len() {
@@ -1504,20 +1514,20 @@ pub fn wrapper() -> Option<i32> {
     let emit = value("--emit").unwrap_or_default();
     let json = value("--json").unwrap_or_default().contains("artifacts");
     let dylib_ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
-    let mut made: Vec<(String, &str)> = Vec::new();
+    let mut made: Vec<(std::path::PathBuf, &str)> = Vec::new();
     for e in emit.split(',') {
         match e.split('=').next().unwrap_or("") {
-            "dep-info" => made.push((format!("{}/{}{}.d", out_dir, name, extra), "dep-info")),
-            "metadata" => made.push((format!("{}/lib{}{}.rmeta", out_dir, name, extra), "metadata")),
+            "dep-info" => made.push((out_dir.join(format!("{}{}.d", name, extra)), "dep-info")),
+            "metadata" => made.push((out_dir.join(format!("lib{}{}.rmeta", name, extra)), "metadata")),
             "link" => {
                 for t in &types {
                     let f = match t.as_str() {
-                        "bin" => format!("{}/{}{}", out_dir, name, extra),
-                        "rlib" | "lib" => format!("{}/lib{}{}.rlib", out_dir, name, extra),
-                        "staticlib" => format!("{}/lib{}{}.a", out_dir, name, extra),
-                        _ => format!("{}/lib{}{}.{}", out_dir, name, extra, dylib_ext),
+                        "bin" => format!("{}{}", name, extra),
+                        "rlib" | "lib" => format!("lib{}{}.rlib", name, extra),
+                        "staticlib" => format!("lib{}{}.a", name, extra),
+                        _ => format!("lib{}{}.{}", name, extra, dylib_ext),
                     };
-                    made.push((f, "link"));
+                    made.push((out_dir.join(f), "link"));
                 }
             }
             _ => {}
@@ -1526,7 +1536,7 @@ pub fn wrapper() -> Option<i32> {
     let exe = std::env::current_exe().ok();
     for (path, kind) in &made {
         let _ = std::fs::create_dir_all(&out_dir);
-        let is_bin = kind == &"link" && types.iter().any(|t| t == "bin") && path.ends_with(&format!("{}{}", name, extra));
+        let is_bin = kind == &"link" && types.iter().any(|t| t == "bin") && path.file_name() == Some(std::ffi::OsStr::new(&format!("{}{}", name, extra)));
         if is_bin {
             // the stub script is this executable (wrapper(): a build script stub exits at once)
             let _ = std::fs::remove_file(path);
@@ -1536,18 +1546,22 @@ pub fn wrapper() -> Option<i32> {
                 }
             }
         } else if *kind == "dep-info" {
-            let src = rest.iter().find(|a| a.ends_with(".rs")).cloned().unwrap_or_default();
-            let mut d = format!("{}: {}\n", path, src);
+            // (the paths as given)
+            let src = rest.iter().position(|a| a.ends_with(".rs")).map(|i| os_rest[i].clone()).unwrap_or_default();
+            let mut d = path.as_os_str().as_encoded_bytes().to_vec();
+            d.extend_from_slice(b": ");
+            d.extend_from_slice(src.as_encoded_bytes());
+            d.push(b'\n');
             if let Some(dir) = &capture {
                 // rustc's form of an `env!` the crate read (cargo's dep-info parser unescapes it)
-                d.push_str(&format!("\n# env-dep:RELAX_NATIVE_LINK_ARGS={}\n", dir.replace('\\', "\\\\").replace('\n', "\\n")));
+                d.extend_from_slice(format!("\n# env-dep:RELAX_NATIVE_LINK_ARGS={}\n", dir.replace('\\', "\\\\").replace('\n', "\\n")).as_bytes());
             }
             let _ = std::fs::write(path, d);
         } else {
             let _ = std::fs::write(path, b"");
         }
         if json {
-            eprintln!("{{\"$message_type\":\"artifact\",\"artifact\":\"{}\",\"emit\":\"{}\"}}", path.replace('\\', "\\\\").replace('"', "\\\""), kind);
+            eprintln!("{{\"$message_type\":\"artifact\",\"artifact\":\"{}\",\"emit\":\"{}\"}}", path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\""), kind);
         }
     }
     Some(0)
