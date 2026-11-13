@@ -8986,3 +8986,1859 @@ fn a465_sha256_scalar_reference() {
     }
     d.line("sha256_scalar_reference", "none");
 }
+
+#[test]
+fn a466_vtrn1q_u64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint64x2_t = sample(&mut rng, case, 0);
+            let p1: real::uint64x2_t = sample(&mut rng, case, 1);
+            let expected = real::vtrn1q_u64(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vtrn1q_u64", "none");
+}
+
+#[test]
+fn a467_vtrn2q_u64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint64x2_t = sample(&mut rng, case, 0);
+            let p1: real::uint64x2_t = sample(&mut rng, case, 1);
+            let expected = real::vtrn2q_u64(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vtrn2q_u64", "none");
+}
+
+#[test]
+fn a468_vzip1q_f64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::float64x2_t = sample(&mut rng, case, 0);
+            let p1: real::float64x2_t = sample(&mut rng, case, 1);
+            let expected = real::vzip1q_f64(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vzip1q_f64", "none");
+}
+
+#[test]
+fn a469_vzip2q_f64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::float64x2_t = sample(&mut rng, case, 0);
+            let p1: real::float64x2_t = sample(&mut rng, case, 1);
+            let expected = real::vzip2q_f64(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vzip2q_f64", "none");
+}
+
+#[test]
+fn a470_vuzp1q_s64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int64x2_t = sample(&mut rng, case, 0);
+            let p1: real::int64x2_t = sample(&mut rng, case, 1);
+            let expected = real::vuzp1q_s64(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vuzp1q_s64", "none");
+}
+
+#[test]
+fn a471_vuzp2q_s64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int64x2_t = sample(&mut rng, case, 0);
+            let p1: real::int64x2_t = sample(&mut rng, case, 1);
+            let expected = real::vuzp2q_s64(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vuzp2q_s64", "none");
+}
+
+#[test]
+fn a472_vuzp1q_u64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint64x2_t = sample(&mut rng, case, 0);
+            let p1: real::uint64x2_t = sample(&mut rng, case, 1);
+            let expected = real::vuzp1q_u64(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vuzp1q_u64", "none");
+}
+
+#[test]
+fn a473_vuzp2q_u64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint64x2_t = sample(&mut rng, case, 0);
+            let p1: real::uint64x2_t = sample(&mut rng, case, 1);
+            let expected = real::vuzp2q_u64(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vuzp2q_u64", "none");
+}
+
+#[test]
+fn a474_vuzp1q_f64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::float64x2_t = sample(&mut rng, case, 0);
+            let p1: real::float64x2_t = sample(&mut rng, case, 1);
+            let expected = real::vuzp1q_f64(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vuzp1q_f64", "none");
+}
+
+#[test]
+fn a475_vuzp2q_f64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::float64x2_t = sample(&mut rng, case, 0);
+            let p1: real::float64x2_t = sample(&mut rng, case, 1);
+            let expected = real::vuzp2q_f64(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vuzp2q_f64", "none");
+}
+
+#[test]
+fn a476_vtrn1q_f64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float64x2_t = neon_sample(&mut rng, case, 0, 8);
+            let p1: real::float64x2_t = neon_sample(&mut rng, case, 1, 8);
+            let expected = real::vtrn1q_f64(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vtrn1q_f64", "none");
+}
+
+#[test]
+fn a477_vtrn2q_f64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float64x2_t = neon_sample(&mut rng, case, 0, 8);
+            let p1: real::float64x2_t = neon_sample(&mut rng, case, 1, 8);
+            let expected = real::vtrn2q_f64(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vtrn2q_f64", "none");
+}
+
+#[test]
+fn a478_vmul_lane_f32() {
+    let mut d = Digest::new();
+    unsafe fn compare<const LANE: i32>(p0: real::float32x2_t, p1: real::float32x2_t, _case: usize, d: &mut Digest) {
+        d.add(bytes(&LANE));
+        let expected = real::vmul_lane_f32::<LANE>(p0, p1);
+        d.add(bytes(&expected));
+    }
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float32x2_t = neon_sample(&mut rng, case, 0, 4);
+            let p1: real::float32x2_t = neon_sample(&mut rng, case, 1, 4);
+            compare::<0>(p0, p1, case, &mut d);
+            compare::<1>(p0, p1, case, &mut d);
+        }
+    }
+    d.line("vmul_lane_f32", "0,1");
+}
+
+#[test]
+fn a479_vmul_laneq_f32() {
+    let mut d = Digest::new();
+    unsafe fn compare<const LANE: i32>(p0: real::float32x2_t, p1: real::float32x4_t, _case: usize, d: &mut Digest) {
+        d.add(bytes(&LANE));
+        let expected = real::vmul_laneq_f32::<LANE>(p0, p1);
+        d.add(bytes(&expected));
+    }
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float32x2_t = neon_sample(&mut rng, case, 0, 4);
+            let p1: real::float32x4_t = neon_sample(&mut rng, case, 1, 4);
+            compare::<0>(p0, p1, case, &mut d);
+            compare::<1>(p0, p1, case, &mut d);
+            compare::<2>(p0, p1, case, &mut d);
+            compare::<3>(p0, p1, case, &mut d);
+        }
+    }
+    d.line("vmul_laneq_f32", "0,1,2,3");
+}
+
+#[test]
+fn a480_vmulq_lane_f32() {
+    let mut d = Digest::new();
+    unsafe fn compare<const LANE: i32>(p0: real::float32x4_t, p1: real::float32x2_t, _case: usize, d: &mut Digest) {
+        d.add(bytes(&LANE));
+        let expected = real::vmulq_lane_f32::<LANE>(p0, p1);
+        d.add(bytes(&expected));
+    }
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float32x4_t = neon_sample(&mut rng, case, 0, 4);
+            let p1: real::float32x2_t = neon_sample(&mut rng, case, 1, 4);
+            compare::<0>(p0, p1, case, &mut d);
+            compare::<1>(p0, p1, case, &mut d);
+        }
+    }
+    d.line("vmulq_lane_f32", "0,1");
+}
+
+#[test]
+fn a481_vmul_lane_f64() {
+    let mut d = Digest::new();
+    unsafe fn compare<const LANE: i32>(p0: real::float64x1_t, p1: real::float64x1_t, _case: usize, d: &mut Digest) {
+        d.add(bytes(&LANE));
+        let expected = real::vmul_lane_f64::<LANE>(p0, p1);
+        d.add(bytes(&expected));
+    }
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float64x1_t = neon_sample(&mut rng, case, 0, 8);
+            let p1: real::float64x1_t = neon_sample(&mut rng, case, 1, 8);
+            compare::<0>(p0, p1, case, &mut d);
+        }
+    }
+    d.line("vmul_lane_f64", "0");
+}
+
+#[test]
+fn a482_vmul_laneq_f64() {
+    let mut d = Digest::new();
+    unsafe fn compare<const LANE: i32>(p0: real::float64x1_t, p1: real::float64x2_t, _case: usize, d: &mut Digest) {
+        d.add(bytes(&LANE));
+        let expected = real::vmul_laneq_f64::<LANE>(p0, p1);
+        d.add(bytes(&expected));
+    }
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float64x1_t = neon_sample(&mut rng, case, 0, 8);
+            let p1: real::float64x2_t = neon_sample(&mut rng, case, 1, 8);
+            compare::<0>(p0, p1, case, &mut d);
+            compare::<1>(p0, p1, case, &mut d);
+        }
+    }
+    d.line("vmul_laneq_f64", "0,1");
+}
+
+#[test]
+fn a483_vmulq_lane_f64() {
+    let mut d = Digest::new();
+    unsafe fn compare<const LANE: i32>(p0: real::float64x2_t, p1: real::float64x1_t, _case: usize, d: &mut Digest) {
+        d.add(bytes(&LANE));
+        let expected = real::vmulq_lane_f64::<LANE>(p0, p1);
+        d.add(bytes(&expected));
+    }
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float64x2_t = neon_sample(&mut rng, case, 0, 8);
+            let p1: real::float64x1_t = neon_sample(&mut rng, case, 1, 8);
+            compare::<0>(p0, p1, case, &mut d);
+        }
+    }
+    d.line("vmulq_lane_f64", "0");
+}
+
+#[test]
+fn a484_vmulq_laneq_f64() {
+    let mut d = Digest::new();
+    unsafe fn compare<const LANE: i32>(p0: real::float64x2_t, p1: real::float64x2_t, _case: usize, d: &mut Digest) {
+        d.add(bytes(&LANE));
+        let expected = real::vmulq_laneq_f64::<LANE>(p0, p1);
+        d.add(bytes(&expected));
+    }
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float64x2_t = neon_sample(&mut rng, case, 0, 8);
+            let p1: real::float64x2_t = neon_sample(&mut rng, case, 1, 8);
+            compare::<0>(p0, p1, case, &mut d);
+            compare::<1>(p0, p1, case, &mut d);
+        }
+    }
+    d.line("vmulq_laneq_f64", "0,1");
+}
+
+#[test]
+fn a485_vmlal_s8() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int16x8_t = sample(&mut rng, case, 0);
+            let p1: real::int8x8_t = sample(&mut rng, case, 1);
+            let p2: real::int8x8_t = sample(&mut rng, case, 2);
+            let expected = real::vmlal_s8(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vmlal_s8", "none");
+}
+
+#[test]
+fn a486_vmlsl_s8() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int16x8_t = sample(&mut rng, case, 0);
+            let p1: real::int8x8_t = sample(&mut rng, case, 1);
+            let p2: real::int8x8_t = sample(&mut rng, case, 2);
+            let expected = real::vmlsl_s8(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vmlsl_s8", "none");
+}
+
+#[test]
+fn a487_vmlal_s16() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int32x4_t = sample(&mut rng, case, 0);
+            let p1: real::int16x4_t = sample(&mut rng, case, 1);
+            let p2: real::int16x4_t = sample(&mut rng, case, 2);
+            let expected = real::vmlal_s16(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vmlal_s16", "none");
+}
+
+#[test]
+fn a488_vmlsl_s16() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int32x4_t = sample(&mut rng, case, 0);
+            let p1: real::int16x4_t = sample(&mut rng, case, 1);
+            let p2: real::int16x4_t = sample(&mut rng, case, 2);
+            let expected = real::vmlsl_s16(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vmlsl_s16", "none");
+}
+
+#[test]
+fn a489_vmlal_s32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int64x2_t = sample(&mut rng, case, 0);
+            let p1: real::int32x2_t = sample(&mut rng, case, 1);
+            let p2: real::int32x2_t = sample(&mut rng, case, 2);
+            let expected = real::vmlal_s32(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vmlal_s32", "none");
+}
+
+#[test]
+fn a490_vmlsl_s32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int64x2_t = sample(&mut rng, case, 0);
+            let p1: real::int32x2_t = sample(&mut rng, case, 1);
+            let p2: real::int32x2_t = sample(&mut rng, case, 2);
+            let expected = real::vmlsl_s32(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vmlsl_s32", "none");
+}
+
+#[test]
+fn a491_vmlal_u8() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint16x8_t = sample(&mut rng, case, 0);
+            let p1: real::uint8x8_t = sample(&mut rng, case, 1);
+            let p2: real::uint8x8_t = sample(&mut rng, case, 2);
+            let expected = real::vmlal_u8(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vmlal_u8", "none");
+}
+
+#[test]
+fn a492_vmlsl_u8() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint16x8_t = sample(&mut rng, case, 0);
+            let p1: real::uint8x8_t = sample(&mut rng, case, 1);
+            let p2: real::uint8x8_t = sample(&mut rng, case, 2);
+            let expected = real::vmlsl_u8(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vmlsl_u8", "none");
+}
+
+#[test]
+fn a493_vmlsl_u16() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint32x4_t = sample(&mut rng, case, 0);
+            let p1: real::uint16x4_t = sample(&mut rng, case, 1);
+            let p2: real::uint16x4_t = sample(&mut rng, case, 2);
+            let expected = real::vmlsl_u16(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vmlsl_u16", "none");
+}
+
+#[test]
+fn a494_vmlal_u32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint64x2_t = sample(&mut rng, case, 0);
+            let p1: real::uint32x2_t = sample(&mut rng, case, 1);
+            let p2: real::uint32x2_t = sample(&mut rng, case, 2);
+            let expected = real::vmlal_u32(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vmlal_u32", "none");
+}
+
+#[test]
+fn a495_vmlsl_u32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint64x2_t = sample(&mut rng, case, 0);
+            let p1: real::uint32x2_t = sample(&mut rng, case, 1);
+            let p2: real::uint32x2_t = sample(&mut rng, case, 2);
+            let expected = real::vmlsl_u32(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vmlsl_u32", "none");
+}
+
+#[test]
+fn a496_vqmovun_s64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::int64x2_t = neon_sample(&mut rng, case, 0, 0);
+            let expected = real::vqmovun_s64(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vqmovun_s64", "none");
+}
+
+#[test]
+fn a497_vqmovun_s32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::int32x4_t = neon_sample(&mut rng, case, 0, 0);
+            let expected = real::vqmovun_s32(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vqmovun_s32", "none");
+}
+
+#[test]
+fn a498_vcvta_s32_f32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float32x2_t = neon_sample(&mut rng, case, 0, 4);
+            let expected = real::vcvta_s32_f32(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vcvta_s32_f32", "none");
+}
+
+#[test]
+fn a499_vcvtaq_s32_f32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float32x4_t = neon_sample(&mut rng, case, 0, 4);
+            let expected = real::vcvtaq_s32_f32(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vcvtaq_s32_f32", "none");
+}
+
+#[test]
+fn a500_vcvta_u32_f32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float32x2_t = neon_sample(&mut rng, case, 0, 4);
+            let expected = real::vcvta_u32_f32(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vcvta_u32_f32", "none");
+}
+
+#[test]
+fn a501_vcvtaq_u32_f32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float32x4_t = neon_sample(&mut rng, case, 0, 4);
+            let expected = real::vcvtaq_u32_f32(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vcvtaq_u32_f32", "none");
+}
+
+#[test]
+fn a502_vcvta_s64_f64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float64x1_t = neon_sample(&mut rng, case, 0, 8);
+            let expected = real::vcvta_s64_f64(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vcvta_s64_f64", "none");
+}
+
+#[test]
+fn a503_vcvtaq_s64_f64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float64x2_t = neon_sample(&mut rng, case, 0, 8);
+            let expected = real::vcvtaq_s64_f64(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vcvtaq_s64_f64", "none");
+}
+
+#[test]
+fn a504_vcvta_u64_f64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float64x1_t = neon_sample(&mut rng, case, 0, 8);
+            let expected = real::vcvta_u64_f64(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vcvta_u64_f64", "none");
+}
+
+#[test]
+fn a505_vcvtaq_u64_f64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float64x2_t = neon_sample(&mut rng, case, 0, 8);
+            let expected = real::vcvtaq_u64_f64(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vcvtaq_u64_f64", "none");
+}
+
+#[test]
+fn a506_vqrdmlah_s16() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("rdm"),
+            "required native rdm coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::int16x4_t = neon_sample(&mut rng, case, 0, 0);
+            let p1: real::int16x4_t = neon_sample(&mut rng, case, 1, 0);
+            let p2: real::int16x4_t = neon_sample(&mut rng, case, 2, 0);
+            let expected = real::vqrdmlah_s16(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vqrdmlah_s16", "none");
+}
+
+#[test]
+fn a507_vqrdmlahq_s16() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("rdm"),
+            "required native rdm coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::int16x8_t = neon_sample(&mut rng, case, 0, 0);
+            let p1: real::int16x8_t = neon_sample(&mut rng, case, 1, 0);
+            let p2: real::int16x8_t = neon_sample(&mut rng, case, 2, 0);
+            let expected = real::vqrdmlahq_s16(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vqrdmlahq_s16", "none");
+}
+
+#[test]
+fn a508_vqrdmlah_s32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("rdm"),
+            "required native rdm coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::int32x2_t = neon_sample(&mut rng, case, 0, 0);
+            let p1: real::int32x2_t = neon_sample(&mut rng, case, 1, 0);
+            let p2: real::int32x2_t = neon_sample(&mut rng, case, 2, 0);
+            let expected = real::vqrdmlah_s32(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vqrdmlah_s32", "none");
+}
+
+#[test]
+fn a509_vqrdmlahq_s32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("rdm"),
+            "required native rdm coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::int32x4_t = neon_sample(&mut rng, case, 0, 0);
+            let p1: real::int32x4_t = neon_sample(&mut rng, case, 1, 0);
+            let p2: real::int32x4_t = neon_sample(&mut rng, case, 2, 0);
+            let expected = real::vqrdmlahq_s32(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vqrdmlahq_s32", "none");
+}
+
+#[test]
+fn a510_vqrdmlsh_s16() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("rdm"),
+            "required native rdm coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::int16x4_t = neon_sample(&mut rng, case, 0, 0);
+            let p1: real::int16x4_t = neon_sample(&mut rng, case, 1, 0);
+            let p2: real::int16x4_t = neon_sample(&mut rng, case, 2, 0);
+            let expected = real::vqrdmlsh_s16(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vqrdmlsh_s16", "none");
+}
+
+#[test]
+fn a511_vqrdmlshq_s16() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("rdm"),
+            "required native rdm coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::int16x8_t = neon_sample(&mut rng, case, 0, 0);
+            let p1: real::int16x8_t = neon_sample(&mut rng, case, 1, 0);
+            let p2: real::int16x8_t = neon_sample(&mut rng, case, 2, 0);
+            let expected = real::vqrdmlshq_s16(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vqrdmlshq_s16", "none");
+}
+
+#[test]
+fn a512_vqrdmlsh_s32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("rdm"),
+            "required native rdm coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::int32x2_t = neon_sample(&mut rng, case, 0, 0);
+            let p1: real::int32x2_t = neon_sample(&mut rng, case, 1, 0);
+            let p2: real::int32x2_t = neon_sample(&mut rng, case, 2, 0);
+            let expected = real::vqrdmlsh_s32(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vqrdmlsh_s32", "none");
+}
+
+#[test]
+fn a513_vqrdmlshq_s32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("rdm"),
+            "required native rdm coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::int32x4_t = neon_sample(&mut rng, case, 0, 0);
+            let p1: real::int32x4_t = neon_sample(&mut rng, case, 1, 0);
+            let p2: real::int32x4_t = neon_sample(&mut rng, case, 2, 0);
+            let expected = real::vqrdmlshq_s32(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vqrdmlshq_s32", "none");
+}
+
+#[test]
+fn a514_vbsl_f64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::uint64x1_t = sample(&mut rng, case, 0);
+            let p1: real::float64x1_t = neon_sample(&mut rng, case, 1, 8);
+            let p2: real::float64x1_t = neon_sample(&mut rng, case, 2, 8);
+            let expected = real::vbsl_f64(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vbsl_f64", "none");
+}
+
+#[test]
+fn a515_vbslq_f64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::uint64x2_t = sample(&mut rng, case, 0);
+            let p1: real::float64x2_t = neon_sample(&mut rng, case, 1, 8);
+            let p2: real::float64x2_t = neon_sample(&mut rng, case, 2, 8);
+            let expected = real::vbslq_f64(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vbslq_f64", "none");
+}
+
+#[test]
+fn a516_vcvt_f32_s32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int32x2_t = sample(&mut rng, case, 0);
+            let expected = real::vcvt_f32_s32(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vcvt_f32_s32", "none");
+}
+
+#[test]
+fn a517_vcvt_f32_u32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint32x2_t = sample(&mut rng, case, 0);
+            let expected = real::vcvt_f32_u32(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vcvt_f32_u32", "none");
+}
+
+#[test]
+fn a518_vcvtq_f32_u32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint32x4_t = sample(&mut rng, case, 0);
+            let expected = real::vcvtq_f32_u32(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vcvtq_f32_u32", "none");
+}
+
+#[test]
+fn a519_vcvtq_f64_u64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint64x2_t = sample(&mut rng, case, 0);
+            let expected = real::vcvtq_f64_u64(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vcvtq_f64_u64", "none");
+}
+
+#[test]
+fn a520_vcvt_s32_f32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float32x2_t = neon_sample(&mut rng, case, 0, 4);
+            let expected = real::vcvt_s32_f32(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vcvt_s32_f32", "none");
+}
+
+#[test]
+fn a521_vcvt_u32_f32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float32x2_t = neon_sample(&mut rng, case, 0, 4);
+            let expected = real::vcvt_u32_f32(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vcvt_u32_f32", "none");
+}
+
+#[test]
+fn a522_vcvtq_u32_f32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float32x4_t = neon_sample(&mut rng, case, 0, 4);
+            let expected = real::vcvtq_u32_f32(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vcvtq_u32_f32", "none");
+}
+
+#[test]
+fn a523_vcvtq_s64_f64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float64x2_t = neon_sample(&mut rng, case, 0, 8);
+            let expected = real::vcvtq_s64_f64(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vcvtq_s64_f64", "none");
+}
+
+#[test]
+fn a524_vcvtq_u64_f64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float64x2_t = neon_sample(&mut rng, case, 0, 8);
+            let expected = real::vcvtq_u64_f64(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vcvtq_u64_f64", "none");
+}
+
+#[test]
+fn a525_vfma_f32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float32x2_t = neon_sample(&mut rng, case, 0, 4);
+            let p1: real::float32x2_t = neon_sample(&mut rng, case, 1, 4);
+            let p2: real::float32x2_t = neon_sample(&mut rng, case, 2, 4);
+            let expected = real::vfma_f32(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vfma_f32", "none");
+}
+
+#[test]
+fn a526_vfms_f32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float32x2_t = neon_sample(&mut rng, case, 0, 4);
+            let p1: real::float32x2_t = neon_sample(&mut rng, case, 1, 4);
+            let p2: real::float32x2_t = neon_sample(&mut rng, case, 2, 4);
+            let expected = real::vfms_f32(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vfms_f32", "none");
+}
+
+#[test]
+fn a527_vfmsq_f64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float64x2_t = neon_sample(&mut rng, case, 0, 8);
+            let p1: real::float64x2_t = neon_sample(&mut rng, case, 1, 8);
+            let p2: real::float64x2_t = neon_sample(&mut rng, case, 2, 8);
+            let expected = real::vfmsq_f64(p0, p1, p2);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vfmsq_f64", "none");
+}
+
+#[test]
+fn a528_vrndaq_f32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float32x4_t = neon_sample(&mut rng, case, 0, 4);
+            let expected = real::vrndaq_f32(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vrndaq_f32", "none");
+}
+
+#[test]
+fn a529_vrndiq_f32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float32x4_t = neon_sample(&mut rng, case, 0, 4);
+            let expected = real::vrndiq_f32(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vrndiq_f32", "none");
+}
+
+#[test]
+fn a530_vrndxq_f32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float32x4_t = neon_sample(&mut rng, case, 0, 4);
+            let expected = real::vrndxq_f32(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vrndxq_f32", "none");
+}
+
+#[test]
+fn a531_vrndq_f64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float64x2_t = neon_sample(&mut rng, case, 0, 8);
+            let expected = real::vrndq_f64(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vrndq_f64", "none");
+}
+
+#[test]
+fn a532_vrndnq_f64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float64x2_t = neon_sample(&mut rng, case, 0, 8);
+            let expected = real::vrndnq_f64(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vrndnq_f64", "none");
+}
+
+#[test]
+fn a533_vrndaq_f64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float64x2_t = neon_sample(&mut rng, case, 0, 8);
+            let expected = real::vrndaq_f64(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vrndaq_f64", "none");
+}
+
+#[test]
+fn a534_vrndiq_f64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float64x2_t = neon_sample(&mut rng, case, 0, 8);
+            let expected = real::vrndiq_f64(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vrndiq_f64", "none");
+}
+
+#[test]
+fn a535_vrndxq_f64() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 64 + 24 * 24 * 24 {
+            let p0: real::float64x2_t = neon_sample(&mut rng, case, 0, 8);
+            let expected = real::vrndxq_f64(p0);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vrndxq_f64", "none");
+}
+
+#[test]
+fn a536_vshlq_s8() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int8x16_t = sample(&mut rng, case, 0);
+            let p1: real::int8x16_t = sample(&mut rng, case, 1);
+            let expected = real::vshlq_s8(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vshlq_s8", "none");
+}
+
+#[test]
+fn a537_vshlq_u8() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint8x16_t = sample(&mut rng, case, 0);
+            let p1: real::int8x16_t = sample(&mut rng, case, 1);
+            let expected = real::vshlq_u8(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vshlq_u8", "none");
+}
+
+#[test]
+fn a538_vuzp1q_s8() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int8x16_t = sample(&mut rng, case, 0);
+            let p1: real::int8x16_t = sample(&mut rng, case, 1);
+            let expected = real::vuzp1q_s8(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vuzp1q_s8", "none");
+}
+
+#[test]
+fn a539_vuzp2q_s8() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int8x16_t = sample(&mut rng, case, 0);
+            let p1: real::int8x16_t = sample(&mut rng, case, 1);
+            let expected = real::vuzp2q_s8(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vuzp2q_s8", "none");
+}
+
+#[test]
+fn a540_vtrn1q_s8() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int8x16_t = sample(&mut rng, case, 0);
+            let p1: real::int8x16_t = sample(&mut rng, case, 1);
+            let expected = real::vtrn1q_s8(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vtrn1q_s8", "none");
+}
+
+#[test]
+fn a541_vtrn2q_s8() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int8x16_t = sample(&mut rng, case, 0);
+            let p1: real::int8x16_t = sample(&mut rng, case, 1);
+            let expected = real::vtrn2q_s8(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vtrn2q_s8", "none");
+}
+
+#[test]
+fn a542_vuzp1q_u8() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint8x16_t = sample(&mut rng, case, 0);
+            let p1: real::uint8x16_t = sample(&mut rng, case, 1);
+            let expected = real::vuzp1q_u8(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vuzp1q_u8", "none");
+}
+
+#[test]
+fn a543_vuzp2q_u8() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint8x16_t = sample(&mut rng, case, 0);
+            let p1: real::uint8x16_t = sample(&mut rng, case, 1);
+            let expected = real::vuzp2q_u8(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vuzp2q_u8", "none");
+}
+
+#[test]
+fn a544_vtrn1q_u8() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint8x16_t = sample(&mut rng, case, 0);
+            let p1: real::uint8x16_t = sample(&mut rng, case, 1);
+            let expected = real::vtrn1q_u8(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vtrn1q_u8", "none");
+}
+
+#[test]
+fn a545_vtrn2q_u8() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint8x16_t = sample(&mut rng, case, 0);
+            let p1: real::uint8x16_t = sample(&mut rng, case, 1);
+            let expected = real::vtrn2q_u8(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vtrn2q_u8", "none");
+}
+
+#[test]
+fn a546_vuzp1q_s16() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int16x8_t = sample(&mut rng, case, 0);
+            let p1: real::int16x8_t = sample(&mut rng, case, 1);
+            let expected = real::vuzp1q_s16(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vuzp1q_s16", "none");
+}
+
+#[test]
+fn a547_vuzp2q_s16() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int16x8_t = sample(&mut rng, case, 0);
+            let p1: real::int16x8_t = sample(&mut rng, case, 1);
+            let expected = real::vuzp2q_s16(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vuzp2q_s16", "none");
+}
+
+#[test]
+fn a548_vtrn1q_s16() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int16x8_t = sample(&mut rng, case, 0);
+            let p1: real::int16x8_t = sample(&mut rng, case, 1);
+            let expected = real::vtrn1q_s16(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vtrn1q_s16", "none");
+}
+
+#[test]
+fn a549_vtrn2q_s16() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int16x8_t = sample(&mut rng, case, 0);
+            let p1: real::int16x8_t = sample(&mut rng, case, 1);
+            let expected = real::vtrn2q_s16(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vtrn2q_s16", "none");
+}
+
+#[test]
+fn a550_vuzp1q_u16() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint16x8_t = sample(&mut rng, case, 0);
+            let p1: real::uint16x8_t = sample(&mut rng, case, 1);
+            let expected = real::vuzp1q_u16(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vuzp1q_u16", "none");
+}
+
+#[test]
+fn a551_vuzp2q_u16() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint16x8_t = sample(&mut rng, case, 0);
+            let p1: real::uint16x8_t = sample(&mut rng, case, 1);
+            let expected = real::vuzp2q_u16(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vuzp2q_u16", "none");
+}
+
+#[test]
+fn a552_vtrn1q_u16() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint16x8_t = sample(&mut rng, case, 0);
+            let p1: real::uint16x8_t = sample(&mut rng, case, 1);
+            let expected = real::vtrn1q_u16(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vtrn1q_u16", "none");
+}
+
+#[test]
+fn a553_vtrn2q_u16() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint16x8_t = sample(&mut rng, case, 0);
+            let p1: real::uint16x8_t = sample(&mut rng, case, 1);
+            let expected = real::vtrn2q_u16(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vtrn2q_u16", "none");
+}
+
+#[test]
+fn a554_vuzp1q_s32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int32x4_t = sample(&mut rng, case, 0);
+            let p1: real::int32x4_t = sample(&mut rng, case, 1);
+            let expected = real::vuzp1q_s32(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vuzp1q_s32", "none");
+}
+
+#[test]
+fn a555_vuzp2q_s32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int32x4_t = sample(&mut rng, case, 0);
+            let p1: real::int32x4_t = sample(&mut rng, case, 1);
+            let expected = real::vuzp2q_s32(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vuzp2q_s32", "none");
+}
+
+#[test]
+fn a556_vtrn1q_s32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int32x4_t = sample(&mut rng, case, 0);
+            let p1: real::int32x4_t = sample(&mut rng, case, 1);
+            let expected = real::vtrn1q_s32(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vtrn1q_s32", "none");
+}
+
+#[test]
+fn a557_vtrn2q_s32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::int32x4_t = sample(&mut rng, case, 0);
+            let p1: real::int32x4_t = sample(&mut rng, case, 1);
+            let expected = real::vtrn2q_s32(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vtrn2q_s32", "none");
+}
+
+#[test]
+fn a558_vuzp1q_u32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint32x4_t = sample(&mut rng, case, 0);
+            let p1: real::uint32x4_t = sample(&mut rng, case, 1);
+            let expected = real::vuzp1q_u32(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vuzp1q_u32", "none");
+}
+
+#[test]
+fn a559_vuzp2q_u32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint32x4_t = sample(&mut rng, case, 0);
+            let p1: real::uint32x4_t = sample(&mut rng, case, 1);
+            let expected = real::vuzp2q_u32(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vuzp2q_u32", "none");
+}
+
+#[test]
+fn a560_vtrn1q_u32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint32x4_t = sample(&mut rng, case, 0);
+            let p1: real::uint32x4_t = sample(&mut rng, case, 1);
+            let expected = real::vtrn1q_u32(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vtrn1q_u32", "none");
+}
+
+#[test]
+fn a561_vtrn2q_u32() {
+    let mut d = Digest::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    unsafe {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "required native neon coverage unavailable"
+        );
+        for case in 0..RANDOM_CASES + 17 {
+            let p0: real::uint32x4_t = sample(&mut rng, case, 0);
+            let p1: real::uint32x4_t = sample(&mut rng, case, 1);
+            let expected = real::vtrn2q_u32(p0, p1);
+            d.add(bytes(&expected));
+        }
+    }
+    d.line("vtrn2q_u32", "none");
+}
