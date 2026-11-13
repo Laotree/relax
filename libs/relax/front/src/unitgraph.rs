@@ -467,7 +467,9 @@ pub fn script_role(pkg: &str, features: &[String]) -> ScriptRole {
 pub static TO_REMOVE: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
 /// `check_only` (`relax check`): a script that compiles C is not run without `--allow-c` (rustc's
-/// check never links native code): its crate gets an empty answer (OUT_DIR, no cfgs), said once.
+/// check never links native code): its crate gets an empty answer (OUT_DIR, no cfgs), said once,
+/// and so does a script that reads such a script's `DEP_` metadata. Any other script that fails
+/// fails the check, as under `cargo check`.
 pub type ScriptsDone<'a> = dyn Fn(&Graph, &[usize], &[Vec<String>], &[Vec<(String, String)>]) -> Option<Box<dyn std::any::Any>> + Sync + 'a;
 
 /// `scripts_done`: called once the scripts Relax runs have finished while cargo is still building
@@ -709,6 +711,12 @@ fn apply_native_scripts(g: &mut Graph, scripts: Vec<crate::native::ScriptOut>) {
 
 /// What each script handed on to the scripts of its dependents, by script index: the metadata
 /// its output carried (`script_metadata`), or why it has none (its script was not run, or failed).
+/// The metadata a check without `--allow-c` hands on for a script it did not run for its C compile
+/// (C_NOT_RUN), or for that script's `DEP_` metadata (C_DEP_NOT_RUN): a script that reads it is not
+/// run either, and is no failure of the check.
+const C_NOT_RUN: &str = "its build script compiles C, which is not run without `--allow-c`";
+const C_DEP_NOT_RUN: &str = "its build script was not run, for a C build script's metadata it reads";
+
 /// One table for both calls of `relax_scripts` (the macro world's scripts first).
 type LinksMeta = Mutex<std::collections::HashMap<usize, Result<Vec<(String, String)>, String>>>;
 
@@ -741,7 +749,7 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
         if check_skipped.contains(&bs.krate) {
             let out_dir = unbuilt(bs);
             results.lock().unwrap().push((bs.krates(), Ok(String::new()), out_dir));
-            meta.lock().unwrap().insert(i, Err("its build script compiles C, which is not run without `--allow-c`".to_string()));
+            meta.lock().unwrap().insert(i, Err(C_NOT_RUN.to_string()));
             continue;
         }
         let (dir, pname, _) = &g.pkg[bs.krate];
@@ -756,8 +764,8 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
             ScriptRole::Answered(lines) => {
                 // cargo sets OUT_DIR for every package with a build script
                 let out_dir = format!("{}/out", root.take(&format!("{}-answered", name)));
-                let _ = std::fs::create_dir_all(&out_dir);
-                done(i, Ok(lines.join("\n")), out_dir);
+                let r = std::fs::create_dir_all(&out_dir).map(|_| lines.join("\n")).map_err(|e| format!("{}: {}", out_dir, e));
+                done(i, r, out_dir);
                 continue;
             }
             ScriptRole::ToRemove => {
@@ -824,7 +832,15 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
                 let mut cenv = g.env[bs.krate].clone();
                 match links_env(g, bs, meta) {
                     Ok(dep_env) => cenv.extend(dep_env),
-                    Err(e) => {
+                    // a check without `--allow-c`: a script that needed a skipped C package (aws-lc-rs
+                    // reads aws-lc-sys's DEP_ metadata) leaves its crate unconfigured, said once, not fatal
+                    Err((e, true)) => {
+                        eprintln!("relax check: {} (its crate is checked without the script's cfgs)", e.lines().next().unwrap_or(""));
+                        results.lock().unwrap().push((bs.krates(), Ok(String::new()), unbuilt(bs)));
+                        meta.lock().unwrap().insert(i, Err(C_DEP_NOT_RUN.to_string()));
+                        continue;
+                    }
+                    Err((e, false)) => {
                         let out_dir = unbuilt(bs);
                         done(i, Err(e), out_dir);
                         continue;
@@ -848,9 +864,10 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
 /// The `DEP_<LINKS>_<KEY>` variables cargo gives a script (custom_build.rs build_work): the
 /// metadata the scripts of its package's `links` dependencies printed. Err: such a script handed
 /// nothing on (not run, or failed) and this script reads `DEP_` variables, so it is not run: it
-/// would fail on the missing value, or answer other than under cargo. A dependency built by
-/// cargo (`--allow-c`) is not in the table: a script reading its metadata is cargo's too.
-fn links_env(g: &Graph, bs: &BuildScript, meta: &LinksMeta) -> Result<Vec<(String, String)>, String> {
+/// would fail on the missing value, or answer other than under cargo; with true when it is missing
+/// for a check's C skip (C_NOT_RUN, C_DEP_NOT_RUN). A dependency built by cargo (`--allow-c`) is
+/// not in the table: a script reading its metadata is cargo's too.
+fn links_env(g: &Graph, bs: &BuildScript, meta: &LinksMeta) -> Result<Vec<(String, String)>, (String, bool)> {
     let mut env = Vec::new();
     for &d in &bs.links_deps {
         let (ddir, dname, _) = &g.pkg[g.build_scripts[d].krate];
@@ -862,8 +879,8 @@ fn links_env(g: &Graph, bs: &BuildScript, meta: &LinksMeta) -> Result<Vec<(Strin
                 }
             }
             Some(Err(why)) if crate::native::reads_dep_metadata(bs) => {
-                return Err(format!("{}: the build script of `{}` was not run: it reads the `DEP_` metadata of `{}` (links = \"{}\"), and {}",
-                    bs.src_path, g.pkg[bs.krate].1, dname, links, why));
+                return Err((format!("{}: the build script of `{}` was not run: it reads the `DEP_` metadata of `{}` (links = \"{}\"), and {}",
+                    bs.src_path, g.pkg[bs.krate].1, dname, links, why), why == C_NOT_RUN || why == C_DEP_NOT_RUN));
             }
             _ => {}
         }
@@ -902,16 +919,9 @@ fn script_metadata(stdout: &str) -> Vec<(String, String)> {
 /// The scripts' `cargo:` lines into the graph: cfgs, link libraries, env (OUT_DIR included).
 fn apply_script_results(g: &mut Graph, results: Vec<(Vec<usize>, Result<String, String>, String)>, check_only: bool) -> Result<(), String> {
     for (krates, r, out_dir) in results {
-        let stdout = match r {
-            Ok(s) => s,
-            // a check without `--allow-c`: a script that needed a skipped C package (aws-lc-rs reads
-            // aws-lc-sys's DEP_ metadata) leaves its crate unconfigured, said once, not fatal
-            Err(e) if check_only => {
-                eprintln!("relax check: {} (its crate is checked without the script's cfgs)", e.lines().next().unwrap_or(""));
-                String::new()
-            }
-            Err(e) => return Err(e),
-        };
+        // a script that failed fails a check too, as under `cargo check` (the scripts a check did
+        // not run for C answered empty: relax_scripts)
+        let stdout = r?;
         for k in krates { apply_script_output(g, k, &stdout, out_dir.clone(), check_only)?; }
     }
     Ok(())
