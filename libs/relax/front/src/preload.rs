@@ -1676,14 +1676,15 @@ pub fn check_macros(prog: &mut crate::program::Program, krate: u32, files: &[(u3
         let mut scans = Vec::new();
         let mut reachable = Vec::new();
         let root = c.root_path().to_string();
-        let mut todo = vec![(root.clone(), crate::program::dir_of(&root).to_string(), name.clone())];
-        while let Some((path, dir, module)) = todo.pop() {
-            if reachable.contains(&path) { continue; }
-            reachable.push(path.clone());
+        let mut todo = vec![(root.clone(), crate::program::dir_of(&root).to_string(), name.clone(), Vec::new())];
+        while let Some((path, dir, module, mut ancestors)) = todo.pop() {
+            if ancestors.contains(&path) { continue; }
+            ancestors.push(path.clone());
+            if !reachable.contains(&path) { reachable.push(path.clone()); }
             let text = files.iter().find(|(f, _)| prog.file_paths[*f as usize] == path).map(|(_, t)| t.clone())
                 .or_else(|| crate::vfs::read(&path).ok());
             if let Some(scan) = text.and_then(|t| scan_text(&path, &dir, &module, &name, c.edition, &c.cfg, t.into(), &c.context)) {
-                todo.extend(scan.children.iter().rev().cloned());
+                todo.extend(scan.children.iter().rev().map(|(p, d, m)| (p.clone(), d.clone(), m.clone(), ancestors.clone())));
                 scans.push(scan);
             }
         }
