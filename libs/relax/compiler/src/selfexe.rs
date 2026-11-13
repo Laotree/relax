@@ -64,6 +64,16 @@ pub fn program_name(flags: &[String], package: &str) -> String {
         .unwrap_or_else(|| Path::new(package).file_stem().map_or_else(|| package.to_string(), |s| s.to_string_lossy().into_owned()))
 }
 
+/// `dir` and the folders above it it creates, each owner-only at its mkdir (on Windows they
+/// inherit the run dir's owner-only DACL, run.rs own_run_dir): never made, then chmod'ed.
+fn private_dirs(dir: &Path) -> std::io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(dir)
+}
+
 /// This process's link to `loader`, named `name` (a package or binary name), made once; the
 /// reason when the run dir's file system cannot hold it (another volume than the loader's).
 /// `test`: a test's executable, in the folder's `deps/` as cargo puts it.
@@ -91,7 +101,7 @@ pub fn link(loader: &Path, name: &str, test: bool) -> Result<PathBuf, String> {
     }
     // a folder under this pid is a gone process's (pids are reused)
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&at).map_err(|e| format!("{}: {e}", at.display()))?;
+    private_dirs(&at).map_err(|e| format!("{}: {e}", at.display()))?;
     let _ = OWN_DIR.set(dir.clone());
     // beside the link, and beside a test's package binaries above its deps/ (add_bins)
     record_loader(&at, loader);

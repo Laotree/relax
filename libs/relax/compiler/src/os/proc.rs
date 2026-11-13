@@ -14,9 +14,13 @@
 //! - `binary_id()`: the identity the linker gave the image holding this code.
 //! - `args_bytes()`: the process arguments as bytes (`set_args`: an embedder names them).
 //! - `create_private(path)`: a new file only this user can read (O_EXCL); `ensure_private_dir`:
-//!   a directory that is safe to load code from (owned by this user, not writable by others).
+//!   a directory that is safe to load code from (owned by this user, not writable by others);
+//!   its error for another user's ends in `OTHER_USERS`.
 
 pub use imp::*;
+
+/// How `ensure_private_dir`'s error for a directory another user owns ends.
+pub const OTHER_USERS: &str = "belongs to another user";
 
 /// `name` (a C symbol) wherever this platform's loader finds one for the process: the default
 /// search of every loaded image (`find`), then the system libraries (`find_system`). Null: none.
@@ -513,7 +517,7 @@ mod unix {
             fn getuid() -> u32;
         }
         if m.uid() != unsafe { getuid() } {
-            return Err(format!("{} belongs to another user", dir.display()));
+            return Err(format!("{} {}", dir.display(), crate::os::proc::OTHER_USERS));
         }
         if m.permissions().mode() & 0o022 != 0 {
             return Err(format!("{} is writable by group or others", dir.display()));
@@ -1167,7 +1171,7 @@ mod imp {
                 &mut owner, null_mut(), &mut acl, null_mut(), &mut sd.0);
             if status != 0 { return Err(format!("{}: {}", display.display(), std::io::Error::from_raw_os_error(status as i32))); }
             if owner.is_null() || IsValidSid(owner) == 0 || (EqualSid(owner, user) == 0 && EqualSid(owner, admins) == 0) {
-                return Err(format!("{} belongs to another user", display.display()));
+                return Err(format!("{} {}", display.display(), crate::os::proc::OTHER_USERS));
             }
             if acl.is_null() || IsValidAcl(acl) == 0 { return Err(writable()); }
             // ACL header: revision, reserved byte, size, AceCount, reserved word.
