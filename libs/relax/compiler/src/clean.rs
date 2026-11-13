@@ -49,6 +49,21 @@ pub fn cmd_clean(args: &[String]) -> i32 {
             println!("relax clean: {} does not exist: nothing to remove", dir.display());
             return 0;
         }
+        // a relax process reading or writing a store holds its lock: refuse rather than delete
+        // a cache under a running program
+        if let Ok(rd) = std::fs::read_dir(dir.join("cache")) {
+            for e in rd.flatten() {
+                let p = e.path();
+                let Some(n) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+                if !crate::store::name_ours(&n) { continue; }
+                let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).open(&p) else { continue };
+                if f.try_lock().is_err() {
+                    eprintln!("relax clean: a relax process is using {}: stop it first, or clean after it ends", dir.display());
+                    return 1;
+                }
+                let _ = f.unlock();
+            }
+        }
         let mut r = Removal::default();
         r.tree(&dir);
         r.report(&dir, None);
