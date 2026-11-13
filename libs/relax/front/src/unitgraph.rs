@@ -1299,9 +1299,14 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     // The script slot (this process's) comes first: a run holding the claim and waiting for a slot
     // could wait on a slot whose script's nested run waits for this claim (a package that is
     // both a dependency here and a build-dependency of another script).
+    // The run that holds it names itself in it (its pid and its devhub lease, `claim_holder`):
+    // a waiter says whom it waits on, and a hang names its holder. A relax-runner test sat 26 min
+    // on its build-script claim, held by a hung run in another lease (11-13).
     let _slot = script_slot();
-    let claim = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(format!("{}/relax-claim", base_dir)).ok();
+    let claim_path = format!("{}/relax-claim", base_dir);
+    let claim = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&claim_path).ok();
     if let Some(claim) = claim.as_ref().filter(|claim| claim.try_lock().is_err()) {
+        eprintln!("relax build-script: {} waits for its claim {}: {}", pname, claim_path, claim_holder(&claim_path));
         let _ = claim.lock();
         // (the wait can be long: the checkout's files are read again)
         if let Some(content) = &shared {
@@ -1317,6 +1322,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
             Err(now) => why = now,
         }
     }
+    if let Some(claim) = claim.as_ref() { name_claim(claim); }
     if shared.is_some() {
         out_dir = format!("{}/out", build_dir);
         let _ = std::fs::create_dir_all(&out_dir);
@@ -1955,6 +1961,49 @@ fn platform_answer(sess: &std::sync::Arc<crate::Session>, out_dir: &str) -> Resu
     Ok(lines)
 }
 
+
+/// The lease a devhub runs this process in (`MAKEPAD_DEVHUB_LEASE`: its ledger dir and the
+/// lease), else `none`.
+fn devhub_lease() -> String {
+    std::env::var("MAKEPAD_DEVHUB_LEASE").ok().and_then(|mark| mark.rsplit('/').next().filter(|id| !id.is_empty()).map(str::to_string)).unwrap_or_else(|| "none".to_string())
+}
+
+/// A build script's run that took its `relax-claim` writes in it who holds it: `<pid> <lease>`.
+fn name_claim(claim: &std::fs::File) {
+    use std::io::{Seek, Write};
+    let mut f = claim;
+    let _ = f.set_len(0);
+    let _ = f.seek(std::io::SeekFrom::Start(0));
+    let _ = writeln!(f, "{} {}", std::process::id(), devhub_lease());
+}
+
+/// Who holds the claim at `path`, said: "held by pid N (lease L...)", from what its holder wrote in
+/// it ([`name_claim`]), and on Linux the kernel's lock table, which names a holder that wrote
+/// nothing (a run of an older relax).
+fn claim_holder(path: &str) -> String {
+    let named = std::fs::read_to_string(path).unwrap_or_default();
+    let mut words = named.split_whitespace();
+    let (pid, lease) = (words.next().and_then(|p| p.parse::<u32>().ok()), words.next().map(str::to_string));
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let locked = std::fs::metadata(path).ok().and_then(|m| {
+            let ino = m.ino().to_string();
+            std::fs::read_to_string("/proc/locks").ok()?.lines().find_map(|line| {
+                let f: Vec<&str> = line.split_whitespace().collect();
+                (f.get(1) == Some(&"FLOCK") && f.get(5).and_then(|dev| dev.rsplit(':').next()) == Some(ino.as_str())).then(|| f.get(4)?.parse::<u32>().ok()).flatten()
+            })
+        });
+        if let Some(holder) = locked.filter(|holder| Some(*holder) != pid) {
+            return format!("held by pid {holder} (lease unknown: it named none)");
+        }
+    }
+    match (pid, lease) {
+        (Some(pid), Some(lease)) => format!("held by pid {pid} (lease {lease})"),
+        _ => "held by a run that has not named itself (lease unknown)".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod script_error_tests {
     /// The cause a failing build script names, by what its stderr holds (relax PR 59).
@@ -1967,6 +2016,24 @@ mod script_error_tests {
         assert_eq!(super::script_error_cause(rustc), "error[E0308]: mismatched types", "rustc's own diagnostic shape");
         assert_eq!(super::script_error_cause(&format!("{{\"message\":\"index out of bounds\",\"type\":\"panic\"}}\n{summary}\n")), "index out of bounds", "a panic's message");
         assert_eq!(super::script_error_cause("one\ntwo\nthree\nfour\n"), "two | three | four", "else its last lines");
+    }
+
+    /// A build script's claim names its holder to whoever waits on it: the pid and devhub lease
+    /// its holder wrote in it, the kernel's lock holder on Linux, else that it named none.
+    #[test]
+    fn a_claims_waiter_hears_who_holds_it() {
+        let path = std::env::temp_dir().join(format!("relax-claim-holder-{}", std::process::id()));
+        let path_s = path.to_string_lossy().to_string();
+        std::fs::write(&path, "4242 L7\n").unwrap();
+        assert_eq!(super::claim_holder(&path_s), "held by pid 4242 (lease L7)", "what its holder wrote");
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(super::claim_holder(&path_s), "held by a run that has not named itself (lease unknown)");
+        let claim = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        claim.lock().unwrap();
+        super::name_claim(&claim);
+        assert_eq!(super::claim_holder(&path_s), format!("held by pid {} (lease {})", std::process::id(), super::devhub_lease()), "the run that took it named itself");
+        drop(claim);
+        let _ = std::fs::remove_file(&path);
     }
 }
 
