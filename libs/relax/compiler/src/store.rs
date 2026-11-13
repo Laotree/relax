@@ -1206,6 +1206,16 @@ fn write_at(file: &std::fs::File, mut b: &[u8], mut off: u64) -> std::io::Result
     Ok(())
 }
 
+/// Test helper: rewrite the build id a store file's header names (and its header checksum).
+#[cfg(test)]
+pub(crate) fn rewrite_build(p: &std::path::Path, build: u64) -> std::io::Result<()> {
+    let mut b = std::fs::read(p)?;
+    b[BUILD_AT..BUILD_AT + 8].copy_from_slice(&build.to_le_bytes());
+    let s = sum64(&b[..HEADER - 8]);
+    b[HEADER - 8..HEADER].copy_from_slice(&s.to_le_bytes());
+    std::fs::write(p, b)
+}
+
 /// The Relax build that wrote the store file `p` (its header; 0: written before headers named
 /// the build). None: unreadable, not a store, or locked by a writer right now.
 pub fn build_of(p: &Path) -> Option<u64> {

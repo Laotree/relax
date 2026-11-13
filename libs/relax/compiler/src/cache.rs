@@ -20,7 +20,17 @@
 //!
 //! RELAX_CACHE=on (default) | off | verify | readonly;
 //! RELAX_SHARED_CACHE=off (default) | global: one run dir for every workspace of the user
-//! (`$RELAX_HOME/shared`, dirs.rs); clean refuses it.
+//! (`$RELAX_HOME/shared`, dirs.rs); clean refuses it, `clean --shared` removes it.
+//!
+//! Integrity and trust: keys hash the inputs (the Relax build, cfg, interfaces, bodies); a
+//! payload is an output and carries its own checksum. Code entries are read through
+//! `Store::get_checked`, so an entry whose payload does not match its checksum is a miss and
+//! never runs; a header or index that fails its checksum invalidates the store. Those checks
+//! detect corruption and edits after the fact -- they do not prove an entry was produced from
+//! the key's inputs: a process that can write the store can write a self-consistent entry for
+//! a key it can compute. The shared dir is per-user and opt-in because a workspace's build
+//! scripts and proc macros already run with the user's privileges; sharing makes their entries
+//! persist across workspaces. That is the threat model, not privilege escalation.
 //! Stores live in `<cargo target dir>/relax/cache` (dirs.rs); RELAX_CACHE_DIR replaces
 //! the run dir for tests and measurement. RELAX_CACHE_MAX (MB) caps them (default: twice
 //! what the run uses, at least 4096; prune_root). The `--allow-c` builds beside them
@@ -4849,6 +4859,14 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
         .collect();
     let now = std::time::SystemTime::now();
     let recent = |t: &std::time::SystemTime| now.duration_since(*t).map_or(true, |age| age < IN_USE_BY_OTHERS);
+    // a store another Relax build wrote is never read by this one (its name and header hash the
+    // codegen identity): reclaim it unless a process of that build is running, this run opened it
+    // (a handed-over dir), or it was stamped a moment ago
+    files.retain(|f| {
+        let foreign = builds[&f.1].is_some_and(|b| b != me);
+        !(foreign && !live.contains(&crate::store::base_path(&f.1)) && !open.contains(&f.1)
+            && !running.contains(&f.1) && !recent(&f.0) && crate::store::delete_checked(&f.1))
+    });
     // this build's replaced crate stores (store sets, write_sets): one a program's set named and
     // its current set no longer names goes once no set or demand part names it, this run does
     // not use it and no run stamped it recently (until then it stays on the retiring list)
@@ -10175,6 +10193,34 @@ mod prune_tests {
         // the folder also holds this process's live lock (store::hold_build)
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir(&root).unwrap();
+    }
+
+    /// A store another Relax build wrote is never read by this one: prune reclaims it at the next
+    /// start, unless a process of that build runs or it was stamped a moment ago.
+    #[test]
+    fn stores_of_another_build_are_reclaimed() {
+        isolated_test!(stores_of_another_build_are_reclaimed);
+        let root = std::env::temp_dir().join(format!("relax-build-prune-{}-{}", std::process::id(), crate::clock::wall_ns()));
+        let dir = root.join("cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        let day = 24 * 3600;
+        let store = |name: &str| -> PathBuf {
+            let p = dir.join(name);
+            crate::store::append(&p, vec![NewEntry { key: 1, kind: KIND_DATA, payload: vec![7; 64] }], true).unwrap();
+            let t = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * day);
+            std::fs::File::options().write(true).open(&p).unwrap().set_modified(t).unwrap();
+            p
+        };
+        let foreign = store("bitflags-00000000000000aa.rcs");
+        crate::store::rewrite_build(&foreign, crate::store::this_build().wrapping_add(1)).unwrap();
+        let mine = store("memchr-0000000000000002.rcs");
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * day);
+        std::fs::File::options().write(true).open(&foreign).unwrap().set_modified(t).unwrap();
+        prune(&root, &HashSet::new(), &HashSet::new(), &[], None);
+        assert!(!foreign.exists(), "a store of another build is reclaimed");
+        assert!(mine.exists(), "this build's store stays");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir(&root);
     }
 
     /// Store sets: a program's run names its store per role; a crate store the previous run's set
