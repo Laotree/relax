@@ -1,7 +1,7 @@
 //! `makepad test [options] <package> [--lib] [--bins] [--bin <name>]... [--tests] [--test <name>]...
-//! [cargo feature flags] [-- <libtest args>]`: what `cargo test -p <package>` runs,
+//! [--examples] [--example <name>]... [cargo feature flags] [-- <libtest args>]`: what `cargo test -p <package>` runs,
 //! under the JIT. The lib's unit tests (the lib built cfg(test)) are a program of their own; the
-//! selected bins' unit tests and integration tests (beside the plain lib) are one program, as
+//! selected bins' and examples' unit tests and integration tests (beside the plain lib) are one program, as
 //! `cargo test` builds them in one go, so every target after the first restores its collected
 //! image. Each target runs in a process of its own, one after the other (`makepad run --harness
 //! --subject <its source>`, run.rs): its own main, statics, environment, threads, exit status
@@ -53,12 +53,14 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         i += 1;
     }
     let Some(package) = args.get(i).cloned() else {
-        eprintln!("usage: {tool} test <package> [--lib] [--bins] [--bin <name>] [--tests] [--test <name>] [cargo flags] [-- <test args>]", tool = crate::tool_name());
+        eprintln!("usage: {tool} test <package> [--lib] [--bins] [--bin <name>] [--tests] [--test <name>] [--examples] [--example <name>] [cargo flags] [-- <test args>]", tool = crate::tool_name());
         return 2;
     };
     let mut lib = false;
     let mut bins: Option<Vec<String>> = None;
     let mut tests: Option<Vec<String>> = None;
+    let mut examples: Option<Vec<String>> = None;
+    let mut all_examples = false;
     let mut selections = 0;
     let mut all_tests = false;
     let mut extra_package = false;
@@ -93,6 +95,20 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
                     return 2;
                 }
             },
+            // examples built with `--test`: all of them, or the named ones (cargo test's default
+            // tests those with `test = true`)
+            "--examples" => {
+                all_tests = true;
+                all_examples = true;
+                examples.get_or_insert_with(Vec::new);
+            }
+            "--example" => match words.next() {
+                Some(e) => { examples.get_or_insert_with(Vec::new).push(e.clone()); selections += 1; }
+                None => {
+                    eprintln!("relax test: --example needs a target name");
+                    return 2;
+                }
+            },
             // every target runs anyway: one failing says nothing about the next
             "--no-fail-fast" => {}
             "--release" => {}
@@ -118,6 +134,10 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
                 tests.get_or_insert_with(Vec::new).push(s[7..].to_string());
                 selections += 1;
             }
+            s if s.starts_with("--example=") => {
+                examples.get_or_insert_with(Vec::new).push(s[10..].to_string());
+                selections += 1;
+            }
             s if is_feature_flag(s) => {
                 feature_flags.push(w.clone());
                 flags.push(w.clone());
@@ -131,7 +151,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
     }
     if live {
         if package.starts_with('-') || package.ends_with(".rs") || all_tests || selections > 1 || extra_package
-            || pre.iter().chain(&flags).any(|s| matches!(s.as_str(), "--tests" | "--bins" | "--bin" | "--test" | "--lib" | "--no-live" | "--workspace" | "--all-targets" | "-p" | "--package")
+            || examples.is_some() || pre.iter().chain(&flags).any(|s| matches!(s.as_str(), "--tests" | "--bins" | "--bin" | "--test" | "--lib" | "--no-live" | "--workspace" | "--all-targets" | "-p" | "--package")
                 || s.starts_with("--package=") || s.starts_with("--bin=") || s.starts_with("--test=")) {
             return live_usage();
         }
@@ -139,13 +159,20 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
     }
     let sess = std::sync::Arc::new(crate::Session::default());
     let live_default = live && !lib && bins.is_none() && tests.is_none();
-    let (has_lib, bin_targets, targets) = match crate::resolve::test_targets(&sess, &crate::run::workspace_dir(), &package,
-        &feature_flags, bins.as_deref().unwrap_or_default(), tests.as_deref().unwrap_or_default()) {
+    let crate::resolve::TestTargets { lib: has_lib, bins: bin_targets, tests: targets, examples: example_targets, all_examples: every_example } = match crate::resolve::test_targets(&sess, &crate::run::workspace_dir(), &package,
+        &feature_flags, bins.as_deref().unwrap_or_default(), tests.as_deref().unwrap_or_default(), examples.as_deref().unwrap_or_default()) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("relax test: {e}");
             return 101;
         }
+    };
+    // `--examples`: every example, `test = true` or not (an `--example <name>` beside it is one of them)
+    let example_targets = if all_examples {
+        examples = Some(Vec::new());
+        every_example
+    } else {
+        example_targets
     };
     if live_default {
         if has_lib.as_ref().is_some_and(|l| l.test) {
@@ -164,11 +191,13 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         }
     }
     if live && lib && has_lib.is_none() { return live_usage(); }
-    let default_selection = !lib && bins.is_none() && tests.is_none();
+    let default_selection = !lib && bins.is_none() && tests.is_none() && examples.is_none();
     if default_selection {
         lib = has_lib.as_ref().is_some_and(|l| l.test);
         bins = (!bin_targets.is_empty()).then(Vec::new);
         tests = (!targets.is_empty()).then(Vec::new);
+        // the examples with `test = true` (relax issue 120: cargo runs their tests, makepad test skipped them)
+        examples = (!example_targets.is_empty()).then(Vec::new);
     }
     // each run: None the lib's unit tests (`--lib`), else one bin or test target out of the
     // package's test graph: its source path, and whether it is a `harness = false` one (a plain
@@ -187,7 +216,7 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         let (h, p): (Vec<_>, Vec<_>) = all.iter().filter(|t| names.is_empty() || names.contains(&t.0)).partition(|t| t.2);
         Ok(h.into_iter().chain(p).map(|t| (t.1.clone(), !t.2)).collect())
     };
-    for (sel, all) in [(&bins, &bin_targets), (&tests, &targets)] {
+    for (sel, all) in [(&bins, &bin_targets), (&tests, &targets), (&examples, &example_targets)] {
         let Some(names) = sel else { continue };
         match chosen(all, names) {
             Ok(r) => runs.extend(r.into_iter().map(Some)),
@@ -197,15 +226,18 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
             }
         }
     }
-    // the test program of the selected bin and integration test targets, as `cargo test` builds
-    // them: each named (the `harness = false` ones too)
+    // the test program of the selected bin, integration test and example targets, as `cargo
+    // test` builds them: each named (the `harness = false` ones too); `--bins` / `--examples`
+    // say that the names after them are targets built with `--test` (resolve.rs parse_flags)
     let mut graph: Vec<String> = Vec::new();
-    for (sel, all, flag) in [(&bins, &bin_targets, "--bin"), (&tests, &targets, "--test")] {
+    for (sel, all, flag) in [(&bins, &bin_targets, "--bin"), (&tests, &targets, "--test"), (&examples, &example_targets, "--example")] {
         let Some(names) = sel else { continue };
+        let mut first = true;
         for t in all.iter().filter(|t| names.is_empty() || names.contains(&t.0)) {
-            if flag == "--bin" && graph.is_empty() {
-                graph.push("--bins".to_string());
+            if first && flag != "--test" {
+                graph.push(if flag == "--bin" { "--bins" } else { "--examples" }.to_string());
             }
+            first = false;
             graph.extend([flag.to_string(), t.0.clone()]);
         }
     }

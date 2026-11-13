@@ -1190,7 +1190,7 @@ impl Resolver {
 /// (cargo test's order: the lib's unit tests, the bins' unit tests, then the test targets by name).
 /// The package's lib path, bins and integration tests: (name, path, harness) each. Missing
 /// required features skip implicit targets and reject explicitly named targets before any run.
-pub fn test_targets(sess: &std::sync::Arc<crate::Session>, dir: &str, package: &str, flags: &[String], bin_names: &[String], test_names: &[String]) -> Result<(Option<LibTarget>, Vec<(String, String, bool)>, Vec<(String, String, bool)>), String> {
+pub fn test_targets(sess: &std::sync::Arc<crate::Session>, dir: &str, package: &str, flags: &[String], bin_names: &[String], test_names: &[String], example_names: &[String]) -> Result<TestTargets, String> {
     let o = parse_flags(flags)?;
     let mut r = Resolver::new(sess, dir)?;
     let i = r.find_member(package)?;
@@ -1209,7 +1209,26 @@ pub fn test_targets(sess: &std::sync::Arc<crate::Session>, dir: &str, package: &
     };
     let bins = enabled(&m.bins, bin_names)?;
     let tests = enabled(&m.tests, test_names)?;
-    Ok((m.lib.as_ref().map(|l| LibTarget { path: l.path.clone(), test: l.test, doctest: l.doctest }), bins, tests))
+    let examples = enabled(&m.examples, example_names)?;
+    let mut all_examples = Vec::new();
+    for t in &m.examples {
+        if t.enabled(&features, false)? {
+            all_examples.push((t.name.clone(), t.path.clone(), t.harness));
+        }
+    }
+    all_examples.sort();
+    Ok(TestTargets { lib: m.lib.as_ref().map(|l| LibTarget { path: l.path.clone(), test: l.test, doctest: l.doctest }), bins, tests, examples, all_examples })
+}
+
+/// A package's targets as `cargo test` selects them (`test_targets`): the lib, and (name, source
+/// path, harness) of each bin, integration test and example with `test = true` or named.
+pub struct TestTargets {
+    pub lib: Option<LibTarget>,
+    pub bins: Vec<(String, String, bool)>,
+    pub tests: Vec<(String, String, bool)>,
+    pub examples: Vec<(String, String, bool)>,
+    /// every example whose required features are on (`--examples`, cargo's "all example targets")
+    pub all_examples: Vec<(String, String, bool)>,
 }
 
 /// The package's lib as `cargo test` sees it.
@@ -1759,9 +1778,10 @@ pub enum TestSel {
     Lib,
     /// these bin targets built with `--test` and these integration test targets, beside the plain
     /// lib: one graph, as `cargo test` builds them in one go with one feature resolution (`makepad
-    /// test` runs each target out of it in a process of its own, run.rs `--subject`). None: no
-    /// target of that kind; empty: all of them.
-    Targets { bins: Option<Vec<String>>, tests: Option<Vec<String>> },
+    /// test` runs each target out of it in a process of its own, run.rs `--subject`), and these
+    /// examples built with `--test` (`--examples`; cargo tests an example with `test = true` by
+    /// default). None: no target of that kind; empty: all of them.
+    Targets { bins: Option<Vec<String>>, tests: Option<Vec<String>>, examples: Option<Vec<String>> },
 }
 
 pub fn parse_flags(flags: &[String]) -> Result<Options, String> {
@@ -1770,6 +1790,10 @@ pub fn parse_flags(flags: &[String]) -> Result<Options, String> {
     let mut bins = false;
     let mut bin_names: Vec<String> = Vec::new();
     let mut tests: Option<Vec<String>> = None;
+    // `--examples` (with the names that follow it as `--example <name>`, as `makepad test` writes
+    // a test graph): examples built with `--test`; `--example <name>` alone: the one example run
+    let mut examples = false;
+    let mut example_names: Vec<String> = Vec::new();
     let mut i = 0;
     while i < flags.len() {
         let f = flags[i].as_str();
@@ -1786,7 +1810,8 @@ pub fn parse_flags(flags: &[String]) -> Result<Options, String> {
             }
             "--bins" => bins = true,
             "--bin" => bin_names.push(value(&mut i)?),
-            "--example" => o.example = Some(value(&mut i)?),
+            "--example" => example_names.push(value(&mut i)?),
+            "--examples" => examples = true,
             "--lib" => lib = true,
             "--tests" => {
                 tests.get_or_insert_with(Vec::new);
@@ -1803,7 +1828,7 @@ pub fn parse_flags(flags: &[String]) -> Result<Options, String> {
                 } else if let Some(v) = f.strip_prefix("--bin=") {
                     bin_names.push(v.to_string());
                 } else if let Some(v) = f.strip_prefix("--example=") {
-                    o.example = Some(v.to_string());
+                    example_names.push(v.to_string());
                 } else if let Some(v) = f.strip_prefix("--test=") {
                     tests.get_or_insert_with(Vec::new).push(v.to_string());
                 } else {
@@ -1813,6 +1838,12 @@ pub fn parse_flags(flags: &[String]) -> Result<Options, String> {
         }
         i += 1;
     }
+    let examples = if examples {
+        Some(example_names)
+    } else {
+        o.example = example_names.into_iter().last();
+        None
+    };
     // (cargo run takes one target: a bin or an example)
     if o.example.is_some() && (bins || !bin_names.is_empty() || lib || tests.is_some()) {
         return Err("unit graph: `--example` runs one example; it takes no other target flag (--bin, --bins, --lib, --tests, --test)".to_string());
@@ -1823,10 +1854,10 @@ pub fn parse_flags(flags: &[String]) -> Result<Options, String> {
         o.bin = bin_names.into_iter().last();
         None
     };
-    o.test = match (lib, bins, tests) {
-        (true, None, None) => Some(TestSel::Lib),
-        (false, None, None) => None,
-        (false, bins, tests) => Some(TestSel::Targets { bins, tests }),
+    o.test = match (lib, bins, tests, examples) {
+        (true, None, None, None) => Some(TestSel::Lib),
+        (false, None, None, None) => None,
+        (false, bins, tests, examples) => Some(TestSel::Targets { bins, tests, examples }),
         _ => return Err("unit graph: the lib's unit tests (--lib) are a test program of their own; select them alone".to_string()),
     };
     Ok(o)
@@ -2359,6 +2390,8 @@ enum UKind {
     Test(usize),
     /// the root's example (`--example`): a bin with the dev-dependencies
     Example(usize),
+    /// the root's example built with `--test` (its unit tests; `makepad test --examples`)
+    ExampleTest(usize),
     BuildCompile,
     BuildRun,
 }
@@ -2409,7 +2442,31 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
     let rm = &r.manifests[root];
     match &o.test {
         Some(TestSel::Lib) if rm.lib.is_none() => return Err(format!("no library targets found in package `{}`", rm.name)),
-        Some(TestSel::Targets { bins, tests }) => {
+        Some(TestSel::Targets { bins, tests, examples }) => {
+            if let Some(names) = examples {
+                if rm.examples.is_empty() {
+                    return Err(format!("no example targets found in package `{}`", rm.name));
+                }
+                for n in names {
+                    if !rm.examples.iter().any(|t| &t.name == n) {
+                        return Err(format!("no example target named `{}` in package `{}`", n, rm.name));
+                    }
+                }
+                for (ei, et) in rm.examples.iter().enumerate() {
+                    if !names.is_empty() && !names.contains(&et.name) {
+                        continue;
+                    }
+                    if !et.enabled(&rn.features, !names.is_empty())? {
+                        continue;
+                    }
+                    // as the bins: `--examples` builds the harness ones; `makepad test` names
+                    // the targets it runs, `harness = false` ones included
+                    if !et.harness && names.is_empty() {
+                        continue;
+                    }
+                    roots.push(add((root, false), UKind::ExampleTest(ei), &mut units));
+                }
+            }
             if let Some(names) = bins {
                 if rm.bins.is_empty() {
                     return Err(format!("no bin targets found in package `{}`", rm.name));
@@ -2557,9 +2614,9 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
                 let b = &m.bins[*bi];
                 (b.kind.clone(), b.name.clone(), b.path.clone(), b.edition.clone(), if matches!(u, UKind::BinTest(_)) { "test" } else { "build" })
             }
-            UKind::Example(ei) => {
+            UKind::Example(ei) | UKind::ExampleTest(ei) => {
                 let e = &m.examples[*ei];
-                (e.kind.clone(), e.name.clone(), e.path.clone(), e.edition.clone(), "build")
+                (e.kind.clone(), e.name.clone(), e.path.clone(), e.edition.clone(), if matches!(u, UKind::ExampleTest(_)) { "test" } else { "build" })
             }
             UKind::BuildCompile | UKind::BuildRun => {
                 let p = m.build.clone().unwrap();
@@ -2572,7 +2629,7 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
         let mut deps: Vec<(usize, String)> = Vec::new();
         // dev-dependencies: only the test targets' and an example's (the plain lib of a test
         // graph has none)
-        let dev = matches!(u, UKind::LibTest | UKind::BinTest(_) | UKind::Test(_) | UKind::Example(_));
+        let dev = matches!(u, UKind::LibTest | UKind::BinTest(_) | UKind::Test(_) | UKind::Example(_) | UKind::ExampleTest(_));
         let normal_edges = |deps: &mut Vec<(usize, String)>, build: bool| {
             for (di, tk) in &node.edges {
                 let d = &m.deps[*di];
@@ -2594,7 +2651,7 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
                     deps.push((bi, "build_script_build".to_string()));
                 }
             }
-            UKind::Bin(_) | UKind::BinTest(_) | UKind::Test(_) | UKind::Example(_) => {
+            UKind::Bin(_) | UKind::BinTest(_) | UKind::Test(_) | UKind::Example(_) | UKind::ExampleTest(_) => {
                 if let Some(&li) = index.get(&(*k, UKind::Lib)) {
                     deps.push((li, lib_name(k.0)));
                 }
@@ -2635,6 +2692,7 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
             harness: match u {
                 UKind::LibTest | UKind::BinTest(_) => true,
                 UKind::Test(ti) => m.tests[*ti].harness,
+                UKind::ExampleTest(ei) => m.examples[*ei].harness,
                 _ => false,
             },
             sysroot: false,
@@ -3141,18 +3199,35 @@ test = false
 name = "quiet_test"
 path = "tests/quiet_test.rs"
 test = false
+[[example]]
+name = "shown"
+test = true
 "#).unwrap();
-    for f in ["src/lib.rs", "src/quiet_bin.rs", "tests/quiet_test.rs", "tests/loud.rs"] { std::fs::write(root.join(f), "").unwrap(); }
+    std::fs::create_dir_all(root.join("examples")).unwrap();
+    for f in ["src/lib.rs", "src/quiet_bin.rs", "tests/quiet_test.rs", "tests/loud.rs", "examples/shown.rs", "examples/plain.rs"] { std::fs::write(root.join(f), "").unwrap(); }
     let sess = std::sync::Arc::new(crate::Session::default());
     let dir = root.to_str().unwrap();
     let names = |t: &[(String, String, bool)]| t.iter().map(|t| t.0.clone()).collect::<Vec<_>>();
-    let (lib, bins, tests) = test_targets(&sess, dir, "quiet", &[], &[], &[]).unwrap();
-    let lib = lib.unwrap();
+    let t = test_targets(&sess, dir, "quiet", &[], &[], &[], &[]).unwrap();
+    let lib = t.lib.unwrap();
     assert!(!lib.test && !lib.doctest);
-    assert!(bins.is_empty(), "{bins:?}");
-    assert_eq!(names(&tests), ["loud"]);
-    let (_, bins, tests) = test_targets(&sess, dir, "quiet", &[], &["quiet_bin".to_string()], &["quiet_test".to_string()]).unwrap();
-    assert_eq!(names(&bins), ["quiet_bin"]);
-    assert_eq!(names(&tests), ["loud", "quiet_test"]);
+    assert!(t.bins.is_empty(), "{:?}", t.bins);
+    assert_eq!(names(&t.tests), ["loud"]);
+    // an example runs its tests when it says `test = true` (relax issue 120: none ran), the
+    // discovered one only when named
+    assert_eq!(names(&t.examples), ["shown"], "examples by default");
+    let t = test_targets(&sess, dir, "quiet", &[], &["quiet_bin".to_string()], &["quiet_test".to_string()], &["plain".to_string()]).unwrap();
+    assert_eq!(names(&t.bins), ["quiet_bin"]);
+    assert_eq!(names(&t.tests), ["loud", "quiet_test"]);
+    assert_eq!(names(&t.examples), ["plain", "shown"], "a named example");
+    assert_eq!(names(&t.all_examples), ["plain", "shown"], "--examples");
+    // `--examples` with the names makepad test lists is a test graph's selection; `--example`
+    // alone is the example `makepad run` runs
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let o = parse_flags(&s(&["--examples", "--example", "shown", "--test", "loud"])).unwrap();
+    assert_eq!(o.test, Some(TestSel::Targets { bins: None, tests: Some(s(&["loud"])), examples: Some(s(&["shown"])) }));
+    assert_eq!(o.example, None);
+    let o = parse_flags(&s(&["--example", "plain"])).unwrap();
+    assert_eq!((o.test, o.example.as_deref()), (None, Some("plain")));
     let _ = std::fs::remove_dir_all(&root);
 }
