@@ -530,13 +530,12 @@ impl Command {
         Some(out)
     }
 
-    /// Inside a build script's run (RELAX_AS_RUSTC), the host answers an option-led question of the
-    /// script's own `$RUSTC` in this process (Relax tool.rs) with the child's stdio ends: its
-    /// handle, or 0 when a process answers.
-    fn tool_spawn(&self, stdin: &Option<OwnedFd>, stdout: &Option<OwnedFd>, stderr: &Option<OwnedFd>) -> u64 {
-        if crate::env::host_var_os("RELAX_AS_RUSTC").is_none() {
-            return 0;
-        }
+    /// Every spawn asks the host first (Relax tool.rs), with the child's stdio ends and whether it
+    /// is plain (no exec, `pre_exec` closures, user or group). Inside a build script's run the host
+    /// answers an option-led question of the script's own `$RUSTC` in this process: its handle.
+    /// 0: a process answers (always, outside a script's run). `TOOL_REFUSED`: the spawn is refused
+    /// (a confined build script starts no process).
+    fn tool_spawn(&self, stdin: &Option<OwnedFd>, stdout: &Option<OwnedFd>, stderr: &Option<OwnedFd>, plain: bool) -> u64 {
         let mut argv: Vec<u8> = Vec::new();
         for a in core::iter::once(&self.program).chain(self.args.iter().skip(1)) {
             let b = a.as_encoded_bytes();
@@ -544,7 +543,7 @@ impl Command {
             argv.extend_from_slice(b);
         }
         let raw = |fd: &Option<OwnedFd>| fd.as_ref().map_or(-1, |fd| fd.as_raw_fd() as i64);
-        unsafe { __relax_tool_spawn(argv.as_ptr(), argv.len(), raw(stdin), raw(stdout), raw(stderr)) }
+        unsafe { __relax_tool_spawn(argv.as_ptr(), argv.len(), raw(stdin), raw(stdout), raw(stderr), plain as i32) }
     }
 
     /// CommandExt::exec: replaces this process (real std sys/process/unix/unix.rs exec:
@@ -591,7 +590,43 @@ impl Command {
         r
     }
 
+    /// A spawn in one order: the stdio, the host's question (`tool_spawn`), then everything that
+    /// starts a process (`spawn_process`, out of line: a confined build script never reaches it).
     fn spawn_now(&mut self, default: Stdio, exec: bool, dir: &ChildDir) -> io::Result<Child> {
+        let default_piped = match default.0 {
+            StdioKind::Piped => true,
+            _ => false,
+        };
+        let (stdin_child, stdin_parent) = setup_stdio(self.stdin.take(), default_piped, true)?;
+        let (stdout_child, stdout_parent) = setup_stdio(self.stdout.take(), default_piped, false)?;
+        let (stderr_child, stderr_parent) = setup_stdio(self.stderr.take(), default_piped, false)?;
+        // a build script's `$RUSTC` question: this process answers it with the child's ends of
+        // the stdio (Relax tool.rs), and no process starts; a refused spawn is a program that is
+        // not there
+        let plain = !exec && self.closures.is_empty() && self.uid.is_none() && self.gid.is_none();
+        match self.tool_spawn(&stdin_child, &stdout_child, &stderr_child, plain) {
+            0 => {}
+            TOOL_REFUSED => return Err(io::Error::from_raw_os_error(sys::os::ENOENT)),
+            tool => {
+                drop(stdin_child);
+                drop(stdout_child);
+                drop(stderr_child);
+                return Ok(Child {
+                    pid: 0,
+                    tool: Tool(tool),
+                    status: None,
+                    stdin: stdin_parent.map(|fd| ChildStdin { fd }),
+                    stdout: stdout_parent.map(|fd| ChildStdout { fd }),
+                    stderr: stderr_parent.map(|fd| ChildStderr { fd }),
+                });
+            }
+        }
+        self.spawn_process(exec, dir, (stdin_child, stdin_parent), (stdout_child, stdout_parent), (stderr_child, stderr_parent))
+    }
+
+    #[inline(never)]
+    fn spawn_process(&mut self, exec: bool, dir: &ChildDir, stdin: (Option<OwnedFd>, Option<OwnedFd>), stdout: (Option<OwnedFd>, Option<OwnedFd>), stderr: (Option<OwnedFd>, Option<OwnedFd>)) -> io::Result<Child> {
+        let ((stdin_child, stdin_parent), (stdout_child, stdout_parent), (stderr_child, stderr_parent)) = (stdin, stdout, stderr);
         let mut self_exec = self.self_exec_args();
         // the program again: what this process compiled goes to the disk cache first, so the new
         // process starts from it (Relax run.rs relax_self_spawn)
@@ -637,31 +672,6 @@ impl Command {
             None => None,
         };
 
-        let default_piped = match default.0 {
-            StdioKind::Piped => true,
-            _ => false,
-        };
-        let (stdin_child, stdin_parent) = setup_stdio(self.stdin.take(), default_piped, true)?;
-        let (stdout_child, stdout_parent) = setup_stdio(self.stdout.take(), default_piped, false)?;
-        let (stderr_child, stderr_parent) = setup_stdio(self.stderr.take(), default_piped, false)?;
-        // a build script's `$RUSTC` question: this process answers it with the child's ends of
-        // the stdio (Relax tool.rs), and no process starts
-        if !exec && self.closures.is_empty() && self.uid.is_none() && self.gid.is_none() {
-            let tool = self.tool_spawn(&stdin_child, &stdout_child, &stderr_child);
-            if tool != 0 {
-                drop(stdin_child);
-                drop(stdout_child);
-                drop(stderr_child);
-                return Ok(Child {
-                    pid: 0,
-                    tool: Tool(tool),
-                    status: None,
-                    stdin: stdin_parent.map(|fd| ChildStdin { fd }),
-                    stdout: stdout_parent.map(|fd| ChildStdout { fd }),
-                    stderr: stderr_parent.map(|fd| ChildStderr { fd }),
-                });
-            }
-        }
 
         #[cfg(not(target_os = "android"))]
         // (posix_spawn cannot change the child's user or group: real std forks for them too)
@@ -1029,12 +1039,15 @@ fn wire_push(out: &mut Vec<u8>, k: &[u8], v: Option<&[u8]>) {
     }
 }
 
+/// `__relax_tool_spawn`'s answer for a refused spawn (Relax tool.rs TOOL_REFUSED)
+const TOOL_REFUSED: u64 = u64::MAX;
+
 extern "C" {
     fn __relax_spawn_env(edits: *const u8, edits_len: usize, host: *const u8, host_len: usize, flags: u32, out: *mut *const u8, out_len: *mut usize);
     /// relax-base progenv.rs prepared_bin: 1 for a package binary this run prepared
     fn __relax_prepared_bin(path: *const u8, len: usize) -> i32;
     /// Relax tool.rs: a build script's `$RUSTC` question answered by this process (a handle), or 0
-    fn __relax_tool_spawn(argv: *const u8, len: usize, stdin: i64, stdout: i64, stderr: i64) -> u64;
+    fn __relax_tool_spawn(argv: *const u8, len: usize, stdin: i64, stdout: i64, stderr: i64, plain: i32) -> u64;
     fn __relax_tool_wait(handle: u64, block: i32) -> i64;
     fn __relax_tool_release(handle: u64);
 }
@@ -1299,10 +1312,7 @@ impl Child {
         if self.status.is_some() || self.tool.0 != 0 {
             return Ok(());
         }
-        if unsafe { sys::kill(self.pid, sys::SIGKILL) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        self.kill_process()
     }
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
         drop(self.stdin.take());
@@ -1314,6 +1324,34 @@ impl Child {
             self.status = Some(s);
             return Ok(s);
         }
+        self.wait_process()
+    }
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        if let Some(s) = self.status {
+            return Ok(Some(s));
+        }
+        if self.tool.0 != 0 {
+            let code = unsafe { __relax_tool_wait(self.tool.0, 0) };
+            if code < 0 {
+                return Ok(None);
+            }
+            let s = ExitStatus(((code as c_int) & 0xff) << 8);
+            self.status = Some(s);
+            return Ok(Some(s));
+        }
+        self.try_wait_process()
+    }
+    // A process's half, out of line as `spawn_process` is: a confined build script has only
+    // answers (a Child of its `$RUSTC` question), so its code never reaches these.
+    #[inline(never)]
+    fn kill_process(&mut self) -> io::Result<()> {
+        if unsafe { sys::kill(self.pid, sys::SIGKILL) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[inline(never)]
+    fn wait_process(&mut self) -> io::Result<ExitStatus> {
         let mut status: c_int = 0;
         loop {
             let r = unsafe { sys::waitpid(self.pid, &mut status as *mut c_int, 0) };
@@ -1329,19 +1367,8 @@ impl Child {
         self.status = Some(s);
         Ok(s)
     }
-    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        if let Some(s) = self.status {
-            return Ok(Some(s));
-        }
-        if self.tool.0 != 0 {
-            let code = unsafe { __relax_tool_wait(self.tool.0, 0) };
-            if code < 0 {
-                return Ok(None);
-            }
-            let s = ExitStatus(((code as c_int) & 0xff) << 8);
-            self.status = Some(s);
-            return Ok(Some(s));
-        }
+    #[inline(never)]
+    fn try_wait_process(&mut self) -> io::Result<Option<ExitStatus>> {
         let mut status: c_int = 0;
         let r = unsafe { sys::waitpid(self.pid, &mut status as *mut c_int, sys::WNOHANG) };
         if r < 0 {

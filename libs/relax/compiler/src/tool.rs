@@ -9,9 +9,10 @@
 //! closes its ends, so a script that writes to its child's stdin and reads the answer behaves as
 //! with a process. The script waits for it as for a process (`relax_tool_wait`).
 //!
-//! Only option-led questions of the script's own `$RUSTC` are answered here; `$CARGO metadata`,
-//! the script's run and any other program start as processes, and so does every spawn outside a
-//! build script's run.
+//! Every spawn of Relax std asks first, before it builds anything that starts a process. Only
+//! plain spawns (no exec, `pre_exec` closures, user or group) with an option-led question of the
+//! script's own `$RUSTC` are answered here; `$CARGO metadata`, the script's run and any other
+//! program start as processes, and so does every spawn outside a build script's run.
 
 use std::sync::{Condvar, Mutex};
 
@@ -73,11 +74,19 @@ fn adopt(raw: i64, slot: u8) -> Option<std::fs::File> {
     }
 }
 
-/// Relax std's spawn in a build script's run: `argv` the command (the program, then its arguments,
-/// each as `<length>:<bytes>`), `stdin` / `stdout` / `stderr` the ends std made for the child
-/// (-1: this process's own). A handle when the answer runs here (std's Child waits for it), 0
-/// when a process answers (std spawns it).
-pub extern "C" fn relax_tool_spawn(argv: *const u8, len: usize, stdin: i64, stdout: i64, stderr: i64) -> u64 {
+/// `relax_tool_spawn`'s answer for a spawn that is refused: std returns NotFound, as for a program
+/// that is not there, and starts nothing (process_unix.rs / process_windows.rs TOOL_REFUSED).
+pub const TOOL_REFUSED: u64 = u64::MAX;
+
+/// Relax std's spawn: `argv` the command (the program, then its arguments, each as
+/// `<length>:<bytes>`), `stdin` / `stdout` / `stderr` the ends std made for the child (-1: this
+/// process's own), `plain` 0 for an exec or a spawn with `pre_exec` closures, a user or a group. A
+/// handle when the answer runs here (std's Child waits for it), 0 when a process answers (std
+/// spawns it). This host refuses none (`TOOL_REFUSED`).
+pub extern "C" fn relax_tool_spawn(argv: *const u8, len: usize, stdin: i64, stdout: i64, stderr: i64, plain: i32) -> u64 {
+    if plain == 0 {
+        return 0;
+    }
     let mut s = if len == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(argv, len) } };
     let mut words = Vec::new();
     while let Some(colon) = s.iter().position(|&b| b == b':') {
