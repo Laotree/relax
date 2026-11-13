@@ -19554,6 +19554,36 @@ unsafe fn queued_cold(rec: *const AtomicU64, threshold: u64, now: u64) -> Option
     (cost < threshold).then_some(cost)
 }
 
+/// A slot whose O3 build gave way at its take (compile_tier1: a front it needs was not made in the
+/// take's rounds, e.g. right after a patch) counts again in its count stub, from the cost it has:
+/// it was picked on evidence, so queued again it is built at its next pick (PICK_RECOUNTED). Left
+/// queued without its stub, nothing queued it again: hot code stayed below O3 for the rest of the
+/// run. Atomics only, as o3_pick_cold (the take's thread holds no unit lock here).
+unsafe fn count_again_after_bail(up: *mut Unit, id: u32) {
+    let u = &*up;
+    let Some(threshold) = u.tier1.as_ref().map(|t| t.threshold) else { return };
+    if id as usize >= u.fns.len() {
+        return;
+    }
+    let rec = tier_rec(&u.slots, id);
+    if (*rec.add(3)).load(Ordering::Acquire) != T_QUEUED {
+        return;
+    }
+    // (other code in the slot -- its O3 code, a patch's -- fails the exchange: it stays)
+    let (code, stub) = ((*rec.add(1)).load(Ordering::Relaxed), (*rec.add(2)).load(Ordering::Relaxed));
+    let s = SlotWord::of(&u.slots, id);
+    if stub == 0 || s.load(Ordering::SeqCst) != stub && s.compare_exchange(code, stub, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return;
+    }
+    let (now, wall) = tier_clocks();
+    let (cost, _) = tier_cost_now(rec, threshold, now);
+    count_again(rec, threshold, cost, now, wall, true);
+    crate::inspect::tierlog::note_arm(id, crate::inspect::tierlog::ARM_LEFT, code);
+    if tier1_trace() {
+        eprintln!("O3q @{:.3} #{} counts again after its take gave way: cost {} of {}", wall_ns() as f64 / 1e9, id, cost, threshold);
+    }
+}
+
 /// A queued slot whose entry left at its pick counts again in its count stub, from the cost it has
 /// now: code that still runs queues itself again soon. `recount`: it left to be counted again (a
 /// calls entry), and its next pick builds it (PICK_RECOUNTED).
@@ -21457,6 +21487,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let _wants = BuildWants::on();
     let mut waiting: std::collections::HashSet<u32> = Default::default();
     let mut rounds = 0u32;
+    // the take gave way (a front it needs not made in its rounds): the slot counts again
+    let mut bailed = false;
     let mut needs: Vec<u32> = Vec::new();
     // a round's walk state between its publishes, and "the last publish stopped mid-walk"
     let walk = std::cell::RefCell::new(None);
@@ -21771,6 +21803,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             if tier1_trace() {
                 eprintln!("O3 take of #{} bailed: {} (slots {:?})", id, b.what, b.slots);
             }
+            bailed = true;
             break None;
         }
     };
@@ -21892,6 +21925,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     drop(front);
     let t1 = cpu_ns();
     let Some((rir, version, (epoch, host_ver), sandboxed, assembled, callees, inline_all, ro, env, cfg, name, counts, hot_root)) = snapped else {
+        if bailed {
+            count_again_after_bail(up, id);
+        }
         return false;
     };
     let assembled = assembled.unwrap_or_else(|| {
@@ -27379,7 +27415,7 @@ fn give_back_lowered(u: &Unit, id: u32, func: relax_backend::rir::Func) {
         FnKey::Closure(cfile, _, parent) => u.body_of(parent, cfile).cloned(),
         _ => None,
     };
-    let back = LoweredAhead { epoch, file: u.fns[id as usize].file, func, body, callees: Vec::new(), consts: Vec::new(), tls: Vec::new() };
+    let back = LoweredAhead { epoch, file: u.key_file(&u.fns[id as usize].key), func, body, callees: Vec::new(), consts: Vec::new(), tls: Vec::new() };
     u.front.lowered.lock().unwrap_or_else(|e| e.into_inner()).insert(id, LoweredState::Ready(back));
     lowered_end();
 }
@@ -27403,10 +27439,11 @@ fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<relax_backend::rir::Func>
             eprintln!("relax O2: lowering ahead of #{} {} not taken: {}", id, name, why);
         }
     };
-    if crate::boundary::on()
-        || lowered.epoch != u.tcx.collect_epoch.load(Ordering::SeqCst)
-        || lowered.file != u.fns[id as usize].file
-    { refuse("epoch/file"); return None; }
+    if crate::boundary::on() { refuse("boundary"); return None; }
+    if lowered.epoch != u.tcx.collect_epoch.load(Ordering::SeqCst) { refuse("epoch"); return None; }
+    // the file the slot's body is in now (a patch moves an edited file's definitions to its new
+    // version; the slot's own `file` stays the one it was named in)
+    if lowered.file != u.key_file(&u.fns[id as usize].key) { refuse("file"); return None; }
     // the constants it read, as the unit has them now (and this build noted as their reader, as
     // its own lowering would): a value that changed since (a patch) discards the lowering. A
     // constant the unit lost meanwhile is evaluated again here, as the build would have. A static

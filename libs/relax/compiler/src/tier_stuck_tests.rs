@@ -560,6 +560,52 @@ fn a_front_checked_before_a_new_collection_is_made_again() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A patch moves the definitions of the file it edits to the file's new version, and a slot keeps
+/// the file it was named in. The take compared a lowering made ahead (its body's file) with the
+/// slot's own, so after a patch every front of a slot of that file was refused for the rest of the
+/// run: an O3 take that needed one bailed after its rounds (a hot fn of a replaced or streamed
+/// module never reached O3), and builds off the owner lowered it again on the owner. The take asks
+/// for the file the slot's body is in now.
+#[test]
+fn a_front_made_after_a_patch_of_its_file_is_taken() {
+    isolated_test!(a_front_made_after_a_patch_of_its_file_is_taken);
+    crate::borrowck::lazy::disable_gandalf();
+    if std::env::var_os("RELAX_STD").is_none() {
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    }
+    let dir = std::env::temp_dir().join(format!("relax-patched-front-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("input.rs");
+    std::fs::write(&path, TAKE_SOURCE).unwrap();
+    let (prog, core, krate) = crate::load_with_std(&std::sync::Arc::new(crate::Session::default()), path.to_str().unwrap(), "patched_front", false).unwrap();
+    let twice = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = DefId(i as u32);
+        (d.krate == krate && d.kind == DefKind::Fn && prog.name(id) == "twice").then_some(id)
+    }).unwrap();
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    unsafe { UNIT = up };
+    enable_pipelining(&u.prog.session.options);
+    let id = crate::owner::call(crate::owner::Class::Program, || unsafe { (*up).fn_id(FnKey::Inst(twice, Vec::new())) });
+    // the patch edits main: twice's text stays, its definition moves to the file's new version
+    let file = crate::owner::call(crate::owner::Class::Program, || unsafe { (*up).prog.def(twice).file });
+    let patched = TAKE_SOURCE.replace("twice(3)", "twice(4)");
+    let outcome = unsafe { crate::reload::apply(up, vec![crate::reload::Edit { file, path: path.to_string_lossy().into_owned(), src: patched.into_bytes() }]) };
+    assert_eq!(outcome.rung, crate::reload::Rung::Patch, "{:?}", outcome.lines);
+    let (now, named) = crate::owner::call(crate::owner::Class::Program, || unsafe { let u = &*up; (u.prog.def(twice).file, u.fns[id as usize].file) });
+    assert_ne!(now, named, "the patch moved twice to the file's new version, its slot kept the file it was named in");
+    let front = crate::owner::call(crate::owner::Class::Program, || unsafe { (*up).front.clone() });
+    assert!(prefront_slot(&front, id), "the front of twice was not made off the owner after the patch");
+    let taken = crate::owner::call(crate::owner::Class::Program, || unsafe { take_lowered_ahead(&mut *up, id).is_some() });
+    assert!(taken, "the lowering made ahead for twice after the patch was refused at its take");
+    // (process exit owns the runtime's teardown)
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 const LEFT_SOURCE: &str = r#"
 const K1: u32 = 40 + 2;
 const K2: u32 = 6 * 7;
