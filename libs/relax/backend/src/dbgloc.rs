@@ -242,7 +242,7 @@ pub struct Frame<'a> {
     /// registers a call sequence may write besides its argument registers (scratch, target)
     pub call_writes: &'a [u8],
     pub spill_fp: &'a dyn Fn(i32) -> i32,
-    pub slot_fp: &'a dyn Fn(u32) -> i32,
+    pub slot_fp: &'a dyn Fn(u32) -> Option<i32>,
 }
 
 /// Builds the table of `f` (after allocation `al`) for the calls the emitter placed: `calls`
@@ -265,8 +265,8 @@ pub fn build(f: &Func, al: &Alloc, fr: &Frame, calls: &[(u32, u32)]) -> Vec<u8> 
         slots.resize(f.slots.len(), None);
         let mut ranges = Vec::new();
         for (s, used) in used_slots(f).into_iter().enumerate() {
-            if used {
-                let at = (fr.slot_fp)(s as u32);
+            // (a slot with no fixed home -- an over-aligned one, where its cell points -- holds none)
+            if let Some(at) = used.then(|| (fr.slot_fp)(s as u32)).flatten() {
                 slots[s] = Some((at, false));
                 ranges.push((at as i64, at as i64 + f.slots[s].size as i64, s));
             }

@@ -898,6 +898,11 @@ struct Gen<'a> {
     /// bytes of callee-saved registers below fp
     saved: i64,
     slot_off: Vec<i64>,
+    /// per slot: the sp offset of the cell that holds its aligned address when its alignment
+    /// is above the frame base's (frame::FRAME_BASE_ALIGN; -1: its slot_off is its address)
+    slot_cell: Vec<i64>,
+    /// the over-aligned storages the prologue aligns: (start sp offset, alignment, cell)
+    realign: Vec<(i64, u32, i64)>,
     /// per value: its frame position when it is a slot address (frame::slot_addr_positions)
     slot_pos: Vec<i64>,
     block_pos: Vec<usize>,
@@ -1039,10 +1044,7 @@ impl<'a> Gen<'a> {
         match k {
             // never xzr for 0: register 31 is sp in add-immediate and address operands
             Remat::Const(k) => self.a.mov_imm(r, k),
-            Remat::Slot(s) => {
-                let off = self.slot_off[s as usize];
-                self.a.add_any(r, SP, off);
-            }
+            Remat::Slot(s) => self.slot_addr_into(r, s),
             Remat::Addr(a) => self.ldr_reloc(r, Reloc::Sym(a)),
             Remat::FnAddr(id) => self.ldr_reloc(r, Reloc::Thunk(id)),
             Remat::Offset(..) => unreachable!("base + k moves through use_i"),
@@ -1058,10 +1060,23 @@ impl<'a> Gen<'a> {
             r => unreachable!("float move from {:?}", r),
         }
     }
-    /// A stack-slot address without a register (Alloc::remat) as a load/store base: sp + its offset.
+    /// Slot `s`'s address into r: sp + its offset, or an over-aligned storage's cell
+    fn slot_addr_into(&mut self, r: u8, s: u32) {
+        match self.slot_cell[s as usize] {
+            -1 => self.a.add_any(r, SP, self.slot_off[s as usize]),
+            cell if cell < 8 * 4096 => self.a.ldst(LDRX, 8, r, SP, cell),
+            // (a far cell through r itself: ldst's far form would take ip1, which may be live here)
+            cell => {
+                self.a.add_any(r, SP, cell);
+                self.a.ldst(LDRX, 8, r, r, 0);
+            }
+        }
+    }
+    /// A stack-slot address without a register (Alloc::remat) as a load/store base: sp + its
+    /// offset (an over-aligned one is no fixed offset: its cell is loaded as a register's value).
     fn slot_base(&self, base: VReg) -> Option<i64> {
         match (self.al.loc[base.0 as usize], self.al.remat[base.0 as usize]) {
-            (Loc::None, Remat::Slot(s)) => Some(self.slot_off[s as usize]),
+            (Loc::None, Remat::Slot(s)) if self.slot_cell[s as usize] < 0 => Some(self.slot_off[s as usize]),
             _ => None,
         }
     }
@@ -1249,8 +1264,24 @@ impl<'a> Gen<'a> {
         // only slots something addresses take space (SROA and inlining leave many unreferenced:
         // the Splash VM's O3 opcode() had 1749 slots, 515 in use); slots whose lifetimes cannot
         // overlap share it (frame::slot_layout)
-        let (slot_fp, mut off) = crate::frame::slot_layout_aligned(self.f, self.saved + self.al.spill_bytes as i64, !crate::stats::opt_off(options, "-slotcolor"), if crate::stats::opt_off(options, "-a64slotalign") { |_| 1 } else { a64_slot_align });
+        let (slot_fp, mut off, over) = crate::frame::slot_layout_aligned(self.f, self.saved + self.al.spill_bytes as i64, !crate::stats::opt_off(options, "-slotcolor"), if crate::stats::opt_off(options, "-a64slotalign") { |_| 1 } else { a64_slot_align }, true);
         self.slot_pos = crate::frame::slot_addr_positions(self.f, &slot_fp);
+        // a storage aligned above fp's 16 (laid out with room for it): its aligned address, made
+        // once by the prologue, in a cell every address of its slots loads (fp offsets for now)
+        let mut cell_fp = vec![-1i64; slot_fp.len()];
+        let mut over_fp: Vec<(i64, u32, i64)> = Vec::new();
+        for s in 0..slot_fp.len() {
+            if over[s] == 0 {
+                continue;
+            }
+            if let Some(&(_, _, cell)) = over_fp.iter().find(|r| r.0 == slot_fp[s]) {
+                cell_fp[s] = cell;
+                continue;
+            }
+            off = (off + 7) / 8 * 8 + 8;
+            over_fp.push((slot_fp[s], over[s], off));
+            cell_fp[s] = off;
+        }
         // C ABI body: buffers that rebuild aggregate params from their registers, and the
         // buffer an aggregate result is written to before Ret loads it into registers
         let mut cbuf_fp: Vec<i64> = Vec::new();
@@ -1327,6 +1358,8 @@ impl<'a> Gen<'a> {
         for x in slot_fp {
             self.slot_off.push(frame - x);
         }
+        self.slot_cell = cell_fp.iter().map(|&c| if c < 0 { -1 } else { frame - c }).collect();
+        self.realign = over_fp.iter().map(|&(start, align, cell)| (frame - start, align, frame - cell)).collect();
         for x in cbuf_fp {
             self.cbuf.push(if x < 0 { -1 } else { frame - x });
         }
@@ -1340,6 +1373,14 @@ impl<'a> Gen<'a> {
             self.stack_probe(frame);
             self.a.add_any(SP, SP, -frame);
             self.callee_saves(true);
+            // (ip0: no argument; ldst's far offsets take ip1)
+            for (start, align, cell) in self.realign.clone() {
+                let k = align.trailing_zeros();
+                self.a.add_any(IP0, SP, start + align as i64 - 1);
+                self.a.ubfm(IP0, IP0, k, 63);
+                self.a.ubfm(IP0, IP0, 64 - k, 63 - k);
+                self.a.ldst(STRX, 8, IP0, SP, cell);
+            }
             self.tail = crate::tail::sibling_calls(options, self.f, &reach, crate::tail::Arch::Arm64);
             if self.dom_read.first() == Some(&true) {
                 self.dom_base();
@@ -4357,8 +4398,7 @@ impl<'a> Gen<'a> {
             }
             Inst::SlotAddr(d, s) => {
                 let rd = self.def_i(*d, S0);
-                let off = self.slot_off[*s as usize];
-                self.a.add_any(rd, SP, off);
+                self.slot_addr_into(rd, *s);
                 self.fin_i(*d, rd);
             }
             Inst::Addr(d, sym) => {
@@ -5688,6 +5728,8 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         tail: Vec::new(),
         saved: 0,
         slot_off: Vec::new(),
+        slot_cell: Vec::new(),
+        realign: Vec::new(),
         slot_pos: Vec::new(),
         block_pos: Vec::new(),
         next_block: Vec::new(),
@@ -5763,10 +5805,11 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // where the named locals are at each call (makepad inspect `locals`; side metadata)
     let mut pc_map = std::mem::take(&mut g.pc_map);
     if !g.f.naked && !g.f.dbg.is_empty() {
-        let (saved, fsz, slot_off) = (g.saved, g.frame, &g.slot_off);
+        let (saved, fsz, slot_off, slot_cell) = (g.saved, g.frame, &g.slot_off, &g.slot_cell);
         // sp = fp - frame in the body
         let spill = |o: i32| -(saved as i32 + o);
-        let slot = |s: u32| (slot_off[s as usize] - fsz) as i32;
+        // (an over-aligned slot is where its cell points: no fixed home)
+        let slot = |s: u32| (slot_cell[s as usize] < 0).then(|| (slot_off[s as usize] - fsz) as i32);
         let fr = crate::dbgloc::Frame { callee_int: &cfg.int_callee, callee_flt: &cfg.flt_callee, arg_regs: &[0, 1, 2, 3, 4, 5, 6, 7], captured: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], call_writes: &[S0, S1, IP0, IP1], spill_fp: &spill, slot_fp: &slot };
         let vars = crate::dbgloc::build(g.f, &g.al, &fr, &g.var_calls);
         let e = crate::dbgloc::pc_entries(&vars, g.f.file);

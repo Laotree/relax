@@ -1128,6 +1128,7 @@ const I32_EQZ: u8 = 0x45;
 const I64_EQZ: u8 = 0x50;
 const I32_ADD: u8 = 0x6A;
 const I32_SUB: u8 = 0x6B;
+const I32_AND: u8 = 0x71;
 const I64_AND: u8 = 0x83;
 const I64_ADD: u8 = 0x7C;
 const I64_SUB: u8 = 0x7D;
@@ -1974,14 +1975,18 @@ fn lower_func(o: &Options, options: &relax_session::Options, f: &Func, me: usize
         }
     }
     // the frame first: rematerialising a slot address prices its offset (plan_remat)
-    let (slot_at, end) = crate::frame::slot_layout(f, 0, true);
-    let frame = ((end + 15) & !15) as u32;
+    // (a slot aligned above 16: the frame pointer is aligned to the largest such alignment, the
+    // caller's stack pointer kept in a local to restore it, and the frame a multiple of it)
+    let (slot_at, end, over) = crate::frame::slot_layout(f, 0, true, false);
+    let realign = over.iter().copied().max().unwrap_or(0) as i64;
+    let to = realign.max(16);
+    let frame = ((end + to - 1) / to * to) as u32;
     fx.slot_at = slot_at;
     fx.frame = frame;
     fx.plan_folds();
     let has_invoke = f.blocks.iter().any(|b| matches!(b.term, Term::Invoke(..)));
     let n_ret = fx.cfg.rpo.iter().filter(|b| matches!(f.blocks[**b as usize].term, Term::Ret(_))).count();
-    let want_sp0 = o.sp0 && frame > 0 && n_ret >= 2;
+    let want_sp0 = frame > 0 && (o.sp0 && n_ret >= 2 || realign > 0);
     let locals = fx.colour(frame > 0 || has_invoke, want_sp0)?;
     // locals declaration
     let mut body = Vec::new();
@@ -2008,6 +2013,10 @@ fn lower_func(o: &Options, options: &relax_session::Options, f: &Func, me: usize
         }
         fx.aconst(frame as i64);
         fx.a_op(I32_SUB, I64_SUB);
+        if realign > 0 {
+            fx.aconst(-realign);
+            fx.a_op(I32_AND, I64_AND);
+        }
         fx.out.push(LTEE);
         let fp = fx.fp;
         uleb(&mut fx.out, fp as u64);

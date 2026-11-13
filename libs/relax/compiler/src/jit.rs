@@ -16578,7 +16578,7 @@ fn dump_o1(func: &relax_backend::rir::Func, c: &x64::Compiled) {
         let _ = std::fs::write(format!("{}.bin", base), &c.code[..c.text_len as usize]);
         let _ = std::fs::write(format!("{}.rir", base), func.dump());
         let _ = std::fs::write(format!("{}.emit.rir", base), &c.rir_emitted);
-        let (at, end) = relax_backend::frame::slot_layout(func, 0, true);
+        let (at, end, _) = relax_backend::frame::slot_layout(func, 0, true, true);
         let mut m = format!("frame {} slot-area {} of {}\n", c.frame_size, end, slot_bytes(func));
         for (k, sl) in func.slots.iter().enumerate() {
             m.push_str(&format!("slot {} {} {} at {}{}\n", k, sl.size, sl.align, at[k], if sl.arg { " arg" } else { "" }));
@@ -21806,7 +21806,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             static EACH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let base = if *EACH.get_or_init(|| std::env::var("RELAX_DUMP_EACH").is_ok()) { format!("{}_{}", base, c.text_len) } else { base };
             let _ = std::fs::write(format!("{}.t1.bin", base), &c.code[..c.text_len as usize]);
-            let _ = std::fs::write(format!("{}.t1.frame", base), format!("frame {} slot-area {} of {}\nslots (size/align): {}\n", c.frame_size, relax_backend::frame::slot_layout(&func, 0, true).1, slot_bytes(&func),
+            let _ = std::fs::write(format!("{}.t1.frame", base), format!("frame {} slot-area {} of {}\nslots (size/align): {}\n", c.frame_size, relax_backend::frame::slot_layout(&func, 0, true, true).1, slot_bytes(&func),
                 func.slots.iter().enumerate().map(|(i, x)| format!("{}:{}/{}", i, x.size, x.align)).collect::<Vec<_>>().join(" ")));
             let _ = std::fs::write(format!("{}.t1.rir", base), func.dump());
             // offset<TAB>block<TAB>instruction (- = terminator)<TAB>source position, per emitted RIR

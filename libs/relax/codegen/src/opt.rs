@@ -7525,7 +7525,8 @@ mod slot_layout_tests {
         for b in &mut f.blocks {
             b.pos = vec![0; b.insts.len()];
         }
-        slot_layout(&f, 0, true)
+        let (at, end, _) = slot_layout(&f, 0, true, true);
+        (at, end)
     }
 
     #[test]
@@ -7579,7 +7580,7 @@ mod slot_layout_tests {
         inline_site(&mut f, 0, 3, &callee, &[a], &[], &|_| false, false);
         f.verify().unwrap();
         assert!(!f.slots[s as usize].arg);
-        let (at, _) = slot_layout(&f, 0, true);
+        let (at, _, _) = slot_layout(&f, 0, true, true);
         assert_ne!(at[0], at[1]);
     }
 
@@ -7596,14 +7597,14 @@ mod slot_layout_tests {
         ];
         f.blocks[0].term = Term::Ret(vec![x]);
         f.blocks[0].pos = vec![0; 6];
-        let (at, end) = slot_layout(&f, 0, true);
+        let (at, end, _) = slot_layout(&f, 0, true, true);
         assert_eq!((at[0], end), (at[1], 128));
         // a partial copy (offset 8 into the destination) leaves them apart
         let off = f.vreg(Cls::I);
         f.blocks[0].insts[4] = Inst::Copy(off, a, 16);
         f.blocks[0].insts.insert(4, Inst::IBinI(IOp::Add, U64, off, b, 8));
         f.blocks[0].pos.push(0);
-        let (at, _) = slot_layout(&f, 0, true);
+        let (at, _, _) = slot_layout(&f, 0, true, true);
         assert_ne!(at[0], at[1]);
     }
 
