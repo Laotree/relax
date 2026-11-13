@@ -4406,7 +4406,8 @@ impl<'a> Parser<'a> {
     pub fn ty(&mut self) -> PResult<TyId> {
         self.ty_inner(false)
     }
-    fn ty_plus(&mut self) -> PResult<TyId> {
+    /// rustc parse_ty: a type where `+` bounds may follow (a `$t:ty` fragment, a generic argument)
+    pub(crate) fn ty_plus(&mut self) -> PResult<TyId> {
         self.ty_inner(true)
     }
 

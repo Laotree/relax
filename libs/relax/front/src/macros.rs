@@ -3578,7 +3578,9 @@ impl<'a> Parser<'a> {
                     }),
                     // `...` is no type start (rustc Token::can_begin_type): only a C-variadic parameter
                     Frag::Ty if k == T::DotDotDot => Err(crate::parser::PErr { pos: self.toks.at(i).lo, msg: "expected a type".to_string() }),
-                    Frag::Ty => self.ty().map(|_| ()),
+                    // rustc_parse nonterminal.rs: `ty` is parse_ty_no_question_mark_recover, `+`
+                    // bounds allowed (a bare `Display + Send` is one type)
+                    Frag::Ty => self.ty_plus().map(|_| ()),
                     Frag::Pat => self.pat_top().map(|_| ()),
                     Frag::PatParam => self.pat_no_or().map(|_| ()),
                     Frag::Path => self.path(false).map(|_| ()),
