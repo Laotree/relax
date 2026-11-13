@@ -27011,9 +27011,11 @@ fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<relax_backend::rir::Func>
     { refuse("epoch/file"); return None; }
     // the constants it read, as the unit has them now (and this build noted as their reader, as
     // its own lowering would): a value that changed since (a patch) discards the lowering. A
-    // constant the unit lost meanwhile is evaluated again here, as the build would have.
+    // constant the unit lost meanwhile is evaluated again here, as the build would have. A static
+    // read ahead (FrontShared::consts) is the same when it is still initialized there; an extern
+    // one (a link section's bound, a symbol) is a static too: it has no initializer to evaluate.
     for (d, args, a) in std::mem::take(&mut lowered.consts) {
-        let same = if u.prog.def(d).kind == DefKind::Static { u.static_ready(d, a) } else { u.const_addr(d, args) == Some(a) };
+        let same = if matches!(u.prog.def(d).kind, DefKind::Static | DefKind::ForeignStatic) { u.static_ready(d, a) } else { u.const_addr(d, args) == Some(a) };
         if !same {
             refuse("constant changed");
             return None;
