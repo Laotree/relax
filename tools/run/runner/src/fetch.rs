@@ -101,8 +101,8 @@ fn newest(home: &Path, spec: &Spec) -> Option<Snapshot> {
             parts.push((dir, path, pinned));
             continue;
         }
-        // the newest fetch of this ref; any ref of the repository when that one was never fetched
-        parts.push((dir, path, relax_compiler::git::fetch::newest(&s, &repo.ref_key())?));
+        // the newest fetch of this ref from this URL; any ref of it when that one was never fetched
+        parts.push((dir, path, relax_compiler::git::fetch::newest(&s, &repo.url, &repo.ref_key())?));
     }
     Some(Snapshot { label: label(spec), parts })
 }

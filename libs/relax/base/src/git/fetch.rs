@@ -76,7 +76,7 @@ impl Repo {
         let name: String = last.trim_end_matches(".git").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
         if name.is_empty() { "repo".into() } else { name }
     }
-    /// The store's key of the ref (the snapshot policy keeps the two newest fetches per key).
+    /// The ref a store records its fetches under, after the URL (`stored_key`).
     pub fn ref_key(&self) -> String {
         self.reference.clone().unwrap_or_else(|| "HEAD".into())
     }
@@ -116,9 +116,18 @@ pub(super) fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-/// The newest kept fetch of `key` (any ref's newest when that key was never fetched).
-pub fn newest(s: &store::Store, key: &str) -> Option<Oid> {
-    s.index.refs.iter().filter(|r| r.key == key).max_by_key(|r| r.time).or_else(|| s.index.refs.iter().max_by_key(|r| r.time)).map(|r| r.commit)
+/// What a store records a fetch under: the URL it came from and its ref (`<url>#<ref>`). A
+/// store answers only for its own URL: a fetch recorded under another never serves this one.
+fn stored_key(url: &str, reference: &str) -> String {
+    format!("{}#{reference}", url.trim_end_matches('/'))
+}
+
+/// The newest kept fetch of `reference` from `url` (this URL's newest fetch of any ref when that
+/// one was never fetched; never another URL's).
+pub fn newest(s: &store::Store, url: &str, reference: &str) -> Option<Oid> {
+    let (key, from_url) = (stored_key(url, reference), stored_key(url, ""));
+    let newest_of = |keep: &dyn Fn(&store::Ref) -> bool| s.index.refs.iter().filter(|r| keep(r)).max_by_key(|r| r.time).map(|r| r.commit);
+    newest_of(&|r| r.key == key).or_else(|| newest_of(&|r| r.key.starts_with(&from_url)))
 }
 
 /// Records `commit` (its path table already in the store) under `key`, unless the ref's newest
@@ -139,7 +148,7 @@ fn record(path: &Path, existing: &store::Store, key: &str, commit: Oid) -> Resul
 pub fn fetch_repo(cache: &Path, repo: &Repo) -> Result<Oid, String> {
     let path = store::store_path(cache, &repo.url);
     let existing = store::Store::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let key = repo.ref_key();
+    let key = stored_key(&repo.url, &repo.ref_key());
     // a pinned commit already in the store, or its pack already downloaded: no remote request
     if let Some(pinned) = repo.commit.as_deref().and_then(store::from_hex) {
         if let Some(s) = &existing {
@@ -167,7 +176,7 @@ pub fn fetch_repo(cache: &Path, repo: &Repo) -> Result<Oid, String> {
         // a usable commit is kept), and the run says so
         Err(e) => {
             let s = existing.as_ref().ok_or_else(|| e.clone())?;
-            let c = newest(s, &key).ok_or(e.clone())?;
+            let c = newest(s, &repo.url, &repo.ref_key()).ok_or(e.clone())?;
             let wanted = repo.commit.as_deref().map(|w| format!(" (wanted {})", &w[..w.len().min(12)])).unwrap_or_default();
             crate::progress::note(&format!("{} unreachable ({e}): running {} from the store{wanted}", host(&repo.url), &store::hex(&c)[..12]));
             Ok(c)
@@ -329,7 +338,8 @@ impl GitRef {
         }
     }
 
-    /// The store's ref key (the runner's spelling for the default branch and for refs).
+    /// The ref a store records its fetches under, after the URL (`stored_key`; the runner's
+    /// spelling for the default branch and for refs).
     fn key(&self) -> String {
         match self {
             GitRef::DefaultBranch => "HEAD".into(),
@@ -353,7 +363,7 @@ pub fn fetch_source(cache: &Path, url: &str, r: &GitRef, locked: Option<Oid>, of
     check_url(url)?;
     let path = store::store_path(cache, url);
     let existing = store::Store::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let key = r.key();
+    let (name, key) = (r.key(), stored_key(url, &r.key()));
     let home = super::cargo::home();
     let offline = offline || self::offline()?;
     let locked = locked.or_else(|| match r { GitRef::Rev(rev) => store::from_hex(&rev.to_ascii_lowercase()), _ => None });
@@ -372,7 +382,7 @@ pub fn fetch_source(cache: &Path, url: &str, r: &GitRef, locked: Option<Oid>, of
         fetch_commit(&path, existing.as_ref(), url, &adv, c, &key)?;
         return Ok(c);
     }
-    let adv = match if offline { Err(super::cargo::missing(&home, url, &key)) } else { advertisement(url) } {
+    let adv = match if offline { Err(super::cargo::missing(&home, url, &name)) } else { advertisement(url) } {
         Ok(a) => a,
         Err(e) => {
             // a commit id (or an abbreviation of one) the store holds needs no remote; a ref is the
@@ -385,7 +395,7 @@ pub fn fetch_source(cache: &Path, url: &str, r: &GitRef, locked: Option<Oid>, of
                 }
                 _ => s.index.refs.iter().filter(|x| x.key == key).max_by_key(|x| x.time).map(|x| x.commit),
             });
-            let c = kept.ok_or_else(|| format!("{e} (and the store keeps no fetch of {key})"))?;
+            let c = kept.ok_or_else(|| format!("{e} (and the store keeps no fetch of {name})"))?;
             crate::progress::note(&format!("{} unreachable ({e}): {} {} from the store", host(url), url, &store::hex(&c)[..12]));
             return Ok(c);
         }
@@ -466,4 +476,44 @@ fn fetch_short_rev(path: &Path, existing: Option<&store::Store>, url: &str, adv:
     };
     store::append(path, store::Append { objects: &objects, reference: store::Ref { key: key.to_string(), commit, time: now() } }, &keep_two)?;
     Ok(commit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store answers only for the URL it was fetched from: its name holds the URL's whole hash
+    /// (with 8 hex digits a URL made to collide shared another's store), and a fetch another URL
+    /// recorded in it never serves this URL's --cached or offline run, neither as its ref nor as
+    /// the fallback for a ref this URL never fetched.
+    #[test]
+    fn a_store_answers_only_for_its_own_url() {
+        let dir = std::env::temp_dir().join(format!("relax-store-url-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (ours, theirs) = ("https://example.com/org/app", "https://example.org/x/app");
+        let path = store::store_path(&dir, ours);
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), format!("git-app-{}.store", store::hex(&store::sha1(ours.as_bytes()))), "the store's name holds the URL's whole hash");
+        let obj = |kind: &str, data: &[u8]| {
+            let mut h = format!("{kind} {}\0", data.len()).into_bytes();
+            h.extend_from_slice(data);
+            store::sha1(&h)
+        };
+        let tree = obj("tree", b"");
+        let fetch = |url: &str, reference: &str, msg: &str, time: u64| {
+            let c = format!("tree {}\nauthor a <a> 0 +0000\ncommitter a <a> 0 +0000\n\n{msg}\n", store::hex(&tree)).into_bytes();
+            let oid = obj("commit", &c);
+            let objects = [(tree, store::TREE, Vec::new()), (oid, store::COMMIT, c)];
+            store::append(&path, store::Append { objects: &objects, reference: store::Ref { key: stored_key(url, reference), commit: oid, time } }, &keep_two).unwrap();
+            oid
+        };
+        let other = fetch(theirs, "HEAD", "theirs", 2);
+        let s = store::Store::open(&path).unwrap().unwrap();
+        assert_eq!(newest(&s, ours, "HEAD"), None, "another URL's fetch in this store serves this URL");
+        assert_eq!(newest(&s, theirs, "HEAD"), Some(other), "a URL's own fetch serves it");
+        let own = fetch(ours, "refs/heads/dev", "ours", 1);
+        let s = store::Store::open(&path).unwrap().unwrap();
+        assert_eq!(newest(&s, ours, "refs/heads/dev"), Some(own), "a URL's own fetch of the ref serves it");
+        assert_eq!(newest(&s, ours, "HEAD"), Some(own), "a ref never fetched takes this URL's newest fetch, never another URL's newer one");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
