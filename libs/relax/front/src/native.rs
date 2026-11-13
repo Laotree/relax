@@ -450,24 +450,25 @@ pub fn build(g: &Graph, seeds: &[usize], req: &Request) -> Result<Built, String>
     // named before anything is read or built under it: a prune from now on keeps it
     write_root(req, &plan)?;
     let flags: Vec<&String> = plan.flags.iter().collect();
-    let out = match std::fs::read_to_string(&plan.messages_path).ok().and_then(|m| cached(&g.pkg, &script_table(g), seeds, &m, &plan.lib_path)) {
-        Some(out) => out,
+    let (out, messages) = match std::fs::read_to_string(&plan.messages_path).ok().and_then(|m| cached(&g.pkg, &script_table(g), seeds, &m, &plan.lib_path)) {
+        Some(out) => (out, None),
         None => {
             let m = run_cargo(g, req, &exe, &flags, &plan.script_pkgs, &plan.lib_pkgs, seeds, Tier::Fast)?;
             std::fs::create_dir_all(&plan.dir).map_err(|e| format!("{}: {}", plan.dir, e))?;
-            std::fs::write(&plan.fast_mark, b"").map_err(|e| format!("{}: {}", plan.fast_mark, e))?;
-            std::fs::write(&plan.messages_path, &m).map_err(|e| format!("{}: {}", plan.messages_path, e))?;
-            // a stale library of an earlier link under this key is not trusted
-            let _ = std::fs::remove_file(&plan.lib_path);
-            outputs(g, seeds, &m)?
+            (outputs(g, seeds, &m)?, Some(m))
         }
     };
-    if out.archives.is_empty() && out.dylibs.is_empty() && out.frameworks.is_empty() {
-        return Ok(Built { scripts: out.scripts, lib: None });
-    }
-    if !std::path::Path::new(&plan.lib_path).is_file() {
+    let no_library = out.archives.is_empty() && out.dylibs.is_empty() && out.frameworks.is_empty();
+    if !no_library && (messages.is_some() || !std::path::Path::new(&plan.lib_path).is_file()) {
+        // link publishes atomically: retain the old library and receipt until this succeeds.
         link(&plan.lib_path, &out, req.triple, req.resolvable)?;
     }
+    if let Some(messages) = messages {
+        std::fs::write(&plan.fast_mark, b"").map_err(|e| format!("{}: {e}", plan.fast_mark))?;
+        let tmp = format!("{}.tmp{}", plan.messages_path, std::process::id());
+        std::fs::write(&tmp, messages).and_then(|_| std::fs::rename(&tmp, &plan.messages_path)).map_err(|e| format!("{}: {e}", plan.messages_path))?;
+    }
+    if no_library { return Ok(Built { scripts: out.scripts, lib: None }); }
     if std::path::Path::new(&plan.fast_mark).is_file() {
         optimize_later(g, req, exe, &flags, plan.script_pkgs, plan.lib_pkgs, seeds, &out, plan.lib_path.clone(), plan.fast_mark);
     }
