@@ -630,7 +630,7 @@ pub struct Program {
     /// would cost more than it saves (set by jit::Unit::new)
     pub body_memos: std::sync::atomic::AtomicBool,
     /// traits each module's scope binds, with visibility (after import resolution)
-    trait_bind_cache: crate::conc::MemoMap<u32, std::sync::Arc<Vec<(DefId, BindVis)>>>,
+    trait_bind_cache: crate::conc::MemoMap<u32, std::sync::Arc<Vec<TraitBinding>>>,
     /// imports are resolved (glob results no longer change)
     pub imports_done: bool,
     /// Rust file selection: imports left unresolved because their lookup stops in
@@ -2190,7 +2190,7 @@ impl Program {
         let uses = |v: &MemoUses| v.as_ref().map_or(0, |u| u.len() * std::mem::size_of::<MemoUse>());
         push("scope_cache", self.scope_cache.mem_stats(|_, v| uses(&v.1)));
         push("glob_cache", self.glob_cache.mem_stats(|_, v| uses(&v.1)));
-        push("trait_bind_cache", self.trait_bind_cache.mem_stats(|_, v| 40 + v.capacity() * std::mem::size_of::<(DefId, BindVis)>()));
+        push("trait_bind_cache", self.trait_bind_cache.mem_stats(|_, v| 40 + v.capacity() * std::mem::size_of::<TraitBinding>()));
         push("trait_scope", self.trait_scope.mem_stats(|_, v| 64 + v.capacity() * 5));
         out
     }
@@ -5398,7 +5398,7 @@ impl Program {
     /// traits_in_scope over the module's resolutions).
     fn module_traits(&self, m: u32, set: &mut crate::fxhash::HashSet<DefId>, visiting: &mut Vec<u32>) {
         let _ = visiting;
-        for &(d, _) in self.module_trait_bindings(m, &mut TraitQuery::default()).iter() {
+        for &(d, _, _) in self.module_trait_bindings(m, &mut TraitQuery::default()).iter() {
             set.insert(d);
         }
     }
@@ -5411,7 +5411,7 @@ impl Program {
     /// cycle is a fixpoint as in lookup_in_module_vis: a module still being walked gives the
     /// previous pass's set (empty in the first pass); a pass whose given sets differ from those
     /// modules' final sets runs again. Only the converged root set is cached.
-    fn module_trait_bindings(&self, m: u32, q: &mut TraitQuery) -> std::sync::Arc<Vec<(DefId, BindVis)>> {
+    fn module_trait_bindings(&self, m: u32, q: &mut TraitQuery) -> std::sync::Arc<Vec<TraitBinding>> {
         if !q.open.is_empty() {
             return self.module_trait_bindings_pass(m, q);
         }
@@ -5436,7 +5436,7 @@ impl Program {
         unreachable!()
     }
 
-    fn module_trait_bindings_pass(&self, m: u32, q: &mut TraitQuery) -> std::sync::Arc<Vec<(DefId, BindVis)>> {
+    fn module_trait_bindings_pass(&self, m: u32, q: &mut TraitQuery) -> std::sync::Arc<Vec<TraitBinding>> {
         if q.open.contains(&m) {
             let given = q.prev.get(&m).cloned().unwrap_or_default();
             q.hits.push((m, given.clone()));
@@ -5452,16 +5452,16 @@ impl Program {
         }
         q.open.push(m);
         let md = &self.mods[m as usize];
-        let mut out: Vec<(DefId, BindVis)> = Vec::new();
+        let mut out: Vec<TraitBinding> = Vec::new();
         let mut names: Vec<(&Sym, &DefId)> = md.types.iter().collect();
         names.sort_by_key(|x| *x.0);
         for (n, d) in names {
             if self.def(*d).kind == DefKind::Trait {
-                out.push((*d, self.binding_vis(m, *n, true, *d)));
+                out.push((*d, self.binding_vis(m, *n, true, *d), Some(*n)));
             }
         }
         for &(d, p) in &md.anon_traits {
-            out.push((d, if p { None } else { Some(md.normal) }));
+            out.push((d, if p { None } else { Some(md.normal) }, None));
         }
         for &(g, gpub) in &md.globs {
             let gd = self.def(g);
@@ -5470,20 +5470,22 @@ impl Program {
             }
             let gv = if gpub { None } else { Some(md.normal) };
             let inner = self.module_trait_bindings_pass(gd.sub, q);
-            for &(d, v) in inner.iter() {
-                // a glob-imported trait whose name an explicit binding of this module shadows
-                // is not in scope (rustc: its methods are unavailable)
-                if md.types.get(&self.def(d).name).is_some_and(|x| *x != d) { continue; }
+            for &(d, v, name) in inner.iter() {
+                // a glob-imported trait whose binding name an explicit binding of this module
+                // shadows is not in scope (rustc: its methods are unavailable); an `as _`
+                // binding has no name, so nothing shadows it (rustc_resolve: underscore
+                // imports get a fresh gensym'd name)
+                if name.is_some_and(|n| md.types.get(&n).is_some_and(|x| *x != d)) { continue; }
                 if self.vis_visible(v, m) {
                     let v = self.vis_min(gv, v);
-                    // one entry per trait, the most visible binding
-                    match out.iter().position(|x| x.0 == d) {
+                    // one entry per trait and binding name, the most visible binding
+                    match out.iter().position(|x| x.0 == d && x.2 == name) {
                         Some(i) => {
                             if self.vis_wider(v, out[i].1) {
                                 out[i].1 = v;
                             }
                         }
-                        None => out.push((d, v)),
+                        None => out.push((d, v, name)),
                     }
                 }
             }
@@ -6798,12 +6800,16 @@ struct GlobQuery {
 }
 
 /// One walk of trait bindings through glob imports (see GlobQuery).
+/// A trait a module's scope binds: the trait, the binding's visibility and its name (None for
+/// an `as _` import, which no other binding can shadow).
+type TraitBinding = (DefId, BindVis, Option<Sym>);
+
 #[derive(Default)]
 struct TraitQuery {
-    memo: HashMap<u32, std::sync::Arc<Vec<(DefId, BindVis)>>>,
-    prev: HashMap<u32, std::sync::Arc<Vec<(DefId, BindVis)>>>,
+    memo: HashMap<u32, std::sync::Arc<Vec<TraitBinding>>>,
+    prev: HashMap<u32, std::sync::Arc<Vec<TraitBinding>>>,
     open: Vec<u32>,
-    hits: Vec<(u32, std::sync::Arc<Vec<(DefId, BindVis)>>)>,
+    hits: Vec<(u32, std::sync::Arc<Vec<TraitBinding>>)>,
 }
 
 crate::memo_local! {
