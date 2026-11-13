@@ -4764,11 +4764,11 @@ pub fn prune_root(root: &std::path::Path) -> (u64, u64) {
     let cap = std::env::var("RELAX_CACHE_MAX").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20);
     let sizes = prune(root, &crate::store::live(), &crate::store::open_files(), &crate::store::programs(), cap);
     let since = std::time::SystemTime::now().checked_sub(IN_USE_BY_OTHERS).unwrap_or(std::time::UNIX_EPOCH);
-    let native = crate::native::prune(&root.join("native"), since);
+    let native = crate::native::prune(&root.join("native"), since, false);
     if native > 0 && std::env::var_os("RELAX_CACHE_TRACE").is_some() {
         eprintln!("relax cache: pruned {native} native build director(ies) no root names");
     }
-    let build = crate::unitgraph::prune_build(&root.join("build"), since);
+    let build = crate::unitgraph::prune_build(&root.join("build"), since, false);
     if build > 0 && std::env::var_os("RELAX_CACHE_TRACE").is_some() {
         eprintln!("relax cache: pruned {build} build script director(ies) no root names");
     }

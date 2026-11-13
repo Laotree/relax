@@ -1066,11 +1066,15 @@ fn write_root(req: &Request, plan: &Plan) -> Result<(), String> {
 /// Keeps `native/` to what the roots name (module doc: roots): every other key's directory and
 /// cargo selection goes, unless it changed since `since` (a build of a Relax without roots may
 /// be in flight there), and so does the root of a workspace that is gone. Under the native lock,
-/// taken only if free (else the next start prunes): what goes is moved to `native/trash` there
-/// and deleted after it, so a run waiting to write its root waits for renames only. Names that
-/// are not a key or selection (16 hex digits) are not the cache's and stay. Returns how many
-/// directories went.
-pub fn prune(native: &std::path::Path, since: std::time::SystemTime) -> usize {
+/// taken only if free (else the next start prunes), or with `wait` once it is: what goes is moved
+/// to `native/trash` there and deleted after it, so a run waiting to write its root waits for
+/// renames only. Names that are not a key or selection (16 hex digits) are not the cache's and
+/// stay. Returns how many directories went.
+/// A child being spawned holds the lock too, from its fork to its exec, when it was forked while
+/// the lock was held: an flock belongs to the open file, which the child's copy of the descriptor
+/// keeps. So right after its holder let go the lock can still be taken for that moment; a caller
+/// that needs the prune done (a test, while other tests spawn) waits.
+pub fn prune(native: &std::path::Path, since: std::time::SystemTime, wait: bool) -> usize {
     if !native.is_dir() {
         return 0;
     }
@@ -1078,7 +1082,7 @@ pub fn prune(native: &std::path::Path, since: std::time::SystemTime) -> usize {
     let old = |p: &std::path::Path| std::fs::symlink_metadata(p).and_then(|m| m.modified()).is_ok_and(|t| t < since);
     let trash = native.join("trash");
     let mut gone = 0;
-    if let Some(_lock) = native_lock(native, false) {
+    if let Some(_lock) = native_lock(native, wait) {
         let mut keys = std::collections::HashSet::new();
         let mut selections = std::collections::HashSet::new();
         for e in std::fs::read_dir(native.join("roots")).into_iter().flatten().flatten() {
@@ -1776,7 +1780,7 @@ fn the_native_prune_keeps_what_the_roots_name() {
     let foreign = unit("not-a-key");
     // everything changed before `since`: what no root names goes
     let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
-    assert_eq!(prune(&native, later), unnamed.len());
+    assert_eq!(prune(&native, later, true), unnamed.len());
     for p in &named { assert!(p.join("blob").is_file(), "a root names {}", p.display()); }
     for p in &unnamed { assert!(!p.exists(), "no root names {}", p.display()); }
     assert!(foreign.is_dir(), "a directory that is not a key or a selection");
@@ -1787,14 +1791,16 @@ fn the_native_prune_keeps_what_the_roots_name() {
     // flight): stays
     let fresh = unit("cargo-target/4444444444444444");
     let since = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
-    assert_eq!(prune(&native, since), 0);
+    assert_eq!(prune(&native, since, true), 0);
     assert!(fresh.join("blob").is_file(), "a fresh selection");
-    // the lock held (a root being written): the prune leaves everything for the next start
-    let held = native_lock(&native, false).unwrap();
-    assert_eq!(prune(&native, later), 0);
+    // the lock held (a root being written): the prune leaves everything for the next start. (A
+    // child another test spawns may hold it for a moment after it was let go, `prune`: so this
+    // test waits for it, and the prunes that must run wait.)
+    let held = native_lock(&native, true).unwrap();
+    assert_eq!(prune(&native, later, false), 0);
     assert!(fresh.is_dir());
     drop(held);
-    assert_eq!(prune(&native, later), 1);
+    assert_eq!(prune(&native, later, true), 1);
     // a shared workspace's run (RELAX_SHARE: its workspace is a folder mount's virtual path, on no
     // disk) names the checkout on disk: the slot of a run in the checkout itself, which the prune
     // finds and keeps with its build
@@ -1807,7 +1813,7 @@ fn the_native_prune_keeps_what_the_roots_name() {
     assert_eq!(texts.len(), 2, "the checkout's slot, replaced: {texts:?}");
     assert!(texts.contains(&format!("{}\ndddddddddddddddd\n5555555555555555\n", workspace.display())), "{texts:?}");
     let built = [unit("dddddddddddddddd"), unit("cargo-target/5555555555555555")];
-    assert_eq!(prune(&native, later), 1, "the build the replaced root named");
+    assert_eq!(prune(&native, later, true), 1, "the build the replaced root named");
     for p in &built { assert!(p.join("blob").is_file(), "the shared run's root names {}", p.display()); }
     let _ = std::fs::remove_dir_all(&dir);
 }

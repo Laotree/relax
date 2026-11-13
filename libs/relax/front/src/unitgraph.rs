@@ -1818,9 +1818,10 @@ impl BuildRoot {
 /// holds its use lock or it changed since `since` (a Relax build without roots may be writing it),
 /// and so does the root of a checkout that is gone. A base dir (`<name>-<16 hex>`, the claim and
 /// what a shared script declared) stays while a dir of it (`<base>-<16 hex>`) does. Under the build
-/// lock, taken only if free (else the next start prunes): what goes is moved to `build/trash` there
-/// and deleted after it. Returns how many dirs went.
-pub fn prune_build(build: &std::path::Path, since: std::time::SystemTime) -> usize {
+/// lock, taken only if free (else the next start prunes), or with `wait` once it is (a child being
+/// spawned may hold it a moment after its holder let go, native.rs `prune`): what goes is moved
+/// to `build/trash` there and deleted after it. Returns how many dirs went.
+pub fn prune_build(build: &std::path::Path, since: std::time::SystemTime, wait: bool) -> usize {
     if !build.is_dir() {
         return 0;
     }
@@ -1828,7 +1829,7 @@ pub fn prune_build(build: &std::path::Path, since: std::time::SystemTime) -> usi
     let trash = build.join("trash");
     let mut gone = 0;
     {
-        let Some(_lock) = build_lock(build, false) else { return 0 };
+        let Some(_lock) = build_lock(build, wait) else { return 0 };
         let mut named: std::collections::HashSet<String> = std::collections::HashSet::new();
         for e in std::fs::read_dir(build.join("roots")).into_iter().flatten().flatten() {
             let p = e.path();
@@ -2239,10 +2240,10 @@ mod shared_script_tests {
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
         {
             let _other = build_lock(&build, true).unwrap();
-            assert_eq!(prune_build(&build, later), 0, "the build lock is another's");
+            assert_eq!(prune_build(&build, later, false), 0, "the build lock is another's");
         }
-        assert_eq!(prune_build(&build, std::time::UNIX_EPOCH), 0, "what changed since `since` stays");
-        assert_eq!(prune_build(&build, later), 3);
+        assert_eq!(prune_build(&build, std::time::UNIX_EPOCH, true), 0, "what changed since `since` stays");
+        assert_eq!(prune_build(&build, later, true), 3);
         let mut left: Vec<String> = std::fs::read_dir(&build).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         left.sort();
         assert_eq!(left, ["again-0123456789abcdef", "held-0123456789abcdef", "lock", "named-0123456789abcdef", "roots", "s-0123456789abcdef", "s-0123456789abcdef-00000000000000aa"],
