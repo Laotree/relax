@@ -54,11 +54,11 @@ pub struct CStr {
     inner: [c_char],
 }
 
-/// The empty C string (core: `impl Default for &CStr`).
+// library/core/src/ffi/c_str.rs:180-187 (`const` dropped: no const trait impls here).
 impl crate::default::Default for &CStr {
+    #[inline]
     fn default() -> Self {
-        // SAFETY: one nul byte is a valid C string with no interior nul
-        unsafe { CStr::from_bytes_with_nul_unchecked(b"\0") }
+        c""
     }
 }
 

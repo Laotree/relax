@@ -71,7 +71,7 @@ impl InferCtxt<'_> {
         // overflows too. rustc then lints `recursion_depth_exceeding_limit`, which only
         // `-Znext-solver` can fire: stable rustc type checks with the old solver and is silent.
         if self.enable_next_solver_overflow_fcw && matches!(&result, Ok(e) if e.certainty.is_overflow()) {
-            let depth = self.recursion_limit(prog) * 2;
+            let depth = self.recursion_limit(prog).saturating_mul(2);
             if let Ok(rerun) = self.commit_if_ok(|_| {
                 let rerun = self.enter_root_with_depth(prog, depth, &evaluate);
                 if matches!(&rerun, Ok(e) if e.certainty.is_overflow()) { Err(()) } else { Ok(rerun) }
@@ -341,7 +341,7 @@ impl InferCtxt<'_> {
         let overflows = |tree: &super::inspect::GoalEvaluation| matches!(&tree.result, Ok(r) if r.value.certainty.is_overflow());
         if !self.enable_next_solver_overflow_fcw || !overflows(&tree) { return tree; }
         self.commit_if_ok(|_| {
-            let rerun = self.evaluate_root_goal_for_proof_tree_with_depth(prog, goal, limit * 2, cached);
+            let rerun = self.evaluate_root_goal_for_proof_tree_with_depth(prog, goal, limit.saturating_mul(2), cached);
             if overflows(&rerun) { Err(()) } else { Ok(rerun) }
         }).unwrap_or(tree)
     }

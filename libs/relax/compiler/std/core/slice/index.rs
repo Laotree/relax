@@ -337,7 +337,11 @@ pub(crate) fn into_slice_range(len: usize, bounds: (Bound<usize>, Bound<usize>))
             if end > len {
                 slice_end_index_len_fail(end, len)
             }
-            slice_index_order_fail(start, end)
+            if start > end {
+                slice_index_order_fail(start, end)
+            }
+            // Only reachable for an inclusive end equal to `len` (rustc slice_index_fail's last arm).
+            slice_end_index_len_fail(end, len)
         }
     }
 }

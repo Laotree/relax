@@ -482,7 +482,7 @@ impl<'a, T, const N: usize> DoubleEndedIterator for ArrayWindows<'a, T, N> {
 }
 impl<'a, T, const N: usize> ExactSizeIterator for ArrayWindows<'a, T, N> {
     fn len(&self) -> usize {
-        (self.v.len() + 1).saturating_sub(N)
+        self.v.len().saturating_sub(N.saturating_sub(1))
     }
 }
 impl<'a, T, const N: usize> FusedIterator for ArrayWindows<'a, T, N> {}

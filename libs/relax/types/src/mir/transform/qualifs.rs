@@ -350,9 +350,6 @@ pub struct State {
 }
 
 impl State {
-    fn new_empty(n: usize) -> Self {
-        State { n, bits: crate::mir::dataflow::BitSet::new_empty(2 * n) }
-    }
     /// Whether a local contains the qualif.
     pub fn contains(&self, local: Local) -> bool {
         self.bits.contains(local.0 as usize)
@@ -572,11 +569,6 @@ impl<Q: Qualif> Visitor for TransferFunction<'_, Q> {
         // We ignore borrow on drop because custom drop impls are not allowed in consts.
         self.super_terminator(terminator, location);
     }
-}
-
-/// Every successor of a terminator (normal, unwind and imaginary edges).
-pub fn successors(term: &Terminator) -> Vec<BasicBlock> {
-    super::simplify::successors(&term.kind)
 }
 
 /// rustc's `FlowSensitiveAnalysis`: the `TransferFunction` of `Q` as a dataflow analysis over the
