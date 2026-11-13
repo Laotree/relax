@@ -219,6 +219,10 @@ fn plain(p: std::path::PathBuf) -> std::path::PathBuf {
 
 /// The runner on this process's command line, with `host` added.
 pub fn main(host: &'static Host) {
+    if let Err(e) = relax_compiler::dirs::shared_cache_mode() {
+        eprintln!("relax: {e}");
+        std::process::exit(2);
+    }
     // a package binary above a test's deps/ (Windows): its run, with the environment its .cmd
     // would give it, before anything reads the environment
     let bin = relax_compiler::selfexe::bin_start(&relax_compiler::os::proc::args_bytes());

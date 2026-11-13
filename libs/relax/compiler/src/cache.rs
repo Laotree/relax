@@ -19,6 +19,8 @@
 //! (cache/front_run.rs), which the stores named by the crate fingerprint refer to (front.rs).
 //!
 //! RELAX_CACHE=on (default) | off | verify | readonly;
+//! RELAX_SHARED_CACHE=off (default) | global: one run dir for every workspace of the user
+//! (`$RELAX_HOME/shared`, dirs.rs); clean refuses it.
 //! Stores live in `<cargo target dir>/relax/cache` (dirs.rs); RELAX_CACHE_DIR replaces
 //! the run dir for tests and measurement. RELAX_CACHE_MAX (MB) caps them (default: twice
 //! what the run uses, at least 4096; prune_root). The `--allow-c` builds beside them
