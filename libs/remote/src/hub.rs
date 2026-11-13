@@ -7,9 +7,9 @@
 //! the link drops the hub reconnects and reopens the feed `from=<last seq>`, and the client sees a
 //! gap marker where the link was down, nothing else.
 //!
-//! The hub is started on demand by the CLI ([`connect`]), listens on `$TMPDIR/makepad-remote-hub.sock`
-//! (0600, same user), keeps a pid file and exits 60 s after its last client. With a TCP listener
-//! (`serve(.., Some(addr))`, only on request) it stays until killed.
+//! The hub is started on demand by the CLI ([`connect`]), listens on `makepad-remote-hub.sock` in this
+//! user's own socket dir (0600, same user; [`hub_dir`]), keeps a pid file and exits 60 s after its
+//! last client. With a TCP listener (`serve(.., Some(addr))`, only on request) it stays until killed.
 
 use crate::cmd::json_str;
 use crate::conn::{Channel, ChannelTx, Conn, Event, CLOSE_LINK_LOST, CLOSE_NORMAL, CLOSE_REFUSED};
@@ -31,16 +31,25 @@ const DIAL_WAIT: Duration = Duration::from_secs(5);
 /// A feed that lost its link tries this many times (backoff up to 2.5 s) before giving up.
 const FEED_RETRIES: u32 = 30;
 
+/// Where the hub's socket, pid file and log are: this user's own socket dir
+/// (`carrier::unix::socket_dir`: `/tmp/makepad-<uid>`, made 0700 and refused when it is not this
+/// user's own; on Windows the user's temp dir). At fixed names in the shared temp dir another
+/// user could bind the socket first and answer this user's requests, write a pid that kept this
+/// user's hub from starting, or own the log.
+pub fn hub_dir() -> PathBuf {
+    crate::carrier::unix::socket_dir()
+}
+
 pub fn socket_path() -> PathBuf {
-    std::env::temp_dir().join("makepad-remote-hub.sock")
+    hub_dir().join("makepad-remote-hub.sock")
 }
 
 pub fn pid_path() -> PathBuf {
-    std::env::temp_dir().join("makepad-remote-hub.pid")
+    hub_dir().join("makepad-remote-hub.pid")
 }
 
 pub fn log_path() -> PathBuf {
-    std::env::temp_dir().join("makepad-remote-hub.log")
+    hub_dir().join("makepad-remote-hub.log")
 }
 
 /// One host's link.
@@ -565,6 +574,8 @@ fn lock_pid() -> io::Result<bool> {
 /// listener). Returns `Ok(false)` at once when another hub already runs. `listen`: `host:port`
 /// for paired devices to dial; the hub's TLS identity is created on first use.
 pub fn serve(hosts: Hosts, listen: Option<&str>) -> io::Result<bool> {
+    #[cfg(unix)]
+    crate::carrier::unix::own_socket_dir()?;
     if !lock_pid()? {
         return Ok(false);
     }
@@ -613,6 +624,8 @@ pub fn connect(start: Option<&std::path::Path>) -> Result<Client, String> {
         return Ok(client);
     }
     let exe = start.ok_or_else(|| "no makepad hub is running".to_string())?;
+    #[cfg(unix)]
+    crate::carrier::unix::own_socket_dir().map_err(|e| e.to_string())?;
     let log = std::fs::File::create(log_path()).map_err(|e| format!("cannot write {}: {e}", log_path().display()))?;
     let log2 = log.try_clone().map_err(|e| e.to_string())?;
     let mut cmd = Command::new(exe);

@@ -494,3 +494,21 @@ fn closed_clients_are_let_go() {
     let (_live, _served) = pair_served(&ep);
     assert_eq!(hub.kept_clients(), (1, 1));
 }
+
+/// The hub's socket, pid file and log are in this user's own socket dir, never at fixed names in
+/// the shared temp dir; and a client refuses a socket another user's process serves (checked
+/// where the system serves one anyone may connect to: macOS's mDNSResponder, Linux's D-Bus).
+#[test]
+fn the_hubs_files_are_this_users_and_a_client_refuses_another_users_socket() {
+    let own = crate::carrier::unix::socket_dir();
+    for p in [crate::hub::socket_path(), crate::hub::pid_path(), crate::hub::log_path()] {
+        assert_eq!(p.parent(), Some(own.as_path()), "{} is not in this user's own socket dir", p.display());
+    }
+    for sys in ["/var/run/mDNSResponder", "/run/dbus/system_bus_socket"] {
+        let path = std::path::Path::new(sys);
+        if UnixStream::connect(path).is_ok() {
+            let e = crate::carrier::unix::dial(path).err().expect("a client dialled another user's socket");
+            assert!(e.to_string().contains("another user"), "{sys}: {e}");
+        }
+    }
+}
