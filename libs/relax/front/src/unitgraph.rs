@@ -119,12 +119,13 @@ pub(crate) fn parse_pkg_id(id: &str) -> (String, String, String) {
     };
     let (name, ver) = match frag.rfind('@') {
         Some(j) => (frag[..j].to_string(), frag[j + 1..].to_string()),
+        // cargo's package id spec leaves the name out when it is the URL's last path segment, for
+        // any source: `path+file:///w/app#0.1.0`, and the git dependencies
+        // `git+https://github.com/zed-industries/tree-sitter-yaml?rev=baff0b51#0.6.1`
         None => {
-            let last = match dir.rfind('/') {
-                Some(k) => dir[k + 1..].to_string(),
-                None => dir.clone(),
-            };
-            (last, frag.to_string())
+            let path = url.split('?').next().unwrap_or(url).trim_end_matches('/');
+            let last = path.rsplit('/').next().unwrap_or(path);
+            (last.to_string(), frag.to_string())
         }
     };
     (dir, name, ver)
@@ -2444,6 +2445,24 @@ mod shared_script_tests {
         roots_left.retain(|n| n.len() != 32);
         assert_eq!(roots_left, ["other"], "a gone checkout's root and a stale root write go");
         std::fs::remove_dir_all(&base).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod package_id_tests {
+    /// Cargo's package id spec names the package after `#`, or leaves the name out when it is the
+    /// URL's last path segment (zed's git dependencies: cargo's build-script messages for them
+    /// matched no package, so `--allow-c` said cargo had not run their scripts).
+    #[test]
+    fn a_package_id_names_its_package_in_either_spelling() {
+        let name_version = |id: &str| { let (_, n, v) = super::parse_pkg_id(id); (n, v) };
+        let pair = |n: &str, v: &str| (n.to_string(), v.to_string());
+        assert_eq!(name_version("registry+https://github.com/rust-lang/crates.io-index#libc@0.2.182"), pair("libc", "0.2.182"));
+        assert_eq!(name_version("git+https://github.com/zed-industries/tree-sitter-yaml?rev=baff0b51c64ef6a1fb1f8390f3ad6015b83ec13a#0.6.1"), pair("tree-sitter-yaml", "0.6.1"), "a git id without the name");
+        assert_eq!(name_version("git+https://github.com/zed-industries/calloop#0.14.3"), pair("calloop", "0.14.3"), "without a query");
+        assert_eq!(name_version("git+https://github.com/zed-industries/candle?branch=9.1-patched#candle-core@0.9.1"), pair("candle-core", "0.9.1"), "a git id with the name");
+        let (dir, n, v) = super::parse_pkg_id("path+file:///work/app#0.1.0");
+        assert_eq!((dir.as_str(), n.as_str(), v.as_str()), ("/work/app", "app", "0.1.0"), "a path id without the name");
     }
 }
 

@@ -3968,6 +3968,13 @@ impl<'a> Parser<'a> {
                             // a path inside a type-macro call subsequently matched as tt.
                             if let Some((end, flags)) = self.fragment_group(t.lo) {
                                 groups.push((end, out.start(t.kind, &text, Some(t.lo)), flags));
+                            } else if let Some(&kind) = self.meta_frags.get(&{ t.lo }) {
+                                // a one-token expression or literal inside the copy stays one: its
+                                // kind, and a proc macro's invisible group (builtins.rs
+                                // group_fragments; const_format's `__str_const!` passes on the block
+                                // holding `formatcp!`'s `"b"` argument)
+                                let kind = if kind == "expr" { EXPR_FRAG } else { LIT_FRAG };
+                                groups.push((t.hi, out.start(t.kind, &text, Some(t.lo)), kind | META_ONLY));
                             }
                             out.push(t.kind, &text, Some(t.lo), u32::MAX);
                             while groups.last().is_some_and(|&(end, _, _)| end == t.hi) {

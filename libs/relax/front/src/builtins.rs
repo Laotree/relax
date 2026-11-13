@@ -1332,6 +1332,9 @@ fn expand_pm_ts(p: &crate::parser::Parser, span_needed: bool, lo: usize, hi: usi
     // A group the macro hands back as it came (its span) stays one group, as under rustc, where it
     // keeps its macro_rules origin: `same!($e * 2)` of `1 + 1` is 4. A macro's own invisible group
     // reads as its tokens (rustc_ast token.rs InvisibleOrigin::ProcMacro; emit_tokens).
+    if !p.frag_groups.is_empty() || !p.meta_frags.is_empty() {
+        group_fragments(&mut input.trees, &p.frag_groups, &p.meta_frags, None);
+    }
     if p.synth_parens.is_empty() {
         return run(input, call);
     }
@@ -1339,6 +1342,44 @@ fn expand_pm_ts(p: &crate::parser::Parser, span_needed: bool, lo: usize, hi: usi
     let mut output = run(input, call)?;
     regroup(&mut output.trees, &p.synth_parens, Delimiter::None, Delimiter::Parenthesis);
     Ok(output)
+}
+
+/// rustc hands a proc macro every fragment a macro_rules arm forwards in an invisible group,
+/// whatever its length, but an `ident`, a `lifetime` and a `tt` (rustc_expand mbe/transcribe.rs
+/// transcribe_pnr: `MetaVarKind`'s invisible delimiters): `$e:expr` of `"b"` is
+/// `Group(None, "b")`. const_format's `formatcp!` reads each argument as one
+/// (`parse_unwrap_group` takes the next tree as the group; a bare `"b"` was taken and the `,`
+/// after it became the argument). The fragments of `trees` with a token range (`frag_groups`: a
+/// type, a path, a block, ...) and the one-token expressions and literals (`meta_frags`) become
+/// invisible groups; an expression of several tokens is one already (`regroup`). `inside`: the
+/// fragment whose group `trees` is, which it starts.
+fn group_fragments(trees: &mut Vec<TokenTree>, ranges: &crate::fxhash::HashMap<u32, u32>, one_token: &crate::fxhash::HashMap<u32, &'static str>, inside: Option<u32>) {
+    let mut i = 0;
+    while i < trees.len() {
+        let first = trees[i].span();
+        let end = if i == 0 && inside == Some(first.lo) {
+            None
+        } else {
+            ranges.get(&first.lo).copied().or_else(|| one_token.contains_key(&first.lo).then_some(first.hi))
+        };
+        // the trees from this one to the one the fragment ends with
+        match end.and_then(|end| (i..trees.len()).find(|&j| trees[j].span().hi == end)) {
+            Some(last) => {
+                let inner: Vec<TokenTree> = trees.drain(i..=last).collect();
+                let stop = inner.last().map_or(first, TokenTree::span);
+                let span = Span { hi: stop.hi, end: stop.end, ..first };
+                let mut group = Group { delim: Delimiter::None, stream: TokenStream { trees: inner }, span };
+                group_fragments(&mut group.stream.trees, ranges, one_token, Some(first.lo));
+                trees.insert(i, TokenTree::Group(group));
+            }
+            None => {
+                if let TokenTree::Group(g) = &mut trees[i] {
+                    group_fragments(&mut g.stream.trees, ranges, one_token, None);
+                }
+            }
+        }
+        i += 1;
+    }
 }
 
 /// The groups of `trees` whose opening parenthesis is one the transcriber wrote around a
@@ -1447,8 +1488,7 @@ fn eval_lit(p: &crate::parser::Parser, a: usize, z: usize) -> Result<(String, bo
     }
     if z == a + 2 && toks.at(a).kind == T::Minus && matches!(toks.at(a + 1).kind, T::Int | T::Float) {
         return Ok((format!("-{}", num_lit_value(&text(a + 1), toks.at(a + 1).kind == T::Int)), false));
-    }
-    // nested macro call: path ! ( .. )
+    }    // nested macro call: path ! ( .. )
     let mut i = a;
     while i < z && matches!(toks.at(i).kind, T::Ident | T::PathSep | T::KwCrate | T::Dollar) {
         i += 1;
@@ -1899,6 +1939,36 @@ pub fn derive_items(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], lo: u
     crate::preload::timed(1, || derive_items_inner(p, attrs, lo, hi))
 }
 
+/// Where an item's outer doc comments begin: rustc hands an attribute macro each of them as a
+/// `#[doc = ".."]` attribute (derives take them through leading_docs). The lexer keeps no
+/// comments as tokens, and expand_attr_macro reads docs from its item's text, so those before
+/// its first token (`///` lines above its first attribute) are taken in here: the first outer
+/// `///` / `/** */` between the token before the item (`gap_lo`: its end) and the item
+/// (`item_lo`), else `item_lo`.
+fn outer_docs_lo(text: &[u8], gap_lo: u32, item_lo: u32) -> u32 {
+    if gap_lo >= item_lo || item_lo as usize > text.len() {
+        return item_lo;
+    }
+    let mut first = None;
+    crate::pm_tokens::for_each_gap_doc(&text[gap_lo as usize..item_lo as usize], |d| {
+        if !d.inner && first.is_none() {
+            first = Some(gap_lo + d.lo as u32);
+        }
+    });
+    first.unwrap_or(item_lo)
+}
+
+/// `outer_docs_lo` for the parser's item starting at its token `lo` (authored source only:
+/// expansion text keeps its doc attributes as tokens).
+fn item_lo_with_docs(p: &crate::parser::Parser, lo: usize) -> u32 {
+    let item_lo = p.toks.at(lo).lo;
+    if item_lo as usize >= p.src.len() {
+        return item_lo;
+    }
+    let gap_lo = if lo > 0 { p.toks.at(lo - 1).hi } else { 0 };
+    outer_docs_lo(p.src, gap_lo, item_lo)
+}
+
 fn derive_items_inner(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], lo: usize, hi: usize) -> Result<Option<Expansion>, (u32, String)> {
     let sess = p.session;
     // RELAX_DERIVES=0: derives are not expanded at all (baseline for measurements only)
@@ -2166,7 +2236,7 @@ pub fn expand_attr_macro(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], 
     let buf = Buf { src: p.src, ext: p.ext.view() };
     let toks = &p.toks;
     let (alo, ahi) = (attrs[k].toks.lo as usize, attrs[k].toks.hi as usize);
-    let item_lo = toks.at(lo).lo;
+    let item_lo = item_lo_with_docs(p, lo);
     let item_hi = toks.at(hi.saturating_sub(1)).hi;
     let path = p.bctx.as_ref().map_or("", |c| c.path.as_str());
     // the attribute's name and arguments

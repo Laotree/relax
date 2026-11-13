@@ -92,8 +92,12 @@ pub fn set_check_scope() {
 }
 
 static CHECK_ALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Per crate: 0 undecided, 1 keeps user types, 2 does not. Reset when the scope changes.
-static USER_TYPES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// Per crate, by its normalized root source path (what `app_crate` decides by): whether it keeps
+/// user types. Reset when the scope changes. Not by crate id: the proc-macro world's program
+/// numbers its crates on its own, and its "no" for its crate N became the application's answer
+/// for the application's crate N (zed's `clock`, after serde's derive ran): typeck left out the
+/// mutable place fix-ups and the borrow check refused `&mut self.values[i]` (E0596).
+static USER_TYPES: Mutex<Option<crate::fxhash::HashMap<String, bool>>> = Mutex::new(None);
 #[cfg(test)]
 thread_local! { pub(crate) static FORCE_USER_TYPES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) }; }
 static USER_TYPES_STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -105,19 +109,16 @@ static USER_TYPES_STALE: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 pub fn user_types_wanted(prog: &Program, krate: u32) -> bool {
     #[cfg(test)]
     if let Some(forced) = FORCE_USER_TYPES.with(|f| f.get()) { return forced; }
+    let root = crate::vfs::normalize_path(prog.crates[krate as usize].root_path());
     let mut cache = USER_TYPES.lock().unwrap_or_else(|e| e.into_inner());
-    if cache.len() <= krate as usize {
-        // the decisions are per crate id, process state: kept heap
-        let _k = crate::zone_alloc::kept();
-        cache.resize(krate as usize + 1, 0);
+    if let Some(&wanted) = cache.as_ref().and_then(|c| c.get(&root)) {
+        return wanted;
     }
-    match cache[krate as usize] {
-        1 => return true,
-        2 => return false,
-        _ => {}
-    }
-    let wanted = CHECK_ALL.load(std::sync::atomic::Ordering::SeqCst) || admit(prog, krate);
-    cache[krate as usize] = if wanted { 1 } else { 2 };
+    // (`admit`'s rule, by the path already in hand)
+    let wanted = CHECK_ALL.load(std::sync::atomic::Ordering::SeqCst) || all_crates() || app_root(&root);
+    // the decisions are process state: kept heap
+    let _k = crate::zone_alloc::kept();
+    cache.get_or_insert_with(Default::default).insert(root, wanted);
     wanted
 }
 
@@ -126,8 +127,8 @@ pub fn user_types_wanted(prog: &Program, krate: u32) -> bool {
 /// scope is set once, before the first body is checked.
 fn rescope_user_types() {
     let mut cache = USER_TYPES.lock().unwrap_or_else(|e| e.into_inner());
-    if cache.iter().any(|&d| d == 2) { USER_TYPES_STALE.store(true, std::sync::atomic::Ordering::SeqCst); }
-    cache.clear();
+    if cache.as_ref().is_some_and(|c| c.values().any(|&wanted| !wanted)) { USER_TYPES_STALE.store(true, std::sync::atomic::Ordering::SeqCst); }
+    *cache = None;
 }
 
 /// Whether the scope grew after some crate had been type-checked without annotations. The
@@ -135,8 +136,12 @@ fn rescope_user_types() {
 pub fn user_types_stale() -> bool { USER_TYPES_STALE.load(std::sync::atomic::Ordering::SeqCst) }
 
 pub fn app_crate(prog: &Program, krate: u32) -> bool {
-    let root = crate::vfs::normalize_path(prog.crates[krate as usize].root_path());
-    APP_SCOPE.lock().unwrap_or_else(|e| e.into_inner()).contains(&root)
+    app_root(&crate::vfs::normalize_path(prog.crates[krate as usize].root_path()))
+}
+
+/// `app_crate` by a crate's normalized root source path.
+fn app_root(root: &str) -> bool {
+    APP_SCOPE.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|r| r == root)
 }
 
 /// The one all-crates switch: the compiled APP_CRATES_ONLY, with RELAX_GANDALF_ALL=1 on top.
@@ -151,6 +156,6 @@ pub fn admit(prog: &Program, krate: u32) -> bool { all_crates() || app_crate(pro
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     reset(&APP_SCOPE, Mutex::new(Vec::new()));
-    reset(&USER_TYPES, Mutex::new(Vec::new()));
+    reset(&USER_TYPES, Mutex::new(None));
     reset(&USER_TYPES_STALE, std::sync::atomic::AtomicBool::new(false));
 }
