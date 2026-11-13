@@ -7136,20 +7136,7 @@ impl Unit {
 
     /// Symbol name of a foreign item: `#[link_name = ".."]` or its own name.
     pub(crate) fn link_name(&self, d: DefId) -> String {
-        let def = self.prog.def(d);
-        let f = &self.prog.files[def.file as usize];
-        for a in f.ast.list(f.ast.item(def.item).attrs) {
-            if a.toks.hi >= a.toks.lo + 3 && f.tok_text(a.toks.lo) == "link_name" && f.tok_text(a.toks.lo + 1) == "=" {
-                let name = crate::lit::unescape_str(f.tok_text(a.toks.lo + 2));
-                // LLVM's leading SOH requests an exact object-file symbol. Our lookups use
-                // C names, so undo Mach-O's ABI prefix only for these exact names.
-                if let Some(exact) = name.strip_prefix('\u{1}') {
-                    return crate::global_asm::c_name(exact).to_string();
-                }
-                return name;
-            }
-        }
-        self.prog.name(d).to_string()
+        crate::global_asm::foreign_link_name(&self.prog, d)
     }
 
     /// A foreign address already available in this process. Reverse pointer attribution must

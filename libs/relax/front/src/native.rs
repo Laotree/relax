@@ -1284,6 +1284,9 @@ fn link(lib_path: &str, out: &Outputs, triple: &str, resolvable: Resolvable) -> 
     // the accessors' object: the callback relink below reuses the link's arguments
     let addresses_path = format!("{}.addresses.o", tmp);
     let mut cmd = Command::new(cc());
+    // every member of the archives, for the loader's check of which callbacks the program needs
+    // (native_stub member_table): the link takes them all, the program's imports are known when it loads
+    let members;
     if cfg!(target_os = "macos") {
         cmd.args(["-dynamiclib", "-o", &tmp, "-Wl,-undefined,dynamic_lookup"]);
         for a in archives {
@@ -1291,7 +1294,9 @@ fn link(lib_path: &str, out: &Outputs, triple: &str, resolvable: Resolvable) -> 
         }
         // C built with -fvisibility=hidden and assembly's `.private_extern` (ring's core) stay
         // local to the library, where dlsym cannot see them: the same address accessors as Linux
-        compile_accessors(&macho_archive_symbols(archives)?, &tmp, &addresses_path)?;
+        let symbols;
+        (symbols, members) = macho_archive_symbols(archives)?;
+        compile_accessors(&symbols, &tmp, &addresses_path)?;
         cmd.arg(&addresses_path);
     } else {
         cmd.args(["-shared", "-fPIC", "-o", &tmp]);
@@ -1308,20 +1313,37 @@ fn link(lib_path: &str, out: &Outputs, triple: &str, resolvable: Resolvable) -> 
         // both copies and fail with duplicate definitions. Each symbol notes whether
         // it is thread-local (the address accessors below leave those out).
         let mut symbols = std::collections::BTreeMap::new();
+        let mut each = Vec::new();
         for archive in archives {
-            let out = Command::new("nm").args(["-g", "--defined-only", "--format=sysv", archive])
+            let out = Command::new("nm").args(["-g", "--format=sysv", archive])
                 .output().map_err(|e| format!("--allow-c: cannot read archive symbols: {e}"))?;
             if !out.status.success() {
                 return Err(format!("--allow-c: nm failed for {archive}: {}", String::from_utf8_lossy(&out.stderr)));
             }
-            // name | value | class | type | size | line | section; the member and column headers have no `|`
+            // per member "Symbols from <archive>[<member>]:", then rows name | value | class |
+            // type | size | line | section (the column header has no `|`); class U, w and v are
+            // references (weak ones included: a member that is taken binds them if it can)
             for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if line.starts_with("Symbols from ") {
+                    each.push(crate::native_stub::ArchiveMember::default());
+                    continue;
+                }
                 let columns: Vec<&str> = line.split('|').map(str::trim).collect();
                 if columns.len() >= 4 && columns[2].len() == 1 && !columns[0].is_empty() {
-                    symbols.insert(columns[0].to_string(), columns[3] == "TLS");
+                    let member = match each.last_mut() {
+                        Some(m) => m,
+                        None => { each.push(Default::default()); each.last_mut().unwrap() }
+                    };
+                    if matches!(columns[2], "U" | "w" | "v") {
+                        member.refs.push(columns[0].to_string());
+                    } else {
+                        symbols.insert(columns[0].to_string(), columns[3] == "TLS");
+                        member.defs.push(columns[0].to_string());
+                    }
                 }
             }
         }
+        members = each;
         let args = symbols.keys().map(|name| {
             format!("--undefined=\"{}\"\n", name.replace('\\', "\\\\").replace('"', "\\\""))
         }).collect::<String>();
@@ -1382,7 +1404,8 @@ fn link(lib_path: &str, out: &Outputs, triple: &str, resolvable: Resolvable) -> 
             if callbacks.is_empty() {
                 return Ok(());
             }
-            std::fs::write(&stubs_path, crate::native_stub::object(triple, &callbacks)?).map_err(|e| format!("{stubs_path}: {e}"))?;
+            let table = crate::native_stub::member_table(&members, &callbacks);
+            std::fs::write(&stubs_path, crate::native_stub::object(triple, &callbacks, &table)?).map_err(|e| format!("{stubs_path}: {e}"))?;
             let mut with_stubs = Command::new(cc());
             with_stubs.arg(&stubs_path).args(cmd.get_args());
             run(&mut with_stubs)
@@ -1446,26 +1469,43 @@ fn compile_accessors(symbols: &std::collections::BTreeMap<String, bool>, tmp: &s
 /// The defined global symbols of Mach-O archives (`nm -g --defined-only -m`: one
 /// `<value> (<segment>,<section>) [private ]external <name>` line each; the member headers have no
 /// section), thread-local when its section is one of `__thread_vars` / `_data` / `_bss`.
-fn macho_archive_symbols(archives: &[String]) -> Result<std::collections::BTreeMap<String, bool>, String> {
+fn macho_archive_symbols(archives: &[String]) -> Result<(std::collections::BTreeMap<String, bool>, Vec<crate::native_stub::ArchiveMember>), String> {
     let mut symbols = std::collections::BTreeMap::new();
+    let mut members: Vec<crate::native_stub::ArchiveMember> = Vec::new();
+    // the members' table spells C names: Mach-O's leading `_` off
+    let c = |name: &str| name.strip_prefix('_').unwrap_or(name).to_string();
     for archive in archives {
-        let out = Command::new("nm").args(["-g", "--defined-only", "-m", archive])
+        let out = Command::new("nm").args(["-g", "-m", archive])
             .output().map_err(|e| format!("--allow-c: cannot read archive symbols: {e}"))?;
         if !out.status.success() {
             return Err(format!("--allow-c: nm failed for {archive}: {}", String::from_utf8_lossy(&out.stderr)));
         }
+        // per member a line "<member>:" (older nm: "<archive>(<member>):"), then "<address>
+        // (<segment>,<section>) .. external <name>" for a definition and "(undefined) .. external
+        // <name>" for a reference: a symbol's line has a ") ", a member's does not
         for line in String::from_utf8_lossy(&out.stdout).lines() {
-            let Some(open) = line.find(" (") else { continue };
-            let Some(close) = line[open..].find(") ").map(|k| open + k) else { continue };
-            if !line[..open].bytes().all(|b| b.is_ascii_hexdigit()) {
+            if line.ends_with(':') && !line.contains(") ") {
+                members.push(Default::default());
                 continue;
             }
-            let section = &line[open + 2..close];
+            let Some(open) = line.find('(') else { continue };
+            let Some(close) = line[open..].find(") ").map(|k| open + k) else { continue };
             let Some(name) = line[close + 2..].split_whitespace().last() else { continue };
-            symbols.insert(name.to_string(), section.contains(",__thread_"));
+            if members.is_empty() {
+                members.push(Default::default());
+            }
+            let member = members.last_mut().unwrap();
+            let section = &line[open + 1..close];
+            let address = line[..open].trim();
+            if section == "undefined" && address.is_empty() {
+                member.refs.push(c(name));
+            } else if !address.is_empty() && address.bytes().all(|b| b.is_ascii_hexdigit()) {
+                symbols.insert(name.to_string(), section.contains(",__thread_"));
+                member.defs.push(c(name));
+            }
         }
     }
-    Ok(symbols)
+    Ok((symbols, members))
 }
 
 // ---- cargo's RUSTC_WRAPPER
