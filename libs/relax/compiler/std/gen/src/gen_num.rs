@@ -794,6 +794,12 @@ impl Eq for bool {}
 impl PartialOrd for bool { fn partial_cmp(&self, other: &bool) -> Option<Ordering> { Some(self.cmp(other)) } }
 impl Ord for bool { fn cmp(&self, other: &bool) -> Ordering { (*self as u8).cmp(&(*other as u8)) } }
 impl Not for bool { type Output = bool; fn not(self) -> bool { !self } }
+// `!` (rustc 1.100.0: never_type stable; Not since 1.60)
+impl PartialEq for ! { fn eq(&self, _: &!) -> bool { *self } }
+impl Eq for ! {}
+impl PartialOrd for ! { fn partial_cmp(&self, _: &!) -> Option<Ordering> { *self } }
+impl Ord for ! { fn cmp(&self, _: &!) -> Ordering { *self } }
+impl Not for ! { type Output = !; fn not(self) -> ! { match self {} } }
 impl<'a> Not for &'a bool { type Output = bool; fn not(self) -> bool { !*self } }
 impl BitAnd for bool { type Output = bool; fn bitand(self, rhs: bool) -> bool { self & rhs } }
 impl BitOr for bool { type Output = bool; fn bitor(self, rhs: bool) -> bool { self | rhs } }
@@ -816,6 +822,8 @@ impl Ord for char { fn cmp(&self, other: &char) -> Ordering { (*self as u32).cmp
 impl bool {
     pub const fn then_some<T>(self, t: T) -> Option<T> { if self { Some(t) } else { None } }
     pub const fn then<T, F: FnOnce() -> T>(self, f: F) -> Option<T> { if self { Some(f()) } else { None } }
+    /// rustc 1.100.0 (bool_toggle)
+    pub const fn toggle(&mut self) { *self = !*self; }
 }
 
 ",

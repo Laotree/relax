@@ -255,7 +255,7 @@ impl OpenOptions {
             }
             (_, true) => {
                 if self.truncate && !self.create_new {
-                    return Err(needs_write());
+                    return Err(io::Error::from_string(io::ErrorKind::InvalidInput, String::from("append and truncate cannot both be enabled")));
                 }
             }
         }

@@ -508,44 +508,32 @@ impl OpenOptions {
         if let Some(mode) = self.access_mode {
             return Ok(mode);
         }
+        // rustc 1.100's order: the creation flags' checks come first, an explicit access mode skips them
         match (self.read, self.write, self.append) {
+            (_, false, false) if self.truncate || self.create || self.create_new => Err(needs_write()),
+            (_, _, true) if self.truncate && !self.create_new => {
+                Err(io::Error::from_string(io::ErrorKind::InvalidInput, String::from("append and truncate cannot both be enabled")))
+            }
             (true, false, false) => Ok(GENERIC_READ),
             (false, true, false) => Ok(GENERIC_WRITE),
             (true, true, false) => Ok(GENERIC_READ | GENERIC_WRITE),
             (false, _, true) => Ok(FILE_GENERIC_WRITE & !FILE_WRITE_DATA),
             (true, _, true) => Ok(GENERIC_READ | (FILE_GENERIC_WRITE & !FILE_WRITE_DATA)),
             (false, false, false) => {
-                if self.create || self.create_new || self.truncate {
-                    Err(needs_write())
-                } else {
-                    Err(io::Error::from_string(io::ErrorKind::InvalidInput, String::from("must specify at least one of read, write, or append access")))
-                }
+                Err(io::Error::from_string(io::ErrorKind::InvalidInput, String::from("must specify at least one of read, write, or append access")))
             }
         }
     }
 
-    fn get_creation_mode(&self) -> io::Result<u32> {
-        match (self.write, self.append) {
-            (true, false) => {}
-            (false, false) => {
-                if self.truncate || self.create || self.create_new {
-                    return Err(needs_write());
-                }
-            }
-            (_, true) => {
-                if self.truncate && !self.create_new {
-                    return Err(needs_write());
-                }
-            }
-        }
-        Ok(match (self.create, self.truncate, self.create_new) {
+    fn get_creation_mode(&self) -> u32 {
+        match (self.create, self.truncate, self.create_new) {
             (false, false, false) => OPEN_EXISTING,
             (true, false, false) => OPEN_ALWAYS,
             (false, true, false) => TRUNCATE_EXISTING,
             // CREATE_ALWAYS replaces attributes / streams: OPEN_ALWAYS + manual truncation (#115745)
             (true, true, false) => OPEN_ALWAYS,
             (_, _, true) => CREATE_NEW,
-        })
+        }
     }
 
     fn get_flags_and_attributes(&self) -> u32 {
@@ -554,8 +542,8 @@ impl OpenOptions {
 
     /// `path` is NUL-terminated.
     fn open_native(&self, path: &[u16]) -> io::Result<File> {
-        let creation = self.get_creation_mode()?;
         let access = self.get_access_mode()?;
+        let creation = self.get_creation_mode();
         let h = unsafe { CreateFileW(path.as_ptr(), access, self.share_mode, core::ptr::null(), creation, self.get_flags_and_attributes(), core::ptr::null_mut()) };
         if h == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
