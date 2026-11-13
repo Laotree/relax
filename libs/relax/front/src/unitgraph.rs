@@ -1492,6 +1492,19 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
             cmd.env(k, v);
         }
     }
+    // Policy::Sandboxed: a script whose closure (its package and its build-dependencies) holds a
+    // registry or git package is given what is set above and nothing else of this environment:
+    // cargo's variables for a script and cargo's `[env]`, no PATH, HOME, tokens or wrappers. Its
+    // run's program reads those names and Relax's own (progenv SCRIPT_ENV); a
+    // `rerun-if-env-changed` declaration grants nothing. The handed names are part of the rerun
+    // key below, so an output of the script run as host code does not stand for a confined run
+    // and the other way round. Not a boundary: the script still runs as host code.
+    let given: Option<Vec<(String, String)>> = (crate::compile_time::policy() == crate::compile_time::Policy::Sandboxed && third_party_closure(bs, raw)).then(|| {
+        let set: Vec<(String, String)> = cmd.get_envs().filter_map(|(k, v)| Some((k.to_string_lossy().into_owned(), v?.to_string_lossy().into_owned()))).collect();
+        let names: crate::progenv::Own = cmd.get_envs().filter(|(_, v)| v.is_some()).map(|(k, _)| (k.as_encoded_bytes().to_vec(), None)).collect();
+        cmd.env(std::str::from_utf8(crate::progenv::SCRIPT_ENV).unwrap(), unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&crate::progenv::encode(&names)) });
+        set
+    });
     // cargo's rerun rules: the previous output stands while the script's units, the environment
     // it was given and its `rerun-if-changed` / `rerun-if-env-changed` inputs are unchanged (a
     // script that names none: no file of its package changed)
@@ -1509,7 +1522,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         (Ok(old), Ok(key)) => {
             let own = std::path::Path::new(&format!("{}/{}", build_dir, CHECKOUT_MARK)).is_file();
             let keyed = if own { format!("{CHECKOUT_LINE}\n{old}") } else { old.clone() };
-            let now = rerun_key(&keyed, dir, &env_key, shared.as_ref()).unwrap_or_default();
+            let now = rerun_key(&keyed, dir, &env_key, shared.as_ref(), given.as_deref()).unwrap_or_default();
             if now == key { Ok(old) } else { Err(rerun_reason(&key, &now, &std::fs::read_to_string(format!("{}/relax-rerun-env", build_dir)).unwrap_or_default(), &env_key)) }
         }
         _ => Err("no previous output".to_string()),
@@ -1521,7 +1534,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         None => (base_dir.clone(), previous(&base_dir)),
         Some(content) => {
             let (at, standing) = shared_build_dir(&base_dir, &std::fs::read_to_string(&declared_path).unwrap_or_default(),
-                &|declared| rerun_key(declared, dir, &env_key, Some(content)).unwrap_or_default(), &previous);
+                &|declared| rerun_key(declared, dir, &env_key, Some(content), given.as_deref()).unwrap_or_default(), &previous);
             let at = root.take(at.rsplit('/').next().unwrap_or_default());
             // (a prune may have taken it before the root named it)
             let standing = standing.and_then(|old| if std::path::Path::new(&format!("{}/output", at)).is_file() { Ok(old) } else { Err("no previous output".to_string()) });
@@ -1597,7 +1610,10 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
                 let _ = std::fs::remove_file(&mark);
             }
             let keyed = if own { format!("{CHECKOUT_LINE}\n{stdout}") } else { stdout.clone() };
-            if let Some(key) = rerun_key(&keyed, dir, &env_key, shared.as_ref()) {
+            if let Some(given) = &given {
+                say_withheld(pname, &stdout, given);
+            }
+            if let Some(key) = rerun_key(&keyed, dir, &env_key, shared.as_ref(), given.as_deref()) {
                 let _ = std::fs::write(&output_path, &stdout);
                 let _ = std::fs::write(&key_path, key);
                 let _ = std::fs::write(&env_path, &env_key);
@@ -1632,6 +1648,51 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
             }
         }
         Err(e) => (Err(format!("{} (build script of {}): {}", exe.display(), name, e)), out_dir),
+    }
+}
+
+/// Whether a script's closure, its package and its build-dependencies, holds a registry or git
+/// package (RawUnit::registry): under Policy::Sandboxed such a script is confined, whole (run_one).
+fn third_party_closure(bs: &BuildScript, raw: &[RawUnit]) -> bool {
+    if raw.iter().any(|u| u.src_path == bs.src_path && !u.run_script && u.registry) {
+        return true;
+    }
+    let mut seen = vec![false; raw.len()];
+    let mut stack: Vec<usize> = bs.build_deps.iter().map(|d| d.0).collect();
+    while let Some(i) = stack.pop() {
+        if i >= raw.len() || std::mem::replace(&mut seen[i], true) {
+            continue;
+        }
+        if raw[i].registry {
+            return true;
+        }
+        stack.extend(raw[i].deps.iter().map(|d| d.0));
+    }
+    false
+}
+
+/// The variables confined scripts declared (`rerun-if-env-changed`) that this environment sets and
+/// they were not given: each is said once per run.
+static WITHHELD: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// A confined script's output (`given`: what it was given, run_one): a variable it declares that
+/// is set here and was withheld is said once, with the way to give it (cargo's `[env]`, the
+/// person's own file); the script saw it unset and took its own default.
+fn say_withheld(pname: &str, output: &str, given: &[(String, String)]) {
+    for line in output.lines() {
+        let Some(name) = line.strip_prefix("cargo::").or_else(|| line.strip_prefix("cargo:")).and_then(|r| r.strip_prefix("rerun-if-env-changed=")) else { continue };
+        if given.iter().any(|(k, _)| k == name) || std::env::var_os(name).is_none() {
+            continue;
+        }
+        let mut said = WITHHELD.lock().unwrap();
+        if said.iter().any(|n| n == name) {
+            continue;
+        }
+        said.push(name.to_string());
+        drop(said);
+        crate::progress::say(&format!(
+            "relax build-script: {pname} reads {name}, which is set here: a confined build script is given cargo's variables and the `[env]` of .cargo/config.toml, not this environment; name {name} in `[env]` to give it"
+        ));
     }
 }
 
@@ -1740,7 +1801,9 @@ fn note_rerun(build_dir: &str, why: &str) {
 /// `rerun-if-env-changed` variable its value; an output that names none: the package's newest file.
 /// A shared workspace's (`shared`, vfs.rs SHARE): a path of its checkout keyed by what it holds
 /// (`shared_content`), not its time (its output names the mount's paths, `shared_output`).
-fn rerun_key(output: &str, pkg_dir: &str, env_key: &str, shared: Option<&SharedContent>) -> Option<String> {
+/// A confined script's (`given`, run_one): a variable's value as the script was given it, unset
+/// when it was not given.
+fn rerun_key(output: &str, pkg_dir: &str, env_key: &str, shared: Option<&SharedContent>, given: Option<&[(String, String)]>) -> Option<String> {
     let mut key = format!("{:016x}\n", fnv(env_key.as_bytes(), 0xcbf29ce484222325));
     let mut any = false;
     for line in output.lines() {
@@ -1763,7 +1826,11 @@ fn rerun_key(output: &str, pkg_dir: &str, env_key: &str, shared: Option<&SharedC
             }
         } else if let Some(v) = rest.strip_prefix("rerun-if-env-changed=") {
             any = true;
-            key.push_str(&format!("e {}={:?}\n", v, std::env::var(v).ok()));
+            let value = match given {
+                Some(given) => given.iter().find(|(k, _)| k == v).map(|(_, x)| x.clone()),
+                None => std::env::var(v).ok(),
+            };
+            key.push_str(&format!("e {}={:?}\n", v, value));
         }
     }
     if !any {
@@ -2433,7 +2500,7 @@ mod shared_script_tests {
 
         let key_in = |checkout: &Path| {
             crate::vfs::mount_folder(&root, checkout);
-            rerun_key(&output, &root, "env", Some(&SharedContent::default())).unwrap()
+            rerun_key(&output, &root, "env", Some(&SharedContent::default()), None).unwrap()
         };
         let ka = key_in(&a);
         assert!(!ka.contains(&disk_a) && ka.contains("f c") && ka.contains(&format!(" {root}/proto\n")), "a key names the mount, never a checkout: {ka}");
@@ -2441,7 +2508,7 @@ mod shared_script_tests {
         std::fs::write(b.join("proto/inner/m.proto"), "message B").unwrap();
         assert_ne!(ka, key_in(&b), "its own file differs");
         let shared = SharedContent::default();
-        let none = rerun_key("cargo:rustc-cfg=x\n", &root, "env", Some(&shared)).unwrap();
+        let none = rerun_key("cargo:rustc-cfg=x\n", &root, "env", Some(&shared), None).unwrap();
         assert!(none.contains("p c") && none.contains(&format!(" {root}\n")), "a script that names nothing: its package's files: {none}");
 
         // the build dir of one content of the inputs, else any of this script's that stands
@@ -2521,4 +2588,5 @@ pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     reset(&TO_REMOVE, Mutex::new(Vec::new()));
     reset(&SCRIPT_RUNNING, Mutex::new(0));
+    reset(&WITHHELD, Mutex::new(Vec::new()));
 }

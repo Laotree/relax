@@ -79,13 +79,21 @@ pub const RUN_FACTS: [&[u8]; 8] = [b"RELAX_SELF_EXEC", b"RELAX_SELF_EXEC_SILENT_
 /// The build environment a run hands the runs of the programs it prepared (`BUILD`, `encode`d):
 /// their hosts build as it does. Never the program's: the child host takes it out at its start.
 pub const BUILD_ENV: &[u8] = b"RELAX_BUILD_ENV";
+/// A confined build script's run (relax-front unitgraph.rs `run_one`, Policy::Sandboxed): the names
+/// its program is given, in the wire form (`encode`, names without values). The run's host takes
+/// it out at its start (`init`), and from then on the program reads those names and the reserved
+/// ones alone: every other name of this process's environment is removed from the program's view
+/// (its overlay), so `var_os`, `vars_os` and the environment of a child it starts go without them.
+/// The host keeps its environment. Not a boundary: code that walks the `environ` array, or a C
+/// library's own `getenv`, still reads this process's environment.
+pub const SCRIPT_ENV: &[u8] = b"RELAX_SCRIPT_ENV";
 /// What one process hands the next and no build reads: never part of a build environment.
 /// RELAX_LOADER is each loader's own (the runner's start sets it, from what it was started with
 /// or the loader recorded beside a run's link): a run started with it (`$RELAX_LOADER run` from a
 /// program) wrote it into its build environment, and a relaunch of its program by a shell that
 /// cleared it hid the loader its start found from the program (the build's reserved names it was
 /// not started with), which then had none.
-const HANDOVER: [&[u8]; 6] = [PROGRAM_ENV, BUILD_ENV, b"RELAX_ARG0", b"RELAX_BIN_NATIVE_RECEIPT", b"RELAX_NATIVE_RECEIPT", b"RELAX_LOADER"];
+const HANDOVER: [&[u8]; 7] = [PROGRAM_ENV, BUILD_ENV, SCRIPT_ENV, b"RELAX_ARG0", b"RELAX_BIN_NATIVE_RECEIPT", b"RELAX_NATIVE_RECEIPT", b"RELAX_LOADER"];
 
 pub fn run_fact(name: &[u8]) -> bool {
     RUN_FACTS.iter().any(|n| same_name(n, name))
@@ -721,6 +729,17 @@ pub fn init_handed(beside: Option<Vec<u8>>) {
         let own = parse(v.as_encoded_bytes()).unwrap_or_else(|e| panic!("RELAX_PROGRAM_ENV from the parent's Relax std: {e}"));
         for (k, v) in &own {
             write(k, v.as_deref());
+        }
+    }
+    // a confined build script's run: the program reads the names it was given and the reserved
+    // ones, nothing else of this environment (`SCRIPT_ENV`)
+    if let Some(v) = std::env::var_os(std::str::from_utf8(SCRIPT_ENV).unwrap()) {
+        std::env::remove_var(std::str::from_utf8(SCRIPT_ENV).unwrap());
+        let given = parse(v.as_encoded_bytes()).unwrap_or_else(|e| panic!("RELAX_SCRIPT_ENV from the run of the script's parent: {e}"));
+        for (k, _) in real() {
+            if !reserved(&k) && !given.iter().any(|(g, _)| same_name(g, &k)) {
+                write(&k, None);
+            }
         }
     }
     let set = |own: Own| -> Env { own.into_iter().filter_map(|(k, v)| Some((k, v?))).collect() };

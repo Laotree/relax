@@ -185,25 +185,8 @@ pub struct Domain {
 
 /// What third-party packages' compile-time code may do (proc macros, pmhost.rs; build scripts,
 /// unitgraph.rs): the entry point's choice, one per process (runner Host `compile_time_code`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Policy {
-    /// it runs as host code with the person's rights, as cargo runs it (bare `relax`)
-    Open,
-    /// code whose closure includes a registry or git package runs confined (`makepad run`)
-    Sandboxed,
-}
-
-/// 0 = Sandboxed (the default when no entry point chose), 1 = Open
-static POLICY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-/// The entry point's policy, before any crate graph loads.
-pub fn set_policy(p: Policy) {
-    POLICY.store((p == Policy::Open) as u8, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub fn policy() -> Policy {
-    if POLICY.load(std::sync::atomic::Ordering::Relaxed) == 1 { Policy::Open } else { Policy::Sandboxed }
-}
+/// Kept in relax-base, where the build-script runs read it too.
+pub use relax_base::compile_time::{policy, set_policy, Policy};
 
 /// The run-time modules' domain: what every domain may call, nothing more; metered (a module's
 /// arena may set a per-call budget).
