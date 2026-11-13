@@ -72,6 +72,10 @@ pub enum SymKind {
 pub enum DataKind {
     /// plain bytes (string literals, file paths): no pointers
     Bytes,
+    /// a path stored in its anchored spelling (`\0tag\0rel`). The cache keeps that spelling (it
+    /// is worktree-independent); the run materialises the current absolute path. Until the
+    /// materialisation lands this behaves exactly as `Bytes`.
+    AnchoredPath,
     /// a value of this type: pointer words are found by walking the type
     Typed(TyId),
     /// 8-byte words, each a pointer (Some) or an integer (None): vtables, Locations
@@ -604,7 +608,7 @@ fn obj_ptrs(u: &Unit, idx: u32) -> Option<(u64, u64, std::sync::Arc<Vec<(u32, Op
     let mut ptrs = Vec::new();
     let mut opaque = false;
     match &kind {
-        DataKind::Bytes => {}
+        DataKind::Bytes | DataKind::AnchoredPath => {}
         DataKind::Relocs(p) => ptrs.extend(p.iter().map(|(o, s)| (*o, Some(*s)))),
         DataKind::Words(w) => {
             // fewer words than the object holds: its pointer words are unknown (a cached object
@@ -1237,7 +1241,7 @@ pub(crate) fn pointer_offsets(u: &Unit, start: u64, image: &[u8]) -> Option<Vec<
         }
     };
     match kind {
-        DataKind::Bytes => Some(Vec::new()),
+        DataKind::Bytes | DataKind::AnchoredPath => Some(Vec::new()),
         DataKind::Relocs(p) => Some(p.iter().map(|(o, _)| *o).collect()),
         DataKind::Words(w) => {
             let pw = u.ptr_bytes() as u64;
