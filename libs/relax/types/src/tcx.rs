@@ -2173,7 +2173,7 @@ impl Tcx {
         let (features, attr_pos) = tf::parse_target_feature_attrs(prog, file, attrs, &mut errors);
         let mut out = tf::TargetFeatureAttrs { attr_pos, ..Default::default() };
         if let Some(attr_pos) = attr_pos {
-            let arch = tf::target_arch(prog);
+            let arch = tf::target_arch(prog, file);
             // ast_lowering: a safe fn with the attribute is unsafe in the type system
             out.safe_target_features = header.safety == Safety::Safe;
             if out.safe_target_features && matches!(def.kind, DefKind::AssocFn) {

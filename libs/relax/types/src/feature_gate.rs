@@ -1220,7 +1220,7 @@ pub fn check_stability(prog: &Program, body: &crate::typeck::Body) -> Vec<String
 }
 
 /// `#[unstable(feature = "name", reason = "..")]` on a definition's item: (feature, reason).
-fn unstable_of(prog: &Program, d: crate::program::DefId) -> Option<(String, Option<String>)> {
+pub(crate) fn unstable_of(prog: &Program, d: crate::program::DefId) -> Option<(String, Option<String>)> {
     let def = prog.def(d);
     // (the other definitions -- primitives, locals -- have no item of their own)
     if !matches!(def.kind, DefKind::Mod | DefKind::Fn | DefKind::AssocFn | DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::Trait | DefKind::TypeAlias | DefKind::AssocTy) { return None; }
