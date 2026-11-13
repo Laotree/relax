@@ -44,8 +44,6 @@ libs/toml_parser                (except libs/toml_parser/tests/manifests.rs)
 libs/windows/sys
 platform/cpu_budget
 platform/network
-platform/src/restart.rs
-platform/src/thread.rs
 tools/run/light_http
 tools/run/runner
 ```
