@@ -13,6 +13,11 @@ autotests = false
 [package.metadata.commercial]
 include = ["../build_stamp.rs", "../self_stamp.rs", "std"]
 
+# devhub runs these tests in the lane's tree, never a JIT overlay: the build script runs cargo
+# metadata on this manifest, and an overlay's tree is one only the JIT process reads
+[package.metadata.makepad]
+test-tree = "its build script runs cargo metadata on the checkout"
+
 [lib]
 name = "relax_compiler"
 path = "src/lib.rs"
