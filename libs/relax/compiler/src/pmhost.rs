@@ -265,15 +265,20 @@ fn world_inner(sess: &std::sync::Arc<crate::Session>, prewarm: bool) -> Option<s
         std::sync::Arc::new(build_world(sess))
     };
     tl_set_once(1, crate::clock::ms_since_start());
+    *WORLD.lock().unwrap_or_else(|e| e.into_inner()) = Some(w.clone());
+    // BUILDING goes before the owner is asked: the owner may be the thread waiting for it (a
+    // module loaded at run time on a program request expands its macros there), and it would
+    // wait for this build while the build waits in its queue.
+    drop(_b);
     // the runtime's unit is the final world's until the program's runs, set on the owner (no
     // owner-path macro call is in flight there): a stage world's call left its unit behind. A
     // world built while the program runs (an expansion of a lazily parsed body) leaves the
-    // program's in place (jit.rs adopt_runtime_unit)
+    // program's in place (jit.rs adopt_runtime_unit). A macro call that comes first adopts the
+    // world's unit itself (jit.rs call_jit_in), and `w` keeps the world alive until this is done.
     if let Ok(world) = w.as_ref() {
         let wu = world.u as usize;
         crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::set_runtime_unit(wu as *mut crate::jit::Unit) });
     }
-    *WORLD.lock().unwrap_or_else(|e| e.into_inner()) = Some(w.clone());
     tl_add(4, 1.0);
     tl_add(5, t.elapsed().as_secs_f64() * 1e3);
     Some(w)
