@@ -182,6 +182,14 @@ static WORLD: relax_session::sync::Mutex<Option<std::sync::Arc<Result<World, Str
 /// serde_derive: three stages). rustc builds each proc-macro crate after the ones its dependencies
 /// use; the stages are that order, one world per layer.
 static BOOT_WORLDS: relax_session::sync::Mutex<Vec<std::sync::Arc<Result<World, String>>>> = relax_session::sync::Mutex::new(Vec::new());
+/// The crates whose expansions called into the macro world (by name), in the order of their first
+/// call: a live test session whose own crates are among them keeps the world after its load
+/// (run.rs), as the reload of an edited file runs their hosted macros again.
+static HOSTED_CALLERS: relax_session::sync::Mutex<Vec<String>> = relax_session::sync::Mutex::new(Vec::new());
+/// Did a crate that `own` accepts call a hosted macro?
+pub fn hosted_caller(own: impl Fn(&str) -> bool) -> bool {
+    HOSTED_CALLERS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|k| own(k))
+}
 /// held while the world is being built: other threads wait for that build
 static BUILDING: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
 
@@ -771,6 +779,13 @@ fn call(sess: &std::sync::Arc<crate::Session>, entry: &Entry, attr: Option<&Toke
     // the runtime's process-wide UNIT and TLS machinery. Preserve the original reload
     // serialization for this step. Cached script expansions never enter the host.
     let call_krate = crate::macro_reg::current_call_krate();
+    {
+        let mut callers = HOSTED_CALLERS.lock().unwrap_or_else(|e| e.into_inner());
+        if !callers.contains(&call_krate) {
+            let _k = crate::zone_alloc::kept();
+            callers.push(call_krate.clone());
+        }
+    }
     // While the program's crates load (no program unit yet: no program code runs) and the call is
     // into the final world, the expansion runs on the asking thread: the runtime's unit is that
     // world's for every such call at once, and its lazy compiles are owner requests as any thread's.

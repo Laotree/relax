@@ -1782,9 +1782,19 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         eprintln!("boot-trace: proc-macro world cache flush {:.1} ms; {}", tf.elapsed().as_secs_f64() * 1e3, crate::pmhost::cache_line());
     }
     // the program's files are loaded: the macro world goes (hot reload or a run-time module
-    // builds it again from its disk cache)
+    // builds it again from its disk cache). A live test session whose own crates ran hosted
+    // macros keeps it: the reload of an edited file of theirs runs those macros again, and the
+    // first edit would build the world again (CPU several times a later edit's; relax issue 144).
+    // The session holds it from then on either way.
+    let keep_world = live_tests && {
+        let own: Vec<&str> = crate::check::workspace_crates(&prog, crate_of[subject_ci]).into_iter().map(|k| prog.syms.str(prog.crates[k as usize].name)).collect();
+        crate::pmhost::hosted_caller(|k| own.contains(&k))
+    };
+    if keep_world && crate::preload::trace() {
+        eprintln!("boot-trace: macro world kept: the live session's own crates run hosted macros");
+    }
     let pm0 = crate::memstat::live_of(crate::memstat::Tag::PmHost);
-    let freed = crate::pmhost::free_world();
+    let freed = !keep_world && crate::pmhost::free_world();
     crate::native_macros::report(sess.runtime.profile);
     if crate::preload::trace() && crate::memstat::enabled() {
         eprintln!("boot-trace: pmhost heap {} KB before the free, {} KB after", pm0 >> 10, crate::memstat::live_of(crate::memstat::Tag::PmHost) >> 10);
