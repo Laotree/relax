@@ -11535,11 +11535,11 @@ fn settle_tier_tick() {
 unsafe fn settle_checkpoint(up: *mut Unit) {
     let u = &*up;
     let Some(threshold) = u.tier1.as_ref().map(|t| t.threshold) else { return };
-    let now = tier_clock();
+    let (now, wall) = tier_clocks();
     for id in 0..u.fns.len() as u32 {
         let rec = tier_rec(&u.slots, id);
         if (*rec.add(3)).load(Ordering::Acquire) == T_COUNTING {
-            let _ = tier_check(rec, threshold, now);
+            let _ = tier_check(rec, threshold, now, wall);
         }
     }
 }
@@ -11649,7 +11649,8 @@ unsafe fn settle_unfinal(u: &Unit, id: u32, threshold: u64) -> bool {
     if (*rec.add(3)).compare_exchange(T_FINAL, T_COUNTING, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         return false;
     }
-    tier_count_fresh(rec, threshold, tier_clock());
+    let (now, wall) = tier_clocks();
+    tier_count_fresh(rec, threshold, now, wall);
     (*rec.add(5)).fetch_and(!STORED_PARKED, Ordering::Relaxed);
     FINAL_SLOTS.fetch_sub(1, Ordering::Relaxed);
     let code = (*rec.add(1)).load(Ordering::Relaxed);
@@ -17535,7 +17536,7 @@ fn rt_loop_hot(counter: u64, fp: u64) {
         tier_charge(rec, chunk);
         note_ui_path(rec);
         let w5 = (*rec.add(5)).load(Ordering::Acquire);
-        let now = tier_clock();
+        let (now, wall) = tier_clocks();
         if w5 & LOOP_HOT_AT != 0 {
             // its loop made it hot (word 7: when) and no call came since, which would have queued
             // it (rt_hot): one invocation runs the loop on. Past IN_LOOP_NS it is queued from in
@@ -17546,7 +17547,7 @@ fn rt_loop_hot(counter: u64, fp: u64) {
             if now.saturating_sub((*rec.add(7)).load(Ordering::Relaxed)) < IN_LOOP_NS {
                 return;
             }
-            match tier_check(rec, threshold, now) {
+            match tier_check(rec, threshold, now, wall) {
                 Some(rate) => {
                     queue_counting(u, id, rec, Q_LOOP, rate);
                 }
@@ -17625,19 +17626,20 @@ unsafe fn loop_walk(mut at: u32, threshold: u64, callers: impl Iterator<Item = u
 }
 
 /// Per-slot record at `SlotTable::tier(slot)`: [cost budget, counted code, count stub, state,
-/// last cost check (wall_ns), counted code bytes | flags, TIER_INBOX link (low 32 bits) | queue
+/// last cost check (tier_clock), counted code bytes | flags, TIER_INBOX link (low 32 bits) | queue
 /// reason Q_* (high 32 bits), cost rate at queueing (counting with LOOP_HOT_AT: when its own loop
 /// made it hot), loop counter, decayed cost at the last check]
 /// (read by JIT code, rt_hot and rt_loop_hot without the lock), patch flag (a live session: 1 once a
 /// patch replaced the slot's body; the guards of its inlined copies read it), copy version (a live
 /// session: moves each time a patch sets a flag the slot's code reads; the guards in its code
-/// read it before their flags, copy_ver). The budget (signed) is what the
+/// read it before their flags, copy_ver), the last cost check's wall time (wall_ns: tier_check's
+/// rate is the cost spent over the wall time it took). The budget (signed) is what the
 /// count stub takes each call's weight from (call_weight) and rt_loop_hot each LOOP_CHUNK back
 /// edges' cost from; at or below 0 the next call goes to rt_hot, which decays the cost seen so far,
 /// adds what was spent since and either queues the slot (tier_check) or refills the budget. The
 /// loop counter is the word the slot's own baseline / O1 / O2 code decrements per loop iteration
 /// (profile::loop_counters).
-const TIER_REC: usize = 96;
+const TIER_REC: usize = 104;
 /// the loop counter's offset in the tier record (word 8)
 const TIER_LOOP: u64 = 64;
 /// the patch flag's offset in the tier record (word 10)
@@ -17743,8 +17745,8 @@ const HEAT_FOLD_NS: u64 = 250_000_000;
 /// while it is counted or queued, 0 otherwise (final, not armed). A queued slot's record is folded
 /// here (its cost check, as rt_hot's under the threshold): only its loop counters charge it then, so
 /// the fold races nothing but their budget decrements (an estimate either way).
-unsafe fn slot_heat(u: &Unit, id: u32, threshold: u64, now: u64) -> (u64, bool) {
-    // (`now`: tier_clock, the records' clock)
+unsafe fn slot_heat(u: &Unit, id: u32, threshold: u64, now: u64, wall: u64) -> (u64, bool) {
+    // (`now`: tier_clock, the records' clock; `wall`: wall_ns, word 12)
     if id as usize >= u.fns.len() {
         return (0, false);
     }
@@ -17757,6 +17759,7 @@ unsafe fn slot_heat(u: &Unit, id: u32, threshold: u64, now: u64) -> (u64, bool) 
             if now.saturating_sub((*rec.add(4)).load(Ordering::Relaxed)) >= HEAT_FOLD_NS {
                 (*rec.add(9)).store(cost, Ordering::Relaxed);
                 (*rec.add(4)).store(now, Ordering::Relaxed);
+                (*rec.add(12)).store(wall, Ordering::Relaxed);
                 (*rec).store(tier_refill(threshold, cost), Ordering::Relaxed);
             }
             (cost, ui)
@@ -17785,7 +17788,8 @@ struct HeatNow {
 
 impl HeatNow {
     fn take() -> Self {
-        HeatNow { hu: heat_unit(), wall: wall_ns(), tier: tier_clock() }
+        let (tier, wall) = tier_clocks();
+        HeatNow { hu: heat_unit(), wall, tier }
     }
 
     /// An O3 queue entry's place among the others: its heat, and the time it waited.
@@ -17796,20 +17800,28 @@ impl HeatNow {
 
     /// An O3 queue entry's heat and UI mark. A queued slot's calls are not counted (rt_hot takes its
     /// stub out), so its record only decays, and all that tells it from any other entry is the rate
-    /// it was queued at (the cost per second that reached the threshold). Its loops and counted code
-    /// may show more since.
+    /// it was queued at (the cost per second that reached the threshold), as the cost it is worth
+    /// (rate_cost). Its loops and counted code may show more since.
     fn tier_heat(&self, e: &queue::TierEntry) -> (u64, bool) {
         let (heat, ui) = self.heat(0, e.0);
-        (heat.max(e.3), ui)
+        (heat.max(rate_cost(e.1, e.3)), ui)
     }
 
     /// Slot `id`'s heat and UI mark (`unit` 0: the tiering unit; another unit's slot: none).
     fn heat(&self, unit: usize, id: u32) -> (u64, bool) {
         match self.hu {
-            Some((u, th)) if unit == 0 || unit == u as *const Unit as usize => unsafe { slot_heat(u, id, th, self.tier) },
+            Some((u, th)) if unit == 0 || unit == u as *const Unit as usize => unsafe { slot_heat(u, id, th, self.tier, self.wall) },
             _ => (0, false),
         }
     }
+}
+
+/// A queued rate as cost units, the heat's scale: a steady rate r converges on r x half-life / ln 2.
+/// A counted window's rate (Q_PROFILED: RIR instructions per second) is cost units at
+/// WORK_PER_UNIT first, as profiled_heat charges its work.
+fn rate_cost(why: u8, rate: u64) -> u64 {
+    let units = if why == Q_PROFILED { rate / WORK_PER_UNIT } else { rate };
+    (units as f64 * COST_HALF_LIFE_NS / 1e9 / std::f64::consts::LN_2) as u64
 }
 
 /// An O2 queue entry's time for a hot slot's build (o2_enqueue_front: first among the O2 builds)
@@ -17861,25 +17873,30 @@ unsafe fn tier_cost_now(rec: *const AtomicU64, threshold: u64, now: u64) -> (u64
     (cost_decay(last, dt).saturating_add(cost_spread(spent, dt)), spent)
 }
 
-/// A slot's counting starts (again) from nothing at `now`.
-unsafe fn tier_count_fresh(rec: *const AtomicU64, threshold: u64, now: u64) {
+/// A slot's counting starts (again) from nothing at `now` (tier_clock; `wall`: wall_ns).
+unsafe fn tier_count_fresh(rec: *const AtomicU64, threshold: u64, now: u64, wall: u64) {
     (*rec.add(9)).store(0, Ordering::Relaxed);
     (*rec.add(4)).store(now, Ordering::Relaxed);
+    (*rec.add(12)).store(wall, Ordering::Relaxed);
     (*rec).store(tier_refill(threshold, 0), Ordering::Relaxed);
     (*rec.add(5)).fetch_and(!LOOP_HOT_AT, Ordering::Relaxed);
 }
 
 /// rt_hot's decision for a counting slot whose budget ran out: its cost now (decayed + spent since
-/// the last check). Over the threshold: Some(rate = the cost spent since the last check per
-/// second). Under it: the check is recorded (decayed cost, time, refilled budget) and None.
-unsafe fn tier_check(rec: *const AtomicU64, threshold: u64, now: u64) -> Option<u64> {
+/// the last check, on the tier clock `now`). Over the threshold: Some(rate = the cost spent since
+/// the last check per second of wall time, `wall`). Under it: the check is recorded (decayed cost,
+/// both times, refilled budget) and None. The rate only orders the queue: on tier_clock, which
+/// stands while any thread's demand compile is open, a cold load's checks came microseconds apart
+/// and its rates were the cost spent times 1e9 (1e12 and more against a threshold rate of 4e4/s).
+unsafe fn tier_check(rec: *const AtomicU64, threshold: u64, now: u64, wall: u64) -> Option<u64> {
     let (cost, spent) = tier_cost_now(rec, threshold, now);
-    let since = now.saturating_sub((*rec.add(4)).load(Ordering::Relaxed)).max(1);
     if cost >= threshold {
+        let since = wall.saturating_sub((*rec.add(12)).load(Ordering::Relaxed)).max(1);
         return Some(((spent as u128 * 1_000_000_000 / since as u128).min(u64::MAX as u128)) as u64);
     }
     (*rec.add(9)).store(cost, Ordering::Relaxed);
     (*rec.add(4)).store(now, Ordering::Relaxed);
+    (*rec.add(12)).store(wall, Ordering::Relaxed);
     (*rec).store(tier_refill(threshold, cost), Ordering::Relaxed);
     None
 }
@@ -17894,23 +17911,48 @@ mod tier_cost_tests {
     use super::*;
 
     /// A slot driven at `per_s` cost units per second in calls of `w` (the stub's budget, rt_hot's
-    /// checks) for `secs`: the time it is queued at, if it is.
+    /// checks) for `secs`: the time it is queued at, if it is. The rate it is queued at is never
+    /// above the rate it was driven at (the gap's rounding aside).
     fn drive(per_s: u64, w: u64, secs: u64) -> Option<f64> {
         let th = tier_threshold(2000);
-        let rec: Vec<AtomicU64> = (0..10).map(|_| AtomicU64::new(0)).collect();
+        let rec: Vec<AtomicU64> = (0..TIER_REC / 8).map(|_| AtomicU64::new(0)).collect();
         let r = rec.as_ptr();
         let gap = (w * 1_000_000_000 / per_s).max(1);
         unsafe {
-            tier_count_fresh(r, th, 1);
+            tier_count_fresh(r, th, 1, 1);
             let mut t = 1u64;
             while t < secs * 1_000_000_000 {
                 t += gap;
-                if ((*r).fetch_sub(w, Ordering::Relaxed) as i64) - (w as i64) <= 0 && tier_check(r, th, t).is_some() {
-                    return Some(t as f64 / 1e9);
+                if ((*r).fetch_sub(w, Ordering::Relaxed) as i64) - (w as i64) <= 0 {
+                    if let Some(rate) = tier_check(r, th, t, t) {
+                        assert!(rate <= per_s + per_s / 1000 + 1, "queued at {rate} units/s, driven at {per_s}");
+                        return Some(t as f64 / 1e9);
+                    }
                 }
             }
         }
         None
+    }
+
+    /// The queue's rate is the cost a slot spent over the wall time that took. The tier clock
+    /// stands while any thread has a demand compile open (most of a cold load), and on it the same
+    /// spending came out as the cost times 1e9.
+    #[test]
+    fn the_queued_rate_is_cost_over_wall_time() {
+        let th = tier_threshold(2000);
+        let rec: Vec<AtomicU64> = (0..TIER_REC / 8).map(|_| AtomicU64::new(0)).collect();
+        let r = rec.as_ptr();
+        unsafe {
+            tier_count_fresh(r, th, 1, 1);
+            // twice the threshold's cost over two seconds of wall time, the tier clock held
+            tier_charge(r, 2 * th);
+            assert_eq!(tier_check(r, th, 1, 1 + 2_000_000_000), Some(th), "the cost spent over the wall time it took");
+        }
+        // one unit in the queue's key: a rate is worth the cost it converges on, and a counted
+        // window's instructions are cost units at WORK_PER_UNIT
+        let steady = (th as f64 * std::f64::consts::LN_2 / (COST_HALF_LIFE_NS / 1e9)) as u64;
+        assert!(rate_cost(Q_CALLS, steady).abs_diff(th) <= th / 1000, "the threshold's rate is worth the threshold");
+        assert_eq!(rate_cost(Q_PROFILED, steady * WORK_PER_UNIT), rate_cost(Q_CALLS, steady), "a profiled rate is in instructions");
     }
 
     /// A final slot counts again for its loop only at the rate its O3 decision needs: without PGO
@@ -18956,11 +18998,12 @@ unsafe fn twin_base_build(up: *mut Unit, t: u32) {
 /// built it. Read with the slot records' races (an estimate either way: slot_heat).
 unsafe fn take_twin_heat(u: &Unit, b: u32, t: u32) {
     let Some(threshold) = u.tier1.as_ref().map(|x| x.threshold).filter(|_| !twin_pgo_off(&u.prog.session.options)) else { return };
-    let now = tier_clock();
+    let (now, wall) = tier_clocks();
     let (rb, rt) = (tier_rec(&u.slots, b), tier_rec(&u.slots, t));
     let cost = tier_cost_now(rt, threshold, now).0.max(tier_cost_now(rb, threshold, now).0);
     (*rb.add(9)).store(cost, Ordering::Relaxed);
     (*rb.add(4)).store(now, Ordering::Relaxed);
+    (*rb.add(12)).store(wall, Ordering::Relaxed);
     (*rb).store(tier_refill(threshold, cost), Ordering::Relaxed);
 }
 
@@ -19352,7 +19395,8 @@ fn tier_revalidate(q: &mut Vec<(u32, u8, u64, u64)>) -> Vec<(u32, u8, u64, u64)>
             let len = (*rec.add(5)).load(Ordering::Relaxed);
             let code = (*rec.add(1)).load(Ordering::Relaxed);
             let stub = (*rec.add(2)).load(Ordering::Relaxed);
-            tier_count_fresh(rec, threshold, tier_clock());
+            let (tier_now, wall) = tier_clocks();
+            tier_count_fresh(rec, threshold, tier_now, wall);
             (*rec.add(5)).store((len & !(LOOP_CHARGED | LOOP_HOT_AT)) | REARMED, Ordering::Relaxed);
             (*rec.add(3)).store(T_COUNTING, Ordering::Release);
             let s = SlotWord::of(&u.slots, id);
@@ -19900,9 +19944,14 @@ static DEMAND_SINCE: AtomicU64 = AtomicU64::new(0);
 /// same code differently (PGO8: warm built O2 over baseline for core generics cold left baseline).
 /// On this clock both see the program's own time.
 fn tier_clock() -> u64 {
+    tier_clocks().0
+}
+
+/// (tier_clock, wall_ns) from one clock read: a cost check records both (tier record words 4 and 12).
+fn tier_clocks() -> (u64, u64) {
     let now = wall_ns();
     let open = if DEMAND_COMPILES.load(Ordering::Relaxed) > 0 { now.saturating_sub(DEMAND_SINCE.load(Ordering::Relaxed)) } else { 0 };
-    now.saturating_sub(DEMAND_BUSY_NS.load(Ordering::Relaxed).saturating_add(open))
+    (now.saturating_sub(DEMAND_BUSY_NS.load(Ordering::Relaxed).saturating_add(open)), now)
 }
 
 struct StartupCompile { foreground: bool }
@@ -20004,7 +20053,7 @@ impl Unit {
             return;
         }
         crate::inspect::tierlog::init();
-        let now = tier_clock();
+        let (now, wall) = tier_clocks();
         // no-codegen: each count stub is an interpreter entry of its own (interp::count_entry)
         if self.prog.session.options.no_codegen {
             for &(id, code) in ids {
@@ -20023,7 +20072,7 @@ impl Unit {
                 if (*rec.add(3)).load(Ordering::Relaxed) != 0 {
                     continue;
                 }
-                tier_count_fresh(rec, threshold, now);
+                tier_count_fresh(rec, threshold, now, wall);
                 let bytes = self.fns[id as usize].code_len as u64;
                 (*rec.add(5)).store(bytes, Ordering::Relaxed);
                 (*rec.add(1)).store(code, Ordering::Relaxed);
@@ -20107,7 +20156,8 @@ impl Unit {
             if (*rec.add(3)).load(Ordering::Relaxed) != 0 {
                 return;
             }
-            tier_count_fresh(rec, threshold, tier_clock());
+            let (now, wall) = tier_clocks();
+            tier_count_fresh(rec, threshold, now, wall);
             let bytes = self.fns[id as usize].code_len as u64;
             (*rec.add(5)).store(bytes, Ordering::Relaxed);
             (*rec.add(1)).store(code, Ordering::Relaxed);
@@ -20709,7 +20759,7 @@ fn rt_hot(slot: u64) -> u64 {
         let s = SlotWord::of(&u.slots, slot as u32);
         // from here on atomics only (rule I-CALL)
         let _no_wait = owner::NoWait::enter();
-        let now = tier_clock();
+        let (now, wall) = tier_clocks();
         let Some(threshold) = u.tier1.as_ref().map(|t| t.threshold) else { return code };
         let mut rate = 0;
         if (*rec.add(3)).load(Ordering::Relaxed) == T_COUNTING {
@@ -20717,7 +20767,7 @@ fn rt_hot(slot: u64) -> u64 {
             if (*rec.add(5)).load(Ordering::Relaxed) & LOOP_HOT_AT != 0 {
                 (*rec.add(5)).fetch_and(!LOOP_HOT_AT, Ordering::Relaxed);
             }
-            match tier_check(rec, threshold, now) {
+            match tier_check(rec, threshold, now, wall) {
                 Some(r) => rate = r,
                 None => {
                     // under the threshold: the stub stays, counting on. Baseline code that keeps
