@@ -80,7 +80,12 @@ pub const RUN_FACTS: [&[u8]; 8] = [b"RELAX_SELF_EXEC", b"RELAX_SELF_EXEC_SILENT_
 /// their hosts build as it does. Never the program's: the child host takes it out at its start.
 pub const BUILD_ENV: &[u8] = b"RELAX_BUILD_ENV";
 /// What one process hands the next and no build reads: never part of a build environment.
-const HANDOVER: [&[u8]; 5] = [PROGRAM_ENV, BUILD_ENV, b"RELAX_ARG0", b"RELAX_BIN_NATIVE_RECEIPT", b"RELAX_NATIVE_RECEIPT"];
+/// RELAX_LOADER is each loader's own (the runner's start sets it, from what it was started with
+/// or the loader recorded beside a run's link): a run started with it (`$RELAX_LOADER run` from a
+/// program) wrote it into its build environment, and a relaunch of its program by a shell that
+/// cleared it hid the loader its start found from the program (the build's reserved names it was
+/// not started with), which then had none.
+const HANDOVER: [&[u8]; 6] = [PROGRAM_ENV, BUILD_ENV, b"RELAX_ARG0", b"RELAX_BIN_NATIVE_RECEIPT", b"RELAX_NATIVE_RECEIPT", b"RELAX_LOADER"];
 
 pub fn run_fact(name: &[u8]) -> bool {
     RUN_FACTS.iter().any(|n| same_name(n, name))
