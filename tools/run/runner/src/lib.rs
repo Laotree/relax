@@ -491,7 +491,7 @@ fn run_package(words: &[String]) -> Option<String> {
     None
 }
 
-/// The package's `[package.metadata.makepad.run-env]` (makepad resolve::run_env), for every way it
+/// The package's `[package.metadata.relax.run-env]` (resolve::run_env), for every way it
 /// is run (a checkout, the stores, the runner's tiles): set unless the environment already has it.
 fn apply_run_env(workspace: &str, package: &str) {
     // Manifest discovery does not evaluate target predicates. Freeze compilation inputs

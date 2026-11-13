@@ -1248,7 +1248,7 @@ pub fn package_dir(sess: &std::sync::Arc<crate::Session>, dir: &str, package: &s
 }
 
 /// What a package asks of its run's environment: its manifest's
-/// `[package.metadata.makepad.run-env]` table of `NAME = "value"` lines. The loader applies it to every run of the package, from a
+/// `[package.metadata.relax.run-env]` table of `NAME = "value"` lines. The loader applies it to every run of the package, from a
 /// checkout or from the stores; a variable the environment already sets wins.
 pub fn run_env(manifest: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -1256,7 +1256,7 @@ pub fn run_env(manifest: &str) -> Vec<(String, String)> {
     for line in manifest.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.starts_with('[') {
-            inside = line == "[package.metadata.makepad.run-env]";
+            inside = line == "[package.metadata.relax.run-env]";
             continue;
         }
         if !inside {
@@ -3171,7 +3171,7 @@ fn unit_graph_host_side_follows_proc_macro_and_build_script_edges() {
 #[cfg(test)]
 #[test]
 fn run_env_reads_the_packages_table() {
-    let m = "[package]\nname = \"makepad-amp\"\n\n[package.metadata.makepad.run-env]\n# why\nMAKEPAD_LOG = \"0\"\nbad key = \"x\"\n\n[dependencies]\nX = \"1\"\n";
+    let m = "[package]\nname = \"makepad-amp\"\n\n[package.metadata.relax.run-env]\n# why\nMAKEPAD_LOG = \"0\"\nbad key = \"x\"\n\n[dependencies]\nX = \"1\"\n";
     assert_eq!(run_env(m), vec![("MAKEPAD_LOG".to_string(), "0".to_string())]);
     assert!(run_env("[package]\nname = \"a\"\n").is_empty());
 }

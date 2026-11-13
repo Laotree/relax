@@ -311,12 +311,12 @@ pub fn run(opts: Options) -> Result<(), String> {
         walk(&root, &res, &mut files)?;
     }
     // data a crate reads by a path outside its own folder, declared in its manifest:
-    // `[package.metadata.makepad] data = ["../../../engine/resources/kits"]` (Sandbox's game
+    // `[package.metadata.relax] data = ["../../../engine/resources/kits"]` (Sandbox's game
     // script reads the engine's kits so; without them a store run's games fail to load)
     for p in graph.iter() {
         let manifest = if p.is_empty() { "Cargo.toml".to_string() } else { format!("{p}/Cargo.toml") };
         let Ok(text) = std::fs::read_to_string(root.join(&manifest)) else { continue };
-        let section = text.lines().skip_while(|l| l.trim() != "[package.metadata.makepad]").skip(1).take_while(|l| !l.trim_start().starts_with('['));
+        let section = text.lines().skip_while(|l| l.trim() != "[package.metadata.relax]").skip(1).take_while(|l| !l.trim_start().starts_with('['));
         for line in section {
             let Some((k, v)) = line.split_once('=') else { continue };
             if k.trim() != "data" { continue; }
