@@ -4800,8 +4800,16 @@ fn const_eval_to_valtree(context: usize, _env: crate::tcx::TypingEnv, def: DefId
     let (value, deferred, refused) = owner::call(owner::Class::Job, || {
         let prev = DEFERRED_ABORT.with(|a| a.replace(false));
         let refusal = RefusalFrame::enter();
+        let stand_ins = relax_types::cycle::stand_ins();
         let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let addr = unsafe { (&mut *u.self_ptr.0).const_addr(def, compact) }.ok_or_else(evaluation_error)?;
+            let addr = match unsafe { (&mut *u.self_ptr.0).const_addr(def, compact) } {
+                Some(addr) => addr,
+                // evaluated across a cycle: its E0391 is the report (no E0080 beside it)
+                None if relax_types::cycle::stand_ins() != stand_ins => {
+                    return Err(ErrorHandled::Reported(relax_types::const_eval::ValTreeCreationError::CyclicConst));
+                }
+                None => return Err(evaluation_error()),
+            };
             crate::valtrees::const_to_valtree(u, addr, ty)
         }));
         let refused = refusal.refused();
@@ -7454,7 +7462,12 @@ impl Unit {
         let cert = CertGuard::begin(FnKey::Inst(d, args.clone()));
         let t_init = cpu_ns();
         let refusal = RefusalFrame::enter();
+        let stand_ins = relax_types::cycle::stand_ins();
         let evaluated = { let _pop = Pop; self.eval_init(d, args.clone(), false) };
+        // a value computed across a cycle read its stand-in (a recovery discriminant, a zero-size
+        // layout): rustc reports the E0391 and builds no program, so the constant has no value and
+        // each use fails as a failed constant's does
+        let evaluated = evaluated.filter(|_| relax_types::cycle::stand_ins() == stand_ins);
         let refused = refusal.refused();
         drop(refusal);
         INIT_NS[3].fetch_add(cpu_ns() - t_init, Ordering::Relaxed);

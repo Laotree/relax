@@ -1083,6 +1083,7 @@ impl<'a> Lcx<'a> {
             None => {
                 let erased = u.tcx.tys.erase_regions(t);
                 let l = u.layout_of(erased);
+                self.check_explicit_discriminants(t);
                 let too_big = u.lay.is_too_big(erased);
                 if !too_big { self.layouts.insert(t, l); }
                 (l, too_big)
@@ -9428,6 +9429,27 @@ impl<'a> Lcx<'a> {
             self.emit(Inst::Call(Callee::Host(rt), vec![s], Vec::new()));
             self.term(Term::Unreachable);
             self.switch(ok2);
+        }
+    }
+
+    /// An enum one of whose explicit discriminants has no value (its evaluation failed, or met a
+    /// cycle) has no code: its layout and tags would hold a stand-in, a value rustc never builds a
+    /// program with. The body that needs the enum's layout fails as a use of that constant does.
+    fn check_explicit_discriminants(&mut self, t: TyId) {
+        let u = self.u;
+        let TyKind::Adt(ad, _, _) = *u.tcx.tys.kind(t) else { return };
+        let Some(adt) = u.tcx.adts.get(&ad) else { return };
+        if !adt.is_enum {
+            return;
+        }
+        for v in &adt.variants {
+            if let crate::tcx::VariantDiscr::Explicit(c) = v.discr {
+                if adt.eval_explicit_discr(&u.tcx, &u.prog, c).is_err() {
+                    let e = self.const_use_error(c, &[]);
+                    self.err(self.pos, e);
+                    return;
+                }
+            }
         }
     }
 
