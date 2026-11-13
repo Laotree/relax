@@ -152,14 +152,27 @@ pub fn mount(home: &Path, snap: &Snapshot) -> Result<String, String> {
     Ok(root)
 }
 
+/// Whether a path component is one some file system opens as a `.git` folder: in any case (APFS
+/// and NTFS ignore it), with trailing dots or spaces or an NTFS stream after it (`.git.`,
+/// `.git::$INDEX_ALLOCATION`), with code points HFS+ ignores inside it, or as its NTFS short name
+/// `git~1`; git's own checkout refuses the same names. A tree an export wrote one of would hand
+/// git its config (`core.fsmonitor`) or hooks, which run commands on the next `git status` there.
+fn names_git_folder(c: &str) -> bool {
+    let hfs_ignores = |ch: char| matches!(ch, '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}');
+    let c = c.chars().filter(|&ch| !hfs_ignores(ch)).collect::<String>().to_ascii_lowercase();
+    let c = c.split(':').next().unwrap_or_default().trim_end_matches([' ', '.']);
+    c == ".git" || c == "git~1"
+}
+
 fn export_path(out: &Path, rel: &str) -> Result<Option<PathBuf>, String> {
     if rel == ".makepad-export" {
         return Ok(None);
     }
-    // What leads out of `out` or the manifest's lines can't hold, on any OS; the rest only where this
-    // OS can't hold it (`a:b.txt` is an ordinary file on Unix, a stream on Windows).
+    // What leads out of `out`, what the manifest's lines can't hold, or a git folder, on any OS; the
+    // rest only where this OS can't hold it (`a:b.txt` is an ordinary file on Unix, a stream on Windows).
     if rel.split('/').any(|c| c.is_empty() || c == "." || c == ".."
         || c.chars().any(char::is_control)
+        || names_git_folder(c)
         || (cfg!(windows) && makepad_core_util::file_name::windows_refuses(c)))
     {
         return Err(format!("export: unsafe relative path {rel:?}"));
@@ -405,6 +418,22 @@ mod tests {
             assert_eq!(export_path(Path::new("out"), rel).is_err(), cfg!(windows), "{rel:?}");
         }
         assert_eq!(export_path(Path::new("out"), "src/lib.rs").unwrap(), Some(PathBuf::from("out/src/lib.rs")));
+    }
+
+    /// A fetched tree's `.git` folder, in every spelling a file system opens as `.git`, is never
+    /// written, on any OS: git would run the commands its config or hooks name in the export.
+    #[test]
+    fn export_never_writes_a_git_folder() {
+        for rel in [
+            ".git/config", "sub/.git/hooks/post-checkout", ".GIT/config", ".Git/hooks/pre-commit",
+            ".git./config", ".git . /config", ".git::$INDEX_ALLOCATION/config", "git~1/config",
+            "GIT~1/hooks/post-checkout", ".g\u{200c}it/config", "\u{feff}.git/config",
+        ] {
+            assert!(export_path(Path::new("out"), rel).is_err(), "wrote {rel:?}: a git folder");
+        }
+        for rel in [".gitignore", ".github/workflows/ci.yml", "src/.gitkeep", "git/config", ".git2/config", "my.git/config"] {
+            assert!(matches!(export_path(Path::new("out"), rel), Ok(Some(_))), "refused {rel:?}: not a git folder");
+        }
     }
 
     #[test]
