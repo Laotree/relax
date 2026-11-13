@@ -1293,12 +1293,20 @@ fn fd_write(fd: &OwnedFd, buf: &[u8]) -> io::Result<usize> {
     }
 }
 
-impl Write for ChildStdin {
+impl Write for &ChildStdin {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         fd_write(&self.fd, buf)
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+impl Write for ChildStdin {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (&*self).write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        (&*self).flush()
     }
 }
 impl Read for ChildStdout {
