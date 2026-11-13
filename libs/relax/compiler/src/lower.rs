@@ -3913,6 +3913,14 @@ impl<'a> Lcx<'a> {
         }
     }
 
+    /// A Box's type arguments: T, then its allocator.
+    fn box_args(&self, t: TyId) -> Vec<TyId> {
+        match self.kind(t) {
+            TyKind::Adt(_, a, _) => self.u.tcx.tys.list(a).to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
     /// T of `Box<T>`; rustc_middle/src/ty/adt.rs:374 identifies the owning ADT by flag.
     fn box_inner(&self, t: TyId) -> Option<TyId> {
         match self.kind(t) {
@@ -4048,7 +4056,8 @@ impl<'a> Lcx<'a> {
                 let ptr = pointer[0];
                 self.drop_tree(entries, ptr, inner, &sub);
                 if let Some(free) = self.u.core_path(&["boxed", "box_free_after_move"]) {
-                    let id = self.u.fn_id(FnKey::Inst(free, vec![inner]));
+                    // all the Box's arguments (its allocator's too) and leaves
+                    let id = self.u.fn_id(FnKey::Inst(free, self.box_args(t)));
                     self.tree_leaf_call_may(Callee::Fn(id), pointer, false);
                 }
                 if let Some(j) = skip {
@@ -6983,7 +6992,7 @@ impl<'a> Lcx<'a> {
                         let b = self.to_leaves(b, xt);
                         let v = self.read_place(&Place::Mem(b[0], 0), inner);
                         if let Some(free) = self.u.core_path(&["boxed", "box_free_after_move"]) {
-                            let id = self.u.fn_id(FnKey::Inst(free, vec![inner]));
+                            let id = self.u.fn_id(FnKey::Inst(free, self.box_args(xt)));
                             self.nounwind += 1;
                             self.emit(Inst::Call(Callee::Fn(id), b, Vec::new()));
                             self.nounwind -= 1;

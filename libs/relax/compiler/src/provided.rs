@@ -506,8 +506,12 @@ fn trusted_in(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, depth: u32, field:
             // free). Such a box is no handle: the type holding it stays opaque (TYPES), dropped
             // and cloned by the crate.
             if tcx.adts.get(d).is_some_and(|a| a.is_box()) {
-                return tcx.tys.list(*a).len() <= 2
-                    && tcx.tys.list(*a).first().is_some_and(|x| match tcx.tys.kind(*x) {
+                // only a Box in the global allocator: rustc's side frees any other through an
+                // allocator value Relax would have laid out
+                let args = tcx.tys.list(*a);
+                return args.len() <= 2
+                    && args.get(1).is_none_or(|al| is_global_alloc(tcx, *al))
+                    && args.first().is_some_and(|x| match tcx.tys.kind(*x) {
                         TyKind::Str => true,
                         TyKind::Slice(e) => tr(*e) || own_pub(*e),
                         TyKind::Dyn(..) => false,
@@ -588,7 +592,8 @@ pub fn layout_deps(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, out: &mut Vec
             }
         }
         TyKind::Adt(d, a, _) => {
-            if tcx.adts.get(d).is_some_and(|a| a.is_box()) {
+            // (Global, a container's allocator: zero-sized and the same on both sides)
+            if tcx.adts.get(d).is_some_and(|a| a.is_box()) || is_global_alloc(tcx, t) {
                 return;
             }
             if prog.def(*d).krate != krate || !a.is_empty() {
@@ -602,6 +607,11 @@ pub fn layout_deps(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, out: &mut Vec
         }
         _ => {}
     }
+}
+
+/// `alloc::alloc::Global` (lang `global_alloc_ty`): the allocator of a Box or Vec that crosses.
+pub(crate) fn is_global_alloc(tcx: &Tcx, t: TyId) -> bool {
+    matches!(tcx.tys.kind(t), TyKind::Adt(d, ..) if tcx.lang_items.get(LangItem::GlobalAlloc) == Some(*d))
 }
 
 /// The key an op is registered under, as `#[relax_api]` records it (relax-api's

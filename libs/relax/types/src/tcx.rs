@@ -3168,6 +3168,31 @@ impl Tcx {
         }
     }
 
+    /// How many of `args` (an ADT's or alias's, lifetimes apart) rustc's printer shows: the
+    /// trailing ones that equal their parameter's default, given the arguments before them, are
+    /// left out (rustc_middle ty/print/pretty.rs `generic_args_to_print`). So `type_name` of
+    /// `Vec<u8, Global>` is `Vec<u8>` and of `HashMap<K, V, RandomState>` is `HashMap<K, V>`, as
+    /// rustc's `type_name::<..>()` and the keys `#[relax_api]` records with it have them.
+    pub fn shown_args(&self, prog: &Program, d: DefId, args: &[TyId]) -> usize {
+        let mut n = args.len();
+        if n == 0 || !matches!(prog.def(d).kind, DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::TypeAlias) {
+            return n;
+        }
+        let state = EvalState::new();
+        // (a default that does not lower is no default here: nothing is reported)
+        state.errors.replace(Some(Vec::new()));
+        let cx = EvalCx::new(prog, self, TypingEnv::fully_monomorphized(prog), &state);
+        while n > 0 {
+            let mut filled = args[..n - 1].to_vec();
+            self.fill_type_defaults(&cx, prog, d, &mut filled, None);
+            if filled.get(n - 1) != Some(&args[n - 1]) {
+                break;
+            }
+            n -= 1;
+        }
+        n
+    }
+
     /// Appends the defaults of type params left out of `args` (`struct HashMap<K, V, S =
     /// RandomState>` written `HashMap<u32, u64>`). Only when some args were given: `HashMap`
     /// alone in an expression path gets inference variables instead.

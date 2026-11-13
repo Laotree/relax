@@ -8478,8 +8478,12 @@ pub fn type_name(prog: &Program, tcx: &Tcx, t: TyId) -> String {
     match tcx.tys.kind(t) {
         TyKind::Adt(d, args, _) => {
             let mut s = type_path(prog, tcx, *d);
-            if !args.is_empty() {
-                s.push_str(&format!("<{}>", list(tcx.tys.list(*args))));
+            // the trailing arguments that are their parameter's default are left out, as rustc's
+            // printer leaves them (`Vec<u8>` for `Vec<u8, Global>`)
+            let args = tcx.tys.list(*args);
+            let shown = tcx.shown_args(prog, *d, args);
+            if shown > 0 {
+                s.push_str(&format!("<{}>", list(&args[..shown])));
             }
             s
         }
