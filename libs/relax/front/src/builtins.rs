@@ -1,6 +1,6 @@
 //! Native built-in macros (builtins lane).
 //!
-//! - proc macros (derives and function-like) go through the sandboxed JIT host (pmhost.rs);
+//! - proc macros (derives and function-like) go through the JIT proc-macro host (pmhost.rs);
 //! - derive input preparation (cfg_eval, derive attrs removed);
 //! - the std built-ins those expansions use: file!, line!, column!, module_path!, env!,
 //!   option_env!, stringify!, concat!, include_str!, include_bytes!.

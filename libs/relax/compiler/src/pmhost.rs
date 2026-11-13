@@ -11,12 +11,19 @@
 //! Trust: one policy per process, chosen by the entry point (`set_policy`; runner Host):
 //! - `Policy::Open` (bare `relax`, the dev/test runner for general crates): every proc-macro
 //!   crate runs as cargo would run it, `unsafe` and std capabilities included.
-//! - `Policy::Sandboxed` (`makepad run`, and the default): compile-time code of a third-party
-//!   package -- a registry or git package by its cargo package id, wherever its sources are
-//!   stored -- gets no capabilities: it (and every macro crate depending on it) may not use
-//!   `unsafe`, `extern` blocks, `asm!`, `static mut` or `transmute`, nor name std's
-//!   fs/net/process/env/thread/time modules (refused before anything compiles). Path packages
-//!   (the workspace's own, makepad's) and std are trusted.
+//! - `Policy::Sandboxed` (`makepad run`, and the default): before a third-party proc-macro crate
+//!   -- a registry or git package by its cargo package id, wherever its sources are stored --
+//!   compiles, a lexical scan of its source files (`sandbox_check`) refuses `unsafe`, `extern`
+//!   blocks, `asm!`, `static mut`, `transmute` and a `std::` path naming fs/net/process/env/
+//!   thread/time; a macro crate depending on a refused one is refused too. Path packages (the
+//!   workspace's own, makepad's) and std are not scanned.
+//!   The scan is not a capability boundary. It sees tokens, not code: `std::os::unix::fs`,
+//!   `Path`'s file-system methods, grouped or renamed imports of std, `#[path]` and `include!`
+//!   files and paths a macro pastes together all pass it, so a third-party proc macro that
+//!   passes it can do whatever the user can. It is being replaced by running that code confined
+//!   as sandbox twins (sandbox.rs), the mechanism run-time modules use.
+//! Neither policy covers build scripts: a third-party package's `build.rs` runs as its own
+//! process with the user's rights (unitgraph.rs).
 //! Every call runs under the hang watchdog.
 
 use crate::macro_reg::{in_world, set_in_world, trace, Entry, REG, STATS};
