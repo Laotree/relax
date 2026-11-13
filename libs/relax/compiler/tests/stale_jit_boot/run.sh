@@ -59,7 +59,7 @@ MAKEPAD_HIDE_WINDOWS=1 check box-hidden-live "cannot rebuild itself" "$T/box/mak
 
 # 2-4. in a cargo target dir, with this fixture's cargo
 M="$T/mac/target/host/makepad"
-mkdir -p "$T/mac/target/host/.fingerprint"
+mkdir -p "$T/mac/target/host" && touch "$T/mac/target/host/.cargo-lock"
 touch "$T/mac/target/CACHEDIR.TAG"
 cp "$BIN" "$M" || exit 1
 cat > "$T/cargo" <<EOF

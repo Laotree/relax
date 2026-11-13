@@ -62,11 +62,13 @@ fn identity(p: &Path) -> Option<(u64, u64, std::time::SystemTime)> {
 }
 
 /// The cargo target directory the loader was built into (cargo keeps `.rustc_info.json` at its
-/// root, and `.fingerprint` in each profile directory), and the `--target` triple between it and
-/// the profile directory, if any.
+/// root, and its build lock `.cargo-lock` in each profile directory), and the `--target` triple
+/// between it and the profile directory, if any. Not `.fingerprint`: cargo 1.100's build
+/// directory keeps fingerprints under `build/<package>/<hash>/`, so a target directory it made
+/// has none, and its loader could never rebuild itself ("not in a cargo target directory").
 fn layout(exe: &Path) -> Option<(PathBuf, String, Option<String>)> {
     let profile_dir = exe.parent()?;
-    if !profile_dir.join(".fingerprint").is_dir() { return None; }
+    if !profile_dir.join(".cargo-lock").is_file() { return None; }
     let profile = profile_dir.file_name()?.to_string_lossy().into_owned();
     let root = |d: &Path| d.join(".rustc_info.json").is_file() || d.join("CACHEDIR.TAG").is_file();
     let up = profile_dir.parent()?;

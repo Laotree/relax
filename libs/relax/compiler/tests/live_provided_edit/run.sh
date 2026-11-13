@@ -100,7 +100,7 @@ kill -0 "$pid" 2>/dev/null || fail "the session ended"
 stop
 
 # 2. in a cargo target dir: the rebuild runs, and its end is the verdict
-mkdir -p "$T/mac/target/host/.fingerprint"
+mkdir -p "$T/mac/target/host" && touch "$T/mac/target/host/.cargo-lock"
 touch "$T/mac/target/CACHEDIR.TAG"
 cat > "$T/cargo" <<EOF
 #!/bin/bash
