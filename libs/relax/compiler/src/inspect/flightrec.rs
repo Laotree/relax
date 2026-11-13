@@ -60,9 +60,9 @@ pub fn init() {
         super::pstream::set_elide_us(us);
     }
     let _k = crate::zone_alloc::kept();
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
     let cwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
-    let env: Vec<String> = std::env::vars().filter(|(k, _)| k.starts_with("MAKEPAD") || k.starts_with("SANDBOX_")).map(|(k, v)| format!("{k}={v}")).collect();
+    let env: Vec<String> = std::env::vars_os().filter(|(k, _)| { let k = k.to_string_lossy(); k.starts_with("MAKEPAD") || k.starts_with("SANDBOX_") }).map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy())).collect();
     *RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some((args.join("\u{1f}"), cwd, env.join("\u{1f}")));
     // the rings exist before the first record (no allocation on a recording thread later)
     let _ = (events(), app_events(), inputs(), jits(), frames());
