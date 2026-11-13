@@ -551,9 +551,8 @@ impl<'a> Sim<'a> {
         let mut t = ExtTable::default();
         for (&n, &d) in &md.types { t.names.insert((n, true), (d, p.precise_vis(m, n, true, d))); }
         for (&n, &d) in &md.values { t.names.insert((n, false), (d, p.precise_vis(m, n, false, d))); }
-        for &(g, gpub) in &md.globs {
+        for &(g, gv) in &md.globs {
             let gd = p.def(g);
-            let gv = if gpub { None } else { Some(md.normal) };
             let mut take = |t: &mut ExtTable, k: (Sym, bool), d: DefId, v: BindVis| {
                 if own(&k) || !p.vis_visible(v, m) { return; }
                 let v = p.vis_min(gv, v);

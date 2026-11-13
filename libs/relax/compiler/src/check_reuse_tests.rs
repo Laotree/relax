@@ -735,7 +735,9 @@ fn a_dependency_error_fails_the_check() {
 /// up alone). Debug builds compare every answer of a table with the lookup of that one name (and
 /// every proc macro name the reach filter skips with the walk for it); the verdicts are rustc's:
 /// the names resolve, and a name the app's own two globs both provide is ambiguous where it is
-/// used (E0659).
+/// used (E0659). A `pub(crate)` glob of the dependency's module brings the app nothing (relax
+/// issue 186: its `Scalar` met the app's own through the app's two globs, E0659, and in a type
+/// it named the dependency's `f32`, E0308).
 #[test]
 fn an_app_check_reads_the_globs_of_unchecked_crates_as_rustc_does() {
     if std::env::var_os(CHILD).is_some() || std::env::var_os(EARLY_CHILD).is_some() || std::env::var_os(APP_CHILD).is_some() { return; }
@@ -748,10 +750,10 @@ fn an_app_check_reads_the_globs_of_unchecked_crates_as_rustc_does() {
     };
     write("ws/Cargo.toml", "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n");
     write("dep/Cargo.toml", "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"lib.rs\"\n");
-    write("dep/lib.rs", "pub mod inner;\nmod a { pub struct Dup; }\npub use inner::*;\npub use a::*;\npub enum Shape { Round, Square }\npub use Shape::*;\npub struct Thing;\npub fn root_fn() -> u32 { 1 }\n");
+    write("dep/lib.rs", "pub mod inner;\nmod a { pub struct Dup; }\npub use inner::*;\npub use a::*;\npub enum Shape { Round, Square }\npub use Shape::*;\npub struct Thing;\npub fn root_fn() -> u32 { 1 }\nmod units { pub type Scalar = f32; }\npub mod prelude { pub struct Body; #[allow(unused_imports)] pub(crate) use crate::units::*; }\n");
     write("dep/inner.rs", "use super::*;\nmod b { pub struct Dup; }\npub use b::*;\npub struct Inner;\npub fn inner_fn() -> u32 { root_fn() + 1 }\n");
     write("ws/app/Cargo.toml", "[package]\nname = \"app_pkg\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"lib.rs\"\n[dependencies]\ndep = { path = \"../../dep\" }\n");
-    let app = |clash: &str| format!("use dep::*;\npub fn top(s: Shape) -> u32 {{ let _ = Inner; root_fn() + inner_fn() + match s {{ Round => 1, Square => 2 }} }}\n{clash}");
+    let app = |clash: &str| format!("use dep::*;\npub fn top(s: Shape) -> u32 {{ let _ = Inner; root_fn() + inner_fn() + match s {{ Round => 1, Square => 2 }} }}\nuse dep::prelude::*;\nmod clock {{ pub struct Scalar; }}\nuse clock::*;\npub fn body() -> Body {{ let _s: Scalar = Scalar; Body }}\n{clash}");
     let check = || {
         let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "check_reuse_tests::app_check_child", "--nocapture", "--test-threads=1", "--format=terse"])
@@ -762,7 +764,8 @@ fn an_app_check_reads_the_globs_of_unchecked_crates_as_rustc_does() {
         let code = stderr.lines().find_map(|l| l.strip_prefix("app child exit ")).map(|c| c.parse::<i32>().unwrap());
         (code, stderr.into_owned())
     };
-    // the dep's names through the cycle and the enum glob: no diagnostic
+    // the dep's names through the cycle and the enum glob, and the app's `Scalar` beside the dep's
+    // `pub(crate)` glob: no diagnostic
     write("ws/app/lib.rs", &app(""));
     let clean = check();
     assert!(clean.0 == Some(0) && !clean.1.contains(": error") && !clean.1.contains(": warning:"), "{}", clean.1);

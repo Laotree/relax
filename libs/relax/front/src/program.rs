@@ -295,8 +295,9 @@ pub struct Module {
     pub types: HashMap<Sym, DefId>,
     pub values: HashMap<Sym, DefId>,
     pub macros: HashMap<Sym, DefId>,
-    /// glob imports: (target, `pub use`)
-    pub globs: Vec<(DefId, bool)>,
+    /// glob imports: (target, the `use` item's visibility: None `pub`, else the module it is
+    /// visible in -- a `pub(crate)` glob's names are not another crate's)
+    pub globs: Vec<(DefId, BindVis)>,
     /// traits imported `as _` (in scope for method calls, no name)
     pub anon_traits: Vec<(DefId, bool)>,
     /// import bindings (name, type ns) -> IMPORT_PUB (`pub use`) | IMPORT_EXTERN (`extern crate`);
@@ -1656,7 +1657,7 @@ impl Program {
             for (ns, names) in ["type", "value", "macro"].iter().zip([&m.types, &m.values, &m.macros]) {
                 for (name, def) in names { if kept(*name, Some(*def)) { bindings.push(format!("{ns} {} {}", self.syms.str(*name), key(*def))); } }
             }
-            for (def, public) in &m.globs { if !skip_globs || self.def(*def).kind != DefKind::Mod || files.contains(self.file_paths.get(self.mods[self.def(*def).sub as usize].file as usize).map_or("", String::as_str)) { bindings.push(format!("glob {public} {}", key(*def))); } }
+            for (def, vis) in &m.globs { if !skip_globs || self.def(*def).kind != DefKind::Mod || files.contains(self.file_paths.get(self.mods[self.def(*def).sub as usize].file as usize).map_or("", String::as_str)) { bindings.push(format!("glob {} {}", vis.map_or_else(|| "pub".to_owned(), |v| key(self.mods[v as usize].def)), key(*def))); } }
             for (def, public) in &m.anon_traits { bindings.push(format!("trait {public} {}", key(*def))); }
             for ((name, types), public) in &m.import_pub { if kept(*name, None) { bindings.push(format!("visibility {} {types} {}", self.syms.str(*name), public & IMPORT_PUB != 0)); } }
             bindings.sort();
@@ -2083,7 +2084,8 @@ impl Program {
         let d = self.add_def(Def { kind: DefKind::Mod, name: sym, parent: pdef, file: f, item: ItemId(0), sub: 0, is_pub: false, krate, scope: parent });
         let m = self.new_module(d, Some(parent), None, krate, f);
         self.defs[d.0 as usize].sub = m;
-        self.mods[m as usize].globs.push((pdef, false));
+        let normal = self.mods[m as usize].normal;
+        self.mods[m as usize].globs.push((pdef, Some(normal)));
         if self.imports_done {
             self.forget_bindings();
         }
@@ -3907,9 +3909,9 @@ impl Program {
     fn globs_visible(&self, via: &[u32], m: u32, from: u32) -> bool {
         via.iter().zip(via.iter().skip(1).chain(std::iter::once(&m))).all(|(&p, &x)| {
             let pm = &self.mods[p as usize];
-            pm.globs.iter().any(|&(g, is_pub)| {
+            pm.globs.iter().any(|&(g, gv)| {
                 let d = self.def(g);
-                d.kind == DefKind::Mod && d.sub == x && (is_pub || self.in_module(from, pm.normal))
+                d.kind == DefKind::Mod && d.sub == x && self.vis_visible(gv, from)
             })
         })
     }
@@ -4554,11 +4556,13 @@ impl Program {
             if self.imports[i].bound & BOUND_PREFIX_ONLY != 0 {
                 return true;
             }
-            let is_pub = self.imports[i].is_pub;
+            // the glob's names are as visible as its `use` item (relax issue 186: a dependency's
+            // `pub(crate) use crate::math::*;` gave an app's glob of that module `math`'s names)
+            let gv = self.open_import_vis(i as u32);
             self.glob_import.entry((module, target)).or_insert(i as u32);
             let order = |p: &Program, t: DefId| p.glob_import.get(&(module, t)).copied().unwrap_or(u32::MAX);
             let at = self.mods[module as usize].globs.partition_point(|(t, _)| order(self, *t) <= i as u32);
-            self.mods[module as usize].globs.insert(at, (target, is_pub));
+            self.mods[module as usize].globs.insert(at, (target, gv));
             return true;
         }
         let bind = self.imports[i].bind.unwrap_or(0);
@@ -5027,7 +5031,7 @@ impl Program {
                 }
                 let sub = self.def(*t).sub;
                 let other = self.mods[sub as usize].krate != krate;
-                if *p && !(own && other) || (own && !other) {
+                if p.is_none() && !(own && other) || (own && !other) {
                     let own2 = own && !other;
                     queue.push_front((sub, path.clone(), own2));
                 }
@@ -5378,7 +5382,7 @@ impl Program {
         // the most visible binding (rustc_resolve imports.rs / try_define): a module's private
         // `use` never leaks through `pub use module::*`
         let mut best: Option<(DefId, BindVis)> = None;
-        for &(g, gpub) in &md.globs {
+        for &(g, gv) in &md.globs {
             let gd = self.def(g);
             let r = match gd.kind {
                 DefKind::Mod => self.lookup_in_module_vis(gd.sub, name, ns_type, q),
@@ -5392,7 +5396,6 @@ impl Program {
                 if !self.vis_visible(v, m) {
                     continue;
                 }
-                let gv = if gpub { None } else { Some(md.normal) };
                 let v = self.vis_min(gv, v);
                 if record_import_uses() && !record_import_use(|u| u.glob.push((m, g))) { self.glob_used.lock().unwrap_or_else(|e| e.into_inner()).insert((m, g)); }
                 match best {
@@ -5508,12 +5511,11 @@ impl Program {
         for &(d, p) in &md.anon_traits {
             out.push((d, if p { None } else { Some(md.normal) }, None));
         }
-        for &(g, gpub) in &md.globs {
+        for &(g, gv) in &md.globs {
             let gd = self.def(g);
             if gd.kind != DefKind::Mod {
                 continue;
             }
-            let gv = if gpub { None } else { Some(md.normal) };
             let inner = self.module_trait_bindings_pass(gd.sub, q);
             for &(d, v, name) in inner.iter() {
                 // a glob-imported trait binding whose name an explicit binding of this module
