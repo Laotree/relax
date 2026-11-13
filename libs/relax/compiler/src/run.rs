@@ -2141,12 +2141,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 None => foreign.push((name, n)),
             }
         }
-        // A check for another target (RELAX_CHECK_TARGET) type-checks Relax's std as that target
-        // reads it too: no JIT on this machine compiles that code (std's process_windows.rs on
-        // Linux), so a type error there waited for the first run on that platform. Its bodies are
-        // checked as a run's app check checks the app's (a clean crate's verdict is stored, so an
-        // unchanged std costs nothing the next time); std is not linted.
-        if options.check_target != crate::options::CheckTarget::Host && !selftest {
+        // A check type-checks Relax's std as its target reads it too. No run compiles all of it: a
+        // run compiles what it calls, and no JIT on this machine compiles another target's code
+        // (std's process_windows.rs on Linux), so a type error there waited for the first caller
+        // or the first run on that platform. Its bodies are checked as a run's app check checks
+        // the app's (a clean crate's verdict is stored, so an unchanged std costs nothing the
+        // next time); std is not linted.
+        if !selftest {
             let t = Instant::now();
             let std_crates = crate::check::std_crates(&u.prog);
             let errors = crate::check::run_check_crates(&mut *u, &std_crates);
