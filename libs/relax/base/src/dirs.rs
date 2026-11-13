@@ -82,26 +82,46 @@ pub fn payload_carries_anchor(bytes: &[u8]) -> Option<&'static str> {
 }
 
 fn payload_carries_anchor_in(bytes: &[u8], anchors: &[(&'static str, String)]) -> Option<&'static str> {
+    // Prefix matching is intentional and conservative: a directory that starts with an anchor's
+    // spelling counts as under it, so a false positive only costs a missing hit.
     for (tag, dir) in anchors {
         if dir.is_empty() {
             continue;
         }
-        let mut forms = vec![dir.clone()];
+        let mut spellings = vec![dir.clone()];
         if let Ok(c) = std::fs::canonicalize(dir) {
             let c = c.to_string_lossy().into_owned();
             if c != *dir {
-                forms.push(c);
+                spellings.push(c);
             }
         }
-        let back = dir.replace('/', "\\");
-        if back != *dir {
-            forms.push(back);
+        let back: Vec<String> = spellings.iter().map(|d| d.replace('/', "\\")).collect();
+        spellings.extend(back.iter().cloned());
+        // Windows' extended-length prefix and its forward-slash form (pairs with the backslash
+        // spellings above).
+        spellings.extend(back.iter().map(|d| format!("\\\\?\\{d}")));
+        let mut forms: Vec<Vec<u8>> = spellings.iter().map(|d| d.as_bytes().to_vec()).collect();
+        // Wide strings in Windows data (debug info, symbol names).
+        for d in &spellings {
+            forms.push(d.encode_utf16().flat_map(u16::to_le_bytes).collect());
         }
-        if forms.iter().any(|f| bytes.windows(f.len()).any(|w| w == f.as_bytes())) {
+        if forms.iter().any(|f| contains(bytes, f, true)) {
             return Some(tag);
         }
     }
     None
+}
+
+/// `needle` in `bytes`, ASCII case-insensitively when `ci` (the default file systems of macOS
+/// and Windows are case-insensitive; folding more than ASCII would need a table, and a missing
+/// hit is the safe side).
+fn contains(bytes: &[u8], needle: &[u8], ci: bool) -> bool {
+    if needle.is_empty() || bytes.len() < needle.len() {
+        return false;
+    }
+    bytes.windows(needle.len()).any(|w| {
+        w.iter().zip(needle).all(|(a, b)| a == b || (ci && a.eq_ignore_ascii_case(b)))
+    })
 }
 
 /// The persisted spelling of a path under its longest anchor; unrelated paths stay borrowed.
@@ -371,6 +391,31 @@ mod tests {
         assert_eq!(super::payload_carries_anchor_in(b"/c/registry/a.rs", &a), Some("cargo"));
         assert_eq!(super::payload_carries_anchor_in(b"/other/a.rs", &a), None);
         assert_eq!(super::payload_carries_anchor_in(b"", &a), None);
+        // case-insensitive (macOS/Windows file systems)
+        assert_eq!(super::payload_carries_anchor_in(b"/W/src/lib.rs", &a), Some("ws"));
+        // Windows extended-length prefix
+        let w = [("ws", "C:\\w".to_string())];
+        assert_eq!(super::payload_carries_anchor_in(b"\\\\?\\C:\\w\\src\\lib.rs", &w), Some("ws"));
+        // UTF-16LE wide strings
+        let wide: Vec<u8> = "/w/src/lib.rs".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(super::payload_carries_anchor_in(&wide, &a), Some("ws"));
+    }
+
+    /// A workspace entered through a symbolic link is found by its resolved spelling too.
+    #[cfg(unix)]
+    #[test]
+    fn payload_scan_finds_the_resolved_form_of_a_symlinked_anchor() {
+        let root = std::env::temp_dir().join(format!("relax-symlink-scan-{}", std::process::id()));
+        let real = root.join("real");
+        let link = root.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let a = [("ws", link.to_string_lossy().into_owned())];
+        // /tmp is itself a symlink on macOS: use the resolved spelling in the payload
+        let hay = format!("{}/src/lib.rs", std::fs::canonicalize(&real).unwrap().display());
+        assert_eq!(super::payload_carries_anchor_in(hay.as_bytes(), &a), Some("ws"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Nested anchors keep one spelling, ties take the fixed order, and a path under no anchor
