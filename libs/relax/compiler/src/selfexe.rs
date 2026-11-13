@@ -90,6 +90,12 @@ pub fn link(loader: &Path, name: &str, test: bool) -> Result<PathBuf, String> {
 /// this process starts (or execs, a restart in place) to start from, so its process has the
 /// program's name from its start. None where it cannot be made (another volume, Windows, whose
 /// processes are not named by an exec): the caller starts `loader`.
+///
+/// Every start a parent of ours makes goes through such a link, with no exec more (a cold start
+/// has no floor): `makepad test` (its targets), a restart in place, devhub's node (a JIT run of a
+/// program, devhub lease/exec.rs launch_link) and the app launcher (`app <id>`, tools/run/launcher).
+/// A user's `makepad run` / `relax run` in a terminal has no parent of ours: on macOS that run
+/// keeps the loader's name; on Linux it renames itself through /proc comm (`name_process`).
 #[cfg(unix)]
 pub fn launch_link(loader: &Path, name: &str) -> Option<PathBuf> {
     static FRESH: std::sync::Once = std::sync::Once::new();

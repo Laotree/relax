@@ -137,15 +137,30 @@ pub(crate) fn loader_exe() -> Option<std::path::PathBuf> {
         let _kept = relax_compiler::zone_alloc::kept();
         let exe = plain(std::env::current_exe().and_then(|e| e.canonicalize()).ok()?);
         // a run's own executable (a test's run of itself, a shell's launch of it): a spawn of it
-        // runs that run's program, so this loader goes by the one its starter named
-        if relax_compiler::selfexe::is_link(&exe) {
-            if let Some(l) = std::env::var_os("RELAX_LOADER").map(std::path::PathBuf::from).filter(|l| l.is_file()) {
+        // runs that run's program; a link its starter named after the program it runs (a launch
+        // link, an app bundle's executable): nothing of the loader is beside it. This loader goes
+        // by the one its starter named
+        if let Some(l) = std::env::var_os("RELAX_LOADER").map(std::path::PathBuf::from).filter(|l| l.is_file()) {
+            if relax_compiler::selfexe::is_link(&exe) || same_file(&exe, &l) {
                 return Some(l);
             }
         }
         Some(exe)
     })
     .clone()
+}
+
+/// Whether `a` and `b` are one file (a hard link of it). Never on Windows.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            return a.dev() == b.dev() && a.ino() == b.ino();
+        }
+    }
+    let _ = (a, b);
+    false
 }
 
 /// Windows: canonicalize answers a verbatim path (`\\?\C:\...`), in which `/` is no separator, so
