@@ -410,6 +410,20 @@ impl<'a> Iterator for Incoming<'a> {
     }
 }
 
+impl<'a> IntoIterator for &'a UnixListener {
+    type Item = io::Result<UnixStream>;
+    type IntoIter = Incoming<'a>;
+    fn into_iter(self) -> Incoming<'a> {
+        self.incoming()
+    }
+}
+
+impl fmt::Debug for Incoming<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Incoming").field("listener", self.listener).finish()
+    }
+}
+
 impl fmt::Debug for UnixListener {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut d = f.debug_struct("UnixListener");

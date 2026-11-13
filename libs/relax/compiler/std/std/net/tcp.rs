@@ -218,6 +218,12 @@ impl fmt::Debug for TcpListener {
     }
 }
 
+impl fmt::Debug for Incoming<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Incoming").field("listener", self.listener).finish()
+    }
+}
+
 /// Unix: the fd traits of std::os::fd.
 #[cfg(unix)]
 mod os_impls {
