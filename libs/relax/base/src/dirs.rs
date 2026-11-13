@@ -73,6 +73,29 @@ fn anchor_in(path: &str, anchors: &[(&'static str, String)]) -> Option<String> {
     anchor_from(path, anchors.iter().map(|(tag, dir)| (*tag, dir.as_str())))
 }
 
+/// Resolves an anchored spelling (`\0tag\0rel`) to this run's absolute path. A `rel` that is
+/// absolute or names a `..` component is refused: a shared payload is untrusted input and must
+/// not point outside the anchor.
+pub fn resolve_anchored(s: &str) -> Option<String> {
+    resolve_anchored_in(s, anchors())
+}
+
+fn resolve_anchored_in(s: &str, anchors: &[(&'static str, String)]) -> Option<String> {
+    let rest = s.strip_prefix('\0')?;
+    let (tag, rel) = rest.split_once('\0')?;
+    if rel.is_empty() || rel.starts_with('/') || rel.starts_with('\\') {
+        return None;
+    }
+    if rel.split(['/', '\\']).any(|c| c == "..") {
+        return None;
+    }
+    let dir = anchors.iter().find(|(t, _)| *t == tag)?.1.as_str();
+    if dir.is_empty() {
+        return None;
+    }
+    Some(format!("{dir}/{rel}"))
+}
+
 /// Whether a cache payload names any anchor directory: the raw spelling, a canonical
 /// (symlink-resolved) form, or the Windows backslash form. Sharing such an entry would carry
 /// one worktree's path into another; this scan is the gate, the compile-time mark is only a
@@ -427,6 +450,19 @@ mod tests {
         assert_eq!(super::payload_carries_anchor_with(b"/elsewhere/relax/build/x", &b, &ok), None);
         assert_eq!(super::payload_carries_anchor_with(b"/proj/src/lib.rs", &b, &ok), Some("ws"));
         assert_eq!(super::payload_carries_anchor_with(b"/elsewhere/relax/x /proj/y", &b, &ok), Some("ws"));
+    }
+
+    /// An anchored spelling resolves against the run's table; a hostile `rel` is refused.
+    #[test]
+    fn anchored_spellings_resolve_and_refuse_escapes() {
+        let a = [("ws", "/w".to_string()), ("run", "/r".to_string())];
+        assert_eq!(super::resolve_anchored_in("\0ws\0src/lib.rs", &a).as_deref(), Some("/w/src/lib.rs"));
+        assert_eq!(super::resolve_anchored_in("\0run\0build/out", &a).as_deref(), Some("/r/build/out"));
+        assert_eq!(super::resolve_anchored_in("\0ws\0../etc/passwd", &a), None);
+        assert_eq!(super::resolve_anchored_in("\0ws\0src/../../etc", &a), None);
+        assert_eq!(super::resolve_anchored_in("\0ws\0/abs", &a), None);
+        assert_eq!(super::resolve_anchored_in("\0nope\0x", &a), None);
+        assert_eq!(super::resolve_anchored_in("plain", &a), None);
     }
 
     /// The payload scan catches every anchor spelling a payload could carry.
