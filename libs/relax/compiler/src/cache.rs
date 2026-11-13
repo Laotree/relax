@@ -66,6 +66,25 @@ pub use front_run::FrontSink;
 #[cfg(test)]
 use front_run::commit_runs;
 
+/// What the shared-cache write path does with an entry once the payload scan has run. The
+/// lookup happens before compilation (it needs an identity) and the scan after, so a first build
+/// looks up the path-free identity, compiles, and may learn that the payload carries a path. In
+/// that case the payload is never stored under the path-free key: a placeholder record saying
+/// "this identity is path-carrying" is stored there instead, and the entry goes under the anchor
+/// identity. A later build reads the placeholder and looks up the anchor identity directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShareWrite {
+    /// The payload carries no anchor path: store it under the path-free identity.
+    PathFree,
+    /// The payload carries a path: placeholder under the path-free key, payload under the anchor
+    /// key. The payload is never written under the path-free key.
+    Anchored,
+}
+
+pub(crate) fn share_write(carries_path: bool) -> ShareWrite {
+    if carries_path { ShareWrite::Anchored } else { ShareWrite::PathFree }
+}
+
 const KIND_CODE: u32 = 1;
 const KIND_DATA: u32 = 2;
 const KIND_LEDGER: u32 = 3;
@@ -10525,6 +10544,26 @@ mod prune_tests {
         // the folder also holds this process's live lock (store::hold_build)
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir(&root).unwrap();
+    }
+
+    /// The iron rule of the shared-cache write path: a payload the scan found carrying a path
+    /// never lands under the path-free identity; only a placeholder may. The identity function is
+    /// injected, which is the only way to exercise this before the identity logicalization (#176).
+    #[test]
+    fn a_carrying_payload_never_lands_under_the_path_free_key() {
+        let path_free: u128 = 0x11;
+        let anchored: u128 = 0x22;
+        let mut writes = Vec::new();
+        for carries in [false, true] {
+            writes.clear();
+            match share_write(carries) {
+                ShareWrite::PathFree => writes.push((path_free, "payload")),
+                ShareWrite::Anchored => { writes.push((path_free, "placeholder")); writes.push((anchored, "payload")); }
+            }
+            let polluted = writes.iter().any(|(k, what)| *k == path_free && *what == "payload");
+            assert_eq!(polluted, !carries, "carries={carries}");
+            assert!(writes.iter().any(|(k, _)| *k == anchored) || !carries);
+        }
     }
 
     /// Only the identity functions below may hash the absolute anchor dirs. A new use is a
