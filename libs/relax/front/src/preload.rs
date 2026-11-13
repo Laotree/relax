@@ -1448,7 +1448,9 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
                             mods.push(child_path.clone());
                             if inner_macro_use(&src, &toks[i + 3..], cfg) { inner_macro_uses.push(child_path.clone()); }
                         }
-                        let child_dir = pa.map_or_else(|| format!("{}/{}", cur, name), |p| crate::crates::join_path(&cur, &p));
+                        // At file level an explicit path is relative to the file, not the
+                        // implicit module subdirectory of a non-mod.rs file, as for `mod x;`.
+                        let child_dir = pa.map_or_else(|| format!("{}/{}", cur, name), |p| crate::crates::join_path(if dirs.len() > 1 { &cur } else { &fdir }, &p));
                         dirs.push((depth + 1, child_dir, child_path, cur_active && active));
                     }
                 }
@@ -1813,6 +1815,31 @@ pub fn check_macros(prog: &mut crate::program::Program, krate: u32, files: &[(u3
 #[cfg(test)]
 mod cold_tests {
     use super::*;
+
+    #[test]
+    fn inline_path_scans_imports_relative_to_the_containing_file() {
+        let dir = std::env::temp_dir().join(format!("relax-inline-path-{}-{}", std::process::id(), crate::clock::wall_ns()));
+        std::fs::create_dir_all(dir.join("custom")).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(dir.clone());
+        let file = dir.join("module.rs").to_string_lossy().into_owned();
+        let child = dir.join("custom/leaf.rs").to_string_lossy().into_owned();
+        let source = b"#[path=\"custom\"] mod inside { mod leaf; }";
+        let imported = b"use dep::answer;";
+        std::fs::write(&file, source).unwrap();
+        std::fs::write(&child, imported).unwrap();
+        let sess = Arc::new(crate::Session::default());
+        let cfg = CfgSet::host(&sess, &[]);
+        let context = crate::source_context::Context::new(&file, Default::default(), &sess);
+        let module_dir = dir.join("module").to_string_lossy().into_owned();
+        let scan = scan_text_mode(&file, &module_dir, "app::module", "app", 2021, &cfg, source.to_vec().into(), &context, false).unwrap();
+        let expected = (child, dir.join("custom/leaf").to_string_lossy().into_owned(), "app::module::inside::leaf".to_string());
+        assert_eq!(scan.children, vec![expected.clone()]);
+        let (path, dir, module) = expected;
+        let child = scan_text_mode(&path, &dir, &module, "app", 2021, &cfg, imported.to_vec().into(), &context, false).unwrap();
+        assert!(child.uses.iter().any(|u| u.module == module && u.bind.as_deref() == Some("answer")));
+    }
 
     #[test]
     fn configured_inner_attributes_do_not_absorb_the_next_items_cfg() {

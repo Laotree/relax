@@ -1,0 +1,9 @@
+[package]
+name = "inline-path-macro-imports"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+macro_dep = { path = "macro_dep" }
