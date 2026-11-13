@@ -5076,19 +5076,28 @@ pub(crate) fn def_key_in(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, 
         h.u32(ord);
     }
     // not def.sub: module / impl indices are global to the program (they differ per app).
-    // Impls (derived ones share their type's item) by what they implement for what.
+    // Source impls by their parsed header, available before their self type's array lengths
+    // are evaluated. Keying that evaluation by a not-yet-collected impl made every generated
+    // array length in one module the same constant. Derived impls share their type's item;
+    // those have no parsed impl header, so use their collected self type and trait.
     if def.kind == DefKind::Impl {
-        if let Some(t) = tcx.impl_self.get(&d) {
-            h.u128(crate::stable::type_hash(&prog, &tcx, *t));
-        }
-        if let Some(tr) = tcx.impl_trait.get(&d) {
-            let mut th = Sip128::new();
-            crate::stable::def_ident(&prog, *tr, &mut th);
-            h.u128(th.finish128());
-        }
-        if let Some(args) = tcx.impl_trait_args.get(&d) {
-            for t in args {
+        if let Some((head, twin)) = prog.files[def.file as usize].impl_head(def.item) {
+            h.str("impl header");
+            h.write(head);
+            h.u32(twin);
+        } else {
+            if let Some(t) = tcx.impl_self.get(&d) {
                 h.u128(crate::stable::type_hash(&prog, &tcx, *t));
+            }
+            if let Some(tr) = tcx.impl_trait.get(&d) {
+                let mut th = Sip128::new();
+                crate::stable::def_ident(&prog, *tr, &mut th);
+                h.u128(th.finish128());
+            }
+            if let Some(args) = tcx.impl_trait_args.get(&d) {
+                for t in args {
+                    h.u128(crate::stable::type_hash(&prog, &tcx, *t));
+                }
             }
         }
     }
