@@ -132,6 +132,12 @@ impl KeyInputs {
     }
 }
 
+/// Whether an entry may use the path-free identity: the shared mode is on and the payload scan
+/// found no `ws` path. A carrying payload keeps its anchors, so it is rebuilt per worktree.
+pub(crate) fn path_free_identity(shared: bool, payload: &[u8]) -> bool {
+    shared && crate::dirs::payload_carries_anchor(payload).is_none()
+}
+
 /// Which crates produce a value that embeds a workspace absolute path (`CARGO_MANIFEST_DIR`,
 /// `OUT_DIR`, an outside-anchor include, ...). The mark is a fast path; the payload scan is the
 /// truth. A crate is carrying when it is marked or when any dependency is.
@@ -10685,6 +10691,17 @@ mod prune_tests {
         for m in muts {
             assert!(seen.insert(m.hash()), "a mutated input kept the hash");
         }
+    }
+
+    /// The path-free identity is used only in shared mode and only for a payload the scan found
+    /// free of workspace paths; a payload naming the workspace keeps its anchors.
+    #[test]
+    fn path_free_identity_needs_shared_mode_and_a_clean_payload() {
+        let ws = crate::dirs::workspace_dir();
+        assert!(!super::path_free_identity(true, ws.as_bytes()), "a workspace path keeps the anchors");
+        assert!(!super::path_free_identity(true, format!("{ws}/src/lib.rs").as_bytes()));
+        assert!(super::path_free_identity(true, b"no paths here"));
+        assert!(!super::path_free_identity(false, b"no paths here"), "off: the identity keeps its anchors");
     }
 
     /// The crate mark propagates along dependencies: a path-free crate that depends on a carrying
