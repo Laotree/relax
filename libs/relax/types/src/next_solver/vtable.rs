@@ -147,7 +147,8 @@ impl Tcx {
             let indices = self.generic_indices_of(prog, parent);
             clauses.push(collect::trait_predicate(parent, args[..indices.types_consts.len() + indices.lifetimes.len()].to_vec()));
         }
-        let infcx = crate::infer::InferCtxt::new(self, crate::tcx::TypingMode::PostAnalysis, TypingEnv::fully_monomorphized(prog).limit);
+        let mut infcx = crate::infer::InferCtxt::new(self, crate::tcx::TypingMode::PostAnalysis, TypingEnv::fully_monomorphized(prog).limit);
+        infcx.enable_next_solver_overflow_fcw = false; // traits/mod.rs:851
 
         let mut ocx = fulfill::ObligationCtxt::new(&infcx, prog);
         let env = ParamEnvId::EMPTY;
