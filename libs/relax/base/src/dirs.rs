@@ -41,10 +41,10 @@ fn absolute_dir(dir: &str) -> String {
 fn anchors() -> &'static [(&'static str, String)] {
     static ANCHORS: OnceLock<Vec<(&'static str, String)>> = OnceLock::new();
     ANCHORS.get_or_init(|| crate::zone_alloc::kept_with(|| {
-        // Resolve symlinks before anchoring: a file path may be the canonical spelling while the
-        // anchor was entered through a link (macOS /tmp -> /private/tmp), and anchoring would fail
-        // silently, putting absolute paths into identities.
-        let dir = |p: &str| std::fs::canonicalize(p).map(|c| c.to_string_lossy().into_owned()).unwrap_or_else(|_| absolute_dir(p));
+        // Anchors are spelled as the paths are passed to the compiler (normalized, not
+        // symlink-resolved): canonicalizing them alone would make a path under /tmp and an anchor
+        // under /private/tmp disagree.
+        let dir = |p: &str| absolute_dir(p);
         let mut v = vec![("run", dir(&relax_dir().to_string_lossy())), ("cargo", dir(&crate::git::cargo::home().to_string_lossy()))];
         if let Ok(root) = crate::resolve::find_root(&workspace_dir()) { v.push(("ws", dir(&root))); }
         v
