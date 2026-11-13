@@ -1552,6 +1552,10 @@ pub fn wrapper() -> Option<i32> {
     let emit = value("--emit").unwrap_or_default();
     let json = value("--json").unwrap_or_default().contains("artifacts");
     let dylib_ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    // a binary as rustc names it, which cargo runs (a stub build script) or hard-links: `.exe` on
+    // Windows. Before, the stub had no `.exe`, so cargo found no build-script-build.exe to run
+    // ("never executed", os error 2) for the first stubbed script it ran (relax issue 164)
+    let bin = format!("{}{}{}", name, extra, std::env::consts::EXE_SUFFIX);
     let mut made: Vec<(std::path::PathBuf, &str)> = Vec::new();
     for e in emit.split(',') {
         match e.split('=').next().unwrap_or("") {
@@ -1560,7 +1564,7 @@ pub fn wrapper() -> Option<i32> {
             "link" => {
                 for t in &types {
                     let f = match t.as_str() {
-                        "bin" => format!("{}{}", name, extra),
+                        "bin" => bin.clone(),
                         "rlib" | "lib" => format!("lib{}{}.rlib", name, extra),
                         "staticlib" => format!("lib{}{}.a", name, extra),
                         _ => format!("lib{}{}.{}", name, extra, dylib_ext),
@@ -1574,7 +1578,7 @@ pub fn wrapper() -> Option<i32> {
     let exe = std::env::current_exe().ok();
     for (path, kind) in &made {
         let _ = std::fs::create_dir_all(&out_dir);
-        let is_bin = kind == &"link" && types.iter().any(|t| t == "bin") && path.file_name() == Some(std::ffi::OsStr::new(&format!("{}{}", name, extra)));
+        let is_bin = kind == &"link" && types.iter().any(|t| t == "bin") && path.file_name() == Some(std::ffi::OsStr::new(&bin));
         if is_bin {
             // the stub script is this executable (wrapper(): a build script stub exits at once)
             let _ = std::fs::remove_file(path);
