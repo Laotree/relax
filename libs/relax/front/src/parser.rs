@@ -1607,14 +1607,21 @@ impl<'a> Parser<'a> {
     }
 
     /// The arms of a `cfg_select!` that were not chosen are parsed as the chosen one is (rustc cfg_select.rs):
-    /// their syntax errors are reported. `how`: 0 an expression, 1 statements, 2 items.
+    /// their syntax errors are reported. `how`: 0 an expression, 1 statements, 2 items. An arm without
+    /// braces is an expression, ended by the `,` after it or by the call's end (rustc's arm grammar,
+    /// `parse_token_tree`): parsed as one, it ends at its comma (statements ran into it: relax issue 121).
     fn parse_cfg_select_rest(&mut self, rest: Vec<(usize, usize)>, how: u8) -> PResult<()> {
         if rest.is_empty() || self.cfg_out > 0 { return Ok(()); }
         for (lo, hi) in rest {
             let save = self.pos;
             self.pos = lo;
+            let braced = lo > 0 && self.toks.kind_at(lo - 1) == T::OpenBrace;
             let r = self.parse_stripped(|p| {
                 match how {
+                    0 | 1 if !braced => {
+                        p.expr()?;
+                        if p.pos < hi { return p.err("expected `,` after a `cfg_select!` arm's expression"); }
+                    }
                     0 => { p.expr()?; }
                     1 => { let mut v = Vec::new(); while p.pos < hi { p.block_stmts_step(&mut v)?; } }
                     _ => { p.items_until(T::CloseBrace)?; }
