@@ -82,3 +82,18 @@ Start in types/src/lint_liveness.rs (the span of the binding it reports).
 rustc's `try_evaluate_const` (traits/mod.rs) evaluates in the post-analysis environment whatever
 the solver's mode; Relax's `evaluate_const` (types/src/next_solver/goals.rs) passes the solver's
 own mode (Coherence in the overlap check) for every constant but a repeat count.
+
+## 7. A provided crate does not see its program's run-env values
+
+A package's `[package.metadata.relax.run-env]` values are its program's alone (base/src/progenv.rs
+`set_run_env`): JIT-run code reads them through the program's environment layer, and the loader,
+its options and the tools it runs never do. A provided crate (built by rustc into the loader, such
+as Makepad's platform crates) reads the environment through rustc's std, which is libc's `environ`,
+so it does not see them either: one program, two environments.
+
+- cargo: no run-env (Relax's own table); every crate of the program reads one environment.
+- Relax: `std::env::var("APP_MODE")` gives the run-env's value in JIT-run code and `NotPresent` in a
+  provided crate.
+
+Start in compiler/src/provided.rs (what crosses between a provided crate's rustc code and JIT-run
+code): its environment reads need to go through progenv's program view, as JIT-run code's do.

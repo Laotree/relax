@@ -1170,6 +1170,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // a line of the layers below for the session log alone (progress::say in a silent run)
         crate::progress::set_log_only(crate::tui::log_only);
     }
+    // what the package's run-env gave its program (the runner's apply_run_env)
+    if let Some(line) = crate::progenv::take_run_env_note() {
+        crate::progress::say(&line);
+    }
     crate::memstat::start_sampler();
     // `makepad run` of a working tree is a live session (watcher + hot reload); sources served from
     // a store (`makepad run <git url>`, mounted bundles) are not, and neither are checks and the

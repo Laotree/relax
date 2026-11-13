@@ -364,6 +364,11 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
                     if !features.is_empty() {
                         words.extend(["--features".to_string(), features.clone()]);
                     }
+                    // the test's run's `--allow-c` is its binary's too (the package the person
+                    // granted; a program's child does not inherit it, progenv ALLOW_C)
+                    if allow_c {
+                        words.push("--allow-c".to_string());
+                    }
                     words.extend(["--bin".to_string(), bin_name.clone(), "--".to_string()]);
                     let wrapper = bin_dir.join(if cfg!(windows) { format!("{bin_name}.cmd") } else { bin_name.clone() });
                     if cfg!(windows) {
@@ -1255,8 +1260,12 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     }
     let chain = if chain.is_empty() { me } else { format!("{chain}>{me}") };
     let mut cmd = std::process::Command::new(&exe);
-    // a run of its own: nothing this run says of itself crosses; its folder's mount is set below
+    // a run of its own: nothing this run says of itself crosses; its folder's mount is set below,
+    // and this invocation's `--allow-c` is the script's too
     crate::progenv::scrub_run_facts(&mut cmd);
+    if sess.options.allow_c {
+        cmd.env("RELAX_ALLOW_C", "1");
+    }
     cmd.args(["run", "--quiet", "--silent", "--run-dir", target_dir, "--units", &units_path, "build-script-build"]);
     cmd.env("OUT_DIR", &out_dir)
         // Build scripts may test this to skip work only rustc needs.

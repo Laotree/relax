@@ -472,10 +472,13 @@ fn run(raw_args: Vec<Vec<u8>>) {
         Some(w) if !w.starts_with('-') && !help::COMMANDS.contains(&w) => std::process::exit(help::unknown(w)),
         _ => {}
     }
-    // `run <package>` in a checkout: the package's run-env first (it decides what is provided)
+    // `run <package>` in a checkout: the package's run-env (the program's values)
     if args.get(1).map(String::as_str) == Some("run") {
         if let (Some(pkg), Ok(cwd)) = (run_package(&args[2..]), std::env::current_dir()) {
-            apply_run_env(&cwd.display().to_string(), &pkg);
+            if let Err(e) = apply_run_env(&cwd.display().to_string(), &pkg) {
+                eprintln!("{tool}: {e}", tool = relax_compiler::tool_name());
+                std::process::exit(2);
+            }
         }
     }
     provided();
@@ -532,19 +535,25 @@ fn run_package(words: &[String]) -> Option<String> {
     None
 }
 
-/// The package's `[package.metadata.relax.run-env]` (resolve::run_env), for every way it
-/// is run (a checkout, the stores, the runner's tiles): set unless the environment already has it.
-fn apply_run_env(workspace: &str, package: &str) {
-    // Manifest discovery does not evaluate target predicates. Freeze compilation inputs
-    // after run-env has been applied.
+/// The package's `[package.metadata.relax.run-env]` (resolve::run_env), for every way it is run
+/// (a checkout, the stores, the runner's tiles): values of the program's alone (progenv
+/// set_run_env), never of this process, so neither the session's options nor the tools the run
+/// starts read them; a variable the environment already sets wins. A name a package may not set
+/// (resolve::run_env_refused: RELAX_ALLOW_C, LD_PRELOAD, ..) is an error naming it and the
+/// manifest. The run says what it gave when its session starts (progenv run_env_note).
+fn apply_run_env(workspace: &str, package: &str) -> Result<(), String> {
+    // (manifest discovery does not evaluate target predicates)
     let discovery = std::sync::Arc::new(relax_compiler::Session::default());
-    let Ok(dir) = relax_compiler::resolve::package_dir(&discovery, workspace, package) else { return };
-    let Ok(text) = relax_compiler::vfs::read_to_string(format!("{dir}/Cargo.toml")) else { return };
-    for (k, v) in relax_compiler::resolve::run_env(&text) {
-        if std::env::var_os(&k).is_none() {
-            std::env::set_var(&k, &v);
-        }
+    let Ok(dir) = relax_compiler::resolve::package_dir(&discovery, workspace, package) else { return Ok(()) };
+    let manifest = format!("{dir}/Cargo.toml");
+    let Ok(text) = relax_compiler::vfs::read_to_string(&manifest) else { return Ok(()) };
+    let values = relax_compiler::resolve::run_env(&text).map_err(|e| format!("{manifest}: {e}"))?;
+    let applied = relax_compiler::progenv::set_run_env(&values);
+    if !applied.is_empty() {
+        let list: Vec<String> = applied.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        relax_compiler::progenv::set_run_env_note(format!("{tool} run: {package}'s run-env ({manifest}) gives the program {list}", tool = relax_compiler::tool_name(), list = list.join(" ")));
     }
+    Ok(())
 }
 
 /// Runs `spec`'s package from its repositories' stores (fetched, or the cached commits): mounted
@@ -583,7 +592,7 @@ fn run_spec(opts: Vec<String>, spec: &fetch::Spec, cached: bool, rest: Vec<Strin
             let workspace = relax_compiler::zone_alloc::kept_with(|| -> Result<String, String> {
                 let snap = if cached { fetch::cached(&home, &spec) } else { fetch::fetch(&home, &spec) }?;
                 let workspace = fetch::mount(&home, &snap)?;
-                mount_vars(&workspace, &rest[0]);
+                mount_vars(&workspace, &rest[0])?;
                 std::mem::forget(snap);
                 Ok(workspace)
             })?;
@@ -723,19 +732,23 @@ fn export_to(snap: Result<fetch::Snapshot, String>, out: &str) -> ! {
 /// in `workspace`, a virtual workspace whose stores are mounted on Relax's VFS. Also the
 /// embedder's entry (the Android host mounts the APK's source store, then runs `--exports`).
 pub fn run_mounted(workspace: &str, opts: Vec<String>, rest: Vec<String>) -> i32 {
-    mount_env(workspace, &rest[0]);
+    if let Err(e) = mount_env(workspace, &rest[0]) {
+        eprintln!("{tool}: {e}", tool = relax_compiler::tool_name());
+        return 2;
+    }
     boot_package(opts, rest)
 }
 
 /// What a run of the mounted workspace and the programs it starts see: the workspace and its
 /// mounts, its std, the package's run-env.
-fn mount_env(workspace: &str, package: &str) {
+fn mount_env(workspace: &str, package: &str) -> Result<(), String> {
     relax_compiler::progenv::set_run_fact("RELAX_WORKSPACE", workspace);
-    mount_vars(workspace, package);
+    mount_vars(workspace, package)
 }
 
-/// What only the mounted source says: its mounts, its std, the package's run-env.
-fn mount_vars(workspace: &str, package: &str) {
+/// What only the mounted source says: its mounts, its std, the package's run-env (Err: a name
+/// it may not set).
+fn mount_vars(workspace: &str, package: &str) -> Result<(), String> {
     // programs it starts that run on Relax (the runner's apps) mount the same repositories
     relax_compiler::progenv::set_run_fact("RELAX_VFS", relax_compiler::vfs::mounts_text());
     // Verify the mounted std against the compiler build before any std disk probes.
@@ -744,16 +757,20 @@ fn mount_vars(workspace: &str, package: &str) {
     // the run's own files (unit graph, build script outputs, code cache): no workspace on disk,
     // so its relax dir is $RELAX_HOME/target/<hash of the virtual workspace> (relax dirs.rs), one
     // per spec shape (the same across updates)
-    apply_run_env(workspace, package);
+    let applied = apply_run_env(workspace, package);
     // compiler-arena blocks (the boot thread compiles): see boot_package
     std::mem::forget(own);
+    applied
 }
 
 /// Runs `rest` (the package and its flags) with `opts` in the current directory, a checkout:
 /// the way `makepad run <package>` does, returning instead of exiting (an embedder's call).
 pub fn run_checkout(opts: Vec<String>, rest: Vec<String>) -> i32 {
     if let Ok(cwd) = std::env::current_dir() {
-        apply_run_env(&cwd.display().to_string(), &rest[0]);
+        if let Err(e) = apply_run_env(&cwd.display().to_string(), &rest[0]) {
+            eprintln!("{tool}: {e}", tool = relax_compiler::tool_name());
+            return 2;
+        }
     }
     boot_package(opts, rest)
 }

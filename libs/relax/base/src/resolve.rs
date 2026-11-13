@@ -1247,10 +1247,13 @@ pub fn package_dir(sess: &std::sync::Arc<crate::Session>, dir: &str, package: &s
     Ok(r.manifests[i].dir.clone())
 }
 
-/// What a package asks of its run's environment: its manifest's
-/// `[package.metadata.relax.run-env]` table of `NAME = "value"` lines. The loader applies it to every run of the package, from a
-/// checkout or from the stores; a variable the environment already sets wins.
-pub fn run_env(manifest: &str) -> Vec<(String, String)> {
+/// What a package asks of its program's environment: its manifest's
+/// `[package.metadata.relax.run-env]` table of `NAME = "value"` lines. The loader gives it to the
+/// program of every run of the package, from a checkout or from the stores, and to the program
+/// alone (progenv `set_run_env`); a variable the environment already sets wins. A name that
+/// steers Relax or the tools it runs (`run_env_refused`) is an error naming it: a package does
+/// not grant itself `--allow-c` or load a library into the loader.
+pub fn run_env(manifest: &str) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
     let mut inside = false;
     for line in manifest.lines() {
@@ -1266,12 +1269,28 @@ pub fn run_env(manifest: &str) -> Vec<(String, String)> {
             let (k, v) = (k.trim(), v.trim());
             if let Some(v) = v.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
                 if !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    if run_env_refused(k) {
+                        return Err(format!("[package.metadata.relax.run-env] sets {k}, which a package may not set: Relax's own settings (RELAX_*, such as RELAX_ALLOW_C: `--allow-c` is the person's) and the names the loader, the C toolchain and cargo read (LD_*, DYLD_*, CC, CXX, AR, LINKER, C/CXX/CPP/LD FLAGS, RUSTC*, RUSTFLAGS, CARGO*)"));
+                    }
                     out.push((k.to_string(), v.to_string()));
                 }
             }
         }
     }
-    out
+    Ok(out)
+}
+
+/// The names a package's run-env may not set: Relax's own (`RELAX_*`: its options, such as
+/// `RELAX_ALLOW_C`, and its run's facts), the dynamic loader's (`LD_*`, `DYLD_*`), the C
+/// toolchain's (`CC`, `CXX`, `AR`, `LINKER`, the C flags, and their per-target forms such as
+/// `CC_<target>` and `TARGET_CC`), cargo's and rustc's (`CARGO*`, `RUSTC*`, `RUSTFLAGS`,
+/// `RUSTDOC*`). Without case: a
+/// Windows name has none.
+pub fn run_env_refused(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    let tool = |t: &str| n == t || n.starts_with(&format!("{t}_")) || n.ends_with(&format!("_{t}"));
+    ["RELAX_", "LD_", "DYLD_", "RUSTC", "RUSTFLAGS", "RUSTDOC", "CARGO"].iter().any(|p| n.starts_with(p))
+        || ["CC", "CXX", "AR", "LINKER", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS"].iter().any(|t| tool(t))
 }
 
 /// The folders of a repository's tree (a commit's path table) whose Cargo.toml cargo's package
@@ -3355,8 +3374,16 @@ fn unit_graph_host_side_follows_proc_macro_and_build_script_edges() {
 #[test]
 fn run_env_reads_the_packages_table() {
     let m = "[package]\nname = \"makepad-amp\"\n\n[package.metadata.relax.run-env]\n# why\nMAKEPAD_LOG = \"0\"\nbad key = \"x\"\n\n[dependencies]\nX = \"1\"\n";
-    assert_eq!(run_env(m), vec![("MAKEPAD_LOG".to_string(), "0".to_string())]);
-    assert!(run_env("[package]\nname = \"a\"\n").is_empty());
+    assert_eq!(run_env(m), Ok(vec![("MAKEPAD_LOG".to_string(), "0".to_string())]));
+    assert_eq!(run_env("[package]\nname = \"a\"\n"), Ok(Vec::new()));
+    // a package grants itself nothing of Relax's or its tools': the run stops, naming the key
+    for key in ["RELAX_ALLOW_C", "relax_allow_c", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "CC", "CC_x86_64_unknown_linux_gnu", "TARGET_CC", "CXX", "AR", "LINKER", "CFLAGS", "RUSTC_WRAPPER", "RUSTFLAGS", "RUSTDOCFLAGS", "CARGO_HOME", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"] {
+        let refused = run_env(&format!("[package.metadata.relax.run-env]\nMAKEPAD_LOG = \"0\"\n{key} = \"1\"\n"));
+        assert!(refused.as_ref().is_err_and(|e| e.contains(&format!("sets {key},"))), "run-env must refuse {key}: {refused:?}");
+    }
+    for key in ["MAKEPAD_LOG", "APP_MODE", "PATH", "ACCOUNT", "SCALE", "RUST_LOG"] {
+        assert!(run_env(&format!("[package.metadata.relax.run-env]\n{key} = \"1\"\n")).is_ok(), "run-env takes {key}");
+    }
 }
 
 #[cfg(test)]

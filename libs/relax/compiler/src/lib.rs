@@ -515,7 +515,9 @@ pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
             }
             "--allow-c" => {
                 options.allow_c = true;
-                std::env::set_var("RELAX_ALLOW_C", "1");
+                // this invocation's: this run again (a self-exec child) and the host's own children
+                // (build scripts, test harnesses) have it; a relax its program starts does not
+                crate::progenv::set_run_fact("RELAX_ALLOW_C", "1");
             }
             _ => {}
         }
