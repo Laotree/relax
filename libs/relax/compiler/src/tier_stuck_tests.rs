@@ -513,6 +513,53 @@ fn a_bailed_take_gives_back_a_full_bodys_normal_lowering() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A body checked ahead before the program's declarations were collected again (Tcx::collect_epoch
+/// moves: a crate a cold demand load added after the first frame, a module, an edit) is lowered from
+/// no more, and the check ahead skipped any key the map held: every later front of the slot failed
+/// "stale" for the rest of the run, and the O3 builds of its callers left it out (an app's input
+/// dispatch: hundreds of left-out lines). The stale body leaves the map and is checked again.
+#[test]
+fn a_front_checked_before_a_new_collection_is_made_again() {
+    isolated_test!(a_front_checked_before_a_new_collection_is_made_again);
+    crate::borrowck::lazy::disable_gandalf();
+    if std::env::var_os("RELAX_STD").is_none() {
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    }
+    let dir = std::env::temp_dir().join(format!("relax-stale-front-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("input.rs");
+    std::fs::write(&path, TAKE_SOURCE).unwrap();
+    let (prog, core, krate) = crate::load_with_std(&std::sync::Arc::new(crate::Session::default()), path.to_str().unwrap(), "stale_front", false).unwrap();
+    let twice = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = DefId(i as u32);
+        (d.krate == krate && d.kind == DefKind::Fn && prog.name(id) == "twice").then_some(id)
+    }).unwrap();
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    unsafe { UNIT = up };
+    enable_pipelining(&u.prog.session.options);
+    let id = crate::owner::call(crate::owner::Class::Program, || unsafe { (*up).fn_id(FnKey::Inst(twice, Vec::new())) });
+    let front = crate::owner::call(crate::owner::Class::Program, || unsafe { (*up).front.clone() });
+    assert!(prefront_slot(&front, id), "the first front of twice was not made off the owner");
+    let key = (twice, Vec::new());
+    assert!(front.ahead.contains_key(&key), "the first front left its checked body in the map");
+    // a build took the lowering; then the declarations are collected again
+    crate::owner::call(crate::owner::Class::Program, || {
+        front.lowered.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+        let _fw = front_write();
+        unsafe { (*up).tcx.collect_epoch.fetch_add(1, Ordering::SeqCst) };
+    });
+    assert!(prefront_slot(&front, id), "the front of twice was not made again after the new collection");
+    let epoch = crate::owner::call(crate::owner::Class::Program, || unsafe { (*up).tcx.collect_epoch.load(Ordering::SeqCst) });
+    assert_eq!(front.ahead.get(&key).map(|(e, _)| e), Some(epoch), "the map holds the body checked under the new collection");
+    // (process exit owns the runtime's teardown)
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 const LEFT_SOURCE: &str = r#"
 const K1: u32 = 40 + 2;
 const K2: u32 = 6 * 7;

@@ -25836,13 +25836,22 @@ fn prefront_slot_once(front: &FrontShared, id: u32) -> bool {
         return false;
     };
     let t0 = cpu_ns();
-    if front.ahead.contains_key(&(d, args.clone())) { PREFRONTS[4].fetch_add(1, Ordering::Relaxed); }
+    let key = (d, args);
+    if front.ahead.contains_key(&key) { PREFRONTS[4].fetch_add(1, Ordering::Relaxed); }
     let why = {
         let _preemptible = crate::preempt::Preemptible::on();
-        typeck_ahead(front, d, args, 0, false, false);
-        PREFRONTS[2].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
-        lower_ahead(front, id, true)
+        let mut why = AF_OK;
+        // twice at most: a body checked before the declarations were collected again leaves the
+        // map in lower_ahead (stale), and is checked again under the current collection
+        for _ in 0..2 {
+            typeck_ahead(front, key.0, key.1.clone(), 0, false, false);
+            PREFRONTS[2].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
+            why = lower_ahead(front, id, true);
+            if why != AF_STALE || front.ahead.contains_key(&key) { break; }
+        }
+        why
     };
+    let d = key.0;
     prefront_count(t0);
     prefronted(id);
     let ok = matches!(front.lowered.lock().unwrap_or_else(|e| e.into_inner()).get(&id), Some(LoweredState::Ready(_)));
@@ -26913,9 +26922,21 @@ fn lower_ahead(f: &FrontShared, id: u32, own: bool) -> u8 {
         let Some((epoch, body)) = f.ahead.get(&key) else { return AF_UNCHECKED; };
         let u = r.unit_of(f);
         let fn_key = FnKey::Inst(d, key.1.clone());
+        // checked before the declarations were collected again (Tcx::collect_epoch: a crate a
+        // cold demand load added, a module, an edit): no build takes that body (take_ahead checks
+        // again), and the check ahead skips a key the map holds, so it leaves the map here and
+        // the slot's next front checks it again (prefront_slot_once)
+        if epoch != u.tcx.collect_epoch.load(Ordering::SeqCst) {
+            let gone = {
+                let _claim = f.inprog.lock().unwrap_or_else(|e| e.into_inner());
+                if f.ahead.get(&key).is_some_and(|(e, _)| e == epoch) { f.ahead.remove(&key) } else { None }
+            };
+            drop(gone);
+            return AF_STALE;
+        }
         // fn_map publishes after the slot's fields (including a decoded image identity).
         // The ahead queue can contain the id before fn_id/name_slot finishes publishing it.
-        if epoch != u.tcx.collect_epoch.load(Ordering::SeqCst) || u.fn_map.get(&fn_key) != Some(id) { return AF_STALE; }
+        if u.fn_map.get(&fn_key) != Some(id) { return AF_STALE; }
         if !lowers_ahead(u, d, &body) { return AF_REFUSED; }
         {
             let mut pending = f.lowered.lock().unwrap_or_else(|e| e.into_inner());
