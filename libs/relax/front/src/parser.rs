@@ -147,7 +147,7 @@ pub struct Parser<'a> {
     pub(crate) meta_frags: crate::fxhash::HashMap<u32, &'static str>,
     /// starts of the `$b:block` substitutions of expansion text (check only)
     pub(crate) block_frags: crate::fxhash::HashSet<u32>,
-    /// starts of the `$s:stmt` substitutions of expansion text: a statement that ends with its group
+    /// Starts of opaque statement fragments; their complete extent is in frag_groups.
     pub(crate) stmt_frags: crate::fxhash::HashSet<u32>,
     /// Offsets of the parens a transcription added around multi-token `$e:expr` fragments.
     pub(super) synth_parens: crate::fxhash::HashSet<u32>,
@@ -439,6 +439,7 @@ impl<'a> Parser<'a> {
     }
 
     fn ident_tok(&mut self) -> PResult<Ident> {
+        if self.at_stmt_frag() { return self.err("expected identifier, found statement metavariable"); }
         match self.kind() {
             T::Ident | T::RawIdent => {
                 let t = self.tok();
@@ -639,10 +640,11 @@ impl<'a> Parser<'a> {
         let mut i = self.pos + 1;
         while i < self.toks.len() {
             let k = self.toks.kind_at(i);
-            // parse_part has no invisible type/path-fragment boundaries (rustc_parse
-            // parser/{ty,path}.rs: parse_ty_common/parse_path); consume these with their expansion.
+            // parse_part has no invisible type/path/statement boundaries (rustc_parse
+            // interpolated nonterminals): consume these while their expansion's metadata is live.
             if (!self.ty_frags.is_empty() && self.ty_frags.contains(&{ self.toks.at(i).lo }))
-                || (!self.path_frags.is_empty() && self.path_frags.contains(&{ self.toks.at(i).lo })) {
+                || (!self.path_frags.is_empty() && self.path_frags.contains(&{ self.toks.at(i).lo }))
+                || (!self.stmt_frags.is_empty() && self.stmt_frags.contains(&{ self.toks.at(i).lo })) {
                 return BodyOutline::Eager(5);
             }
             // Nor the invisible parentheses of an expression fragment (synth_parens): there a false
@@ -2430,9 +2432,35 @@ impl<'a> Parser<'a> {
 
     /// One statement of a block, or all statements of a statement-position macro call.
     fn block_stmts_step(&mut self, stmts: &mut Vec<Stmt>) -> PResult<()> {
+        if !self.at_stmt_frag() { return self.block_stmts_inner(stmts, false); }
+        let lo = self.lo();
+        // rustc_parse returns an interpolated NtStmt without extending it with the next
+        // statement's tokens. Reparse its exact extent, as ty_inner does for NtTy. Keep a
+        // statement-position macro's full statement list, including empty expansions.
+        let Some(&hi) = self.frag_groups.get(&lo) else { return self.err("statement fragment without its extent"); };
+        let Some(last) = (self.pos..self.toks.len()).find(|&i| self.toks.at(i).hi == hi) else {
+            return self.err("incomplete statement fragment");
+        };
+        let end = last + 1;
+        if end >= self.toks.len() { return self.err("incomplete statement fragment"); }
+        let next = self.toks.at(end);
+        self.toks.edit(end, |t| *t = Tok { kind: T::Eof, lo: hi, hi });
+        self.stmt_frags.remove(&lo);
+        let result = self.block_stmts_inner(stmts, true);
+        let complete = self.pos == end;
+        self.toks.edit(end, |t| *t = next);
+        self.stmt_frags.insert(lo);
+        result?;
+        if !complete { return self.err("unexpected token in statement fragment"); }
+        // A written `;` after NtStmt is a separate empty statement, not permission to
+        // discard its value (rustc_parse parse_full_stmt). Leave it to the next step.
+        Ok(())
+    }
+
+    fn block_stmts_inner(&mut self, stmts: &mut Vec<Stmt>, interpolated: bool) -> PResult<()> {
         if self.macros.is_some() && self.mac_ahead() {
             let save = self.pos;
-            if self.stmt_macro(stmts)? {
+            if self.stmt_macro(stmts, interpolated)? {
                 return Ok(());
             }
             self.pos = save;
@@ -2459,7 +2487,7 @@ impl<'a> Parser<'a> {
                     } else {
                         self.pos = at;
                         self.record_mac_call_attrs(&attrs);
-                        if self.stmt_macro(stmts)? {
+                        if self.stmt_macro(stmts, interpolated)? {
                             return Ok(());
                         }
                     }
@@ -2468,7 +2496,7 @@ impl<'a> Parser<'a> {
             self.pending_shape.truncate(pend0);
             self.pos = save;
         }
-        let s = self.stmt()?;
+        let s = self.stmt(interpolated)?;
         // generated items go before the statement (item order does not matter in a block; a
         // tail expression must stay last)
         for id in std::mem::take(&mut self.extra_items) {
@@ -2495,11 +2523,11 @@ impl<'a> Parser<'a> {
     /// A statement-position `macro_rules!` call at the cursor: its statements splice into the
     /// block (a `;` after the call ends a tail expression). False (cursor unspecified) when it
     /// is not one.
-    fn stmt_macro(&mut self, stmts: &mut Vec<Stmt>) -> PResult<bool> {
+    fn stmt_macro(&mut self, stmts: &mut Vec<Stmt>, interpolated: bool) -> PResult<bool> {
         self.stmt_ctx = true;
         let r = self.try_expand_rules(|p, include, tail_expr| {
             let mut v = Vec::new();
-            if tail_expr {
+            if tail_expr && !interpolated {
                 return p.tail_expansion();
             }
             // `include!` in statement position is an expression: its first one, the rest of the
@@ -2982,6 +3010,7 @@ impl<'a> Parser<'a> {
     /// An item, also one inside a fn body: its own text is not the body's (an impl or a const in
     /// a hole body is seen by other crates), so it is no hole until a fn of its own says so.
     fn item(&mut self, attrs: Vec<Attr>) -> PResult<Option<ItemId>> {
+        if self.at_stmt_frag() { return self.err("expected item, found statement metavariable"); }
         let outer = std::mem::replace(&mut self.hole_body, false);
         let r = self.item_here(attrs);
         self.hole_body = outer;
@@ -4362,6 +4391,12 @@ impl<'a> Parser<'a> {
         self.ty_inner(true)
     }
 
+    /// The cursor is at the start of a `$s:stmt` fragment (rustc's `MetaVarKind::Stmt` invisible
+    /// group): only a statement parses there.
+    fn at_stmt_frag(&self) -> bool {
+        !self.stmt_frags.is_empty() && self.stmt_frags.contains(&self.lo())
+    }
+
     pub(super) fn ty_fragment_end(&self, lo: u32) -> Option<u32> {
         if self.ty_frags.contains(&lo) { self.frag_groups.get(&lo).copied() } else { None }
     }
@@ -4386,6 +4421,7 @@ impl<'a> Parser<'a> {
     }
 
     fn ty_inner(&mut self, plus: bool) -> PResult<TyId> {
+        if self.at_stmt_frag() { return self.err("expected type, found statement metavariable"); }
         // rustc_parse parser/ty.rs: parse_ty_common; parser/mod.rs: eat_metavar_seq.
         // Reparse a captured type inside invisible delimiters (`as $t << n`).
         if let Some(hi) = self.ty_fragment_end(self.tok().lo) {
@@ -4676,6 +4712,7 @@ impl<'a> Parser<'a> {
     }
 
     pub fn pat_no_or(&mut self) -> PResult<PatId> {
+        if self.at_stmt_frag() { return self.err("expected pattern, found statement metavariable"); }
         if self.exp_depth > 0 && (!self.meta_frags.is_empty() || self.kind() == T::OpenParen) {
             self.expr_fragment_pat()?;
         }
@@ -4907,7 +4944,7 @@ impl<'a> Parser<'a> {
         Ok(BlockId(self.ast.base[3] + self.ast.blocks.len() as u32 - 1))
     }
 
-    fn stmt(&mut self) -> PResult<Stmt> {
+    fn stmt(&mut self, interpolated: bool) -> PResult<Stmt> {
         if self.kind() == T::Semi && self.doc_before() {
             return self.err("E0585: found a documentation comment that doesn't document anything");
         }
@@ -4940,7 +4977,7 @@ impl<'a> Parser<'a> {
         }
         let mut attrs = attrs;
         self.normalize_builtin_test_attrs(&mut attrs);
-        let s = self.with_cfg_active(active, pend0, |p| p.stmt_after_attrs(attrs.clone(), item_tok))?;
+        let s = self.with_cfg_active(active, pend0, |p| p.stmt_after_attrs(attrs.clone(), interpolated))?;
         if matches!(s, Stmt::Item(_)) {
             if !active {
                 self.pending_shape.truncate(pend0);
@@ -4960,35 +4997,8 @@ impl<'a> Parser<'a> {
         Ok(s)
     }
 
-    /// `start`: the token the statement's attributes began at.
-    fn stmt_after_attrs(&mut self, attrs: Vec<Attr>, start: usize) -> PResult<Stmt> {
-        // rustc_parse parser/stmt.rs parse_full_stmt (eat_metavar_seq of MetaVarKind::Stmt): a
-        // statement that is a `$s:stmt` fragment is parsed inside the fragment's invisible
-        // delimiters and ends with them, no `;` looked for after it: `$s next();` is two
-        // statements, and the `;` of `$s;` is an empty one of its own
-        let start_lo = self.toks.at(start).lo;
-        if !self.stmt_frags.is_empty() && self.stmt_frags.contains(&start_lo) {
-            if let Some(&hi) = self.frag_groups.get(&start_lo) {
-                if let Some(last) = (self.pos..self.toks.len()).find(|&i| self.toks.at(i).hi == hi) {
-                    let end = last + 1;
-                    if end < self.toks.len() {
-                        let next = self.toks.at(end);
-                        self.toks.edit(end, |t| *t = Tok { kind: T::Eof, lo: hi, hi });
-                        let result = self.stmt_in(attrs, true);
-                        let complete = self.pos == end;
-                        self.toks.edit(end, |t| *t = next);
-                        let s = result?;
-                        if !complete { return self.err("unexpected token in statement fragment"); }
-                        return Ok(s);
-                    }
-                }
-            }
-        }
-        self.stmt_in(attrs, false)
-    }
-
-    /// `fragment`: the statement is a `$s:stmt` fragment, the token after it an end of file.
-    fn stmt_in(&mut self, attrs: Vec<Attr>, fragment: bool) -> PResult<Stmt> {
+    /// Interpolated statements already carry their boundary, including a let without `;`.
+    fn stmt_after_attrs(&mut self, attrs: Vec<Attr>, interpolated: bool) -> PResult<Stmt> {
         if self.kind() == T::KwLet {
             self.pos += 1;
             let pat = self.pat_top()?;
@@ -5010,7 +5020,8 @@ impl<'a> Parser<'a> {
             } else {
                 (None, None)
             };
-            if !(fragment && self.kind() == T::Eof) {
+            // a `$s:stmt` fragment forwarded into a block is a whole statement, its `;` not part of it
+            if !interpolated {
                 self.expect(T::Semi)?;
             }
             let attrs = self.ast.push_list(attrs);
@@ -5632,6 +5643,7 @@ impl<'a> Parser<'a> {
     }
 
     fn primary(&mut self, r: u8) -> PResult<ExprId> {
+        if self.at_stmt_frag() { return self.err("expected expression, found statement metavariable"); }
         let lo = self.lo();
         // rustc_parse parser/expr.rs: parse_expr_bottom returns a Path expression
         // for MetaVarKind::Path; calls follow, but `{ .. }` and `::` do not extend it.

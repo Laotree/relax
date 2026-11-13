@@ -3281,6 +3281,10 @@ impl<'a> Parser<'a> {
         if t.kind != m.kind {
             return false;
         }
+        // a forwarded statement is one opaque nonterminal, not its first written token
+        if !self.stmt_frags.is_empty() && self.stmt_frags.contains(&{ t.lo }) {
+            return false;
+        }
         match t.kind {
             T::Ident | T::RawIdent | T::Lifetime | T::Int | T::Float | T::Str | T::ByteStr | T::CStr | T::RawStr | T::Char | T::Byte => self.tok_text(t) == m.text.as_bytes(),
             _ => true,
@@ -3314,6 +3318,11 @@ impl<'a> Parser<'a> {
             return expected();
         }
         let k = if i < end { self.toks.at(i).kind } else { T::Eof };
+        // a forwarded `$s:stmt` matched as a statement again: the whole fragment, as one
+        if f == Frag::Stmt && i < end && !self.stmt_frags.is_empty() && self.stmt_frags.contains(&{ self.toks.at(i).lo }) {
+            let Some(&hi) = self.frag_groups.get(&{ self.toks.at(i).lo }) else { return expected() };
+            return (i..end).find(|&j| self.toks.at(j).hi == hi).map(|j| (j + 1, None, false)).ok_or_else(|| format!("expected {}", frag_desc(f)));
+        }
         match f {
             Frag::Ident => {
                 if i < end && (matches!(k, T::Ident | T::RawIdent) || (T::KwAs as u8..=T::KwTry as u8).contains(&(k as u8))) && self.tok_text(self.toks.at(i)) != b"_" {
@@ -3448,6 +3457,10 @@ impl<'a> Parser<'a> {
     /// whatever its first token; None for written tokens and the kinds that forward as their
     /// tokens (ident, lifetime, tt).
     fn forwarded_kind(&self, lo: u32) -> Option<Frag> {
+        // an outer statement stays a statement when it begins with a captured expression
+        if !self.stmt_frags.is_empty() && self.stmt_frags.contains(&lo) {
+            return Some(Frag::Stmt);
+        }
         if self.synth_parens.contains(&lo) {
             return Some(Frag::Expr);
         }
@@ -3477,6 +3490,12 @@ impl<'a> Parser<'a> {
             return false;
         }
         if let Some(fk) = self.forwarded_kind(t.lo) {
+            // a forwarded statement is no expression, type, pattern or literal (rustc
+            // `can_begin_expr` & co. take no `MetaVarKind::Stmt`); where rustc would try another
+            // kind on it and fail, the arm is skipped here
+            if fk == Frag::Stmt {
+                return matches!(f, Frag::Stmt | Frag::Tt);
+            }
             return match f {
                 Frag::Tt | Frag::Item | Frag::Stmt | Frag::Vis => true,
                 Frag::Ident | Frag::Lifetime => false,
