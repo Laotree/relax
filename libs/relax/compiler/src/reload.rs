@@ -9619,16 +9619,21 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         if synced {
             // A devhub sync of landed work: one whole tree, so no part of it is a half-done
             // checkout. What makepad itself is built from (provided crates, std, the Cargo graph,
-            // build scripts) goes to a rebuild of makepad, which restarts only if the binary
-            // changed; sources of crates the program has not loaded are read when it loads them;
-            // the program's own sources patch as any save does.
+            // build scripts) is offered, as a landing is anywhere else: the sync builds the
+            // checkout's makepad itself right after it moved the files (devhub's prebuild, on the
+            // cores its room was granted), so the restart, or the app's next launch, finds it
+            // built. The app never builds it beside that build: every dock app on a box ran its
+            // own cargo of the same target after each deploy, leased by nobody (11-13). Sources of
+            // crates the program has not loaded are read when it loads them; the program's own
+            // sources patch as any save does.
             let (host_side, rest): (Vec<usize>, Vec<usize>) = changed.iter().partition(|&&k| inputs.process_input(&files[k].0));
             if !host_side.is_empty() {
                 let short = |p: &str| -> String { let v: Vec<&str> = p.rsplit('/').take(2).collect(); v.into_iter().rev().collect::<Vec<_>>().join("/") };
                 let names: Vec<String> = host_side.iter().take(3).map(|&k| short(&files[k].0)).collect();
                 let why = format!("{} {tool} input(s) changed ({}{}): {}", host_side.len(), names.join(", "), if host_side.len() > 3 { ", ..." } else { "" },
                     inputs.restart_reason(host_side.iter().map(|&k| files[k].0.as_str())).unwrap_or("its sources changed"), tool = crate::tool_name());
-                if let Err(e) = host::request(why.clone(), inputs.process_paths(&|_| true)) {
+                let paths = inputs.process_paths(&|_| true);
+                if let Err(e) = if crate::harness::live::enabled() { host::request(why.clone(), paths) } else { host::offer(why.clone(), paths) } {
                     let message = format!("{why}; cannot rebuild {tool} here ({e}); the app goes on with the {tool} it runs", tool = crate::tool_name());
                     eprintln!("relax live: {message}");
                     live_log(&format!("{{\"event\":\"host_rebuild\",\"ok\":false,\"message\":{}}}", json_str(&message)));
