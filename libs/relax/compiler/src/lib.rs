@@ -1502,6 +1502,7 @@ pub unsafe fn reset_statics() {
     reload::reset_statics();
     run::reset_statics();
     sandbox::reset_statics();
+    selfexe::reset_statics();
     stale::reset_statics();
     store::reset_statics();
     syms::reset_statics();

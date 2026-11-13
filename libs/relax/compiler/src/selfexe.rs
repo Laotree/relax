@@ -260,6 +260,14 @@ pub fn set_line(words: &[String]) -> Result<(), String> {
 /// The run's build environment as a launch of its link takes it (`hand_build`).
 static HANDED: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
 
+/// What this module holds of a run, as a fresh process has it (`run_end`): the ended run's build
+/// environment is no longer handed to a launch of its link (its file goes with the descriptor; a
+/// child that inherited one keeps its own). The link and its folder are the process's
+/// (process_statics.tsv).
+pub(crate) unsafe fn reset_statics() {
+    drop(HANDED.lock().unwrap_or_else(|e| e.into_inner()).take());
+}
+
 #[cfg(unix)]
 extern "C" {
     fn dup(fd: i32) -> i32;
