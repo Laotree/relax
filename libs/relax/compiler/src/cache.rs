@@ -222,22 +222,35 @@ pub(crate) fn share_write(carries_path: bool) -> ShareWrite {
 /// Whether the identities computed right now hash the absolute anchor dirs. Target B's shared
 /// mode computes both variants of a key: path-free (no anchor dirs) for lookup and storage of a
 /// clean payload, anchored for a payload the scan found carrying a workspace path.
-thread_local! {
-    static IDENTITY_ANCHORS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+/// Process-wide identity anchor switch: unset (2) takes the mode's default on first use (off in
+/// shared mode, on otherwise). Shared mode computes the anchored variant by temporarily setting
+/// it; key computation is serialized by the cache's own locks.
+static IDENTITY_ANCHORS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
+fn identity_anchors_now() -> bool {
+    match IDENTITY_ANCHORS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = !matches!(crate::dirs::shared_cache_mode(), Ok(true));
+            IDENTITY_ANCHORS.store(on as u8, std::sync::atomic::Ordering::Relaxed);
+            on
+        }
+    }
 }
 
 /// Runs `f` with the identity anchor switch at `on` (restores the previous value).
 pub(crate) fn with_identity_anchors<R>(on: bool, f: impl FnOnce() -> R) -> R {
-    let prev = IDENTITY_ANCHORS.with(|c| c.replace(on));
+    let prev = IDENTITY_ANCHORS.swap(on as u8, std::sync::atomic::Ordering::Relaxed);
     let r = f();
-    IDENTITY_ANCHORS.with(|c| c.set(prev));
+    IDENTITY_ANCHORS.store(prev, std::sync::atomic::Ordering::Relaxed);
     r
 }
 
 /// The anchor-dir hash an identity mixes in: the absolute dirs, or nothing in the path-free
 /// variant.
 fn anchors_in_key() -> u128 {
-    if IDENTITY_ANCHORS.with(|c| c.get()) { crate::dirs::anchors_key() } else { 0 }
+    if identity_anchors_now() { crate::dirs::anchors_key() } else { 0 }
 }
 
 const KIND_CODE: u32 = 1;
@@ -1157,6 +1170,9 @@ pub struct Cache {
     linked_key: HashMap<u32, u128>,
     /// slot keys by slot (fixed for a run)
     slot_keys: HashMap<u32, Option<u128>>,
+    /// Per slot in shared mode: its (path-free, anchored) key pair, for the write path's
+    /// placeholder decision.
+    slot_variants: std::collections::HashMap<u32, (u128, u128)>,
     /// An unnamed image slot must not cache a failed key before its identity is decoded.
     key_waits: bool,
     /// a slot's encoded key (None: not encodable), and encoded keys already decoded to slots
@@ -1467,7 +1483,7 @@ impl Cache {
             rec_tier: HashMap::new(),
             manifest_root: None,
             linked_key: HashMap::new(),
-            slot_keys: HashMap::new(),
+            slot_keys: HashMap::new(), slot_variants: Default::default(),
             key_waits: false,
             last_callees: Vec::new(),
             last_tier1: None,
@@ -2943,6 +2959,7 @@ impl Cache {
             let anchored = with_identity_anchors(true, || self.code_key_bytes(u, &key))?;
             let carries = self.get(free.0).is_some_and(|(kind, p)| kind == KIND_SHARE_PLACEHOLDER && p == SHARE_PLACEHOLDER);
             self.slot_crates.insert(id, anchored.1);
+            self.slot_variants.insert(id, (free.0, anchored.0));
             let k = if carries { anchored.0 } else { free.0 };
             return Some((k, anchored.2));
         }
@@ -4006,6 +4023,16 @@ impl Cache {
         }
         // (the store encode_entry chose: the slot's verdict and tier records follow its code)
         let kc = self.cur_crate;
+        let mut key = key;
+        if matches!(crate::dirs::shared_cache_mode(), Ok(true)) {
+            if let Some(&(free, anchored)) = self.slot_variants.get(&id) {
+                if key == free && crate::dirs::payload_carries_anchor(&payload).is_some() {
+                    // the conclusion, never the payload, under the path-free identity
+                    self.push_pending(kc, NewEntry { key: free, kind: KIND_SHARE_PLACEHOLDER, payload: SHARE_PLACEHOLDER.to_vec() });
+                    key = anchored;
+                }
+            }
+        }
         self.key_crate.insert(key, kc);
         if self.slot_crates.get(&id).is_some_and(|c| self.dominant(c) != kc) { self.stats.wider_store += 1; }
         if sealed { self.stats.sealed_records += 1; }
