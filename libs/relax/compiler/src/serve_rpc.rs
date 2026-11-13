@@ -332,15 +332,44 @@ fn run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> Result<(), Str
 }
 
 pub fn request(dir: &Path, method: &str, params: &str) -> Result<Json, String> {
+    request_within(dir, method, params, Duration::from_secs(1800))
+}
+/// `request`, waiting at most `answer` for the server's answer.
+fn request_within(dir: &Path, method: &str, params: &str, answer: Duration) -> Result<Json, String> {
     let (port, token, _) = endpoint(dir)?;
     let mut socket = TcpStream::connect_timeout(&([127,0,0,1],port).into(), Duration::from_secs(2)).map_err(|e|e.to_string())?;
-    socket.set_read_timeout(Some(Duration::from_secs(1800))).map_err(|e|e.to_string())?;
+    socket.set_read_timeout(Some(answer)).map_err(|e|e.to_string())?;
     socket.set_write_timeout(Some(Duration::from_secs(5))).map_err(|e|e.to_string())?;
     writeln!(socket,"{{\"id\":1,\"token\":{},\"method\":{},\"params\":{params}}}", quote(&token),quote(method)).map_err(|e|e.to_string())?;
     let text = line(&mut BufReader::new(socket)).map_err(|e|e.to_string())?.ok_or("server closed connection")?;
     let response = crate::json::parse(text.as_bytes())?;
     if let Some(e) = response.get("error") { return Err(e.get("message").map_or("server error",Json::str).into()); }
     match response { Json::Obj(v) => v.into_iter().find(|(k,_)|k=="result").map(|(_,v)|v).ok_or("missing result".into()), _ => Err("invalid response".into()) }
+}
+/// Stops the check server `pid` (listening on `port`) within seconds, each step said in one line:
+/// asked (`shutdown`), then SIGTERM, then SIGKILL. A busy server takes neither the ask nor SIGTERM
+/// before its current request ends, which can be minutes. It is gone once its pid is or its port no
+/// longer takes connections: a server whose parent is still running stays a zombie, alive by its
+/// pid. Whether it is gone.
+fn stop_server(dir: &Path, port: u16, pid: u32) -> bool {
+    let gone = |within: Duration| {
+        let since = Instant::now();
+        loop {
+            if !serve_os::alive(pid) || TcpStream::connect_timeout(&([127,0,0,1],port).into(), Duration::from_millis(200)).is_err() { return true; }
+            if since.elapsed() >= within { return false; }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    let answered = request_within(dir, "shutdown", "{}", Duration::from_secs(1)).is_ok();
+    if gone(Duration::from_secs(2)) { return true; }
+    eprintln!("relax: the check server (pid {pid}) still runs 2 s after it was asked to stop{}: sending SIGTERM", if answered { "" } else { " (no answer)" });
+    serve_os::stop(pid);
+    if gone(Duration::from_secs(3)) { return true; }
+    eprintln!("relax: the check server (pid {pid}) still runs 3 s after SIGTERM: sending SIGKILL");
+    serve_os::stop_now(pid);
+    if gone(Duration::from_secs(2)) { return true; }
+    eprintln!("relax: the check server (pid {pid}) still runs 2 s after SIGKILL: going on without it");
+    false
 }
 fn connect(start: bool) -> Result<PathBuf, String> {
     let root = workspace(&std::env::current_dir().map_err(|e|e.to_string())?)?;
@@ -350,15 +379,14 @@ fn connect(start: bool) -> Result<PathBuf, String> {
         // any upgrade: it is stopped by the pid it recorded, and this compiler checks.
         let theirs = status.get("compiler").map_or("", Json::str);
         if theirs == crate::jit::PROVENANCE { return Ok(dir); }
-        if let Ok((_, _, pid)) = endpoint(&dir) {
-            serve_os::stop(pid);
-            eprintln!("relax: the check server (pid {pid}) runs another compiler ({}): stopped it{}", if theirs.is_empty() { "unnamed" } else { theirs }, if start { "" } else { "; checking in-process" });
-            if !start { return Err("the check server ran another compiler".into()); }
-            let stopping = Instant::now();
-            while serve_os::alive(pid) {
-                if stopping.elapsed() > Duration::from_secs(1800) { return Err("timed out stopping the check server".into()); }
-                std::thread::sleep(Duration::from_millis(25));
+        if let Ok((port, _, pid)) = endpoint(&dir) {
+            let name = if theirs.is_empty() { "unnamed" } else { theirs };
+            eprintln!("relax: the check server (pid {pid}) runs another compiler ({name}): asking it to stop");
+            if !stop_server(&dir, port, pid) {
+                return Err(format!("the check server (pid {pid}) of another compiler did not stop"));
             }
+            eprintln!("relax: the check server (pid {pid}) runs another compiler ({name}): stopped it{}", if start { "" } else { "; checking in-process" });
+            if !start { return Err("the check server ran another compiler".into()); }
         }
     }
     if !start { return Err("no check server".into()); }

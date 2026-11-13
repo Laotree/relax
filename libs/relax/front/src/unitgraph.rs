@@ -483,7 +483,7 @@ pub enum ScriptRole {
 
 pub fn script_role(pkg: &str, bs: &BuildScript) -> ScriptRole {
     let has = |f: &str| bs.features.iter().any(|x| x == f);
-    if let Some(a) = script_answer(pkg) {
+    if let Some(a) = script_answer(pkg, bs) {
         return ScriptRole::Native(a);
     }
     match pkg {
@@ -558,13 +558,18 @@ pub fn export_opt_level(dir: &str) -> Option<u8> {
 /// A host's own answer to a package's build script: what the script prints (`cargo:` lines) and
 /// writes to its OUT_DIR, from the code the script shares, without running it. Its cfg lines and
 /// OUT_DIR files key the crate as a run script's output does (crate_image Record: cfg, files).
+/// It answers only the package whose script reads as the host's: another version of the package (a
+/// registry copy, an older checkout) or an edited script runs its own.
 pub struct ScriptAnswer {
     pub package: &'static str,
+    /// the files the answer stands for, by their path from the script's folder (the script
+    /// itself, the files it includes), with the text the host was built from
+    pub sources: &'static [(&'static str, &'static str)],
     pub answer: fn(&ScriptEnv) -> Result<Vec<String>, String>,
 }
 
-/// What the script would be given: cargo's build-script environment (CARGO_CFG_*, TARGET, ..),
-/// the target triple and its OUT_DIR (made, empty or as the last answer left it).
+/// What the script would be given: the environment a run of it would see (`answer_env`), the
+/// target triple and its OUT_DIR (made, empty or as the last answer left it).
 pub struct ScriptEnv<'a> {
     pub env: &'a [(String, String)],
     pub target: &'a str,
@@ -580,8 +585,29 @@ pub fn register_script_answer(a: &'static ScriptAnswer) {
     v.push(a);
 }
 
-fn script_answer(pkg: &str) -> Option<&'static ScriptAnswer> {
-    SCRIPT_ANSWERS.lock().unwrap().iter().copied().find(|a| a.package == pkg)
+/// The host's answer to `pkg`'s script `bs`, when the script's files read as the answer's sources.
+fn script_answer(pkg: &str, bs: &BuildScript) -> Option<&'static ScriptAnswer> {
+    let a = SCRIPT_ANSWERS.lock().unwrap().iter().copied().find(|a| a.package == pkg)?;
+    let folder = std::path::Path::new(&bs.src_path).parent()?;
+    a.sources.iter().all(|(path, text)| crate::vfs::read_to_string(folder.join(path)).is_ok_and(|t| t == *text)).then_some(a)
+}
+
+/// The environment a run of the build script of package `pname` (folder `dir`, version `ver`)
+/// would see (run_one): cargo's variables for the package, its features and the target first,
+/// then cargo's `[env]` configuration, then this process's environment.
+fn answer_env(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, dir: &str, pname: &str, ver: &str) -> Vec<(String, String)> {
+    let mut env = crate::cfg::CfgSet::host(sess, &[]).build_script_env();
+    env.extend(pkg_env(dir, pname, ver));
+    env.push(("TARGET".to_string(), target_triple(sess).to_string()));
+    env.push(("HOST".to_string(), host_triple(sess).to_string()));
+    env.extend(bs.features.iter().map(|f| (format!("CARGO_FEATURE_{}", f.to_uppercase().replace('-', "_")), "1".to_string())));
+    let process = std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
+    for (k, v) in crate::crates::config_env().into_iter().chain(process) {
+        if !env.iter().any(|(n, _)| *n == k) {
+            env.push((k, v));
+        }
+    }
+    env
 }
 
 /// Packages whose build script ran although it is to be removed: (package, script path).
@@ -936,7 +962,7 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
             meta.lock().unwrap().insert(i, Err(C_NOT_RUN.to_string()));
             continue;
         }
-        let (dir, pname, _) = &g.pkg[bs.krate];
+        let (dir, pname, ver) = &g.pkg[bs.krate];
         let name = &g.crates[bs.krate].name;
         let role = if noop::script(bs, &g.raw) {
             if sess.runtime.profile {
@@ -980,7 +1006,7 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
             }
             ScriptRole::Native(a) => {
                 let out_dir = format!("{}/out", root.take(&format!("{}-answered", name)));
-                let env: Vec<(String, String)> = crate::cfg::CfgSet::host(sess, &[]).build_script_env();
+                let env = answer_env(sess, bs, dir, pname, ver);
                 let r = std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {}", out_dir, e))
                     .and_then(|_| (a.answer)(&ScriptEnv { env: &env, target: target_triple(sess), out_dir: std::path::Path::new(&out_dir) }));
                 done(i, r.map(|l| l.join("\n")), out_dir);
