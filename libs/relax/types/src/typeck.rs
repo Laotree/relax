@@ -6122,6 +6122,16 @@ impl<'a> Fcx<'a> {
                 // N:rustc_hir_typeck/src/expr.rs:1823 and fn_ctxt/_impl.rs:1293-1301:
                 // obligations belong to the instantiated path, including explicit args.
                 self.register_wf(adt_ty, lo);
+                // fn_ctxt/mod.rs check_struct_path, add_required_obligations_for_hir: the ADT's own
+                // predicates on the path's arguments, `S: Sized` of `Kind<S>` among them. A pending
+                // `?S: Sized` is what lets the closure in `Kind { get: |s| s }` unsize `&mut ?S` to
+                // `&mut dyn Tr` once `?S` is known, instead of taking `?S = dyn Tr` (relax issue 201).
+                if let TyKind::Adt(ad, args, regions) = self.tcx.tys.kind(self.shallow(adt_ty)).clone() {
+                    if crate::wfcheck::obligations::arity_ok(self.tcx, self.prog, adt_ty) {
+                        let full = self.tcx.complete_args(self.prog, ad, &self.tcx.tys.list(args).to_vec(), regions);
+                        self.apply_fn_bounds(ad, &full, lo);
+                    }
+                }
                 // an unsized expectation (`Wrap<dyn Debug>` for `Box::new(Wrap { .. })`) is no
                 // type to check against (rustc only_has_type of ExpectRvalueLikeUnsized)
                 if let Some(x) = expected {
@@ -7334,8 +7344,11 @@ impl<'a> Fcx<'a> {
         self.loops = save_loops;
         self.in_loop_condition = save_condition;
         self.coerce_or_unify(bt, rt, Some(body), self.ast().expr(body).lo);
-        // a coerced body keeps its own type: lowering converts it to the return type
-        if !self.b.coerce(body.0).is_some() {
+        // a coerced body keeps its own type: lowering converts it to the return type. So does one
+        // whose pointer-to-dyn coercion waits for its pointee (`|s| s` returning `&mut dyn Tr` for
+        // a `&mut ?S`): typed as the return type, its thin value was lowered as a fat one (relax
+        // issue 202).
+        if self.b.coerce(body.0).is_none() && !self.deferred_dyn.iter().any(|&(x, ..)| x.0 == body.0) {
             self.set_ty(body, rt);
         }
         self.ret_stack.pop();
