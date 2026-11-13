@@ -21,6 +21,14 @@ pub fn link(loader: &Path, name: &str) -> Result<PathBuf, String> {
     let root = crate::dirs::relax_dir().join("exe");
     sweep(&root);
     let dir = root.join(std::process::id().to_string());
+    // an exec of the program's own executable is this process going on (its pid) in a new image,
+    // which runs from the link in this folder: that link is its own executable still (removing
+    // the folder took the file it runs from, the new link found no loader, and a spawn of
+    // current_exe() failed: not found, 11-13)
+    if dir.canonicalize().is_ok_and(|d| loader.starts_with(d)) {
+        let _ = OWN_DIR.set(dir);
+        return Ok(loader.to_path_buf());
+    }
     // a folder under this pid is a gone process's (pids are reused)
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
