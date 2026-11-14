@@ -4304,9 +4304,10 @@ impl Cache {
         let old: HashSet<&[u8]> = self.manifest.iter().map(|b| b.as_slice()).collect();
         let new = list.iter().filter(|b| !old.contains(b.0.as_slice())).count();
         // the same start as before (within 2%), the loaded manifest still valid and its image
-        // current (within 2%, and covering all but 2% of its cached slots): no new one
+        // current (within 2%, covering all but 2% of its cached slots, and at most 2% of its slots
+        // ones no call reached while its window was open: jit::startup_set_called): no new one
         let image_current = !self.image_rewrite
-            && (self.image_slots == 0 || ((self.image_stale + (self.stats.rewrite_why[0] + self.stats.rewrite_why[1]) as usize) * 50 <= self.image_slots && self.image_slots * 50 >= self.manifest_present_cached * 49));
+            && (self.image_slots == 0 || ((self.image_stale + (self.stats.rewrite_why[0] + self.stats.rewrite_why[1]) as usize) * 50 <= self.image_slots && self.image_slots * 50 >= self.manifest_present_cached * 49 && crate::jit::not_called_at_present() * 50 <= self.image_slots));
         if self.startup_manifest_valid() && new * 50 <= list.len() && image_current {
             self.manifest_done = true; self.manifest_len = order.len();
             return true;

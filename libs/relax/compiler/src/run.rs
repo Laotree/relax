@@ -4856,7 +4856,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         let again = jit::QUIT_SEEN.load(Ordering::Relaxed) && MID_MANIFEST_DONE.load(Ordering::Relaxed) && u.start_order.len() > MID_MANIFEST_LEN.load(Ordering::Relaxed);
         if u.cache.is_some() && jit::started() && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed) && (!MID_MANIFEST_DONE.swap(true, Ordering::Relaxed) || again) {
             MID_MANIFEST_LEN.store(u.start_order.len(), Ordering::Relaxed);
-            let (order, present) = jit::manifest_order(u.start_order.clone(), jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed));
+            let (order, present) = jit::manifest_order(&*u, u.start_order.clone(), jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed));
             let mut cache = u.cache.take();
             if let Some(c) = cache.as_mut() {
                 // a waiting request (a frame's lazy compile, a live patch, a back end's Job) goes
@@ -5086,7 +5086,8 @@ fn summary_inner(why: &str) {
             let u = unsafe { &mut *up };
             jit::record_queued_at_exit(u);
             u.flush_cache_records();
-            let (order, present) = jit::manifest_order(std::mem::take(&mut u.start_order), jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed));
+            let order = std::mem::take(&mut u.start_order);
+            let (order, present) = jit::manifest_order(&*u, order, jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed));
             let mut cache = u.cache.take();
             if let Some(c) = cache.as_mut() {
                 c.record_manifest(u, crate::layout::root_crate(), &order, present, &|| false);

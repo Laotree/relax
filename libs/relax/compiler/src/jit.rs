@@ -1666,6 +1666,86 @@ pub static ORDER_UNTIL_NS: AtomicU64 = AtomicU64::new(0);
 /// How many of those installs came while the startup image's window was open (the first present
 /// and the frame after it: postframe::image_window_open): the next start prelinks them.
 pub static ORDER_PRESENT_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The counted slots this run's startup image installed ahead of any call (prelink_startup).
+static PRELINKED_AHEAD: relax_session::sync::Mutex<Vec<u32>> = relax_session::sync::Mutex::new(Vec::new());
+/// Those of them no call had reached when the startup image's window closed (taken by the next
+/// tick, or by the manifest's first write when no tick took it): startup_set_called.
+static NOT_CALLED_AT_PRESENT: relax_session::sync::Mutex<Option<Vec<u32>>> = relax_session::sync::Mutex::new(None);
+static NOT_CALLED_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// Slot `id`, armed by the startup image (PRELINKED_AHEAD), has not been called since: its count
+/// record is still as arm_counters left it. Every call reaches a slot through its thunk, which
+/// jumps where the table word points (calls.DESIGN.md; a fn pointer or vtable entry is the thunk
+/// too), and the armed word is the count stub, whose calls spend the record's budget; calls
+/// between image slots included. A slot in another tier state (queued, final, never armed) counts
+/// as called. Atomics only.
+unsafe fn not_called_since_armed(u: &Unit, id: u32) -> bool {
+    let Some(threshold) = u.tier1.as_ref().map(|t| t.threshold) else { return false };
+    let rec = tier_rec(&u.slots, id);
+    (*rec.add(3)).load(Ordering::Acquire) == T_COUNTING && (*rec.add(9)).load(Ordering::Acquire) == 0 && (*rec).load(Ordering::Relaxed) == tier_refill(threshold, 0)
+}
+
+/// The slots the startup image installed ahead that no call has reached (yet): add_called follows
+/// call edges to called slots only.
+pub(crate) fn prelinked_not_called(u: &Unit) -> crate::fxhash::HashSet<u32> {
+    let ids = PRELINKED_AHEAD.lock().unwrap_or_else(|e| e.into_inner());
+    ids.iter().copied().filter(|&id| unsafe { not_called_since_armed(u, id) }).collect()
+}
+
+/// NOT_CALLED_AT_PRESENT, once the startup image's window has closed (run_tick: atomics and the
+/// two locks; a brief pass over the image's slots, once per run).
+fn note_startup_calls() {
+    if NOT_CALLED_TAKEN.load(Ordering::Relaxed) || !FIRST_PRESENT.load(Ordering::Acquire) || crate::postframe::image_window_open() {
+        return;
+    }
+    let up = TIER_UNIT.load(Ordering::Acquire);
+    if up.is_null() {
+        return;
+    }
+    take_not_called(unsafe { &*up });
+}
+
+/// How many of the slots the startup image installed ahead no call reached while its window was
+/// open (0 until known): the image is rewritten when they are more than a few.
+pub(crate) fn not_called_at_present() -> usize {
+    NOT_CALLED_AT_PRESENT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |v| v.len())
+}
+
+fn take_not_called(u: &Unit) {
+    let mut out = NOT_CALLED_AT_PRESENT.lock().unwrap_or_else(|e| e.into_inner());
+    if out.is_none() {
+        let ids = PRELINKED_AHEAD.lock().unwrap_or_else(|e| e.into_inner());
+        *out = Some(crate::zone_alloc::kept_with(|| ids.iter().copied().filter(|&id| unsafe { not_called_since_armed(u, id) }).collect()));
+        NOT_CALLED_TAKEN.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The startup set takes the slots that were called while the startup image's window was open. A
+/// slot the image installed ahead is one of them only when a call reached it by the time the window
+/// closed (not_called_since_armed): every slot of an image, called or not, used to be a startup
+/// slot of the next one, so an image only grew (the callees add_called puts in became startup slots
+/// in turn, and theirs after them) and its prelink before main with it. One called later goes
+/// behind the startup set, as a later first install would; one never called is left out.
+fn startup_set_called(u: &Unit, order: Vec<u32>, present: usize) -> (Vec<u32>, usize) {
+    take_not_called(u);
+    let late: crate::fxhash::HashSet<u32> = NOT_CALLED_AT_PRESENT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or_else(Default::default, |v| v.iter().copied().collect());
+    if late.is_empty() {
+        return (order, present);
+    }
+    let mut out = Vec::with_capacity(order.len());
+    let mut later = Vec::new();
+    for &id in &order[..present] {
+        if !late.contains(&id) {
+            out.push(id);
+        } else if !unsafe { not_called_since_armed(u, id) } {
+            later.push(id);
+        }
+    }
+    let n = out.len();
+    out.extend(later);
+    out.extend_from_slice(&order[present..]);
+    (out, n)
+}
 
 /// Queues the previous run's startup manifest (disk cache) for the speculative workers, in the
 /// order that run installed the slots: they link the cached code ahead of the main thread.
@@ -1736,7 +1816,8 @@ unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, 
         note_linked_provisional(up, s.id, level);
     }
     let u = &mut *up;
-    // the startup set of the next manifest (install_compiled's rule: before the first present)
+    // the startup set of the next manifest (install_compiled's rule: before the first present;
+    // startup_set_called keeps it there only if a call reaches it while the image's window is open)
     if u.fns[s.id as usize].patch_gen == 0 && (!FIRST_PRESENT.load(Ordering::Acquire) || wall_ns() < ORDER_UNTIL_NS.load(Ordering::Relaxed)) {
         crate::zone_alloc::kept_with(|| u.start_order.push(s.id));
         if crate::postframe::image_window_open() {
@@ -1807,6 +1888,8 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
                 install_prelinked_slot(up, s, gandalf, &mut notes, &mut arm, &mut verdicts);
             }
             (&mut *up).arm_counters(&arm);
+            // (a call reaches each through its count stub: startup_set_called reads which were called)
+            crate::zone_alloc::kept_with(|| PRELINKED_AHEAD.lock().unwrap_or_else(|e| e.into_inner()).extend(arm.iter().map(|a| a.0)));
             for (id, v, base) in verdicts {
                 stored_tier_verdict(&*up, id, v, base);
             }
@@ -30965,9 +31048,12 @@ pub(crate) fn realtime_vtable(addr: u64, name: &str) {
 }
 
 /// The startup manifest's order (cache.rs record_manifest) and its before-present length: the
-/// real-time set goes before the first present, so the next run's startup image links it
-/// before main (a device opened right after the first frame finds its code installed).
-pub fn manifest_order(order: Vec<u32>, present: usize) -> (Vec<u32>, usize) {
+/// slots called before the present (startup_set_called), and the real-time set before the first
+/// present too, so the next run's startup image links it before main (a device opened right after
+/// the first frame finds its code installed).
+pub fn manifest_order(u: &Unit, order: Vec<u32>, present: usize) -> (Vec<u32>, usize) {
+    let present = present.min(order.len());
+    let (order, present) = startup_set_called(u, order, present);
     let set = REALTIME.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|r| r.set.clone()).unwrap_or_default();
     if set.is_empty() {
         return (order, present);
@@ -31425,6 +31511,7 @@ fn run_tick() {
     queue::cleanup_ahead();
     drain_slow_base();
     settle_tier_tick();
+    note_startup_calls();
     if records_due() { drain_records_bounded(); }
     o2_offer_hottest();
     let now = w0_activity();
@@ -31455,6 +31542,9 @@ pub(crate) unsafe fn reset_statics() {
     reset(&QUIT_SEEN, AtomicBool::new(false));
     reset(&ORDER_UNTIL_NS, AtomicU64::new(0));
     reset(&ORDER_PRESENT_LEN, std::sync::atomic::AtomicUsize::new(0));
+    reset(&PRELINKED_AHEAD, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&NOT_CALLED_AT_PRESENT, relax_session::sync::Mutex::new(None));
+    reset(&NOT_CALLED_TAKEN, AtomicBool::new(false));
     reset(&TIER1_PANICS, AtomicU64::new(0));
     reset(&O3_OPT_PANICS, [AtomicU64::new(0), AtomicU64::new(0)]);
     reset(&O3_OPT_PANICKED, relax_session::sync::Mutex::new(std::collections::BTreeSet::new()));

@@ -361,7 +361,7 @@ impl Cache {
     }
 
     /// build_image: appends to `chosen` the slots its code calls (call and slot-word relocations,
-    /// transitively) that ran this session and have an image entry.
+    /// transitively) that were called this session and have an image entry.
     fn add_called(&mut self, u: &Unit, chosen: &mut Vec<(u32, u128, Vec<u32>)>, pend: &HashMap<u128, usize>, stop: &dyn Fn() -> bool) -> Result<(), ()> {
         let mut by_bytes: HashMap<Vec<u8>, u32> = HashMap::with_capacity(self.fnkey_bytes.len());
         for (n, (&id, b)) in self.fnkey_bytes.iter().enumerate() {
@@ -375,9 +375,13 @@ impl Cache {
         }
         if stop() { return Err(()); }
         let mut have: HashSet<u32> = chosen.iter().map(|c| c.0).collect();
+        // called: compiled at a call (a speculative build is installed at its first call), and not
+        // a slot the startup image put in that no call reached since. A slot only inlined into
+        // other code was not called, and neither were the calls to it in the code taken here.
+        let not_called = crate::jit::prelinked_not_called(u);
         let ran = |c: u32| {
             let f = &u.fns[c as usize];
-            (f.compiled && f.spec_state != 1) || !f.history().inlined_into.is_empty()
+            f.compiled && f.spec_state != 1 && !not_called.contains(&c)
         };
         let mut i = 0;
         let mut added = 0;
