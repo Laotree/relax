@@ -2544,6 +2544,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&TLS_OFF, std::sync::atomic::AtomicU32::new(0));
     reset(&DEAD, Mutex::new(Vec::new()));
     reset(&ARENAS, [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; MAX_MODULES]);
+    script::reset_statics();
 }
 
 #[cfg(test)]

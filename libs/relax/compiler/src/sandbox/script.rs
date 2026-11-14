@@ -259,6 +259,20 @@ fn end(code: i32) -> ! {
     std::process::exit(code)
 }
 
+/// A run's end in place: sandbox.rs `reset_statics` empties the arena table, so no confined
+/// script is left in this process, and nothing it was given or did (its arena, its environment's
+/// copies, its exit handlers, its broker with the folders it reaches and its open fds) may reach
+/// the next run.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&ARENA_BASE, std::sync::atomic::AtomicU64::new(0));
+    reset(&INTERNED, Mutex::new(Vec::new()));
+    reset(&EXITS, Mutex::new(Vec::new()));
+    reset(&EXITED, std::sync::atomic::AtomicBool::new(false));
+    #[cfg(unix)]
+    files::reset_statics();
+}
+
 // ------------------------------------------------------------------ files
 
 /// The file entries: paths go to the broker's walk (broker.rs), fds are the broker's table.
@@ -271,6 +285,11 @@ mod files {
 
     /// The broker of this process's confined script (one per child).
     pub(super) static BROKER: Mutex<Option<Broker>> = Mutex::new(None);
+
+    /// (script.rs `reset_statics`): the broker goes, its fds closed.
+    pub(super) unsafe fn reset_statics() {
+        relax_session::reset_static(&BROKER, Mutex::new(None));
+    }
 
     pub(super) fn entry(name: &str) -> Option<(&'static str, u64)> {
         macro_rules! e {
