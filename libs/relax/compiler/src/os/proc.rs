@@ -949,20 +949,43 @@ mod imp {
         (unsafe { GetModuleHandleExW(0x2, std::ptr::null(), &mut module) } != 0 && module != 0).then_some(module as usize)
     }
 
-    /// --allow-c's native library is not supported on Windows.
-    pub fn load_path(_path: &str) -> Result<usize, String> {
-        Err("--allow-c native libraries are not supported on Windows".into())
+    /// A library by its path (--allow-c's native library, a DLL), as dlopen loads one: the
+    /// DLLs it imports are searched in its own folder first (LOAD_WITH_ALTERED_SEARCH_PATH), as
+    /// an executable's are beside it. The error is the system's message. (Before, --allow-c
+    /// stopped here: "not supported on Windows", relax issue 165.)
+    pub fn load_path(path: &str) -> Result<usize, String> {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = std::ffi::OsStr::new(path).encode_wide().chain(Some(0)).collect();
+        let module = unsafe { LoadLibraryExW(wide.as_ptr(), 0, 0x8) };
+        if module != 0 {
+            return Ok(module as usize);
+        }
+        Err(std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32).to_string())
     }
 
-    pub fn symbol_in(_handle: usize, _name: &str) -> usize {
-        0
+    /// The export `name` of the library `handle` (load_path), 0 without one.
+    pub fn symbol_in(handle: usize, name: &str) -> usize {
+        let Ok(name) = std::ffi::CString::new(name) else { return 0 };
+        unsafe { GetProcAddress(handle as HANDLE, name.as_ptr().cast()) as usize }
     }
 
-    /// load_path takes no handle here.
-    pub fn unload(_handle: usize) {}
+    pub fn unload(handle: usize) {
+        unsafe {
+            FreeLibrary(handle as HANDLE);
+        }
+    }
 
-    pub fn image_of(_addr: usize) -> Option<(usize, std::path::PathBuf)> {
-        None
+    /// The image `addr` is in: its base and its file.
+    pub fn image_of(addr: usize) -> Option<(usize, std::path::PathBuf)> {
+        use std::os::windows::ffi::OsStringExt;
+        let mut module: HANDLE = 0;
+        // FROM_ADDRESS | UNCHANGED_REFCOUNT
+        if unsafe { GetModuleHandleExW(0x4 | 0x2, addr as *const u16, &mut module) } == 0 || module == 0 {
+            return None;
+        }
+        let mut name = vec![0u16; 32768];
+        let n = unsafe { GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32) } as usize;
+        (n > 0 && n < name.len()).then(|| (module as usize, std::path::PathBuf::from(std::ffi::OsString::from_wide(&name[..n]))))
     }
 
     /// `#[link(name = "user32")]` / raw-dylib `name = "DINPUT8"`: the DLL of that name.
@@ -1263,4 +1286,24 @@ pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     reset(&EMBEDDED_FAILURE, std::sync::atomic::AtomicI32::new(0));
     reset(&PROGRAM_ATEXIT, std::sync::Mutex::new(Vec::new()));
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    /// A library loaded by its path answers its exports and the image they are in, and one that
+    /// is not there says why (--allow-c's native library, relax issue 165).
+    #[test]
+    fn a_library_loaded_by_its_path_answers_its_exports_and_its_image() {
+        let system = format!("{}\\System32", std::env::var("SystemRoot").unwrap());
+        let handle = super::load_path(&format!("{system}\\version.dll")).unwrap();
+        let export = super::symbol_in(handle, "GetFileVersionInfoSizeW");
+        assert_ne!(export, 0, "the library's export");
+        assert_eq!(super::symbol_in(handle, "relax_no_such_export"), 0, "a name it does not export");
+        let (base, file) = super::image_of(export).unwrap();
+        assert_eq!(base, handle, "the export's image is the library");
+        assert!(file.to_string_lossy().to_ascii_lowercase().ends_with("\\version.dll"), "the image's file: {}", file.display());
+        super::unload(handle);
+        let missing = super::load_path(&format!("{system}\\relax-no-such-library.dll")).unwrap_err();
+        assert!(missing.contains("os error 126"), "the system's reason: {missing}");
+    }
 }

@@ -2975,8 +2975,8 @@ pub(crate) fn note_native_bundle(handle: usize, path: &str) {
     }
 }
 
-/// (tests) The native libraries noted so far.
-#[cfg(test)]
+/// (tests) The native libraries noted so far (reload_host's test of the next run, unix only).
+#[cfg(all(test, unix))]
 pub(crate) fn native_bundle_count() -> usize {
     NATIVE_BUNDLES.lock().unwrap_or_else(|e| e.into_inner()).len()
 }

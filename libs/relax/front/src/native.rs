@@ -441,7 +441,7 @@ fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
     names.dedup();
     let dir = format!("{}/native/{:016x}", req.relax_dir, h);
     let messages_path = format!("{}/messages.jsonl", dir);
-    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let ext = if cfg!(target_os = "macos") { "dylib" } else if cfg!(windows) { "dll" } else { "so" };
     let lib_path = format!("{}/libnative.{}", dir, ext);
     let fast_mark = format!("{}/fast", dir);
     Plan { script_pkgs, lib_pkgs, flags, names, key: h, selection, dir, messages_path, lib_path, fast_mark }
@@ -1236,6 +1236,10 @@ fn cargo_selection(flags: &[&String]) -> Vec<String> {
 /// is its own), on ELF every undefined one (`nm -D`; ELF records no providing library), the
 /// symbol version off.
 fn library_imports(lib: &str) -> Result<Vec<String>, String> {
+    // a DLL leaves no import open: its link bound each to a library or failed
+    if cfg!(windows) {
+        return Ok(Vec::new());
+    }
     let apple = cfg!(target_vendor = "apple");
     let mut nm = Command::new("nm");
     nm.args(if apple { ["-m", "-u"] } else { ["-D", "-u"] }).arg(lib);
@@ -1299,7 +1303,14 @@ fn link(lib_path: &str, out: &Outputs, triple: &str, resolvable: Resolvable) -> 
         compile_accessors(&symbols, &tmp, &addresses_path)?;
         cmd.arg(&addresses_path);
     } else {
-        cmd.args(["-shared", "-fPIC", "-o", &tmp]);
+        if cfg!(windows) {
+            // a DLL (mingw-w64's gcc and ld) that exports every global symbol of what it links,
+            // as an ELF library's dynamic table has them: the loader looks them up by name
+            // (GetProcAddress, os::proc symbol_in)
+            cmd.args(["-shared", "-o", &tmp, "-Wl,--export-all-symbols"]);
+        } else {
+            cmd.args(["-shared", "-fPIC", "-o", &tmp]);
+        }
         if cfg!(target_os = "linux") {
             // Prebuilt assembly archives may omit .note.GNU-stack. Like rustc's
             // ELF links, keep the stack non-executable instead of inheriting an
@@ -1390,7 +1401,11 @@ fn link(lib_path: &str, out: &Outputs, triple: &str, resolvable: Resolvable) -> 
         if out.status.success() {
             return Ok(());
         }
-        Err(format!("--allow-c: linking the native library failed ({} archive(s): {}):\n{}", archives.len(), archives.join(" "), String::from_utf8_lossy(&out.stderr)))
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // a DLL's link resolves every import: C calling a fn of the program has no stub to bind
+        // through here (library_imports)
+        let callbacks = if cfg!(windows) && stderr.contains("undefined reference") { "\n(on Windows, C code that calls back into the program's Rust is not supported yet)" } else { "" };
+        Err(format!("--allow-c: linking the native library failed ({} archive(s): {}):\n{stderr}{callbacks}", archives.len(), archives.join(" ")))
     };
     let mut linked = run(&mut cmd);
     // C code calling back into Rust (crate::native_stub): an import the link left that no library
