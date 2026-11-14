@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """A live test session answers each test's outcome, not only counts and failing names: run.py
-[/path/to/relax] (without one, from the workspace root: `cargo run --profile host` of relax).
+[/path/to/relax] (without one, from the workspace root: relax-runner's relax, built by cargo).
 Relax issue 131 (ported from makepad/relax PR 134).
 
 `makepad test --live live-test-results --lib -- --skip filtered`, found with `inspect list`:
@@ -24,7 +24,10 @@ import time
 if len(sys.argv) > 1:
     jit = [str(Path(sys.argv[1]).resolve())]
 else:
-    jit = ["cargo", "run", "--profile", "host", "-q", "--manifest-path", str(Path.cwd() / "Cargo.toml"), "-p", "relax-runner", "--bin", "relax", "--"]
+    # built once, here: a `cargo run` per call ran in the test's package, outside the workspace,
+    # without its .cargo/config.toml, so the first call built relax again with other flags (100 s)
+    sp.run(["cargo", "build", "--profile", "host", "-q", "-p", "relax-runner", "--bin", "relax"], check=True)
+    jit = [str((Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "host" / "relax").resolve())]
 here = Path(__file__).resolve().parent
 
 
