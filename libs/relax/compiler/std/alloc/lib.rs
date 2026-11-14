@@ -38,6 +38,7 @@ pub mod fmt {
         from_fn, write, Alignment, Arguments, Binary, Debug, DebugList, DebugMap, DebugSet, DebugStruct, DebugTuple, Display,
         Error, Formatter, FromFn, LowerExp, LowerHex, Octal, Pointer, Result, UpperExp, UpperHex, Write,
     };
+    pub use core::fmt::NumBuffer;
 }
 
 pub mod rc {
