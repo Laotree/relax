@@ -1907,6 +1907,19 @@ impl<'a> Fcx<'a> {
         None
     }
 
+    /// A `!` branch of an `if` or `match` is `NeverToAny` to the type the branches meet at; a type
+    /// variable it reaches is diverging (rustc fn_ctxt apply_adjustments), so `match Err(e) { Ok(v)
+    /// => v, Err(e) => return Err(e) }` falls back instead of leaving `Ok`'s type unknown
+    fn never_to_any(&mut self, e: Option<ExprId>, target: TyId) {
+        if let Some(e) = e {
+            self.set_coerce(e.0, Coerce::Never, target);
+        }
+        let s = self.shallow(target);
+        if matches!(self.tcx.tys.kind(s), TyKind::Infer(_)) {
+            self.diverging.push(s);
+        }
+    }
+
     /// A diverging scrutinee (`match return 1 { 2 => .. }`): rustc types it against a fresh
     /// variable (demand_scrutinee_type), so `!` reaches the patterns as NeverToAny to that
     /// variable, which falls back like any diverging one.
@@ -5402,11 +5415,12 @@ impl<'a> Fcx<'a> {
                         let es = self.shallow(et);
                         if ts == self.tcx.tys.never {
                             // the `!` then-branch is `NeverToAny` to the else type
-                            if let Some(crate::ast::Stmt::Expr(false, t2)) = self.ast().stmts(*then).last() { self.set_coerce(t2.0, Coerce::Never, et); }
+                            let tail = match self.ast().stmts(*then).last() { Some(crate::ast::Stmt::Expr(false, t2)) => Some(*t2), _ => None };
+                            self.never_to_any(tail, et);
                             return et;
                         }
                         if es == self.tcx.tys.never {
-                            self.set_coerce(x.0, Coerce::Never, tt);
+                            self.never_to_any(Some(*x), tt);
                             return tt;
                         }
                         // the then-branch's value is its block's tail expression
@@ -5514,7 +5528,7 @@ impl<'a> Fcx<'a> {
                 self.diverges = all_div;
                 // coercion.rs CoerceMany: a `!` arm is `NeverToAny` to the match's type
                 if let (true, Some(r)) = (any_value, result) {
-                    for body in never_arms { self.set_coerce(body.0, Coerce::Never, r); }
+                    for body in never_arms { self.never_to_any(Some(body), r); }
                 }
                 match result {
                     Some(r) if any_value => r,
