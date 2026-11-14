@@ -2346,6 +2346,21 @@ pub struct Units {
     pub roots: Vec<usize>,
     /// binary target names of the root package when building integration tests (`CARGO_BIN_EXE_<name>`)
     pub bins: Vec<String>,
+    /// a build script's units: its parent confined its run, with these folders (`relax_script`)
+    pub script: Option<ScriptFolders>,
+}
+
+/// The folders of a confined build script's run, as its parent names them (relax-front
+/// unitgraph.rs `script_units`): a store's or a folder mount's path stays virtual. OUT_DIR, the
+/// one it writes, is its environment's.
+#[derive(Clone, Debug, Default)]
+pub struct ScriptFolders {
+    /// its package's source root, which it reads
+    pub read: Vec<String>,
+    /// folders it never reaches (the run's target folder, Relax's dir)
+    pub excluded: Vec<String>,
+    /// its current folder at the start (its package's)
+    pub cwd: String,
 }
 
 impl Units {
@@ -2393,7 +2408,8 @@ impl Units {
             pending.extend(units[i].deps.iter().map(|d| d.0));
         }
         let roots = j.get("roots").map(|r| r.arr().iter().map(|x| x.num() as usize).collect()).unwrap_or_default();
-        Ok(Units { units, roots, bins: Vec::new() })
+        let script = j.get("relax_script").map(|r| ScriptFolders { read: list(r.get("read")), excluded: list(r.get("excluded")), cwd: s(r.get("cwd")) });
+        Ok(Units { units, roots, bins: Vec::new(), script })
     }
 }
 
@@ -3010,7 +3026,7 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
                 if u.host { "host" } else { "target" }, u.name, u.mode, u.features.join(","), deps.join(","));
         }
     }
-    Ok(Units { units: out, roots, bins })
+    Ok(Units { units: out, roots, bins, script: None })
 }
 
 #[cfg(test)]

@@ -801,6 +801,11 @@ pub fn given_value(name: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Whether this run was handed a build script's given names (`SCRIPT_ENV`): its parent confined it.
+pub fn script_env_handed() -> bool {
+    GIVEN.get().is_some()
+}
+
 /// A confined build script's whole environment (`given_value` of each given name that is set), in
 /// the wire form (`encode`, every entry set).
 pub fn given_wire() -> Vec<u8> {

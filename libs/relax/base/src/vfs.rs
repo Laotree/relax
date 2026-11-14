@@ -582,6 +582,11 @@ pub fn store_read(path: &str) -> Option<io::Result<Vec<u8>>> {
     })
 }
 
+/// The root of the store mount `path` lies under (a git package's repository).
+pub fn store_root(path: &str) -> Option<String> {
+    find(path).map(|(m, _)| m.root.clone())
+}
+
 /// A store folder's entries (name, is folder).
 pub fn store_list(path: &str) -> Option<io::Result<Vec<(String, bool)>>> {
     let (m, rel) = find(path)?;

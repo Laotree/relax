@@ -581,7 +581,7 @@ fn merged_host_units_keep_features_and_dependencies() {
         unit("target_helper", "lib", false, &[], &[]),
         unit("shared", "lib", true, &["full", "visit"], &[(5, "host_helper")]),
         unit("host_helper", "lib", true, &["walk"], &[]),
-    ], roots: vec![0], bins: Vec::new() };
+    ], roots: vec![0], bins: Vec::new(), script: None };
     let mut g = crate::unitgraph::load(&units, false).unwrap();
     let sess = &std::sync::Arc::new(crate::Session::default());
     let saved = REG.with(|r| r.borrow_mut().take());
@@ -664,7 +664,7 @@ fn a_crate_only_a_build_script_links_is_no_root_of_the_app() {
         unit("codegen", "lib", "build", "src/lib.rs", true, &[], &[(5, "generator")]),
         unit("generator", "lib", "build", "src/lib.rs", true, &[], &[(6, "rand")]),
         unit("rand", "lib", "build", "src/lib.rs", true, &["small_rng", "std"], &[]),
-    ], roots: vec![0], bins: Vec::new() };
+    ], roots: vec![0], bins: Vec::new(), script: None };
     let mut g = crate::unitgraph::load(&units, false).unwrap();
     let sess = &std::sync::Arc::new(crate::Session::default());
     let saved = REG.with(|r| r.borrow_mut().take());

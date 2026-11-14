@@ -56,6 +56,7 @@ fn entry(name: &str) -> Option<(&'static str, u64)> {
 }
 
 /// The folders a confined script reaches, as its parent gives them (absolute paths).
+#[derive(Default)]
 pub struct Roots {
     /// folders it reads (its package's source)
     pub read: Vec<Vec<u8>>,
@@ -65,8 +66,51 @@ pub struct Roots {
     pub excluded: Vec<Vec<u8>>,
     /// store folders of Relax's VFS it reads (a git package's source; virtual paths)
     pub store: Vec<Vec<u8>>,
+    /// another spelling of a folder of `read`: (spelling, folder) (a folder mount's virtual path
+    /// of its disk folder)
+    pub alias: Vec<(Vec<u8>, Vec<u8>)>,
     /// its current folder at the start (the manifest folder, as cargo starts a script)
     pub cwd: Vec<u8>,
+}
+
+/// A confined script's folders from what its parent named (relax-base resolve.rs `ScriptFolders`)
+/// and OUT_DIR, the one it writes (its environment's): a store mount's path is a store folder, a
+/// folder mount's path its disk folder under both spellings, any other path a disk folder.
+pub fn roots_of(f: &relax_base::resolve::ScriptFolders) -> Result<Roots, String> {
+    let out = std::env::var_os("OUT_DIR").filter(|o| !o.is_empty()).ok_or("its parent gave it no OUT_DIR")?;
+    let bytes = |s: &str| s.as_bytes().to_vec();
+    let mut r = Roots { write: vec![out.into_encoded_bytes()], ..Default::default() };
+    for p in &f.read {
+        if crate::vfs::in_store(p) {
+            r.store.push(bytes(p));
+            continue;
+        }
+        let disk = crate::vfs::on_disk(p).into_owned();
+        if disk != *p {
+            r.alias.push((bytes(p), bytes(&disk)));
+        }
+        r.read.push(bytes(&disk));
+    }
+    r.excluded = f.excluded.iter().map(|p| bytes(&crate::vfs::on_disk(p))).collect();
+    r.cwd = bytes(&crate::vfs::on_disk(&f.cwd));
+    Ok(r)
+}
+
+/// What the script asked for and was refused (broker.rs `withhold`), said when it failed or under
+/// RELAX_VERBOSE: a script that probes and takes its fallback says nothing.
+fn say_withheld(code: i32) {
+    #[cfg(unix)]
+    {
+        if code == 0 && std::env::var_os("RELAX_VERBOSE").is_none() {
+            return;
+        }
+        let list = files::BROKER.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|b| b.withheld()).unwrap_or_default();
+        if !list.is_empty() {
+            eprintln!("relax: the confined build script was refused: {}", list.join(", "));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = code;
 }
 
 const ENAMETOOLONG: i32 = if cfg!(target_vendor = "apple") { 63 } else { 36 };
@@ -206,6 +250,7 @@ extern "C" fn sc_exit(code: i32) {
 
 /// The run's end as an exit ends it (jit.rs `recorded_exit`).
 fn end(code: i32) -> ! {
+    say_withheld(code);
     #[cfg(unix)]
     if let Some(f) = crate::jit::loader_symbol(b"exit") {
         let f: extern "C" fn(i32) -> ! = unsafe { std::mem::transmute(f) };
@@ -817,16 +862,23 @@ mod files {
 
     extern "C" fn sc_tool_spawn(argv: u64, len: u64, stdin: i64, stdout: i64, stderr: i64, plain: i32) -> u64 {
         use crate::tool::TOOL_REFUSED;
-        if plain == 0 {
-            return TOOL_REFUSED;
-        }
         let Ok(a) = buf(argv, len) else { return TOOL_REFUSED };
         let bytes = {
             let _safe = crate::jit::FaultSafe::enter();
             unsafe { std::slice::from_raw_parts(a as *const u8, len as usize) }.to_vec()
         };
-        let Some(rustc) = relax_base::progenv::given_value(b"RUSTC") else { return TOOL_REFUSED };
-        let Some(args) = crate::tool::words(&bytes).and_then(|w| crate::tool::confined_question(&w, &rustc)) else { return TOOL_REFUSED };
+        let words = crate::tool::words(&bytes);
+        // (said in the withheld report: the program it named)
+        let refuse = || {
+            let program = words.as_ref().and_then(|w| w.first()).map_or(&b"a program"[..], |p| p.as_slice());
+            let _ = with(|b| Ok(b.withhold("run", program, 0)));
+            TOOL_REFUSED
+        };
+        if plain == 0 {
+            return refuse();
+        }
+        let Some(rustc) = relax_base::progenv::given_value(b"RUSTC") else { return refuse() };
+        let Some(args) = words.as_deref().and_then(|w| crate::tool::confined_question(w, &rustc)) else { return refuse() };
         let (Some(i), Some(o), Some(e)) = (child_end(stdin, 0), child_end(stdout, 1), child_end(stderr, 2)) else { return TOOL_REFUSED };
         // (0 would tell std to start a process: an answer that cannot start is refused)
         match crate::tool::start(args, i, o, e) {
@@ -993,6 +1045,7 @@ pub unsafe fn run_main(up: *mut Unit, root: u32, main_def: DefId, roots: &Roots)
     };
     run_exit_handlers();
     leave();
+    say_withheld(code);
     code
 }
 

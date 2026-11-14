@@ -282,6 +282,9 @@ pub(crate) struct Broker {
     dirs: Vec<Option<(usize, u64)>>,
     /// the null device as the host's fd (a Null fd's stat, and handed to a process: script.rs)
     pub(crate) null: OwnedFd,
+    /// what the script asked for and was refused, once each (`withhold`): "read <path>",
+    /// "write <path>", "run <program>"
+    withheld: std::cell::RefCell<Vec<String>>,
 }
 
 fn host_open(path: &[u8], flags: c_int) -> Result<OwnedFd, String> {
@@ -319,6 +322,12 @@ impl Broker {
                 if given != canon {
                     names.push(given);
                 }
+                // another spelling of the folder (a folder mount's virtual path)
+                for (spelling, folder) in &spec.alias {
+                    if folder == p && !names.contains(&components(spelling)) {
+                        names.push(components(spelling));
+                    }
+                }
                 roots.push(Root { fd, write, names, canon });
             }
         }
@@ -331,7 +340,7 @@ impl Broker {
         }
         let null = host_open(b"/dev/null", c::O_RDWR).map_err(|e| say(b"/dev/null", e))?;
         let stores = spec.store.iter().map(|p| crate::vfs::normalize_path(&String::from_utf8_lossy(p))).collect();
-        let mut b = Broker { roots, excluded, stores, cwd: None, virtual_cwd: None, fds: vec![Some(Fd::Null), Some(Fd::Std(1)), Some(Fd::Std(2))], dirs: Vec::new(), null };
+        let mut b = Broker { roots, excluded, stores, cwd: None, virtual_cwd: None, fds: vec![Some(Fd::Null), Some(Fd::Std(1)), Some(Fd::Std(2))], dirs: Vec::new(), null, withheld: Default::default() };
         if b.roots.is_empty() {
             return Err("the confined build script has no folders".into());
         }
@@ -361,6 +370,21 @@ impl Broker {
 
     fn excluded(&self, st: &Stat) -> bool {
         st.is_dir() && self.excluded.contains(&st.id())
+    }
+
+    /// Records a refusal (`what` and the path or program the script named) and gives its errno.
+    pub(crate) fn withhold(&self, what: &str, name: &[u8], errno: i32) -> i32 {
+        let line = format!("{what} {}", String::from_utf8_lossy(name));
+        let mut w = self.withheld.borrow_mut();
+        if !w.contains(&line) {
+            w.push(line);
+        }
+        errno
+    }
+
+    /// What the script was refused, in the order it asked.
+    pub(crate) fn withheld(&self) -> Vec<String> {
+        self.withheld.borrow().clone()
     }
 
     /// The longest root spelling that continues `at` with the next components of `todo` (up to
@@ -394,11 +418,12 @@ impl Broker {
         if path.is_empty() {
             return Err(c::ENOENT);
         }
+        let what = if write { "write" } else { "read" };
         let outside = if write { c::EACCES } else { c::ENOENT };
         let want_dir = path.ends_with(b"/") || path.ends_with(b"/.");
         let mut todo: std::collections::VecDeque<Vec<u8>> = components(path).into();
         if path[0] != b'/' {
-            let Some((r, below)) = &self.cwd else { return Err(outside) };
+            let Some((r, below)) = &self.cwd else { return Err(self.withhold(what, path, outside)) };
             for c in self.roots[*r].canon.iter().chain(below.iter()).rev() {
                 todo.push_front(c.clone());
             }
@@ -437,7 +462,7 @@ impl Broker {
                 At::Out(l) => {
                     // outside every root and none ahead: only a `..` could lead back into one
                     if !todo.iter().any(|c| c == b"..") {
-                        return Err(outside);
+                        return Err(self.withhold(what, path, outside));
                     }
                     l.push(comp);
                     continue;
@@ -484,7 +509,7 @@ impl Broker {
                 continue;
             }
             if self.excluded(&st) {
-                return Err(c::ENOENT);
+                return Err(self.withhold(what, path, c::ENOENT));
             }
             if last {
                 if want_dir && !st.is_dir() {
@@ -506,13 +531,13 @@ impl Broker {
             let fd = unsafe { OwnedFd::from_raw_fd(fd) };
             // (the folder it opened, whatever happened since the fstatat)
             if self.excluded(&fstat_fd(fd.as_raw_fd())?) {
-                return Err(c::ENOENT);
+                return Err(self.withhold(what, path, c::ENOENT));
             }
             stack.push(fd);
             below.push(comp);
         }
         match at {
-            At::Out(_) => Err(outside),
+            At::Out(_) => Err(self.withhold(what, path, outside)),
             At::In { root, below, mut stack } => {
                 let dir = match stack.pop() {
                     Some(f) => DirFd::Own(f),
@@ -528,7 +553,7 @@ impl Broker {
     fn walk_to_change(&self, path: &[u8], follow: bool) -> Result<Found, i32> {
         let f = self.walk(path, follow, true)?;
         if !self.roots[f.root].write {
-            return Err(c::EACCES);
+            return Err(self.withhold("write", path, c::EACCES));
         }
         if f.name.is_none() {
             return Err(c::EBUSY);
@@ -552,7 +577,7 @@ impl Broker {
         let f = self.walk(path, follow, writes)?;
         let write = self.roots[f.root].write;
         if writes && !write {
-            return Err(c::EACCES);
+            return Err(self.withhold("write", path, c::EACCES));
         }
         if f.name.is_none() && writes {
             return Err(if creates && flags & c::O_EXCL != 0 { c::EEXIST } else { c::EISDIR });
@@ -581,7 +606,7 @@ impl Broker {
             return Err(c::EEXIST);
         }
         if !self.roots[f.root].write {
-            return Err(c::EACCES);
+            return Err(self.withhold("write", path, c::EACCES));
         }
         if unsafe { mkdirat(f.dir.raw(), f.at_name().as_ptr(), (mode & 0o7777) as ModeT) } != 0 {
             return Err(last_errno());
@@ -639,7 +664,7 @@ impl Broker {
     pub(crate) fn chmod(&self, path: &[u8], mode: u32) -> Result<(), i32> {
         let f = self.walk(path, true, true)?;
         if !self.roots[f.root].write {
-            return Err(c::EACCES);
+            return Err(self.withhold("write", path, c::EACCES));
         }
         let fd = unsafe { openat(f.dir.raw(), f.at_name().as_ptr(), c::O_RDONLY | c::O_NOFOLLOW | c::O_CLOEXEC, 0 as std::ffi::c_uint) };
         if fd < 0 {
@@ -784,7 +809,7 @@ mod tests {
             let to = if i == 40 { "src/lib.rs".to_string() } else { format!("chain_{}", i + 1) };
             std::os::unix::fs::symlink(to, ws.join(format!("chain_{i}"))).unwrap();
         }
-        let spec = Roots { read: vec![b(&ws)], write: vec![b(&out)], excluded: vec![b(&ws.join("target"))], store: Vec::new(), cwd: b(&ws) };
+        let spec = Roots { read: vec![b(&ws)], write: vec![b(&out)], excluded: vec![b(&ws.join("target"))], store: Vec::new(), alias: Vec::new(), cwd: b(&ws) };
         let br = Broker::new(&spec).unwrap();
         let read = |p: &[u8]| -> Result<Vec<u8>, i32> {
             match br.open(p, c::O_RDONLY, 0)? {

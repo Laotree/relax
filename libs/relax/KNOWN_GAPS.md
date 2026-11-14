@@ -140,3 +140,39 @@ fn main() {
   them in that order), so these impls and the `Box<str, A>` ones are the global allocator's only.
 
 Start in libs/relax/compiler/std/core/boxed.rs (its `Box<[T]>` and `Box<str>` impls) and vec/mod.rs.
+
+## 9. A confined build script reaches files, folders, its environment, pipes and `$RUSTC` only
+
+Under `makepad run` (compile-time policy Sandboxed), the build script of a package whose units
+hold a registry or git package runs confined (compiler/src/sandbox/script.rs): its program runs in
+an arena, and the only host functions it reaches are the domain's entries. It reads its package's
+source (a registry package's folder, a git package's repository in the store, a path package's
+workspace) and OUT_DIR, writes OUT_DIR, reads the environment its parent gave it, and asks
+`$RUSTC` option-led questions, answered in the host. Bare `relax` runs every script as cargo does.
+
+```rust
+// build.rs of a registry package
+fn main() {
+    let t = std::time::SystemTime::now();
+    println!("cargo:rustc-env=BUILT_AT={:?}", t);
+}
+```
+
+- cargo: the script runs with the person's rights.
+- Relax under `makepad run`: the script fails, naming the C function its code reached
+  (`clock_gettime`).
+
+Not served yet, each a refusal naming its C function unless said otherwise:
+- Windows: there are no arena windows yet; such a script is refused there with that reason.
+- threads, clocks, sockets and name lookups, and any C function a script declares itself.
+- `symlink`, hard links, `chown`, and setting file times.
+- `$CARGO` questions, and programs other than `$RUSTC`: refused as not found (NotFound).
+- A folder of the store opened as a `File`: an error.
+- A store package is read as committed: the run's edits (RELAX_EDITS) do not reach a confined
+  script.
+- A git package checked out on disk by cargo reads its own folder, not its whole repository.
+- Output lines are not checked yet: a `rustc-link-search` or `rerun-if-changed` path outside the
+  script's folders is taken as given.
+
+Start in compiler/src/sandbox/script.rs (`entry`, the domain's table) and sandbox/broker.rs (the
+folders and the walk); the decision is relax-front unitgraph.rs `script_confined`.

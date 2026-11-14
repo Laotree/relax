@@ -2689,6 +2689,43 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         eprintln!("error: no test ran: a path dependency does not compile (`{tool} test` fails as `cargo test` does on code rustc rejects)", tool = crate::tool_name());
         return 101;
     }
+    // a build script's run (relax-front unitgraph.rs run_one): confined when its parent and this
+    // run, deciding over the same units (`script_confined`), both say so; a run where the two
+    // differ is refused
+    if std::env::var_os("RELAX_SCRIPT_DEPTH").is_some() || units.script.is_some() || crate::progenv::script_env_handed() {
+        match (unitgraph::script_confined(&g.raw), &units.script) {
+            (true, Some(folders)) => {
+                let roots = match (main_def, crate::sandbox::script::roots_of(folders)) {
+                    (Some(main_def), Ok(roots)) => (main_def, roots),
+                    (None, _) => {
+                        eprintln!("relax: a confined build script has no main: refused");
+                        return 1;
+                    }
+                    (_, Err(e)) => {
+                        eprintln!("relax: the confined build script cannot run: {e}");
+                        return 1;
+                    }
+                };
+                boot_over();
+                let code = unsafe { crate::sandbox::script::run_main(up, root, roots.0, &roots.1) };
+                flush_errors(true);
+                return code;
+            }
+            (true, None) => {
+                eprintln!("relax: this build script's run is confined (a registry or git package is among its units) and its parent named no folders for it: refused");
+                return 1;
+            }
+            (false, Some(_)) => {
+                eprintln!("relax: this build script's parent confined its run, and this run finds no registry or git package among its units under its policy: refused");
+                return 1;
+            }
+            (false, None) if crate::progenv::script_env_handed() => {
+                eprintln!("relax: this build script's run was handed a confined script's environment, and its units hold no registry or git package under its policy: refused");
+                return 1;
+            }
+            (false, None) => {}
+        }
+    }
     // the platform's start code runs the program's constructors before its entry (sections.rs)
     if !entry_defs.is_empty() || harness || !exports_mode && !HAL_RUN.load(Ordering::Acquire) {
         // the program's own code runs on this thread from here (its constructors, then its

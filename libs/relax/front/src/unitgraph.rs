@@ -62,6 +62,9 @@ pub struct RawUnit {
     /// build script's unit graph says of it (`script_units`), so the script's run sees its
     /// third-party packages as this run does
     pub registry: bool,
+    /// a git package (cargo's pkg_id is `git+`): its repository is its source (a confined
+    /// script's read root, `script_folders`)
+    pub git: bool,
     /// the checks its profile gives the unit as a host unit, which a build script's run builds it
     /// with (`makepad test`'s profile: run.rs; a build script's run: its graph's)
     pub host_checks: Option<crate::resolve::ProfileChecks>,
@@ -163,7 +166,7 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
     let mut test_crates: Vec<usize> = Vec::new();
     // unit index of a run-custom-build unit -> its script (src_path, edition, features, build unit)
     let mut run_build: Vec<Option<(String, u16, Vec<String>, usize)>> = vec![None; n_units];
-    let mut raw: Vec<RawUnit> = vec![RawUnit { name: String::new(), src_path: String::new(), edition: 2015, features: Vec::new(), proc_macro: false, deps: Vec::new(), run_script: false, pkg: Default::default(), path_source: false, registry: false, host_checks: None }; n_units];
+    let mut raw: Vec<RawUnit> = vec![RawUnit { name: String::new(), src_path: String::new(), edition: 2015, features: Vec::new(), proc_macro: false, deps: Vec::new(), run_script: false, pkg: Default::default(), path_source: false, registry: false, git: false, host_checks: None }; n_units];
     // a crate used on both sides (normal dependency and build-dependency / proc-macro side) is one
     // crate here: keep the target side for the app and the host side for the macro world.
     // Cargo reference features.md#feature-resolver-version-2 keeps their features separate;
@@ -209,7 +212,7 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
             (d, n, v)
         };
         raw[ui] = RawUnit { name: tname.clone(), src_path: src_path.clone(), edition, features: features.clone(), proc_macro: pm, deps: udeps.clone(), run_script: build && mode == "run-custom-build", pkg: (pkg_dir.clone(), pname.clone(), ver.clone()),
-            path_source: !u.sysroot && u.pkg_id.starts_with("path+"), registry: !u.pkg_id.starts_with("path+"), host_checks: u.checks };
+            path_source: !u.sysroot && u.pkg_id.starts_with("path+"), registry: !u.pkg_id.starts_with("path+"), git: u.pkg_id.starts_with("git+"), host_checks: u.checks };
         // the run unit depends on the script's compile unit, whose deps are the build-dependencies
         let build_unit = udeps.first().map(|d| d.0).unwrap_or(usize::MAX);
         run_build[ui] = if build && mode == "run-custom-build" { Some((src_path.clone(), edition, features.clone(), build_unit)) } else { None };
@@ -1201,10 +1204,20 @@ fn script_output_into(cfgs: &mut [Vec<String>], env: &mut [Vec<(String, String)>
     Ok(())
 }
 
+/// Whether a build script's run is confined: under Policy::Sandboxed, when the units it runs with
+/// (its own and everything its build-dependencies reach, `script_units`) hold a registry or git
+/// package. One function for both sides: the script's parent asks it of the units it writes, the
+/// script's run of the units it read (relax-compiler run.rs), and a run where the two differ is
+/// refused.
+pub fn script_confined<'a>(units: impl IntoIterator<Item = &'a RawUnit>) -> bool {
+    crate::compile_time::policy() == crate::compile_time::Policy::Sandboxed && units.into_iter().any(|u| u.registry)
+}
+
 /// The units a build script runs with: its build-dependencies and everything they reach (their
 /// own build scripts included), plus the script itself as the bin root, in cargo's unit-graph
-/// JSON (unitgraph::load reads it back in the child).
-fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrite>, target_dir: &str) -> (String, u64) {
+/// JSON (unitgraph::load reads it back in the child); and whether its run is confined
+/// (`script_confined`), with its folders in the graph (`relax_script`, `script_folders`).
+fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrite>, target_dir: &str) -> (String, u64, bool) {
     let _why = crate::why::enabled().then(|| crate::why::enter(crate::why::Cause::new(&bs.src_path, 1, "build-script-dependency-hash", "script_units")));
     let build_deps: Vec<_> = bs.build_deps.iter().filter(|(_, name)|
         !rewrite.is_some_and(|r| r.calls.iter().any(|(dep, _)| dep == name))).cloned().collect();
@@ -1252,7 +1265,11 @@ fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrit
     // a registry or git package's unit keeps a non-path id (its folder still in it), so the
     // script's run sees it as third-party, as this run does (RawUnit::registry): its proc macros
     // run confined under Policy::Sandboxed (relax-compiler pmhost.rs)
-    let source = |registry: bool| if registry { "registry" } else { "path" };
+    let source = |u: Option<&RawUnit>| match u {
+        Some(u) if u.git => "git",
+        Some(u) if u.registry => "registry",
+        _ => "path",
+    };
     let deps_json = |deps: &[(usize, String)]| -> String {
         deps.iter().filter_map(|(d, n)| idx(*d).map(|k| format!("{{\"index\":{},\"extern_crate_name\":{}}}", k, q(n)))).collect::<Vec<_>>().join(",")
     };
@@ -1284,7 +1301,7 @@ fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrit
         let feats: Vec<String> = u.features.iter().map(|f| q(f)).collect();
         units.push(format!(
             "{{\"pkg_id\":{},\"target\":{{\"kind\":[\"{}\"],\"name\":{},\"src_path\":{},\"edition\":\"{}\"}},\"profile\":{{\"opt_level\":\"3\"{}}},\"mode\":\"{}\",\"features\":[{}],\"dependencies\":[{}]}}",
-            q(&format!("{}+file://{}#{}@{}", source(u.registry), u.pkg.0, u.pkg.1, u.pkg.2)),
+            q(&format!("{}+file://{}#{}@{}", source(Some(u)), u.pkg.0, u.pkg.1, u.pkg.2)),
             kind,
             q(&name),
             q(&u.src_path),
@@ -1315,7 +1332,7 @@ fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrit
     }
     let script_unit = |src_path: &str| format!(
         "{{\"pkg_id\":{},\"target\":{{\"kind\":[\"bin\"],\"name\":\"build-script-build\",\"src_path\":{},\"edition\":\"{}\"}},\"profile\":{{\"opt_level\":\"3\"{}}},\"mode\":\"build\",\"features\":[{}],\"dependencies\":[{}]}}",
-        q(&format!("{}+file://{}#build-script-build@0.0.0", source(script_registry), pkg_dir)),
+        q(&format!("{}+file://{}#build-script-build@0.0.0", source(script_compile), pkg_dir)),
         q(src_path),
         bs.edition,
         script_checks,
@@ -1324,7 +1341,16 @@ fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrit
     );
     units.push(script_unit(&bs.src_path));
     let root = units.len() - 1;
-    let encode = |units: &[String]| format!("{{\"version\":1,\"units\":[{}],\"roots\":[{}]}}", units.join(","), root);
+    // the decision over the units written here, which are the units its run reads
+    let confined = script_confined(seen.iter().map(|&i| &raw[i]).chain(script_compile));
+    let folders = if confined {
+        let (read, excluded) = script_folders(&pkg_dir, script_compile, target_dir);
+        let list = |l: &[String]| l.iter().map(|p| q(p)).collect::<Vec<_>>().join(",");
+        format!(",\"relax_script\":{{\"read\":[{}],\"excluded\":[{}],\"cwd\":{}}}", list(&read), list(&excluded), q(&pkg_dir))
+    } else {
+        String::new()
+    };
+    let encode = |units: &[String]| format!("{{\"version\":1,\"units\":[{}],\"roots\":[{}]{}}}", units.join(","), root, folders);
     let mut json = encode(&units);
     // Hash the logical graph and the source the child actually compiles before
     // substituting the hash-derived path. Edges/aliases affect the rerun key too.
@@ -1333,7 +1359,30 @@ fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrit
         units[root] = script_unit(&format!("{}/build-scripts/{:016x}/build.rs", target_dir, h));
         json = encode(&units);
     }
-    (json, h)
+    (json, h, confined)
+}
+
+/// A confined script's folders (Q2's roots): (what it reads, what it never reaches). It reads its
+/// package's source: a registry package's folder, a git package's repository (its store mount; a
+/// checkout on disk: the package's folder), a path package's workspace. It never reaches the
+/// run's folder (`run_dir`), the workspace's target folder or Relax's dir, however it spells
+/// them. OUT_DIR, which it writes, is its environment's (a shared workspace's moves after this).
+/// A store's or a folder mount's path stays as this run names it: the script's run maps it
+/// (relax-compiler sandbox/script.rs `roots_of`), so the checkouts of a shared workspace keep one
+/// units file.
+fn script_folders(pkg_dir: &str, script: Option<&RawUnit>, run_dir: &str) -> (Vec<String>, Vec<String>) {
+    let read = match script {
+        Some(u) if u.git => crate::vfs::store_root(pkg_dir).unwrap_or_else(|| pkg_dir.to_string()),
+        Some(u) if u.registry => pkg_dir.to_string(),
+        _ => crate::resolve::find_root(pkg_dir).unwrap_or_else(|_| pkg_dir.to_string()),
+    };
+    let mut excluded = vec![run_dir.to_string(), crate::dirs::relax_dir().display().to_string()];
+    if let Ok(t) = crate::resolve::target_dir(pkg_dir) {
+        excluded.push(t);
+    }
+    excluded.sort();
+    excluded.dedup();
+    (vec![read], excluded)
 }
 
 /// A unit's checks in a build script's unit graph (its `profile`), which the script's run builds
@@ -1393,7 +1442,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
             }
         }
     }
-    let (units, h) = script_units(bs, raw, rewrite.as_ref(), target_dir);
+    let (units, h, confined) = script_units(bs, raw, rewrite.as_ref(), target_dir);
     let mut fh = h;
     for f in &bs.features {
         fh = fnv(f.as_bytes(), fh);
@@ -1516,14 +1565,15 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
             cmd.env(k, v);
         }
     }
-    // Policy::Sandboxed: a script whose closure (its package and its build-dependencies) holds a
-    // registry or git package is given what is set above and nothing else of this environment:
-    // cargo's variables for a script and cargo's `[env]`, no PATH, HOME, tokens or wrappers. Its
-    // run's program reads those names and Relax's own (progenv SCRIPT_ENV); a
-    // `rerun-if-env-changed` declaration grants nothing. The handed names are part of the rerun
-    // key below, so an output of the script run as host code does not stand for a confined run
-    // and the other way round. Not a boundary: the script still runs as host code.
-    let given: Option<Vec<(String, String)>> = (crate::compile_time::policy() == crate::compile_time::Policy::Sandboxed && third_party_closure(bs, raw)).then(|| {
+    // a confined script (`script_confined`: Policy::Sandboxed, a registry or git package among
+    // its units) is given what is set above and nothing else of this environment: cargo's
+    // variables for a script and cargo's `[env]`, no PATH, HOME, tokens or wrappers. Its run's
+    // program reads those names and Relax's own (progenv SCRIPT_ENV); a `rerun-if-env-changed`
+    // declaration grants nothing. The handed names are part of the rerun key below, so an output
+    // of the script run as host code does not stand for a confined run and the other way round.
+    // Its run reaches the folders its units file names and nothing else (relax-compiler
+    // sandbox/script.rs).
+    let given: Option<Vec<(String, String)>> = confined.then(|| {
         let set: Vec<(String, String)> = cmd.get_envs().filter_map(|(k, v)| Some((k.to_string_lossy().into_owned(), v?.to_string_lossy().into_owned()))).collect();
         let names: crate::progenv::Own = cmd.get_envs().filter(|(_, v)| v.is_some()).map(|(k, _)| (k.as_encoded_bytes().to_vec(), None)).collect();
         cmd.env(std::str::from_utf8(crate::progenv::SCRIPT_ENV).unwrap(), unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&crate::progenv::encode(&names)) });
@@ -1673,26 +1723,6 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         }
         Err(e) => (Err(format!("{} (build script of {}): {}", exe.display(), name, e)), out_dir),
     }
-}
-
-/// Whether a script's closure, its package and its build-dependencies, holds a registry or git
-/// package (RawUnit::registry): under Policy::Sandboxed such a script is confined, whole (run_one).
-fn third_party_closure(bs: &BuildScript, raw: &[RawUnit]) -> bool {
-    if raw.iter().any(|u| u.src_path == bs.src_path && !u.run_script && u.registry) {
-        return true;
-    }
-    let mut seen = vec![false; raw.len()];
-    let mut stack: Vec<usize> = bs.build_deps.iter().map(|d| d.0).collect();
-    while let Some(i) = stack.pop() {
-        if i >= raw.len() || std::mem::replace(&mut seen[i], true) {
-            continue;
-        }
-        if raw[i].registry {
-            return true;
-        }
-        stack.extend(raw[i].deps.iter().map(|d| d.0));
-    }
-    false
 }
 
 /// The variables confined scripts declared (`rerun-if-env-changed`) that this environment sets and
