@@ -941,6 +941,14 @@ mod imp {
         std::ptr::null_mut()
     }
 
+    /// The executable's image base, its DOS header: what a PE linker's `__ImageBase` is in a
+    /// program linked into the executable (jit.rs loader_symbol).
+    pub fn exe_image_base() -> Option<usize> {
+        let mut module: HANDLE = 0;
+        // UNCHANGED_REFCOUNT, and no name: the process's executable
+        (unsafe { GetModuleHandleExW(0x2, std::ptr::null(), &mut module) } != 0 && module != 0).then_some(module as usize)
+    }
+
     /// --allow-c's native library is not supported on Windows.
     pub fn load_path(_path: &str) -> Result<usize, String> {
         Err("--allow-c native libraries are not supported on Windows".into())

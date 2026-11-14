@@ -25196,6 +25196,12 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         // thread's locals are gone, where a lazy compile of it cannot run: makepad-remote's cleanup)
         b"atexit" => Some(os::proc::program_atexit as *const () as usize),
         b"__relax_precompile" => Some(relax_precompile as *const () as usize),
+        // the image base a PE linker defines in every image (its DOS header, the module's
+        // HINSTANCE, which winit's get_instance_handle reads): JIT code is in no image, so the
+        // executable's, as in a program linked into it (relax issue 187: not found, and every
+        // winit app panicked at its first window)
+        #[cfg(windows)]
+        b"__ImageBase" => os::proc::exe_image_base(),
         #[cfg(unix)]
         b"__relax_fork_exec" => Some(crate::forkexec::relax_fork_exec as *const () as usize),
         #[cfg(unix)]
