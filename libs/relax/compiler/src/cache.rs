@@ -585,6 +585,8 @@ pub struct CacheStats {
     pub misses: u64,
     pub link_fail: u64,
     pub recorded: u64,
+    /// of those, kept in the store of a crate deeper than their deepest crate (store_crate)
+    pub wider_store: u64,
     pub unencodable: u64,
     /// entries rejected because a closure they name is another expression in this parse
     pub closure_mismatch: u64,
@@ -1637,6 +1639,26 @@ impl Cache {
     /// theirs), ties by crate index.
     fn dominant(&self, crates: &[u32]) -> u32 {
         crates.iter().copied().max_by_key(|&c| (self.depth.get(c as usize).copied().unwrap_or(0), c)).unwrap_or(0)
+    }
+
+    /// Whether crate `c`'s dependency closure holds every crate of `crates`.
+    fn sees_all(&self, c: u32, crates: &[u32]) -> bool {
+        let Some(set) = self.crate_closure.get(c as usize) else { return false };
+        crates.iter().all(|&x| set.get(x as usize / 64).is_some_and(|w| w >> (x % 64) & 1 == 1))
+    }
+
+    /// The crate whose code store holds an entry made from crates `crates` (its key's, its
+    /// certificate's): one whose dependency closure holds them all, as a code store's ledger
+    /// lists the late inputs (env!, include!) of its crate's closure alone. The deepest of them
+    /// when it sees the others (along a chain it does); else (`r::f::<s::T>`, r deeper than s
+    /// and not depending on it) the shallowest crate that sees them all, ties by crate index.
+    /// None: no crate the cache opened with does.
+    fn store_crate(&self, crates: &[u32]) -> Option<u32> {
+        let dom = self.dominant(crates);
+        if self.sees_all(dom, crates) {
+            return Some(dom);
+        }
+        (0..self.crate_closure.len() as u32).filter(|&c| self.sees_all(c, crates)).min_by_key(|&c| (self.depth.get(c as usize).copied().unwrap_or(u32::MAX), c))
     }
 
     /// SPEC-V: slot `id`'s body failed the borrow checker. Its code stays out of the cache: a record
@@ -2753,7 +2775,7 @@ impl Cache {
         }
         crates.sort_unstable();
         crates.dedup();
-        let dom = self.dominant(&crates);
+        let dom = self.store_crate(&crates)?;
         // a slot of the startup manifest whose crates are as it was recorded from and none
         // edited since: its key as recorded (the bodies below hash to what they hashed to then)
         let unchanged = |c: &u32| self.manifest_key_crates.as_ref().is_none_or(|ok| ok.get(*c as usize) == Some(&true));
@@ -3755,7 +3777,10 @@ impl Cache {
                 trace_keyed(u, id, &format!("rec:{}{} {:?}{} rir {} deps {} code {}", ["base", "O1", "O2", "O3"][tier_level(t) as usize], if t & TIER_PROVISIONAL != 0 { "-provisional" } else { "" }, kind, if pending.is_some() { " deferred" } else { "" }, rir, u.body_deps.get(&id).map_or(0, |v| v.len()), code.len()), Some(key));
             }
         }
+        // (the store encode_entry chose: the slot's verdict and tier records follow its code)
         let kc = self.cur_crate;
+        self.key_crate.insert(key, kc);
+        if self.slot_crates.get(&id).is_some_and(|c| self.dominant(c) != kc) { self.stats.wider_store += 1; }
         self.push_pending(kc, NewEntry { key, kind: KIND_CODE, payload });
         self.stats.recorded += 1;
         warm_count::add(warm_count::RECORDED, 1);
@@ -3785,15 +3810,16 @@ impl Cache {
     /// The dependency certificate of a code: every slot of `deps` (`record_deps`: the slots whose
     /// RIR it took in), by its key encoding with its key
     /// now. The entry links only while each still has that key (its body, position and
-    /// interface unchanged). None: one has no key (the entry cannot be stored).
-    fn cert_bytes(&mut self, u: &Unit, deps: &[u32]) -> Option<Vec<u8>> {
+    /// interface unchanged). With it, the crates those keys come from. None: one has no key (the
+    /// entry cannot be stored).
+    fn cert_bytes(&mut self, u: &Unit, deps: &[u32]) -> Option<(Vec<u8>, Vec<u32>)> {
         let t0 = relax_session::clock::cpu_ns();
         let r = self.cert_bytes_inner(u, deps);
         self.stats.cert_write_ns += relax_session::clock::cpu_ns() - t0;
         r
     }
 
-    fn cert_bytes_inner(&mut self, u: &Unit, deps: &[u32]) -> Option<Vec<u8>> {
+    fn cert_bytes_inner(&mut self, u: &Unit, deps: &[u32]) -> Option<(Vec<u8>, Vec<u32>)> {
         let mut items: Vec<(Vec<u8>, u128)> = Vec::new();
         let mut crates: Vec<u32> = Vec::new();
         for &c in deps {
@@ -3823,7 +3849,7 @@ impl Cache {
             e.bytes(&b);
             e.u128(k);
         }
-        Some(e.0)
+        Some((e.0, crates))
     }
 
     /// A hash of crates `idents`' whole fingerprints (certificate fast path). None: one is
@@ -3850,8 +3876,8 @@ impl Cache {
     /// ones -- O3 code: the callees it kept as calls for lack of a body (PendingRecord::with_kept),
     /// those without a key left out -- (each list by key, in key order: the same slots encode the
     /// same in every session), the nounwind answers and the dependency certificate. Verify compares
-    /// a cached entry's with the fresh build's.
-    fn encode_inputs(&mut self, u: &Unit, id: u32, o3: Option<(&[u32], &[(u32, bool)])>, kind: RecKind, pending: Option<&PendingRecord>, breaches: bool, e: &mut E) -> Option<()> {
+    /// a cached entry's with the fresh build's. Returns the crates the certificate's keys come from.
+    fn encode_inputs(&mut self, u: &Unit, id: u32, o3: Option<(&[u32], &[(u32, bool)])>, kind: RecKind, pending: Option<&PendingRecord>, breaches: bool, e: &mut E) -> Option<Vec<u32>> {
         let o2 = kind == RecKind::O2;
         let base = o3.is_none() && kind == RecKind::First && match pending {
             Some(p) => p.baseline,
@@ -3933,13 +3959,13 @@ impl Cache {
                 &deps
             }
         };
-        let Some(cert) = self.cert_bytes(u, deps) else {
+        let Some((cert, crates)) = self.cert_bytes(u, deps) else {
             self.stats.unencodable += 1;
             self.why("dependency key");
             return None;
         };
         e.0.extend_from_slice(&cert);
-        Some(())
+        Some(crates)
     }
 
     /// The payload of a code entry (O1, or O3 with its inlined slots);
@@ -3972,7 +3998,19 @@ impl Cache {
         let mut e = E::default();
         e.u32(ENTRY_VERSION);
         e.str(&u.fns[id as usize].name);
-        self.encode_inputs(u, id, o3, kind, pending, self.mode == Mode::Verify, &mut e)?;
+        let mut named = self.encode_inputs(u, id, o3, kind, pending, self.mode == Mode::Verify, &mut e)?;
+        // code that took in slots of crates its store's crate does not see (a std fn that inlined
+        // a caller of the workspace allocator's shim): the store of one that sees those too, whose
+        // ledger lists their late inputs (store_crate); its data objects, encoded below, go along
+        if !self.sees_all(self.cur_crate, &named) {
+            named.push(self.cur_crate);
+            let Some(c) = self.store_crate(&named) else {
+                self.stats.unencodable += 1;
+                self.why("no crate sees the certificate's crates");
+                return None;
+            };
+            self.cur_crate = c;
+        }
         e.bytes(code);
         e.u32(relocs.len() as u32);
         let mut rw = Vec::new();
@@ -8228,6 +8266,67 @@ mod data_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A code store is checked by its ledger: the `env!`/`include!` inputs of its crate's
+    /// dependency closure. `r::name::<s::T>` folds `s`'s `env!` constant, and `r` is deeper than
+    /// `s` without depending on it: the entry went to `r`'s store, whose ledger does not list
+    /// GAP_X, and linked with the old value folded in after it changed. Each run here is one
+    /// program over the same cache, the value of GAP_X as `s` reads it noted as its expansion does.
+    #[test]
+    fn an_instance_over_an_unrelated_crate_misses_when_that_crates_late_input_changes() {
+        isolated_test!(an_instance_over_an_unrelated_crate_misses_when_that_crates_late_input_changes);
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = crate::Session::default();
+        session.options.tier1 = false; session.options.tyck_ahead = false;
+        let session = std::sync::Arc::new(session);
+        let dir = std::env::temp_dir().join(format!("relax-ledger-gap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // (crate, source, dependencies): r reaches depth 2 through x, s has depth 1
+        let crates: [(&str, &str, &[&str]); 5] = [
+            ("base", "#![no_std] pub trait Tag { const NAME: &'static str; }", &[]),
+            ("s", "#![no_std] pub struct T; impl base::Tag for T { const NAME: &'static str = env!(\"GAP_X\"); } pub fn own() -> u32 { 1 }", &["base"]),
+            ("x", "#![no_std] pub fn deeper() {}", &["base"]),
+            ("r", "#![no_std] #[inline(never)] pub fn name<A: base::Tag>() -> &'static str { A::NAME } pub fn own() -> u32 { x::deeper(); 7 }", &["base", "x"]),
+            ("root", "#![no_std] pub fn main() -> &'static str { r::name::<s::T>() }", &["base", "s", "r"]),
+        ];
+        for (name, text, _) in crates { std::fs::write(dir.join(format!("{name}.rs")), text).unwrap(); }
+        let mut prog = crate::program::Program::new(&session);
+        let mut index: HashMap<&str, u32> = HashMap::new();
+        for (name, _, deps) in crates {
+            let deps = deps.iter().map(|d| (prog.syms.intern(d), index[d])).collect();
+            let path = dir.join(format!("{name}.rs"));
+            index.insert(name, prog.load_crate(name, path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), deps).unwrap());
+        }
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        let mut u = Unit::new(prog, tcx, 0);
+        let def = |u: &Unit, krate: u32, name: &str| (0..u.prog.defs.len() as u32).map(DefId).find(|&d| u.prog.def(d).krate == krate && u.prog.name(d) == name).unwrap();
+        let t = u.tcx.tys.intern(TyKind::Adt(def(&u, index["s"], "T"), u.tcx.tys.mk_list(&[]), crate::types::RegionArgsId::EMPTY));
+        let (name, r_own, s_own) = (def(&u, index["r"], "name"), def(&u, index["r"], "own"), def(&u, index["s"], "own"));
+        let ids = [u.fn_id(FnKey::Inst(name, vec![t])), u.fn_id(FnKey::Inst(r_own, vec![])), u.fn_id(FnKey::Inst(s_own, vec![]))];
+        // one run over the cache with GAP_X = `value`, as `s`'s expansion of env! notes it: whether
+        // each slot hit (a miss is recorded), and how many records went to a store wider than
+        // their deepest crate's
+        let mut run = |value: &str| -> ([bool; 3], u64) {
+            crate::crates::set_crate_env("s", vec![("GAP_X".to_string(), value.to_string())]);
+            crate::sip::note_late_input("s", crate::sip::LATE_ENV, "GAP_X", Some(value.as_bytes()));
+            let mut cache = open_test_cache(&u, &dir.join("cache"));
+            let hit = ids.map(|id| cache.lookup(&mut u, id).is_some());
+            for (&id, hit) in ids.iter().zip(hit) {
+                if !hit { cache.record(&u, id, &[0xc3], &[], &[]); }
+            }
+            cache.flush().unwrap();
+            (hit, cache.stats.wider_store)
+        };
+        assert_eq!(run("one"), ([false; 3], 1), "a cold cache: r::name::<s::T> is kept in the store of a crate that sees s (root's)");
+        assert_eq!(run("one").0, [true; 3], "GAP_X unchanged: every slot hits");
+        let ([name, r_own, s_own], _) = run("two");
+        assert!(!s_own, "s's own code misses: s's store's ledger lists GAP_X");
+        assert!(!name, "r::name::<s::T> folds GAP_X: it misses and is built again");
+        assert!(r_own, "r's own code hits: no late input of s reaches it");
+        assert_eq!(run("two").0, [true; 3], "the entries recorded under the new value hit");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A warm start: a key names a coroutine's type, and the body that defines the coroutine is
     /// never type-checked (its code is cached). The decoded type is a coroutine all the same: the
     /// key says so (enc_ty 29 or 30), where Tcx::coroutines was filled by that type check alone and an
@@ -10293,7 +10392,7 @@ impl Cache {
         h.u128(crate::dirs::anchors_key());
         h.u128(self.cfg);
         h.write(&e.0);
-        let dom = self.dominant(&crates);
+        let dom = self.store_crate(&crates)?;
         Some((h.finish128(), dom, crates))
     }
 
@@ -10314,7 +10413,8 @@ impl Cache {
     /// of changed), and for a complete one each body by its identity with its code key. An
     /// incomplete certificate (the value ran code, or read one that did) holds only by the fast
     /// path over the crates its identity names (whose fingerprints cover their dependencies).
-    fn const_cert_bytes(&mut self, u: &Unit, own: &[u32], cert: &crate::jit::ConstCert) -> Option<Vec<u8>> {
+    /// With it, every crate it names.
+    fn const_cert_bytes(&mut self, u: &Unit, own: &[u32], cert: &crate::jit::ConstCert) -> Option<(Vec<u8>, Vec<u32>)> {
         let mut complete = cert.complete;
         let mut items: Vec<(Vec<u8>, u128)> = Vec::new();
         let mut crates: Vec<u32> = own.to_vec();
@@ -10351,7 +10451,8 @@ impl Cache {
             e.bytes(&b);
             e.u128(k);
         }
-        Some(e.0)
+        let named = idents.iter().map(|i| self.crate_by_ident.get(i).copied()).collect::<Option<Vec<u32>>>()?;
+        Some((e.0, named))
     }
 
     pub fn record_const(&mut self, u: &Unit, def: DefId, args: &[TyId], addr: u64, cert: &crate::jit::ConstCert) -> Option<()> {
@@ -10362,13 +10463,18 @@ impl Cache {
         // A recursive compile can inspect this object before its initializer finishes.
         self.data_key.retain(|&(i, _), _| i != idx);
         self.data_why.remove(&idx);
+        // the value was evaluated from bodies of crates the key's store crate may not see: the
+        // store of one that sees them all (store_crate); the value's data goes there too
+        let (mut payload, mut named) = self.const_cert_bytes(u, &own, cert)?;
+        let krate = if self.sees_all(krate, &named) { krate } else {
+            named.push(krate);
+            self.store_crate(&named)?
+        };
         let previous = self.cur_crate;
         self.cur_crate = krate;
         let data = self.data_entry(u, idx);
         self.cur_crate = previous;
-        let data = data?;
-        let mut payload = self.const_cert_bytes(u, &own, cert)?;
-        payload.extend_from_slice(&data.to_le_bytes());
+        payload.extend_from_slice(&data?.to_le_bytes());
         self.pending_keys.insert(key);
         self.const_live.insert(key);
         self.push_pending(krate, NewEntry { key, kind: KIND_CONST, payload });
