@@ -373,6 +373,12 @@ pub fn relative_path(path: &str, root: &str) -> Option<String> {
     relative(&normalize_path(path), &normalize_path(root)).map(str::to_string)
 }
 
+/// relative_path's containment for inputs already normalized (normalize_path): many paths
+/// checked against folders normalized once.
+pub fn is_under_normalized(path: &str, root: &str) -> bool {
+    relative(path, root).is_some()
+}
+
 // Inputs already have normalized spelling. Kept separate so canonicalize can
 // check `..` before resolving it, using exactly the same mount boundaries.
 fn relative<'a>(path: &'a str, root: &str) -> Option<&'a str> {

@@ -66,10 +66,51 @@ pub fn anchored(path: &str) -> std::borrow::Cow<'_, str> {
 
 /// The absolute anchor locations as one key input (the worktree).
 pub fn anchors_key() -> u128 {
+    key_of(anchors())
+}
+
+fn key_of(anchors: &[(&'static str, String)]) -> u128 {
     let mut h = crate::sip::Sip128::new();
     h.str("relax-anchors");
-    for (tag, dir) in anchors() { h.str(tag); h.str(dir); }
+    for (tag, dir) in anchors { h.str(tag); h.str(dir); }
     h.finish128()
+}
+
+/// The anchors a code cache is opened against, held as a value (two checkouts in one test are two
+/// values): the process's (`run`, `cargo`, `ws`), and where the sources no checkout owns lie --
+/// the cargo home, and std's sources when no checkout anchor holds them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Anchors {
+    /// (tag, absolute normalized dir), as anchors() has them
+    dirs: Vec<(&'static str, String)>,
+    /// std's sources (absolute, normalized)
+    std: String,
+}
+
+impl Anchors {
+    /// This process's: anchors() and `std`, std's source folder.
+    pub fn current(std: &str) -> Anchors {
+        Anchors { dirs: anchors().to_vec(), std: absolute_dir(std) }
+    }
+
+    /// The anchors `dirs` (each made absolute) with std at `std`.
+    pub fn of(dirs: &[(&'static str, &str)], std: &str) -> Anchors {
+        Anchors { dirs: dirs.iter().map(|(tag, dir)| (*tag, absolute_dir(dir))).collect(), std: absolute_dir(std) }
+    }
+
+    /// anchors_key() of these anchors.
+    pub fn key(&self) -> u128 {
+        key_of(&self.dirs)
+    }
+
+    /// Whether `path` is a source no checkout owns: under the cargo home or std's folder, and in
+    /// no folder of the checkout, the workspace or the run dir (a cargo home inside the workspace
+    /// is the checkout's, and so are packages downloaded into the run dir).
+    pub fn sealed_source(&self, path: &str) -> bool {
+        let p = crate::vfs::normalize_path(path);
+        let under = |tags: &[&str]| self.dirs.iter().any(|(tag, dir)| tags.contains(tag) && crate::vfs::is_under_normalized(&p, dir));
+        (under(&["cargo"]) || crate::vfs::is_under_normalized(&p, &self.std)) && !under(&["ws", "run"])
+    }
 }
 
 /// The run dir handed over by a parent run (`makepad run --run-dir`). Set before anything

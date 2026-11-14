@@ -587,6 +587,10 @@ pub struct CacheStats {
     pub recorded: u64,
     /// of those, kept in the store of a crate deeper than their deepest crate (store_crate)
     pub wider_store: u64,
+    /// of those, made from sealed crates only (key and certificate: sealed_crates), and the
+    /// program's sealed crates: what a store no checkout owns could share (Target B)
+    pub sealed_records: u64,
+    pub sealed_crates: u64,
     pub unencodable: u64,
     /// entries rejected because a closure they name is another expression in this parse
     pub closure_mismatch: u64,
@@ -780,6 +784,11 @@ pub struct Cache {
     /// folded it (a const, an inlined body) stale with the crate that read it
     crate_names: Vec<String>,
     crate_closure: Vec<Vec<u64>>,
+    /// the key of the anchors this cache was opened against (OpenFrom::anchors): the checkout's
+    /// identity in the code, const and data keys and the code store names
+    anchors_key: u128,
+    /// per crate: whether no checkout owns its code (sealed_crates)
+    sealed: Vec<bool>,
     /// interface fingerprints (cache/items.rs), per crate index: what code keys name; the bound
     /// crates of this program folded in (items::apply_bound)
     iface: Vec<u128>,
@@ -1073,6 +1082,8 @@ pub struct OpenFrom<'a> {
     pub tier1: bool,
     pub global_allocator: Option<DefId>,
     pub provided: Vec<(u32, u64)>,
+    /// the anchors the cache's keys and sealed crates are made against (None: this process's)
+    pub anchors: Option<crate::dirs::Anchors>,
 }
 impl<'a> OpenFrom<'a> {
     pub fn of(u: &'a Unit) -> Self {
@@ -1082,7 +1093,7 @@ impl<'a> OpenFrom<'a> {
     /// new state)
     pub fn with(u: &Unit, prog: &'a crate::program::Program, tcx: &'a crate::tcx::Tcx) -> Self {
         OpenFrom { prog, tcx, opt: u.opt.clone(), tier1: u.tier1.is_some(), global_allocator: crate::jit::global_allocator_static_of(prog, u.aux),
-            provided: u.provided.iter().map(|(k, pc)| (*k, pc.binding)).collect() }
+            provided: u.provided.iter().map(|(k, pc)| (*k, pc.binding)).collect(), anchors: None }
     }
 }
 
@@ -1171,6 +1182,11 @@ impl Cache {
             }
             None => cfgh.u8(0),
         }
+        let crate_closure = dep_closures(prog, ncr);
+        // the checkout's anchors (a test's two checkouts in one process: two values), and which
+        // crates no checkout owns
+        let anchors = from.anchors.clone().unwrap_or_else(|| crate::dirs::Anchors::current(&crate::std_dir()));
+        let sealed = sealed_crates(prog, ncr, &anchors, &crate_closure);
         let mut c = Cache {
             verbose,
             mode,
@@ -1185,7 +1201,9 @@ impl Cache {
             mapped_index: None,
             fps,
             crate_names: (0..ncr).map(|ci| prog.syms.str(prog.crates[ci].name).to_string()).collect(),
-            crate_closure: dep_closures(prog, ncr),
+            crate_closure,
+            anchors_key: anchors.key(),
+            sealed,
             iface: Vec::new(),
             iface_plain: Vec::new(),
             view: Vec::new(),
@@ -1353,9 +1371,10 @@ impl Cache {
         // named by the view: an edit of the crate's items keeps its store (the entries' keys say
         // which code still holds)
         for ci in 0..ncr {
-            c.code_path.push(dir.join(code_store_name(options, prog.syms.str(prog.crates[ci].name), c.view[ci])));
+            c.code_path.push(dir.join(code_store_name(options, prog.syms.str(prog.crates[ci].name), c.view[ci], c.anchors_key)));
         }
         c.depth = crate_depths(prog);
+        c.stats.sealed_crates = c.sealed.iter().filter(|s| **s).count() as u64;
         c.stale = vec![false; ncr];
         c.code_stale = vec![false; ncr];
         // open them (in parallel: ~80 files of each kind, each a header + an index copy)
@@ -2788,7 +2807,7 @@ impl Cache {
                 let mut h = Sip128::new();
                 h.str("code-deps");
                 // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-                h.u128(crate::dirs::anchors_key());
+                h.u128(self.anchors_key);
                 h.u128(self.cfg);
                 h.write(&e.0);
                 h.write(&shim.0);
@@ -3483,7 +3502,7 @@ impl Cache {
                 let mut h = Sip128::new();
                 h.str("data");
                 // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-                h.u128(crate::dirs::anchors_key());
+                h.u128(self.anchors_key);
                 h.u128(self.cfg);
                 h.write(&e.0);
                 // a named object (a constant, a vtable, a location) is its own entry: two
@@ -3732,7 +3751,7 @@ impl Cache {
             trace_lookup(u, id, "norecord:o1v-not-below");
             return;
         }
-        let Some(payload) = self.encode_entry(u, id, code, relocs, pc_map, o3, kind, pending) else {
+        let Some((payload, sealed)) = self.encode_entry(u, id, code, relocs, pc_map, o3, kind, pending) else {
             if o3.is_some() { warm_count::add(warm_count::O3_UNENCODABLE, 1); }
             let w = self.last_why;
             trace_lookup(u, id, &format!("norecord:encode:{}", w));
@@ -3781,6 +3800,7 @@ impl Cache {
         let kc = self.cur_crate;
         self.key_crate.insert(key, kc);
         if self.slot_crates.get(&id).is_some_and(|c| self.dominant(c) != kc) { self.stats.wider_store += 1; }
+        if sealed { self.stats.sealed_records += 1; }
         self.push_pending(kc, NewEntry { key, kind: KIND_CODE, payload });
         self.stats.recorded += 1;
         warm_count::add(warm_count::RECORDED, 1);
@@ -3971,7 +3991,9 @@ impl Cache {
     /// The payload of a code entry (O1, or O3 with its inlined slots);
     /// None: it cannot be stored (`last_why` says why).
     #[allow(clippy::too_many_arguments)]
-    fn encode_entry(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], o3: Option<(&[u32], &[(u32, bool)])>, kind: RecKind, pending: Option<&PendingRecord>) -> Option<Vec<u8>> {
+    /// Slot `id`'s code entry: its payload, and whether it is made from sealed crates only (its
+    /// key's and its certificate's: sealed_crates).
+    fn encode_entry(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], o3: Option<(&[u32], &[(u32, bool)])>, kind: RecKind, pending: Option<&PendingRecord>) -> Option<(Vec<u8>, bool)> {
         // unlinked code only: a pool word must still be zero (linked code holds this run's values)
         for rl in relocs {
             let o = rl.at as usize;
@@ -3999,6 +4021,8 @@ impl Cache {
         e.u32(ENTRY_VERSION);
         e.str(&u.fns[id as usize].name);
         let mut named = self.encode_inputs(u, id, o3, kind, pending, self.mode == Mode::Verify, &mut e)?;
+        let is_sealed = |c: &u32| self.sealed.get(*c as usize) == Some(&true);
+        let sealed = named.iter().all(is_sealed) && self.slot_crates.get(&id).is_some_and(|k| k.iter().all(is_sealed));
         // code that took in slots of crates its store's crate does not see (a std fn that inlined
         // a caller of the workspace allocator's shim): the store of one that sees those too, whose
         // ledger lists their late inputs (store_crate); its data objects, encoded below, go along
@@ -4088,7 +4112,7 @@ impl Cache {
                 e.u128(0);
             }
         }
-        Some(e.0)
+        Some((e.0, sealed))
     }
 
     // ------------------------------------------------------------ linking
@@ -4868,6 +4892,26 @@ fn dep_closures(prog: &crate::program::Program, ncr: usize) -> Vec<Vec<u64>> {
     let mut out: Vec<Option<Vec<u64>>> = vec![None; ncr];
     for c in 0..ncr { visit(c, prog, ncr, &mut out); }
     out.into_iter().map(Option::unwrap_or_default).collect()
+}
+
+/// Per crate: whether no checkout owns its code, so that two checkouts would build the same code
+/// from it. Its root and every file of it the program loaded are sources no checkout owns
+/// (Anchors::sealed_source: under the cargo home or std's folder, outside the workspace and the
+/// run dir), it has no build-script output (a registered OUT_DIR: the run dir's), and so is
+/// every crate of its dependency closure (`closure`, dep_closures): a code store's ledger checks
+/// the late inputs of the closure, and one of them may be a checkout's file.
+fn sealed_crates(prog: &crate::program::Program, ncr: usize, anchors: &crate::dirs::Anchors, closure: &[Vec<u64>]) -> Vec<bool> {
+    let mut own: Vec<bool> = (0..ncr).map(|c| {
+        let krate = &prog.crates[c];
+        let root = prog.mods.get(krate.root_mod as usize).and_then(|m| prog.file_paths.get(m.file as usize));
+        root.is_some_and(|p| anchors.sealed_source(p)) && crate::crates::crate_env_registered(prog.syms.str(krate.name), "OUT_DIR").is_none()
+    }).collect();
+    for (path, &c) in prog.file_paths.iter().zip(&prog.file_crate) {
+        if own.get(c as usize) == Some(&true) && !anchors.sealed_source(path) {
+            own[c as usize] = false;
+        }
+    }
+    (0..ncr).map(|c| closure.get(c).is_some_and(|set| (0..ncr).all(|d| set.get(d / 64).is_none_or(|w| w >> (d % 64) & 1 == 0) || own[d]))).collect()
 }
 
 impl Cache {
@@ -5803,11 +5847,12 @@ fn front_store_name_with(parse_options: u128, name: &str, fp: u128) -> String {
 }
 /// A crate's code store: the front store's formula over its interface fingerprint (another
 /// hash domain, so never the front store's name).
-fn code_store_name(options: &crate::options::Options, name: &str, iface: u128) -> String {
+fn code_store_name(options: &crate::options::Options, name: &str, iface: u128, anchors_key: u128) -> String {
     let mut h = Sip128::new();
     h.str("code-store");
-    // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-    h.u128(crate::dirs::anchors_key());
+    // the worktree (Cache::anchors_key): payloads still hold its absolute paths (Target B
+    // removes this per payload)
+    h.u128(anchors_key);
     h.u128(crate::codegen_id::id());
     h.str(&crate::codegen_id::target_tag());
     h.u128(iface);
@@ -8327,6 +8372,107 @@ mod data_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Two checkouts `a` and `b` of one program over one cargo home, each with its own run dir,
+    /// opened with their own anchors (OpenFrom::anchors) in the order a, b, b edited, b, a.
+    /// Nothing is shared between them: b's first run hits none of a's code, each sees its own
+    /// edit, and a's reopen records nothing. Which crates are sealed (no checkout owns their
+    /// code): a registry package; not one with a build script's OUT_DIR, nor one depending on it,
+    /// nor a path dependency, nor a registry package when the cargo home lies in the checkout.
+    #[test]
+    fn two_checkouts_keep_their_own_code_and_name_their_sealed_crates() {
+        isolated_test!(two_checkouts_keep_their_own_code_and_name_their_sealed_crates);
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = crate::Session::default();
+        session.options.tier1 = false; session.options.tyck_ahead = false;
+        let session = std::sync::Arc::new(session);
+        let top = std::env::temp_dir().join(format!("relax-two-checkouts-{}", std::process::id()));
+        let (cargo, std_dir) = (top.join("cargo"), top.join("std"));
+        let registry = cargo.join("registry/src/index");
+        let write = |path: &std::path::Path, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(&registry.join("dep-1.0.0/src/lib.rs"), "#![no_std] pub fn twice() -> u32 { 2 } pub fn same<T>(t: T) -> T { t }");
+        write(&registry.join("gen-1.0.0/src/lib.rs"), "#![no_std] pub fn made() -> u32 { 3 }");
+        write(&registry.join("above-1.0.0/src/lib.rs"), "#![no_std] pub fn more() -> u32 { gen::made() }");
+        crate::crates::set_crate_env("gen", vec![("OUT_DIR".to_string(), top.join("a/target/relax/build/gen-0/out").to_string_lossy().into_owned())]);
+        let app = |n: u32| format!("#![no_std] pub struct Local; pub fn main() -> u32 {{ dep::twice(); above::more(); util::local(); {n} }} pub fn keep() -> Local {{ dep::same(Local) }}");
+        let (a, b) = (top.join("a"), top.join("b"));
+        for ws in [&a, &b] {
+            write(&ws.join("util/src/lib.rs"), "#![no_std] pub fn local() -> u32 { 4 }");
+            write(&ws.join("src/lib.rs"), &app(1));
+        }
+        // (crate, root, dependencies); the slots of each run
+        let load = |ws: &std::path::Path| {
+            let crates: [(&str, std::path::PathBuf, &[&str]); 5] = [
+                ("dep", registry.join("dep-1.0.0/src/lib.rs"), &[]),
+                ("gen", registry.join("gen-1.0.0/src/lib.rs"), &[]),
+                ("above", registry.join("above-1.0.0/src/lib.rs"), &["gen"]),
+                ("util", ws.join("util/src/lib.rs"), &[]),
+                ("app", ws.join("src/lib.rs"), &["dep", "above", "util"]),
+            ];
+            let mut prog = crate::program::Program::new(&session);
+            let mut index: HashMap<&str, u32> = HashMap::new();
+            for (name, path, deps) in crates {
+                let deps = deps.iter().map(|d| (prog.syms.intern(d), index[d])).collect();
+                index.insert(name, prog.load_crate(name, path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), deps).unwrap());
+            }
+            let mut tcx = crate::tcx::Tcx::new();
+            tcx.collect(&prog);
+            let mut u = Unit::new(prog, tcx, 0);
+            let def = |u: &Unit, krate: &str, name: &str| (0..u.prog.defs.len() as u32).map(DefId).find(|&d| u.prog.def(d).krate == index[krate] && u.prog.name(d) == name).unwrap();
+            let local = u.tcx.tys.intern(TyKind::Adt(def(&u, "app", "Local"), u.tcx.tys.mk_list(&[]), crate::types::RegionArgsId::EMPTY));
+            let u32_ = u.tcx.tys.u32_;
+            let keys = [("dep", "twice", None), ("dep", "same", Some(u32_)), ("dep", "same", Some(local)), ("gen", "made", None), ("above", "more", None), ("util", "local", None), ("app", "main", None), ("app", "keep", None)]
+                .map(|(krate, name, arg)| FnKey::Inst(def(&u, krate, name), arg.into_iter().collect()));
+            let ids = keys.map(|k| u.fn_id(k));
+            (u, ids, index)
+        };
+        // every unit made before any runs (a unit's drop stops the key queries of later ones)
+        let (mut ua, a_ids, index) = load(&a);
+        let (mut ub, b_ids, _) = load(&b);
+        write(&b.join("src/lib.rs"), &app(2));
+        let (mut ub2, b2_ids, _) = load(&b);
+        let anchors = |ws: &std::path::Path, cargo: &std::path::Path| crate::dirs::Anchors::of(&[
+            ("run", ws.join("target/relax").to_str().unwrap()), ("cargo", cargo.to_str().unwrap()), ("ws", ws.to_str().unwrap()),
+        ], std_dir.to_str().unwrap());
+        let open = |u: &Unit, ws: &std::path::Path| {
+            let mut from = OpenFrom::of(u);
+            from.anchors = Some(anchors(ws, &cargo));
+            let mut cache = Cache::open_from(&from, Mode::ReadOnly, ws.join("target/relax"), None).unwrap();
+            cache.mode = Mode::On;
+            cache
+        };
+        // one run of checkout `ws`: which slots hit (a miss is recorded), what it recorded and how
+        // much of that was made from sealed crates alone
+        let run = |u: &mut Unit, ids: &[u32; 8], ws: &std::path::Path| -> ([bool; 8], u64, u64) {
+            let mut cache = open(u, ws);
+            let hit = ids.map(|id| cache.lookup(u, id).is_some());
+            for (&id, hit) in ids.iter().zip(hit) {
+                if !hit { cache.record(u, id, &[0xc3], &[], &[]); }
+            }
+            cache.flush().unwrap();
+            (hit, cache.stats.recorded, cache.stats.sealed_records)
+        };
+        let cold = open(&ua, &a);
+        let sealed: Vec<(&str, bool)> = ["dep", "gen", "above", "util", "app"].iter().map(|c| (*c, cold.sealed[index[c] as usize])).collect();
+        assert_eq!(sealed, [("dep", true), ("gen", false), ("above", false), ("util", false), ("app", false)],
+            "sealed: the registry package; not one with OUT_DIR, one depending on it, a path dependency or the workspace");
+        assert_eq!(cold.stats.sealed_crates, 1);
+        drop(cold);
+        let n = ua.prog.crates.len();
+        let inside = sealed_crates(&ua.prog, n, &anchors(&top, &cargo), &dep_closures(&ua.prog, n));
+        assert!(!inside[index["dep"] as usize], "a cargo home inside the checkout is the checkout's: its packages are not sealed");
+        assert_eq!(run(&mut ua, &a_ids, &a), ([false; 8], 8, 2), "a's first run records every slot, dep::twice and dep::same::<u32> from sealed crates alone");
+        assert_eq!(run(&mut ub, &b_ids, &b), ([false; 8], 8, 2), "b's first run hits none of a's code (nothing is shared yet)");
+        let edited = run(&mut ub2, &b2_ids, &b);
+        assert_eq!(edited, ([true, true, true, true, true, true, false, true], 1, 0), "b sees its own edit: main misses and is recorded, the rest hits");
+        assert_eq!(run(&mut ub2, &b2_ids, &b), ([true; 8], 0, 0), "b's edited code hits");
+        assert_eq!(run(&mut ua, &a_ids, &a), ([true; 8], 0, 0), "a's reopen hits its own code, b's edit unseen, and records nothing");
+        drop((ua, ub, ub2));
+        std::fs::remove_dir_all(top).unwrap();
+    }
+
     /// A warm start: a key names a coroutine's type, and the body that defines the coroutine is
     /// never type-checked (its code is cached). The decoded type is a coroutine all the same: the
     /// key says so (enc_ty 29 or 30), where Tcx::coroutines was filled by that type check alone and an
@@ -10389,7 +10535,7 @@ impl Cache {
         let mut h = Sip128::new();
         h.str("const-value-v2");
         // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
-        h.u128(crate::dirs::anchors_key());
+        h.u128(self.anchors_key);
         h.u128(self.cfg);
         h.write(&e.0);
         let dom = self.store_crate(&crates)?;
