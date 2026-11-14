@@ -178,6 +178,9 @@ const KIND_TIER: u32 = 20;
 /// check_test_subjects): the warnings it printed, under the key of their check keys together
 /// (test_warnings_key). The crates' clean verdicts are not stored then: a rerun prints these.
 const KIND_TEST_WARNINGS: u32 = 21;
+/// A program's real-time set (rt_set_load): one entry in its own store, under the key of the
+/// root crate and the cache configuration, which holds the codegen identity (compiler and std).
+const KIND_RT_SET: u32 = 22;
 const TIER_PARKED_SALT: u128 = 0x7469_6572_2d76_6572_6469_6374_2d70_6b64;
 const TIER_QUEUED_SALT: u128 = 0x7469_6572_2d71_7565_7565_642d_7261_7465;
 /// stores a front image was mapped from: kept for the rest of the process (the arrays point
@@ -2324,7 +2327,13 @@ impl Cache {
             12 => {
                 let def = self.dec_def(u, d)?;
                 let regions = self.dec_regions(u, d)?;
-                TyKind::Adt(def, u.tcx.tys.mk_list(&self.dec_tys(u, d, depth)?), regions)
+                let args = self.dec_tys(u, d, depth)?;
+                // a key a program with other generics recorded (an edited type, or another std's
+                // `Box<T>` read where Box is `Box<T, A>`): no type of this program, so no key
+                if u.tcx.adts.get(&def).is_some_and(|adt| adt.n_generics as usize != args.len()) {
+                    return None;
+                }
+                TyKind::Adt(def, u.tcx.tys.mk_list(&args), regions)
             }
             13 => {
                 let ps = self.dec_tys(u, d, depth)?;
@@ -2521,14 +2530,16 @@ impl Cache {
     /// What real-time threads of the program rooted at crate `root` reached in earlier runs (jit.rs
     /// realtime), compiled ahead when the program marks its real-time code: the key encodings of
     /// the slots (resolve them with slot_for_bytes_unit) and the trait-object types whose vtables
-    /// it followed (a type that no longer decodes is left out).
+    /// it followed (a type that no longer decodes is left out). Only a set this configuration
+    /// recorded (rt_set_key): key bytes name definitions and types in the std and compiler that
+    /// wrote them, and decoded against another std they name other types (a `Box<T>` key of a
+    /// std before `Box<T, A>` decoded to a one-argument Box, which no impl matches).
     pub fn rt_set_load(&mut self, u: &Unit, root: u32) -> (Vec<Vec<u8>>, Vec<TyId>) {
-        let Ok(b) = std::fs::read(self.rt_set_path(u, root)) else { return Default::default() };
-        let mut d = D { b: &b, p: 0 };
+        let key = self.rt_set_key(u, root);
+        let Some(store) = Store::open(&self.rt_set_path(key)) else { return Default::default() };
+        let Some((KIND_RT_SET, b)) = store.get(key) else { return Default::default() };
+        let mut d = D { b, p: 0 };
         let (mut keys, mut dyns) = (Vec::new(), Vec::new());
-        if d.u32() != Some(ENTRY_VERSION) {
-            return (keys, dyns);
-        }
         for _ in 0..d.u32().unwrap_or(0) {
             let Some(k) = d.bytes() else { break };
             keys.push(k.to_vec());
@@ -2564,7 +2575,6 @@ impl Cache {
             }
         }
         let mut e = E::default();
-        e.u32(ENTRY_VERSION);
         e.u32(n);
         e.0.extend_from_slice(&keys.0);
         e.u32(nd);
@@ -2572,16 +2582,26 @@ impl Cache {
         if crate::jit::rt_trace() {
             eprintln!("relax rt: recorded {} of {} slots, {} of {} trait-object types", n, ids.len(), nd, dyns.len());
         }
-        let path = self.rt_set_path(u, root);
-        let tmp = path.with_extension("new");
-        if std::fs::write(&tmp, &e.0).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
+        let key = self.rt_set_key(u, root);
+        let _ = crate::store::append(&self.rt_set_path(key), vec![NewEntry { key, kind: KIND_RT_SET, payload: e.0 }], true);
     }
 
-    fn rt_set_path(&self, u: &Unit, root: u32) -> PathBuf {
-        let name = u.prog.crates.get(root as usize).map_or("program", |c| u.prog.syms.str(c.name));
-        self.dir.join(format!("rt-{}.set", name))
+    /// The real-time set's key: the root crate's name under this cache configuration (the codegen
+    /// identity: compiler stamps and std digest, the format and the code options) and worktree.
+    fn rt_set_key(&self, u: &Unit, root: u32) -> u128 {
+        let mut h = Sip128::new();
+        h.str("rt-set");
+        // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
+        h.u128(crate::dirs::anchors_key());
+        h.u128(self.cfg);
+        h.str(&crate::codegen_id::target_tag());
+        h.str(u.prog.crates.get(root as usize).map_or("program", |c| u.prog.syms.str(c.name)));
+        h.finish128()
+    }
+
+    /// The real-time set's store: its own, pruned as every store is (one per key)
+    fn rt_set_path(&self, key: u128) -> PathBuf {
+        self.dir.join(format!("rt_set-{:016x}.rcs", key as u64))
     }
 
     /// memory report (RELAX_MEM_REPORT): the recorder's and linker's tables (capacity based)
@@ -8161,6 +8181,48 @@ mod data_tests {
                 assert!(unsafe { Linker::new(&mut cache).dec_fnkey(&mut u, &mut D { b: &bytes[..end], p: 0 }, 0) }.is_none());
             }
         }
+        drop(cache);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The real-time set crosses runs, so it is read only under the configuration that wrote it:
+    /// a set a std before `Box<T, A>` recorded decoded its `Box<T>` keys to a one-argument Box,
+    /// and the glue over it failed to compile (Sandbox's first frame, 11-14). A type key that a
+    /// program with other generics wrote (an edited type under one compiler) decodes to no type.
+    #[test]
+    fn rt_set_keyed_by_configuration_and_generic_counts() {
+        isolated_test!(rt_set_keyed_by_configuration_and_generic_counts);
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let session = std::sync::Arc::new(crate::Session::default());
+        let root = std::env::temp_dir().join(format!("relax-rt-set-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("lib.rs");
+        let load = |text: &str| {
+            std::fs::write(&source, text).unwrap();
+            let mut prog = crate::program::Program::new(&session);
+            prog.load_crate("rt_set", source.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+            let mut tcx = crate::tcx::Tcx::new();
+            tcx.collect(&prog);
+            Unit::new(prog, tcx, 0)
+        };
+        let held = |u: &Unit, name: &str| {
+            let def = (0..u.prog.defs.len() as u32).map(DefId).find(|&d| u.prog.name(d) == name).unwrap();
+            u.tcx.tys.intern(TyKind::Adt(def, u.tcx.tys.mk_list(&[u.tcx.tys.i32_]), crate::types::RegionArgsId::EMPTY))
+        };
+        let u = load("#![no_std] pub struct S<T>(T); pub struct R<T>(T);");
+        let mut cache = open_test_cache(&u, &root.join("cache"));
+        let types = [held(&u, "S"), held(&u, "R")];
+        cache.rt_set_store(&u, 0, &[], &types);
+        assert_eq!(cache.rt_set_load(&u, 0).1, types, "the configuration that wrote the set reads it");
+        let cfg = cache.cfg;
+        cache.cfg ^= 1;
+        assert!(cache.rt_set_load(&u, 0).1.is_empty(), "another configuration (another compiler or std) reads no set");
+        drop(cache);
+        // the program edited: S takes two arguments now, R is as it was
+        let v = load("#![no_std] pub struct S<T, U = u8>(T, U); pub struct R<T>(T);");
+        let mut cache = open_test_cache(&v, &root.join("cache"));
+        assert_eq!(cache.cfg, cfg, "an edit keeps the configuration");
+        assert_eq!(cache.rt_set_load(&v, 0).1, [held(&v, "R")], "S<i32> names no type of the edited program; R<i32> still does");
         drop(cache);
         std::fs::remove_dir_all(root).unwrap();
     }
