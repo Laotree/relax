@@ -81,8 +81,9 @@ pub struct Graph {
     pub cfgs: Vec<Vec<String>>,
     /// per crate: compile-time environment for env!()
     pub env: Vec<Vec<(String, String)>>,
-    /// libraries the build scripts link: (name, framework)
-    pub link_libs: Vec<(String, bool)>,
+    /// libraries the build scripts link: (name, framework, named by a confined script: the run
+    /// never finds it in the working folder, relax-compiler os/proc.rs `load_library_outside_cwd`)
+    pub link_libs: Vec<(String, bool, bool)>,
     /// `--allow-c`: the shared library the native dependencies were linked into (native.rs)
     pub native: Option<crate::native::NativeLib>,
     pub raw: Vec<RawUnit>,
@@ -800,10 +801,10 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
             if !job.is_finished() {
                 let (mut cfgs, mut env, mut libs) = (gr.cfgs.clone(), gr.env.clone(), gr.link_libs.clone());
                 let mut ok = true;
-                for (krates, r, out_dir) in &results {
+                for (krates, r, out_dir, confined) in &results {
                     let Ok(stdout) = r else { ok = false; break };
                     for &k in krates {
-                        if script_output_into(&mut cfgs, &mut env, &mut libs, &gr.pkg, k, stdout, out_dir.clone(), check_only).is_err() { ok = false; }
+                        if script_output_into(&mut cfgs, &mut env, &mut libs, &gr.pkg, k, stdout, out_dir.clone(), check_only, *confined).is_err() { ok = false; }
                     }
                 }
                 if ok { _kept = done(gr, &native_krates, &cfgs, &env); }
@@ -932,7 +933,8 @@ fn apply_native_scripts(g: &mut Graph, scripts: Vec<crate::native::ScriptOut>) {
             g.env[k].extend(n.env.iter().cloned());
             g.env[k].push(("OUT_DIR".to_string(), n.out_dir.clone()));
         }
-        for l in n.system {
+        for (name, fw) in n.system {
+            let l = (name, fw, false);
             if !g.link_libs.contains(&l) {
                 g.link_libs.push(l);
             }
@@ -952,19 +954,19 @@ const C_DEP_NOT_RUN: &str = "its build script was not run, for a C build script'
 type LinksMeta = Mutex<std::collections::HashMap<usize, Result<Vec<(String, String)>, String>>>;
 
 /// The scripts Relax runs itself (every one but the native packages' and a check's skipped
-/// ones), on the pool: (crates, stdout or error, OUT_DIR) per script. A script whose package
+/// ones), on the pool: (crates, stdout or error, OUT_DIR, confined) per script. A script whose package
 /// depends on `links` packages runs after their scripts, given their metadata (cargo orders the
 /// runs the same way); most graphs have no such pair and run every script at once.
 fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &str, root: &BuildRoot, native_krates: &[usize], check_skipped: &[usize],
     receipts: &[Option<&str>], meta: &LinksMeta,
-    only: &(dyn Fn(usize) -> bool + Sync)) -> Vec<(Vec<usize>, Result<String, String>, String)> {
-    let results: Mutex<Vec<(Vec<usize>, Result<String, String>, String)>> = Mutex::new(Vec::new());
-    let done = |i: usize, r: Result<String, String>, out_dir: String| {
+    only: &(dyn Fn(usize) -> bool + Sync)) -> Vec<ScriptRun> {
+    let results: Mutex<Vec<ScriptRun>> = Mutex::new(Vec::new());
+    let done = |i: usize, r: Result<String, String>, out_dir: String, confined: bool| {
         meta.lock().unwrap().insert(i, match &r {
             Ok(stdout) => Ok(script_metadata(stdout)),
             Err(_) => Err("its build script failed".to_string()),
         });
-        results.lock().unwrap().push((g.build_scripts[i].krates(), r, out_dir));
+        results.lock().unwrap().push((g.build_scripts[i].krates(), r, out_dir, confined));
     };
     let unbuilt = |bs: &BuildScript| {
         let build_dir = root.take(&format!("{}-unbuilt", g.crates[bs.krate].name));
@@ -979,7 +981,7 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
         }
         if check_skipped.contains(&bs.krate) {
             let out_dir = unbuilt(bs);
-            results.lock().unwrap().push((bs.krates(), Ok(String::new()), out_dir));
+            results.lock().unwrap().push((bs.krates(), Ok(String::new()), out_dir, false));
             meta.lock().unwrap().insert(i, Err(C_NOT_RUN.to_string()));
             continue;
         }
@@ -996,7 +998,7 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
                 // cargo sets OUT_DIR for every package with a build script
                 let out_dir = format!("{}/out", root.take(&format!("{}-answered", name)));
                 let r = std::fs::create_dir_all(&out_dir).map(|_| lines.join("\n")).map_err(|e| format!("{}: {}", out_dir, e));
-                done(i, r, out_dir);
+                done(i, r, out_dir, false);
                 continue;
             }
             ScriptRole::ToRemove => {
@@ -1022,7 +1024,7 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
                     }
                     Ok(String::new())
                 });
-                done(i, r, out_dir);
+                done(i, r, out_dir, false);
                 continue;
             }
             ScriptRole::Native(a) => {
@@ -1030,7 +1032,7 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
                 let env = answer_env(sess, bs, dir, pname, ver);
                 let r = std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {}", out_dir, e))
                     .and_then(|_| (a.answer)(&ScriptEnv { env: &env, target: target_triple(sess), out_dir: std::path::Path::new(&out_dir) }));
-                done(i, r.map(|l| l.join("\n")), out_dir);
+                done(i, r.map(|l| l.join("\n")), out_dir, false);
                 continue;
             }
             ScriptRole::Artefact => {}
@@ -1069,13 +1071,13 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
                     // reads aws-lc-sys's DEP_ metadata) leaves its crate unconfigured, said once, not fatal
                     Err((e, true)) => {
                         eprintln!("relax check: {} (its crate is checked without the script's cfgs)", e.lines().next().unwrap_or(""));
-                        results.lock().unwrap().push((bs.krates(), Ok(String::new()), unbuilt(bs)));
+                        results.lock().unwrap().push((bs.krates(), Ok(String::new()), unbuilt(bs), false));
                         meta.lock().unwrap().insert(i, Err(C_DEP_NOT_RUN.to_string()));
                         continue;
                     }
                     Err((e, false)) => {
                         let out_dir = unbuilt(bs);
-                        done(i, Err(e), out_dir);
+                        done(i, Err(e), out_dir, false);
                         continue;
                     }
                 }
@@ -1086,7 +1088,7 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
                 let receipt = receipts[i];
                 s.spawn(move || {
                     let r = run_one(sess, bs, raw, &cenv, &dir, &pname, &ver, &name, target_dir, root, receipt);
-                    done(i, r.0, r.1);
+                    done(i, r.0, r.1, r.2);
                 });
             }
         });
@@ -1150,24 +1152,30 @@ fn script_metadata(stdout: &str) -> Vec<(String, String)> {
 }
 
 /// The scripts' `cargo:` lines into the graph: cfgs, link libraries, env (OUT_DIR included).
-fn apply_script_results(g: &mut Graph, results: Vec<(Vec<usize>, Result<String, String>, String)>, check_only: bool) -> Result<(), String> {
-    for (krates, r, out_dir) in results {
+fn apply_script_results(g: &mut Graph, results: Vec<ScriptRun>, check_only: bool) -> Result<(), String> {
+    for (krates, r, out_dir, confined) in results {
         // a script that failed fails a check too, as under `cargo check` (the scripts a check did
         // not run for C answered empty: relax_scripts)
         let stdout = r?;
-        for k in krates { apply_script_output(g, k, &stdout, out_dir.clone(), check_only)?; }
+        for k in krates { apply_script_output(g, k, &stdout, out_dir.clone(), check_only, confined)?; }
     }
     Ok(())
 }
 
-/// One crate's share of a script's output (`stdout`, its OUT_DIR).
-fn apply_script_output(g: &mut Graph, k: usize, stdout: &str, out_dir: String, check_only: bool) -> Result<(), String> {
-    script_output_into(&mut g.cfgs, &mut g.env, &mut g.link_libs, &g.pkg, k, stdout, out_dir, check_only)
+/// One crate's share of a script's output (`stdout`, its OUT_DIR; `confined`: the script ran
+/// confined, its output checked: `confined_output_refusals`).
+fn apply_script_output(g: &mut Graph, k: usize, stdout: &str, out_dir: String, check_only: bool, confined: bool) -> Result<(), String> {
+    script_output_into(&mut g.cfgs, &mut g.env, &mut g.link_libs, &g.pkg, k, stdout, out_dir, check_only, confined)
 }
 
+/// A script's share of the graph: (its crates, its stdout or why it failed, its OUT_DIR, whether
+/// it ran confined).
+type ScriptRun = (Vec<usize>, Result<String, String>, String, bool);
+
 /// apply_script_output into these tables (the graph's, or copies of them).
-fn script_output_into(cfgs: &mut [Vec<String>], env: &mut [Vec<(String, String)>], link_libs: &mut Vec<(String, bool)>, pkg: &[(String, String, String)],
-    k: usize, stdout: &str, out_dir: String, check_only: bool) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+fn script_output_into(cfgs: &mut [Vec<String>], env: &mut [Vec<(String, String)>], link_libs: &mut Vec<(String, bool, bool)>, pkg: &[(String, String, String)],
+    k: usize, stdout: &str, out_dir: String, check_only: bool, confined: bool) -> Result<(), String> {
     env[k].push(("OUT_DIR".to_string(), out_dir));
     for line in stdout.lines() {
         let rest = match line.strip_prefix("cargo::").or_else(|| line.strip_prefix("cargo:")) {
@@ -1191,9 +1199,9 @@ fn script_output_into(cfgs: &mut [Vec<String>], env: &mut [Vec<(String, String)>
             if kind == "static" {
                 return Err(format!("`{}`'s build script links the static library `{}` (native code): it {}", pkg[k].1, name, relax_session::options::C_GATE));
             }
-            let fw = kind == "framework";
-            if !link_libs.contains(&(name.clone(), fw)) {
-                link_libs.push((name, fw));
+            let l = (name, kind == "framework", confined);
+            if !link_libs.contains(&l) {
+                link_libs.push(l);
             }
         } else if let Some(e) = rest.strip_prefix("rustc-env=") {
             if let Some(i) = e.find('=') {
@@ -1215,9 +1223,10 @@ pub fn script_confined<'a>(units: impl IntoIterator<Item = &'a RawUnit>) -> bool
 
 /// The units a build script runs with: its build-dependencies and everything they reach (their
 /// own build scripts included), plus the script itself as the bin root, in cargo's unit-graph
-/// JSON (unitgraph::load reads it back in the child); and whether its run is confined
-/// (`script_confined`), with its folders in the graph (`relax_script`, `script_folders`).
-fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrite>, target_dir: &str) -> (String, u64, bool) {
+/// JSON (unitgraph::load reads it back in the child); and, when its run is confined
+/// (`script_confined`), its folders (what it reads, what it never reaches), which the graph
+/// names too (`relax_script`, `script_folders`).
+fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrite>, target_dir: &str) -> (String, u64, Option<(Vec<String>, Vec<String>)>) {
     let _why = crate::why::enabled().then(|| crate::why::enter(crate::why::Cause::new(&bs.src_path, 1, "build-script-dependency-hash", "script_units")));
     let build_deps: Vec<_> = bs.build_deps.iter().filter(|(_, name)|
         !rewrite.is_some_and(|r| r.calls.iter().any(|(dep, _)| dep == name))).cloned().collect();
@@ -1343,14 +1352,15 @@ fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrit
     let root = units.len() - 1;
     // the decision over the units written here, which are the units its run reads
     let confined = script_confined(seen.iter().map(|&i| &raw[i]).chain(script_compile));
-    let folders = if confined {
-        let (read, excluded) = script_folders(&pkg_dir, script_compile, target_dir);
-        let list = |l: &[String]| l.iter().map(|p| q(p)).collect::<Vec<_>>().join(",");
-        format!(",\"relax_script\":{{\"read\":[{}],\"excluded\":[{}],\"cwd\":{}}}", list(&read), list(&excluded), q(&pkg_dir))
-    } else {
-        String::new()
+    let folders = confined.then(|| script_folders(&pkg_dir, script_compile, target_dir));
+    let record = match &folders {
+        Some((read, excluded)) => {
+            let list = |l: &[String]| l.iter().map(|p| q(p)).collect::<Vec<_>>().join(",");
+            format!(",\"relax_script\":{{\"read\":[{}],\"excluded\":[{}],\"cwd\":{}}}", list(read), list(excluded), q(&pkg_dir))
+        }
+        None => String::new(),
     };
-    let encode = |units: &[String]| format!("{{\"version\":1,\"units\":[{}],\"roots\":[{}]{}}}", units.join(","), root, folders);
+    let encode = |units: &[String]| format!("{{\"version\":1,\"units\":[{}],\"roots\":[{}]{}}}", units.join(","), root, record);
     let mut json = encode(&units);
     // Hash the logical graph and the source the child actually compiles before
     // substituting the hash-derived path. Edges/aliases affect the rerun key too.
@@ -1359,7 +1369,7 @@ fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrit
         units[root] = script_unit(&format!("{}/build-scripts/{:016x}/build.rs", target_dir, h));
         json = encode(&units);
     }
-    (json, h, confined)
+    (json, h, folders)
 }
 
 /// A confined script's folders (Q2's roots): (what it reads, what it never reaches). It reads its
@@ -1383,6 +1393,168 @@ fn script_folders(pkg_dir: &str, script: Option<&RawUnit>, run_dir: &str) -> (Ve
     excluded.sort();
     excluded.dedup();
     (vec![read], excluded)
+}
+
+/// The forms of `rustc-link-arg`: a confined script passes none.
+const LINK_ARGS: [&str; 8] = ["rustc-link-arg", "rustc-link-arg-bins", "rustc-link-arg-bin", "rustc-link-arg-tests", "rustc-link-arg-benches",
+    "rustc-link-arg-examples", "rustc-link-arg-cdylib", "rustc-cdylib-link-arg"];
+
+/// What a confined script's output asks of this run that reaches past the script's folders: each
+/// such line once, with why. Its lines act here with the person's rights (the run loads the
+/// libraries they name, sets their variables in this process, walks their paths), so each is held
+/// to what the script itself reaches (`read`: its package's source, `excluded`: the folders inside
+/// it never reaches, `out_dir`, which it writes; `pkg_dir`, its package's folder, is where a
+/// relative path starts):
+/// - `rustc-link-search` (and `rustc-flags`' `-L`): a folder inside its folders;
+/// - `rustc-link-lib` (and `-l`): a plain name of a kind the run loads (none, dylib, framework,
+///   static); the run never finds it in the working folder (`Graph::link_libs`);
+/// - no `rustc-link-arg`, in any of its forms;
+/// - `rustc-env`: no name that steers this process or its tools (relax-base resolve.rs
+///   `script_env_refused`);
+/// - `rerun-if-changed`: a path inside its folders (the rerun key's walk follows no links for it);
+/// - `cargo::` lines cargo knows; the old syntax's other keys are metadata, as cargo reads them.
+/// Its parent keeps none of an output that has any (run_one).
+fn confined_output_refusals(stdout: &str, read: &[String], excluded: &[String], out_dir: &str, pkg_dir: &str) -> Vec<String> {
+    let folders = ScriptReach::new(read, excluded, out_dir);
+    let mut refused: Vec<String> = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim_end_matches('\r');
+        let (new, rest) = match line.strip_prefix("cargo::") {
+            Some(r) => (true, r),
+            None => match line.strip_prefix("cargo:") {
+                Some(r) => (false, r),
+                None => continue,
+            },
+        };
+        let (key, value) = rest.split_once('=').unwrap_or((rest, ""));
+        let why = match key {
+            "rustc-link-search" => folders.link_search(value, pkg_dir),
+            "rustc-link-lib" => link_lib_refusal(value),
+            "rustc-flags" => folders.rustc_flags(value, pkg_dir),
+            k if LINK_ARGS.contains(&k) => Some("a confined build script passes no link arguments".to_string()),
+            "rustc-env" => match value.split_once('=') {
+                Some((name, _)) if !name.is_empty() => crate::resolve::script_env_refused(name).then(|| format!("`{name}`: {}", crate::resolve::SCRIPT_ENV_PRINCIPLE)),
+                _ => Some("it names no variable".to_string()),
+            },
+            "rerun-if-changed" => folders.path(value, pkg_dir),
+            "rustc-cfg" | "rustc-check-cfg" | "rerun-if-env-changed" | "warning" | "error" | "metadata" => None,
+            _ if new => Some("it is no instruction cargo knows".to_string()),
+            _ => None,
+        };
+        if let Some(why) = why {
+            let said = format!("`{line}`: {why}");
+            if !refused.contains(&said) {
+                refused.push(said);
+            }
+        }
+    }
+    refused
+}
+
+/// `rustc-link-lib=[KIND[:MODIFIERS]=]NAME[:RENAME]` of a confined script: Some(why) it is refused.
+fn link_lib_refusal(value: &str) -> Option<String> {
+    let (kind, name) = value.split_once('=').unwrap_or(("", value));
+    let base = kind.split(':').next().unwrap_or(kind);
+    if !["", "dylib", "framework", "static"].contains(&base) {
+        return Some(format!("the link kind `{base}` is none a confined build script names (none, dylib, framework, static)"));
+    }
+    let (name, rename) = match name.split_once(':') {
+        Some((n, r)) => (n, Some(r)),
+        None => (name, None),
+    };
+    let plain = |n: &str| !n.is_empty() && !n.starts_with('.') && !n.contains("..") && n.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-+.".contains(&b));
+    std::iter::once(name).chain(rename).find(|n| !plain(n)).map(|n| format!("`{n}` is no plain library name (letters, digits, `_ - + .`, no path)"))
+}
+
+/// A confined script's folders, each spelled every way this run may meet it (a folder mount's
+/// virtual path and its disk folder), and, for a path on disk, as its links resolve
+/// (`confined_output_refusals`).
+struct ScriptReach {
+    read: Vec<String>,
+    excluded: Vec<String>,
+    out_dir: Vec<String>,
+}
+
+impl ScriptReach {
+    fn new(read: &[String], excluded: &[String], out_dir: &str) -> ScriptReach {
+        let all = |l: &[String]| -> Vec<String> {
+            let mut v: Vec<String> = Vec::new();
+            for f in l {
+                let disk = crate::vfs::on_disk(f).into_owned();
+                let real = std::fs::canonicalize(&disk).ok().map(|c| c.to_string_lossy().into_owned());
+                for s in [f.clone(), disk.clone(), crate::vfs::virtual_of(f).into_owned()].into_iter().chain(real) {
+                    let s = crate::vfs::normalize_path(&s);
+                    if !v.contains(&s) {
+                        v.push(s);
+                    }
+                }
+            }
+            v
+        };
+        ScriptReach { read: all(read), excluded: all(excluded), out_dir: all(&[out_dir.to_string()]) }
+    }
+
+    /// Some(why) when `path` (from `pkg_dir` when relative) lies outside the script's folders, or
+    /// inside one it never reaches; a path on disk is judged again as its links resolve.
+    fn path(&self, path: &str, pkg_dir: &str) -> Option<String> {
+        let joined = if std::path::Path::new(path).is_absolute() { path.to_string() } else { format!("{pkg_dir}/{path}") };
+        let p = crate::vfs::normalize_path(&joined);
+        let mut spellings = vec![p.clone()];
+        for s in [crate::vfs::on_disk(&p).into_owned(), crate::vfs::virtual_of(&p).into_owned()] {
+            let s = crate::vfs::normalize_path(&s);
+            if !spellings.contains(&s) {
+                spellings.push(s);
+            }
+        }
+        if let Some(why) = self.judge(&spellings) {
+            return Some(why.to_string());
+        }
+        if crate::vfs::in_store(&p) {
+            return None;
+        }
+        let real = std::fs::canonicalize(&*crate::vfs::on_disk(&p)).ok()?;
+        self.judge(&[crate::vfs::normalize_path(&real.to_string_lossy())]).map(|why| format!("{why}, where its links lead"))
+    }
+
+    fn judge(&self, spellings: &[String]) -> Option<&'static str> {
+        let within = |folders: &[String]| spellings.iter().any(|x| folders.iter().any(|f| crate::vfs::relative_path(x, f).is_some()));
+        if within(&self.out_dir) {
+            None
+        } else if within(&self.excluded) {
+            Some("it lies in a folder a confined build script never reaches (the run's, the target folder or Relax's)")
+        } else if within(&self.read) {
+            None
+        } else {
+            Some("it lies outside the script's folders (its package's source and OUT_DIR)")
+        }
+    }
+
+    /// `rustc-link-search=[KIND=]PATH` (rustc's `-L`: a known kind before `=`, else the path).
+    fn link_search(&self, value: &str, pkg_dir: &str) -> Option<String> {
+        let path = match value.split_once('=') {
+            Some((kind, p)) if ["dependency", "crate", "native", "framework", "all"].contains(&kind) => p,
+            _ => value,
+        };
+        self.path(path, pkg_dir)
+    }
+
+    /// `rustc-flags`: `-l` and `-L` alone, as cargo takes them (a value joined or the next word).
+    fn rustc_flags(&self, value: &str, pkg_dir: &str) -> Option<String> {
+        let mut words = value.split_whitespace();
+        while let Some(w) = words.next() {
+            let (flag, joined) = if w.starts_with("-l") || w.starts_with("-L") { w.split_at(2) } else { return Some(format!("`{w}`: only `-l` and `-L` are flags a build script gives")) };
+            let v = if joined.is_empty() { words.next().unwrap_or("") } else { joined };
+            let why = match (flag, v) {
+                (_, "") => Some(format!("`{flag}` names nothing")),
+                ("-l", v) => link_lib_refusal(v),
+                (_, v) => self.link_search(v, pkg_dir),
+            };
+            if why.is_some() {
+                return why;
+            }
+        }
+        None
+    }
 }
 
 /// A unit's checks in a build script's unit graph (its `profile`), which the script's run builds
@@ -1425,14 +1597,14 @@ fn self_exe() -> std::io::Result<std::path::PathBuf> {
     }
 }
 
-/// (stdout of the script, OUT_DIR). The script runs as a Relax program: this executable started
+/// (stdout of the script, OUT_DIR, whether it ran confined). The script runs as a Relax program: this executable started
 /// again on the script's units (script_units) -- no rustc, no script binary; Relax re-running
 /// itself is the only process it starts. A script of a git run reads its package through the
 /// VFS (RELAX_VFS / RELAX_WORKSPACE for the child), and writes only OUT_DIR (on disk).
 #[allow(clippy::too_many_arguments)]
-fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUnit], cenv: &[(String, String)], dir: &str, pname: &str, ver: &str, name: &str, target_dir: &str, root: &BuildRoot, receipt: Option<&str>) -> (Result<String, String>, String) {
+fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUnit], cenv: &[(String, String)], dir: &str, pname: &str, ver: &str, name: &str, target_dir: &str, root: &BuildRoot, receipt: Option<&str>) -> (Result<String, String>, String, bool) {
     if let Err(e) = crate::vfs::read(&bs.src_path) {
-        return (Err(format!("{}: {}", bs.src_path, e)), String::new());
+        return (Err(format!("{}: {}", bs.src_path, e)), String::new(), false);
     }
     let rewrite = noop::rewrite(bs, raw);
     if sess.runtime.profile {
@@ -1442,7 +1614,13 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
             }
         }
     }
-    let (units, h, confined) = script_units(bs, raw, rewrite.as_ref(), target_dir);
+    let (units, h, folders) = script_units(bs, raw, rewrite.as_ref(), target_dir);
+    let confined = folders.is_some();
+    // a confined script's output acts here with the person's rights: held to its folders first
+    let refusals = |output: &str, out_dir: &str| match &folders {
+        Some((read, excluded)) => confined_output_refusals(output, read, excluded, out_dir, dir),
+        None => Vec::new(),
+    };
     let mut fh = h;
     for f in &bs.features {
         fh = fnv(f.as_bytes(), fh);
@@ -1465,7 +1643,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
                 let _ = std::fs::create_dir_all(&unit_dir);
                 let tmp = format!("{}.tmp{}-{}", path, std::process::id(), TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
                 if std::fs::write(&tmp, content).and_then(|_| std::fs::rename(&tmp, path)).is_err() {
-                    return (Err(format!("{}: cannot write", path)), out_dir);
+                    return (Err(format!("{}: cannot write", path)), out_dir, confined);
                 }
             }
         }
@@ -1473,7 +1651,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     let _ = std::fs::create_dir_all(if shared.is_some() { &base_dir } else { &out_dir });
     let exe = match self_exe() {
         Ok(e) => e,
-        Err(e) => return (Err(format!("this executable: {e}")), out_dir),
+        Err(e) => return (Err(format!("this executable: {e}")), out_dir, confined),
     };
     // nesting: a build-dependency's own script runs inside a script's run, and its
     // build-dependencies' scripts inside that, as deep as the graph goes (cargo refuses a cyclic
@@ -1484,7 +1662,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     let chain = std::env::var("RELAX_SCRIPT_CHAIN").unwrap_or_default();
     let me = format!("{pname}@{ver}");
     if chain.split('>').any(|p| p == me) {
-        return (Err(format!("{}: the build script of `{}` runs again inside its own run (build-dependency cycle: {} -> {}); refused", bs.src_path, me, chain.replace('>', " -> "), me)), out_dir);
+        return (Err(format!("{}: the build script of `{}` runs again inside its own run (build-dependency cycle: {} -> {}); refused", bs.src_path, me, chain.replace('>', " -> "), me)), out_dir, confined);
     }
     let chain = if chain.is_empty() { me } else { format!("{chain}>{me}") };
     let mut cmd = std::process::Command::new(&exe);
@@ -1594,6 +1772,11 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     // Ok: the output in `build_dir`, which stands; Err: why the script runs again
     let previous = |build_dir: &str| match (std::fs::read_to_string(format!("{}/output", build_dir)), std::fs::read_to_string(format!("{}/relax-rerun", build_dir))) {
         (Ok(old), Ok(key)) => {
+            // (only a checked output is kept; checked again before it stands, and before the key's
+            // walk takes its paths)
+            if !refusals(&old, &format!("{}/out", build_dir)).is_empty() {
+                return Err("its kept output reaches past its folders".to_string());
+            }
             let own = std::path::Path::new(&format!("{}/{}", build_dir, CHECKOUT_MARK)).is_file();
             let keyed = if own { format!("{CHECKOUT_LINE}\n{old}") } else { old.clone() };
             let now = rerun_key(&keyed, dir, &env_key, shared.as_ref(), given.as_deref()).unwrap_or_default();
@@ -1619,7 +1802,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     let mut why = match standing {
         Ok(old) => {
             if sess.runtime.profile { eprintln!("relax build-script: {} cached", pname); }
-            return (Ok(old), format!("{}/out", build_dir));
+            return (Ok(old), format!("{}/out", build_dir), confined);
         }
         Err(why) => why,
     };
@@ -1649,7 +1832,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         match standing {
             Ok(old) => {
                 if sess.runtime.profile { eprintln!("relax build-script: {} made by another run", pname); }
-                return (Ok(old), format!("{}/out", build_dir));
+                return (Ok(old), format!("{}/out", build_dir), confined);
             }
             Err(now) => why = now,
         }
@@ -1674,6 +1857,13 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     match output {
         Ok(o) if o.status.success() => {
             let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+            let refused = refusals(&stdout, &out_dir);
+            if !refused.is_empty() {
+                // nothing of it is kept, so it never stands
+                let _ = std::fs::remove_file(&key_path);
+                let _ = std::fs::remove_file(&output_path);
+                return (Err(format!("{}: the build script of `{}` ran confined and printed what a confined build script may not:\n  {}", bs.src_path, pname, refused.join("\n  "))), out_dir, confined);
+            }
             let stdout = if shared.is_some() { shared_output(&stdout) } else { stdout };
             // an output that names its checkout stands for that checkout alone (`names_checkout`)
             let own = shared.is_some() && names_checkout(&stdout, &out_dir);
@@ -1701,7 +1891,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
                     let _ = std::fs::write(&declared_path, &declared);
                 }
             }
-            (Ok(stdout), out_dir)
+            (Ok(stdout), out_dir, confined)
         }
         Ok(o) => {
             let cause = script_error_cause(&String::from_utf8_lossy(&o.stderr));
@@ -1718,10 +1908,10 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
                     (None, Some(sig)) => format!("killed by signal {}", sig),
                     _ => "exit -1".to_string(),
                 };
-                (Err(format!("{}: build script failed ({}): {}", bs.src_path, how, cause)), out_dir)
+                (Err(format!("{}: build script failed ({}): {}", bs.src_path, how, cause)), out_dir, confined)
             }
         }
-        Err(e) => (Err(format!("{} (build script of {}): {}", exe.display(), name, e)), out_dir),
+        Err(e) => (Err(format!("{} (build script of {}): {}", exe.display(), name, e)), out_dir, confined),
     }
 }
 
@@ -1857,7 +2047,10 @@ fn note_rerun(build_dir: &str, why: &str) {
 /// (`shared_content`), not its time (its output names the mount's paths, `shared_output`).
 /// A confined script's (`given`, run_one): a variable's value as the script was given it, unset
 /// when it was not given.
+/// A confined script's walks follow no links (its paths lie inside its folders,
+/// `confined_output_refusals`; a link there could lead anywhere).
 fn rerun_key(output: &str, pkg_dir: &str, env_key: &str, shared: Option<&SharedContent>, given: Option<&[(String, String)]>) -> Option<String> {
+    let follow = given.is_none();
     let mut key = format!("{:016x}\n", fnv(env_key.as_bytes(), 0xcbf29ce484222325));
     let mut any = false;
     for line in output.lines() {
@@ -1873,10 +2066,10 @@ fn rerun_key(output: &str, pkg_dir: &str, env_key: &str, shared: Option<&SharedC
         if let Some(p) = rest.strip_prefix("rerun-if-changed=") {
             any = true;
             let path = if std::path::Path::new(p).is_absolute() { p.to_string() } else { format!("{}/{}", pkg_dir, p) };
-            match (shared_content(shared, &path, false), crate::vfs::identity(&path)) {
+            match (shared_content(shared, &path, false, follow), crate::vfs::identity(&path)) {
                 (Some(c), _) => key.push_str(&format!("f c{:032x} {}\n", c, path)),
                 (None, Some(id)) => key.push_str(&format!("f {} {}\n", id, path)),
-                (None, None) => key.push_str(&format!("f {} {}\n", newest_mtime(std::path::Path::new(&path)), path)),
+                (None, None) => key.push_str(&format!("f {} {}\n", newest_mtime(std::path::Path::new(&path), follow), path)),
             }
         } else if let Some(v) = rest.strip_prefix("rerun-if-env-changed=") {
             any = true;
@@ -1889,10 +2082,10 @@ fn rerun_key(output: &str, pkg_dir: &str, env_key: &str, shared: Option<&SharedC
     }
     if !any {
         // cargo: a script that names no inputs reruns when any file of its package changes
-        match (shared_content(shared, pkg_dir, true), crate::vfs::identity(pkg_dir)) {
+        match (shared_content(shared, pkg_dir, true, follow), crate::vfs::identity(pkg_dir)) {
             (Some(c), _) => key.push_str(&format!("p c{:032x} {}\n", c, pkg_dir)),
             (None, Some(id)) => key.push_str(&format!("p {} {}\n", id, pkg_dir)),
-            (None, None) => key.push_str(&format!("p {} {}\n", newest_mtime_pkg(std::path::Path::new(pkg_dir)), pkg_dir)),
+            (None, None) => key.push_str(&format!("p {} {}\n", newest_mtime_pkg(std::path::Path::new(pkg_dir), follow), pkg_dir)),
         }
     }
     Some(key)
@@ -1905,8 +2098,9 @@ type SharedContent = std::cell::RefCell<std::collections::HashMap<(String, bool)
 /// What a file holds, or a folder with everything below it (each entry's name and content; 0:
 /// missing). `pkg`: a package's own folder, without its target directories and hidden entries
 /// (`newest_mtime_pkg`). Links are followed, as cargo's walk of a rerun-if-changed folder follows
-/// them; a folder that is its own ancestor (a link back up) ends there, so a loop ends.
-fn content(p: &std::path::Path, pkg: bool) -> u128 {
+/// them; a folder that is its own ancestor (a link back up) ends there, so a loop ends. Not
+/// `follow`: a link is its target's text (a confined script's, `rerun_key`).
+fn content(p: &std::path::Path, pkg: bool, follow: bool) -> u128 {
     // (unix: device and inode; elsewhere the canonical path)
     fn identity(p: &std::path::Path, m: &std::fs::Metadata) -> (u64, u64, String) {
         #[cfg(unix)]
@@ -1921,9 +2115,14 @@ fn content(p: &std::path::Path, pkg: bool) -> u128 {
             (0, 0, std::fs::canonicalize(p).map(|c| c.to_string_lossy().into_owned()).unwrap_or_default())
         }
     }
-    fn walk(p: &std::path::Path, pkg: bool, ancestors: &mut Vec<(u64, u64, String)>) -> u128 {
-        let Ok(m) = std::fs::metadata(p) else { return 0 };
+    fn walk(p: &std::path::Path, pkg: bool, follow: bool, ancestors: &mut Vec<(u64, u64, String)>) -> u128 {
+        let Ok(m) = (if follow { std::fs::metadata(p) } else { std::fs::symlink_metadata(p) }) else { return 0 };
         let mut h = crate::sip::Sip128::new();
+        if m.file_type().is_symlink() {
+            h.str("link");
+            h.str(&std::fs::read_link(p).map(|t| t.to_string_lossy().into_owned()).unwrap_or_default());
+            return h.finish128();
+        }
         if !m.is_dir() {
             let Ok(bytes) = std::fs::read(p) else { return 0 };
             h.str("file");
@@ -1946,25 +2145,25 @@ fn content(p: &std::path::Path, pkg: bool) -> u128 {
                 continue;
             }
             h.str(&name);
-            h.u128(walk(&p.join(&n), false, ancestors));
+            h.u128(walk(&p.join(&n), false, follow, ancestors));
         }
         ancestors.pop();
         h.finish128()
     }
-    walk(p, pkg, &mut Vec::new())
+    walk(p, pkg, follow, &mut Vec::new())
 }
 
 /// `path`'s part of a shared workspace's rerun key (vfs.rs SHARE): what the checkout holds there,
 /// not when it was written. The checkouts of one repository have one run dir: a file's time says
 /// which of them was written last. None: no shared workspace, or a path outside its folder mount (a
-/// registry package's, the same folder for every checkout).
-fn shared_content(shared: Option<&SharedContent>, path: &str, pkg: bool) -> Option<u128> {
+/// registry package's, the same folder for every checkout). `follow`: as `content`.
+fn shared_content(shared: Option<&SharedContent>, path: &str, pkg: bool, follow: bool) -> Option<u128> {
     let shared = shared.filter(|_| crate::vfs::in_folder(path))?;
     let at = (crate::vfs::normalize_path(path), pkg);
     if let Some(c) = shared.borrow().get(&at) {
         return Some(*c);
     }
-    let c = content(std::path::Path::new(&*crate::vfs::on_disk(&at.0)), pkg);
+    let c = content(std::path::Path::new(&*crate::vfs::on_disk(&at.0)), pkg, follow);
     shared.borrow_mut().insert(at, c);
     Some(c)
 }
@@ -2274,7 +2473,7 @@ pub fn prune_build(build: &std::path::Path, since: std::time::SystemTime, wait: 
 }
 
 /// newest_mtime of a package directory, without its target directories and hidden entries.
-fn newest_mtime_pkg(p: &std::path::Path) -> u128 {
+fn newest_mtime_pkg(p: &std::path::Path, follow: bool) -> u128 {
     let mut t = 0;
     if let Ok(rd) = std::fs::read_dir(p) {
         for e in rd.flatten() {
@@ -2283,20 +2482,21 @@ fn newest_mtime_pkg(p: &std::path::Path) -> u128 {
             if n.starts_with("target") || n.starts_with('.') {
                 continue;
             }
-            t = t.max(newest_mtime(&e.path()));
+            t = t.max(newest_mtime(&e.path(), follow));
         }
     }
     t
 }
 
 /// Newest modification time (ns) of a file, or of everything below a directory; 0 if missing.
-fn newest_mtime(p: &std::path::Path) -> u128 {
-    let Ok(m) = std::fs::metadata(p) else { return 0 };
+/// Not `follow`: a link is itself (its own time), never what it leads to.
+fn newest_mtime(p: &std::path::Path, follow: bool) -> u128 {
+    let Ok(m) = (if follow { std::fs::metadata(p) } else { std::fs::symlink_metadata(p) }) else { return 0 };
     let mut t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
     if m.is_dir() {
         if let Ok(rd) = std::fs::read_dir(p) {
             for e in rd.flatten() {
-                t = t.max(newest_mtime(&e.path()));
+                t = t.max(newest_mtime(&e.path(), follow));
             }
         }
     }
@@ -2522,25 +2722,29 @@ mod shared_script_tests {
             std::fs::write(c.join("target/x/junk"), "junk").unwrap();
         }
         // content: what the files hold, wherever and whenever they were written
-        assert_eq!(content(&a.join("proto"), false), content(&b.join("proto"), false), "two checkouts, one content");
+        assert_eq!(content(&a.join("proto"), false, true), content(&b.join("proto"), false, true), "two checkouts, one content");
         std::fs::write(b.join("target/x/junk"), "other").unwrap();
         std::fs::write(b.join(".hidden"), "h").unwrap();
-        assert_eq!(content(&a, true), content(&b, true), "a package's target dirs and hidden entries are not its files");
-        assert_ne!(content(&a, false), content(&b, false), "a declared folder's are");
-        assert_ne!(content(&a.join("build.rs"), false), content(&a.join("proto/inner/m.proto"), false));
-        assert_eq!(content(&a.join("none"), false), 0);
+        assert_eq!(content(&a, true, true), content(&b, true, true), "a package's target dirs and hidden entries are not its files");
+        assert_ne!(content(&a, false, true), content(&b, false, true), "a declared folder's are");
+        assert_ne!(content(&a.join("build.rs"), false, true), content(&a.join("proto/inner/m.proto"), false, true));
+        assert_eq!(content(&a.join("none"), false, true), 0);
         #[cfg(unix)]
         {
             // a linked folder is walked (cargo follows links); a link back up ends there
             std::fs::create_dir_all(base.join("elsewhere")).unwrap();
             std::fs::write(base.join("elsewhere/f"), "1").unwrap();
             std::os::unix::fs::symlink(base.join("elsewhere"), base.join("linked")).unwrap();
-            let before = content(&base.join("linked"), false);
+            let before = content(&base.join("linked"), false, true);
             std::fs::write(base.join("elsewhere/f"), "2").unwrap();
-            assert_ne!(before, content(&base.join("linked"), false), "a change behind a linked folder");
+            assert_ne!(before, content(&base.join("linked"), false, true), "a change behind a linked folder");
             std::os::unix::fs::symlink(base.join("elsewhere"), base.join("elsewhere/up")).unwrap();
-            let looped = content(&base.join("linked"), false);
-            assert_eq!(looped, content(&base.join("linked"), false), "a loop ends, the same each time");
+            let looped = content(&base.join("linked"), false, true);
+            assert_eq!(looped, content(&base.join("linked"), false, true), "a loop ends, the same each time");
+            // a confined script's walk follows no link: what lies behind one is not its key's
+            let unfollowed = content(&base.join("linked"), false, false);
+            std::fs::write(base.join("elsewhere/f"), "3").unwrap();
+            assert_eq!(unfollowed, content(&base.join("linked"), false, false), "a confined script's key reads a link as itself");
         }
 
         let root = crate::vfs::normalize_path(&base.join("vfs/share/ws").to_string_lossy());

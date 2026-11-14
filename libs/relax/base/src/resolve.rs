@@ -1293,6 +1293,27 @@ pub fn run_env_refused(name: &str) -> bool {
         || ["CC", "CXX", "AR", "LINKER", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS"].iter().any(|t| tool(t))
 }
 
+/// What a confined build script's `rustc-env` says of a refused name (`script_env_refused`).
+pub const SCRIPT_ENV_PRINCIPLE: &str = "a third-party build script sets variables for the program, never for Relax, makepad, the loader or the tools they start";
+
+/// The names a confined build script's `rustc-env` may not set. The value lands in the host
+/// process, which the program shares with Relax, makepad, the dynamic loader and every tool they
+/// start (a rebuild's scripts, a self-exec run, git, ssh, a linker): a third-party script sets
+/// variables for the program, never for them (SCRIPT_ENV_PRINCIPLE). So every name that steers
+/// one of them is refused: `run_env_refused`'s, the program search (`PATH`, the Windows loader's
+/// too), the loader's (`LD_*`, `DYLD_*`), Relax's and makepad's (`RELAX_*`, `MAKEPAD_*`), cargo's,
+/// rustc's and rustup's (`CARGO*`, `RUSTC*`, `RUSTFLAGS`, `RUSTDOCFLAGS`, `RUSTUP_*`), git's and
+/// ssh's (`GIT_*`, `SSH_*`), the home and temp folders (`HOME`, `TMPDIR`, `TMP`, `TEMP`,
+/// `XDG_*`), the shell (`SHELL`) and the network's route (`HTTP_PROXY`, `HTTPS_PROXY`,
+/// `ALL_PROXY`, `NO_PROXY`). Without case: a Windows name has none, and the proxies are read in
+/// either.
+pub fn script_env_refused(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    run_env_refused(name)
+        || ["LD_", "DYLD_", "RELAX_", "MAKEPAD_", "CARGO", "RUSTC", "RUSTUP_", "GIT_", "SSH_", "XDG_"].iter().any(|p| n.starts_with(p))
+        || ["PATH", "RUSTFLAGS", "RUSTDOCFLAGS", "HOME", "TMPDIR", "TMP", "TEMP", "SHELL", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"].contains(&n.as_str())
+}
+
 /// The folders of a repository's tree (a commit's path table) whose Cargo.toml cargo's package
 /// discovery in a git checkout reads, in its order: the root first, then depth-first; no folder
 /// under a hidden one (`.x`), a `target` folder beside a Cargo.toml, or a nested repository (a

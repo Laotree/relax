@@ -3114,12 +3114,13 @@ pub(crate) fn bind_native_callbacks(u: &Unit, cb: &NativeCallbacks, owner: Optio
     Ok(())
 }
 
-/// Loads the libraries the build scripts link and the ones `#[link]` blocks of files from
+/// Loads the libraries the build scripts link (one a confined script named never from the working
+/// folder: os/proc.rs `load_library_outside_cwd`) and the ones `#[link]` blocks of files from
 /// `first_file` on name: (how many, the optional ones not found, the native library's callbacks
 /// to bind once the unit is made). A native bundle's load failure is fatal, with the loader's
 /// diagnostic and the crates it carries, and so is a callback the program does not define.
 /// The native library's callbacks are the fns of `crates` (a domain's; None: any).
-pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(String, bool)], native: Option<&crate::native::NativeLib>, first_file: usize, crates: Option<&std::collections::HashSet<u32>>) -> Result<(usize, Vec<String>, NativeCallbacks), String> {
+pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(String, bool, bool)], native: Option<&crate::native::NativeLib>, first_file: usize, crates: Option<&std::collections::HashSet<u32>>) -> Result<(usize, Vec<String>, NativeCallbacks), String> {
     let mut missing = Vec::new();
     // no-codegen mode: nothing is linked at run time -- native code is the host binary's, and
     // the program reaches only the symbols the host exports (jit.rs foreign_addr)
@@ -3138,8 +3139,9 @@ pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(Strin
         callbacks = loaded.inspect_err(|_| { let _ = std::fs::remove_file(&n.path); })?;
     }
     let provided_static = |name: &str| native.is_some_and(|n| n.statics.iter().any(|s| s == name));
-    for (name, fw) in link_libs {
-        if !crate::os::proc::load_library(name, *fw) && (*fw || !crate::os::proc::load_library_versioned(name)) {
+    for (name, fw, outside_cwd) in link_libs {
+        let loaded = if *outside_cwd { crate::os::proc::load_library_outside_cwd(name, *fw) } else { crate::os::proc::load_library(name, *fw) };
+        if !loaded && (*fw || !crate::os::proc::load_library_versioned(name)) {
             missing.push(name.clone());
         }
     }

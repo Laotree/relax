@@ -355,6 +355,29 @@ mod unix {
         pub fn dlsym(handle: *mut u8, name: *const u8) -> *mut u8;
     }
 
+    /// Where a confined build script's library `file` lies in the loader's search lists `vars`
+    /// (split at `seps`, as the loader reads them), the working folder aside: (the first absolute
+    /// entry's file, whether an entry that leads to the working folder, empty, `.` or relative,
+    /// holds it). The loader's own search of the bare name would take the latter.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn search_outside_cwd(file: &str, vars: &[&str], seps: &[char]) -> (Option<String>, bool) {
+        let mut in_cwd = false;
+        for var in vars {
+            let Some(list) = std::env::var_os(var) else { continue };
+            for entry in list.to_string_lossy().split(seps) {
+                if entry.starts_with('/') {
+                    let candidate = Path::new(entry).join(file);
+                    if candidate.is_file() {
+                        return (Some(candidate.to_string_lossy().into_owned()), in_cwd);
+                    }
+                } else if Path::new(if entry.is_empty() { "." } else { entry }).join(file).exists() {
+                    in_cwd = true;
+                }
+            }
+        }
+        (None, in_cwd)
+    }
+
     /// The library's handle, or the loader's diagnostic.
     pub fn load_path(path: &str, flags: i32) -> Result<usize, String> {
         let path = std::ffi::CString::new(path).map_err(|e| e.to_string())?;
@@ -540,6 +563,27 @@ mod imp {
         unsafe { !dlopen(path.as_ptr(), 2 | 0x100).is_null() }
     }
 
+    /// A library a confined build script named (`lib<name>.so`, a plain name: relax-front
+    /// unitgraph.rs `confined_output_refusals`) as the loader finds it with the person's
+    /// environment, but never in the working folder: an LD_LIBRARY_PATH entry that is empty, `.`
+    /// or relative is passed over. An absolute entry holding it loads by its path; else the bare
+    /// name goes to the loader when no passed-over entry holds the file (its own search finds none
+    /// there), and otherwise the system's folders are searched by path.
+    pub fn load_library_outside_cwd(name: &str, framework: bool) -> bool {
+        if framework {
+            // (an absolute path)
+            return load_library(name, framework);
+        }
+        let file = format!("lib{}.so", name);
+        let open = |path: &str| unsafe { !dlopen(format!("{}\0", path).as_ptr(), 2 | 0x100).is_null() };
+        match super::unix::search_outside_cwd(&file, &["LD_LIBRARY_PATH"], &[':', ';']) {
+            (Some(path), _) => open(&path),
+            (None, false) => load_library(name, false),
+            (None, true) => ["/lib", "/usr/lib", "/lib64", "/usr/lib64", "/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu", "/lib/aarch64-linux-gnu", "/usr/lib/aarch64-linux-gnu"]
+                .iter().map(|d| format!("{}/{}", d, file)).find(|p| std::path::Path::new(p).is_file()).is_some_and(|p| open(&p)),
+        }
+    }
+
     /// glibc's lib<name>.so is often a linker script (libm.so): the versioned file instead.
     pub fn load_library_versioned(name: &str) -> bool {
         match versioned_so(name) {
@@ -722,6 +766,22 @@ mod imp {
         }
     }
 
+    /// A confined build script's library (the Linux one's rule): an absolute LD_LIBRARY_PATH entry
+    /// holding it loads by its path; a bare name goes to the loader only when no entry that leads
+    /// to the working folder holds the file (bionic keeps `.` as that folder); else it is not
+    /// loaded.
+    pub fn load_library_outside_cwd(name: &str, framework: bool) -> bool {
+        if framework {
+            return load_library(name, framework);
+        }
+        let file = format!("lib{}.so", name);
+        match super::unix::search_outside_cwd(&file, &["LD_LIBRARY_PATH"], &[':']) {
+            (Some(path), _) => unsafe { !dlopen(format!("{}\0", path).as_ptr(), 2 | 0x100).is_null() },
+            (None, false) => load_library(name, false),
+            (None, true) => false,
+        }
+    }
+
     /// Bionic public libraries use plain sonames; never scan desktop library paths.
     pub fn load_library_versioned(_name: &str) -> bool { false }
 
@@ -771,6 +831,41 @@ mod imp {
         let path = if framework { format!("/System/Library/Frameworks/{}.framework/{}\0", name, name) } else { format!("lib{}.dylib\0", name) };
         // RTLD_NOW | RTLD_GLOBAL
         unsafe { !dlopen(path.as_ptr(), 2 | 8).is_null() }
+    }
+
+    /// A library a confined build script named (`lib<name>.dylib`, a plain name: relax-front
+    /// unitgraph.rs `confined_output_refusals`), resolved to an absolute path before the dlopen, so
+    /// the working folder never applies (dlopen of a bare name tries it, between the person's
+    /// DYLD_LIBRARY_PATH and the fallback folders): the absolute entries of LD_LIBRARY_PATH and
+    /// DYLD_LIBRARY_PATH, then of DYLD_FALLBACK_LIBRARY_PATH (unset: dyld's /usr/local/lib and
+    /// /usr/lib); the first that holds it, as a file or in the shared cache, loads. A framework's
+    /// path is absolute already.
+    pub fn load_library_outside_cwd(name: &str, framework: bool) -> bool {
+        if framework {
+            return load_library(name, framework);
+        }
+        extern "C" {
+            fn _dyld_shared_cache_contains_path(path: *const std::ffi::c_char) -> bool;
+        }
+        let absolute = |var: &str| -> Vec<String> {
+            std::env::var(var).map(|v| v.split(':').filter(|e| e.starts_with('/')).map(str::to_string).collect()).unwrap_or_default()
+        };
+        let mut dirs = absolute("LD_LIBRARY_PATH");
+        dirs.extend(absolute("DYLD_LIBRARY_PATH"));
+        if std::env::var_os("DYLD_FALLBACK_LIBRARY_PATH").is_some() {
+            dirs.extend(absolute("DYLD_FALLBACK_LIBRARY_PATH"));
+        } else {
+            dirs.extend(["/usr/local/lib".to_string(), "/usr/lib".to_string()]);
+        }
+        for d in dirs {
+            let path = format!("{}/lib{}.dylib\0", d, name);
+            let held = std::path::Path::new(&path[..path.len() - 1]).is_file() || unsafe { _dyld_shared_cache_contains_path(path.as_ptr().cast()) };
+            // RTLD_NOW | RTLD_GLOBAL
+            if held && unsafe { !dlopen(path.as_ptr(), 2 | 8).is_null() } {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn load_library_versioned(_name: &str) -> bool {
@@ -870,6 +965,12 @@ mod imp {
 
     pub fn load_library_versioned(_name: &str) -> bool {
         false
+    }
+
+    /// A confined build script's library: Windows confines no build script (its run is refused,
+    /// relax KNOWN_GAPS), so none is named; loaded as any other.
+    pub fn load_library_outside_cwd(name: &str, framework: bool) -> bool {
+        load_library(name, framework)
     }
 
     pub unsafe fn lookup(handle: *mut u8, name: *const u8) -> *mut u8 {

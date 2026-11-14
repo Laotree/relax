@@ -1036,7 +1036,7 @@ pub(crate) fn graph_key(g: &crate::unitgraph::Graph) -> u128 {
     h.u32(g.bins.len() as u32);
     for b in &g.bins { h.u32(*b as u32); }
     h.u32(g.link_libs.len() as u32);
-    for (l, framework) in &g.link_libs { h.str(l); h.u8(*framework as u8); }
+    for (l, framework, outside_cwd) in &g.link_libs { h.str(l); h.u8(*framework as u8); h.u8(*outside_cwd as u8); }
     h.u8(g.native.is_some() as u8);
     h.finish128()
 }

@@ -171,8 +171,15 @@ Not served yet, each a refusal naming its C function unless said otherwise:
 - A store package is read as committed: the run's edits (RELAX_EDITS) do not reach a confined
   script.
 - A git package checked out on disk by cargo reads its own folder, not its whole repository.
-- Output lines are not checked yet: a `rustc-link-search` or `rerun-if-changed` path outside the
-  script's folders is taken as given.
+
+Its output lines act in the run with the person's rights, so they are held to what the script
+reaches (relax-front unitgraph.rs `confined_output_refusals`); a line past that fails the build,
+naming it, and none of that output is kept: `rustc-link-search` and `rerun-if-changed` paths lie
+in its folders (a `rerun-if-changed` folder is walked without following links); `rustc-link-lib`
+names a plain library of a kind the run loads, never found in the working folder; no
+`rustc-link-arg` of any form; `rustc-env` sets no name that steers the run's process or its tools
+(`script_env_refused`: the program's variables only); no `cargo::` instruction cargo does not
+know.
 
 Start in compiler/src/sandbox/script.rs (`entry`, the domain's table) and sandbox/broker.rs (the
 folders and the walk); the decision is relax-front unitgraph.rs `script_confined`.
