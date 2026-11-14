@@ -2316,6 +2316,14 @@ pub(crate) unsafe fn fault_policy(label: &str, info: &PanicInfo, guard_depth: u3
         eprintln!("relax: {} ({}, address {:#x}) inside a guarded module call on thread '{}' at {}: contained, the call returns an error", info.kind, label, info.fault_addr, tname, at);
         return false;
     }
+    // a confined build script's run (sandbox/script.rs): its own fault ends it as a crash ends a
+    // script; any other is Relax's, with the report
+    if let Some((script, note)) = owner::call(owner::Class::Job, || crate::sandbox::script::fault_note(u, info)) {
+        eprintln!("{note}");
+        if script {
+            return true;
+        }
+    }
     crate::harness::live::fault(cur_unit(), info);
     // (a fault in an app domain is that domain's crash: the others go on)
     if FAULTS_FATAL.load(Ordering::Relaxed) && !crate::domain::in_app_domain() {

@@ -28,6 +28,8 @@
 
 include!("rt_abi.rs");
 
+pub mod script;
+
 use crate::jit::{self, FnKey, Unit};
 use crate::program::DefKind;
 use relax_backend::rir::{Callee, Cls, Cond, Conv, Func, IOp, Inst, Sym, Term, VReg, U32, U64};
@@ -1400,14 +1402,7 @@ fn run_key_destructors() {
     if !a.alive.load(std::sync::atomic::Ordering::SeqCst) || jit::unwinding() {
         return;
     }
-    // under a recovery point, as the module's own catch_unwind (a panicking destructor, or one
-    // out of fuel, is reported and the next one runs; std aborts the process there)
-    let call = |dtor: u64, value: u64| {
-        let s = save();
-        let g: rt_fn_ty!(fn(u64, u64) -> u64) = unsafe { std::mem::transmute(jit::rt_entry("catch_panic") as usize) };
-        g(mask_thunk(dtor), m(value));
-        restore(s);
-    };
+    let call = call_in_arena;
     loop {
         let next = {
             let mut g = a.keys.lock().unwrap_or_else(|e| e.into_inner());
@@ -1442,6 +1437,39 @@ fn run_key_destructors() {
     for (dtor, value) in late {
         call(dtor, value);
     }
+}
+
+/// Host code calls code of the current arena through a pointer that code supplied: `f` masked into
+/// the arena's thunk table (a forged pointer lands on a thunk: a twin or the trap), `arg` into its
+/// window, under a recovery point as the module's own catch_unwind (a panicking callee, or one out
+/// of fuel, is reported and the caller goes on; std aborts the process there), the sandbox words as
+/// they were after. The one way host code calls such a pointer (key destructors, exit handlers):
+/// never stored as a host fn type, never called outside an entry of its arena.
+pub(crate) fn call_in_arena(f: u64, arg: u64) {
+    if !sb_ready() || cur_arena().is_none() {
+        return;
+    }
+    let s = save();
+    let g: rt_fn_ty!(fn(u64, u64) -> u64) = unsafe { std::mem::transmute(jit::rt_entry("catch_panic") as usize) };
+    g(mask_thunk(f), m(arg));
+    restore(s);
+}
+
+/// A pointer a confinement entry hands back to the current arena's code (returned, or written
+/// through an out pointer): itself when it lies in the arena's window, else 0 (a broker bug,
+/// said): the code gets NULL, a clean error, never the arena's bytes at a masked host address.
+pub(crate) fn ret_arena(p: u64) -> u64 {
+    let base = if sb_ready() { cur_arena().map_or(0, |a| a.base) } else { 0 };
+    let r = ret_in(base, p);
+    if r != p {
+        eprintln!("relax: a confinement entry handed back {p:#x}, outside its arena (a Relax bug): the code gets NULL");
+    }
+    r
+}
+
+/// `ret_arena` of the window at `base` (0: no arena).
+fn ret_in(base: u64, p: u64) -> u64 {
+    if base != 0 && p & !(WINDOW - 1) == base { p } else { 0 }
 }
 
 /// A wrapper's call returns (or unwinds): the state before it comes back.
@@ -1825,6 +1853,10 @@ extern "C" fn sb_gettid() -> i32 {
 extern "C" fn sb_getpid() -> i32 {
     0
 }
+/// (a pthread_t is a host address on Linux and macOS: the segment's number instead, as `gettid`)
+extern "C" fn sb_pthread_self() -> u64 {
+    cur_seg().map_or(0, |(_, k)| k as u64 + 1)
+}
 
 rt_fn! {
 fn sb_fmt_str(p: u64, len: u64, spec: u64) {
@@ -1949,6 +1981,7 @@ fn c_policy(allow: Allow, name: &str) -> Option<Option<(&'static str, u64)>> {
         // thread identity (std::thread::current): no host thread or process ids
         "pthread_main_np" => Some(("sb_main_np", sb_main_np as *const () as u64)),
         "gettid" => Some(("sb_gettid", sb_gettid as *const () as u64)),
+        "pthread_self" => Some(("sb_pthread_self", sb_pthread_self as *const () as u64)),
         "getpid" => Some(("sb_getpid", sb_getpid as *const () as u64)),
         "abort" => Some(("abort", 0)),
         // std's catch_unwind names its recovery point (jit.rs relax_catch_caught: a thread-local flag)
@@ -2509,4 +2542,20 @@ pub(crate) unsafe fn reset_statics() {
     reset(&TLS_OFF, std::sync::atomic::AtomicU32::new(0));
     reset(&DEAD, Mutex::new(Vec::new()));
     reset(&ARENAS, [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; MAX_MODULES]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_confinement_entry_hands_back_only_addresses_in_its_window() {
+        let base = 7 * WINDOW;
+        let host = &base as *const u64 as u64;
+        assert_eq!(ret_in(base, base + 0x1000), base + 0x1000, "an address in the window is handed back as it is");
+        assert_eq!(ret_in(base, base + WINDOW - 1), base + WINDOW - 1, "the window's last byte is in it");
+        assert_eq!(ret_in(base, host), 0, "a host address becomes NULL, never the window's bytes at its masked offset");
+        assert_eq!(ret_in(base, base + WINDOW), 0, "the next window is not this one");
+        assert_eq!(ret_in(0, host), 0, "with no arena nothing is handed back");
+    }
 }

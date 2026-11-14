@@ -3364,6 +3364,15 @@ pub(crate) fn link_attr_libs(prog: &crate::program::Program, first_file: usize) 
 /// with its code; std::process::__relax_lang_start::<T>(main) does the same.
 /// (a `#[no_main]` crate's `extern "C" fn main(argc, argv) -> c_int` is called as before)
 pub(crate) fn main_call(u: &mut Unit, main_def: DefId, entry: u64) -> Result<(u64, u64), String> {
+    Ok(match lang_start_slot(u, main_def)? {
+        Some(sid) => (u.entry(sid), entry),
+        None => (entry, 0),
+    })
+}
+
+/// The slot of std's start for a `main` that returns a value (it takes main as a fn value and
+/// reports an error); None for a main that returns nothing (it is entered itself).
+pub(crate) fn lang_start_slot(u: &mut Unit, main_def: DefId) -> Result<Option<u32>, String> {
     let main_ret = u.tcx.fn_sig(&u.prog, main_def).filter(|s| !s.header.abi.is_c_like()).map(|s| s.ret);
     match main_ret {
         Some(ret) if ret != u.tcx.tys.unit => {
@@ -3376,14 +3385,11 @@ pub(crate) fn main_call(u: &mut Unit, main_def: DefId, entry: u64) -> Result<(u6
                         && matches!(u.prog.def_path(*d).as_str(), "std::process::__relax_lang_start" | "std::process::imp::__relax_lang_start")
                 });
             match start {
-                Some(sd) => {
-                    let sid = u.fn_id(FnKey::Inst(sd, vec![ret]));
-                    Ok((u.entry(sid), entry))
-                }
+                Some(sd) => Ok(Some(u.fn_id(FnKey::Inst(sd, vec![ret])))),
                 None => Err("`fn main` returns a value but std has no process::__relax_lang_start".to_string()),
             }
         }
-        _ => Ok((entry, 0)),
+        _ => Ok(None),
     }
 }
 

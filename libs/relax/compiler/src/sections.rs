@@ -289,6 +289,12 @@ fn plain_ctor(u: &Unit, t: crate::types::TyId) -> bool {
     }
 }
 
+/// The def paths of the constructor tables the program crate `root` links (`constructors`).
+pub(crate) unsafe fn constructor_paths(up: *mut Unit, root: u32) -> Result<Vec<String>, String> {
+    let list = crate::owner::call(crate::owner::Class::Program, || constructors(&mut *up, root))?;
+    Ok(crate::owner::call(crate::owner::Class::Program, || list.iter().map(|(d, _)| (&*up).prog.def_path(*d)).collect()))
+}
+
 /// The constructors of the program crate `root` links (its dependency closure, proc-macro crates
 /// not), in the order the platform's start code calls them: (static, fn address). Err: the tables
 /// it has that the JIT does not run, each named.

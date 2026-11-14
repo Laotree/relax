@@ -741,6 +741,7 @@ pub fn init_handed(beside: Option<Vec<u8>>) {
                 write(&k, None);
             }
         }
+        let _ = GIVEN.set(given.into_iter().map(|(k, _)| k).filter(|k| !reserved(k)).collect());
     }
     let set = |own: Own| -> Env { own.into_iter().filter_map(|(k, v)| Some((k, v?))).collect() };
     let build = match std::env::var_os(std::str::from_utf8(BUILD_ENV).unwrap()) {
@@ -782,6 +783,30 @@ pub fn init_handed(beside: Option<Vec<u8>>) {
 
 /// This run's build environment (`init`): the one it was handed, else its own as it started.
 static BUILD: std::sync::OnceLock<Env> = std::sync::OnceLock::new();
+
+/// A confined build script's run (`SCRIPT_ENV`): the names its parent gave, without the reserved
+/// ones (Relax's own plumbing is never the script's).
+static GIVEN: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+
+/// A confined build script's value of `name`: one of the names its parent gave (`SCRIPT_ENV`), as
+/// the program's view has it; None for any other name, and for every name outside such a run (a
+/// confined run that was given none reads none).
+pub fn given_value(name: &[u8]) -> Option<Vec<u8>> {
+    if !GIVEN.get()?.iter().any(|g| same_name(g, name)) {
+        return None;
+    }
+    match lookup(name) {
+        Some(v) => v.map(|v| v.to_bytes().to_vec()),
+        None => std::env::var_os(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(name) }).map(std::ffi::OsString::into_encoded_bytes),
+    }
+}
+
+/// A confined build script's whole environment (`given_value` of each given name that is set), in
+/// the wire form (`encode`, every entry set).
+pub fn given_wire() -> Vec<u8> {
+    let own: Own = GIVEN.get().map_or(&[][..], Vec::as_slice).iter().filter_map(|k| Some((k.clone(), Some(given_value(k)?)))).collect();
+    encode(&own)
+}
 
 /// This run's build environment in the wire form (`encode`): what a run of its program again
 /// builds with (`spawn_env`, and selfexe.rs `hand_build` for a launch of its link by a shell).
