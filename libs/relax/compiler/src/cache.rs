@@ -8419,7 +8419,7 @@ mod data_tests {
             }
             let mut tcx = crate::tcx::Tcx::new();
             tcx.collect(&prog);
-            let mut u = Unit::new(prog, tcx, 0);
+            let u = Unit::new(prog, tcx, 0);
             let def = |u: &Unit, krate: &str, name: &str| (0..u.prog.defs.len() as u32).map(DefId).find(|&d| u.prog.def(d).krate == index[krate] && u.prog.name(d) == name).unwrap();
             let local = u.tcx.tys.intern(TyKind::Adt(def(&u, "app", "Local"), u.tcx.tys.mk_list(&[]), crate::types::RegionArgsId::EMPTY));
             let u32_ = u.tcx.tys.u32_;
