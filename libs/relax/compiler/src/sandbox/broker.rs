@@ -18,6 +18,10 @@
 //!   the null device, 1 and 2 the child's stdout and stderr.
 //! - The current folder is the broker's (the manifest folder, as cargo starts a script): `chdir`
 //!   moves it within the roots, and the process's own never changes.
+//! - A git package's source is a store folder of Relax's VFS (a virtual row): its committed files
+//!   only (relax-base vfs.rs `store_*`), never a folder mount's disk, the edits folder or a link's
+//!   target, and any other path of the VFS is "not virtual", so the walk answers it. A script whose
+//!   manifest folder is virtual has std's virtual current folder (RELAX_WORKSPACE) and no disk one.
 
 use std::ffi::{c_char, c_int, CString};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -126,6 +130,8 @@ extern "C" {
     fn unlinkat(dir: c_int, path: *const c_char, flags: c_int) -> c_int;
     fn renameat(from_dir: c_int, from: *const c_char, to_dir: c_int, to: *const c_char) -> c_int;
     fn fchmod(fd: c_int, mode: ModeT) -> c_int;
+    #[cfg_attr(all(target_vendor = "apple", target_arch = "x86_64"), link_name = "fdopendir$INODE64")]
+    fn fdopendir(fd: c_int) -> *mut std::ffi::c_void;
 }
 
 /// The host's errno of the call that just failed.
@@ -211,8 +217,10 @@ pub(crate) enum Fd {
     Std(RawFd),
     /// the null device: reads end, writes vanish
     Null,
-    /// a file or folder the walk opened; `write`: under a write root
+    /// a file or folder the walk opened, or an anonymous file; `write`: under a write root
     File { fd: OwnedFd, write: bool },
+    /// an end of a pipe the script made
+    Pipe(OwnedFd),
 }
 
 /// What `open` gives.
@@ -263,9 +271,15 @@ enum At {
 pub(crate) struct Broker {
     roots: Vec<Root>,
     excluded: Vec<(u64, u64)>,
-    /// the current folder: a root and the components under it
-    cwd: (usize, Vec<Vec<u8>>),
+    /// the store folders it reads (virtual paths, normalized)
+    stores: Vec<String>,
+    /// the current folder on disk: a root and the components under it (None: a virtual one)
+    cwd: Option<(usize, Vec<Vec<u8>>)>,
+    /// the virtual current folder (a git package's manifest folder)
+    pub(crate) virtual_cwd: Option<String>,
     fds: Vec<Option<Fd>>,
+    /// open folder listings: the host's `DIR*` and the script's dirent block (script.rs)
+    dirs: Vec<Option<(usize, u64)>>,
     /// the null device as the host's fd (a Null fd's stat, and handed to a process: script.rs)
     pub(crate) null: OwnedFd,
 }
@@ -316,12 +330,20 @@ impl Broker {
             }
         }
         let null = host_open(b"/dev/null", c::O_RDWR).map_err(|e| say(b"/dev/null", e))?;
-        let mut b = Broker { roots, excluded, cwd: (0, Vec::new()), fds: vec![Some(Fd::Null), Some(Fd::Std(1)), Some(Fd::Std(2))], null };
+        let stores = spec.store.iter().map(|p| crate::vfs::normalize_path(&String::from_utf8_lossy(p))).collect();
+        let mut b = Broker { roots, excluded, stores, cwd: None, virtual_cwd: None, fds: vec![Some(Fd::Null), Some(Fd::Std(1)), Some(Fd::Std(2))], dirs: Vec::new(), null };
         if b.roots.is_empty() {
             return Err("the confined build script has no folders".into());
         }
-        let f = b.walk(&spec.cwd, true, false).map_err(|e| say(&spec.cwd, std::io::Error::from_raw_os_error(e).to_string()))?;
-        b.cwd = b.folder_of(f)?;
+        if let Some(v) = b.store_path(&spec.cwd) {
+            if !matches!(crate::vfs::store_kind(&v), Some(crate::vfs::StoreKind::Dir)) {
+                return Err(say(&spec.cwd, "not a folder of its store".into()));
+            }
+            b.virtual_cwd = Some(v);
+        } else {
+            let f = b.walk(&spec.cwd, true, false).map_err(|e| say(&spec.cwd, std::io::Error::from_raw_os_error(e).to_string()))?;
+            b.cwd = Some(b.folder_of(f)?);
+        }
         Ok(b)
     }
 
@@ -376,7 +398,7 @@ impl Broker {
         let want_dir = path.ends_with(b"/") || path.ends_with(b"/.");
         let mut todo: std::collections::VecDeque<Vec<u8>> = components(path).into();
         if path[0] != b'/' {
-            let (r, below) = &self.cwd;
+            let Some((r, below)) = &self.cwd else { return Err(outside) };
             for c in self.roots[*r].canon.iter().chain(below.iter()).rev() {
                 todo.push_front(c.clone());
             }
@@ -632,16 +654,71 @@ impl Broker {
 
     pub(crate) fn chdir(&mut self, path: &[u8]) -> Result<(), i32> {
         let f = self.walk(path, true, false)?;
-        self.cwd = self.folder_of(f).map_err(|_| c::ENOTDIR)?;
+        self.cwd = Some(self.folder_of(f).map_err(|_| c::ENOTDIR)?);
+        self.virtual_cwd = None;
         Ok(())
     }
 
-    /// The current folder's canonical spelling.
+    /// The current folder's canonical spelling (a virtual one's, as std's own `current_dir`).
     pub(crate) fn cwd(&self) -> Vec<u8> {
-        let (r, below) = &self.cwd;
+        let Some((r, below)) = &self.cwd else { return self.virtual_cwd.clone().unwrap_or_default().into_bytes() };
         let mut comps = self.roots[*r].canon.clone();
         comps.extend(below.iter().cloned());
         join(&comps)
+    }
+
+    /// A folder of `path` to list: the host's `DIR*` (it owns the fd), opened from the walk.
+    pub(crate) fn opendir(&self, path: &[u8]) -> Result<usize, i32> {
+        let f = self.walk(path, true, false)?;
+        if !f.last.ok_or(c::ENOENT)?.is_dir() {
+            return Err(c::ENOTDIR);
+        }
+        let fd = unsafe { openat(f.dir.raw(), f.at_name().as_ptr(), c::O_RDONLY | c::O_DIRECTORY | c::O_NOFOLLOW | c::O_CLOEXEC, 0 as std::ffi::c_uint) };
+        if fd < 0 {
+            return Err(last_errno());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        if self.excluded(&fstat_fd(fd.as_raw_fd())?) {
+            return Err(c::ENOENT);
+        }
+        let d = unsafe { fdopendir(fd.as_raw_fd()) };
+        if d.is_null() {
+            return Err(last_errno());
+        }
+        // (the listing owns the fd now)
+        std::mem::forget(fd);
+        Ok(d as usize)
+    }
+
+    /// Records a listing: its handle, from 1 (never a host address).
+    pub(crate) fn add_dir(&mut self, dir: usize, block: u64) -> u64 {
+        let i = match self.dirs.iter().position(|d| d.is_none()) {
+            Some(i) => i,
+            None => {
+                self.dirs.push(None);
+                self.dirs.len() - 1
+            }
+        };
+        self.dirs[i] = Some((dir, block));
+        i as u64 + 1
+    }
+
+    pub(crate) fn dir(&self, h: u64) -> Option<(usize, u64)> {
+        usize::try_from(h).ok().and_then(|h| h.checked_sub(1)).and_then(|i| self.dirs.get(i).copied().flatten())
+    }
+
+    pub(crate) fn take_dir(&mut self, h: u64) -> Option<(usize, u64)> {
+        usize::try_from(h).ok().and_then(|h| h.checked_sub(1)).and_then(|i| self.dirs.get_mut(i)).and_then(|d| d.take())
+    }
+
+    /// `path` normalized when it lies in one of the script's store folders; None: the walk's.
+    pub(crate) fn store_path(&self, path: &[u8]) -> Option<String> {
+        let p = std::str::from_utf8(path).ok()?;
+        if !p.starts_with('/') {
+            return None;
+        }
+        let n = crate::vfs::normalize_path(p);
+        self.stores.iter().any(|s| crate::vfs::relative_path(&n, s).is_some()).then_some(n)
     }
 
     // ------------------------------------------------------------------ the fd table
@@ -707,7 +784,7 @@ mod tests {
             let to = if i == 40 { "src/lib.rs".to_string() } else { format!("chain_{}", i + 1) };
             std::os::unix::fs::symlink(to, ws.join(format!("chain_{i}"))).unwrap();
         }
-        let spec = Roots { read: vec![b(&ws)], write: vec![b(&out)], excluded: vec![b(&ws.join("target"))], cwd: b(&ws) };
+        let spec = Roots { read: vec![b(&ws)], write: vec![b(&out)], excluded: vec![b(&ws.join("target"))], store: Vec::new(), cwd: b(&ws) };
         let br = Broker::new(&spec).unwrap();
         let read = |p: &[u8]| -> Result<Vec<u8>, i32> {
             match br.open(p, c::O_RDONLY, 0)? {

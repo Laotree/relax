@@ -329,7 +329,9 @@ pub fn relax_as_rustc() -> bool {
 /// probe: autocfg, rustc_version's `--emit`) fails with status 1, as a missing rustc would: Relax
 /// is not rustc, and the script decides.
 pub fn rustc_answer(args: &[String], input: &[u8]) -> (i32, Vec<u8>, Vec<u8>) {
-    let sess = &session_from_env(args);
+    // the session of this process's own options: a question's words are rustc's, never Relax's
+    // (a script's `$RUSTC --allow-c` sets nothing of the run's)
+    let sess = &session_from_env(&[]);
     let out = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["--version"] | ["-V"] => format!("rustc {} (Relax {})\n", RUSTC_VERSION, PROVENANCE),
         ["-vV"] | ["--version", "--verbose"] | ["--verbose", "--version"] | ["-V", "--verbose"] | ["--verbose", "-V"] => format!(

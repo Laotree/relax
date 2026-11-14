@@ -25027,6 +25027,42 @@ pub extern "C" fn __relax_exit(code: i32) {
     os::proc::exit(code)
 }
 
+/// A virtual file's private copy (Relax std fs_unix.rs `virtual_fd`): an anonymous file of this
+/// process, close-on-exec: Linux's memfd, elsewhere a file of the temp folder removed as soon as it
+/// is made. A confined build script gets one from its broker (sandbox/script.rs), which calls this:
+/// the temp folder's name never reaches the script. -1 with errno set when none can be made.
+#[cfg(unix)]
+pub(crate) extern "C" fn relax_anon_fd() -> i32 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        extern "C" {
+            fn memfd_create(name: *const std::ffi::c_char, flags: std::ffi::c_uint) -> i32;
+        }
+        // MFD_CLOEXEC
+        unsafe { memfd_create(c"relax-vfs".as_ptr(), 1) }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir();
+        loop {
+            let p = dir.join(format!("relax-vfs-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            match std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&p) {
+                Ok(f) => {
+                    let _ = std::fs::remove_file(&p);
+                    return f.into_raw_fd();
+                }
+                // (a name an earlier process of the same pid left: the next one)
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                // (errno: the open's)
+                Err(_) => return -1,
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 extern "C" fn recorded_exit(code: i32) -> ! {
     // an app domain's exit ends that domain only (domain.rs)
@@ -25100,6 +25136,8 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         #[cfg(windows)]
         b"__relax_host_getenv_w" => Some(relax_base::progenv::host_get_environment_variable_w as *const () as usize),
         b"__relax_exit" => Some(__relax_exit as *const () as usize),
+        #[cfg(unix)]
+        b"__relax_anon_fd" => Some(relax_anon_fd as *const () as usize),
         b"__relax_self_spawn" => Some(crate::run::relax_self_spawn as *const () as usize),
         // makepad inspect's timeline: makepad's UI phases (platform thread/ui_hang.rs), Relax std's
         // futex wakes and the recording flag they check

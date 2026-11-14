@@ -549,6 +549,45 @@ fn not_found(path: &str) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, format!("{path}: no such file"))
 }
 
+// ---- the store alone: for code that must reach nothing on disk (a confined build script,
+// compiler sandbox/script.rs). A store mount's committed files only: never a folder mount's disk,
+// the edits folder or a link's target (a link entry reads as its text). None: `path` is under no
+// store mount (a folder mount's path is the disk's).
+
+/// What a store mount holds at `path`.
+pub enum StoreKind {
+    /// a file: its length and stat time ([`store_time_ns`])
+    File(u64, u64),
+    Dir,
+    Missing,
+}
+
+pub fn store_kind(path: &str) -> Option<StoreKind> {
+    let (m, rel) = find(path)?;
+    Some(match m.file(&rel) {
+        Some(e) if e.mode == 0o160000 => StoreKind::Missing,
+        Some(e) => StoreKind::File(m.store.object_size(&e.oid).ok().flatten().unwrap_or(0), store_time_ns(&m, Some(e))),
+        None if m.is_dir(&rel) => StoreKind::Dir,
+        None => StoreKind::Missing,
+    })
+}
+
+pub fn store_read(path: &str) -> Option<io::Result<Vec<u8>>> {
+    let (m, rel) = find(path)?;
+    let Some(e) = m.file(&rel).filter(|e| e.mode != 0o160000) else { return Some(Err(not_found(path))) };
+    Some(match m.store.object(&e.oid) {
+        Ok(Some((_, data))) => Ok(data),
+        Ok(None) => Err(io::Error::new(io::ErrorKind::InvalidData, format!("{path}: object missing from {}", m.store.path.display()))),
+        Err(e) => Err(e),
+    })
+}
+
+/// A store folder's entries (name, is folder).
+pub fn store_list(path: &str) -> Option<io::Result<Vec<(String, bool)>>> {
+    let (m, rel) = find(path)?;
+    Some(m.folders().get(&rel).cloned().ok_or_else(|| not_found(path)))
+}
+
 // Read bindings: a load binds its read snapshot to the thread it runs on for the extent of a
 // `ReadScope` on that thread's stack. The binding lives in the thread's own table and owns its
 // snapshot (a strong reference, dropped with the scope): there is no process registry, no weak

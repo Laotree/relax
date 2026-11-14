@@ -63,6 +63,8 @@ pub struct Roots {
     pub write: Vec<Vec<u8>>,
     /// folders inside those it never reaches (the run's target folder, Relax's cache)
     pub excluded: Vec<Vec<u8>>,
+    /// store folders of Relax's VFS it reads (a git package's source; virtual paths)
+    pub store: Vec<Vec<u8>>,
     /// its current folder at the start (the manifest folder, as cargo starts a script)
     pub cwd: Vec<u8>,
 }
@@ -147,8 +149,17 @@ extern "C" fn sc_env_snapshot(out: u64, out_len: u64) {
     }
 }
 
-/// std's plumbing reads: none of the host's values reach the script.
-extern "C" fn sc_host_getenv(_name: u64) -> u64 {
+/// std's plumbing reads: none of the host's values reach the script. RELAX_WORKSPACE, std's
+/// virtual current folder, is the script's own when its manifest folder is virtual.
+extern "C" fn sc_host_getenv(name: u64) -> u64 {
+    #[cfg(unix)]
+    if c_str(name).is_ok_and(|n| n == b"RELAX_WORKSPACE") {
+        let v = files::BROKER.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|b| b.virtual_cwd.clone());
+        if let Some(v) = v {
+            return interned(b"RELAX_WORKSPACE", v.as_bytes());
+        }
+    }
+    let _ = name;
     0
 }
 
@@ -248,6 +259,23 @@ mod files {
             "realpath" => e!(sc_realpath),
             "getcwd" => e!(sc_getcwd),
             "chdir" => e!(sc_chdir),
+            "opendir" => e!(sc_opendir),
+            "readdir" => e!(sc_readdir),
+            "closedir" => e!(sc_closedir),
+            "pipe" => e!(sc_pipe),
+            "pipe2" => e!(sc_pipe2),
+            "poll" => e!(sc_poll),
+            "relax_anon_fd" => e!(sc_anon_fd),
+            "relax_tool_spawn" => e!(sc_tool_spawn),
+            "relax_tool_wait" => e!(sc_tool_wait),
+            "relax_tool_release" => e!(sc_tool_release),
+            "relax_vfs_stat" => e!(sc_vfs_stat),
+            "relax_vfs_read" => e!(sc_vfs_read),
+            "relax_vfs_list" => e!(sc_vfs_list),
+            "relax_vfs_release" => e!(sc_vfs_release),
+            "relax_vfs_edit" => e!(sc_vfs_edit),
+            "relax_vfs_mounts" => e!(sc_vfs_mounts),
+            "relax_vfs_note" => e!(sc_vfs_note),
             _ => return None,
         })
     }
@@ -278,7 +306,26 @@ mod files {
         fn host_isatty(fd: c_int) -> c_int;
         #[link_name = "fcntl"]
         fn host_fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+        #[link_name = "pipe"]
+        fn host_pipe(fds: *mut c_int) -> c_int;
+        fn poll(fds: *mut PollFd, n: NfdsT, timeout: c_int) -> c_int;
+        #[cfg_attr(all(target_vendor = "apple", target_arch = "x86_64"), link_name = "readdir$INODE64")]
+        #[cfg_attr(not(all(target_vendor = "apple", target_arch = "x86_64")), link_name = "readdir")]
+        fn host_readdir(dir: *mut c_void) -> *const u8;
+        #[link_name = "closedir"]
+        fn host_closedir(dir: *mut c_void) -> c_int;
     }
+    /// struct pollfd, as reload_watch.rs and tui.rs declare it.
+    #[repr(C)]
+    struct PollFd {
+        fd: c_int,
+        events: i16,
+        revents: i16,
+    }
+    #[cfg(target_vendor = "apple")]
+    type NfdsT = u32;
+    #[cfg(not(target_vendor = "apple"))]
+    type NfdsT = u64;
     #[cfg(target_vendor = "apple")]
     type ModeT = u16;
     #[cfg(not(target_vendor = "apple"))]
@@ -310,6 +357,7 @@ mod files {
                 Fd::Null => On::Null,
                 Fd::Std(h) => On::Std(*h),
                 Fd::File { fd, write } => On::File(fd.as_raw_fd(), *write),
+                Fd::Pipe(fd) => On::File(fd.as_raw_fd(), false),
             })
         })
     }
@@ -604,6 +652,263 @@ mod files {
     extern "C" fn sc_chdir(path: u64) -> i32 {
         path_then(path, |b, p| b.chdir(p).map(|()| 0)) as i32
     }
+
+    // ---- folder listings: a handle from 1 (never a `DIR*`), the entry written into a block of
+    // the script's heap that opendir made and closedir frees, overwritten per entry (C's contract)
+
+    /// struct dirent: its size, and where d_type and d_name lie (d_ino at 0, d_reclen at 16)
+    #[cfg(target_vendor = "apple")]
+    const DIRENT: (usize, usize, usize) = (1048, 20, 21);
+    #[cfg(not(target_vendor = "apple"))]
+    const DIRENT: (usize, usize, usize) = (280, 18, 19);
+
+    extern "C" fn sc_opendir(path: u64) -> u64 {
+        let r = c_str(path).and_then(|p| {
+            with(|b| {
+                let d = b.opendir(&p)?;
+                let block = sb_malloc(DIRENT.0 as u64);
+                if block == 0 {
+                    unsafe { host_closedir(d as *mut c_void) };
+                    return Err(ENOMEM);
+                }
+                Ok(b.add_dir(d, block))
+            })
+        });
+        r.unwrap_or_else(|e| {
+            fail(e);
+            0
+        })
+    }
+
+    extern "C" fn sc_readdir(h: u64) -> u64 {
+        let Some((d, block)) = with(|b| b.dir(h).ok_or(c::EBADF)).map_err(fail).ok() else { return 0 };
+        // (the end of the listing leaves errno as it was)
+        let e = unsafe { host_readdir(d as *mut c_void) };
+        if e.is_null() {
+            return 0;
+        }
+        let (size, ty, name) = DIRENT;
+        let n = unsafe { std::ffi::CStr::from_ptr(e.add(name) as *const std::ffi::c_char) }.to_bytes();
+        let n = &n[..n.len().min(size - name - 1)];
+        let out = unsafe { std::slice::from_raw_parts_mut(block as *mut u8, size) };
+        out.fill(0);
+        // a constant non-zero inode: the script learns nothing of the host's numbering
+        out[0..8].copy_from_slice(&1u64.to_ne_bytes());
+        out[16..18].copy_from_slice(&(size as u16).to_ne_bytes());
+        #[cfg(target_vendor = "apple")]
+        out[18..20].copy_from_slice(&(n.len() as u16).to_ne_bytes());
+        out[ty] = unsafe { *e.add(ty) };
+        out[name..name + n.len()].copy_from_slice(n);
+        ret_arena(block)
+    }
+
+    extern "C" fn sc_closedir(h: u64) -> i32 {
+        match with(|b| b.take_dir(h).ok_or(c::EBADF)) {
+            Ok((d, block)) => {
+                sb_free(block);
+                unsafe { host_closedir(d as *mut c_void) }
+            }
+            Err(e) => fail(e) as i32,
+        }
+    }
+
+    // ---- pipes: real host pipes with both ends in the table (a `$RUSTC` answer writes into one)
+
+    fn pipe_in(fds: u64, flags: i32) -> i32 {
+        let r = (|| {
+            if flags & !(c::O_CLOEXEC | c::O_NONBLOCK) != 0 {
+                return Err(c::EINVAL);
+            }
+            let out = buf(fds, 8)?;
+            let mut p = [0 as c_int; 2];
+            if unsafe { host_pipe(p.as_mut_ptr()) } != 0 {
+                return Err(last_errno());
+            }
+            let ends = p.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+            for e in &ends {
+                // (close-on-exec always: the host's processes never get a script's pipe)
+                if unsafe { host_fcntl(e.as_raw_fd(), c::F_SETFD, c::FD_CLOEXEC) } != 0 || (flags & c::O_NONBLOCK != 0 && unsafe { host_fcntl(e.as_raw_fd(), c::F_SETFL, c::O_NONBLOCK) } != 0) {
+                    return Err(last_errno());
+                }
+            }
+            let [r, w] = ends;
+            let (r, w) = with(|b| Ok((b.add_fd(Fd::Pipe(r), 0), b.add_fd(Fd::Pipe(w), 0))))?;
+            unsafe { std::ptr::copy_nonoverlapping([r, w].as_ptr() as *const u8, out as *mut u8, 8) };
+            Ok(0)
+        })();
+        r.unwrap_or_else(fail) as i32
+    }
+
+    extern "C" fn sc_pipe(fds: u64) -> i32 {
+        pipe_in(fds, 0)
+    }
+
+    extern "C" fn sc_pipe2(fds: u64, flags: i32) -> i32 {
+        pipe_in(fds, flags)
+    }
+
+    /// poll over the script's fds (struct pollfd: fd, events, revents): an fd it does not have
+    /// is POLLNVAL, as the kernel says of a closed one.
+    extern "C" fn sc_poll(fds: u64, n: NfdsT, timeout: i32) -> i32 {
+        const POLLNVAL: i16 = 0x20;
+        let r = (|| {
+            let n = n as u64;
+            let a = buf(fds, n.checked_mul(8).ok_or(EFAULT)?)?;
+            let theirs = unsafe { std::slice::from_raw_parts_mut(a as *mut [u8; 8], n as usize) };
+            let mut host_fds: Vec<PollFd> = Vec::with_capacity(theirs.len());
+            let mut bad = 0;
+            for p in theirs.iter() {
+                let fd = i32::from_ne_bytes(p[0..4].try_into().unwrap());
+                let h = if fd < 0 {
+                    -1
+                } else {
+                    match on(fd) {
+                        Ok(On::Null) => with(|b| Ok(b.null.as_raw_fd()))?,
+                        Ok(On::Std(h) | On::File(h, _)) => h,
+                        Err(_) => {
+                            bad += 1;
+                            -1
+                        }
+                    }
+                };
+                host_fds.push(PollFd { fd: h, events: i16::from_ne_bytes([p[4], p[5]]), revents: 0 });
+            }
+            let r = unsafe { poll(host_fds.as_mut_ptr(), n as NfdsT, if bad > 0 { 0 } else { timeout }) };
+            if r < 0 {
+                return Err(last_errno());
+            }
+            for (p, q) in theirs.iter_mut().zip(host_fds.iter()) {
+                let fd = i32::from_ne_bytes(p[0..4].try_into().unwrap());
+                let revents = if fd >= 0 && q.fd < 0 { POLLNVAL } else { q.revents };
+                p[6..8].copy_from_slice(&revents.to_ne_bytes());
+            }
+            Ok(r as i64 + bad)
+        })();
+        r.unwrap_or_else(fail) as i32
+    }
+
+    // ---- a virtual file's private copy: an anonymous file the host makes (jit.rs relax_anon_fd)
+
+    extern "C" fn sc_anon_fd() -> i32 {
+        let fd = crate::jit::relax_anon_fd();
+        if fd < 0 {
+            return fail(last_errno()) as i32;
+        }
+        with(|b| Ok(b.add_fd(Fd::File { fd: unsafe { OwnedFd::from_raw_fd(fd) }, write: true }, 0))).unwrap_or_else(|e| fail(e) as i32)
+    }
+
+    // ---- `$RUSTC` questions (tool.rs): only an option-led question of the `rustc` the script was
+    // given, answered here; any other spawn is refused (std's NotFound) and nothing starts
+
+    /// A child's end as a host file: the script's fd `fd` (stdin's -1 is the null device, never
+    /// the host's stdin; stdout's and stderr's the child's own).
+    fn child_end(fd: i64, slot: i32) -> Option<std::fs::File> {
+        let h = match fd {
+            -1 if slot == 0 => with(|b| Ok(b.null.as_raw_fd())).ok()?,
+            -1 => slot,
+            fd => match on(i32::try_from(fd).ok()?).ok()? {
+                On::Null => with(|b| Ok(b.null.as_raw_fd())).ok()?,
+                On::Std(h) | On::File(h, _) => h,
+            },
+        };
+        let owned = unsafe { std::os::fd::BorrowedFd::borrow_raw(h) }.try_clone_to_owned().ok()?;
+        Some(std::fs::File::from(owned))
+    }
+
+    extern "C" fn sc_tool_spawn(argv: u64, len: u64, stdin: i64, stdout: i64, stderr: i64, plain: i32) -> u64 {
+        use crate::tool::TOOL_REFUSED;
+        if plain == 0 {
+            return TOOL_REFUSED;
+        }
+        let Ok(a) = buf(argv, len) else { return TOOL_REFUSED };
+        let bytes = {
+            let _safe = crate::jit::FaultSafe::enter();
+            unsafe { std::slice::from_raw_parts(a as *const u8, len as usize) }.to_vec()
+        };
+        let Some(rustc) = relax_base::progenv::given_value(b"RUSTC") else { return TOOL_REFUSED };
+        let Some(args) = crate::tool::words(&bytes).and_then(|w| crate::tool::confined_question(&w, &rustc)) else { return TOOL_REFUSED };
+        let (Some(i), Some(o), Some(e)) = (child_end(stdin, 0), child_end(stdout, 1), child_end(stderr, 2)) else { return TOOL_REFUSED };
+        // (0 would tell std to start a process: an answer that cannot start is refused)
+        match crate::tool::start(args, i, o, e) {
+            0 => TOOL_REFUSED,
+            h => h,
+        }
+    }
+
+    extern "C" fn sc_tool_wait(h: u64, block: i32) -> i64 {
+        crate::tool::relax_tool_wait(h, block)
+    }
+
+    extern "C" fn sc_tool_release(h: u64) {
+        crate::tool::relax_tool_release(h)
+    }
+
+    // ---- the VFS: the script's store folders only, as arena copies; any other path is "not
+    // virtual" (0), and std goes on to the walk
+
+    fn store_arg(p: u64, n: u64) -> Option<String> {
+        let a = buf(p, n).ok()?;
+        let bytes = {
+            let _safe = crate::jit::FaultSafe::enter();
+            unsafe { std::slice::from_raw_parts(a as *const u8, n as usize) }.to_vec()
+        };
+        with(|b| Ok(b.store_path(&bytes))).ok().flatten()
+    }
+
+    extern "C" fn sc_vfs_stat(p: u64, n: u64, size: u64, mtime_ns: u64) -> i32 {
+        let Some(path) = store_arg(p, n) else { return 0 };
+        match crate::vfs::store_kind(&path) {
+            None => 0,
+            Some(crate::vfs::StoreKind::File(len, t)) => {
+                if !(put_u64(size, len) && put_u64(mtime_ns, t)) {
+                    return -1;
+                }
+                1
+            }
+            Some(crate::vfs::StoreKind::Dir) => 2,
+            Some(crate::vfs::StoreKind::Missing) => -1,
+        }
+    }
+
+    /// Hands `data` to the script (`give`) through its out pointers: a constant id, 0 when it
+    /// cannot (std then reads NotFound).
+    fn hand(data: &[u8], out: u64, out_len: u64) -> u64 {
+        let q = ret_arena(give(data));
+        if q == 0 || !(put_u64(out, q) && put_u64(out_len, data.len() as u64)) {
+            return 0;
+        }
+        1
+    }
+
+    extern "C" fn sc_vfs_read(p: u64, n: u64, out: u64, out_len: u64) -> u64 {
+        match store_arg(p, n).and_then(|path| crate::vfs::store_read(&path)) {
+            Some(Ok(data)) => hand(&data, out, out_len),
+            _ => 0,
+        }
+    }
+
+    extern "C" fn sc_vfs_list(p: u64, n: u64, out: u64, out_len: u64) -> u64 {
+        match store_arg(p, n).and_then(|path| crate::vfs::store_list(&path)) {
+            Some(Ok(v)) => hand(v.iter().map(|(name, d)| format!("{} {name}\n", if *d { 'd' } else { 'f' })).collect::<String>().as_bytes(), out, out_len),
+            _ => 0,
+        }
+    }
+
+    /// (the broker's copy went with `give`: nothing of the host's is held)
+    extern "C" fn sc_vfs_release(_id: u64) {}
+
+    /// A write into a virtual folder: none (a confined script's virtual files are read-only).
+    extern "C" fn sc_vfs_edit(_p: u64, _n: u64, _mode: u32, _out: u64, _out_len: u64) -> u64 {
+        0
+    }
+
+    /// The mount table a child would inherit: none (the script starts no process).
+    extern "C" fn sc_vfs_mounts(_out: u64, _out_len: u64) -> u64 {
+        0
+    }
+
+    /// What the program looked at, for a live session: nothing of a confined script's is kept.
+    extern "C" fn sc_vfs_note(_p: u64, _n: u64, _kind: u32) {}
 }
 
 // ------------------------------------------------------------------ the run

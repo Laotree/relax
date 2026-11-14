@@ -37,10 +37,40 @@ fn rustc_question(argv: &[Vec<u8>]) -> Option<Vec<String>> {
     let program = std::path::Path::new(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(program) });
     let same = program.as_os_str() == rustc.as_os_str()
         || matches!((program.canonicalize(), std::path::Path::new(&rustc).canonicalize()), (Ok(a), Ok(b)) if a == b);
-    if !same || !args.first().is_some_and(|a| a.first() == Some(&b'-')) {
+    if !same {
+        return None;
+    }
+    option_led(args)
+}
+
+/// A confined script's question (sandbox/script.rs): the program is the `rustc` its parent gave
+/// it, byte for byte (no path of the script's is resolved), and the question is option-led.
+#[cfg(unix)]
+pub(crate) fn confined_question(argv: &[Vec<u8>], rustc: &[u8]) -> Option<Vec<String>> {
+    let (program, args) = argv.split_first()?;
+    if program.as_slice() != rustc {
+        return None;
+    }
+    option_led(args)
+}
+
+fn option_led(args: &[Vec<u8>]) -> Option<Vec<String>> {
+    if !args.first().is_some_and(|a| a.first() == Some(&b'-')) {
         return None;
     }
     Some(args.iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect())
+}
+
+/// The words of std's encoded command (`<length>:<bytes>` each); None: malformed.
+pub(crate) fn words(mut s: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut words = Vec::new();
+    while let Some(colon) = s.iter().position(|&b| b == b':') {
+        let n = std::str::from_utf8(&s[..colon]).ok()?.parse::<usize>().ok()?;
+        let w = s.get(colon + 1..colon.checked_add(1 + n)?)?;
+        words.push(w.to_vec());
+        s = &s[colon + 1 + n..];
+    }
+    Some(words)
 }
 
 /// One end of the child's stdio, as this process's own file: `raw` the end std made for the child
@@ -87,16 +117,15 @@ pub extern "C" fn relax_tool_spawn(argv: *const u8, len: usize, stdin: i64, stdo
     if plain == 0 {
         return 0;
     }
-    let mut s = if len == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(argv, len) } };
-    let mut words = Vec::new();
-    while let Some(colon) = s.iter().position(|&b| b == b':') {
-        let Ok(n) = std::str::from_utf8(&s[..colon]).unwrap_or("").parse::<usize>() else { return 0 };
-        let Some(w) = s.get(colon + 1..colon + 1 + n) else { return 0 };
-        words.push(w.to_vec());
-        s = &s[colon + 1 + n..];
-    }
-    let Some(args) = rustc_question(&words) else { return 0 };
+    let s = if len == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(argv, len) } };
+    let Some(args) = words(s).and_then(|w| rustc_question(&w)) else { return 0 };
     let (Some(input), Some(out), Some(err)) = (adopt(stdin, 0), adopt(stdout, 1), adopt(stderr, 2)) else { return 0 };
+    start(args, input, out, err)
+}
+
+/// Starts the answer to `args` on a run thread of its own, with the child's ends: its handle, 0
+/// when it could not start.
+pub(crate) fn start(args: Vec<String>, input: std::fs::File, out: std::fs::File, err: std::fs::File) -> u64 {
     let h = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     TOOLS.lock().unwrap_or_else(|e| e.into_inner()).push((h, Tool { status: None, released: false }));
     let started = crate::run_threads::spawn("run-tool", move || {
@@ -153,5 +182,22 @@ pub extern "C" fn relax_tool_release(h: u64) {
         } else {
             t[i].1.released = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A build script's question carries rustc's words only: Relax's own flags among them
+    /// (`--no-asm`, `--allow-c`) change nothing of the run that answers.
+    #[test]
+    fn a_rustc_question_never_sets_the_runs_flags() {
+        isolated_test!(a_rustc_question_never_sets_the_runs_flags);
+        for name in ["RELAX_NO_ASM", "RELAX_ALLOW_C"] {
+            assert_eq!(std::env::var_os(name), None, "{name} is set in the test's own environment");
+        }
+        let args: Vec<String> = ["--print", "cfg", "--no-asm", "--allow-c"].iter().map(|s| s.to_string()).collect();
+        let _ = crate::rustc_answer(&args, b"");
+        assert_eq!(std::env::var_os("RELAX_NO_ASM"), None, "the question's --no-asm set RELAX_NO_ASM");
+        assert_eq!(std::env::var_os("RELAX_ALLOW_C"), None, "the question's --allow-c set RELAX_ALLOW_C");
     }
 }
