@@ -859,8 +859,8 @@ impl Extend<String> for String {
 }
 
 // alloc/src/string.rs (Rust 1.45; compact_str's iterators)
-impl Extend<crate::boxed::Box<str>> for String {
-    fn extend<I: IntoIterator<Item = crate::boxed::Box<str>>>(&mut self, iter: I) {
+impl<A: crate::heap::Allocator> Extend<crate::boxed::Box<str, A>> for String {
+    fn extend<I: IntoIterator<Item = crate::boxed::Box<str, A>>>(&mut self, iter: I) {
         let mut it = iter.into_iter();
         while let Some(s) = it.next() {
             self.push_str(&s);
@@ -868,8 +868,8 @@ impl Extend<crate::boxed::Box<str>> for String {
     }
 }
 
-impl FromIterator<crate::boxed::Box<str>> for String {
-    fn from_iter<I: IntoIterator<Item = crate::boxed::Box<str>>>(iter: I) -> String {
+impl<A: crate::heap::Allocator> FromIterator<crate::boxed::Box<str, A>> for String {
+    fn from_iter<I: IntoIterator<Item = crate::boxed::Box<str, A>>>(iter: I) -> String {
         let mut buf = String::new();
         buf.extend(iter);
         buf

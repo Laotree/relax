@@ -2,7 +2,7 @@
 //! S1), at real alloc's paths.
 
 pub mod alloc {
-    pub use core::heap::{alloc, alloc_zeroed, dealloc, handle_alloc_error, realloc, AllocError, Allocator, Global, GlobalAlloc, Layout, LayoutErr, LayoutError, StaticAllocator, System};
+    pub use core::heap::{alloc, alloc_zeroed, dealloc, handle_alloc_error, realloc, AllocError, Allocator, AllocatorNightly, Global, GlobalAlloc, Layout, LayoutErr, LayoutError, StaticAllocator, System};
 }
 
 pub mod borrow {
@@ -69,7 +69,7 @@ pub mod sync {
 }
 
 pub mod vec {
-    pub use core::vec::{from_elem, Drain, ExtractIf, IntoIter, Vec};
+    pub use core::vec::{from_elem, Drain, ExtractIf, IntoIter, Splice, Vec};
 }
 
 pub mod task {

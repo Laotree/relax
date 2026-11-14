@@ -3122,6 +3122,21 @@ impl Tcx {
                     return self.tys.error;
                 }
                 if self.prohibit_constraints(cx, prog, file, seg.args()) { return self.tys.error; }
+                // lower_generic_args: an argument given to another crate's `#[unstable]` parameter
+                // needs its feature (rustc 1.100's `vec::IntoIter<T, A>`: E0658 for allocator_ext)
+                let krate = prog.mods[module as usize].krate;
+                if def.krate != krate && self.validates(prog, file) {
+                    let given = match ast.gargs(seg.args()) {
+                        Some(ast::GenericArgs::Angle(v)) => ast.list(*v).iter().filter(|a| matches!(a, ast::GenericArg::Type(_) | ast::GenericArg::Const(_))).count(),
+                        _ => 0,
+                    };
+                    if given > 0 {
+                        let feats = prog.crates[krate as usize].features(prog);
+                        for (i, u) in crate::feature_gate::unstable_generic_params(prog, d) {
+                            if i < given && !u.enabled(feats) { self.err(cx, prog, file, seg.name.lo, u.message()); }
+                        }
+                    }
+                }
             }
         }
         match def.kind {

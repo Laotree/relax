@@ -591,10 +591,16 @@ impl<T> [T] {
     {
         super::to_vec(self)
     }
-    pub fn into_vec(self: crate::boxed::Box<[T]>) -> Vec<T> {
+    pub fn to_vec_in<A: crate::heap::Allocator>(&self, alloc: A) -> Vec<T, A>
+    where
+        T: Clone,
+    {
+        super::to_vec_in(self, alloc)
+    }
+    pub fn into_vec<A: crate::heap::Allocator>(self: crate::boxed::Box<[T], A>) -> Vec<T, A> {
         let len = self.len();
-        let p = crate::boxed::Box::into_raw(self) as *mut T;
-        unsafe { Vec::from_raw_parts(p, len, len) }
+        let (p, alloc) = crate::boxed::Box::into_non_null_with_allocator(self);
+        unsafe { Vec::from_raw_parts_in(p.cast::<T>().as_ptr(), len, len, alloc) }
     }
     pub fn repeat(&self, n: usize) -> Vec<T>
     where

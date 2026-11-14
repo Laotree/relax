@@ -3,8 +3,7 @@
 //! Box<T> -> Box<dyn Tr> and Box<[T; N]> -> Box<[T]> unsize, and calls through Box<dyn Fn*> are
 //! built in. Its allocator is its last field: a Box is its pointer's leaves, then A's.
 //! Constructors without an allocator are the global allocator's, as library/'s are; so are the
-//! conversions through Vec, String and slices until Vec has its allocator parameter
-//! (KNOWN_GAPS.md).
+//! conversions from slices, arrays, str, String, Cow and iterators.
 
 use crate::any::Any;
 use crate::borrow::{Borrow, BorrowMut};
@@ -193,6 +192,19 @@ impl<T> Box<[T]> {
     }
 }
 
+impl<T, A: Allocator> Box<[T], A> {
+    pub fn new_uninit_slice_in(len: usize, alloc: A) -> Box<[MaybeUninit<T>], A> {
+        let mut v: Vec<MaybeUninit<T>, A> = Vec::with_capacity_in(len, alloc);
+        unsafe { v.set_len(len) };
+        v.into_boxed_slice()
+    }
+    pub fn new_zeroed_slice_in(len: usize, alloc: A) -> Box<[MaybeUninit<T>], A> {
+        let mut b = Box::<[T], A>::new_uninit_slice_in(len, alloc);
+        unsafe { im::write_bytes(b.as_mut_ptr(), 0, len) };
+        b
+    }
+}
+
 impl<T, A: Allocator> Box<MaybeUninit<T>, A> {
     pub unsafe fn assume_init(self) -> Box<T, A> {
         let (raw, alloc) = Box::into_raw_with_allocator(self);
@@ -240,21 +252,6 @@ impl<T, const N: usize> crate::convert::TryFrom<Vec<T>> for Box<[T; N]> {
     }
 }
 
-/// A Box's block given back to its allocator when dropped (a zero-sized one is no block).
-struct BoxFree<'a, A: Allocator> {
-    ptr: NonNull<u8>,
-    layout: Layout,
-    alloc: &'a A,
-}
-
-impl<'a, A: Allocator> Drop for BoxFree<'a, A> {
-    fn drop(&mut self) {
-        if self.layout.size() != 0 {
-            unsafe { self.alloc.deallocate(self.ptr, self.layout) }
-        }
-    }
-}
-
 // The contents, then the block (library/'s Drop deallocates after the compiler dropped the
 // contents), then the allocator itself (the field's own drop, after this).
 unsafe impl<#[may_dangle] T: ?Sized, A: Allocator> Drop for Box<T, A> {
@@ -263,7 +260,7 @@ unsafe impl<#[may_dangle] T: ?Sized, A: Allocator> Drop for Box<T, A> {
             let layout = Layout::for_value(&*self.ptr.as_ptr());
             // rustc_mir_transform/src/elaborate_drop.rs: open_drop_for_adt calls
             // Box's deallocator even when dropping its contents unwinds.
-            let _free = BoxFree { ptr: self.ptr.cast::<u8>(), layout, alloc: &self.alloc };
+            let _free = heap::DeallocGuard { ptr: self.ptr.cast::<u8>(), layout, alloc: &self.alloc };
             im::drop_in_place(self.ptr.as_ptr());
         }
     }
@@ -325,15 +322,32 @@ impl<T: Clone, A: Allocator + Clone> Clone for Box<T, A> {
     }
 }
 
-impl<T: Clone> Clone for Box<[T]> {
-    fn clone(&self) -> Box<[T]> {
-        crate::slice::to_vec(&**self).into_boxed_slice()
+impl<T: Clone, A: Allocator + Clone> Clone for Box<[T], A> {
+    fn clone(&self) -> Self {
+        crate::slice::to_vec_in(&**self, self.alloc.clone()).into_boxed_slice()
+    }
+    fn clone_from(&mut self, source: &Self) {
+        if self.len() == source.len() {
+            self.clone_from_slice(source);
+        } else {
+            *self = source.clone();
+        }
     }
 }
 
-impl Clone for Box<str> {
-    fn clone(&self) -> Box<str> {
-        String::from(&**self).into_boxed_str()
+impl<A: Allocator + Clone> Clone for Box<str, A> {
+    fn clone(&self) -> Self {
+        let bytes = crate::slice::to_vec_in(self.as_bytes(), self.alloc.clone()).into_boxed_slice();
+        let (raw, alloc) = Box::into_raw_with_allocator(bytes);
+        // the bytes of a str
+        unsafe { Box::from_raw_in(raw as *mut str, alloc) }
+    }
+}
+
+impl<A: Allocator> From<Box<str, A>> for Box<[u8], A> {
+    fn from(s: Box<str, A>) -> Self {
+        let (raw, alloc) = Box::into_raw_with_allocator(s);
+        unsafe { Box::from_raw_in(raw as *mut [u8], alloc) }
     }
 }
 
@@ -469,10 +483,10 @@ impl<I: DoubleEndedIterator + ?Sized, A: Allocator> DoubleEndedIterator for Box<
 }
 impl<I: ExactSizeIterator + ?Sized, A: Allocator> ExactSizeIterator for Box<I, A> {}
 
-impl<T> IntoIterator for Box<[T]> {
+impl<T, A: Allocator> IntoIterator for Box<[T], A> {
     type Item = T;
-    type IntoIter = crate::vec::IntoIter<T>;
-    fn into_iter(self) -> crate::vec::IntoIter<T> {
+    type IntoIter = crate::vec::IntoIter<T, A>;
+    fn into_iter(self) -> crate::vec::IntoIter<T, A> {
         self.into_vec().into_iter()
     }
 }

@@ -121,25 +121,46 @@ What stays out of reach:
 Start in libs/relax_api/src/lib.rs (`env`) for the read, and in tools/run/runner/src/lib.rs
 `run_spec` for a store run's order.
 
-## 8. A boxed slice or str in an allocator of its own has no Vec or String conversions yet
+## 8. `drain`, `splice` and `extract_if` of a Vec in another allocator: E0277 where rustc says E0658
 
 ```rust
 use std::alloc::System;
 
 fn main() {
-    let b: Box<[u8], System> = Box::new_in([1u8, 2, 3], System);
-    let c = b.clone();
-    let v = b.into_vec();
-    let n: u32 = c.into_iter().map(u32::from).sum();
-    println!("{} {}", v.len(), n);
+    let mut v = Vec::new_in(System);
+    v.push(1u8);
+    println!("{}", v.drain(..).count());
 }
 ```
 
-- rustc 1.100: `3 6`. Clone, `into_vec` and IntoIterator of `Box<[T], A>` go through `Vec<T, A>`.
-- Relax: E0599 / E0277. Box has its allocator parameter, but Vec does not yet (relax issue 156 ports
-  them in that order), so these impls and the `Box<str, A>` ones are the global allocator's only.
+- rustc 1.100: E0658, use of unstable library feature `allocator_ext`, at `drain`, with the note
+  "required for `System` to implement `std::alloc::AllocatorNightly`". Vec's allocator parameter
+  is stable, Drain's, Splice's and ExtractIf's are not: these methods need `A: AllocatorNightly`, a
+  `#[marker]` trait that library/ implements for Global, and for every allocator under an
+  `#[unstable_feature_bound(allocator_ext)]` impl. rustc 1.100.0 also says E0658 for `splice` and
+  `extract_if` on such a Vec, for `drain` on a generic `A: Allocator` (the note names `A`), and for
+  `VecDeque::from(v)` of a `Vec<u8, System>` (its `From` impl needs `A: AllocatorNightly` too).
+  Only `#![feature(allocator_ext)]` makes these programs compile (the one above prints 1);
+  `#![feature(allocator_api)]` does not, although it implies `allocator_ext` for the `#[unstable]`
+  items: a feature bound takes the exact feature (and rustc warns that `allocator_api` has been
+  partially stabilized and is succeeded by `allocator_ext`).
+- Relax: E0277, the trait bound `System: AllocatorNightly` is not satisfied. Relax std has the
+  Global impl only, since Relax does not take `#[unstable_feature_bound]`: the same programs are
+  rejected on stable, under another code, and with `#![feature(allocator_ext)]` they stay rejected.
 
-Start in libs/relax/compiler/std/core/boxed.rs (its `Box<[T]>` and `Box<str>` impls) and vec/mod.rs.
+Start in the trait solver (types/src/next_solver). rustc's mechanism, as we understand it (check it
+against rustc_next_trait_solver before porting): an
+`#[unstable_feature_bound(f)]` on an impl (or fn) adds a where clause that holds when the param env
+has the same clause, in post-analysis typing modes (codegen of an upstream body), or when the crate
+being solved enables exactly `f` and is not a staged-API crate; otherwise the goal is ambiguous, not
+false, and an ambiguity whose leaf is that clause is reported as E0658 with the "required for" note.
+For `Global`, the plain impl's answer wins over the ambiguous blanket one. The catch in Relax: one
+solver serves every crate of the program, and a canonical answer for a goal with no inference
+variables is shared by all of them (`CanonicalQueryInput` keeps `impl_view` only for goals with
+inference variables). This clause's answer depends on the solving crate's features, so the cache key
+has to say which crate's features apply (for instance only for a crate that enables some feature, so
+stable crates keep sharing every answer). The fix is that cache-key change, the new clause kind, the
+E0658 report, and the blanket impl in std/core/heap.rs.
 
 ## 9. A confined build script reaches files, folders, its environment, pipes and `$RUSTC` only
 

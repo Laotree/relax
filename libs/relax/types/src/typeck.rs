@@ -1607,7 +1607,7 @@ impl<'a> Fcx<'a> {
 
     fn ty_str(&mut self, t: TyId) -> String {
         let t = self.infcx.deeply_resolve_ignoring_regions(t);
-        ty_to_string(false, self.prog, self.tcx, t)
+        ty_to_diag_string(self.prog, self.tcx, t)
     }
 
     /// rustc_hir_typeck demand_eqtype / demand_suptype: the types are the same, or E0308.
@@ -1615,7 +1615,7 @@ impl<'a> Fcx<'a> {
         if self.eq(expected, actual) { return true; }
         let (x, a) = (self.infcx.deeply_resolve_ignoring_regions(expected), self.infcx.deeply_resolve_ignoring_regions(actual));
         if self.tcx.tys.has_error(x) || self.tcx.tys.has_error(a) { return false; }
-        let (sx, sa) = (ty_to_string(false, self.prog, self.tcx, x), ty_to_string(false, self.prog, self.tcx, a));
+        let (sx, sa) = (ty_to_diag_string(self.prog, self.tcx, x), ty_to_diag_string(self.prog, self.tcx, a));
         let (sx, sa) = if sx == sa { (ty_to_string_paths(self.prog, self.tcx, x), ty_to_string_paths(self.prog, self.tcx, a)) } else { (sx, sa) };
         self.err(pos, format!("E0308: mismatched types: expected `{}`, found `{}`", sx, sa));
         false
@@ -8719,6 +8719,18 @@ pub fn item_path(prog: &Program, tcx: &Tcx, d: DefId) -> String {
 }
 
 pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -> String {
+    ty_string(stable_closures, false, prog, tcx, t)
+}
+
+/// A type as rustc's diagnostics print it: an ADT's trailing arguments that equal their
+/// parameter's default are left out (`Vec<u8>` for `Vec<u8, Global>`, rustc_middle
+/// ty/print/pretty.rs `generic_args_to_print`). For messages only: it lowers the defaults, so
+/// keys and names keep `ty_to_string`.
+pub fn ty_to_diag_string(prog: &Program, tcx: &Tcx, t: TyId) -> String {
+    ty_string(false, true, prog, tcx, t)
+}
+
+fn ty_string(stable_closures: bool, elide: bool, prog: &Program, tcx: &Tcx, t: TyId) -> String {
     match tcx.tys.kind(t) {
         TyKind::Bool => "bool".to_string(),
         TyKind::Char => "char".to_string(),
@@ -8732,7 +8744,7 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
                 if i > 0 {
                     s.push_str(", ");
                 }
-                s.push_str(&ty_to_string(stable_closures, prog, tcx, *x));
+                s.push_str(&ty_string(stable_closures, elide, prog, tcx, *x));
             }
             if tcx.tys.list(*v).len() == 1 {
                 s.push(',');
@@ -8740,20 +8752,22 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
             s.push(')');
             s
         }
-        TyKind::Array(e, n) => format!("[{}; {}]", ty_to_string(stable_closures, prog, tcx, *e), const_str(prog, tcx, *n)),
+        TyKind::Array(e, n) => format!("[{}; {}]", ty_string(stable_closures, elide, prog, tcx, *e), const_str(prog, tcx, *n)),
         TyKind::Const(v) => const_str(prog, tcx, *v),
-        TyKind::Slice(e) => format!("[{}]", ty_to_string(stable_closures, prog, tcx, *e)),
-        TyKind::Ref(m, e, _) => format!("&{}{}", if *m { "mut " } else { "" }, ty_to_string(stable_closures, prog, tcx, *e)),
-        TyKind::Ptr(m, e) => format!("*{} {}", if *m { "mut" } else { "const" }, ty_to_string(stable_closures, prog, tcx, *e)),
+        TyKind::Slice(e) => format!("[{}]", ty_string(stable_closures, elide, prog, tcx, *e)),
+        TyKind::Ref(m, e, _) => format!("&{}{}", if *m { "mut " } else { "" }, ty_string(stable_closures, elide, prog, tcx, *e)),
+        TyKind::Ptr(m, e) => format!("*{} {}", if *m { "mut" } else { "const" }, ty_string(stable_closures, elide, prog, tcx, *e)),
         TyKind::Adt(d, args, _) => {
             let mut s = prog.name(*d).to_string();
+            let args = tcx.tys.list(*args);
+            let args = if elide { &args[..tcx.shown_args(prog, *d, args)] } else { args };
             if !args.is_empty() {
                 s.push('<');
-                for (i, x) in tcx.tys.list(*args).iter().enumerate() {
+                for (i, x) in args.iter().enumerate() {
                     if i > 0 {
                         s.push_str(", ");
                     }
-                    s.push_str(&ty_to_string(stable_closures, prog, tcx, *x));
+                    s.push_str(&ty_string(stable_closures, elide, prog, tcx, *x));
                 }
                 s.push('>');
             }
@@ -8765,10 +8779,10 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
                 if i > 0 {
                     s.push_str(", ");
                 }
-                s.push_str(&ty_to_string(stable_closures, prog, tcx, *x));
+                s.push_str(&ty_string(stable_closures, elide, prog, tcx, *x));
             }
             s.push_str(") -> ");
-            s.push_str(&ty_to_string(stable_closures, prog, tcx, *r));
+            s.push_str(&ty_string(stable_closures, elide, prog, tcx, *r));
             s
         }
         TyKind::FnDef(d, _, _) => format!("fn item {}", prog.def_path(*d)),
@@ -8799,7 +8813,7 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
                     if i > 0 {
                         s.push_str(", ");
                     }
-                    s.push_str(&ty_to_string(stable_closures, prog, tcx, *a));
+                    s.push_str(&ty_string(stable_closures, elide, prog, tcx, *a));
                 }
                 s.push('>');
             }
@@ -8811,7 +8825,7 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
         }
         TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { def_id: d }, args, regions: _ }) => {
             let st = match tcx.tys.list(*args).first() {
-                Some(t) => ty_to_string(stable_closures, prog, tcx, *t),
+                Some(t) => ty_string(stable_closures, elide, prog, tcx, *t),
                 None => "?".to_string(),
             };
             format!("<{} as {}>::{}", st, prog.name(prog.def(*d).parent), prog.name(*d))
@@ -8828,7 +8842,7 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
             }
             s
         }
-        TyKind::Alias(_, alias) => format!("{}<{}>", prog.name(alias.kind.def_id()), tcx.tys.list(alias.args).iter().map(|ty| ty_to_string(stable_closures, prog, tcx, *ty)).collect::<Vec<_>>().join(", ")),
+        TyKind::Alias(_, alias) => format!("{}<{}>", prog.name(alias.kind.def_id()), tcx.tys.list(alias.args).iter().map(|ty| ty_string(stable_closures, elide, prog, tcx, *ty)).collect::<Vec<_>>().join(", ")),
         TyKind::Error => "{error}".to_string(),
     }
 }

@@ -196,34 +196,20 @@ pub(crate) fn alloc_or_abort(layout: Layout) -> *mut u8 {
     p
 }
 
-pub(crate) fn realloc_or_abort(ptr: *mut u8, old: Layout, new_size: usize) -> *mut u8 {
-    if old.size == 0 {
-        return alloc_or_abort(unsafe { Layout::from_size_align_unchecked(new_size, old.align()) });
-    }
-    if new_size == 0 {
-        unsafe { dealloc(ptr, old) };
-        return old.align() as *mut u8;
-    }
-    let p = unsafe { realloc(ptr, old, new_size) };
-    if p.is_null() {
-        handle_alloc_error(unsafe { Layout::from_size_align_unchecked(new_size, old.align()) });
-    }
-    p
+/// Gives a block back to its allocator when dropped, on the unwind path too (library/'s
+/// DeallocDropGuard of Box::try_clone_from_ref_in; Box's and Vec's drops free their block with
+/// it after dropping the contents). A zero-sized layout is no block.
+pub(crate) struct DeallocGuard<'a, A: Allocator> {
+    pub(crate) ptr: NonNull<u8>,
+    pub(crate) layout: Layout,
+    pub(crate) alloc: &'a A,
 }
 
-pub(crate) fn free(ptr: *mut u8, layout: Layout) {
-    if layout.size != 0 {
-        unsafe { dealloc(ptr, layout) }
-    }
-}
-
-// library/alloc/src/boxed.rs: Box::try_clone_from_ref_in uses DeallocDropGuard
-// to keep deallocation on the unwind path.
-pub(crate) struct DeallocGuard(pub(crate) *mut u8, pub(crate) Layout);
-
-impl Drop for DeallocGuard {
+impl<'a, A: Allocator> Drop for DeallocGuard<'a, A> {
     fn drop(&mut self) {
-        free(self.0, self.1);
+        if self.layout.size != 0 {
+            unsafe { self.alloc.deallocate(self.ptr, self.layout) }
+        }
     }
 }
 
@@ -429,6 +415,15 @@ pub struct Global;
 
 unsafe impl StaticAllocator for Global {}
 unsafe impl StaticAllocator for System {}
+
+/// library/alloc/src/alloc.rs @1.100.0: the bound of the stable methods whose result names an
+/// allocator parameter that is still unstable (Vec::drain, splice and extract_if: Drain, Splice and
+/// ExtractIf). library/ implements it for every allocator only under `allocator_ext`
+/// (`#[unstable_feature_bound]`), which Relax does not take: here, as on stable, Global alone.
+#[doc(hidden)]
+pub trait AllocatorNightly: Allocator {}
+
+impl AllocatorNightly for Global {}
 
 impl Global {
     #[inline]
