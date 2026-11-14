@@ -6094,6 +6094,8 @@ impl<'a> Lcx<'a> {
             ExprKind::Array(v) | ExprKind::Tuple(v) => ast.list(v).iter().all(|x| self.value_unqualified(*x)),
             // (qualifs.rs in_rvalue: a repeat is qualified by its operand)
             ExprKind::Repeat(x, _) => self.value_unqualified(x),
+            // (qualifs.rs in_place: a field's type may hold a qualif, then its base's value decides)
+            ExprKind::Field(x, _) | ExprKind::TupleField(x, _) => self.value_unqualified(x),
             ExprKind::Path(_) => match self.b.res.get(&e.0).copied() {
                 Some(Res::Def(d)) => match self.u.prog.def(d).kind {
                     DefKind::Const | DefKind::AssocConst => self.const_promotable(e),
@@ -6187,6 +6189,15 @@ impl<'a> Lcx<'a> {
             ExprKind::Closure(_) => matches!(self.kind_ref(t), TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: captures, .. })
                 if matches!(self.kind_ref(*captures), TyKind::Tuple(ts) if ts.is_empty())),
             ExprKind::AddrOf(false, false, x) => self.promotable(x),
+            // rustc_mir_transform/src/promote_consts.rs: Validator::validate_place: a field of a
+            // promotable temporary (`&[C.id, 6]` reads `C`'s temporary), not of a union; a Deref
+            // projection (an autoderef) is not promoted
+            ExprKind::Field(x, _) | ExprKind::TupleField(x, _) => {
+                let bt = self.body_ty(x);
+                self.b.field_idx.get(&e.0).is_some_and(|&(d, _)| d == 0)
+                    && !matches!(self.kind(bt), TyKind::Adt(d, ..) if self.u.tcx.adts.get(&d).is_some_and(|a| a.is_union()))
+                    && self.promotable(x)
+            }
             ExprKind::Call(f, args) => {
                 let ctor = matches!(self.b.res.get(&strip_paren(ast, f).0), Some(Res::Def(d)) if matches!(self.u.prog.def(*d).kind, DefKind::Variant | DefKind::Struct));
                 // rustc_mir_transform/src/promote_consts.rs: Validator::validate_call.
