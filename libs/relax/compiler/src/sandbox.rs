@@ -29,6 +29,8 @@
 include!("rt_abi.rs");
 
 pub mod script;
+#[cfg(unix)]
+mod broker;
 
 use crate::jit::{self, FnKey, Unit};
 use crate::program::DefKind;
@@ -1005,9 +1007,9 @@ fn m(p: u64) -> u64 {
     }
 }
 
-/// `len` bytes from masked `p` stay inside the window.
+/// `len` bytes from masked `p` stay inside the window (a length past the address space too).
 fn fits(p: u64, len: u64) -> bool {
-    (p & 0xffff_ffff) + len <= WINDOW
+    (p & 0xffff_ffff).checked_add(len).is_some_and(|end| end <= WINDOW)
 }
 
 /// The state a guarded call or a wrapper restores (the sandbox words, W_*).
