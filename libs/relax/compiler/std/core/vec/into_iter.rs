@@ -20,6 +20,9 @@ pub struct IntoIter<T, #[unstable(feature = "allocator_ext", issue = "163177", i
 unsafe impl<T: Send, A: Allocator + Send> Send for IntoIter<T, A> {}
 unsafe impl<T: Sync, A: Allocator + Sync> Sync for IntoIter<T, A> {}
 
+// inlined into `into_iter` as before the allocator parameter (moving the allocator out took the
+// source past O1's size rule): the iterator's fields are registers from the loop's first round
+#[inline]
 pub(super) fn new<T, A: Allocator>(v: Vec<T, A>) -> IntoIter<T, A> {
     let me = crate::mem::ManuallyDrop::new(v);
     let alloc = unsafe { im::ptr_read(&me.alloc as *const A) };
