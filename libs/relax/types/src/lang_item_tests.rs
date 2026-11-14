@@ -154,7 +154,10 @@ fn relax_std_provides_coerce_unsized_for_pointers_and_smart_pointers() {
     let slice = tys.intern(TyKind::Slice(tys.i32_));
     let r = tys.intern_region(crate::types::RegionKind::ReStatic);
     let boxed = tcx.lang_items.require(LangItem::OwnedBox).unwrap();
-    let adt = |d, t| tys.intern(TyKind::Adt(d, tys.mk_list(&[t]), crate::types::RegionArgsId::EMPTY));
+    // `Box<T, A = Global>`, as in rustc 1.100: the type carries its allocator argument.
+    let global = (0..prog.defs.len() as u32).map(DefId).find(|d| prog.name(*d) == "Global" && tcx.adts.contains_key(d)).expect("Global");
+    let global = tys.intern(TyKind::Adt(global, tys.mk_list(&[]), crate::types::RegionArgsId::EMPTY));
+    let adt = |d, t| tys.intern(TyKind::Adt(d, tys.mk_list(&[t, global]), crate::types::RegionArgsId::EMPTY));
     let infcx = crate::infer::InferCtxt::new(&tcx, crate::tcx::TypingMode::PostAnalysis, Default::default());
     let holds = |from, to| infcx.evaluate_obligation(&prog, Goal { param_env: crate::tcx::ParamEnvId::EMPTY,
         predicate: collect::trait_predicate(coerce, vec![GenericArg::Type(from), GenericArg::Type(to)]) }).must_apply_modulo_regions();
