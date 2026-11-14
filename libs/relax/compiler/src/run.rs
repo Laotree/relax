@@ -2555,6 +2555,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
     }
     if prelinked > 0 {
+        // a warm start: the watcher (started below) takes edits once no demand compile runs
+        jit::prelinked_start();
         if let Some(c) = unsafe { (*up).cache.as_ref() } {
             let s = &c.stats;
             let ms = |ns: u64| ns as f64 / 1e6;

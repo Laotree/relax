@@ -9347,7 +9347,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // a late include, the startup's end, an unpin, a recovery, a disarmed real-time root); a
         // timeout only for what is due (a landing check, the startup scan). At rest it makes no
         // system call.
-        let quiet = (crate::harness::live::enabled() || jit::live_startup_done()) && !DOMAIN_LOADING.load(std::sync::atomic::Ordering::Acquire)
+        let quiet = (crate::harness::live::enabled() || jit::live_edits_open()) && !DOMAIN_LOADING.load(std::sync::atomic::Ordering::Acquire)
             && pending.is_empty() && !streams_busy(up);
         let t_wait = Instant::now();
         match events.as_mut() {
@@ -9392,9 +9392,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             startup_scan = true;
         }
         // Keep the original stamps and queued OS notifications intact until startup
-        // finishes. In particular, do not acquire Reloading or drain streamed edits:
-        // either can compete with the cold compiler before the first frame.
-        if !crate::harness::live::enabled() && !jit::live_startup_done() { gate_note(2); continue; }
+        // finishes (jit::live_edits_open). In particular, do not acquire Reloading or drain
+        // streamed edits: either can compete with the cold compiler before the first frame.
+        if !crate::harness::live::enabled() && !jit::live_edits_open() { gate_note(2); continue; }
         // a live test session's rebuilt makepad: the tests restart into it now, between runs
         if let Some(why) = host::take_harness_restart() {
             let group = crate::owner::call(crate::owner::Class::Program, || (*up).begin_patch());

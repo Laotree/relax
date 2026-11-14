@@ -22885,6 +22885,30 @@ pub(crate) fn live_startup_done() -> bool {
         || LIVE_STARTUP_DONE.load(Ordering::Acquire) && !LIVE_NEEDS_PRESENT.load(Ordering::Acquire)
 }
 
+/// A warm start: the startup image was prelinked and installed before main and before the watcher
+/// started (run.rs, prelink_startup).
+static PRELINKED_START: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn prelinked_start() {
+    PRELINKED_START.store(true, Ordering::Release);
+}
+
+/// The watcher takes edits (reload.rs). Its gate holds them for the startup's speed only, not
+/// for correctness: a patch is correct beside the program's compiles (a build whose snapshot
+/// predates a patch is dropped, PATCH_EPOCH; installs hold the unit lock), as a live test
+/// session's edits from its first moment show. Past the startup (live_startup_done: the first
+/// present, or a cold start's 2 s of quiet) it is open; a program that takes edits without a
+/// present opens it at once on a warm start, whose startup image is installed, while no demand
+/// compile is in flight or queued for the owner (a cold start has no such event: it keeps the
+/// quiet).
+pub(crate) fn live_edits_open() -> bool {
+    live_startup_done()
+        || PRELINKED_START.load(Ordering::Acquire)
+            && HEADLESS.load(Ordering::Acquire)
+            && !LIVE_NEEDS_PRESENT.load(Ordering::Acquire)
+            && DEMAND_COMPILES.load(Ordering::SeqCst) == 0
+}
+
 /// A program that never presents (no makepad_platform, or a batch program) reached the point a
 /// present marks for an app: its startup went quiet (live_startup_done). Its warm record (crate
 /// records and front graph, then the collected program: run.rs's mid-run writer) is written from
@@ -31565,6 +31589,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&HEADLESS, AtomicBool::new(false));
     reset(&LIVE_STARTUP_DONE, AtomicBool::new(false));
     reset(&LIVE_NEEDS_PRESENT, AtomicBool::new(false));
+    reset(&PRELINKED_START, AtomicBool::new(false));
     reset(&STARTUP_THREAD, std::sync::OnceLock::new());
     reset(&PIPELINE, AtomicBool::new(false));
     reset(&PATCH_OPEN, AtomicBool::new(false));
