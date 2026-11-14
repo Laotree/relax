@@ -26,8 +26,9 @@
 //!   The twins' code goes to the world's disk cache like its other code (keyed by the macro
 //!   domain and their base's key; what it holds of the run's sandbox is linked again): a warm
 //!   start compiles none of it.
-//! Neither policy covers build scripts: a third-party package's `build.rs` runs as its own
-//! process with the user's rights (unitgraph.rs).
+//! The same switch covers build scripts: under `Policy::Sandboxed` the build script of a package
+//! whose units hold a third-party package runs confined (relax-front unitgraph.rs
+//! `script_confined`, sandbox/script.rs), and its output lines are held to its folders.
 //! Every call runs under the hang watchdog.
 
 use crate::macro_reg::{in_world, set_in_world, trace, Entry, REG, STATS};
