@@ -812,7 +812,8 @@ fn wrapper_source(u: &Unit, krate: u32, modname: &str, idx: u32, defs: &[DefId])
         } else {
             let n = ty_src(u, rt);
             let boxed = match u.tcx.tys.kind(rt) {
-                TyKind::Adt(d, a, _) if u.tcx.adts.get(d).is_some_and(|adt| adt.is_box()) && !a.is_empty() => match u.tcx.tys.kind(u.tcx.tys.list(*a)[0]) {
+                // (a Box in the global allocator: the host frees it as one)
+                TyKind::Adt(d, a, _) if u.tcx.adts.get(d).is_some_and(|adt| adt.is_box()) && !a.is_empty() && u.tcx.tys.list(*a)[1..].iter().all(|x| crate::provided::is_global_alloc(&u.tcx, *x)) => match u.tcx.tys.kind(u.tcx.tys.list(*a)[0]) {
                     TyKind::Adt(d, _, _) => u.prog.def(*d).krate == krate,
                     _ => false,
                 },

@@ -120,3 +120,23 @@ What stays out of reach:
 
 Start in libs/relax_api/src/lib.rs (`env`) for the read, and in tools/run/runner/src/lib.rs
 `run_spec` for a store run's order.
+
+## 8. A boxed slice or str in an allocator of its own has no Vec or String conversions yet
+
+```rust
+use std::alloc::System;
+
+fn main() {
+    let b: Box<[u8], System> = Box::new_in([1u8, 2, 3], System);
+    let c = b.clone();
+    let v = b.into_vec();
+    let n: u32 = c.into_iter().map(u32::from).sum();
+    println!("{} {}", v.len(), n);
+}
+```
+
+- rustc 1.100: `3 6`. Clone, `into_vec` and IntoIterator of `Box<[T], A>` go through `Vec<T, A>`.
+- Relax: E0599 / E0277. Box has its allocator parameter, but Vec does not yet (relax issue 156 ports
+  them in that order), so these impls and the `Box<str, A>` ones are the global allocator's only.
+
+Start in libs/relax/compiler/std/core/boxed.rs (its `Box<[T]>` and `Box<str>` impls) and vec/mod.rs.

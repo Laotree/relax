@@ -411,6 +411,14 @@ unsafe impl<A: Allocator + ?Sized> Allocator for &mut A {
     }
 }
 
+/// library/core/src/alloc/mod.rs @1.100.0 (unstable allocator_ext): an allocator whose blocks stay
+/// valid until they are deallocated, whatever happens to the allocator value. Box::into_pin and
+/// `Pin<Box<T, A>>: From<Box<T, A>>` require it of A; Global and System are, and a reference to one.
+pub unsafe trait StaticAllocator: Allocator {}
+
+unsafe impl<A: StaticAllocator + ?Sized> StaticAllocator for &A {}
+unsafe impl<A: StaticAllocator + ?Sized> StaticAllocator for &mut A {}
+
 /// library/alloc/src/alloc.rs @1.100.0: the global memory allocator as an `Allocator`. It goes to the
 /// program's global allocator (`alloc` and the rest: a `#[global_allocator]` static, else System),
 /// as Box's and Vec's allocations do. A zero-sized allocation is the layout's dangling pointer and
@@ -418,6 +426,9 @@ unsafe impl<A: Allocator + ?Sized> Allocator for &mut A {
 #[derive(Copy, Clone, Default, Debug)]
 #[lang = "global_alloc_ty"]
 pub struct Global;
+
+unsafe impl StaticAllocator for Global {}
+unsafe impl StaticAllocator for System {}
 
 impl Global {
     #[inline]

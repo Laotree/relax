@@ -2,7 +2,7 @@
 //! S1), at real alloc's paths.
 
 pub mod alloc {
-    pub use core::heap::{alloc, alloc_zeroed, dealloc, handle_alloc_error, realloc, AllocError, Allocator, Global, GlobalAlloc, Layout, LayoutErr, LayoutError, System};
+    pub use core::heap::{alloc, alloc_zeroed, dealloc, handle_alloc_error, realloc, AllocError, Allocator, Global, GlobalAlloc, Layout, LayoutErr, LayoutError, StaticAllocator, System};
 }
 
 pub mod borrow {
